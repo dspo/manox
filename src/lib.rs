@@ -135,6 +135,7 @@ fn provider_agents_or_all(_provider_name: &str, _endpoint: &EndpointConfig) -> V
 
 fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
+        // Backward-compat for legacy config entries only; the CLI no longer proxies `codex app`.
         "codex-app" => "codex",
         _ => agent_id,
     }
@@ -266,21 +267,8 @@ fn find_agent(config: &CxConfig, agent_id: &str) -> Option<ResolvedAgent> {
         .find(|agent| agent.id == agent_id)
 }
 
-fn normalize_codex_passthrough(agent_id: &str, passthrough_args: &[String]) -> Vec<String> {
-    if canonical_agent_id(agent_id) == "codex"
-        && agent_id == "codex-app"
-        && passthrough_args.first().map(String::as_str) != Some("app")
-    {
-        let mut normalized = vec!["app".to_string()];
-        normalized.extend(passthrough_args.iter().cloned());
-        normalized
-    } else {
-        passthrough_args.to_vec()
-    }
-}
-
-fn is_codex_app_passthrough(passthrough_args: &[String]) -> bool {
-    passthrough_args.first().map(String::as_str) == Some("app")
+fn unsupported_codex_app_message() -> &'static str {
+    "`cx` 不再代理 `codex app` 桌面版。请直接运行原生 `codex app ...`；终端版仍可继续使用 `cx codex ...`。"
 }
 
 // ══════════════════════════════════════════════════
@@ -419,6 +407,7 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Invocation::Probe { target_model } => run_probe(target_model, &config),
+        Invocation::Unsupported { message } => bail!(message),
         Invocation::Launch {
             agent_hint,
             passthrough_args,
@@ -432,6 +421,9 @@ enum Invocation {
     Version,
     Probe {
         target_model: Option<String>,
+    },
+    Unsupported {
+        message: String,
     },
     Launch {
         agent_hint: Option<String>,
@@ -450,11 +442,19 @@ fn parse_invocation(args: Vec<String>, config: &CxConfig) -> Invocation {
         Some("probe") => Invocation::Probe {
             target_model: args.get(1).cloned(),
         },
+        Some("codex-app") => Invocation::Unsupported {
+            message: unsupported_codex_app_message().to_string(),
+        },
+        Some("codex") if args.get(1).map(String::as_str) == Some("app") => {
+            Invocation::Unsupported {
+                message: unsupported_codex_app_message().to_string(),
+            }
+        }
         Some(first) => {
-            if find_agent(config, first).is_some() || first == "codex-app" {
+            if find_agent(config, first).is_some() {
                 Invocation::Launch {
                     agent_hint: Some(canonical_agent_id(first).to_string()),
-                    passthrough_args: normalize_codex_passthrough(first, &args[1..]),
+                    passthrough_args: args[1..].to_vec(),
                 }
             } else {
                 Invocation::Launch {
@@ -482,13 +482,13 @@ cx {VERSION}
   - 运行 cx 时，总是会先进入交互式选择 Provider / Model。
   - `cx <agent> [args...]` 会跳过 agent 选择，但仍进入 Provider / Model 选择。
   - 选择完成后，剩余参数会原样透传给最终原生 CLI。
+  - `cx` 不代理 `codex app` 桌面端；如需桌面端请直接运行原生 `codex app ...`。
   - `probe` 用于探测模型对 completions / responses 的支持情况。
 
 示例：
   cx
   cx claude mcp list
   cx codex --approval-mode on-request
-  cx codex app .
   cx probe
   cx probe qwen3.6-plus"
     );
@@ -593,12 +593,6 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
 
     let agent_id = &selection.agent_id;
     let provider = &selection.provider;
-    let codex_app_passthrough = is_codex_app_passthrough(passthrough_args);
-    let codex_passthrough_tail = if codex_app_passthrough {
-        &passthrough_args[1..]
-    } else {
-        passthrough_args
-    };
 
     // Default provider (no endpoints) — use agent's own default behavior
     if !provider.has_endpoints {
@@ -665,23 +659,13 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
             }
             "codex" => {
                 env.insert("DASHSCOPE_API_KEY".into(), apikey);
-                if codex_app_passthrough && model.wire_api != WireApi::Responses {
-                    bail!(
-                        "`codex app` 当前仅支持 responses 类型的 Provider；`{}` 目前是 {}。请改用 `cx codex ...`，或先选择支持 responses 的模型。",
-                        model.id,
-                        model.wire_api.display()
-                    );
-                }
-                if codex_app_passthrough {
-                    args.push("app".to_string());
-                }
                 args.extend([
                     "-c".to_string(),
                     r#"model_provider="dashscope""#.to_string(),
                     "-c".to_string(),
                     format!(r#"model="{}""#, model.id),
                 ]);
-                args.extend(codex_passthrough_tail.iter().cloned());
+                args.extend(passthrough_args.iter().cloned());
             }
             _ => {
                 // Generic fallback: just pass through
@@ -690,18 +674,12 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         }
     }
 
-    let launch_label = if agent_id == "codex" && codex_app_passthrough {
-        "codex app"
-    } else {
-        agent_id
-    };
-
     let summary = match &selection.model {
         Some(model) => format!(
             "启动 {} | Provider: {} | Model: {}",
-            launch_label, provider.name, model.id
+            agent_id, provider.name, model.id
         ),
-        None => format!("启动 {} | Provider: {}", launch_label, provider.name),
+        None => format!("启动 {} | Provider: {}", agent_id, provider.name),
     };
 
     Ok(LaunchSpec {
@@ -1401,54 +1379,91 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_app_as_native_subcommand() {
+    fn parse_codex_app_is_rejected() {
+        let config = test_config();
+        let invocation = parse_invocation(vec!["codex".into(), "app".into(), ".".into()], &config);
+        assert!(
+            matches!(invocation, Invocation::Unsupported { .. }),
+            "expected codex app to be rejected, got {invocation:?}"
+        );
+    }
+
+    #[test]
+    fn parse_legacy_codex_app_alias_is_rejected() {
+        let config = test_config();
+        let invocation = parse_invocation(vec!["codex-app".into(), ".".into()], &config);
+        assert!(
+            matches!(invocation, Invocation::Unsupported { .. }),
+            "expected codex-app alias to be rejected, got {invocation:?}"
+        );
+    }
+
+    #[test]
+    fn parse_non_desktop_codex_subcommand_still_passes_through() {
         let config = test_config();
         assert_eq!(
-            parse_invocation(vec!["codex".into(), "app".into(), ".".into()], &config),
+            parse_invocation(vec!["codex".into(), "exec".into(), "app".into()], &config),
             Invocation::Launch {
                 agent_hint: Some("codex".into()),
-                passthrough_args: vec!["app".into(), ".".into()],
+                passthrough_args: vec!["exec".into(), "app".into()],
             }
         );
     }
 
     #[test]
-    fn parse_legacy_codex_app_alias() {
-        let config = test_config();
-        assert_eq!(
-            parse_invocation(vec!["codex-app".into(), ".".into()], &config),
-            Invocation::Launch {
-                agent_hint: Some("codex".into()),
-                passthrough_args: vec!["app".into(), ".".into()],
-            }
-        );
-    }
-
-    #[test]
-    fn codex_app_rejects_completions_models() {
-        let config = test_config();
-        let all_models = build_all_models(&config);
-        let provider = providers_for_agent(&config, "codex")
-            .into_iter()
-            .find(|provider| provider.name == "百炼 Coding Plan")
-            .unwrap();
-        let model = all_models
-            .into_iter()
-            .find(|model| {
-                model.provider_name == "百炼 Coding Plan"
-                    && model.supports_agent("codex")
-                    && model.wire_api == WireApi::Completions
-            })
-            .unwrap();
+    fn codex_mcp_passthrough_stays_raw_without_endpoints() {
         let selection = Selection {
             agent_id: "codex".into(),
             agent_binary: "codex".into(),
-            provider,
-            model: Some(model),
+            provider: ResolvedProvider {
+                name: "Codex Default".into(),
+                has_endpoints: false,
+                apikey_source: None,
+            },
+            model: None,
         };
 
-        let error = build_launch_spec(&selection, &["app".into()]).unwrap_err();
-        assert!(error.to_string().contains("仅支持 responses"));
+        let spec = build_launch_spec(&selection, &["mcp".into(), "serve".into()]).unwrap();
+        assert_eq!(spec.args, vec!["mcp".to_string(), "serve".to_string()]);
+        assert!(!spec.args.iter().any(|arg| arg.starts_with("--cwd")));
+    }
+
+    #[test]
+    fn codex_mcp_passthrough_never_injects_cwd_with_endpoint_provider() {
+        let selection = Selection {
+            agent_id: "codex".into(),
+            agent_binary: "codex".into(),
+            provider: ResolvedProvider {
+                name: "DashScope".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+            },
+            model: Some(ResolvedModel {
+                id: "qwen3-coder-plus".into(),
+                arena: "—".into(),
+                swe_p: "—".into(),
+                tb2: "—".into(),
+                desc: String::new(),
+                wire_api: WireApi::Responses,
+                provider_name: "DashScope".into(),
+                endpoint_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
+                visible_agents: vec!["codex".into()],
+            }),
+        };
+
+        let spec = build_launch_spec(&selection, &["mcp".into(), "list".into()]).unwrap();
+        assert_eq!(
+            spec.args,
+            vec![
+                "-c".to_string(),
+                r#"model_provider="dashscope""#.to_string(),
+                "-c".to_string(),
+                r#"model="qwen3-coder-plus""#.to_string(),
+                "mcp".to_string(),
+                "list".to_string(),
+            ]
+        );
+        assert!(!spec.args.iter().any(|arg| arg.starts_with("--cwd")));
     }
 
     #[test]
@@ -1492,7 +1507,7 @@ mod tests {
         // Should include: 百炼 Coding Plan (all agents), GitHub Copilot Plan (copilot only)
         assert!(providers.iter().any(|p| p.name == "百炼 Coding Plan"));
         assert!(providers.iter().any(|p| p.name == "GitHub Copilot Plan"));
-        // Should NOT include: Packy API (claude only), Azure OpenAI (codex/codex-app only)
+        // Should NOT include: Packy API (claude only), Azure OpenAI (codex only)
         assert!(
             providers
                 .iter()

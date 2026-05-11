@@ -8,6 +8,7 @@
 - `cx <agent> [args...]`：跳过 agent 选择，但仍会进入 provider / model 选择。
 - 选择完成后，`[args...]` 会原样透传给底层原生 CLI。
 - 不对 `mcp`、`plugin`、`skill` 等命令做特判，它们只是普通透传参数。
+- 不代理 `codex app` 桌面端；如需桌面端请直接运行原生 `codex app ...`。
 
 ## 示例
 
@@ -15,12 +16,9 @@
 cx
 cx claude mcp list
 cx codex --approval-mode on-request
-cx codex app .
 cx probe
 cx probe qwen3.6-plus
 ```
-
-`codex app` 被视为 `codex` 的原生子命令透传；`cx` 仍会先完成 Provider / Model 选择，再启动桌面端。当前桌面端仅放行 `responses` 类型模型。
 
 ## 开发
 
