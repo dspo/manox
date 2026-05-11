@@ -1,0 +1,167 @@
+# cx 配置文件 Schema 定义
+# 此文件定义了 ~/.config/cx/config.yaml 的结构约束
+# 供后续开发参考，确保配置文件格式一致
+
+# ══════════════════════════════════════════════════
+# 顶层结构
+# ══════════════════════════════════════════════════
+
+schema_version: "1"   # string, 仅 "1"，用于未来格式演进
+
+# providers: 列表，每个元素是一个 Provider 定义
+#   - 必须至少有 1 个 provider
+#   - name 在列表中必须唯一
+providers:
+  - _see_provider_definition_below
+
+# agents: 列表，每个元素是一个 Agent 定义
+#   - id 在列表中必须唯一
+agents:
+  - _see_agent_definition_below
+
+# ══════════════════════════════════════════════════
+# Provider 定义
+# ══════════════════════════════════════════════════
+
+_provider_definition:
+  # name: string, 必填
+  #   Provider 的显示名称，同时也是唯一标识
+  #   TUI 中直接展示此字段
+  name: "string (required, unique)"
+
+  # apikey_source: string, 选填
+  #   API Key 的获取方式，格式为 <策略>:<值>
+  #   策略:
+  #     keychain:<service>   → macOS Keychain: security find-generic-password -s <service>
+  #     env:<VAR>            → 环境变量
+  #     literal:<value>      → 直接值（仅限本地调试）
+  #     $(shell command)     → 执行 shell 命令获取
+  #   若缺省，表示此 Provider 不需要额外 API Key（使用 agent 自身默认认证）
+  apikey_source: "string (optional)"
+
+  # agents: string[], 选填
+  #   此 Provider 对哪些 agent 可见
+  #   值为 agent 的 id（如 copilot, claude, codex）
+  #   若缺省或为空，表示对所有 agent 可见
+  agents: ["string (optional)"]
+
+  # endpoints: object[], 选填
+  #   此 Provider 暴露的 API endpoint 列表
+  #   若缺省或为空，表示此 Provider 使用 agent 自身默认行为，无需额外 env
+  #   一个 Provider 可以有多个 endpoint（如百炼支持 responses/completions/anthropic）
+  endpoints:
+    - _see_endpoint_definition_below
+
+# ══════════════════════════════════════════════════
+# Endpoint 定义
+# ══════════════════════════════════════════════════
+
+_endpoint_definition:
+  # wire_api: string, 必填, enum
+  #   API 协议类型，决定环境变量/参数的组装方式
+  #   取值:
+  #     responses    → OpenAI Responses API
+  #     completions  → OpenAI Chat Completions API
+  #     anthropic    → Anthropic Messages API
+  wire_api: "enum: responses | completions | anthropic (required)"
+
+  # url: string, 必填
+  #   endpoint 基础 URL
+  #   示例: https://dashscope.aliyuncs.com/compatible-mode/v1
+  url: "string (required)"
+
+  # models: object[], 必填（至少 1 个）
+  #   该 endpoint 下可用的模型列表
+  models:
+    - _see_model_definition_below
+
+# ══════════════════════════════════════════════════
+# Model 定义
+# ══════════════════════════════════════════════════
+
+_model_definition:
+  # id: string, 必填
+  #   模型 ID，即传给底层 CLI 的模型标识
+  #   同一 Provider 内可跨 endpoint 重复（如 glm-5 在 anthropic 和 completions 下都有）
+  id: "string (required)"
+
+  # arena: string, 选填
+  #   Arena 排名，如 "#8"、"—"
+  arena: "string (optional)"
+
+  # swe_p: string, 选填
+  #   SWE-P 百分比，如 "50.9%"、"—"
+  swe_p: "string (optional)"
+
+  # tb2: string, 选填
+  #   TB2 百分比，如 "61.6%"、"—"
+  tb2: "string (optional)"
+
+  # desc: string, 选填
+  #   模型简短描述，如 "Agent/终端最强"
+  desc: "string (optional)"
+
+  # agents: string[], 选填
+  #   此模型对哪些 agent 可见
+  #   值为 agent 的 id
+  #   若缺省或为空，继承 endpoint 层可见性或对所有 agent 可见
+  agents: ["string (optional)"]
+
+# ══════════════════════════════════════════════════
+# Agent 定义
+# ══════════════════════════════════════════════════
+
+_agent_definition:
+  # id: string, 必填, unique
+  #   Agent 标识，用于命令行参数和内部引用
+  #   如: copilot, claude, codex
+  #   兼容旧配置中的 codex-app，但推荐统一使用 codex，
+  #   桌面端通过 `cx codex app [PATH]` 启动。
+  id: "string (required, unique)"
+
+  # binary: string, 必填
+  #   底层 CLI 可执行文件名
+  #   cx 会通过 which 和 fallback 路径查找此文件
+  binary: "string (required)"
+
+  # app_type / app_bundle: 旧版遗留字段，当前实现已不再使用
+  #   Codex Desktop 统一通过 `codex app` 子命令启动，
+  #   不再直接执行 .app bundle，也不再写 ~/.codex/config.toml。
+  app_type: "enum: cli | app (optional, default: cli)"
+  app_bundle: "string (optional, app_type=app only)"
+
+  # 注意: 不设 default_provider 字段
+  #   每个 agent 的默认 Provider 是其官方 Provider（免配置）
+  #   官方 Provider = 配置中第一个无 endpoint 且 agents 包含该 agent 的 Provider
+  #   如无匹配，则 TUI 中 Provider 列表的第一项即为默认
+
+# ══════════════════════════════════════════════════
+# wire_api → env/argv 组装逻辑（代码内驱动）
+# ══════════════════════════════════════════════════
+#
+# 配置文件只声明 wire_api，具体的 env 名和 argv 格式由代码内逻辑驱动:
+#
+# (copilot, responses)  → COPILOT_PROVIDER_BASE_URL=<url>
+#                         COPILOT_PROVIDER_TYPE=openai
+#                         COPILOT_PROVIDER_API_KEY=<apikey>
+#                         COPILOT_MODEL=<model.id>
+#                         COPILOT_PROVIDER_WIRE_API=responses
+#
+# (copilot, completions) → 同 responses，WIRE_API=completions
+#
+# (claude, anthropic)    → ANTHROPIC_BASE_URL=<url>
+#                         ANTHROPIC_API_KEY=<apikey>
+#                         ANTHROPIC_MODEL=<model.id>
+#
+# (codex, completions)   → DASHSCOPE_API_KEY=<apikey>
+#                         args: -c model_provider="dashscope" -c model="<model.id>"
+#
+# (codex app, responses) → 通过 `codex app ...` 启动原生桌面端；
+#                          `cx` 只负责补齐 `app` 子命令前后的 env 与
+#                          `-c` 覆盖参数。当前不放行 completions，
+#                          因为桌面端配置层只接受 responses。
+#
+# (any, default/no-endpoint) → 使用 agent 自身默认认证和配置
+#                               (copilot) 原样透传
+#                               (codex)   可注入 AZURE_OPENAI_API_KEY 等
+#                               (claude)  可注入 ANTHROPIC_BASE_URL 等
