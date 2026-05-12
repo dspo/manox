@@ -115,8 +115,7 @@ _agent_definition:
   # id: string, 必填, unique
   #   Agent 标识，用于命令行参数和内部引用
   #   如: copilot, claude, codex
-  #   兼容旧配置中的 codex-app，但推荐统一使用 codex，
-  #   桌面端通过 `cx codex app [PATH]` 启动。
+  #   兼容旧配置中的 codex-app，但推荐统一使用 codex。
   id: "string (required, unique)"
 
   # binary: string, 必填
@@ -125,8 +124,6 @@ _agent_definition:
   binary: "string (required)"
 
   # app_type / app_bundle: 旧版遗留字段，当前实现已不再使用
-  #   Codex Desktop 统一通过 `codex app` 子命令启动，
-  #   不再直接执行 .app bundle，也不再写 ~/.codex/config.toml。
   app_type: "enum: cli | app (optional, default: cli)"
   app_bundle: "string (optional, app_type=app only)"
 
@@ -153,13 +150,8 @@ _agent_definition:
 #                         ANTHROPIC_API_KEY=<apikey>
 #                         ANTHROPIC_MODEL=<model.id>
 #
-# (codex, completions)   → DASHSCOPE_API_KEY=<apikey>
-#                         args: -c model_provider="dashscope" -c model="<model.id>"
-#
-# (codex app, responses) → 通过 `codex app ...` 启动原生桌面端；
-#                          `cx` 只负责补齐 `app` 子命令前后的 env 与
-#                          `-c` 覆盖参数。当前不放行 completions，
-#                          因为桌面端配置层只接受 responses。
+# (codex, endpoint model) → DASHSCOPE_API_KEY=<apikey>
+#                          args: -c model_provider="dashscope" -c model="<model.id>"
 #
 # (any, default/no-endpoint) → 使用 agent 自身默认认证和配置
 #                               (copilot) 原样透传
