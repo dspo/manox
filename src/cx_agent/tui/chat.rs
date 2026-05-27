@@ -33,6 +33,14 @@ use crate::cx_agent::tui::approval_prompt::{
 
 const HISTORY_SCROLL_STEP: usize = 3;
 const INPUT_MAX_HEIGHT: usize = 8;
+const COMMANDS_HELP: &str =
+    "Commands: /help /usage /tools /clear /retry /draft /reasoning /quit /exit :q";
+const CHAT_ACTIONS: &str =
+    "Actions: Enter send | Alt-Enter newline | /help | /quit | PgUp/PgDn scroll";
+const STREAMING_ACTIONS: &str = "Actions: Esc/Ctrl-C stop turn | PgUp/PgDn scroll | /retry";
+const APPROVAL_ACTIONS: &str =
+    "Actions: Enter allow once | t allow turn | s allow session | d deny";
+const ERROR_RECOVERY_ACTIONS: &str = "Recovery: edit input and resend, or run /retry /draft";
 const BANNER_TEXT: &str = "Ready. Enter sends, Alt-Enter adds a newline, /help shows commands.";
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -83,8 +91,8 @@ impl MessageRole {
         match self {
             Self::User => "you> ",
             Self::Assistant => "cx > ",
-            Self::System => "note>",
-            Self::Tool => "tool>",
+            Self::System => "note> ",
+            Self::Tool => "tool> ",
             Self::Error => "err> ",
         }
     }
@@ -315,7 +323,7 @@ impl ChatApp {
                                 return Ok(ChatEvent::Quit);
                             }
                             "/help" => {
-                                self.push_system("Commands: /help /usage /tools /clear /retry /draft /reasoning /quit".to_string());
+                                self.push_system(COMMANDS_HELP.to_string());
                                 self.draw()?;
                                 continue;
                             }
@@ -336,7 +344,9 @@ impl ChatApp {
                             }
                             "/clear" => {
                                 self.messages = self.initial_messages.clone();
-                                self.push_system("Conversation cleared. Context in provider memory remains unchanged.".to_string());
+                                self.push_system(
+                                    "Conversation cleared (provider memory unchanged).".to_string(),
+                                );
                                 self.follow_output = true;
                                 self.transient_event = Some("conversation cleared".to_string());
                                 self.draw()?;
@@ -492,6 +502,12 @@ impl ChatApp {
             self.fatal_error = Some(format!("failed to redraw error state: {err}"));
             eprintln!("Error: {msg}");
         }
+    }
+
+    pub fn notify(&mut self, message: impl Into<String>) {
+        self.push_system(message.into());
+        self.follow_output = true;
+        let _ = self.draw();
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
@@ -881,9 +897,8 @@ fn render_history(
     snapshot: &RenderSnapshot,
 ) -> HistoryMetrics {
     let block = Block::default().borders(Borders::ALL).title(format!(
-        " Conversation · mode:{} · follow:{} ",
+        " Conversation · mode:{} ",
         snapshot.ui_mode.label(),
-        if snapshot.follow_output { "on" } else { "off" }
     ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -947,23 +962,14 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &RenderSn
         if snapshot.follow_output { "on" } else { "off" }
     );
 
-    let line3 =
-        snapshot.transient_event.clone().unwrap_or_else(|| {
-            match snapshot.ui_mode {
-        UiMode::Chat => {
-            "Actions: Enter send | Alt-Enter newline | /help | PgUp/PgDn scroll | Esc/Ctrl-C quit"
-                .to_string()
-        }
-        UiMode::Streaming => {
-            "Actions: Esc/Ctrl-C stop turn | PgUp/PgDn scroll | /retry".to_string()
-        }
-        UiMode::Approval => {
-            "Actions: Enter allow once | t allow turn | s allow session | d deny".to_string()
-        }
-        UiMode::ErrorRecovery => {
-            "Recovery: edit input and resend, or run /retry /draft".to_string()
-        }
-    }
+    let line3 = snapshot
+        .transient_event
+        .clone()
+        .unwrap_or_else(|| match snapshot.ui_mode {
+            UiMode::Chat => CHAT_ACTIONS.to_string(),
+            UiMode::Streaming => STREAMING_ACTIONS.to_string(),
+            UiMode::Approval => APPROVAL_ACTIONS.to_string(),
+            UiMode::ErrorRecovery => ERROR_RECOVERY_ACTIONS.to_string(),
         });
 
     let paragraph = Paragraph::new(vec![
@@ -1037,9 +1043,10 @@ fn render_approval_prompt(
         frame.render_stateful_widget(scrollbar, preview_scrollbar, &mut state);
     }
 
-    let footer = Paragraph::new(vec![Line::from(
-        "[Enter/a] allow once  [t] allow turn  [s] allow session  [d/n/Esc] deny  [Ctrl-C] deny+quit",
-    )])
+    let footer = Paragraph::new(vec![
+        Line::from("[Enter/a] allow once  [t] allow turn  [s] allow session"),
+        Line::from("[d/n/Esc] deny  [Ctrl-C] deny+quit"),
+    ])
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, sections[2]);
 
@@ -1125,14 +1132,14 @@ fn approval_mode_label(mode: ApprovalMode) -> &'static str {
         ApprovalMode::PerCall => "per-call",
         ApprovalMode::ReadOnlyAutoAllow => "read-only-auto-allow",
     }
+}
 
-    fn approval_risk_label(category: &str) -> &'static str {
-        match category {
-            "read" => "low (read-only)",
-            "write" => "medium (file modification)",
-            "execute" => "high (command execution)",
-            _ => "unknown",
-        }
+fn approval_risk_label(category: &str) -> &'static str {
+    match category {
+        "read" => "low (read-only)",
+        "write" => "medium (file modification)",
+        "execute" => "high (command execution)",
+        _ => "unknown",
     }
 }
 
@@ -1197,16 +1204,6 @@ fn split_at_char_boundary(text: &str, max_chars: usize) -> usize {
     if text.chars().count() <= max_chars {
         return text.len();
     }
-
-    fn clamp_reasoning_text(text: &str) -> String {
-        const MAX_REASONING_CHARS: usize = 2_000;
-        let char_count = text.chars().count();
-        if char_count <= MAX_REASONING_CHARS {
-            return text.to_string();
-        }
-        let truncated: String = text.chars().take(MAX_REASONING_CHARS).collect();
-        format!("{truncated}\n\n[truncated reasoning: {MAX_REASONING_CHARS}/{char_count} chars]")
-    }
     let mut count = 0;
     for (idx, ch) in text.char_indices() {
         if count == max_chars {
@@ -1218,6 +1215,16 @@ fn split_at_char_boundary(text: &str, max_chars: usize) -> usize {
         }
     }
     text.len()
+}
+
+fn clamp_reasoning_text(text: &str) -> String {
+    const MAX_REASONING_CHARS: usize = 2_000;
+    let char_count = text.chars().count();
+    if char_count <= MAX_REASONING_CHARS {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(MAX_REASONING_CHARS).collect();
+    format!("{truncated}\n\n[truncated reasoning: {MAX_REASONING_CHARS}/{char_count} chars]")
 }
 
 #[cfg(test)]

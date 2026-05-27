@@ -239,7 +239,16 @@ async fn execute_tool_calls(
     history: &mut Vec<CxMessage>,
 ) -> Result<()> {
     let mut turn_tool_allow_override = false;
+    let mut notified_turn_override = false;
+    let mut notified_session_override = false;
     for tool_call in tool_calls {
+        if *session_tool_allow_override && !notified_session_override {
+            chat.notify("Approval override active: auto-allowing tools for this session.");
+            notified_session_override = true;
+        } else if turn_tool_allow_override && !notified_turn_override {
+            chat.notify("Approval override active: auto-allowing remaining tools this turn.");
+            notified_turn_override = true;
+        }
         let default_decision = if *session_tool_allow_override || turn_tool_allow_override {
             ApprovalDecision::Allow
         } else {
@@ -251,10 +260,13 @@ async fn execute_tool_calls(
         match tool_result.approval_decision {
             ApprovalDecision::AllowForTurn => {
                 turn_tool_allow_override = true;
+                notified_turn_override = false;
             }
             ApprovalDecision::AllowForSession => {
                 *session_tool_allow_override = true;
                 turn_tool_allow_override = true;
+                notified_session_override = false;
+                notified_turn_override = true;
             }
             ApprovalDecision::Allow | ApprovalDecision::Ask | ApprovalDecision::Deny { .. } => {}
         }
@@ -306,7 +318,9 @@ async fn execute_single_tool_call(
             ))?,
             ApprovalDecision::Deny { reason } => ApprovalDecision::Deny { reason },
             ApprovalDecision::AllowForTurn | ApprovalDecision::AllowForSession => {
-                ApprovalDecision::Allow
+                unreachable!(
+                    "decide() only returns Allow/Ask/Deny; tiered decisions come from user prompts"
+                )
             }
         },
     };
