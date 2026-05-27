@@ -1,0 +1,16 @@
+{
+  "name": "@awesome/cx",
+  "version": "0.0.0-internal",
+  "private": false,
+  "bin": {
+    "cx": "bin/cx.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "license": "UNLICENSED",
+  "description": "Internal launcher wrapper for cx",
+  "engines": {
+    "node": ">=18"
+  }
+}

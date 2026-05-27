@@ -1,0 +1,156 @@
+# Default provider configuration baseline for cx.
+# Patch or copy this into ~/.config/cx/cx.providers.config.yaml and adjust
+# apikey_source to match your local secret backend if needed.
+
+providers:
+  - name: 百炼
+    apikey_source: "keychain:DASHSCOPE_API_KEY"
+    endpoints:
+      anthropic:
+        url: https://dashscope.aliyuncs.com/apps/anthropic
+      responses:
+        url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      completions:
+        url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    models:
+      qwen3.6-plus:
+        arena: "#8"
+        swe_p: "—"
+        tb2: "61.6%"
+        desc: "Agent/终端最强"
+        wire_apis: [responses]
+      qwen3.5-plus:
+        arena: "#26"
+        swe_p: "50.9%"
+        tb2: "—"
+        desc: "通用"
+        wire_apis: [responses]
+      qwen3-max:
+        arena: "—"
+        swe_p: "—"
+        tb2: "—"
+        desc: "深度推理"
+        wire_apis: [responses]
+      qwen3-coder-plus:
+        arena: "#45"
+        swe_p: "~38.7%"
+        tb2: "—"
+        desc: "编码专用"
+        wire_apis: [responses]
+      qwen3-coder-flash:
+        arena: "—"
+        swe_p: "—"
+        tb2: "—"
+        desc: "轻量编码"
+      qwen3.5-flash:
+        arena: "#50"
+        swe_p: "—"
+        tb2: "—"
+        desc: "轻量快速"
+        wire_apis: [responses]
+      qwen-plus-latest:
+        arena: "—"
+        swe_p: "—"
+        tb2: "—"
+        desc: "旧版通用"
+        wire_apis: [responses]
+      qwen-turbo-latest:
+        arena: "—"
+        swe_p: "—"
+        tb2: "—"
+        desc: "最轻量"
+        wire_apis: [responses]
+      deepseek-v4-pro[1m]:
+        wire_apis: [anthropic, completions]
+        agents: [claude]
+      glm-5.1:
+        arena: "#"
+        swe_p: "—"
+        tb2: "—"
+        desc: "通用"
+        wire_apis: [anthropic, completions]
+      glm-5:
+        arena: "#9"
+        swe_p: "55.1%"
+        tb2: "49.4%"
+        desc: "推理+知识可靠"
+        wire_apis: [anthropic, completions]
+      kimi-k2.5:
+        arena: "#14"
+        swe_p: "53.8%"
+        tb2: "50.8%"
+        desc: "竞赛编程强"
+        wire_apis: [anthropic, completions]
+      MiniMax-M2.5:
+        arena: "#20"
+        swe_p: "—"
+        tb2: "—"
+        desc: "SWE-V 80.2%"
+        wire_apis: [anthropic, completions]
+      qwen3-coder-next:
+        arena: "—"
+        swe_p: "—"
+        tb2: "—"
+        desc: "3B激活，性价比极高"
+        wire_apis: [anthropic, completions]
+      deepseek-v4-pro:
+        wire_apis: [completions]
+      deepseek-v4-flash:
+        wire_apis: [completions]
+      MiniMax-M2.7:
+        arena: "—"
+        swe_p: "—"
+        tb2: "—"
+        desc: "自我迭代"
+        wire_apis: [completions]
+      deepseek-v3.2:
+        arena: "—"
+        swe_p: "—"
+        tb2: "—"
+        desc: "深度思考"
+        wire_apis: [completions]
+
+  - name: GitHub Copilot Plan
+
+  - name: Packy API
+    apikey_source: "keychain:ANTHROPIC_API_KEY"
+    endpoints:
+      anthropic:
+        url: https://www.packyapi.com/
+    models:
+      claude-opus-4-6:
+        desc: "Claude Opus 4.6"
+      claude-opus-4-7:
+        desc: "Claude Opus 4.7"
+
+  - name: Xiaomi MIMO (陈忠润)
+    apikey_source: "keychain:MIMO_API_KEY"
+    endpoints:
+      anthropic:
+        url: https://token-plan-cn.xiaomimimo.com/anthropic
+        copilot_auth: bearer_token
+      completions:
+        url: https://token-plan-cn.xiaomimimo.com/v1
+    models:
+      mimo-v2.5-pro: {}
+      mimo-v2.5: {}
+      mimo-v2.5-tts-voiceclone: {}
+      mimo-v2.5-tts-voicedesign: {}
+      mimo-v2.5-tts: {}
+      mimo-v2-pro: {}
+      mimo-v2-omni: {}
+      mimo-v2-tts: {}
+
+agents:
+  - id: copilot
+    bin: copilot
+    wire_apis: [anthropic, responses, completions]
+  - id: claude
+    bin: claude
+    wire_apis: [anthropic]
+  - id: codex
+    bin: codex
+    wire_apis: [responses]
+
+cx_agent:
+  approval_mode: read-only-auto-allow

@@ -1,41 +1,147 @@
-# cx
+# cx internal edition
 
-`cx` 是一个基于 Rust TUI 的聚合入口，用来启动 `copilot`、`claude`、`codex`，并在真正进入原生 CLI 之前完成 Provider / Model 选择。
+`cx` internal edition is a Rust TUI launcher for `copilot`, `claude`, and `codex`.
+This edition is designed for GitLab-hosted internal distribution:
 
-## 设计约定
+- provider/model config lives in runtime YAML files
+- GitLab CI builds and publishes both rolling main artifacts and tag release assets
+- the rolling GitLab install script is the primary installation path
+- npm/npx is provided as a secondary GitLab-based distribution path
 
-- `cx`：先选择 agent，再选择 provider / model。
-- `cx <agent> [args...]`：跳过 agent 选择，但仍会进入 provider / model 选择。
-- 选择完成后，`[args...]` 会原样透传给底层原生 CLI。
-- 不对 `mcp`、`plugin`、`skill` 等命令做特判，它们只是普通透传参数。
-- 不代理 `codex app` 桌面端；如需桌面端请直接运行原生 `codex app ...`。
+## Runtime model
 
-## 示例
+- `cx`: choose agent first, then provider/model
+- `cx <agent> [args...]`: skip agent selection, still choose provider/model
+- after selection, passthrough args are forwarded unchanged to the native CLI
+- for `codex`, `cx` injects a synthetic DashScope provider view before launch, so it does not depend on the user already having `~/.codex/config.toml`
+- `cx` does **not** proxy `codex app`
+
+## Cx Agent
+
+`cx-agent` is the in-process coding agent shipped inside `cx`. It uses the same
+provider/model picker as the launcher, then opens its own chat loop instead of
+exec'ing an external CLI.
+
+Typical flow:
 
 ```bash
-cx
-cx claude mcp list
-cx codex --approval-mode on-request
-cx probe
-cx probe qwen3.6-plus
+cx cx-agent
+# 1. pick a provider + model in the launcher
+# 2. chat with Cx Agent in the terminal
+# 3. inspect usage later with `cx stats`
 ```
 
-## 开发
+Cx Agent rollout files are written to
+`~/.local/share/cx/cx-agent-sessions/<YYYY-MM-DD>/`, and their token usage is
+included in `cx stats`.
+
+## Install from GitLab
+
+This is the primary installation path for internal users.
+
+```bash
+curl -fsSL \
+  "https://git.huayi.tech/awesome/cx/-/jobs/artifacts/main/raw/dist/install.sh?job=publish-main" | sh
+```
+
+By default this installs the latest successful `main` build for the matching
+platform, verifies `SHA256SUMS`, and writes `cx` to `~/.local/bin/cx`.
+
+To install the latest stable release instead:
+
+```bash
+curl -fsSL \
+  "https://git.huayi.tech/awesome/cx/-/jobs/artifacts/main/raw/dist/install.sh?job=publish-main" | \
+  CX_CHANNEL=release sh
+```
+
+To install a specific release tag:
+
+```bash
+curl -fsSL \
+  "https://git.huayi.tech/awesome/cx/-/jobs/artifacts/main/raw/dist/install.sh?job=publish-main" | \
+  CX_CHANNEL=release CX_VERSION=v0.1.0 sh
+```
+
+The installer currently supports:
+
+- `cx-linux-x86_64`
+- `cx-linux-arm64`
+- `cx-darwin-arm64`
+- `cx-darwin-x86_64`
+
+If `~/.local/bin` is not already in `PATH`, the installer prints the export line
+to add before invoking `cx`.
+
+## Install with npx
+
+`npx` is available as a secondary GitLab-based path. If your environment can
+reach the GitLab npm registry directly, install the wrapper and then let it
+download the matching release binary.
+
+```bash
+npm config set @awesome:registry https://git.huayi.tech/api/v4/projects/<project-id>/packages/npm/
+npm config set -- //git.huayi.tech/api/v4/projects/<project-id>/packages/npm/:_authToken=<gitlab-token>
+
+npx @awesome/cx
+```
+
+## Runtime provider config
+
+`cx` reads provider/model config from `~/.config/cx/cx.providers.config.yaml`
+at runtime. If an older `~/.config/cx/config.yaml` exists, it is migrated to the
+new path automatically on first use.
+
+The repo keeps `config/providers.default.yaml` as the published baseline
+reference. Typical workflows:
+
+```bash
+cx add
+cx patch config/providers.default.yaml
+cx patch --url <url>
+cx patch --refresh
+```
+
+If `~/.config/cx/cx.providers.config.yaml` is missing, `cx` creates it from the
+published baseline automatically on first use. You can also edit it directly.
+
+`cx add` launches a TUI wizard rooted at the Providers list. From there you can:
+
+- select an existing Provider, then add a `wire_api` endpoint or a model
+- choose `+ 新建 Provider` to create a new API Provider, fill `apikey_source`,
+  complete a three-row Anthropic / Responses / Completions endpoint form, and
+  optionally add its first model
+
+When a provider uses `apikey_source: keychain:<SERVICE>` and that secret is
+missing, `cx` prompts on first real use and writes it back to Keychain. `env:`
+sources are resolved strictly from the environment and are not rewritten.
+
+For `codex`, only models verified to work through the injected DashScope
+responses provider are exposed in the published baseline config.
+
+## GitLab CI delivery
+
+`.gitlab-ci.yml` provides:
+
+1. `cargo fmt --check`
+2. `cargo test`
+3. build jobs for `cx-linux-x86_64`, `cx-linux-arm64`, `cx-darwin-arm64`, and `cx-darwin-x86_64`
+4. a `publish-main` job whose raw artifacts provide a stable installer + checksum + binary URL for the latest successful `main` pipeline
+5. tag pipelines upload versioned assets to the GitLab Generic Package Registry and create a GitLab Release with permanent asset links
+6. tag pipelines publish the npm wrapper to the GitLab npm registry
+
+## Local development
+
+The repo pins Rust 1.95.0 with `rust-toolchain.toml` and CI runs the same
+version.
 
 ```bash
 ./scripts/build.sh
 cargo test
 ```
 
-## 安装
+For a local binary install from source:
 
 ```bash
 ./scripts/install.sh
 ```
-
-安装脚本会：
-
-1. 构建 release 版本的 `cx`
-2. 安装到 `~/.local/bin/cx`
-3. 移除 `~/.zshrc` 中旧的 `copilot` / `claude` / `codex` 劫持
-4. 删除旧的 `~/.local/bin/ccc`

@@ -1,0 +1,274 @@
+stages:
+  - validate
+  - build
+  - publish
+  - release
+
+default:
+  interruptible: true
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/bin/
+      - .cargo/registry/
+      - .cargo/git/db/
+      - .cargo/git/checkouts/
+      - .zig/
+      - .rustup/downloads/
+      - .rustup/tmp/
+      - .rustup/toolchains/
+      - .rustup/update-hashes/
+
+variables:
+  CARGO_TERM_COLOR: always
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_HTTP_TIMEOUT: "120"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_HOME: "$CI_PROJECT_DIR/.rustup"
+  RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+  RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
+  DARWIN_BUILDER_IMAGE: "joseluisq/rust-linux-darwin-builder:2.0.0-beta.1"
+  ZIG_VERSION: "0.13.0"
+
+fmt:
+  stage: validate
+  image: rust:1.95.0
+  script:
+    - rustup component add rustfmt --toolchain 1.95.0-x86_64-unknown-linux-gnu
+    - cargo fmt --check
+
+test:
+  stage: validate
+  image: rust:1.95.0
+  script:
+    - cargo test
+
+build:linux-x86_64:
+  stage: build
+  image: rust:1.95.0
+  script:
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        export CX_ENFORCE_EMBEDDED_SECRETS=1
+      fi
+      cargo build --release
+    - mkdir -p dist
+    - cp target/release/cx dist/cx-linux-x86_64
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+build:linux-arm64:
+  stage: build
+  image: rust:1.95.0
+  retry: 2
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends curl xz-utils ca-certificates
+    - |
+      mkdir -p .zig
+      if [ ! -x "${CI_PROJECT_DIR}/.zig/zig-linux-x86_64-${ZIG_VERSION}/zig" ]; then
+        curl --fail --show-error --location --output zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+        tar -xf zig.tar.xz -C .zig
+      fi
+      export PATH="${CI_PROJECT_DIR}/.zig/zig-linux-x86_64-${ZIG_VERSION}:${PATH}"
+    - |
+      if [ ! -x "${CARGO_HOME}/bin/cargo-zigbuild" ]; then
+        cargo install --root "${CARGO_HOME}" --locked cargo-zigbuild
+      fi
+    - |
+      TARGET_STD_DIR="${RUSTUP_HOME}/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib/rustlib/aarch64-unknown-linux-gnu"
+      if [ ! -d "${TARGET_STD_DIR}" ]; then
+        for attempt in 1 2 3; do
+          if rustup target add aarch64-unknown-linux-gnu --toolchain 1.95.0-x86_64-unknown-linux-gnu; then
+            break
+          fi
+          if [ "${attempt}" -eq 3 ]; then
+            echo "FATAL: 安装 aarch64-unknown-linux-gnu target 失败。" >&2
+            exit 1
+          fi
+          echo "rustup target add 失败，10 秒后重试（${attempt}/3）..." >&2
+          sleep 10
+        done
+      fi
+  script:
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        export CX_ENFORCE_EMBEDDED_SECRETS=1
+      fi
+      export PATH="${CI_PROJECT_DIR}/.zig/zig-linux-x86_64-${ZIG_VERSION}:${PATH}"
+      cargo zigbuild --release --target aarch64-unknown-linux-gnu
+    - mkdir -p dist
+    - cp target/aarch64-unknown-linux-gnu/release/cx dist/cx-linux-arm64
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+.darwin-build:
+  stage: build
+  image: ${DARWIN_BUILDER_IMAGE}
+  before_script:
+    - |
+      TOOLCHAIN_DIR="${RUSTUP_HOME}/toolchains/1.95.0-x86_64-unknown-linux-gnu"
+      if [ ! -d "${TOOLCHAIN_DIR}" ]; then
+        rustup toolchain install 1.95.0 --profile minimal --no-self-update
+      fi
+    - |
+      TARGET_STD_DIR="${RUSTUP_HOME}/toolchains/1.95.0-x86_64-unknown-linux-gnu/lib/rustlib/${CARGO_BUILD_TARGET}"
+      if [ ! -d "${TARGET_STD_DIR}" ]; then
+        rustup target add ${CARGO_BUILD_TARGET} --toolchain 1.95.0
+      fi
+    - |
+      SDK_CANDIDATE="$(find /opt /usr/local /root -maxdepth 6 -type d -name 'MacOSX*.sdk' 2>/dev/null | head -n 1)"
+      if [ -z "${SDK_CANDIDATE}" ]; then
+        echo "FATAL: 镜像内未找到 MacOSX*.sdk；请升级 DARWIN_BUILDER_IMAGE 或检查镜像内容。" >&2
+        exit 1
+      fi
+      echo "Detected MacOSX SDK at: ${SDK_CANDIDATE}"
+      export SDKROOT="${SDK_CANDIDATE}"
+    - |
+      case "${CARGO_BUILD_TARGET}" in
+        aarch64-apple-darwin) CROSS_CC=oa64-clang ;;
+        x86_64-apple-darwin)  CROSS_CC=o64-clang  ;;
+        *) echo "FATAL: unsupported target ${CARGO_BUILD_TARGET}" >&2; exit 1 ;;
+      esac
+      if ! command -v "${CROSS_CC}" >/dev/null 2>&1; then
+        echo "FATAL: ${CROSS_CC} not on PATH; image layout may have changed." >&2
+        exit 1
+      fi
+      TARGET_UPPER="$(printf '%s' "${CARGO_BUILD_TARGET}" | tr 'a-z-' 'A-Z_')"
+      ENV_TARGET="$(printf '%s' "${CARGO_BUILD_TARGET}" | tr '-' '_')"
+      export "CARGO_TARGET_${TARGET_UPPER}_LINKER=${CROSS_CC}"
+      export "CC_${ENV_TARGET}=${CROSS_CC}"
+      export "CXX_${ENV_TARGET}=${CROSS_CC}++"
+  script:
+    - |
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        export CX_ENFORCE_EMBEDDED_SECRETS=1
+      fi
+      cargo build --release --target ${CARGO_BUILD_TARGET}
+    - mkdir -p dist
+    - cp target/${CARGO_BUILD_TARGET}/release/cx dist/cx-${ARTIFACT_SUFFIX}
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+build:darwin-arm64:
+  extends: .darwin-build
+  variables:
+    CARGO_BUILD_TARGET: aarch64-apple-darwin
+    ARTIFACT_SUFFIX: darwin-arm64
+
+build:darwin-x86_64:
+  extends: .darwin-build
+  variables:
+    CARGO_BUILD_TARGET: x86_64-apple-darwin
+    ARTIFACT_SUFFIX: darwin-x86_64
+
+publish-main:
+  stage: publish
+  image: alpine:3.20
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  needs:
+    - build:linux-x86_64
+    - build:linux-arm64
+    - build:darwin-arm64
+    - build:darwin-x86_64
+  before_script:
+    - apk add --no-cache coreutils
+  script:
+    - test -f dist/cx-linux-x86_64
+    - test -f dist/cx-linux-arm64
+    - test -f dist/cx-darwin-arm64
+    - test -f dist/cx-darwin-x86_64
+    - cp scripts/install-release.sh dist/install.sh
+    - chmod +x dist/install.sh
+    - (cd dist && sha256sum cx-* install.sh > SHA256SUMS)
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+publish:release-assets:
+  stage: publish
+  image: alpine:3.20
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  needs:
+    - build:linux-x86_64
+    - build:linux-arm64
+    - build:darwin-arm64
+    - build:darwin-x86_64
+  before_script:
+    - apk add --no-cache curl bash coreutils
+  script:
+    - test -f dist/cx-linux-x86_64
+    - test -f dist/cx-linux-arm64
+    - test -f dist/cx-darwin-arm64
+    - test -f dist/cx-darwin-x86_64
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - PACKAGE_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/cx/${VERSION}"
+    - cp scripts/install-release.sh dist/install.sh
+    - chmod +x dist/install.sh
+    - (cd dist && sha256sum cx-* install.sh > SHA256SUMS)
+    - |
+      for file in dist/*; do
+        curl --fail --show-error --location \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file "${file}" \
+          "${PACKAGE_URL}/$(basename "${file}")"
+      done
+    - |
+      links='['
+      sep=''
+      for file in dist/cx-*; do
+        name="$(basename "${file}")"
+        url="${PACKAGE_URL}/${name}"
+        filepath="/binaries/${name}"
+        links="${links}${sep}{\"name\":\"${name}\",\"url\":\"${url}\",\"filepath\":\"${filepath}\",\"link_type\":\"package\"}"
+        sep=','
+      done
+      links="${links}${sep}{\"name\":\"SHA256SUMS\",\"url\":\"${PACKAGE_URL}/SHA256SUMS\",\"filepath\":\"/checksums/SHA256SUMS\",\"link_type\":\"other\"}"
+      links="${links}${sep}{\"name\":\"install.sh\",\"url\":\"${PACKAGE_URL}/install.sh\",\"filepath\":\"/install.sh\",\"link_type\":\"other\"}]"
+      printf '%s' "${links}" > release-links.json
+  artifacts:
+    paths:
+      - dist/
+      - release-links.json
+    expire_in: 1 week
+
+release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  needs:
+    - publish:release-assets
+  variables:
+    GITLAB_TOKEN: $CI_JOB_TOKEN
+  script:
+    - release-cli create --tag-name "${CI_COMMIT_TAG}" --name "Release ${CI_COMMIT_TAG}" --description "Internal build ${CI_COMMIT_TAG}" --assets-link "$(cat release-links.json)"
+
+publish:npm:
+  stage: publish
+  image: node:20-alpine
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - |
+      node -e "const fs=require('node:fs'); const path='npm/package.json'; const pkg=JSON.parse(fs.readFileSync(path,'utf8')); pkg.version=process.env.VERSION; fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');"
+    - |
+      cat > npm/.npmrc <<EOF
+      @awesome:registry=https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/packages/npm/
+      //${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/packages/npm/:_authToken=${CI_JOB_TOKEN}
+      EOF
+    - cd npm
+    - npm publish
