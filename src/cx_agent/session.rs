@@ -37,9 +37,15 @@ pub async fn run(selection: Selection, _passthrough_args: Vec<String>) -> Result
         runtime_config.approval_mode,
         rollout.session_id.clone(),
         rollout.path.clone(),
+        registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect(),
     );
 
     let mut history: Vec<CxMessage> = Vec::new();
+    let mut session_tool_allow_override = false;
 
     while let ChatEvent::Input(text) = chat.read_user_input().await? {
         let trimmed = text.trim();
@@ -54,6 +60,7 @@ pub async fn run(selection: Selection, _passthrough_args: Vec<String>) -> Result
             &registry,
             &runtime_config.adapter.model_id,
             runtime_config.approval_mode,
+            &mut session_tool_allow_override,
             &mut history,
             &mut rollout,
         )
@@ -74,6 +81,7 @@ async fn run_one_turn(
     registry: &Registry,
     model_id: &str,
     approval_mode: ApprovalMode,
+    session_tool_allow_override: &mut bool,
     history: &mut Vec<CxMessage>,
     rollout: &mut Rollout,
 ) -> Result<()> {
@@ -114,6 +122,7 @@ async fn run_one_turn(
             chat,
             registry,
             approval_mode,
+            session_tool_allow_override,
             &assistant_turn.tool_calls,
             history,
         )
@@ -225,12 +234,30 @@ async fn execute_tool_calls(
     chat: &mut ChatApp,
     registry: &Registry,
     approval_mode: ApprovalMode,
+    session_tool_allow_override: &mut bool,
     tool_calls: &[PendingToolCall],
     history: &mut Vec<CxMessage>,
 ) -> Result<()> {
+    let mut turn_tool_allow_override = false;
     for tool_call in tool_calls {
+        let default_decision = if *session_tool_allow_override || turn_tool_allow_override {
+            ApprovalDecision::Allow
+        } else {
+            ApprovalDecision::Ask
+        };
         let tool_result =
-            execute_single_tool_call(chat, registry, approval_mode, tool_call).await?;
+            execute_single_tool_call(chat, registry, approval_mode, default_decision, tool_call)
+                .await?;
+        match tool_result.approval_decision {
+            ApprovalDecision::AllowForTurn => {
+                turn_tool_allow_override = true;
+            }
+            ApprovalDecision::AllowForSession => {
+                *session_tool_allow_override = true;
+                turn_tool_allow_override = true;
+            }
+            ApprovalDecision::Allow | ApprovalDecision::Ask | ApprovalDecision::Deny { .. } => {}
+        }
         history.push(CxMessage::ToolResult {
             call_id: tool_call.id.clone(),
             name: Some(tool_call.name.clone()),
@@ -245,12 +272,14 @@ async fn execute_tool_calls(
 struct ToolExecutionResult {
     content: String,
     is_error: bool,
+    approval_decision: ApprovalDecision,
 }
 
 async fn execute_single_tool_call(
     chat: &mut ChatApp,
     registry: &Registry,
     approval_mode: ApprovalMode,
+    default_decision: ApprovalDecision,
     tool_call: &PendingToolCall,
 ) -> Result<ToolExecutionResult> {
     let Some(tool) = registry.get(&tool_call.name) else {
@@ -260,21 +289,32 @@ async fn execute_single_tool_call(
                 tool_call.name
             ),
             is_error: true,
+            approval_decision: ApprovalDecision::Deny {
+                reason: "tool unavailable".to_string(),
+            },
         });
     };
 
-    let decision = match decide(approval_mode, tool.category()) {
+    let decision = match default_decision {
         ApprovalDecision::Allow => ApprovalDecision::Allow,
-        ApprovalDecision::Ask => chat.prompt_approval(ApprovalRequest::from_json(
-            tool_call.name.clone(),
-            tool.category(),
-            &tool_call.arguments,
-        ))?,
-        ApprovalDecision::Deny { reason } => ApprovalDecision::Deny { reason },
+        _ => match decide(approval_mode, tool.category()) {
+            ApprovalDecision::Allow => ApprovalDecision::Allow,
+            ApprovalDecision::Ask => chat.prompt_approval(ApprovalRequest::from_json(
+                tool_call.name.clone(),
+                tool.category(),
+                &tool_call.arguments,
+            ))?,
+            ApprovalDecision::Deny { reason } => ApprovalDecision::Deny { reason },
+            ApprovalDecision::AllowForTurn | ApprovalDecision::AllowForSession => {
+                ApprovalDecision::Allow
+            }
+        },
     };
 
     match decision {
-        ApprovalDecision::Allow => {
+        ApprovalDecision::Allow
+        | ApprovalDecision::AllowForTurn
+        | ApprovalDecision::AllowForSession => {
             let outcome = match registry
                 .invoke(&tool_call.name, tool_call.arguments.clone())
                 .await
@@ -282,10 +322,12 @@ async fn execute_single_tool_call(
                 Ok(output) => ToolExecutionResult {
                     content: clamp_tool_result(output),
                     is_error: false,
+                    approval_decision: decision.clone(),
                 },
                 Err(err) => ToolExecutionResult {
                     content: clamp_tool_result(format!("Tool `{}` failed: {err}", tool_call.name)),
                     is_error: true,
+                    approval_decision: decision.clone(),
                 },
             };
             if outcome.is_error {
@@ -302,6 +344,9 @@ async fn execute_single_tool_call(
                 tool_call.name, reason
             )),
             is_error: true,
+            approval_decision: ApprovalDecision::Deny {
+                reason: reason.clone(),
+            },
         }),
     }
 }
