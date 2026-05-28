@@ -258,9 +258,9 @@ fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
             "{:<10} {:<28} {:>14} {:>14} {:>14} {:>5}",
             agent,
             model,
-            format_tokens(usage.raw_in_tokens),
-            format_tokens(usage.out_tokens),
             format_tokens(usage.billable_in_tokens),
+            format_tokens(usage.out_tokens),
+            format_tokens(usage.raw_in_tokens),
             days.len()
         );
     }
@@ -1032,7 +1032,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     let mut sorted: Vec<(String, UsageTotals)> = totals.into_iter().collect();
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.total_tokens()));
 
-    let visible = (area.height.saturating_sub(2) as usize / 2).max(1);
+    let visible = area.height.saturating_sub(2) as usize;
     let max_scroll = sorted.len().saturating_sub(visible.max(1));
     if app.models_scroll > max_scroll {
         app.models_scroll = max_scroll;
@@ -1051,37 +1051,22 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             };
             let dot_color = PALETTE[idx % PALETTE.len()];
             Row::new(vec![
-                Cell::from(Text::from(vec![
-                    Line::from(Span::styled("●", Style::default().fg(dot_color))),
-                    Line::from(""),
-                ])),
-                Cell::from(Text::from(vec![
-                    Line::from(Span::styled(
-                        model.clone(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                ])),
-                Cell::from(Text::from(vec![
-                    Line::from(Span::styled(
-                        format!("{:.1}%", pct),
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                    Line::from(""),
-                ])),
-                Cell::from(Text::from(vec![
-                    Line::from(format!("In: {}", format_tokens(usage.raw_in_tokens))),
-                    Line::from(Span::styled(
-                        format!("Billable In: {}", format_tokens(usage.billable_in_tokens)),
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ])),
-                Cell::from(Text::from(vec![
-                    Line::from(format!("Out: {}", format_tokens(usage.out_tokens))),
-                    Line::from(""),
-                ])),
+                Cell::from(Span::styled("●", Style::default().fg(dot_color))),
+                Cell::from(Span::styled(
+                    model.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(Span::styled(
+                    format!("{:.1}%", pct),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Cell::from(format!("In: {}", format_tokens(usage.billable_in_tokens))),
+                Cell::from(format!("Out: {}", format_tokens(usage.out_tokens))),
+                Cell::from(Span::styled(
+                    format!("Billable In: {}", format_tokens(usage.raw_in_tokens)),
+                    Style::default().fg(Color::DarkGray),
+                )),
             ])
-            .height(2)
         })
         .collect();
 
@@ -1089,8 +1074,9 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         Constraint::Length(2),
         Constraint::Length(28),
         Constraint::Length(8),
-        Constraint::Length(20),
         Constraint::Length(16),
+        Constraint::Length(16),
+        Constraint::Length(18),
     ];
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
@@ -1157,11 +1143,11 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                     Some(usage) => Text::from(vec![
                         Line::from(format!(
                             "In: {}  Out: {}",
-                            format_tokens(usage.raw_in_tokens),
+                            format_tokens(usage.billable_in_tokens),
                             format_tokens(usage.out_tokens)
                         )),
                         Line::from(Span::styled(
-                            format!("Billable In: {}", format_tokens(usage.billable_in_tokens)),
+                            format!("Billable In: {}", format_tokens(usage.raw_in_tokens)),
                             Style::default().fg(Color::DarkGray),
                         )),
                     ]),
