@@ -251,7 +251,7 @@ fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
     println!("today: {today}  total records: {}", records.len());
     println!(
         "{:<10} {:<28} {:>14} {:>14} {:>14} {:>5}",
-        "agent", "model", "in", "out", "billable_in", "days"
+        "agent", "model", "raw_in", "out", "real_in", "days"
     );
     for ((agent, model), (usage, days)) in &by_agent_model {
         println!(
@@ -1079,7 +1079,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     ];
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
-    let title = format!(" Models · {} of {} ", shown, sorted.len());
+    let title = format!(" Models · In(real/raw) · {} of {} ", shown, sorted.len());
     let table = Table::new(rows, widths).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
 }
@@ -1170,7 +1170,7 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     ];
 
     let title = format!(
-        " Agent × Model · {} · In(raw/total)/Out ({}/{}) ",
+        " Agent × Model · {} · In(real/raw)/Out ({}/{}) ",
         app.period.label(),
         models.len().min(app.matrix_scroll + visible),
         models.len()
