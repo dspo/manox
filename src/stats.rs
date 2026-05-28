@@ -912,7 +912,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         if idx >= day_count {
             continue;
         }
-        let tokens = r.total_tokens() as f64;
+        let tokens = (r.raw_in_tokens + r.out_tokens) as f64;
         if let Some(v) = series.get_mut(&r.model) {
             v[idx] += tokens;
         }
@@ -967,11 +967,10 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
     let y_mid_label = format_tokens((max_y / 2.0) as u64);
 
     let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Tokens per Day · {} ", app.period.label())),
-        )
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Tokens per Day (real in + out) · {} ",
+            app.period.label()
+        )))
         .x_axis(
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
