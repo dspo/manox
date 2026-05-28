@@ -748,9 +748,9 @@ fn event_loop<B: ratatui::backend::Backend>(
                     View::Matrix => View::Models,
                 };
             }
-            KeyCode::Char('1') => app.period = Period::All,
-            KeyCode::Char('2') => app.period = Period::Last7,
-            KeyCode::Char('3') => app.period = Period::Last30,
+            KeyCode::Char('1') => app.period = Period::Last7,
+            KeyCode::Char('2') => app.period = Period::Last30,
+            KeyCode::Char('3') => app.period = Period::All,
             KeyCode::Char('r') => app.period = app.period.cycle(),
             KeyCode::Down | KeyCode::Char('j') => match app.view {
                 View::Models => app.models_scroll = app.models_scroll.saturating_add(1),
@@ -827,9 +827,9 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let period_hint = match app.period {
-        Period::All => "[1] All  2 7d  3 30d",
-        Period::Last7 => "1 All  [2] 7d  3 30d",
-        Period::Last30 => "1 All  2 7d  [3] 30d",
+        Period::Last7 => "[1] 7d  2 30d  3 All",
+        Period::Last30 => "1 7d  [2] 30d  3 All",
+        Period::All => "1 7d  2 30d  [3] All",
     };
     let text = format!("[Tab] toggle view   {period_hint}   r cycle dates   ↑↓ scroll   q quit");
     let p = Paragraph::new(Line::from(Span::styled(
@@ -987,7 +987,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
 
 fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let mut spans: Vec<Span> = Vec::new();
-    for (i, p) in [Period::All, Period::Last7, Period::Last30]
+    for (i, p) in [Period::Last7, Period::Last30, Period::All]
         .iter()
         .enumerate()
     {
