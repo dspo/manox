@@ -85,7 +85,7 @@ struct UsageTotals {
 
 impl UsageTotals {
     fn total_tokens(self) -> u64 {
-        self.billable_in_tokens + self.out_tokens
+        self.raw_in_tokens + self.out_tokens
     }
 
     fn add_record(&mut self, record: &UsageRecord) {
