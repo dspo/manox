@@ -4,6 +4,7 @@
 //! 提供 Models / Matrix 两种 TUI 视图。
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Local};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -25,13 +26,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 // ──────────────────────────────────────────────────────────
 // 常量
 // ──────────────────────────────────────────────────────────
 
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 const AGENT_CLAUDE: &str = "claude";
 const AGENT_CODEX: &str = "codex";
@@ -182,7 +183,7 @@ pub fn run_stats() -> Result<()> {
         if !source.root.exists() {
             continue;
         }
-        let files = collect_jsonl_files(&source.root, source.kind);
+        let files = collect_jsonl_files(&source.root);
         for path in files {
             let path_key = path.to_string_lossy().to_string();
             visited.insert(path_key.clone());
@@ -312,7 +313,7 @@ fn log_sources() -> Vec<LogSource> {
 }
 
 /// 递归收集 *.jsonl 文件。
-fn collect_jsonl_files(root: &Path, kind: SourceKind) -> Vec<PathBuf> {
+fn collect_jsonl_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -333,18 +334,10 @@ fn collect_jsonl_files(root: &Path, kind: SourceKind) -> Vec<PathBuf> {
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            if matches!(kind, SourceKind::Claude) && is_claude_subagent_log(&path) {
-                continue;
-            }
             out.push(path);
         }
     }
     out
-}
-
-fn is_claude_subagent_log(path: &Path) -> bool {
-    path.components()
-        .any(|component| component.as_os_str().to_str() == Some("subagents"))
 }
 
 // ──────────────────────────────────────────────────────────
@@ -366,10 +359,7 @@ fn parse_file(path: &Path, kind: SourceKind) -> Vec<UsageRecord> {
 }
 
 fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
-    let Some(session_date) = claude_session_date(content) else {
-        return Vec::new();
-    };
-    let mut acc: BTreeMap<String, UsageTotals> = BTreeMap::new();
+    let mut acc: BTreeMap<(String, String), UsageTotals> = BTreeMap::new();
 
     for line in content.lines() {
         if line.is_empty() {
@@ -399,6 +389,9 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
         if model.is_empty() || model == "<synthetic>" {
             continue;
         }
+        let Some(date) = date_field(v.get("timestamp")) else {
+            continue;
+        };
 
         let input_tokens = u64_field(usage, "input_tokens");
         let cache_read = u64_field(usage, "cache_read_input_tokens");
@@ -409,7 +402,7 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
             continue;
         }
 
-        let entry = acc.entry(model).or_default();
+        let entry = acc.entry((model, date)).or_default();
         entry.in_tokens += input_tokens;
         entry.total_tokens += total_tokens;
         entry.out_tokens += out_tokens;
@@ -418,10 +411,10 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
     }
 
     acc.into_iter()
-        .map(|(model, totals)| UsageRecord {
+        .map(|((model, date), totals)| UsageRecord {
             agent: AGENT_CLAUDE.to_string(),
             model,
-            date: session_date.clone(),
+            date,
             in_tokens: totals.in_tokens,
             total_tokens: totals.total_tokens,
             out_tokens: totals.out_tokens,
@@ -429,22 +422,6 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
             cache_creation_input_tokens: totals.cache_creation_input_tokens,
         })
         .collect()
-}
-
-fn claude_session_date(content: &str) -> Option<String> {
-    for line in content.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Some(date) = date_field(v.get("timestamp")) {
-            return Some(date);
-        }
-    }
-    None
 }
 
 fn parse_codex_jsonl(
@@ -654,18 +631,17 @@ fn save_cache(path: &Path, cache: &ScanCache) -> Result<()> {
 }
 
 // ──────────────────────────────────────────────────────────
-// 日期工具（不引入 chrono）
+// 日期工具
 // ──────────────────────────────────────────────────────────
 
 fn today_date_string() -> Result<String> {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("系统时间早于 Unix Epoch")?
-        .as_secs() as i64;
-    Ok(unix_to_date(secs))
+    Ok(Local::now().format("%Y-%m-%d").to_string())
 }
 
 fn date_from_iso(s: &str) -> String {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return dt.with_timezone(&Local).format("%Y-%m-%d").to_string();
+    }
     if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
         s[..10].to_string()
     } else {
@@ -1374,38 +1350,37 @@ mod tests {
     }
 
     #[test]
-    fn claude_parser_buckets_to_session_start_and_keeps_duplicate_message_ids() {
+    fn claude_parser_buckets_by_message_date_and_sums_duplicate_message_ids() {
         let content = concat!(
             r#"{"type":"user","timestamp":"2026-05-26T23:59:59Z","message":{"role":"user","content":"hi"}}"#,
             "\n",
             r#"{"type":"assistant","timestamp":"2026-05-27T12:34:56Z","message":{"id":"msg-1","model":"claude-opus-4-7","usage":{"input_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":7}}}"#,
             "\n",
             r#"{"type":"assistant","timestamp":"2026-05-27T12:35:56Z","message":{"id":"msg-1","model":"claude-opus-4-7","usage":{"input_tokens":999,"cache_read_input_tokens":999,"cache_creation_input_tokens":999,"output_tokens":999}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-05-28T12:36:56Z","message":{"id":"msg-2","model":"claude-opus-4-7","usage":{"input_tokens":1,"cache_read_input_tokens":2,"cache_creation_input_tokens":3,"output_tokens":4}}}"#,
             "\n"
         );
 
         let records = parse_claude_jsonl(content);
 
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 2);
         assert_eq!(records[0].agent, AGENT_CLAUDE);
         assert_eq!(records[0].model, "claude-opus-4-7");
-        assert_eq!(records[0].date, "2026-05-26");
+        assert_eq!(records[0].date, date_from_iso("2026-05-27T12:34:56Z"));
         assert_eq!(records[0].in_tokens, 1099);
         assert_eq!(records[0].total_tokens, 2105);
         assert_eq!(records[0].out_tokens, 1006);
         assert_eq!(records[0].cache_read_input_tokens, 1019);
         assert_eq!(records[0].cache_creation_input_tokens, 1004);
+        assert_eq!(records[1].date, date_from_iso("2026-05-28T12:36:56Z"));
+        assert_eq!(records[1].in_tokens, 1);
+        assert_eq!(records[1].out_tokens, 4);
     }
 
     #[test]
     fn fallback_date_from_path_reads_parent_day_directory() {
         let path = Path::new("/logs/cx-agent-sessions/2026-05-29/session.jsonl");
         assert_eq!(fallback_date_from_path(path).as_deref(), Some("2026-05-29"));
-    }
-
-    #[test]
-    fn claude_subagent_logs_are_skipped() {
-        let path = Path::new("/logs/projects/foo/session/subagents/agent-1.jsonl");
-        assert!(is_claude_subagent_log(path));
     }
 }
