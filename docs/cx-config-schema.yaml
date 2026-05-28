@@ -35,9 +35,6 @@ agents:
     bin: "string (required; binary is accepted as alias)"
     wire_apis: ["enum: anthropic | responses | completions"]
 
-cx_agent:
-  approval_mode: "enum: always-allow | per-call | read-only-auto-allow (optional; default read-only-auto-allow)"
-
 # 运行时语义
 #
 # 1. 默认兼容性由下面两层自动推导：

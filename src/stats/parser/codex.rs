@@ -1,4 +1,4 @@
-//! Codex / Zed agent / cx-agent 共用的 jsonl 格式解析。
+//! Codex / Zed agent 共用的 jsonl 格式解析。
 //!
 //! 参考 ccusage `adapter/codex/parser.rs`，关键点：
 //! - 事件 `{type:"event_msg", payload:{type:"token_count", info:{total_token_usage, last_token_usage}}}`。
@@ -13,7 +13,7 @@
 //!
 //! 跨文件去重需要稳定的 session_id：同一逻辑 session 在 resume 后会写到新 rollout 文件，
 //! 文件名 UUID 不同。所以 session_id 必须从 jsonl 第一条 `session_meta.payload.id` 取
-//! （codex CLI / Zed / cx-agent 都在 session_meta 里写了 UUID）。文件名 stem 仅作兜底。
+//! （codex CLI / Zed 都在 session_meta 里写了 UUID）。文件名 stem 仅作兜底。
 
 use serde_json::Value;
 use std::path::Path;
@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn falls_back_to_path_date_when_timestamps_missing() {
         let content = concat!(
-            r#"{"type":"session_meta","payload":{"session_id":"cx-agent-abc","agent":"cx-agent","model":"qwen3.6-plus","started_at":"2026-05-28T09:00:00Z"}}"#,
+            r#"{"type":"session_meta","payload":{"session_id":"zed-abc","agent":"zed","model":"qwen3.6-plus","started_at":"2026-05-28T09:00:00Z"}}"#,
             "\n",
             r#"{"type":"turn_context","payload":{"model":"qwen3.6-plus"}}"#,
             "\n",
@@ -446,9 +446,9 @@ mod tests {
         );
         let r = parse(
             content,
-            "cx-agent",
+            "zed",
             Some("2026-05-27"),
-            Path::new("/tmp/cx-agent-abc.jsonl"),
+            Path::new("/tmp/zed-abc.jsonl"),
         );
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].date, "2026-05-28");

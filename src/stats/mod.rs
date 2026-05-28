@@ -35,14 +35,12 @@ const CACHE_VERSION: u32 = 6;
 pub(crate) const AGENT_CLAUDE: &str = "claude";
 pub(crate) const AGENT_CODEX: &str = "codex";
 pub(crate) const AGENT_ZED: &str = "zed";
-pub(crate) const AGENT_CX: &str = "cx-agent";
 pub(crate) const AGENT_COPILOT: &str = "copilot";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_CLAUDE, "claude code"),
     (AGENT_CODEX, "codex"),
     (AGENT_ZED, "zed agent"),
-    (AGENT_CX, "cx agent"),
     (AGENT_COPILOT, "copilot"),
 ];
 
@@ -90,11 +88,6 @@ fn log_sources() -> Vec<LogSource> {
             root: home.join("Library/Application Support/Zed/codex/sessions"),
             extra_file: None,
             kind: SourceKind::CodexLike(AGENT_ZED),
-        },
-        LogSource {
-            root: home.join(".local/share/cx/cx-agent-sessions"),
-            extra_file: None,
-            kind: SourceKind::CodexLike(AGENT_CX),
         },
         LogSource {
             root: home.join(".copilot/otel"),

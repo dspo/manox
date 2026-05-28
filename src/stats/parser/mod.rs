@@ -32,7 +32,7 @@ pub(super) struct RawEntry {
     pub(super) reasoning_output_tokens: u64,
     /// 用于跨文件去重的稳定主键（同一 agent 内唯一）。
     /// - claude: None（Claude Code Stats raw-sum，不按 message id 去重）
-    /// - codex/zed/cx-agent: `session_id|timestamp_iso`
+    /// - codex/zed: `session_id|timestamp_iso`
     /// - copilot: 见 copilot 内部说明
     pub(super) dedup_primary: Option<String>,
     /// 次级主键（与 primary 联合一起去重）。
@@ -47,7 +47,7 @@ pub(super) struct RawEntry {
 #[derive(Debug, Clone, Copy)]
 pub(super) enum SourceKind {
     Claude,
-    /// codex / zed / cx-agent 共用一套日志格式。
+    /// codex / zed 共用一套日志格式。
     CodexLike(&'static str),
     /// github copilot OpenTelemetry 导出。
     Copilot(&'static str),
@@ -84,7 +84,7 @@ pub(super) fn fallback_date_from_path(path: &Path) -> Option<String> {
     None
 }
 
-/// 提取 codex/zed/cx-agent 一行事件的日期，按多个候选位置回退。
+/// 提取 codex/zed 一行事件的日期，按多个候选位置回退。
 pub(super) fn codex_like_event_date(v: &Value, payload: &Value) -> Option<String> {
     date_field(v.get("timestamp"))
         .or_else(|| date_field(payload.get("timestamp")))

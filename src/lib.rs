@@ -29,11 +29,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
-mod cx_agent;
 mod stats;
-
-pub(crate) const CX_AGENT_ID: &str = "cx-agent";
-pub(crate) const CX_AGENT_TITLE: &str = "Cx Agent";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
@@ -56,20 +52,6 @@ struct CxConfig {
     providers: Vec<ProviderConfig>,
     #[serde(default)]
     agents: Vec<AgentConfig>,
-    #[serde(default, skip_serializing_if = "CxAgentConfig::is_empty")]
-    cx_agent: CxAgentConfig,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
-struct CxAgentConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    approval_mode: Option<String>,
-}
-
-impl CxAgentConfig {
-    fn is_empty(&self) -> bool {
-        self.approval_mode.is_none()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -648,14 +630,6 @@ fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
             supported_wire_apis,
         });
     }
-    // Cx Agent —— in-process agent，永远在列表末尾，支持三种 wire API。
-    if !agents.iter().any(|a| a.id == CX_AGENT_ID) {
-        agents.push(ResolvedAgent {
-            id: CX_AGENT_ID.to_string(),
-            binary: String::new(),
-            supported_wire_apis: vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
-        });
-    }
     agents
 }
 
@@ -688,7 +662,6 @@ fn available_agents_for_add(config: &CxConfig) -> Vec<ResolvedAgent> {
     resolved_agents(&CxConfig {
         providers: Vec::new(),
         agents: default_agent_configs(),
-        cx_agent: CxAgentConfig::default(),
     })
 }
 
@@ -1025,7 +998,6 @@ fn load_config_for_add() -> Result<(CxConfig, PathBuf)> {
         CxConfig {
             providers: Vec::new(),
             agents: default_agent_configs(),
-            cx_agent: CxAgentConfig::default(),
         }
     };
     Ok((config, path))
@@ -1323,12 +1295,6 @@ fn run_launcher(
         return Ok(());
     }
 
-    // Cx Agent — in-process，绕开 exec_launch。
-    if selection.agent_id == CX_AGENT_ID {
-        apply_selected_model_tab_name(&selection)?;
-        return cx_agent::run_cx_agent(selection, passthrough_args);
-    }
-
     let spec = build_launch_spec(&selection, &passthrough_args)?;
 
     println!();
@@ -1458,7 +1424,6 @@ fn run_patch(source: Option<String>, url: Option<String>, refresh: bool) -> Resu
     let merged = CxConfig {
         providers: merge_providers(&existing.providers, &incoming.providers),
         agents: merge_agents(&existing.agents, &incoming.agents),
-        cx_agent: merge_cx_agent(&existing.cx_agent, &incoming.cx_agent),
     };
 
     let yaml = serde_yaml::to_string(&merged).context("序列化配置失败")?;
@@ -1530,15 +1495,6 @@ fn merge_agents(existing: &[AgentConfig], incoming: &[AgentConfig]) -> Vec<Agent
     }
 
     result
-}
-
-fn merge_cx_agent(existing: &CxAgentConfig, incoming: &CxAgentConfig) -> CxAgentConfig {
-    CxAgentConfig {
-        approval_mode: incoming
-            .approval_mode
-            .clone()
-            .or_else(|| existing.approval_mode.clone()),
-    }
 }
 
 fn validate_provider_name(config: &CxConfig, name: &str) -> Result<String> {
@@ -3437,9 +3393,6 @@ impl AppState {
                 .resolved_agents()
                 .iter()
                 .map(|a| {
-                    if a.id == CX_AGENT_ID {
-                        return CX_AGENT_TITLE.to_string();
-                    }
                     let mut title = a.id.clone();
                     if let Some(first) = title.get_mut(0..1) {
                         first.make_ascii_uppercase();
@@ -3783,7 +3736,6 @@ mod tests {
                     wire_apis: vec![],
                 },
             ],
-            cx_agent: CxAgentConfig::default(),
         }
     }
 
@@ -3844,7 +3796,6 @@ mod tests {
                 ]),
             }],
             agents: default_agent_configs(),
-            cx_agent: CxAgentConfig::default(),
         }
     }
 
@@ -4235,30 +4186,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_cx_agent_preserves_existing_approval_mode() {
-        let merged = merge_cx_agent(
-            &CxAgentConfig {
-                approval_mode: Some("per-call".into()),
-            },
-            &CxAgentConfig::default(),
-        );
-        assert_eq!(merged.approval_mode.as_deref(), Some("per-call"));
-    }
-
-    #[test]
-    fn merge_cx_agent_prefers_incoming_approval_mode() {
-        let merged = merge_cx_agent(
-            &CxAgentConfig {
-                approval_mode: Some("per-call".into()),
-            },
-            &CxAgentConfig {
-                approval_mode: Some("always-allow".into()),
-            },
-        );
-        assert_eq!(merged.approval_mode.as_deref(), Some("always-allow"));
-    }
-
-    #[test]
     fn apply_add_provider_appends_provider() {
         let mut config = minimal_test_config();
         let provider = ProviderConfig {
@@ -4373,7 +4300,6 @@ mod tests {
                 )]),
             }],
             agents: default_agent_configs(),
-            cx_agent: CxAgentConfig::default(),
         };
         let provider = &config.providers[0];
         assert!(provider_supports_agent(&config, provider, "copilot"));
@@ -4450,27 +4376,6 @@ agents:
         assert!(!provider_supports_agent(&config, provider, "codex"));
         let serialized = serde_yaml::to_string(&config).unwrap();
         assert!(!serialized.contains("agents: [codex]"));
-    }
-
-    #[test]
-    fn cx_agent_approval_mode_round_trips_without_adding_empty_sections() {
-        let config: CxConfig = serde_yaml::from_str(
-            r#"
-cx_agent:
-  approval_mode: per-call
-providers: []
-agents: []
-"#,
-        )
-        .unwrap();
-        assert_eq!(config.cx_agent.approval_mode.as_deref(), Some("per-call"));
-
-        let serialized = serde_yaml::to_string(&config).unwrap();
-        assert!(serialized.contains("cx_agent:"));
-        assert!(serialized.contains("approval_mode: per-call"));
-
-        let legacy_serialized = serde_yaml::to_string(&CxConfig::default()).unwrap();
-        assert!(!legacy_serialized.contains("cx_agent:"));
     }
 
     #[test]
@@ -4644,7 +4549,6 @@ trust_level = "trusted"
                     wire_apis: vec![],
                 },
             ],
-            cx_agent: CxAgentConfig::default(),
         };
         let agents = resolved_agents(&config);
         assert_eq!(agents.iter().filter(|agent| agent.id == "codex").count(), 1);

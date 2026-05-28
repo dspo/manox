@@ -16,25 +16,6 @@ This edition is designed for GitLab-hosted internal distribution:
 - for `codex`, `cx` injects a synthetic DashScope provider view before launch, so it does not depend on the user already having `~/.codex/config.toml`
 - `cx` does **not** proxy `codex app`
 
-## Cx Agent
-
-`cx-agent` is the in-process coding agent shipped inside `cx`. It uses the same
-provider/model picker as the launcher, then opens its own chat loop instead of
-exec'ing an external CLI.
-
-Typical flow:
-
-```bash
-cx cx-agent
-# 1. pick a provider + model in the launcher
-# 2. chat with Cx Agent in the terminal
-# 3. inspect usage later with `cx stats`
-```
-
-Cx Agent rollout files are written to
-`~/.local/share/cx/cx-agent-sessions/<YYYY-MM-DD>/`, and their token usage is
-included in `cx stats`.
-
 ## Install from GitLab
 
 This is the primary installation path for internal users.

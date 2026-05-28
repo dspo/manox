@@ -5,23 +5,18 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 dirs = "6.0"
-futures = "0.3"
 rand = "0.8"
 ratatui = "0.29"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
-rig-core = "=0.37.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 glob = "0.3"
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt", "macros", "process", "io-util", "time"] }
-tui-textarea = "0.7"
 url = "2.5"
 which = "7.0"
