@@ -84,7 +84,7 @@ struct UsageTotals {
 }
 
 impl UsageTotals {
-    // 排名 / 占比 / 图表统一按“真实参与本次计算的新输入 + 输出”衡量，
+    // 排名 / 占比 / 图表统一按“uncached in + out”衡量，
     // 不把缓存命中重复算进活跃使用量。
     fn total_tokens(self) -> u64 {
         self.uncached_in_tokens + self.out_tokens
@@ -970,7 +970,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
 
     let chart = Chart::new(datasets)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " Tokens per Day (real in + out) · {} ",
+            " Tokens per Day (uncached in + out) · {} ",
             app.period.label()
         )))
         .x_axis(
