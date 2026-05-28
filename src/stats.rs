@@ -1060,12 +1060,12 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                     format!("{:.1}%", pct),
                     Style::default().fg(Color::DarkGray),
                 )),
-                Cell::from(format!("In: {}", format_tokens(usage.billable_in_tokens))),
-                Cell::from(format!("Out: {}", format_tokens(usage.out_tokens))),
-                Cell::from(Span::styled(
-                    format!("Billable In: {}", format_tokens(usage.raw_in_tokens)),
-                    Style::default().fg(Color::DarkGray),
+                Cell::from(format!(
+                    "In: {}/{}",
+                    format_tokens(usage.raw_in_tokens),
+                    format_tokens(usage.billable_in_tokens)
                 )),
+                Cell::from(format!("Out: {}", format_tokens(usage.out_tokens))),
             ])
         })
         .collect();
@@ -1074,9 +1074,8 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         Constraint::Length(2),
         Constraint::Length(28),
         Constraint::Length(8),
+        Constraint::Length(26),
         Constraint::Length(16),
-        Constraint::Length(16),
-        Constraint::Length(18),
     ];
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
@@ -1142,12 +1141,12 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
                     Some(usage) => Text::from(vec![
                         Line::from(format!(
-                            "In: {}  Out: {}",
-                            format_tokens(usage.billable_in_tokens),
-                            format_tokens(usage.out_tokens)
+                            "In: {}/{}",
+                            format_tokens(usage.raw_in_tokens),
+                            format_tokens(usage.billable_in_tokens)
                         )),
                         Line::from(Span::styled(
-                            format!("Billable In: {}", format_tokens(usage.raw_in_tokens)),
+                            format!("Out: {}", format_tokens(usage.out_tokens)),
                             Style::default().fg(Color::DarkGray),
                         )),
                     ]),
@@ -1171,7 +1170,7 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     ];
 
     let title = format!(
-        " Agent × Model · {} · In/Out/Billable ({}/{}) ",
+        " Agent × Model · {} · In(raw/total)/Out ({}/{}) ",
         app.period.label(),
         models.len().min(app.matrix_scroll + visible),
         models.len()
