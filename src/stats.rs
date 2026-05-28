@@ -71,15 +71,15 @@ struct UsageRecord {
     model: String,
     /// `YYYY-MM-DD`
     date: String,
-    real_in_tokens: u64,
-    raw_in_tokens: u64,
+    uncached_in_tokens: u64,
+    total_in_tokens: u64,
     out_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct UsageTotals {
-    real_in_tokens: u64,
-    raw_in_tokens: u64,
+    uncached_in_tokens: u64,
+    total_in_tokens: u64,
     out_tokens: u64,
 }
 
@@ -87,12 +87,12 @@ impl UsageTotals {
     // 排名 / 占比 / 图表统一按“真实参与本次计算的新输入 + 输出”衡量，
     // 不把缓存命中重复算进活跃使用量。
     fn total_tokens(self) -> u64 {
-        self.real_in_tokens + self.out_tokens
+        self.uncached_in_tokens + self.out_tokens
     }
 
     fn add_record(&mut self, record: &UsageRecord) {
-        self.real_in_tokens += record.real_in_tokens;
-        self.raw_in_tokens += record.raw_in_tokens;
+        self.uncached_in_tokens += record.uncached_in_tokens;
+        self.total_in_tokens += record.total_in_tokens;
         self.out_tokens += record.out_tokens;
     }
 }
@@ -247,16 +247,16 @@ fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
     println!("today: {today}  total records: {}", records.len());
     println!(
         "{:<10} {:<28} {:>14} {:>14} {:>14} {:>5}",
-        "agent", "model", "raw_in", "out", "real_in", "days"
+        "agent", "model", "total_in", "out", "uncached_in", "days"
     );
     for ((agent, model), (usage, days)) in &by_agent_model {
         println!(
             "{:<10} {:<28} {:>14} {:>14} {:>14} {:>5}",
             agent,
             model,
-            format_tokens(usage.raw_in_tokens),
+            format_tokens(usage.total_in_tokens),
             format_tokens(usage.out_tokens),
-            format_tokens(usage.real_in_tokens),
+            format_tokens(usage.uncached_in_tokens),
             days.len()
         );
     }
@@ -412,15 +412,15 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
         let cache_create = u64_field(usage, "cache_creation_input_tokens");
         let out_tokens = u64_field(usage, "output_tokens");
         // Claude usage 把 cache read / cache create 作为独立 bucket 暴露。
-        let real_in_tokens = input_tokens + cache_create;
-        let raw_in_tokens = real_in_tokens + cache_read;
-        if real_in_tokens == 0 && raw_in_tokens == 0 && out_tokens == 0 {
+        let uncached_in_tokens = input_tokens + cache_create;
+        let total_in_tokens = uncached_in_tokens + cache_read;
+        if uncached_in_tokens == 0 && total_in_tokens == 0 && out_tokens == 0 {
             continue;
         }
 
         let entry = acc.entry((model, date)).or_default();
-        entry.real_in_tokens += real_in_tokens;
-        entry.raw_in_tokens += raw_in_tokens;
+        entry.uncached_in_tokens += uncached_in_tokens;
+        entry.total_in_tokens += total_in_tokens;
         entry.out_tokens += out_tokens;
     }
 
@@ -429,8 +429,8 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
             agent: AGENT_CLAUDE.to_string(),
             model,
             date,
-            real_in_tokens: totals.real_in_tokens,
-            raw_in_tokens: totals.raw_in_tokens,
+            uncached_in_tokens: totals.uncached_in_tokens,
+            total_in_tokens: totals.total_in_tokens,
             out_tokens: totals.out_tokens,
         })
         .collect()
@@ -491,11 +491,11 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
         let cache_creation_input_tokens = u64_field(last, "cache_creation_input_tokens");
         let out_tokens = u64_field(last, "output_tokens");
         // Codex/OpenAI 风格里 cached_input_tokens 更像 input_tokens 的子集。
-        let real_in_tokens = input_tokens
+        let uncached_in_tokens = input_tokens
             .saturating_sub(cached_input_tokens)
             .saturating_add(cache_creation_input_tokens);
-        let raw_in_tokens = input_tokens.saturating_add(cache_creation_input_tokens);
-        if real_in_tokens == 0 && raw_in_tokens == 0 && out_tokens == 0 {
+        let total_in_tokens = input_tokens.saturating_add(cache_creation_input_tokens);
+        if uncached_in_tokens == 0 && total_in_tokens == 0 && out_tokens == 0 {
             continue;
         }
 
@@ -511,8 +511,8 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
             .unwrap_or_else(|| "unknown".to_string());
 
         let entry = acc.entry((model, date)).or_default();
-        entry.real_in_tokens += real_in_tokens;
-        entry.raw_in_tokens += raw_in_tokens;
+        entry.uncached_in_tokens += uncached_in_tokens;
+        entry.total_in_tokens += total_in_tokens;
         entry.out_tokens += out_tokens;
     }
 
@@ -521,8 +521,8 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
             agent: agent.to_string(),
             model,
             date,
-            real_in_tokens: totals.real_in_tokens,
-            raw_in_tokens: totals.raw_in_tokens,
+            uncached_in_tokens: totals.uncached_in_tokens,
+            total_in_tokens: totals.total_in_tokens,
             out_tokens: totals.out_tokens,
         })
         .collect()
@@ -914,7 +914,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         if idx >= day_count {
             continue;
         }
-        let tokens = (r.real_in_tokens + r.out_tokens) as f64;
+        let tokens = (r.uncached_in_tokens + r.out_tokens) as f64;
         if let Some(v) = series.get_mut(&r.model) {
             v[idx] += tokens;
         }
@@ -1076,7 +1076,11 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     ];
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
-    let title = format!(" Models · In(real/raw) · {} of {} ", shown, sorted.len());
+    let title = format!(
+        " Models · In(uncached/total) · {} of {} ",
+        shown,
+        sorted.len()
+    );
     let table = Table::new(rows, widths).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
 }
@@ -1163,7 +1167,7 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     ];
 
     let title = format!(
-        " Agent × Model · {} · In(real/raw)/Out ({}/{}) ",
+        " Agent × Model · {} · In(uncached/total)/Out ({}/{}) ",
         app.period.label(),
         models.len().min(app.matrix_scroll + visible),
         models.len()
@@ -1237,12 +1241,12 @@ fn format_tokens(n: u64) -> String {
 }
 
 fn format_in_display(usage: UsageTotals) -> String {
-    let real = format_tokens(usage.real_in_tokens);
-    let raw = format_tokens(usage.raw_in_tokens);
-    if usage.real_in_tokens == usage.raw_in_tokens {
-        real
+    let uncached = format_tokens(usage.uncached_in_tokens);
+    let total = format_tokens(usage.total_in_tokens);
+    if usage.uncached_in_tokens == usage.total_in_tokens {
+        uncached
     } else {
-        format!("{real}/{raw}")
+        format!("{uncached}/{total}")
     }
 }
 
@@ -1276,8 +1280,8 @@ mod tests {
         assert_eq!(records[0].agent, AGENT_CX);
         assert_eq!(records[0].model, "qwen3.6-plus");
         assert_eq!(records[0].date, "2026-05-27");
-        assert_eq!(records[0].real_in_tokens, 85);
-        assert_eq!(records[0].raw_in_tokens, 105);
+        assert_eq!(records[0].uncached_in_tokens, 85);
+        assert_eq!(records[0].total_in_tokens, 105);
         assert_eq!(records[0].out_tokens, 7);
     }
 
@@ -1296,13 +1300,13 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].date, "2026-05-28");
-        assert_eq!(records[0].real_in_tokens, 11);
-        assert_eq!(records[0].raw_in_tokens, 11);
+        assert_eq!(records[0].uncached_in_tokens, 11);
+        assert_eq!(records[0].total_in_tokens, 11);
         assert_eq!(records[0].out_tokens, 13);
     }
 
     #[test]
-    fn claude_parser_dedupes_message_ids_and_preserves_real_vs_raw_in() {
+    fn claude_parser_dedupes_message_ids_and_preserves_uncached_vs_total_in() {
         let content = concat!(
             r#"{"type":"assistant","timestamp":"2026-05-27T12:34:56Z","message":{"id":"msg-1","model":"claude-opus-4-7","usage":{"input_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":7}}}"#,
             "\n",
@@ -1316,8 +1320,8 @@ mod tests {
         assert_eq!(records[0].agent, AGENT_CLAUDE);
         assert_eq!(records[0].model, "claude-opus-4-7");
         assert_eq!(records[0].date, "2026-05-27");
-        assert_eq!(records[0].real_in_tokens, 105);
-        assert_eq!(records[0].raw_in_tokens, 125);
+        assert_eq!(records[0].uncached_in_tokens, 105);
+        assert_eq!(records[0].total_in_tokens, 125);
         assert_eq!(records[0].out_tokens, 7);
     }
 
