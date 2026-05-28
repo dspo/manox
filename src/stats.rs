@@ -31,8 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // 常量
 // ──────────────────────────────────────────────────────────
 
-const SCAN_DAYS: i64 = 30;
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 const AGENT_CLAUDE: &str = "claude";
 const AGENT_CODEX: &str = "codex";
@@ -71,29 +70,34 @@ struct UsageRecord {
     model: String,
     /// `YYYY-MM-DD`
     date: String,
-    uncached_in_tokens: u64,
-    total_in_tokens: u64,
+    in_tokens: u64,
+    total_tokens: u64,
     out_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct UsageTotals {
-    uncached_in_tokens: u64,
-    total_in_tokens: u64,
+    in_tokens: u64,
+    total_tokens: u64,
     out_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
 }
 
 impl UsageTotals {
-    // 排名 / 占比 / 图表统一按“uncached in + out”衡量，
-    // 不把缓存命中重复算进活跃使用量。
+    // Claude Code 的主统计口径按 In + Out 计算，不把缓存 token 算进图表/排序/占比。
     fn total_tokens(self) -> u64 {
-        self.uncached_in_tokens + self.out_tokens
+        self.in_tokens + self.out_tokens
     }
 
     fn add_record(&mut self, record: &UsageRecord) {
-        self.uncached_in_tokens += record.uncached_in_tokens;
-        self.total_in_tokens += record.total_in_tokens;
+        self.in_tokens += record.in_tokens;
+        self.total_tokens += record.total_tokens;
         self.out_tokens += record.out_tokens;
+        self.cache_read_input_tokens += record.cache_read_input_tokens;
+        self.cache_creation_input_tokens += record.cache_creation_input_tokens;
     }
 }
 
@@ -164,7 +168,6 @@ impl Period {
 
 pub fn run_stats() -> Result<()> {
     let today = today_date_string()?;
-    let cutoff = date_offset(&today, -SCAN_DAYS)?;
 
     let cache_path = cache_path()?;
     let mut cache = load_cache(&cache_path).unwrap_or_else(|_| ScanCache::new());
@@ -179,7 +182,7 @@ pub fn run_stats() -> Result<()> {
         if !source.root.exists() {
             continue;
         }
-        let files = collect_jsonl_files(&source.root, &cutoff);
+        let files = collect_jsonl_files(&source.root, source.kind);
         for path in files {
             let path_key = path.to_string_lossy().to_string();
             visited.insert(path_key.clone());
@@ -216,9 +219,7 @@ pub fn run_stats() -> Result<()> {
             );
 
             for r in records {
-                if r.date.as_str() >= cutoff.as_str() {
-                    all_records.push(r);
-                }
+                all_records.push(r);
             }
         }
     }
@@ -246,17 +247,18 @@ fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
     }
     println!("today: {today}  total records: {}", records.len());
     println!(
-        "{:<10} {:<28} {:>14} {:>14} {:>14} {:>5}",
-        "agent", "model", "total_in", "out", "uncached_in", "days"
+        "{:<10} {:<28} {:>14} {:>14} {:>14} {:>14} {:>5}",
+        "agent", "model", "in", "out", "cache_read", "cache_create", "days"
     );
     for ((agent, model), (usage, days)) in &by_agent_model {
         println!(
-            "{:<10} {:<28} {:>14} {:>14} {:>14} {:>5}",
+            "{:<10} {:<28} {:>14} {:>14} {:>14} {:>14} {:>5}",
             agent,
             model,
-            format_tokens(usage.total_in_tokens),
+            format_tokens(usage.in_tokens),
             format_tokens(usage.out_tokens),
-            format_tokens(usage.uncached_in_tokens),
+            format_tokens(usage.cache_read_input_tokens),
+            format_tokens(usage.cache_creation_input_tokens),
             days.len()
         );
     }
@@ -303,9 +305,8 @@ fn log_sources() -> Vec<LogSource> {
     ]
 }
 
-/// 递归收集 *.jsonl 文件，按 mtime 过滤掉 cutoff 之前的文件。
-fn collect_jsonl_files(root: &Path, cutoff: &str) -> Vec<PathBuf> {
-    let cutoff_secs: u64 = date_to_unix_secs(cutoff).unwrap_or(0).max(0) as u64;
+/// 递归收集 *.jsonl 文件。
+fn collect_jsonl_files(root: &Path, kind: SourceKind) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -326,19 +327,18 @@ fn collect_jsonl_files(root: &Path, cutoff: &str) -> Vec<PathBuf> {
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
-            // mtime 早于 cutoff 的整个文件可跳过（行 timestamp 还会在解析时再过滤一次）。
-            if meta
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .is_some_and(|d| d.as_secs() + 86400 < cutoff_secs)
-            {
+            if matches!(kind, SourceKind::Claude) && is_claude_subagent_log(&path) {
                 continue;
             }
             out.push(path);
         }
     }
     out
+}
+
+fn is_claude_subagent_log(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str().to_str() == Some("subagents"))
 }
 
 // ──────────────────────────────────────────────────────────
@@ -360,8 +360,10 @@ fn parse_file(path: &Path, kind: SourceKind) -> Vec<UsageRecord> {
 }
 
 fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
-    let mut seen_ids: BTreeSet<String> = BTreeSet::new();
-    let mut acc: BTreeMap<(String, String), UsageTotals> = BTreeMap::new();
+    let Some(session_date) = claude_session_date(content) else {
+        return Vec::new();
+    };
+    let mut acc: BTreeMap<String, UsageTotals> = BTreeMap::new();
 
     for line in content.lines() {
         if line.is_empty() {
@@ -391,49 +393,52 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
         if model.is_empty() || model == "<synthetic>" {
             continue;
         }
-        if message
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !seen_ids.insert(id.to_string()))
-        {
-            continue;
-        }
-        let timestamp = v
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let date = date_from_iso(timestamp);
-        if date.is_empty() {
-            continue;
-        }
 
         let input_tokens = u64_field(usage, "input_tokens");
         let cache_read = u64_field(usage, "cache_read_input_tokens");
         let cache_create = u64_field(usage, "cache_creation_input_tokens");
         let out_tokens = u64_field(usage, "output_tokens");
-        // Claude usage 把 cache read / cache create 作为独立 bucket 暴露。
-        let uncached_in_tokens = input_tokens + cache_create;
-        let total_in_tokens = uncached_in_tokens + cache_read;
-        if uncached_in_tokens == 0 && total_in_tokens == 0 && out_tokens == 0 {
+        let total_tokens = input_tokens.saturating_add(out_tokens);
+        if input_tokens == 0 && cache_read == 0 && cache_create == 0 && out_tokens == 0 {
             continue;
         }
 
-        let entry = acc.entry((model, date)).or_default();
-        entry.uncached_in_tokens += uncached_in_tokens;
-        entry.total_in_tokens += total_in_tokens;
+        let entry = acc.entry(model).or_default();
+        entry.in_tokens += input_tokens;
+        entry.total_tokens += total_tokens;
         entry.out_tokens += out_tokens;
+        entry.cache_read_input_tokens += cache_read;
+        entry.cache_creation_input_tokens += cache_create;
     }
 
     acc.into_iter()
-        .map(|((model, date), totals)| UsageRecord {
+        .map(|(model, totals)| UsageRecord {
             agent: AGENT_CLAUDE.to_string(),
             model,
-            date,
-            uncached_in_tokens: totals.uncached_in_tokens,
-            total_in_tokens: totals.total_in_tokens,
+            date: session_date.clone(),
+            in_tokens: totals.in_tokens,
+            total_tokens: totals.total_tokens,
             out_tokens: totals.out_tokens,
+            cache_read_input_tokens: totals.cache_read_input_tokens,
+            cache_creation_input_tokens: totals.cache_creation_input_tokens,
         })
         .collect()
+}
+
+fn claude_session_date(content: &str) -> Option<String> {
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(date) = date_field(v.get("timestamp")) {
+            return Some(date);
+        }
+    }
+    None
 }
 
 fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) -> Vec<UsageRecord> {
@@ -490,12 +495,12 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
         let cached_input_tokens = u64_field(last, "cached_input_tokens");
         let cache_creation_input_tokens = u64_field(last, "cache_creation_input_tokens");
         let out_tokens = u64_field(last, "output_tokens");
-        // Codex/OpenAI 风格里 cached_input_tokens 更像 input_tokens 的子集。
-        let uncached_in_tokens = input_tokens
-            .saturating_sub(cached_input_tokens)
-            .saturating_add(cache_creation_input_tokens);
-        let total_in_tokens = input_tokens.saturating_add(cache_creation_input_tokens);
-        if uncached_in_tokens == 0 && total_in_tokens == 0 && out_tokens == 0 {
+        let total_tokens = input_tokens.saturating_add(out_tokens);
+        if input_tokens == 0
+            && cached_input_tokens == 0
+            && cache_creation_input_tokens == 0
+            && out_tokens == 0
+        {
             continue;
         }
 
@@ -511,9 +516,11 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
             .unwrap_or_else(|| "unknown".to_string());
 
         let entry = acc.entry((model, date)).or_default();
-        entry.uncached_in_tokens += uncached_in_tokens;
-        entry.total_in_tokens += total_in_tokens;
+        entry.in_tokens += input_tokens;
+        entry.total_tokens += total_tokens;
         entry.out_tokens += out_tokens;
+        entry.cache_read_input_tokens += cached_input_tokens;
+        entry.cache_creation_input_tokens += cache_creation_input_tokens;
     }
 
     acc.into_iter()
@@ -521,9 +528,11 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
             agent: agent.to_string(),
             model,
             date,
-            uncached_in_tokens: totals.uncached_in_tokens,
-            total_in_tokens: totals.total_in_tokens,
+            in_tokens: totals.in_tokens,
+            total_tokens: totals.total_tokens,
             out_tokens: totals.out_tokens,
+            cache_read_input_tokens: totals.cache_read_input_tokens,
+            cache_creation_input_tokens: totals.cache_creation_input_tokens,
         })
         .collect()
 }
@@ -639,10 +648,6 @@ fn unix_to_date(secs: i64) -> String {
 }
 
 /// "YYYY-MM-DD" → unix 秒（当日 00:00 UTC）。
-fn date_to_unix_secs(s: &str) -> Option<i64> {
-    let (y, m, d) = parse_ymd(s)?;
-    Some(days_from_civil(y, m, d) * 86_400)
-}
 
 fn parse_ymd(s: &str) -> Option<(i64, u32, u32)> {
     if s.len() < 10 {
@@ -904,7 +909,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
     let day_count = (days_diff(&min_date, &max_date).unwrap_or(0).max(0) + 1) as usize;
     let day_count = day_count.max(1);
 
-    // 每个模型每天的 token 数（in+out）
+    // 每个模型每天的 token 数（In + Out）
     let mut series: HashMap<String, Vec<f64>> = HashMap::new();
     for m in &top_models {
         series.insert(m.clone(), vec![0.0; day_count]);
@@ -914,7 +919,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         if idx >= day_count {
             continue;
         }
-        let tokens = (r.uncached_in_tokens + r.out_tokens) as f64;
+        let tokens = r.total_tokens as f64;
         if let Some(v) = series.get_mut(&r.model) {
             v[idx] += tokens;
         }
@@ -970,7 +975,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
 
     let chart = Chart::new(datasets)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " Tokens per Day (uncached in + out) · {} ",
+            " Tokens per Day (in + out) · {} ",
             app.period.label()
         )))
         .x_axis(
@@ -1061,7 +1066,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                     format!("{:.1}%", pct),
                     Style::default().fg(Color::DarkGray),
                 )),
-                Cell::from(format!("In: {}", format_in_display(*usage))),
+                Cell::from(format!("In: {}", format_tokens(usage.in_tokens))),
                 Cell::from(format!("Out: {}", format_tokens(usage.out_tokens))),
             ])
         })
@@ -1076,11 +1081,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     ];
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
-    let title = format!(
-        " Models · In(uncached/total) · {} of {} ",
-        shown,
-        sorted.len()
-    );
+    let title = format!(" Models · {} of {} ", shown, sorted.len());
     let table = Table::new(rows, widths).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
 }
@@ -1141,7 +1142,7 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             for (agent, _) in MATRIX_AGENTS {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
                     Some(usage) => Text::from(vec![
-                        Line::from(format!("In: {}", format_in_display(*usage))),
+                        Line::from(format!("In: {}", format_tokens(usage.in_tokens))),
                         Line::from(Span::styled(
                             format!("Out: {}", format_tokens(usage.out_tokens)),
                             Style::default().fg(Color::DarkGray),
@@ -1167,7 +1168,7 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     ];
 
     let title = format!(
-        " Agent × Model · {} · In(uncached/total)/Out ({}/{}) ",
+        " Agent × Model · {} · In/Out ({}/{}) ",
         app.period.label(),
         models.len().min(app.matrix_scroll + visible),
         models.len()
@@ -1240,16 +1241,6 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-fn format_in_display(usage: UsageTotals) -> String {
-    let uncached = format_tokens(usage.uncached_in_tokens);
-    let total = format_tokens(usage.total_in_tokens);
-    if usage.uncached_in_tokens == usage.total_in_tokens {
-        uncached
-    } else {
-        format!("{uncached}/{total}")
-    }
-}
-
 fn short_date(s: &str) -> String {
     // YYYY-MM-DD → "MMM DD"
     if let Some((_, m, d)) = parse_ymd(s) {
@@ -1280,9 +1271,11 @@ mod tests {
         assert_eq!(records[0].agent, AGENT_CX);
         assert_eq!(records[0].model, "qwen3.6-plus");
         assert_eq!(records[0].date, "2026-05-27");
-        assert_eq!(records[0].uncached_in_tokens, 85);
-        assert_eq!(records[0].total_in_tokens, 105);
+        assert_eq!(records[0].in_tokens, 100);
+        assert_eq!(records[0].total_tokens, 107);
         assert_eq!(records[0].out_tokens, 7);
+        assert_eq!(records[0].cache_read_input_tokens, 20);
+        assert_eq!(records[0].cache_creation_input_tokens, 5);
     }
 
     #[test]
@@ -1300,14 +1293,16 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].date, "2026-05-28");
-        assert_eq!(records[0].uncached_in_tokens, 11);
-        assert_eq!(records[0].total_in_tokens, 11);
+        assert_eq!(records[0].in_tokens, 11);
+        assert_eq!(records[0].total_tokens, 24);
         assert_eq!(records[0].out_tokens, 13);
     }
 
     #[test]
-    fn claude_parser_dedupes_message_ids_and_preserves_uncached_vs_total_in() {
+    fn claude_parser_buckets_to_session_start_and_keeps_duplicate_message_ids() {
         let content = concat!(
+            r#"{"type":"user","timestamp":"2026-05-26T23:59:59Z","message":{"role":"user","content":"hi"}}"#,
+            "\n",
             r#"{"type":"assistant","timestamp":"2026-05-27T12:34:56Z","message":{"id":"msg-1","model":"claude-opus-4-7","usage":{"input_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":7}}}"#,
             "\n",
             r#"{"type":"assistant","timestamp":"2026-05-27T12:35:56Z","message":{"id":"msg-1","model":"claude-opus-4-7","usage":{"input_tokens":999,"cache_read_input_tokens":999,"cache_creation_input_tokens":999,"output_tokens":999}}}"#,
@@ -1319,15 +1314,23 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].agent, AGENT_CLAUDE);
         assert_eq!(records[0].model, "claude-opus-4-7");
-        assert_eq!(records[0].date, "2026-05-27");
-        assert_eq!(records[0].uncached_in_tokens, 105);
-        assert_eq!(records[0].total_in_tokens, 125);
-        assert_eq!(records[0].out_tokens, 7);
+        assert_eq!(records[0].date, "2026-05-26");
+        assert_eq!(records[0].in_tokens, 1099);
+        assert_eq!(records[0].total_tokens, 2105);
+        assert_eq!(records[0].out_tokens, 1006);
+        assert_eq!(records[0].cache_read_input_tokens, 1019);
+        assert_eq!(records[0].cache_creation_input_tokens, 1004);
     }
 
     #[test]
     fn fallback_date_from_path_reads_parent_day_directory() {
         let path = Path::new("/logs/cx-agent-sessions/2026-05-29/session.jsonl");
         assert_eq!(fallback_date_from_path(path).as_deref(), Some("2026-05-29"));
+    }
+
+    #[test]
+    fn claude_subagent_logs_are_skipped() {
+        let path = Path::new("/logs/projects/foo/session/subagents/agent-1.jsonl");
+        assert!(is_claude_subagent_log(path));
     }
 }
