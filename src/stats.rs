@@ -76,12 +76,6 @@ struct UsageRecord {
     out_tokens: u64,
 }
 
-impl UsageRecord {
-    fn total_tokens(&self) -> u64 {
-        self.billable_in_tokens + self.out_tokens
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct UsageTotals {
     raw_in_tokens: u64,
