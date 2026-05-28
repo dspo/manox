@@ -265,7 +265,6 @@ async fn execute_tool_calls(
             ApprovalDecision::AllowForSession => {
                 *session_tool_allow_override = true;
                 turn_tool_allow_override = true;
-                notified_session_override = false;
                 notified_turn_override = true;
             }
             ApprovalDecision::Allow | ApprovalDecision::Ask | ApprovalDecision::Deny { .. } => {}

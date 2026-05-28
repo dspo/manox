@@ -344,6 +344,8 @@ impl ChatApp {
                             }
                             "/clear" => {
                                 self.messages = self.initial_messages.clone();
+                                self.last_submitted_prompt = None;
+                                self.saved_draft = None;
                                 self.push_system(
                                     "Conversation cleared (provider memory unchanged).".to_string(),
                                 );
