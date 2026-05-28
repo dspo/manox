@@ -15,7 +15,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols;
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table,
 };
@@ -32,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // ──────────────────────────────────────────────────────────
 
 const SCAN_DAYS: i64 = 30;
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 const AGENT_CLAUDE: &str = "claude";
 const AGENT_CODEX: &str = "codex";
@@ -71,8 +71,34 @@ struct UsageRecord {
     model: String,
     /// `YYYY-MM-DD`
     date: String,
-    in_tokens: u64,
+    raw_in_tokens: u64,
+    billable_in_tokens: u64,
     out_tokens: u64,
+}
+
+impl UsageRecord {
+    fn total_tokens(&self) -> u64 {
+        self.billable_in_tokens + self.out_tokens
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageTotals {
+    raw_in_tokens: u64,
+    billable_in_tokens: u64,
+    out_tokens: u64,
+}
+
+impl UsageTotals {
+    fn total_tokens(self) -> u64 {
+        self.billable_in_tokens + self.out_tokens
+    }
+
+    fn add_record(&mut self, record: &UsageRecord) {
+        self.raw_in_tokens += record.raw_in_tokens;
+        self.billable_in_tokens += record.billable_in_tokens;
+        self.out_tokens += record.out_tokens;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,28 +239,28 @@ pub fn run_stats() -> Result<()> {
 }
 
 fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
-    let mut by_agent_model: BTreeMap<(String, String), (u64, u64, BTreeSet<String>)> =
+    let mut by_agent_model: BTreeMap<(String, String), (UsageTotals, BTreeSet<String>)> =
         BTreeMap::new();
     for r in records {
         let entry = by_agent_model
             .entry((r.agent.clone(), r.model.clone()))
-            .or_insert((0, 0, BTreeSet::new()));
-        entry.0 += r.in_tokens;
-        entry.1 += r.out_tokens;
-        entry.2.insert(r.date.clone());
+            .or_insert((UsageTotals::default(), BTreeSet::new()));
+        entry.0.add_record(r);
+        entry.1.insert(r.date.clone());
     }
     println!("today: {today}  total records: {}", records.len());
     println!(
-        "{:<10} {:<28} {:>14} {:>14} {:>5}",
-        "agent", "model", "in", "out", "days"
+        "{:<10} {:<28} {:>14} {:>14} {:>14} {:>5}",
+        "agent", "model", "in", "out", "billable_in", "days"
     );
-    for ((agent, model), (i, o, days)) in &by_agent_model {
+    for ((agent, model), (usage, days)) in &by_agent_model {
         println!(
-            "{:<10} {:<28} {:>14} {:>14} {:>5}",
+            "{:<10} {:<28} {:>14} {:>14} {:>14} {:>5}",
             agent,
             model,
-            format_tokens(*i),
-            format_tokens(*o),
+            format_tokens(usage.raw_in_tokens),
+            format_tokens(usage.out_tokens),
+            format_tokens(usage.billable_in_tokens),
             days.len()
         );
     }
@@ -339,7 +365,7 @@ fn parse_file(path: &Path, kind: SourceKind) -> Vec<UsageRecord> {
 
 fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
     let mut seen_ids: BTreeSet<String> = BTreeSet::new();
-    let mut acc: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+    let mut acc: BTreeMap<(String, String), UsageTotals> = BTreeMap::new();
 
     for line in content.lines() {
         if line.is_empty() {
@@ -385,27 +411,29 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
             continue;
         }
 
-        let input = u64_field(usage, "input_tokens");
+        let raw_in_tokens = u64_field(usage, "input_tokens");
         let cache_read = u64_field(usage, "cache_read_input_tokens");
         let cache_create = u64_field(usage, "cache_creation_input_tokens");
-        let output = u64_field(usage, "output_tokens");
-        let in_tokens = input + cache_read + cache_create;
-        if in_tokens == 0 && output == 0 {
+        let out_tokens = u64_field(usage, "output_tokens");
+        let billable_in_tokens = raw_in_tokens + cache_read + cache_create;
+        if raw_in_tokens == 0 && billable_in_tokens == 0 && out_tokens == 0 {
             continue;
         }
 
-        let entry = acc.entry((model, date)).or_insert((0, 0));
-        entry.0 += in_tokens;
-        entry.1 += output;
+        let entry = acc.entry((model, date)).or_default();
+        entry.raw_in_tokens += raw_in_tokens;
+        entry.billable_in_tokens += billable_in_tokens;
+        entry.out_tokens += out_tokens;
     }
 
     acc.into_iter()
-        .map(|((model, date), (in_t, out_t))| UsageRecord {
+        .map(|((model, date), totals)| UsageRecord {
             agent: AGENT_CLAUDE.to_string(),
             model,
             date,
-            in_tokens: in_t,
-            out_tokens: out_t,
+            raw_in_tokens: totals.raw_in_tokens,
+            billable_in_tokens: totals.billable_in_tokens,
+            out_tokens: totals.out_tokens,
         })
         .collect()
 }
@@ -413,7 +441,7 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
 fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) -> Vec<UsageRecord> {
     let mut current_model: Option<String> = None;
     let mut current_date: Option<String> = None;
-    let mut acc: BTreeMap<(String, String), (u64, u64)> = BTreeMap::new();
+    let mut acc: BTreeMap<(String, String), UsageTotals> = BTreeMap::new();
 
     for line in content.lines() {
         if line.is_empty() {
@@ -463,9 +491,9 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
         let input_tokens = u64_field(last, "input_tokens");
         let cached_input_tokens = u64_field(last, "cached_input_tokens");
         let cache_creation_input_tokens = u64_field(last, "cache_creation_input_tokens");
-        let in_tokens = input_tokens + cached_input_tokens + cache_creation_input_tokens;
+        let billable_in_tokens = input_tokens + cached_input_tokens + cache_creation_input_tokens;
         let out_tokens = u64_field(last, "output_tokens");
-        if in_tokens == 0 && out_tokens == 0 {
+        if input_tokens == 0 && billable_in_tokens == 0 && out_tokens == 0 {
             continue;
         }
 
@@ -480,18 +508,20 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
 
-        let entry = acc.entry((model, date)).or_insert((0, 0));
-        entry.0 += in_tokens;
-        entry.1 += out_tokens;
+        let entry = acc.entry((model, date)).or_default();
+        entry.raw_in_tokens += input_tokens;
+        entry.billable_in_tokens += billable_in_tokens;
+        entry.out_tokens += out_tokens;
     }
 
     acc.into_iter()
-        .map(|((model, date), (in_t, out_t))| UsageRecord {
+        .map(|((model, date), totals)| UsageRecord {
             agent: agent.to_string(),
             model,
             date,
-            in_tokens: in_t,
-            out_tokens: out_t,
+            raw_in_tokens: totals.raw_in_tokens,
+            billable_in_tokens: totals.billable_in_tokens,
+            out_tokens: totals.out_tokens,
         })
         .collect()
 }
@@ -882,7 +912,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         if idx >= day_count {
             continue;
         }
-        let tokens = (r.in_tokens + r.out_tokens) as f64;
+        let tokens = r.total_tokens() as f64;
         if let Some(v) = series.get_mut(&r.model) {
             v[idx] += tokens;
         }
@@ -987,7 +1017,7 @@ fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
 fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     let records = app.period_records();
     let totals = totals_by_model(&records);
-    let total_all: u64 = totals.values().map(|(i, o)| i + o).sum();
+    let total_all: u64 = totals.values().map(|usage| usage.total_tokens()).sum();
 
     if totals.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
@@ -999,10 +1029,10 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         return;
     }
 
-    let mut sorted: Vec<(String, (u64, u64))> = totals.into_iter().collect();
-    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.0 + entry.1.1));
+    let mut sorted: Vec<(String, UsageTotals)> = totals.into_iter().collect();
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.total_tokens()));
 
-    let visible = (area.height.saturating_sub(2)) as usize;
+    let visible = (area.height.saturating_sub(2) as usize / 2).max(1);
     let max_scroll = sorted.len().saturating_sub(visible.max(1));
     if app.models_scroll > max_scroll {
         app.models_scroll = max_scroll;
@@ -1013,26 +1043,45 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         .enumerate()
         .skip(app.models_scroll)
         .take(visible)
-        .map(|(idx, (model, (in_t, out_t)))| {
+        .map(|(idx, (model, usage))| {
             let pct = if total_all > 0 {
-                (*in_t + *out_t) as f64 * 100.0 / total_all as f64
+                usage.total_tokens() as f64 * 100.0 / total_all as f64
             } else {
                 0.0
             };
             let dot_color = PALETTE[idx % PALETTE.len()];
             Row::new(vec![
-                Cell::from(Span::styled("●", Style::default().fg(dot_color))),
-                Cell::from(Span::styled(
-                    model.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Cell::from(Span::styled(
-                    format!("{:.1}%", pct),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Cell::from(format!("In: {}", format_tokens(*in_t))),
-                Cell::from(format!("Out: {}", format_tokens(*out_t))),
+                Cell::from(Text::from(vec![
+                    Line::from(Span::styled("●", Style::default().fg(dot_color))),
+                    Line::from(""),
+                ])),
+                Cell::from(Text::from(vec![
+                    Line::from(Span::styled(
+                        model.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                ])),
+                Cell::from(Text::from(vec![
+                    Line::from(Span::styled(
+                        format!("{:.1}%", pct),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::from(""),
+                ])),
+                Cell::from(Text::from(vec![
+                    Line::from(format!("In: {}", format_tokens(usage.raw_in_tokens))),
+                    Line::from(Span::styled(
+                        format!("Billable In: {}", format_tokens(usage.billable_in_tokens)),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                ])),
+                Cell::from(Text::from(vec![
+                    Line::from(format!("Out: {}", format_tokens(usage.out_tokens))),
+                    Line::from(""),
+                ])),
             ])
+            .height(2)
         })
         .collect();
 
@@ -1040,7 +1089,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         Constraint::Length(2),
         Constraint::Length(28),
         Constraint::Length(8),
-        Constraint::Length(16),
+        Constraint::Length(20),
         Constraint::Length(16),
     ];
 
@@ -1060,8 +1109,8 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
 
     // 按 model 总用量（across all agents）从高到低排序；零用量或无统计的不显示。
     let mut model_totals: HashMap<String, u64> = HashMap::new();
-    for ((_, model), (i, o)) in &cells {
-        *model_totals.entry(model.clone()).or_insert(0) += i + o;
+    for ((_, model), usage) in &cells {
+        *model_totals.entry(model.clone()).or_insert(0) += usage.total_tokens();
     }
     let mut models: Vec<(String, u64)> = model_totals
         .into_iter()
@@ -1070,7 +1119,7 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     models.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let models: Vec<String> = models.into_iter().map(|(m, _)| m).collect();
 
-    let visible = (area.height.saturating_sub(4)) as usize;
+    let visible = (area.height.saturating_sub(4) as usize / 2).max(1);
     let max_scroll = models.len().saturating_sub(visible.max(1));
     if app.matrix_scroll > max_scroll {
         app.matrix_scroll = max_scroll;
@@ -1105,33 +1154,38 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             )));
             for (agent, _) in MATRIX_AGENTS {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
-                    Some((in_t, out_t)) => format!(
-                        "In: {} · Out: {}",
-                        format_tokens(*in_t),
-                        format_tokens(*out_t)
-                    ),
-                    None => "—".to_string(),
+                    Some(usage) => Text::from(vec![
+                        Line::from(format!(
+                            "In: {}  Out: {}",
+                            format_tokens(usage.raw_in_tokens),
+                            format_tokens(usage.out_tokens)
+                        )),
+                        Line::from(Span::styled(
+                            format!("Billable In: {}", format_tokens(usage.billable_in_tokens)),
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ]),
+                    None => Text::from(vec![
+                        Line::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
+                        Line::from(""),
+                    ]),
                 };
-                let style = if cell == "—" {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                row_cells.push(Cell::from(Span::styled(cell, style)));
+                row_cells.push(Cell::from(cell));
             }
-            Row::new(row_cells)
+            Row::new(row_cells).height(2)
         })
         .collect();
 
     let widths = [
         Constraint::Length(28),
-        Constraint::Length(22),
-        Constraint::Length(22),
-        Constraint::Length(22),
+        Constraint::Length(24),
+        Constraint::Length(24),
+        Constraint::Length(24),
+        Constraint::Length(24),
     ];
 
     let title = format!(
-        " Agent × Model · {} ({}/{}) ",
+        " Agent × Model · {} · In/Out/Billable ({}/{}) ",
         app.period.label(),
         models.len().min(app.matrix_scroll + visible),
         models.len()
@@ -1146,34 +1200,30 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
 // 聚合工具
 // ──────────────────────────────────────────────────────────
 
-fn totals_by_model(records: &[&UsageRecord]) -> HashMap<String, (u64, u64)> {
-    let mut map: HashMap<String, (u64, u64)> = HashMap::new();
+fn totals_by_model(records: &[&UsageRecord]) -> HashMap<String, UsageTotals> {
+    let mut map: HashMap<String, UsageTotals> = HashMap::new();
     for r in records {
-        let entry = map.entry(r.model.clone()).or_insert((0, 0));
-        entry.0 += r.in_tokens;
-        entry.1 += r.out_tokens;
+        let entry = map.entry(r.model.clone()).or_default();
+        entry.add_record(r);
     }
     map
 }
 
-fn totals_by_agent_model(records: &[&UsageRecord]) -> HashMap<(String, String), (u64, u64)> {
-    let mut map: HashMap<(String, String), (u64, u64)> = HashMap::new();
+fn totals_by_agent_model(records: &[&UsageRecord]) -> HashMap<(String, String), UsageTotals> {
+    let mut map: HashMap<(String, String), UsageTotals> = HashMap::new();
     for r in records {
-        let entry = map
-            .entry((r.agent.clone(), r.model.clone()))
-            .or_insert((0, 0));
-        entry.0 += r.in_tokens;
-        entry.1 += r.out_tokens;
+        let entry = map.entry((r.agent.clone(), r.model.clone())).or_default();
+        entry.add_record(r);
     }
     map
 }
 
 /// 按总用量降序取头部模型，直到累计占比 ≥ `ratio`。
 /// 至少返回 1 个非空模型（如有），避免折线图为空。
-fn top_models_covering(totals: &HashMap<String, (u64, u64)>, ratio: f64) -> Vec<String> {
+fn top_models_covering(totals: &HashMap<String, UsageTotals>, ratio: f64) -> Vec<String> {
     let mut v: Vec<(String, u64)> = totals
         .iter()
-        .map(|(k, (i, o))| (k.clone(), i + o))
+        .map(|(k, usage)| (k.clone(), usage.total_tokens()))
         .filter(|(_, t)| *t > 0)
         .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -1238,7 +1288,8 @@ mod tests {
         assert_eq!(records[0].agent, AGENT_CX);
         assert_eq!(records[0].model, "qwen3.6-plus");
         assert_eq!(records[0].date, "2026-05-27");
-        assert_eq!(records[0].in_tokens, 125);
+        assert_eq!(records[0].raw_in_tokens, 100);
+        assert_eq!(records[0].billable_in_tokens, 125);
         assert_eq!(records[0].out_tokens, 7);
     }
 
@@ -1257,8 +1308,29 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].date, "2026-05-28");
-        assert_eq!(records[0].in_tokens, 11);
+        assert_eq!(records[0].raw_in_tokens, 11);
+        assert_eq!(records[0].billable_in_tokens, 11);
         assert_eq!(records[0].out_tokens, 13);
+    }
+
+    #[test]
+    fn claude_parser_dedupes_message_ids_and_preserves_raw_vs_billable_in() {
+        let content = concat!(
+            r#"{"type":"assistant","timestamp":"2026-05-27T12:34:56Z","message":{"id":"msg-1","model":"claude-opus-4-7","usage":{"input_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":7}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-05-27T12:35:56Z","message":{"id":"msg-1","model":"claude-opus-4-7","usage":{"input_tokens":999,"cache_read_input_tokens":999,"cache_creation_input_tokens":999,"output_tokens":999}}}"#,
+            "\n"
+        );
+
+        let records = parse_claude_jsonl(content);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].agent, AGENT_CLAUDE);
+        assert_eq!(records[0].model, "claude-opus-4-7");
+        assert_eq!(records[0].date, "2026-05-27");
+        assert_eq!(records[0].raw_in_tokens, 100);
+        assert_eq!(records[0].billable_in_tokens, 125);
+        assert_eq!(records[0].out_tokens, 7);
     }
 
     #[test]
