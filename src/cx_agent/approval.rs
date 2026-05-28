@@ -18,6 +18,8 @@ pub enum ApprovalMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Allow,
+    AllowForTurn,
+    AllowForSession,
     Ask,
     Deny { reason: String },
 }

@@ -33,8 +33,15 @@ use crate::cx_agent::tui::approval_prompt::{
 
 const HISTORY_SCROLL_STEP: usize = 3;
 const INPUT_MAX_HEIGHT: usize = 8;
-const BANNER_TEXT: &str =
-    "Ready. Enter sends, Alt-Enter adds a newline, PgUp/PgDn scrolls, /quit exits.";
+const COMMANDS_HELP: &str =
+    "Commands: /help /usage /tools /clear /retry /draft /reasoning /quit /exit :q";
+const CHAT_ACTIONS: &str =
+    "Actions: Enter send | Alt-Enter newline | /help | /quit | PgUp/PgDn scroll";
+const STREAMING_ACTIONS: &str = "Actions: Esc/Ctrl-C stop turn | PgUp/PgDn scroll | /retry";
+const APPROVAL_ACTIONS: &str =
+    "Actions: Enter allow once | t allow turn | s allow session | d deny";
+const ERROR_RECOVERY_ACTIONS: &str = "Recovery: edit input and resend, or run /retry /draft";
+const BANNER_TEXT: &str = "Ready. Enter sends, Alt-Enter adds a newline, /help shows commands.";
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -56,6 +63,7 @@ enum UiMode {
     Chat,
     Streaming,
     Approval,
+    ErrorRecovery,
 }
 
 impl UiMode {
@@ -64,6 +72,7 @@ impl UiMode {
             Self::Chat => "chat",
             Self::Streaming => "streaming",
             Self::Approval => "approval",
+            Self::ErrorRecovery => "error-recovery",
         }
     }
 }
@@ -73,6 +82,7 @@ enum MessageRole {
     User,
     Assistant,
     System,
+    Tool,
     Error,
 }
 
@@ -81,7 +91,8 @@ impl MessageRole {
         match self {
             Self::User => "you> ",
             Self::Assistant => "cx > ",
-            Self::System => "sys> ",
+            Self::System => "note> ",
+            Self::Tool => "tool> ",
             Self::Error => "err> ",
         }
     }
@@ -91,6 +102,7 @@ impl MessageRole {
             Self::User => Style::default().fg(Color::Cyan),
             Self::Assistant => Style::default().fg(Color::Green),
             Self::System => Style::default().fg(Color::Yellow),
+            Self::Tool => Style::default().fg(Color::Magenta),
             Self::Error => Style::default().fg(Color::Red),
         }
     }
@@ -144,7 +156,8 @@ struct RenderSnapshot {
     approval_prompt: Option<ApprovalPromptState>,
     history_scroll: usize,
     cumulative_usage: TokenUsageRecord,
-    status_note: Option<String>,
+    follow_output: bool,
+    transient_event: Option<String>,
 }
 
 struct TerminalSession {
@@ -207,14 +220,20 @@ pub struct ChatApp {
     terminal: Option<TerminalSession>,
     input: TextArea<'static>,
     messages: Vec<ChatMessage>,
+    initial_messages: Vec<ChatMessage>,
+    available_tools: Vec<String>,
     ui_mode: UiMode,
     active_assistant: Option<usize>,
     showed_reasoning_prefix: bool,
+    reasoning_visible: bool,
+    active_reasoning: String,
     history_scroll: usize,
     follow_output: bool,
     history_metrics: HistoryMetrics,
     cumulative_usage: TokenUsageRecord,
-    status_note: Option<String>,
+    transient_event: Option<String>,
+    last_submitted_prompt: Option<String>,
+    saved_draft: Option<String>,
     pending_quit: bool,
     fatal_error: Option<String>,
 }
@@ -227,7 +246,9 @@ impl ChatApp {
         approval_mode: ApprovalMode,
         session_id: String,
         rollout_path: PathBuf,
+        available_tools: Vec<String>,
     ) -> Self {
+        let initial_messages = vec![ChatMessage::new(MessageRole::System, BANNER_TEXT)];
         let mut app = Self {
             provider,
             model,
@@ -237,15 +258,21 @@ impl ChatApp {
             rollout_path,
             terminal: None,
             input: build_input_box(),
-            messages: vec![ChatMessage::new(MessageRole::System, BANNER_TEXT)],
+            messages: initial_messages.clone(),
+            initial_messages,
+            available_tools,
             ui_mode: UiMode::Chat,
             active_assistant: None,
             showed_reasoning_prefix: false,
+            reasoning_visible: false,
+            active_reasoning: String::new(),
             history_scroll: 0,
             follow_output: true,
             history_metrics: HistoryMetrics::default(),
             cumulative_usage: TokenUsageRecord::default(),
-            status_note: None,
+            transient_event: None,
+            last_submitted_prompt: None,
+            saved_draft: None,
             pending_quit: false,
             fatal_error: None,
         };
@@ -296,9 +323,7 @@ impl ChatApp {
                                 return Ok(ChatEvent::Quit);
                             }
                             "/help" => {
-                                self.push_system(
-                                    "Commands: /quit /exit :q /help /usage".to_string(),
-                                );
+                                self.push_system(COMMANDS_HELP.to_string());
                                 self.draw()?;
                                 continue;
                             }
@@ -307,9 +332,71 @@ impl ChatApp {
                                 self.draw()?;
                                 continue;
                             }
+                            "/tools" => {
+                                let tools = if self.available_tools.is_empty() {
+                                    "(none)".to_string()
+                                } else {
+                                    self.available_tools.join(", ")
+                                };
+                                self.push_system(format!("Available tools: {tools}"));
+                                self.draw()?;
+                                continue;
+                            }
+                            "/clear" => {
+                                self.messages = self.initial_messages.clone();
+                                self.last_submitted_prompt = None;
+                                self.saved_draft = None;
+                                self.push_system(
+                                    "Conversation cleared (provider memory unchanged).".to_string(),
+                                );
+                                self.follow_output = true;
+                                self.transient_event = Some("conversation cleared".to_string());
+                                self.draw()?;
+                                continue;
+                            }
+                            "/retry" => {
+                                if let Some(last) = self.last_submitted_prompt.clone() {
+                                    self.push_system("Retrying previous prompt.".to_string());
+                                    self.push_user(last.clone());
+                                    self.follow_output = true;
+                                    self.transient_event = Some("retrying last prompt".to_string());
+                                    self.draw()?;
+                                    return Ok(ChatEvent::Input(last));
+                                }
+                                self.push_system("No previous prompt to retry.".to_string());
+                                self.draw()?;
+                                continue;
+                            }
+                            "/draft" => {
+                                if let Some(draft) = self.saved_draft.clone() {
+                                    self.input.insert_str(draft);
+                                    self.transient_event =
+                                        Some("restored latest draft into input".to_string());
+                                } else {
+                                    self.push_system("No saved draft yet.".to_string());
+                                }
+                                self.draw()?;
+                                continue;
+                            }
+                            "/reasoning" => {
+                                self.reasoning_visible = !self.reasoning_visible;
+                                self.push_system(format!(
+                                    "Reasoning visibility: {}",
+                                    if self.reasoning_visible {
+                                        "expanded"
+                                    } else {
+                                        "collapsed"
+                                    }
+                                ));
+                                self.draw()?;
+                                continue;
+                            }
                             _ => {
+                                self.last_submitted_prompt = Some(text.clone());
+                                self.saved_draft = Some(text.clone());
                                 self.push_user(text.clone());
                                 self.follow_output = true;
+                                self.transient_event = Some("prompt submitted".to_string());
                                 self.draw()?;
                                 return Ok(ChatEvent::Input(text));
                             }
@@ -345,8 +432,9 @@ impl ChatApp {
 
     pub fn begin_assistant(&mut self) {
         self.ui_mode = UiMode::Streaming;
-        self.status_note = Some("Assistant is responding...".to_string());
+        self.transient_event = Some("assistant stream started".to_string());
         self.showed_reasoning_prefix = false;
+        self.active_reasoning.clear();
         self.active_assistant = Some(self.messages.len());
         self.messages
             .push(ChatMessage::new(MessageRole::Assistant, String::new()));
@@ -365,8 +453,8 @@ impl ChatApp {
         self.cumulative_usage.cache_read += usage.cache_read;
         self.cumulative_usage.cache_write += usage.cache_write;
         self.cumulative_usage.reasoning += usage.reasoning;
-        self.status_note = Some(format!(
-            "Last turn: {:.1}s  in={} out={} cache_r={} cache_w={} reasoning={}",
+        self.transient_event = Some(format!(
+            "turn completed in {:.1}s  in={} out={} cache_r={} cache_w={} reasoning={}",
             elapsed.as_secs_f32(),
             usage.input,
             usage.output,
@@ -374,6 +462,19 @@ impl ChatApp {
             usage.cache_write,
             usage.reasoning
         ));
+        if !self.active_reasoning.is_empty() {
+            if self.reasoning_visible {
+                self.push_system(format!(
+                    "Reasoning\n{}",
+                    clamp_reasoning_text(&self.active_reasoning)
+                ));
+            } else {
+                self.push_system(format!(
+                    "Reasoning hidden ({} chars). Use /reasoning to toggle.",
+                    self.active_reasoning.chars().count()
+                ));
+            }
+        }
         if let Some(last) = self.messages.last_mut() {
             if last.role == MessageRole::Assistant && last.text.is_empty() {
                 last.text = "(empty response)".to_string();
@@ -397,11 +498,18 @@ impl ChatApp {
 
     pub fn show_error(&mut self, msg: &str) {
         self.push_error(msg.to_string());
-        self.status_note = Some(format!("Error: {msg}"));
+        self.ui_mode = UiMode::ErrorRecovery;
+        self.transient_event = Some(format!("error: {msg}"));
         if let Err(err) = self.draw() {
             self.fatal_error = Some(format!("failed to redraw error state: {err}"));
             eprintln!("Error: {msg}");
         }
+    }
+
+    pub fn notify(&mut self, message: impl Into<String>) {
+        self.push_system(message.into());
+        self.follow_output = true;
+        let _ = self.draw();
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
@@ -424,7 +532,8 @@ impl ChatApp {
             Err(err) => {
                 let msg = err.to_string();
                 self.push_error(format!("Stream error: {msg}"));
-                self.status_note = Some(format!("Stream error: {msg}"));
+                self.ui_mode = UiMode::ErrorRecovery;
+                self.transient_event = Some(format!("stream error: {msg}"));
                 RunOutcome::Aborted
             }
         };
@@ -452,6 +561,12 @@ impl ChatApp {
                         KeyCode::Char('a') | KeyCode::Char('y') | KeyCode::Enter
                     ) {
                         break ApprovalDecision::Allow;
+                    }
+                    if matches!(key.code, KeyCode::Char('t')) {
+                        break ApprovalDecision::AllowForTurn;
+                    }
+                    if matches!(key.code, KeyCode::Char('s')) {
+                        break ApprovalDecision::AllowForSession;
                     }
                     if matches!(
                         key.code,
@@ -481,6 +596,21 @@ impl ChatApp {
         };
 
         self.ui_mode = previous_mode;
+        match &decision {
+            ApprovalDecision::Allow => {
+                self.transient_event = Some("approval granted once".to_string());
+            }
+            ApprovalDecision::AllowForTurn => {
+                self.transient_event = Some("approval granted for this turn".to_string());
+            }
+            ApprovalDecision::AllowForSession => {
+                self.transient_event = Some("approval granted for this session".to_string());
+            }
+            ApprovalDecision::Deny { .. } => {
+                self.transient_event = Some("approval denied".to_string());
+            }
+            ApprovalDecision::Ask => {}
+        }
         self.draw()?;
         Ok(decision)
     }
@@ -543,7 +673,8 @@ impl ChatApp {
             approval_prompt: prompt,
             history_scroll: self.history_scroll,
             cumulative_usage: self.cumulative_usage,
-            status_note: self.status_note.clone(),
+            follow_output: self.follow_output,
+            transient_event: self.transient_event.clone(),
         }
     }
 
@@ -601,8 +732,8 @@ impl ChatApp {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if is_quit_key(key) {
                         self.pending_quit = true;
-                        self.status_note =
-                            Some("Stopping after current stream chunk...".to_string());
+                        self.transient_event =
+                            Some("stop requested; finishing current stream chunk".to_string());
                         return Ok(Some(RunOutcome::Aborted));
                     }
                     if self.handle_history_key(key) {
@@ -626,35 +757,37 @@ impl ChatApp {
             CxStreamEvent::TextDelta(text) => {
                 self.append_assistant_text(text);
                 if self.showed_reasoning_prefix {
-                    self.status_note = Some("Assistant is responding...".to_string());
+                    self.transient_event = Some("assistant response streaming".to_string());
                     self.showed_reasoning_prefix = false;
                 }
             }
-            CxStreamEvent::ReasoningDelta(_) => {
+            CxStreamEvent::ReasoningDelta(text) => {
+                self.active_reasoning.push_str(text);
                 if !self.showed_reasoning_prefix {
-                    self.status_note = Some("Assistant is reasoning...".to_string());
+                    self.transient_event = Some("assistant reasoning".to_string());
                     self.showed_reasoning_prefix = true;
                 }
             }
             CxStreamEvent::ToolCallStart { id, name } => {
-                self.push_system(format!("Tool call started: {name} ({id})"));
+                self.push_tool(format!("{name} started ({id})"));
             }
             CxStreamEvent::ToolCallArgsDelta { id, partial } => {
-                self.status_note = Some(format!(
-                    "Tool {id} arguments streaming... ({} chars)",
+                self.transient_event = Some(format!(
+                    "tool {id} args streaming ({} chars)",
                     partial.len()
                 ));
             }
             CxStreamEvent::ToolCallDone { name, .. } => {
-                self.push_system(format!("Tool call finished: {name}"));
+                self.push_tool(format!("{name} finished"));
             }
             CxStreamEvent::Usage { .. } => {}
             CxStreamEvent::Done => {
-                self.status_note = Some("Assistant response completed.".to_string());
+                self.transient_event = Some("assistant response completed".to_string());
             }
             CxStreamEvent::Error(msg) => {
                 self.push_error(format!("Stream error: {msg}"));
-                self.status_note = Some(format!("Stream error: {msg}"));
+                self.ui_mode = UiMode::ErrorRecovery;
+                self.transient_event = Some(format!("stream error: {msg}"));
                 return RunOutcome::Aborted;
             }
         }
@@ -682,6 +815,12 @@ impl ChatApp {
     fn push_system(&mut self, text: String) {
         self.messages
             .push(ChatMessage::new(MessageRole::System, text));
+    }
+
+    fn push_tool(&mut self, text: String) {
+        self.messages
+            .push(ChatMessage::new(MessageRole::Tool, text));
+        self.follow_output = true;
     }
 
     fn push_error(&mut self, text: String) {
@@ -739,7 +878,7 @@ fn draw_ui(
         .constraints([
             Constraint::Min(5),
             Constraint::Length(input_height as u16),
-            Constraint::Length(2),
+            Constraint::Length(3),
         ])
         .split(area);
 
@@ -759,9 +898,10 @@ fn render_history(
     area: Rect,
     snapshot: &RenderSnapshot,
 ) -> HistoryMetrics {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Conversation ");
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " Conversation · mode:{} ",
+        snapshot.ui_mode.label(),
+    ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -806,31 +946,33 @@ fn render_input(frame: &mut ratatui::Frame<'_>, area: Rect, input: &TextArea<'st
 
 fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &RenderSnapshot) {
     let line1 = format!(
-        "provider:{}  model:{}  api:{}  session:{}  approval:{}  mode:{}  usage:{}/{}/r{}/c{}/w{}",
+        "provider:{}  model:{}  api:{}  session:{}  approval:{}  mode:{}",
         snapshot.provider,
         snapshot.model,
         snapshot.wire_api,
         snapshot.session_id,
         approval_mode_label(snapshot.approval_mode),
-        snapshot.ui_mode.label(),
+        snapshot.ui_mode.label()
+    );
+    let line2 = format!(
+        "usage in:{} out:{} reasoning:{} cache_r:{} cache_w:{}  follow:{}",
         snapshot.cumulative_usage.input,
         snapshot.cumulative_usage.output,
         snapshot.cumulative_usage.reasoning,
         snapshot.cumulative_usage.cache_read,
         snapshot.cumulative_usage.cache_write,
+        if snapshot.follow_output { "on" } else { "off" }
     );
-    let line2 = snapshot.status_note.clone().unwrap_or_else(|| match snapshot.ui_mode {
-        UiMode::Chat => {
-            "Enter send | Alt-Enter newline | Ctrl-Home/End jump | PgUp/PgDn scroll | Esc/Ctrl-C quit"
-                .to_string()
-        }
-        UiMode::Streaming => {
-            "Streaming... PgUp/PgDn scroll history | Esc/Ctrl-C stop and exit".to_string()
-        }
-        UiMode::Approval => {
-            "Approval prompt open".to_string()
-        }
-    });
+
+    let line3 = snapshot
+        .transient_event
+        .clone()
+        .unwrap_or_else(|| match snapshot.ui_mode {
+            UiMode::Chat => CHAT_ACTIONS.to_string(),
+            UiMode::Streaming => STREAMING_ACTIONS.to_string(),
+            UiMode::Approval => APPROVAL_ACTIONS.to_string(),
+            UiMode::ErrorRecovery => ERROR_RECOVERY_ACTIONS.to_string(),
+        });
 
     let paragraph = Paragraph::new(vec![
         Line::from(Span::styled(
@@ -839,7 +981,8 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &RenderSn
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(line2, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(line2, Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(line3, Style::default().fg(Color::DarkGray))),
     ]);
     frame.render_widget(paragraph, area);
 }
@@ -873,7 +1016,11 @@ fn render_approval_prompt(
     let header = Paragraph::new(vec![
         Line::from(format!("tool: {}", prompt.request.tool_name)),
         Line::from(format!("category: {}", prompt.request.category_label())),
-        Line::from("review the arguments preview before allowing the tool call"),
+        Line::from(format!(
+            "risk: {}",
+            approval_risk_label(prompt.request.category_label())
+        )),
+        Line::from("review arguments before approving"),
     ])
     .style(Style::default().fg(Color::White));
     frame.render_widget(header, sections[0]);
@@ -898,9 +1045,10 @@ fn render_approval_prompt(
         frame.render_stateful_widget(scrollbar, preview_scrollbar, &mut state);
     }
 
-    let footer = Paragraph::new(vec![Line::from(
-        "[Enter/a] allow  [d/n/Esc] deny  [PgUp/PgDn] scroll  [Ctrl-C] deny + quit",
-    )])
+    let footer = Paragraph::new(vec![
+        Line::from("[Enter/a] allow once  [t] allow turn  [s] allow session"),
+        Line::from("[d/n/Esc] deny  [Ctrl-C] deny+quit"),
+    ])
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, sections[2]);
 
@@ -930,7 +1078,7 @@ fn render_history_lines(messages: &[ChatMessage], width: usize) -> Vec<Line<'sta
         }
     }
     if lines.is_empty() {
-        lines.push(Line::from("sys> No messages yet."));
+        lines.push(Line::from("note> No messages yet."));
     }
     lines
 }
@@ -985,6 +1133,15 @@ fn approval_mode_label(mode: ApprovalMode) -> &'static str {
         ApprovalMode::AlwaysAllow => "always-allow",
         ApprovalMode::PerCall => "per-call",
         ApprovalMode::ReadOnlyAutoAllow => "read-only-auto-allow",
+    }
+}
+
+fn approval_risk_label(category: &str) -> &'static str {
+    match category {
+        "read" => "low (read-only)",
+        "write" => "medium (file modification)",
+        "execute" => "high (command execution)",
+        _ => "unknown",
     }
 }
 
@@ -1062,6 +1219,16 @@ fn split_at_char_boundary(text: &str, max_chars: usize) -> usize {
     text.len()
 }
 
+fn clamp_reasoning_text(text: &str) -> String {
+    const MAX_REASONING_CHARS: usize = 2_000;
+    let char_count = text.chars().count();
+    if char_count <= MAX_REASONING_CHARS {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(MAX_REASONING_CHARS).collect();
+    format!("{truncated}\n\n[truncated reasoning: {MAX_REASONING_CHARS}/{char_count} chars]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,5 +1253,19 @@ mod tests {
         };
         assert_eq!(metrics.max_scroll(), 14);
         assert_eq!(metrics.page_step(), 5);
+    }
+
+    #[test]
+    fn approval_risk_label_matches_category() {
+        assert_eq!(approval_risk_label("read"), "low (read-only)");
+        assert_eq!(approval_risk_label("write"), "medium (file modification)");
+        assert_eq!(approval_risk_label("execute"), "high (command execution)");
+    }
+
+    #[test]
+    fn clamp_reasoning_text_truncates_long_content() {
+        let input = "x".repeat(2_100);
+        let output = clamp_reasoning_text(&input);
+        assert!(output.contains("truncated reasoning"));
     }
 }
