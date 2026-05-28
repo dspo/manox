@@ -687,7 +687,7 @@ impl StatsApp {
             records,
             today,
             view: View::Models,
-            period: Period::All,
+            period: Period::Last7,
             models_scroll: 0,
             matrix_scroll: 0,
         }
