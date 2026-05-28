@@ -272,7 +272,13 @@ fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
 #[derive(Debug, Clone, Copy)]
 enum SourceKind {
     Claude,
-    CodexLike(&'static str), // agent_id
+    CodexLike(&'static str, CodexUsageMode), // agent_id
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CodexUsageMode {
+    TotalUsageDelta,
+    LastUsageOnly,
 }
 
 struct LogSource {
@@ -292,15 +298,15 @@ fn log_sources() -> Vec<LogSource> {
         },
         LogSource {
             root: home.join(".codex/sessions"),
-            kind: SourceKind::CodexLike(AGENT_CODEX),
+            kind: SourceKind::CodexLike(AGENT_CODEX, CodexUsageMode::TotalUsageDelta),
         },
         LogSource {
             root: home.join("Library/Application Support/Zed/codex/sessions"),
-            kind: SourceKind::CodexLike(AGENT_ZED),
+            kind: SourceKind::CodexLike(AGENT_ZED, CodexUsageMode::TotalUsageDelta),
         },
         LogSource {
             root: home.join(".local/share/cx/cx-agent-sessions"),
-            kind: SourceKind::CodexLike(AGENT_CX),
+            kind: SourceKind::CodexLike(AGENT_CX, CodexUsageMode::LastUsageOnly),
         },
     ]
 }
@@ -352,9 +358,9 @@ fn parse_file(path: &Path, kind: SourceKind) -> Vec<UsageRecord> {
     };
     match kind {
         SourceKind::Claude => parse_claude_jsonl(&content),
-        SourceKind::CodexLike(agent) => {
+        SourceKind::CodexLike(agent, usage_mode) => {
             let fallback_date = fallback_date_from_path(path);
-            parse_codex_jsonl(&content, agent, fallback_date.as_deref())
+            parse_codex_jsonl(&content, agent, fallback_date.as_deref(), usage_mode)
         }
     }
 }
@@ -441,7 +447,12 @@ fn claude_session_date(content: &str) -> Option<String> {
     None
 }
 
-fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) -> Vec<UsageRecord> {
+fn parse_codex_jsonl(
+    content: &str,
+    agent: &str,
+    fallback_date: Option<&str>,
+    usage_mode: CodexUsageMode,
+) -> Vec<UsageRecord> {
     let mut current_model: Option<String> = None;
     let mut current_date: Option<String> = None;
     let mut previous_total_usage: Option<(u64, u64, u64, u64)> = None;
@@ -493,35 +504,42 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
             .filter(|total| !total.is_null());
         let last = info.get("last_token_usage").filter(|last| !last.is_null());
         let (input_tokens, cached_input_tokens, cache_creation_input_tokens, out_tokens) =
-            if let Some(total) = total {
-                let total_input_tokens = u64_field(total, "input_tokens");
-                let total_cached_input_tokens = u64_field(total, "cached_input_tokens");
-                let total_cache_creation_input_tokens =
-                    u64_field(total, "cache_creation_input_tokens");
-                let total_out_tokens = u64_field(total, "output_tokens");
-                let (prev_input, prev_cached, prev_cache_create, prev_out) =
-                    previous_total_usage.unwrap_or((0, 0, 0, 0));
-                previous_total_usage = Some((
-                    total_input_tokens,
-                    total_cached_input_tokens,
-                    total_cache_creation_input_tokens,
-                    total_out_tokens,
-                ));
-                (
-                    total_input_tokens.saturating_sub(prev_input),
-                    total_cached_input_tokens.saturating_sub(prev_cached),
-                    total_cache_creation_input_tokens.saturating_sub(prev_cache_create),
-                    total_out_tokens.saturating_sub(prev_out),
-                )
-            } else if let Some(last) = last {
-                (
-                    u64_field(last, "input_tokens"),
-                    u64_field(last, "cached_input_tokens"),
-                    u64_field(last, "cache_creation_input_tokens"),
-                    u64_field(last, "output_tokens"),
-                )
-            } else {
-                continue;
+            match usage_mode {
+                CodexUsageMode::TotalUsageDelta => {
+                    let Some(total) = total else {
+                        continue;
+                    };
+                    let total_input_tokens = u64_field(total, "input_tokens");
+                    let total_cached_input_tokens = u64_field(total, "cached_input_tokens");
+                    let total_cache_creation_input_tokens =
+                        u64_field(total, "cache_creation_input_tokens");
+                    let total_out_tokens = u64_field(total, "output_tokens");
+                    let (prev_input, prev_cached, prev_cache_create, prev_out) =
+                        previous_total_usage.unwrap_or((0, 0, 0, 0));
+                    previous_total_usage = Some((
+                        total_input_tokens,
+                        total_cached_input_tokens,
+                        total_cache_creation_input_tokens,
+                        total_out_tokens,
+                    ));
+                    (
+                        total_input_tokens.saturating_sub(prev_input),
+                        total_cached_input_tokens.saturating_sub(prev_cached),
+                        total_cache_creation_input_tokens.saturating_sub(prev_cache_create),
+                        total_out_tokens.saturating_sub(prev_out),
+                    )
+                }
+                CodexUsageMode::LastUsageOnly => {
+                    let Some(last) = last else {
+                        continue;
+                    };
+                    (
+                        u64_field(last, "input_tokens"),
+                        u64_field(last, "cached_input_tokens"),
+                        u64_field(last, "cache_creation_input_tokens"),
+                        u64_field(last, "output_tokens"),
+                    )
+                }
             };
         let total_tokens = input_tokens.saturating_add(out_tokens);
         if input_tokens == 0
@@ -1289,14 +1307,15 @@ mod tests {
         let content = concat!(
             r#"{"type":"turn_context","payload":{"model":"qwen3.6-plus"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","at":"2026-05-27T12:34:56Z","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":7}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","at":"2026-05-27T12:34:56Z","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":7},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":7}}}}"#,
             "\n"
         );
 
-        let records = parse_codex_jsonl(content, AGENT_CX, None);
+        let records =
+            parse_codex_jsonl(content, AGENT_CODEX, None, CodexUsageMode::TotalUsageDelta);
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].agent, AGENT_CX);
+        assert_eq!(records[0].agent, AGENT_CODEX);
         assert_eq!(records[0].model, "qwen3.6-plus");
         assert_eq!(records[0].date, "2026-05-27");
         assert_eq!(records[0].in_tokens, 100);
@@ -1317,7 +1336,12 @@ mod tests {
             "\n"
         );
 
-        let records = parse_codex_jsonl(content, AGENT_CX, Some("2026-05-27"));
+        let records = parse_codex_jsonl(
+            content,
+            AGENT_CX,
+            Some("2026-05-27"),
+            CodexUsageMode::LastUsageOnly,
+        );
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].date, "2026-05-28");
@@ -1339,7 +1363,8 @@ mod tests {
             "\n"
         );
 
-        let records = parse_codex_jsonl(content, AGENT_CODEX, None);
+        let records =
+            parse_codex_jsonl(content, AGENT_CODEX, None, CodexUsageMode::TotalUsageDelta);
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].in_tokens, 150);
