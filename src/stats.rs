@@ -71,26 +71,28 @@ struct UsageRecord {
     model: String,
     /// `YYYY-MM-DD`
     date: String,
+    real_in_tokens: u64,
     raw_in_tokens: u64,
-    billable_in_tokens: u64,
     out_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct UsageTotals {
+    real_in_tokens: u64,
     raw_in_tokens: u64,
-    billable_in_tokens: u64,
     out_tokens: u64,
 }
 
 impl UsageTotals {
+    // 排名 / 占比 / 图表统一按“真实参与本次计算的新输入 + 输出”衡量，
+    // 不把缓存命中重复算进活跃使用量。
     fn total_tokens(self) -> u64 {
-        self.raw_in_tokens + self.out_tokens
+        self.real_in_tokens + self.out_tokens
     }
 
     fn add_record(&mut self, record: &UsageRecord) {
+        self.real_in_tokens += record.real_in_tokens;
         self.raw_in_tokens += record.raw_in_tokens;
-        self.billable_in_tokens += record.billable_in_tokens;
         self.out_tokens += record.out_tokens;
     }
 }
@@ -252,9 +254,9 @@ fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
             "{:<10} {:<28} {:>14} {:>14} {:>14} {:>5}",
             agent,
             model,
-            format_tokens(usage.billable_in_tokens),
-            format_tokens(usage.out_tokens),
             format_tokens(usage.raw_in_tokens),
+            format_tokens(usage.out_tokens),
+            format_tokens(usage.real_in_tokens),
             days.len()
         );
     }
@@ -405,18 +407,20 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
             continue;
         }
 
-        let raw_in_tokens = u64_field(usage, "input_tokens");
+        let input_tokens = u64_field(usage, "input_tokens");
         let cache_read = u64_field(usage, "cache_read_input_tokens");
         let cache_create = u64_field(usage, "cache_creation_input_tokens");
         let out_tokens = u64_field(usage, "output_tokens");
-        let billable_in_tokens = raw_in_tokens + cache_read + cache_create;
-        if raw_in_tokens == 0 && billable_in_tokens == 0 && out_tokens == 0 {
+        // Claude usage 把 cache read / cache create 作为独立 bucket 暴露。
+        let real_in_tokens = input_tokens + cache_create;
+        let raw_in_tokens = real_in_tokens + cache_read;
+        if real_in_tokens == 0 && raw_in_tokens == 0 && out_tokens == 0 {
             continue;
         }
 
         let entry = acc.entry((model, date)).or_default();
+        entry.real_in_tokens += real_in_tokens;
         entry.raw_in_tokens += raw_in_tokens;
-        entry.billable_in_tokens += billable_in_tokens;
         entry.out_tokens += out_tokens;
     }
 
@@ -425,8 +429,8 @@ fn parse_claude_jsonl(content: &str) -> Vec<UsageRecord> {
             agent: AGENT_CLAUDE.to_string(),
             model,
             date,
+            real_in_tokens: totals.real_in_tokens,
             raw_in_tokens: totals.raw_in_tokens,
-            billable_in_tokens: totals.billable_in_tokens,
             out_tokens: totals.out_tokens,
         })
         .collect()
@@ -485,9 +489,13 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
         let input_tokens = u64_field(last, "input_tokens");
         let cached_input_tokens = u64_field(last, "cached_input_tokens");
         let cache_creation_input_tokens = u64_field(last, "cache_creation_input_tokens");
-        let billable_in_tokens = input_tokens + cached_input_tokens + cache_creation_input_tokens;
         let out_tokens = u64_field(last, "output_tokens");
-        if input_tokens == 0 && billable_in_tokens == 0 && out_tokens == 0 {
+        // Codex/OpenAI 风格里 cached_input_tokens 更像 input_tokens 的子集。
+        let real_in_tokens = input_tokens
+            .saturating_sub(cached_input_tokens)
+            .saturating_add(cache_creation_input_tokens);
+        let raw_in_tokens = input_tokens.saturating_add(cache_creation_input_tokens);
+        if real_in_tokens == 0 && raw_in_tokens == 0 && out_tokens == 0 {
             continue;
         }
 
@@ -503,8 +511,8 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
             .unwrap_or_else(|| "unknown".to_string());
 
         let entry = acc.entry((model, date)).or_default();
-        entry.raw_in_tokens += input_tokens;
-        entry.billable_in_tokens += billable_in_tokens;
+        entry.real_in_tokens += real_in_tokens;
+        entry.raw_in_tokens += raw_in_tokens;
         entry.out_tokens += out_tokens;
     }
 
@@ -513,8 +521,8 @@ fn parse_codex_jsonl(content: &str, agent: &str, fallback_date: Option<&str>) ->
             agent: agent.to_string(),
             model,
             date,
+            real_in_tokens: totals.real_in_tokens,
             raw_in_tokens: totals.raw_in_tokens,
-            billable_in_tokens: totals.billable_in_tokens,
             out_tokens: totals.out_tokens,
         })
         .collect()
@@ -906,7 +914,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         if idx >= day_count {
             continue;
         }
-        let tokens = (r.raw_in_tokens + r.out_tokens) as f64;
+        let tokens = (r.real_in_tokens + r.out_tokens) as f64;
         if let Some(v) = series.get_mut(&r.model) {
             v[idx] += tokens;
         }
@@ -1229,9 +1237,9 @@ fn format_tokens(n: u64) -> String {
 }
 
 fn format_in_display(usage: UsageTotals) -> String {
-    let real = format_tokens(usage.raw_in_tokens);
-    let raw = format_tokens(usage.billable_in_tokens);
-    if usage.raw_in_tokens == usage.billable_in_tokens {
+    let real = format_tokens(usage.real_in_tokens);
+    let raw = format_tokens(usage.raw_in_tokens);
+    if usage.real_in_tokens == usage.raw_in_tokens {
         real
     } else {
         format!("{real}/{raw}")
@@ -1268,8 +1276,8 @@ mod tests {
         assert_eq!(records[0].agent, AGENT_CX);
         assert_eq!(records[0].model, "qwen3.6-plus");
         assert_eq!(records[0].date, "2026-05-27");
-        assert_eq!(records[0].raw_in_tokens, 100);
-        assert_eq!(records[0].billable_in_tokens, 125);
+        assert_eq!(records[0].real_in_tokens, 85);
+        assert_eq!(records[0].raw_in_tokens, 105);
         assert_eq!(records[0].out_tokens, 7);
     }
 
@@ -1288,13 +1296,13 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].date, "2026-05-28");
+        assert_eq!(records[0].real_in_tokens, 11);
         assert_eq!(records[0].raw_in_tokens, 11);
-        assert_eq!(records[0].billable_in_tokens, 11);
         assert_eq!(records[0].out_tokens, 13);
     }
 
     #[test]
-    fn claude_parser_dedupes_message_ids_and_preserves_raw_vs_billable_in() {
+    fn claude_parser_dedupes_message_ids_and_preserves_real_vs_raw_in() {
         let content = concat!(
             r#"{"type":"assistant","timestamp":"2026-05-27T12:34:56Z","message":{"id":"msg-1","model":"claude-opus-4-7","usage":{"input_tokens":100,"cache_read_input_tokens":20,"cache_creation_input_tokens":5,"output_tokens":7}}}"#,
             "\n",
@@ -1308,8 +1316,8 @@ mod tests {
         assert_eq!(records[0].agent, AGENT_CLAUDE);
         assert_eq!(records[0].model, "claude-opus-4-7");
         assert_eq!(records[0].date, "2026-05-27");
-        assert_eq!(records[0].raw_in_tokens, 100);
-        assert_eq!(records[0].billable_in_tokens, 125);
+        assert_eq!(records[0].real_in_tokens, 105);
+        assert_eq!(records[0].raw_in_tokens, 125);
         assert_eq!(records[0].out_tokens, 7);
     }
 
