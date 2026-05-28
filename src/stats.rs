@@ -1053,11 +1053,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                     format!("{:.1}%", pct),
                     Style::default().fg(Color::DarkGray),
                 )),
-                Cell::from(format!(
-                    "In: {}/{}",
-                    format_tokens(usage.raw_in_tokens),
-                    format_tokens(usage.billable_in_tokens)
-                )),
+                Cell::from(format!("In: {}", format_in_display(*usage))),
                 Cell::from(format!("Out: {}", format_tokens(usage.out_tokens))),
             ])
         })
@@ -1133,11 +1129,7 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             for (agent, _) in MATRIX_AGENTS {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
                     Some(usage) => Text::from(vec![
-                        Line::from(format!(
-                            "In: {}/{}",
-                            format_tokens(usage.raw_in_tokens),
-                            format_tokens(usage.billable_in_tokens)
-                        )),
+                        Line::from(format!("In: {}", format_in_display(*usage))),
                         Line::from(Span::styled(
                             format!("Out: {}", format_tokens(usage.out_tokens)),
                             Style::default().fg(Color::DarkGray),
@@ -1233,6 +1225,16 @@ fn format_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+fn format_in_display(usage: UsageTotals) -> String {
+    let real = format_tokens(usage.raw_in_tokens);
+    let raw = format_tokens(usage.billable_in_tokens);
+    if usage.raw_in_tokens == usage.billable_in_tokens {
+        real
+    } else {
+        format!("{real}/{raw}")
     }
 }
 
