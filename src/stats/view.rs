@@ -25,6 +25,8 @@ const TABLE_COLUMN_SPACING: u16 = 1;
 const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
 const STEP_CHART_MAX_WIDTH: u16 = 78;
 const STEP_CHART_HEIGHT: u16 = 14;
+const Y_TICK_COUNT: usize = 10;
+const X_TICK_MIN_COUNT: usize = 6;
 
 pub(super) fn draw(f: &mut ratatui::Frame, app: &mut StatsApp) {
     let area = f.area();
@@ -188,9 +190,12 @@ fn draw_step_chart(
         return;
     }
 
-    let y_max_label = format_tokens(max_y as u64);
-    let y_mid_label = format_tokens((max_y / 2.0) as u64);
-    let label_width = ["0", y_mid_label.as_str(), y_max_label.as_str()]
+    let y_ticks = y_tick_values(max_y, Y_TICK_COUNT);
+    let y_tick_labels: Vec<String> = y_ticks
+        .iter()
+        .map(|value| format_tokens(value.round() as u64))
+        .collect();
+    let label_width = y_tick_labels
         .iter()
         .map(|label| label.chars().count() as u16)
         .max()
@@ -216,9 +221,6 @@ fn draw_step_chart(
     }
 
     let max_bound = (max_y * 1.05).max(1.0);
-    let mid_y = value_row(max_y / 2.0, max_bound, plot_top, plot_bottom);
-    let top_y = value_row(max_y, max_bound, plot_top, plot_bottom);
-    let bottom_y = plot_bottom;
     let axis_style = Style::default().fg(Color::DarkGray);
 
     let plot_area = Rect::new(
@@ -229,31 +231,17 @@ fn draw_step_chart(
     );
 
     let buf = f.buffer_mut();
-    right_aligned_label(
-        buf,
-        chart_area.x,
-        top_y,
-        label_width,
-        &y_max_label,
-        axis_style,
-    );
-    right_aligned_label(
-        buf,
-        chart_area.x,
-        mid_y,
-        label_width,
-        &y_mid_label,
-        axis_style,
-    );
-    right_aligned_label(buf, chart_area.x, bottom_y, label_width, "0", axis_style);
+    let mut used_y_tick_rows = HashSet::new();
+    for (value, label) in y_ticks.iter().zip(y_tick_labels.iter()) {
+        let y = value_row(*value, max_bound, plot_top, plot_bottom);
+        if used_y_tick_rows.insert(y) {
+            right_aligned_label(buf, chart_area.x, y, label_width, label, axis_style);
+        }
+    }
 
     for y in plot_top..=plot_bottom {
         buf.set_string(axis_x, y, "│", axis_style);
     }
-    for x in axis_x..=plot_right {
-        buf.set_string(x, plot_bottom, "─", axis_style);
-    }
-    buf.set_string(axis_x, plot_bottom, "└", axis_style);
 
     let mut occupied = ChartOccupancy::new();
     for (_, values, color) in series {
@@ -269,19 +257,9 @@ fn draw_step_chart(
     }
 
     let x_label_y = plot_bottom + 1;
-    buf.set_string(plot_left, x_label_y, short_date(min_date), axis_style);
-    if day_count > 1 {
-        let mid_idx = day_count / 2;
-        let mid_date = date_offset(min_date, mid_idx as i64).unwrap_or_else(|_| String::new());
-        let mid_label = short_date(&mid_date);
-        let mid_x = plot_left + (plot_right - plot_left) / 2;
-        let mid_x = mid_x.saturating_sub((mid_label.chars().count() / 2) as u16);
-        buf.set_string(mid_x, x_label_y, mid_label, axis_style);
-
-        let max_label = short_date(max_date);
-        let max_x = plot_right.saturating_sub(max_label.chars().count() as u16);
-        buf.set_string(max_x, x_label_y, max_label, axis_style);
-    }
+    draw_x_tick_labels(
+        buf, min_date, max_date, day_count, plot_left, plot_right, x_label_y, axis_style,
+    );
 
     let legend_width = chart_legend_max_width(series)
         .min(plot_right.saturating_sub(plot_left) + 1)
@@ -312,6 +290,70 @@ fn right_aligned_label(
     let label_width = label.chars().count() as u16;
     let label_x = x + width.saturating_sub(label_width);
     buf.set_string(label_x, y, label, style);
+}
+
+fn y_tick_values(max_y: f64, tick_count: usize) -> Vec<f64> {
+    if tick_count <= 1 {
+        return vec![0.0];
+    }
+
+    let max_y = max_y.max(0.0);
+    (0..tick_count)
+        .map(|idx| max_y * idx as f64 / (tick_count - 1) as f64)
+        .collect()
+}
+
+fn x_tick_indices(day_count: usize) -> Vec<usize> {
+    match day_count {
+        0 => Vec::new(),
+        1..=7 => (0..day_count).collect(),
+        _ => {
+            let tick_count = X_TICK_MIN_COUNT.min(day_count);
+            let last = day_count - 1;
+            let mut indices = Vec::with_capacity(tick_count);
+            for idx in 0..tick_count {
+                let numerator = idx * last + (tick_count - 1) / 2;
+                indices.push(numerator / (tick_count - 1));
+            }
+            indices.dedup();
+            indices
+        }
+    }
+}
+
+fn draw_x_tick_labels(
+    buf: &mut Buffer,
+    min_date: &str,
+    max_date: &str,
+    day_count: usize,
+    plot_left: u16,
+    plot_right: u16,
+    y: u16,
+    style: Style,
+) {
+    let mut occupied_columns = HashSet::new();
+    for idx in x_tick_indices(day_count) {
+        let date = if idx + 1 == day_count {
+            max_date.to_string()
+        } else {
+            date_offset(min_date, idx as i64).unwrap_or_else(|_| String::new())
+        };
+        let label = short_date(&date);
+        let label_width = label.chars().count() as u16;
+        let tick_x = chart_x_boundary(idx, day_count.max(1), plot_left, plot_right);
+        let label_x = tick_x
+            .saturating_sub(label_width / 2)
+            .max(plot_left)
+            .min(plot_right.saturating_sub(label_width.saturating_sub(1)));
+        let label_end = label_x.saturating_add(label_width.saturating_sub(1));
+        if (label_x..=label_end).any(|x| occupied_columns.contains(&x)) {
+            continue;
+        }
+        for x in label_x..=label_end {
+            occupied_columns.insert(x);
+        }
+        buf.set_string(label_x, y, label, style);
+    }
 }
 
 fn value_row(value: f64, max_bound: f64, plot_top: u16, plot_bottom: u16) -> u16 {
@@ -642,6 +684,29 @@ mod tests {
         assert_eq!(chart_x_boundary(0, 7, 10, 30), 10);
         assert_eq!(chart_x_boundary(7, 7, 10, 30), 30);
         assert_eq!(chart_x_boundary(99, 7, 10, 30), 30);
+    }
+
+    #[test]
+    fn y_tick_values_include_zero_and_max() {
+        let ticks = y_tick_values(90.0, Y_TICK_COUNT);
+
+        assert_eq!(ticks.len(), Y_TICK_COUNT);
+        assert_eq!(ticks.first(), Some(&0.0));
+        assert_eq!(ticks.last(), Some(&90.0));
+    }
+
+    #[test]
+    fn x_tick_indices_draw_every_day_for_short_ranges() {
+        assert_eq!(x_tick_indices(7), vec![0, 1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn x_tick_indices_draw_at_least_six_ticks_for_long_ranges() {
+        let ticks = x_tick_indices(30);
+
+        assert_eq!(ticks.len(), X_TICK_MIN_COUNT);
+        assert_eq!(ticks.first(), Some(&0));
+        assert_eq!(ticks.last(), Some(&29));
     }
 
     #[test]
