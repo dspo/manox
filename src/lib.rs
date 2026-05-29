@@ -4006,6 +4006,48 @@ mod tests {
     }
 
     #[test]
+    fn copilot_with_bearer_auth_sets_bearer_token_env() {
+        let fake_binary = create_fake_binary("copilot");
+        let selection = Selection {
+            agent_id: "copilot".into(),
+            agent_binary: fake_binary.display().to_string(),
+            provider: ResolvedProvider {
+                name: "Packy API".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+            },
+            model: Some(ResolvedModel {
+                id: "claude-opus-4-7".into(),
+                arena: "—".into(),
+                swe_p: "—".into(),
+                tb2: "—".into(),
+                desc: String::new(),
+                wire_api: WireApi::Anthropic,
+                provider_name: "Packy API".into(),
+                endpoint_url: "https://www.packyapi.com/".into(),
+                visible_agents: vec!["copilot".into()],
+                copilot_auth: CopilotAuth::BearerToken,
+            }),
+        };
+
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert_eq!(
+            spec.env.get("COPILOT_PROVIDER_BEARER_TOKEN"),
+            Some(&"test-key".to_string())
+        );
+        assert!(!spec.env.contains_key("COPILOT_PROVIDER_API_KEY"));
+        assert_eq!(
+            spec.env.get("COPILOT_PROVIDER_TYPE"),
+            Some(&"anthropic".to_string())
+        );
+        assert_eq!(
+            spec.env.get("COPILOT_PROVIDER_BASE_URL"),
+            Some(&"https://www.packyapi.com/".to_string())
+        );
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
     fn sanitize_terminal_title_strips_control_chars() {
         assert_eq!(
             sanitize_terminal_title("gpt-5.4\x1b]2;ignored\x07\n"),
@@ -4529,6 +4571,20 @@ trust_level = "trusted"
         let config = read_config_file(&path).unwrap();
         assert!(!config.providers.is_empty());
         assert!(!config.agents.is_empty());
+        let packy = config
+            .providers
+            .iter()
+            .find(|provider| provider.name == "Packy API")
+            .expect("baseline should include Packy API");
+        let packy_anthropic = packy
+            .normalized_endpoints()
+            .into_iter()
+            .find(|endpoint| endpoint.wire_api == "anthropic")
+            .expect("Packy API should include an anthropic endpoint");
+        assert_eq!(
+            CopilotAuth::from_endpoint(&packy_anthropic),
+            CopilotAuth::BearerToken
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

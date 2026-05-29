@@ -117,6 +117,7 @@ providers:
     endpoints:
       anthropic:
         url: https://www.packyapi.com/
+        copilot_auth: bearer_token
     models:
       claude-opus-4-6:
         desc: "Claude Opus 4.6"

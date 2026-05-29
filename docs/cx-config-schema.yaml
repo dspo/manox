@@ -16,7 +16,7 @@ providers:
       anthropic:
         url: "string (required)"
         agents: ["string (optional override filter)"]
-        copilot_auth: "enum: api_key | bearer_token (optional)"
+        copilot_auth: "enum: api_key | bearer_token (optional; Packy API requires bearer_token for cx copilot)"
       responses:
         url: "string (required)"
       completions:
