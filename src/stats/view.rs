@@ -27,6 +27,7 @@ const Y_TICK_COUNT: usize = 10;
 const X_TICK_MIN_COUNT: usize = 6;
 const RACE_VISIBLE_MODELS: usize = 10;
 const RACE_TWEEN_STEPS: usize = 12;
+const RACE_FINAL_HOLD_TICKS: usize = RACE_TWEEN_STEPS * 3;
 
 #[derive(Debug, Clone)]
 struct RaceEntry {
@@ -220,7 +221,7 @@ fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frame
     let previous_idx = current_idx.saturating_sub(1);
     let current = &frames[current_idx];
     let previous = &frames[previous_idx];
-    let tween = race_tween(app.race_tick);
+    let tween = race_tween(app.race_tick, frames.len());
     let max_value = race_max_value(&frames);
 
     draw_race_frame(f, chart_area, previous, current, tween, max_value);
@@ -701,8 +702,23 @@ fn race_frame_index(tick: usize, frame_count: usize) -> usize {
     if frame_count == 0 {
         0
     } else {
-        (tick / RACE_TWEEN_STEPS) % frame_count
+        let cycle_tick = race_cycle_tick(tick, frame_count);
+        let frame_ticks = frame_count.saturating_mul(RACE_TWEEN_STEPS);
+        if cycle_tick >= frame_ticks {
+            frame_count - 1
+        } else {
+            cycle_tick / RACE_TWEEN_STEPS
+        }
     }
+}
+
+fn race_cycle_tick(tick: usize, frame_count: usize) -> usize {
+    if frame_count == 0 {
+        return 0;
+    }
+    let frame_ticks = frame_count.saturating_mul(RACE_TWEEN_STEPS);
+    let cycle_ticks = frame_ticks.saturating_add(RACE_FINAL_HOLD_TICKS);
+    tick % cycle_ticks
 }
 
 fn current_race_frame<'a>(
@@ -717,12 +733,21 @@ fn current_race_frame<'a>(
     Some((
         &frames[previous_idx],
         &frames[current_idx],
-        race_tween(app.race_tick),
+        race_tween(app.race_tick, frames.len()),
     ))
 }
 
-fn race_tween(tick: usize) -> f64 {
-    (tick % RACE_TWEEN_STEPS) as f64 / RACE_TWEEN_STEPS as f64
+fn race_tween(tick: usize, frame_count: usize) -> f64 {
+    if frame_count == 0 {
+        return 0.0;
+    }
+    let cycle_tick = race_cycle_tick(tick, frame_count);
+    let frame_ticks = frame_count.saturating_mul(RACE_TWEEN_STEPS);
+    if cycle_tick >= frame_ticks {
+        1.0
+    } else {
+        (cycle_tick % RACE_TWEEN_STEPS) as f64 / RACE_TWEEN_STEPS as f64
+    }
 }
 
 fn smoothstep(value: f64) -> f64 {
@@ -1658,7 +1683,24 @@ mod tests {
         assert_eq!(race_frame_index(0, 3), 0);
         assert_eq!(race_frame_index(RACE_TWEEN_STEPS - 1, 3), 0);
         assert_eq!(race_frame_index(RACE_TWEEN_STEPS, 3), 1);
-        assert_eq!(race_frame_index(RACE_TWEEN_STEPS * 3, 3), 0);
+        assert_eq!(race_frame_index(RACE_TWEEN_STEPS * 3, 3), 2);
+        assert_eq!(
+            race_frame_index(RACE_TWEEN_STEPS * 3 + RACE_FINAL_HOLD_TICKS - 1, 3),
+            2
+        );
+        assert_eq!(
+            race_frame_index(RACE_TWEEN_STEPS * 3 + RACE_FINAL_HOLD_TICKS, 3),
+            0
+        );
+    }
+
+    #[test]
+    fn race_tween_reaches_final_value_during_final_hold() {
+        assert_eq!(race_tween(RACE_TWEEN_STEPS * 3, 3), 1.0);
+        assert_eq!(
+            race_tween(RACE_TWEEN_STEPS * 3 + RACE_FINAL_HOLD_TICKS - 1, 3),
+            1.0
+        );
     }
 
     #[test]
