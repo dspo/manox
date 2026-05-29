@@ -34,6 +34,7 @@ const RACE_FINAL_FADE_TICKS: usize = RACE_TWEEN_STEPS;
 struct RaceEntry {
     model: String,
     value: u64,
+    usage: UsageTotals,
     color: Color,
 }
 
@@ -302,10 +303,9 @@ fn draw_race_frame(
         .entries
         .iter()
         .take(row_count)
-        .map(|entry| text_width(&format_tokens(entry.value)))
+        .map(|entry| text_width(&usage_cell_text(&entry.usage)))
         .max()
         .unwrap_or(4)
-        .max(text_width(&format_tokens(max_value)))
         .max(4);
 
     let bar_left = chart_area.x + model_width + 2;
@@ -320,7 +320,7 @@ fn draw_race_frame(
     let plot_top = chart_area.y + 3;
     let plot_bottom = plot_top + row_count as u16 - 1;
     let previous_ranks = race_rank_map(previous);
-    let previous_values = race_value_map(previous);
+    let previous_usages = race_usage_map(previous);
     let eased = smoothstep(tween);
     let bar_width = bar_right.saturating_sub(bar_left) + 1;
     let mut occupied_rows = HashSet::new();
@@ -339,13 +339,17 @@ fn draw_race_frame(
         };
         occupied_rows.insert(row);
 
-        let previous_value = previous_values.get(&entry.model).copied().unwrap_or(0);
-        let value = interpolate_u64(previous_value, entry.value, eased);
-        let bar_len = ((value as f64 / max_value.max(1) as f64) * f64::from(bar_width))
+        let previous_usage = previous_usages
+            .get(&entry.model)
+            .copied()
+            .unwrap_or_default();
+        let usage = interpolate_usage_totals(previous_usage, entry.usage, eased);
+        let total_tokens = usage.total_tokens();
+        let bar_len = ((total_tokens as f64 / max_value.max(1) as f64) * f64::from(bar_width))
             .round()
-            .max(if value > 0 { 1.0 } else { 0.0 }) as u16;
+            .max(if total_tokens > 0 { 1.0 } else { 0.0 }) as u16;
         let label = truncate_text(&entry.model, model_width);
-        let value_label = format_tokens(value);
+        let value_label = usage_cell_text(&usage);
         let style = Style::default().fg(fade_color(entry.color, fade));
         let buf = f.buffer_mut();
 
@@ -656,6 +660,7 @@ fn race_entries(
             color: color_map.get(model).copied().unwrap_or(Color::White),
             model: model.clone(),
             value: usage.total_tokens(),
+            usage: *usage,
         })
         .collect();
     entries.sort_by(|left, right| {
@@ -835,11 +840,11 @@ fn race_rank_map(frame: &RaceFrame) -> HashMap<String, usize> {
         .collect()
 }
 
-fn race_value_map(frame: &RaceFrame) -> HashMap<String, u64> {
+fn race_usage_map(frame: &RaceFrame) -> HashMap<String, UsageTotals> {
     frame
         .entries
         .iter()
-        .map(|entry| (entry.model.clone(), entry.value))
+        .map(|entry| (entry.model.clone(), entry.usage))
         .collect()
 }
 
@@ -1706,6 +1711,7 @@ mod tests {
         assert_eq!(frames[0].date, "2026-05-27");
         assert_eq!(frames[0].entries[0].model, "alpha");
         assert_eq!(frames[0].entries[0].value, 120);
+        assert_eq!(usage_cell_text(&frames[0].entries[0].usage), "↑100 ↓20");
         assert_eq!(frames[1].date, "2026-05-28");
         assert_eq!(frames[1].entries[0].model, "alpha");
         assert_eq!(frames[1].entries[0].value, 120);
@@ -1714,6 +1720,7 @@ mod tests {
         assert_eq!(frames[2].date, "2026-05-29");
         assert_eq!(frames[2].entries[0].model, "beta");
         assert_eq!(frames[2].entries[0].value, 200);
+        assert_eq!(usage_cell_text(&frames[2].entries[0].usage), "↑200 ↓0");
         assert_eq!(frames[2].entries[1].model, "alpha");
         assert_eq!(frames[2].entries[1].value, 120);
     }
