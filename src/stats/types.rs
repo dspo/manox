@@ -90,8 +90,29 @@ impl Period {
     pub(super) fn includes(self, date: &str, today: &str) -> bool {
         match self {
             Period::All => true,
-            Period::Last7 => super::date::days_diff(date, today).is_some_and(|d| d < 7),
-            Period::Last30 => super::date::days_diff(date, today).is_some_and(|d| d < 30),
+            Period::Last7 => {
+                super::date::days_diff(date, today).is_some_and(|d| (0..7).contains(&d))
+            }
+            Period::Last30 => {
+                super::date::days_diff(date, today).is_some_and(|d| (0..30).contains(&d))
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_periods_exclude_future_dates() {
+        assert!(Period::Last7.includes("2026-05-23", "2026-05-29"));
+        assert!(Period::Last7.includes("2026-05-29", "2026-05-29"));
+        assert!(!Period::Last7.includes("2026-05-22", "2026-05-29"));
+        assert!(!Period::Last7.includes("2026-05-30", "2026-05-29"));
+
+        assert!(Period::Last30.includes("2026-04-30", "2026-05-29"));
+        assert!(!Period::Last30.includes("2026-04-29", "2026-05-29"));
+        assert!(!Period::Last30.includes("2026-05-30", "2026-05-29"));
     }
 }

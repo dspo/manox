@@ -11,7 +11,7 @@ use super::aggregate::{top_models_covering, totals_by_agent_model, totals_by_mod
 use super::date::{date_offset, days_diff};
 use super::format::{format_tokens, short_date};
 use super::tui::StatsApp;
-use super::types::{Period, UsageTotals};
+use super::types::{Period, UsageRecord, UsageTotals};
 use super::{MATRIX_AGENTS, PALETTE};
 
 type ChartSeries = (String, Vec<f64>, Color);
@@ -109,19 +109,9 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
     let totals = totals_by_model(&records);
     let top_models: Vec<String> = top_models_covering(&totals, 0.80);
 
-    let mut min_date = app.today.clone();
-    let mut max_date = "0000-00-00".to_string();
-    for r in &records {
-        if r.date < min_date {
-            min_date = r.date.clone();
-        }
-        if r.date > max_date {
-            max_date = r.date.clone();
-        }
-    }
-    if max_date == "0000-00-00" {
+    let Some((min_date, max_date)) = chart_date_range(app.period, &app.today, &records) else {
         return;
-    }
+    };
 
     let day_count = (days_diff(&min_date, &max_date).unwrap_or(0).max(0) + 1) as usize;
     let day_count = day_count.max(1);
@@ -275,6 +265,31 @@ fn fixed_chart_area(area: Rect) -> Rect {
         area.width.min(STEP_CHART_MAX_WIDTH),
         area.height.min(STEP_CHART_HEIGHT),
     )
+}
+
+fn chart_date_range(
+    period: Period,
+    today: &str,
+    records: &[&UsageRecord],
+) -> Option<(String, String)> {
+    match period {
+        Period::Last7 => Some((date_offset(today, -6).ok()?, today.to_string())),
+        Period::Last30 => Some((date_offset(today, -29).ok()?, today.to_string())),
+        Period::All => {
+            let first = records.first()?;
+            let mut min_date = first.date.clone();
+            let mut max_date = first.date.clone();
+            for record in records.iter().skip(1) {
+                if record.date < min_date {
+                    min_date = record.date.clone();
+                }
+                if record.date > max_date {
+                    max_date = record.date.clone();
+                }
+            }
+            Some((min_date, max_date))
+        }
+    }
 }
 
 fn right_aligned_label(
@@ -720,6 +735,62 @@ mod tests {
         assert_eq!(
             area,
             Rect::new(2, 3, STEP_CHART_MAX_WIDTH, STEP_CHART_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn relative_chart_ranges_use_full_period_windows() {
+        let records = vec![UsageRecord {
+            agent: "claude".to_string(),
+            model: "qwen3.7-max".to_string(),
+            date: "2026-05-27".to_string(),
+            in_tokens: 1,
+            total_tokens: 1,
+            out_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+        }];
+        let record_refs = records.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            chart_date_range(Period::Last7, "2026-05-29", &record_refs),
+            Some(("2026-05-23".to_string(), "2026-05-29".to_string()))
+        );
+        assert_eq!(
+            chart_date_range(Period::Last30, "2026-05-29", &record_refs),
+            Some(("2026-04-30".to_string(), "2026-05-29".to_string()))
+        );
+    }
+
+    #[test]
+    fn all_time_chart_range_uses_data_extent() {
+        let records = vec![
+            UsageRecord {
+                agent: "claude".to_string(),
+                model: "qwen3.7-max".to_string(),
+                date: "2026-05-27".to_string(),
+                in_tokens: 1,
+                total_tokens: 1,
+                out_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+            UsageRecord {
+                agent: "claude".to_string(),
+                model: "qwen3.7-max".to_string(),
+                date: "2026-05-12".to_string(),
+                in_tokens: 1,
+                total_tokens: 1,
+                out_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        ];
+        let record_refs = records.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            chart_date_range(Period::All, "2026-05-29", &record_refs),
+            Some(("2026-05-12".to_string(), "2026-05-27".to_string()))
         );
     }
 
