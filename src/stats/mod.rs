@@ -38,10 +38,10 @@ pub(crate) const AGENT_ZED: &str = "zed";
 pub(crate) const AGENT_COPILOT: &str = "copilot";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
-    (AGENT_CLAUDE, "claude code"),
-    (AGENT_CODEX, "codex"),
-    (AGENT_ZED, "zed agent"),
-    (AGENT_COPILOT, "copilot"),
+    (AGENT_CLAUDE, "Claude Code"),
+    (AGENT_CODEX, "Codex"),
+    (AGENT_ZED, "Zed Agent"),
+    (AGENT_COPILOT, "Copilot"),
 ];
 
 /// 折线图调色板（与 Claude `/usage` 风格相近）。

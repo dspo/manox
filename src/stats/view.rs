@@ -283,7 +283,11 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                     format!("{:.1}%", pct),
                     Style::default().fg(Color::DarkGray),
                 )),
-                Cell::from(format_tokens(usage.total_tokens())),
+                Cell::from(format!(
+                    "↑{} ↓{}",
+                    format_tokens(usage.in_tokens),
+                    format_tokens(usage.out_tokens)
+                )),
             ];
             for (agent, _) in MATRIX_AGENTS {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
@@ -302,19 +306,19 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
 
     let header_cells: Vec<Cell> = [
         Cell::from(Span::styled(
-            "model id",
+            "Model",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
         Cell::from(Span::styled(
-            "model share",
+            "Share",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
         Cell::from(Span::styled(
-            "model total tokens",
+            "Total",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -334,8 +338,8 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
 
     let mut widths = vec![
         Constraint::Length(32),
-        Constraint::Length(12),
-        Constraint::Length(18),
+        Constraint::Length(8),
+        Constraint::Length(20),
     ];
     widths.extend(MATRIX_AGENTS.iter().map(|_| Constraint::Length(20)));
 
