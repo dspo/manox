@@ -155,23 +155,9 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         chart_series.push((model.clone(), values, color));
     }
 
-    let (chart_area, legend_area) = if area.height >= 8 {
-        (
-            Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1)),
-            Some(Rect::new(
-                area.x,
-                area.bottom().saturating_sub(1),
-                area.width,
-                1,
-            )),
-        )
-    } else {
-        (area, None)
-    };
-
     draw_step_chart(
         f,
-        chart_area,
+        area,
         app.period.label(),
         &min_date,
         &max_date,
@@ -179,9 +165,6 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         max_y,
         &chart_series,
     );
-    if let Some(legend_area) = legend_area {
-        draw_chart_legend(f, legend_area, &chart_series);
-    }
 }
 
 fn draw_step_chart(
@@ -283,6 +266,13 @@ fn draw_step_chart(
         let max_x = plot_right.saturating_sub(max_label.chars().count() as u16);
         buf.set_string(max_x, x_label_y, max_label, axis_style);
     }
+
+    let legend_width = chart_legend_width(series)
+        .min(plot_right.saturating_sub(plot_left) + 1)
+        .max(1);
+    let legend_x = plot_right.saturating_add(1).saturating_sub(legend_width);
+    let legend_area = Rect::new(legend_x, plot_top, legend_width, 1);
+    draw_chart_legend(f, legend_area, series);
 }
 
 fn right_aligned_label(
@@ -303,17 +293,57 @@ fn step_line_segments(values: &[f64], color: Color) -> Vec<CanvasLine> {
         return Vec::new();
     }
 
-    let mut segments = Vec::with_capacity(values.len().saturating_mul(2).saturating_sub(1));
+    const CORNER_X: f64 = 0.08;
+    const CORNER_Y_RATIO: f64 = 0.12;
+
+    let mut segments = Vec::with_capacity(values.len().saturating_mul(4));
     for (idx, &value) in values.iter().enumerate() {
         let x = idx as f64;
         let next_x = (idx + 1) as f64;
-        segments.push(CanvasLine::new(x, value, next_x, value, color));
+        let has_previous_corner = idx > 0 && values[idx - 1] != value;
+        let has_next_corner = values.get(idx + 1).is_some_and(|&next| next != value);
+        let horizontal_start = if has_previous_corner { x + CORNER_X } else { x };
+        let horizontal_end = if has_next_corner {
+            next_x - CORNER_X
+        } else {
+            next_x
+        };
+        if horizontal_end > horizontal_start {
+            segments.push(CanvasLine::new(
+                horizontal_start,
+                value,
+                horizontal_end,
+                value,
+                color,
+            ));
+        }
 
         let Some(&next_value) = values.get(idx + 1) else {
             continue;
         };
         if next_value != value {
-            segments.push(CanvasLine::new(next_x, value, next_x, next_value, color));
+            let corner_y = (next_value - value) * CORNER_Y_RATIO;
+            segments.push(CanvasLine::new(
+                horizontal_end,
+                value,
+                next_x,
+                value + corner_y,
+                color,
+            ));
+            segments.push(CanvasLine::new(
+                next_x,
+                value + corner_y,
+                next_x,
+                next_value - corner_y,
+                color,
+            ));
+            segments.push(CanvasLine::new(
+                next_x,
+                next_value - corner_y,
+                next_x + CORNER_X,
+                next_value,
+                color,
+            ));
         }
     }
 
@@ -333,15 +363,19 @@ fn draw_chart_legend(f: &mut ratatui::Frame, area: Rect, datasets: &[ChartSeries
             spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
         }
         spans.push(Span::styled("● ", Style::default().fg(*color)));
-        spans.push(Span::styled(
-            name.clone(),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.push(Span::styled(name.clone(), Style::default().fg(*color)));
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn chart_legend_width(datasets: &[ChartSeries]) -> u16 {
+    datasets
+        .iter()
+        .enumerate()
+        .map(|(idx, (name, _, _))| name.chars().count() + 2 + usize::from(idx > 0) * 3)
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16
 }
 
 fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
@@ -503,22 +537,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn step_segments_are_axis_aligned() {
+    fn step_segments_include_softened_corners() {
         let segments = step_line_segments(&[1.0, 3.0, 2.0], Color::Red);
 
-        assert_eq!(segments.len(), 5);
+        assert_eq!(segments.len(), 9);
         assert_eq!(
             segments.first().map(|line| (line.x1, line.x2)),
-            Some((0.0, 1.0))
+            Some((0.0, 0.92))
         );
         assert_eq!(
             segments.last().map(|line| (line.x1, line.x2)),
-            Some((2.0, 3.0))
+            Some((2.08, 3.0))
         );
         assert!(
             segments
                 .iter()
-                .all(|line| line.x1 == line.x2 || line.y1 == line.y2)
+                .any(|line| line.x1 != line.x2 && line.y1 != line.y2)
         );
+    }
+
+    #[test]
+    fn chart_legend_width_includes_separators() {
+        let datasets = vec![
+            ("alpha".to_string(), Vec::new(), Color::Red),
+            ("beta".to_string(), Vec::new(), Color::Green),
+        ];
+
+        assert_eq!(chart_legend_width(&datasets), 16);
     }
 }
