@@ -1150,7 +1150,7 @@ fn draw_dynamic_model_list(
             f,
             area,
             app,
-            "Dynamic Models",
+            "Dynamic Model Rankings",
             HashMap::new(),
             HashMap::new(),
             None,
