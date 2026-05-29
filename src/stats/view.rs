@@ -28,6 +28,7 @@ const X_TICK_MIN_COUNT: usize = 6;
 const RACE_VISIBLE_MODELS: usize = 10;
 const RACE_TWEEN_STEPS: usize = 12;
 const RACE_FINAL_HOLD_TICKS: usize = RACE_TWEEN_STEPS * 3;
+const RACE_FINAL_FADE_TICKS: usize = RACE_TWEEN_STEPS;
 
 #[derive(Debug, Clone)]
 struct RaceEntry {
@@ -128,9 +129,10 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         }
         ChartTab::Dynamicview => {
             let frames = race_frames(&app.records);
+            let fade = race_fade(app.race_tick, frames.len());
             draw_bar_chart_race(f, chunks[0], app, &frames);
-            draw_dynamic_context(f, chunks[1], app, &frames);
-            draw_dynamic_model_list(f, chunks[2], app, &frames);
+            draw_dynamic_context(f, chunks[1], app, &frames, fade);
+            draw_dynamic_model_list(f, chunks[2], app, &frames, fade);
         }
     }
 }
@@ -222,9 +224,10 @@ fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frame
     let current = &frames[current_idx];
     let previous = &frames[previous_idx];
     let tween = race_tween(app.race_tick, frames.len());
+    let fade = race_fade(app.race_tick, frames.len());
     let max_value = race_max_value(&frames);
 
-    draw_race_frame(f, chart_area, previous, current, tween, max_value);
+    draw_race_frame(f, chart_area, previous, current, tween, fade, max_value);
 }
 
 fn draw_race_frame(
@@ -233,11 +236,14 @@ fn draw_race_frame(
     previous: &RaceFrame,
     current: &RaceFrame,
     tween: f64,
+    fade: f64,
     max_value: u64,
 ) {
     let title = Line::from(Span::styled(
         " Model Tokens Race · All time ",
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(fade_color(Color::White, fade))
+            .add_modifier(Modifier::BOLD),
     ));
     f.render_widget(
         Paragraph::new(title),
@@ -245,11 +251,14 @@ fn draw_race_frame(
     );
 
     let date_line = Line::from(vec![
-        Span::styled(" Date ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            " Date ",
+            Style::default().fg(fade_color(Color::DarkGray, fade)),
+        ),
         Span::styled(
             short_date(&current.date),
             Style::default()
-                .fg(Color::LightYellow)
+                .fg(fade_color(Color::LightYellow, fade))
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -262,7 +271,7 @@ fn draw_race_frame(
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "  Waiting for the first model token usage...",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(fade_color(Color::DarkGray, fade)),
             ))),
             Rect::new(
                 chart_area.x,
@@ -337,7 +346,7 @@ fn draw_race_frame(
             .max(if value > 0 { 1.0 } else { 0.0 }) as u16;
         let label = truncate_text(&entry.model, model_width);
         let value_label = format_tokens(value);
-        let style = Style::default().fg(entry.color);
+        let style = Style::default().fg(fade_color(entry.color, fade));
         let buf = f.buffer_mut();
 
         buf.set_string(chart_area.x, row, label, style.add_modifier(Modifier::BOLD));
@@ -353,7 +362,7 @@ fn draw_race_frame(
             bar_right + 2,
             row,
             value_label,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(fade_color(Color::DarkGray, fade)),
         );
     }
 }
@@ -717,7 +726,9 @@ fn race_cycle_tick(tick: usize, frame_count: usize) -> usize {
         return 0;
     }
     let frame_ticks = frame_count.saturating_mul(RACE_TWEEN_STEPS);
-    let cycle_ticks = frame_ticks.saturating_add(RACE_FINAL_HOLD_TICKS);
+    let cycle_ticks = frame_ticks
+        .saturating_add(RACE_FINAL_HOLD_TICKS)
+        .saturating_add(RACE_FINAL_FADE_TICKS);
     tick % cycle_ticks
 }
 
@@ -750,9 +761,63 @@ fn race_tween(tick: usize, frame_count: usize) -> f64 {
     }
 }
 
+fn race_fade(tick: usize, frame_count: usize) -> f64 {
+    if frame_count == 0 {
+        return 0.0;
+    }
+    let cycle_tick = race_cycle_tick(tick, frame_count);
+    let fade_start = frame_count
+        .saturating_mul(RACE_TWEEN_STEPS)
+        .saturating_add(RACE_FINAL_HOLD_TICKS);
+    if cycle_tick < fade_start {
+        0.0
+    } else {
+        ((cycle_tick - fade_start + 1) as f64 / RACE_FINAL_FADE_TICKS as f64).clamp(0.0, 1.0)
+    }
+}
+
 fn smoothstep(value: f64) -> f64 {
     let value = value.clamp(0.0, 1.0);
     value * value * (3.0 - 2.0 * value)
+}
+
+fn fade_color(color: Color, fade: f64) -> Color {
+    let fade = fade.clamp(0.0, 1.0);
+    if fade <= f64::EPSILON {
+        return color;
+    }
+    let Some((red, green, blue)) = color_rgb(color) else {
+        return color;
+    };
+    let keep = 1.0 - fade;
+    Color::Rgb(
+        (f64::from(red) * keep).round() as u8,
+        (f64::from(green) * keep).round() as u8,
+        (f64::from(blue) * keep).round() as u8,
+    )
+}
+
+fn color_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Black => Some((0, 0, 0)),
+        Color::Red => Some((205, 49, 49)),
+        Color::Green => Some((13, 188, 121)),
+        Color::Yellow => Some((229, 229, 16)),
+        Color::Blue => Some((36, 114, 200)),
+        Color::Magenta => Some((188, 63, 188)),
+        Color::Cyan => Some((17, 168, 205)),
+        Color::Gray => Some((229, 229, 229)),
+        Color::DarkGray => Some((102, 102, 102)),
+        Color::LightRed => Some((241, 76, 76)),
+        Color::LightGreen => Some((35, 209, 139)),
+        Color::LightYellow => Some((245, 245, 67)),
+        Color::LightBlue => Some((59, 142, 234)),
+        Color::LightMagenta => Some((214, 112, 214)),
+        Color::LightCyan => Some((41, 184, 219)),
+        Color::White => Some((255, 255, 255)),
+        Color::Rgb(red, green, blue) => Some((red, green, blue)),
+        Color::Indexed(_) | Color::Reset => None,
+    }
 }
 
 fn interpolate_u64(from: u64, to: u64, tween: f64) -> u64 {
@@ -1068,13 +1133,22 @@ fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     f.render_widget(p, area);
 }
 
-fn draw_dynamic_context(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frames: &[RaceFrame]) {
+fn draw_dynamic_context(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &StatsApp,
+    frames: &[RaceFrame],
+    fade: f64,
+) {
     let text = current_race_frame(app, frames)
         .map(|(_, current, _)| {
             format!("All time cumulative tokens · {}", short_date(&current.date))
         })
         .unwrap_or_else(|| "All time cumulative tokens".to_string());
-    let spans = vec![Span::styled(text, Style::default().fg(Color::DarkGray))];
+    let spans = vec![Span::styled(
+        text,
+        Style::default().fg(fade_color(Color::DarkGray, fade)),
+    )];
     let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
@@ -1083,7 +1157,7 @@ fn draw_overview_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsA
     let records = app.period_records();
     let cells = totals_by_agent_model(&records);
     let totals = totals_by_model(&records);
-    draw_model_table(f, area, app, "Models", cells, totals, None, false);
+    draw_model_table(f, area, app, "Models", cells, totals, None, false, 0.0);
 }
 
 fn draw_dynamic_model_list(
@@ -1091,6 +1165,7 @@ fn draw_dynamic_model_list(
     area: Rect,
     app: &mut StatsApp,
     frames: &[RaceFrame],
+    fade: f64,
 ) {
     let Some((previous, current, tween)) = current_race_frame(app, frames) else {
         draw_model_table(
@@ -1102,6 +1177,7 @@ fn draw_dynamic_model_list(
             HashMap::new(),
             None,
             true,
+            0.0,
         );
         return;
     };
@@ -1118,6 +1194,7 @@ fn draw_dynamic_model_list(
         displayed_totals,
         Some(&color_map),
         true,
+        fade,
     );
 }
 
@@ -1130,6 +1207,7 @@ fn draw_model_table(
     totals: HashMap<String, UsageTotals>,
     color_map: Option<&HashMap<String, Color>>,
     hide_empty_agents: bool,
+    fade: f64,
 ) {
     let total_all: u64 = totals.values().map(|usage| usage.total_tokens()).sum();
 
@@ -1174,25 +1252,32 @@ fn draw_model_table(
             let mut row_cells = vec![
                 Cell::from(Span::styled(
                     model.clone(),
-                    Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(fade_color(dot_color, fade))
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Cell::from(Span::styled(
                     format!("{:.1}%", pct),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(fade_color(Color::DarkGray, fade)),
                 )),
-                Cell::from(usage_cell_text(usage)),
+                usage_cell(usage, fade),
             ];
             for (agent, _) in &agent_columns {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
-                    Some(usage) => Cell::from(usage_cell_text(usage)),
-                    None => Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
+                    Some(usage) => usage_cell(usage, fade),
+                    None => Cell::from(Span::styled(
+                        "—",
+                        Style::default().fg(fade_color(Color::DarkGray, fade)),
+                    )),
                 };
                 row_cells.push(cell);
             }
             let row_style = if idx % 2 == 0 {
                 Style::default()
-            } else {
+            } else if fade <= f64::EPSILON {
                 Style::default().bg(STRIPED_ROW_BG)
+            } else {
+                Style::default().bg(fade_color(STRIPED_ROW_BG, fade))
             };
             Row::new(row_cells).style(row_style)
         })
@@ -1202,19 +1287,19 @@ fn draw_model_table(
         Cell::from(Span::styled(
             "Model",
             Style::default()
-                .fg(Color::White)
+                .fg(fade_color(Color::White, fade))
                 .add_modifier(Modifier::BOLD),
         )),
         Cell::from(Span::styled(
             "Share",
             Style::default()
-                .fg(Color::White)
+                .fg(fade_color(Color::White, fade))
                 .add_modifier(Modifier::BOLD),
         )),
         Cell::from(Span::styled(
             "Total",
             Style::default()
-                .fg(Color::White)
+                .fg(fade_color(Color::White, fade))
                 .add_modifier(Modifier::BOLD),
         )),
     ]
@@ -1223,7 +1308,7 @@ fn draw_model_table(
         Cell::from(Span::styled(
             *label,
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(fade_color(Color::LightCyan, fade))
                 .add_modifier(Modifier::BOLD),
         ))
     }))
@@ -1239,6 +1324,18 @@ fn draw_model_table(
         .column_spacing(TABLE_COLUMN_SPACING)
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
+}
+
+fn usage_cell(usage: &UsageTotals, fade: f64) -> Cell<'static> {
+    let text = usage_cell_text(usage);
+    if fade <= f64::EPSILON {
+        Cell::from(text)
+    } else {
+        Cell::from(Span::styled(
+            text,
+            Style::default().fg(fade_color(Color::Gray, fade)),
+        ))
+    }
 }
 
 fn usage_cell_text(usage: &UsageTotals) -> String {
@@ -1680,27 +1777,43 @@ mod tests {
 
     #[test]
     fn race_frame_index_advances_by_tween_steps() {
+        let frame_ticks = RACE_TWEEN_STEPS * 3;
+        let cycle_ticks = frame_ticks + RACE_FINAL_HOLD_TICKS + RACE_FINAL_FADE_TICKS;
+
         assert_eq!(race_frame_index(0, 3), 0);
         assert_eq!(race_frame_index(RACE_TWEEN_STEPS - 1, 3), 0);
         assert_eq!(race_frame_index(RACE_TWEEN_STEPS, 3), 1);
-        assert_eq!(race_frame_index(RACE_TWEEN_STEPS * 3, 3), 2);
-        assert_eq!(
-            race_frame_index(RACE_TWEEN_STEPS * 3 + RACE_FINAL_HOLD_TICKS - 1, 3),
-            2
-        );
-        assert_eq!(
-            race_frame_index(RACE_TWEEN_STEPS * 3 + RACE_FINAL_HOLD_TICKS, 3),
-            0
-        );
+        assert_eq!(race_frame_index(frame_ticks, 3), 2);
+        assert_eq!(race_frame_index(cycle_ticks - 1, 3), 2);
+        assert_eq!(race_frame_index(cycle_ticks, 3), 0);
     }
 
     #[test]
-    fn race_tween_reaches_final_value_during_final_hold() {
-        assert_eq!(race_tween(RACE_TWEEN_STEPS * 3, 3), 1.0);
-        assert_eq!(
-            race_tween(RACE_TWEEN_STEPS * 3 + RACE_FINAL_HOLD_TICKS - 1, 3),
-            1.0
-        );
+    fn race_tween_reaches_final_value_during_final_hold_and_fade() {
+        let frame_ticks = RACE_TWEEN_STEPS * 3;
+        let cycle_ticks = frame_ticks + RACE_FINAL_HOLD_TICKS + RACE_FINAL_FADE_TICKS;
+
+        assert_eq!(race_tween(frame_ticks, 3), 1.0);
+        assert_eq!(race_tween(cycle_ticks - 1, 3), 1.0);
+    }
+
+    #[test]
+    fn race_fade_starts_after_final_hold() {
+        let frame_ticks = RACE_TWEEN_STEPS * 3;
+        let fade_start = frame_ticks + RACE_FINAL_HOLD_TICKS;
+        let cycle_ticks = fade_start + RACE_FINAL_FADE_TICKS;
+
+        assert_eq!(race_fade(frame_ticks, 3), 0.0);
+        assert_eq!(race_fade(fade_start - 1, 3), 0.0);
+        assert!(race_fade(fade_start, 3) > 0.0);
+        assert_eq!(race_fade(cycle_ticks - 1, 3), 1.0);
+        assert_eq!(race_fade(cycle_ticks, 3), 0.0);
+    }
+
+    #[test]
+    fn fade_color_dims_to_black() {
+        assert_eq!(fade_color(Color::LightYellow, 0.0), Color::LightYellow);
+        assert_eq!(fade_color(Color::LightYellow, 1.0), Color::Rgb(0, 0, 0));
     }
 
     #[test]
