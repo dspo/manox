@@ -26,7 +26,7 @@ const STEP_CHART_HEIGHT: u16 = 14;
 const Y_TICK_COUNT: usize = 10;
 const X_TICK_MIN_COUNT: usize = 6;
 const RACE_VISIBLE_MODELS: usize = 10;
-const RACE_TWEEN_STEPS: usize = 3;
+const RACE_TWEEN_STEPS: usize = 12;
 
 #[derive(Debug, Clone)]
 struct RaceEntry {
@@ -204,8 +204,9 @@ fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let current = &frames[current_idx];
     let previous = &frames[previous_idx];
     let tween = race_tween(app.race_tick);
+    let max_value = race_max_value(&frames);
 
-    draw_race_frame(f, chart_area, previous, current, tween);
+    draw_race_frame(f, chart_area, previous, current, tween, max_value);
 }
 
 fn draw_race_frame(
@@ -214,6 +215,7 @@ fn draw_race_frame(
     previous: &RaceFrame,
     current: &RaceFrame,
     tween: f64,
+    max_value: u64,
 ) {
     let title = Line::from(Span::styled(
         " Model Tokens Race · All time ",
@@ -269,14 +271,6 @@ fn draw_race_frame(
         .max()
         .unwrap_or(10)
         .clamp(10, 22);
-    let max_value = current
-        .entries
-        .iter()
-        .take(row_count)
-        .map(|entry| entry.value)
-        .max()
-        .unwrap_or(1)
-        .max(1);
     let value_width = current
         .entries
         .iter()
@@ -284,6 +278,7 @@ fn draw_race_frame(
         .map(|entry| text_width(&format_tokens(entry.value)))
         .max()
         .unwrap_or(4)
+        .max(text_width(&format_tokens(max_value)))
         .max(4);
 
     let bar_left = chart_area.x + model_width + 2;
@@ -319,7 +314,7 @@ fn draw_race_frame(
 
         let previous_value = previous_values.get(&entry.model).copied().unwrap_or(0);
         let value = interpolate_u64(previous_value, entry.value, eased);
-        let bar_len = ((value as f64 / max_value as f64) * f64::from(bar_width))
+        let bar_len = ((value as f64 / max_value.max(1) as f64) * f64::from(bar_width))
             .round()
             .max(if value > 0 { 1.0 } else { 0.0 }) as u16;
         let label = truncate_text(&entry.model, model_width);
@@ -489,47 +484,125 @@ fn race_frames(records: &[UsageRecord]) -> Vec<RaceFrame> {
     };
     let day_count = (days_diff(&min_date, &max_date).unwrap_or(0).max(0) + 1) as usize;
     let color_map = race_color_map(records);
-    let mut records_by_date: HashMap<String, Vec<&UsageRecord>> = HashMap::new();
+    let mut deltas_by_date: HashMap<String, HashMap<String, u64>> = HashMap::new();
     for record in records {
-        records_by_date
+        let tokens = record.in_tokens.saturating_add(record.out_tokens);
+        *deltas_by_date
             .entry(record.date.clone())
             .or_default()
-            .push(record);
+            .entry(record.model.clone())
+            .or_default() += tokens;
     }
 
     let mut cumulative: HashMap<String, u64> = HashMap::new();
+    let mut snapshots: Vec<(usize, HashMap<String, u64>)> = Vec::new();
+    for day_idx in 0..day_count {
+        let date = date_for_day(&min_date, &max_date, day_idx, day_count);
+        if let Some(deltas) = deltas_by_date.get(&date) {
+            for (model, tokens) in deltas {
+                *cumulative.entry(model.clone()).or_default() += *tokens;
+            }
+            snapshots.push((day_idx, cumulative.clone()));
+        }
+    }
+
     let mut frames = Vec::with_capacity(day_count);
     for day_idx in 0..day_count {
-        let date = if day_idx + 1 == day_count {
-            max_date.clone()
-        } else {
-            date_offset(&min_date, day_idx as i64).unwrap_or_else(|_| min_date.clone())
-        };
-
-        for record in records_by_date.get(&date).into_iter().flatten() {
-            let tokens = record.in_tokens.saturating_add(record.out_tokens);
-            *cumulative.entry(record.model.clone()).or_default() += tokens;
-        }
-
-        let mut entries: Vec<RaceEntry> = cumulative
-            .iter()
-            .filter(|(_, value)| **value > 0)
-            .map(|(model, value)| RaceEntry {
-                model: model.clone(),
-                value: *value,
-                color: color_map.get(model).copied().unwrap_or(Color::White),
-            })
-            .collect();
-        entries.sort_by(|left, right| {
-            right
-                .value
-                .cmp(&left.value)
-                .then_with(|| left.model.cmp(&right.model))
-        });
-        entries.truncate(RACE_VISIBLE_MODELS);
+        let date = date_for_day(&min_date, &max_date, day_idx, day_count);
+        let values = interpolated_race_values(day_idx, &snapshots);
+        let entries = race_entries(values, &color_map);
         frames.push(RaceFrame { date, entries });
     }
     frames
+}
+
+fn date_for_day(min_date: &str, max_date: &str, day_idx: usize, day_count: usize) -> String {
+    if day_idx + 1 == day_count {
+        max_date.to_string()
+    } else {
+        date_offset(min_date, day_idx as i64).unwrap_or_else(|_| min_date.to_string())
+    }
+}
+
+fn interpolated_race_values(
+    day_idx: usize,
+    snapshots: &[(usize, HashMap<String, u64>)],
+) -> HashMap<String, u64> {
+    let Some((first_idx, first_values)) = snapshots.first() else {
+        return HashMap::new();
+    };
+    if day_idx <= *first_idx {
+        return first_values.clone();
+    }
+
+    for window in snapshots.windows(2) {
+        let (previous_idx, previous_values) = &window[0];
+        let (next_idx, next_values) = &window[1];
+        if day_idx == *previous_idx {
+            return previous_values.clone();
+        }
+        if (*previous_idx..=*next_idx).contains(&day_idx) {
+            if day_idx == *next_idx {
+                return next_values.clone();
+            }
+            let span = (*next_idx - *previous_idx).max(1) as f64;
+            let tween = (day_idx - *previous_idx) as f64 / span;
+            return interpolate_race_values(previous_values, next_values, tween);
+        }
+    }
+
+    snapshots
+        .last()
+        .map(|(_, values)| values.clone())
+        .unwrap_or_default()
+}
+
+fn interpolate_race_values(
+    previous: &HashMap<String, u64>,
+    next: &HashMap<String, u64>,
+    tween: f64,
+) -> HashMap<String, u64> {
+    let models: HashSet<&String> = previous.keys().chain(next.keys()).collect();
+    models
+        .into_iter()
+        .map(|model| {
+            let from = previous.get(model).copied().unwrap_or(0);
+            let to = next.get(model).copied().unwrap_or(0);
+            (model.clone(), interpolate_u64(from, to, tween))
+        })
+        .collect()
+}
+
+fn race_entries(
+    values: HashMap<String, u64>,
+    color_map: &HashMap<String, Color>,
+) -> Vec<RaceEntry> {
+    let mut entries: Vec<RaceEntry> = values
+        .into_iter()
+        .filter(|(_, value)| *value > 0)
+        .map(|(model, value)| RaceEntry {
+            color: color_map.get(&model).copied().unwrap_or(Color::White),
+            model,
+            value,
+        })
+        .collect();
+    entries.sort_by(|left, right| {
+        right
+            .value
+            .cmp(&left.value)
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    entries.truncate(RACE_VISIBLE_MODELS);
+    entries
+}
+
+fn race_max_value(frames: &[RaceFrame]) -> u64 {
+    frames
+        .iter()
+        .flat_map(|frame| frame.entries.iter().map(|entry| entry.value))
+        .max()
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn all_time_date_range(records: &[UsageRecord]) -> Option<(String, String)> {
@@ -1369,7 +1442,7 @@ mod tests {
     }
 
     #[test]
-    fn race_frames_are_cumulative_and_include_empty_days() {
+    fn race_frames_interpolate_empty_days_between_cumulative_snapshots() {
         let records = vec![
             record("alpha", "2026-05-27", 100, 20),
             record("beta", "2026-05-29", 200, 0),
@@ -1384,6 +1457,8 @@ mod tests {
         assert_eq!(frames[1].date, "2026-05-28");
         assert_eq!(frames[1].entries[0].model, "alpha");
         assert_eq!(frames[1].entries[0].value, 120);
+        assert_eq!(frames[1].entries[1].model, "beta");
+        assert_eq!(frames[1].entries[1].value, 100);
         assert_eq!(frames[2].date, "2026-05-29");
         assert_eq!(frames[2].entries[0].model, "beta");
         assert_eq!(frames[2].entries[0].value, 200);
@@ -1407,6 +1482,19 @@ mod tests {
         assert_eq!(models.len(), RACE_VISIBLE_MODELS);
         assert_eq!(models.first(), Some(&"model-11"));
         assert_eq!(models.last(), Some(&"model-02"));
+    }
+
+    #[test]
+    fn race_max_value_uses_global_final_scale() {
+        let records = vec![
+            record("alpha", "2026-05-27", 100, 0),
+            record("beta", "2026-05-28", 1000, 0),
+        ];
+
+        let frames = race_frames(&records);
+
+        assert_eq!(frames[0].entries[0].value, 100);
+        assert_eq!(race_max_value(&frames), 1000);
     }
 
     #[test]

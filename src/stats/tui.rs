@@ -14,6 +14,8 @@ use std::time::Duration;
 use super::types::{Period, UsageRecord};
 use super::view::draw;
 
+const RACE_FRAME_DURATION: Duration = Duration::from_millis(83);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChartTab {
     Overview,
@@ -112,7 +114,7 @@ fn event_loop<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|f| draw(f, &mut app))?;
 
-        if !event::poll(Duration::from_millis(250))? {
+        if !event::poll(RACE_FRAME_DURATION)? {
             app.advance_race();
             continue;
         }
