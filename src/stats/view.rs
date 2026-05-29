@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use super::aggregate::{top_models_covering, totals_by_agent_model, totals_by_model};
 use super::date::{date_offset, days_diff};
 use super::format::{format_tokens, short_date};
-use super::tui::{ChartTab, FocusArea, StatsApp};
+use super::tui::{ChartTab, StatsApp};
 use super::types::{Period, UsageRecord, UsageTotals};
 use super::{MATRIX_AGENTS, PALETTE};
 
@@ -39,6 +39,7 @@ struct RaceEntry {
 struct RaceFrame {
     date: String,
     entries: Vec<RaceEntry>,
+    cells: HashMap<(String, String), UsageTotals>,
 }
 
 pub(super) fn draw(f: &mut ratatui::Frame, app: &mut StatsApp) {
@@ -57,8 +58,8 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &mut StatsApp) {
     draw_footer(f, chunks[2], app);
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: Rect, _app: &StatsApp) {
-    let title = Line::from(vec![
+fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
+    let mut spans = vec![
         Span::styled(
             " cx stats ",
             Style::default()
@@ -66,14 +67,22 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, _app: &StatsApp) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("· Token Usage Dashboard   "),
-        Span::styled(
-            " Models ",
+    ];
+    for tab in [ChartTab::Overview, ChartTab::Dynamicview] {
+        let style = if app.chart_tab == tab {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(format!(" {} ", tab.label()), style));
+        spans.push(Span::raw("  "));
+    }
+    let title = Line::from(spans);
 
     let block = Block::default().borders(Borders::BOTTOM);
     let p = Paragraph::new(title).block(block);
@@ -86,11 +95,13 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         Period::Last30 => "1 7d  [2] 30d  3 All",
         Period::All => "1 7d  2 30d  [3] All",
     };
-    let focus_hint = match app.focus {
-        FocusArea::Models => "↓ tabs   j/k scroll",
-        FocusArea::ChartTabs => "↑ models   Tab switch view",
+    let view_hint = match app.chart_tab {
+        ChartTab::Overview => "Overview",
+        ChartTab::Dynamicview => "Dynamicview · All time cumulative",
     };
-    let text = format!("{period_hint}   r cycle dates   {focus_hint}   q quit");
+    let text = format!(
+        "{period_hint}   r cycle dates   Tab switch view   ↑↓/j/k scroll   {view_hint}   q quit"
+    );
     let p = Paragraph::new(Line::from(Span::styled(
         text,
         Style::default().fg(Color::DarkGray),
@@ -109,11 +120,18 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         .split(area);
 
     match app.chart_tab {
-        ChartTab::Overview => draw_tokens_per_day_chart(f, chunks[0], app),
-        ChartTab::Funview => draw_bar_chart_race(f, chunks[0], app),
+        ChartTab::Overview => {
+            draw_tokens_per_day_chart(f, chunks[0], app);
+            draw_period_switch(f, chunks[1], app);
+            draw_overview_model_list(f, chunks[2], app);
+        }
+        ChartTab::Dynamicview => {
+            let frames = race_frames(&app.records);
+            draw_bar_chart_race(f, chunks[0], app, &frames);
+            draw_dynamic_context(f, chunks[1], app, &frames);
+            draw_dynamic_model_list(f, chunks[2], app, &frames);
+        }
     }
-    draw_chart_tabs(f, chunks[1], app);
-    draw_model_list(f, chunks[2], app);
 }
 
 fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
@@ -181,14 +199,13 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
     );
 }
 
-fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
+fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frames: &[RaceFrame]) {
     let chart_area = fixed_chart_area(area);
     if chart_area.width < 32 || chart_area.height < 6 {
         f.render_widget(Paragraph::new("Model Tokens Race · All time"), chart_area);
         return;
     }
 
-    let frames = race_frames(&app.records);
     if frames.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
             "  No data for bar chart race.",
@@ -484,23 +501,24 @@ fn race_frames(records: &[UsageRecord]) -> Vec<RaceFrame> {
     };
     let day_count = (days_diff(&min_date, &max_date).unwrap_or(0).max(0) + 1) as usize;
     let color_map = race_color_map(records);
-    let mut deltas_by_date: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    let mut deltas_by_date: HashMap<String, HashMap<(String, String), UsageTotals>> =
+        HashMap::new();
     for record in records {
-        let tokens = record.in_tokens.saturating_add(record.out_tokens);
-        *deltas_by_date
+        deltas_by_date
             .entry(record.date.clone())
             .or_default()
-            .entry(record.model.clone())
-            .or_default() += tokens;
+            .entry((record.agent.clone(), record.model.clone()))
+            .or_default()
+            .add_record(record);
     }
 
-    let mut cumulative: HashMap<String, u64> = HashMap::new();
-    let mut snapshots: Vec<(usize, HashMap<String, u64>)> = Vec::new();
+    let mut cumulative: HashMap<(String, String), UsageTotals> = HashMap::new();
+    let mut snapshots: Vec<(usize, HashMap<(String, String), UsageTotals>)> = Vec::new();
     for day_idx in 0..day_count {
         let date = date_for_day(&min_date, &max_date, day_idx, day_count);
         if let Some(deltas) = deltas_by_date.get(&date) {
-            for (model, tokens) in deltas {
-                *cumulative.entry(model.clone()).or_default() += *tokens;
+            for (key, usage) in deltas {
+                add_usage_totals(cumulative.entry(key.clone()).or_default(), usage);
             }
             snapshots.push((day_idx, cumulative.clone()));
         }
@@ -509,9 +527,14 @@ fn race_frames(records: &[UsageRecord]) -> Vec<RaceFrame> {
     let mut frames = Vec::with_capacity(day_count);
     for day_idx in 0..day_count {
         let date = date_for_day(&min_date, &max_date, day_idx, day_count);
-        let values = interpolated_race_values(day_idx, &snapshots);
-        let entries = race_entries(values, &color_map);
-        frames.push(RaceFrame { date, entries });
+        let cells = interpolated_race_cells(day_idx, &snapshots);
+        let totals = totals_by_model_from_cells(&cells);
+        let entries = race_entries(&totals, &color_map);
+        frames.push(RaceFrame {
+            date,
+            entries,
+            cells,
+        });
     }
     frames
 }
@@ -524,10 +547,10 @@ fn date_for_day(min_date: &str, max_date: &str, day_idx: usize, day_count: usize
     }
 }
 
-fn interpolated_race_values(
+fn interpolated_race_cells(
     day_idx: usize,
-    snapshots: &[(usize, HashMap<String, u64>)],
-) -> HashMap<String, u64> {
+    snapshots: &[(usize, HashMap<(String, String), UsageTotals>)],
+) -> HashMap<(String, String), UsageTotals> {
     let Some((first_idx, first_values)) = snapshots.first() else {
         return HashMap::new();
     };
@@ -547,7 +570,7 @@ fn interpolated_race_values(
             }
             let span = (*next_idx - *previous_idx).max(1) as f64;
             let tween = (day_idx - *previous_idx) as f64 / span;
-            return interpolate_race_values(previous_values, next_values, tween);
+            return interpolate_usage_cells(previous_values, next_values, tween);
         }
     }
 
@@ -557,33 +580,72 @@ fn interpolated_race_values(
         .unwrap_or_default()
 }
 
-fn interpolate_race_values(
-    previous: &HashMap<String, u64>,
-    next: &HashMap<String, u64>,
+fn interpolate_usage_cells(
+    previous: &HashMap<(String, String), UsageTotals>,
+    next: &HashMap<(String, String), UsageTotals>,
     tween: f64,
-) -> HashMap<String, u64> {
-    let models: HashSet<&String> = previous.keys().chain(next.keys()).collect();
-    models
-        .into_iter()
-        .map(|model| {
-            let from = previous.get(model).copied().unwrap_or(0);
-            let to = next.get(model).copied().unwrap_or(0);
-            (model.clone(), interpolate_u64(from, to, tween))
+) -> HashMap<(String, String), UsageTotals> {
+    let keys: HashSet<&(String, String)> = previous.keys().chain(next.keys()).collect();
+    keys.into_iter()
+        .map(|key| {
+            let from = previous.get(key).copied().unwrap_or_default();
+            let to = next.get(key).copied().unwrap_or_default();
+            (key.clone(), interpolate_usage_totals(from, to, tween))
         })
         .collect()
 }
 
+fn add_usage_totals(target: &mut UsageTotals, usage: &UsageTotals) {
+    target.in_tokens = target.in_tokens.saturating_add(usage.in_tokens);
+    target.total_tokens = target.total_tokens.saturating_add(usage.total_tokens);
+    target.out_tokens = target.out_tokens.saturating_add(usage.out_tokens);
+    target.cache_read_input_tokens = target
+        .cache_read_input_tokens
+        .saturating_add(usage.cache_read_input_tokens);
+    target.cache_creation_input_tokens = target
+        .cache_creation_input_tokens
+        .saturating_add(usage.cache_creation_input_tokens);
+}
+
+fn interpolate_usage_totals(from: UsageTotals, to: UsageTotals, tween: f64) -> UsageTotals {
+    UsageTotals {
+        in_tokens: interpolate_u64(from.in_tokens, to.in_tokens, tween),
+        total_tokens: interpolate_u64(from.total_tokens, to.total_tokens, tween),
+        out_tokens: interpolate_u64(from.out_tokens, to.out_tokens, tween),
+        cache_read_input_tokens: interpolate_u64(
+            from.cache_read_input_tokens,
+            to.cache_read_input_tokens,
+            tween,
+        ),
+        cache_creation_input_tokens: interpolate_u64(
+            from.cache_creation_input_tokens,
+            to.cache_creation_input_tokens,
+            tween,
+        ),
+    }
+}
+
+fn totals_by_model_from_cells(
+    cells: &HashMap<(String, String), UsageTotals>,
+) -> HashMap<String, UsageTotals> {
+    let mut totals: HashMap<String, UsageTotals> = HashMap::new();
+    for ((_, model), usage) in cells {
+        add_usage_totals(totals.entry(model.clone()).or_default(), usage);
+    }
+    totals
+}
+
 fn race_entries(
-    values: HashMap<String, u64>,
+    totals: &HashMap<String, UsageTotals>,
     color_map: &HashMap<String, Color>,
 ) -> Vec<RaceEntry> {
-    let mut entries: Vec<RaceEntry> = values
-        .into_iter()
-        .filter(|(_, value)| *value > 0)
-        .map(|(model, value)| RaceEntry {
-            color: color_map.get(&model).copied().unwrap_or(Color::White),
-            model,
-            value,
+    let mut entries: Vec<RaceEntry> = totals
+        .iter()
+        .filter(|(_, usage)| usage.total_tokens() > 0)
+        .map(|(model, usage)| RaceEntry {
+            color: color_map.get(model).copied().unwrap_or(Color::White),
+            model: model.clone(),
+            value: usage.total_tokens(),
         })
         .collect();
     entries.sort_by(|left, right| {
@@ -641,6 +703,22 @@ fn race_frame_index(tick: usize, frame_count: usize) -> usize {
     } else {
         (tick / RACE_TWEEN_STEPS) % frame_count
     }
+}
+
+fn current_race_frame<'a>(
+    app: &StatsApp,
+    frames: &'a [RaceFrame],
+) -> Option<(&'a RaceFrame, &'a RaceFrame, f64)> {
+    if frames.is_empty() {
+        return None;
+    }
+    let current_idx = race_frame_index(app.race_tick, frames.len());
+    let previous_idx = current_idx.saturating_sub(1);
+    Some((
+        &frames[previous_idx],
+        &frames[current_idx],
+        race_tween(app.race_tick),
+    ))
 }
 
 fn race_tween(tick: usize) -> f64 {
@@ -943,58 +1021,99 @@ fn chart_legend_max_width(datasets: &[ChartSeries]) -> u16 {
         .min(u16::MAX as usize) as u16
 }
 
-fn draw_chart_tabs(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
+fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let mut spans: Vec<Span> = Vec::new();
-    if app.focus == FocusArea::ChartTabs {
-        spans.push(Span::styled("▸ ", Style::default().fg(Color::LightCyan)));
-    } else {
-        spans.push(Span::raw("  "));
-    }
-
-    for (i, tab) in [ChartTab::Overview, ChartTab::Funview].iter().enumerate() {
+    for (i, p) in [Period::Last7, Period::Last30, Period::All]
+        .iter()
+        .enumerate()
+    {
         if i > 0 {
             spans.push(Span::raw(" · "));
         }
-        let style = if app.chart_tab == *tab {
+        let style = if app.period == *p {
             Style::default()
-                .fg(Color::LightCyan)
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default().fg(Color::Gray)
         };
-        spans.push(Span::styled(tab.label(), style));
-    }
-
-    if app.chart_tab == ChartTab::Overview {
-        spans.push(Span::styled(
-            format!("   ·   {}", app.period.label()),
-            Style::default().fg(Color::DarkGray),
-        ));
-    } else {
-        spans.push(Span::styled(
-            "   ·   All time cumulative tokens",
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled(p.label().to_string(), style));
     }
     let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
 
-fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
+fn draw_dynamic_context(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frames: &[RaceFrame]) {
+    let text = current_race_frame(app, frames)
+        .map(|(_, current, _)| {
+            format!("All time cumulative tokens · {}", short_date(&current.date))
+        })
+        .unwrap_or_else(|| "All time cumulative tokens".to_string());
+    let spans = vec![Span::styled(text, Style::default().fg(Color::DarkGray))];
+    let p = Paragraph::new(Line::from(spans));
+    f.render_widget(p, area);
+}
+
+fn draw_overview_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     let records = app.period_records();
     let cells = totals_by_agent_model(&records);
     let totals = totals_by_model(&records);
+    draw_model_table(f, area, app, "Models", cells, totals, None);
+}
+
+fn draw_dynamic_model_list(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut StatsApp,
+    frames: &[RaceFrame],
+) {
+    let Some((previous, current, tween)) = current_race_frame(app, frames) else {
+        draw_model_table(
+            f,
+            area,
+            app,
+            "Dynamic Models",
+            HashMap::new(),
+            HashMap::new(),
+            None,
+        );
+        return;
+    };
+    let displayed_cells =
+        interpolate_usage_cells(&previous.cells, &current.cells, smoothstep(tween));
+    let displayed_totals = totals_by_model_from_cells(&displayed_cells);
+    let color_map = race_color_map(&app.records);
+    draw_model_table(
+        f,
+        area,
+        app,
+        "Dynamic Models",
+        displayed_cells,
+        displayed_totals,
+        Some(&color_map),
+    );
+}
+
+fn draw_model_table(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut StatsApp,
+    title_prefix: &str,
+    cells: HashMap<(String, String), UsageTotals>,
+    totals: HashMap<String, UsageTotals>,
+    color_map: Option<&HashMap<String, Color>>,
+) {
     let total_all: u64 = totals.values().map(|usage| usage.total_tokens()).sum();
 
     if totals.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
-            "  No models in selected period.",
+            "  No models to display.",
             Style::default().fg(Color::DarkGray),
         )))
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(model_list_title(app.focus, "Models".to_string())),
+                .title(format!(" {title_prefix} ")),
         );
         f.render_widget(p, area);
         return;
@@ -1021,7 +1140,9 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             } else {
                 0.0
             };
-            let dot_color = PALETTE[idx % PALETTE.len()];
+            let dot_color = color_map
+                .and_then(|colors| colors.get(model).copied())
+                .unwrap_or(PALETTE[idx % PALETTE.len()]);
             let mut row_cells = vec![
                 Cell::from(Span::styled(
                     model.clone(),
@@ -1084,20 +1205,12 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     let widths = model_table_widths(area.width, &sorted, &cells, &agent_columns);
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
-    let title = model_list_title(app.focus, format!("Models · {} of {}", shown, sorted.len()));
+    let title = format!(" {title_prefix} · {} of {} ", shown, sorted.len());
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(TABLE_COLUMN_SPACING)
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
-}
-
-fn model_list_title(focus: FocusArea, title: String) -> String {
-    if focus == FocusArea::Models {
-        format!(" ▸ {title} ")
-    } else {
-        format!(" {title} ")
-    }
 }
 
 fn usage_cell_text(usage: &UsageTotals) -> String {
@@ -1217,8 +1330,18 @@ mod tests {
     }
 
     fn record(model: &str, date: &str, in_tokens: u64, out_tokens: u64) -> UsageRecord {
+        agent_record("claude", model, date, in_tokens, out_tokens)
+    }
+
+    fn agent_record(
+        agent: &str,
+        model: &str,
+        date: &str,
+        in_tokens: u64,
+        out_tokens: u64,
+    ) -> UsageRecord {
         UsageRecord {
-            agent: "claude".to_string(),
+            agent: agent.to_string(),
             model: model.to_string(),
             date: date.to_string(),
             in_tokens,
@@ -1495,6 +1618,26 @@ mod tests {
 
         assert_eq!(frames[0].entries[0].value, 100);
         assert_eq!(race_max_value(&frames), 1000);
+    }
+
+    #[test]
+    fn race_frames_keep_agent_cells_for_dynamic_table() {
+        let records = vec![
+            agent_record("claude", "alpha", "2026-05-27", 100, 0),
+            agent_record("codex", "beta", "2026-05-28", 300, 0),
+        ];
+
+        let frames = race_frames(&records);
+
+        assert_eq!(
+            frames[0]
+                .cells
+                .get(&("claude".to_string(), "alpha".to_string()))
+                .map(|usage| usage.total_tokens()),
+            Some(100)
+        );
+        assert_eq!(sorted_agents_by_usage(&frames[0].cells)[0], ("claude", "Claude Code"));
+        assert_eq!(sorted_agents_by_usage(&frames[1].cells)[0], ("codex", "Codex"));
     }
 
     #[test]

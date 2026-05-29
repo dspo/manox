@@ -19,29 +19,23 @@ const RACE_FRAME_DURATION: Duration = Duration::from_millis(83);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChartTab {
     Overview,
-    Funview,
+    Dynamicview,
 }
 
 impl ChartTab {
     pub(super) fn label(self) -> &'static str {
         match self {
             ChartTab::Overview => "Overview",
-            ChartTab::Funview => "Funview",
+            ChartTab::Dynamicview => "Dynamicview",
         }
     }
 
     fn next(self) -> Self {
         match self {
-            ChartTab::Overview => ChartTab::Funview,
-            ChartTab::Funview => ChartTab::Overview,
+            ChartTab::Overview => ChartTab::Dynamicview,
+            ChartTab::Dynamicview => ChartTab::Overview,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FocusArea {
-    Models,
-    ChartTabs,
 }
 
 pub(super) struct StatsApp {
@@ -50,7 +44,6 @@ pub(super) struct StatsApp {
     pub(super) period: Period,
     pub(super) models_scroll: usize,
     pub(super) chart_tab: ChartTab,
-    pub(super) focus: FocusArea,
     pub(super) race_tick: usize,
 }
 
@@ -62,7 +55,6 @@ impl StatsApp {
             period: Period::Last7,
             models_scroll: 0,
             chart_tab: ChartTab::Overview,
-            focus: FocusArea::Models,
             race_tick: 0,
         }
     }
@@ -76,14 +68,15 @@ impl StatsApp {
     }
 
     fn advance_race(&mut self) {
-        if self.chart_tab == ChartTab::Funview {
+        if self.chart_tab == ChartTab::Dynamicview {
             self.race_tick = self.race_tick.saturating_add(1);
         }
     }
 
     fn cycle_chart_tab(&mut self) {
         self.chart_tab = self.chart_tab.next();
-        if self.chart_tab == ChartTab::Funview {
+        self.models_scroll = 0;
+        if self.chart_tab == ChartTab::Dynamicview {
             self.race_tick = 0;
         }
     }
@@ -130,13 +123,13 @@ fn event_loop<B: ratatui::backend::Backend>(
             KeyCode::Char('2') => app.period = Period::Last30,
             KeyCode::Char('3') => app.period = Period::All,
             KeyCode::Char('r') => app.period = app.period.cycle(),
-            KeyCode::Down => app.focus = FocusArea::ChartTabs,
-            KeyCode::Up => app.focus = FocusArea::Models,
-            KeyCode::Tab | KeyCode::BackTab if app.focus == FocusArea::ChartTabs => {
-                app.cycle_chart_tab()
+            KeyCode::Tab | KeyCode::BackTab => app.cycle_chart_tab(),
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.models_scroll = app.models_scroll.saturating_add(1)
             }
-            KeyCode::Char('j') => app.models_scroll = app.models_scroll.saturating_add(1),
-            KeyCode::Char('k') => app.models_scroll = app.models_scroll.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.models_scroll = app.models_scroll.saturating_sub(1)
+            }
             _ => {}
         }
     }
