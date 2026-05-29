@@ -28,7 +28,9 @@ const X_TICK_MIN_COUNT: usize = 6;
 const RACE_VISIBLE_MODELS: usize = 10;
 const RACE_TWEEN_STEPS: usize = 12;
 const RACE_FINAL_HOLD_TICKS: usize = RACE_TWEEN_STEPS * 3;
-const RACE_FINAL_FADE_TICKS: usize = RACE_TWEEN_STEPS;
+const RACE_FINAL_DISSOLVE_TICKS: usize = RACE_TWEEN_STEPS * 2;
+const RACE_INITIAL_COALESCE_TICKS: usize = RACE_TWEEN_STEPS * 2;
+const RACE_TRANSITION_SEED: u32 = 0x1234_5678;
 
 #[derive(Debug, Clone)]
 struct RaceEntry {
@@ -43,6 +45,26 @@ struct RaceFrame {
     date: String,
     entries: Vec<RaceEntry>,
     cells: HashMap<(String, String), UsageTotals>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RacePhase {
+    Playing {
+        previous_idx: usize,
+        current_idx: usize,
+        tween: f64,
+    },
+    HoldingLast {
+        idx: usize,
+    },
+    DissolvingLast {
+        idx: usize,
+        progress: f64,
+    },
+    CoalescingFirst {
+        idx: usize,
+        progress: f64,
+    },
 }
 
 pub(super) fn draw(f: &mut ratatui::Frame, app: &mut StatsApp) {
@@ -133,9 +155,13 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                 .constraints([Constraint::Length(STEP_CHART_HEIGHT), Constraint::Min(0)])
                 .split(area);
             let frames = race_frames(&app.records);
-            let fade = race_fade(app.race_tick, frames.len());
             draw_bar_chart_race(f, chunks[0], app, &frames);
-            draw_dynamic_model_list(f, chunks[1], app, &frames, fade);
+            draw_dynamic_model_list(f, chunks[1], app, &frames);
+            apply_dynamicview_transition(
+                f.buffer_mut(),
+                area,
+                race_phase(app.race_tick, frames.len()),
+            );
         }
     }
 }
@@ -222,15 +248,11 @@ fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frame
         return;
     }
 
-    let current_idx = race_frame_index(app.race_tick, frames.len());
-    let previous_idx = current_idx.saturating_sub(1);
-    let current = &frames[current_idx];
-    let previous = &frames[previous_idx];
-    let tween = race_tween(app.race_tick, frames.len());
-    let fade = race_fade(app.race_tick, frames.len());
+    let Some((previous, current, tween)) = current_race_frame(app, frames) else {
+        return;
+    };
     let max_value = race_max_value(&frames);
-
-    draw_race_frame(f, chart_area, previous, current, tween, fade, max_value);
+    draw_race_frame(f, chart_area, previous, current, tween, max_value);
 }
 
 fn draw_race_frame(
@@ -239,20 +261,19 @@ fn draw_race_frame(
     previous: &RaceFrame,
     current: &RaceFrame,
     tween: f64,
-    fade: f64,
     max_value: u64,
 ) {
     let title = Line::from(vec![
         Span::styled(
             " Model Tokens Race · All time ",
             Style::default()
-                .fg(fade_color(Color::White, fade))
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             short_date(&current.date),
             Style::default()
-                .fg(fade_color(Color::LightYellow, fade))
+                .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
         ),
     ]);
@@ -265,7 +286,7 @@ fn draw_race_frame(
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "  Waiting for the first model token usage...",
-                Style::default().fg(fade_color(Color::DarkGray, fade)),
+                Style::default().fg(Color::DarkGray),
             ))),
             Rect::new(
                 chart_area.x,
@@ -343,9 +364,8 @@ fn draw_race_frame(
             .max(if total_tokens > 0 { 1.0 } else { 0.0 }) as u16;
         let label = truncate_text(&entry.model, model_width);
         let value_label = usage_cell_text(&usage);
-        let style = Style::default().fg(fade_color(entry.color, fade));
+        let style = Style::default().fg(entry.color);
         let buf = f.buffer_mut();
-
         buf.set_string(chart_area.x, row, label, style.add_modifier(Modifier::BOLD));
         if bar_len > 0 {
             buf.set_string(
@@ -359,7 +379,7 @@ fn draw_race_frame(
             bar_right + 2,
             row,
             value_label,
-            Style::default().fg(fade_color(Color::DarkGray, fade)),
+            Style::default().fg(Color::DarkGray),
         );
     }
 }
@@ -705,16 +725,16 @@ fn race_color_map(records: &[UsageRecord]) -> HashMap<String, Color> {
         .collect()
 }
 
+#[cfg(test)]
 fn race_frame_index(tick: usize, frame_count: usize) -> usize {
     if frame_count == 0 {
         0
     } else {
-        let cycle_tick = race_cycle_tick(tick, frame_count);
-        let frame_ticks = frame_count.saturating_mul(RACE_TWEEN_STEPS);
-        if cycle_tick >= frame_ticks {
-            frame_count - 1
-        } else {
-            cycle_tick / RACE_TWEEN_STEPS
+        match race_phase(tick, frame_count) {
+            RacePhase::Playing { current_idx, .. } => current_idx,
+            RacePhase::HoldingLast { idx }
+            | RacePhase::DissolvingLast { idx, .. }
+            | RacePhase::CoalescingFirst { idx, .. } => idx,
         }
     }
 }
@@ -726,7 +746,8 @@ fn race_cycle_tick(tick: usize, frame_count: usize) -> usize {
     let frame_ticks = frame_count.saturating_mul(RACE_TWEEN_STEPS);
     let cycle_ticks = frame_ticks
         .saturating_add(RACE_FINAL_HOLD_TICKS)
-        .saturating_add(RACE_FINAL_FADE_TICKS);
+        .saturating_add(RACE_FINAL_DISSOLVE_TICKS)
+        .saturating_add(RACE_INITIAL_COALESCE_TICKS);
     tick % cycle_ticks
 }
 
@@ -737,85 +758,132 @@ fn current_race_frame<'a>(
     if frames.is_empty() {
         return None;
     }
-    let current_idx = race_frame_index(app.race_tick, frames.len());
-    let previous_idx = current_idx.saturating_sub(1);
-    Some((
-        &frames[previous_idx],
-        &frames[current_idx],
-        race_tween(app.race_tick, frames.len()),
-    ))
+    match race_phase(app.race_tick, frames.len()) {
+        RacePhase::Playing {
+            previous_idx,
+            current_idx,
+            tween,
+        } => Some((&frames[previous_idx], &frames[current_idx], tween)),
+        RacePhase::HoldingLast { idx }
+        | RacePhase::DissolvingLast { idx, .. }
+        | RacePhase::CoalescingFirst { idx, .. } => Some((&frames[idx], &frames[idx], 1.0)),
+    }
 }
 
+#[cfg(test)]
 fn race_tween(tick: usize, frame_count: usize) -> f64 {
+    match race_phase(tick, frame_count) {
+        RacePhase::Playing { tween, .. } => tween,
+        RacePhase::HoldingLast { .. }
+        | RacePhase::DissolvingLast { .. }
+        | RacePhase::CoalescingFirst { .. } => 1.0,
+    }
+}
+
+fn race_phase(tick: usize, frame_count: usize) -> RacePhase {
     if frame_count == 0 {
-        return 0.0;
+        return RacePhase::HoldingLast { idx: 0 };
     }
     let cycle_tick = race_cycle_tick(tick, frame_count);
     let frame_ticks = frame_count.saturating_mul(RACE_TWEEN_STEPS);
-    if cycle_tick >= frame_ticks {
-        1.0
-    } else {
-        (cycle_tick % RACE_TWEEN_STEPS) as f64 / RACE_TWEEN_STEPS as f64
+    if cycle_tick < frame_ticks {
+        let current_idx = cycle_tick / RACE_TWEEN_STEPS;
+        return RacePhase::Playing {
+            previous_idx: current_idx.saturating_sub(1),
+            current_idx,
+            tween: (cycle_tick % RACE_TWEEN_STEPS) as f64 / RACE_TWEEN_STEPS as f64,
+        };
+    }
+
+    let last_idx = frame_count - 1;
+    let hold_end = frame_ticks.saturating_add(RACE_FINAL_HOLD_TICKS);
+    if cycle_tick < hold_end {
+        return RacePhase::HoldingLast { idx: last_idx };
+    }
+
+    let dissolve_end = hold_end.saturating_add(RACE_FINAL_DISSOLVE_TICKS);
+    if cycle_tick < dissolve_end {
+        let progress =
+            ((cycle_tick - hold_end + 1) as f64 / RACE_FINAL_DISSOLVE_TICKS as f64).clamp(0.0, 1.0);
+        return RacePhase::DissolvingLast {
+            idx: last_idx,
+            progress: smoothstep(progress),
+        };
+    }
+
+    let progress = ((cycle_tick - dissolve_end + 1) as f64 / RACE_INITIAL_COALESCE_TICKS as f64)
+        .clamp(0.0, 1.0);
+    RacePhase::CoalescingFirst {
+        idx: 0,
+        progress: smoothstep(progress),
     }
 }
 
-fn race_fade(tick: usize, frame_count: usize) -> f64 {
-    if frame_count == 0 {
-        return 0.0;
+fn apply_dynamicview_transition(buf: &mut Buffer, area: Rect, phase: RacePhase) {
+    match phase {
+        RacePhase::DissolvingLast { progress, .. } => {
+            apply_transition_mask(buf, area, progress, TransitionMask::Dissolve);
+        }
+        RacePhase::CoalescingFirst { progress, .. } => {
+            apply_transition_mask(buf, area, progress, TransitionMask::Coalesce);
+        }
+        RacePhase::Playing { .. } | RacePhase::HoldingLast { .. } => {}
     }
-    let cycle_tick = race_cycle_tick(tick, frame_count);
-    let fade_start = frame_count
-        .saturating_mul(RACE_TWEEN_STEPS)
-        .saturating_add(RACE_FINAL_HOLD_TICKS);
-    if cycle_tick < fade_start {
-        0.0
-    } else {
-        ((cycle_tick - fade_start + 1) as f64 / RACE_FINAL_FADE_TICKS as f64).clamp(0.0, 1.0)
+}
+
+fn apply_transition_mask(buf: &mut Buffer, area: Rect, progress: f64, mask: TransitionMask) {
+    let mut rng = TransitionRng::new(RACE_TRANSITION_SEED);
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let threshold = rng.gen_f32() as f64;
+            let clear = match mask {
+                TransitionMask::Dissolve => progress >= threshold,
+                TransitionMask::Coalesce => progress < threshold,
+            };
+            if clear {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_char(' ');
+                    cell.set_style(Style::default());
+                }
+            }
+        }
+    }
+}
+
+enum TransitionMask {
+    Dissolve,
+    Coalesce,
+}
+
+// SplitMix32 matches tachyonfx's SimpleRng so the transition mask behaves like the referenced effect.
+#[derive(Clone, Copy)]
+struct TransitionRng {
+    state: u32,
+}
+
+impl TransitionRng {
+    fn new(seed: u32) -> Self {
+        Self { state: seed }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state = self.state.wrapping_add(0x9E3779B9);
+        let mut z = self.state;
+        z = (z ^ (z >> 15)).wrapping_mul(0x85EBCA6B);
+        z = (z ^ (z >> 13)).wrapping_mul(0xC2B2AE35);
+        z ^ (z >> 16)
+    }
+
+    fn gen_f32(&mut self) -> f32 {
+        const EXPONENT: u32 = 0x3f80_0000;
+        let mantissa = self.next_u32() >> 9;
+        f32::from_bits(EXPONENT | mantissa) - 1.0
     }
 }
 
 fn smoothstep(value: f64) -> f64 {
     let value = value.clamp(0.0, 1.0);
     value * value * (3.0 - 2.0 * value)
-}
-
-fn fade_color(color: Color, fade: f64) -> Color {
-    let fade = fade.clamp(0.0, 1.0);
-    if fade <= f64::EPSILON {
-        return color;
-    }
-    let Some((red, green, blue)) = color_rgb(color) else {
-        return color;
-    };
-    let keep = 1.0 - fade;
-    Color::Rgb(
-        (f64::from(red) * keep).round() as u8,
-        (f64::from(green) * keep).round() as u8,
-        (f64::from(blue) * keep).round() as u8,
-    )
-}
-
-fn color_rgb(color: Color) -> Option<(u8, u8, u8)> {
-    match color {
-        Color::Black => Some((0, 0, 0)),
-        Color::Red => Some((205, 49, 49)),
-        Color::Green => Some((13, 188, 121)),
-        Color::Yellow => Some((229, 229, 16)),
-        Color::Blue => Some((36, 114, 200)),
-        Color::Magenta => Some((188, 63, 188)),
-        Color::Cyan => Some((17, 168, 205)),
-        Color::Gray => Some((229, 229, 229)),
-        Color::DarkGray => Some((102, 102, 102)),
-        Color::LightRed => Some((241, 76, 76)),
-        Color::LightGreen => Some((35, 209, 139)),
-        Color::LightYellow => Some((245, 245, 67)),
-        Color::LightBlue => Some((59, 142, 234)),
-        Color::LightMagenta => Some((214, 112, 214)),
-        Color::LightCyan => Some((41, 184, 219)),
-        Color::White => Some((255, 255, 255)),
-        Color::Rgb(red, green, blue) => Some((red, green, blue)),
-        Color::Indexed(_) | Color::Reset => None,
-    }
 }
 
 fn interpolate_u64(from: u64, to: u64, tween: f64) -> u64 {
@@ -1135,7 +1203,7 @@ fn draw_overview_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsA
     let records = app.period_records();
     let cells = totals_by_agent_model(&records);
     let totals = totals_by_model(&records);
-    draw_model_table(f, area, app, "Models", cells, totals, None, false, 0.0);
+    draw_model_table(f, area, app, "Models", cells, totals, None, false);
 }
 
 fn draw_dynamic_model_list(
@@ -1143,7 +1211,6 @@ fn draw_dynamic_model_list(
     area: Rect,
     app: &mut StatsApp,
     frames: &[RaceFrame],
-    fade: f64,
 ) {
     let Some((previous, current, tween)) = current_race_frame(app, frames) else {
         draw_model_table(
@@ -1155,7 +1222,6 @@ fn draw_dynamic_model_list(
             HashMap::new(),
             None,
             true,
-            0.0,
         );
         return;
     };
@@ -1167,12 +1233,11 @@ fn draw_dynamic_model_list(
         f,
         area,
         app,
-        "Dynamic Models",
+        "Dynamic Model Rankings",
         displayed_cells,
         displayed_totals,
         Some(&color_map),
         true,
-        fade,
     );
 }
 
@@ -1185,7 +1250,6 @@ fn draw_model_table(
     totals: HashMap<String, UsageTotals>,
     color_map: Option<&HashMap<String, Color>>,
     hide_empty_agents: bool,
-    fade: f64,
 ) {
     let total_all: u64 = totals.values().map(|usage| usage.total_tokens()).sum();
 
@@ -1230,32 +1294,25 @@ fn draw_model_table(
             let mut row_cells = vec![
                 Cell::from(Span::styled(
                     model.clone(),
-                    Style::default()
-                        .fg(fade_color(dot_color, fade))
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
                 )),
                 Cell::from(Span::styled(
                     format!("{:.1}%", pct),
-                    Style::default().fg(fade_color(Color::DarkGray, fade)),
+                    Style::default().fg(Color::DarkGray),
                 )),
-                usage_cell(usage, fade),
+                usage_cell(usage),
             ];
             for (agent, _) in &agent_columns {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
-                    Some(usage) => usage_cell(usage, fade),
-                    None => Cell::from(Span::styled(
-                        "—",
-                        Style::default().fg(fade_color(Color::DarkGray, fade)),
-                    )),
+                    Some(usage) => usage_cell(usage),
+                    None => Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
                 };
                 row_cells.push(cell);
             }
             let row_style = if idx % 2 == 0 {
                 Style::default()
-            } else if fade <= f64::EPSILON {
-                Style::default().bg(STRIPED_ROW_BG)
             } else {
-                Style::default().bg(fade_color(STRIPED_ROW_BG, fade))
+                Style::default().bg(STRIPED_ROW_BG)
             };
             Row::new(row_cells).style(row_style)
         })
@@ -1265,19 +1322,19 @@ fn draw_model_table(
         Cell::from(Span::styled(
             "Model",
             Style::default()
-                .fg(fade_color(Color::White, fade))
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
         Cell::from(Span::styled(
             "Share",
             Style::default()
-                .fg(fade_color(Color::White, fade))
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
         Cell::from(Span::styled(
             "Total",
             Style::default()
-                .fg(fade_color(Color::White, fade))
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
     ]
@@ -1286,7 +1343,7 @@ fn draw_model_table(
         Cell::from(Span::styled(
             *label,
             Style::default()
-                .fg(fade_color(Color::LightCyan, fade))
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD),
         ))
     }))
@@ -1304,16 +1361,8 @@ fn draw_model_table(
     f.render_widget(table, area);
 }
 
-fn usage_cell(usage: &UsageTotals, fade: f64) -> Cell<'static> {
-    let text = usage_cell_text(usage);
-    if fade <= f64::EPSILON {
-        Cell::from(text)
-    } else {
-        Cell::from(Span::styled(
-            text,
-            Style::default().fg(fade_color(Color::Gray, fade)),
-        ))
-    }
+fn usage_cell(usage: &UsageTotals) -> Cell<'static> {
+    Cell::from(usage_cell_text(usage))
 }
 
 fn usage_cell_text(usage: &UsageTotals) -> String {
@@ -1758,42 +1807,94 @@ mod tests {
     #[test]
     fn race_frame_index_advances_by_tween_steps() {
         let frame_ticks = RACE_TWEEN_STEPS * 3;
-        let cycle_ticks = frame_ticks + RACE_FINAL_HOLD_TICKS + RACE_FINAL_FADE_TICKS;
+        let cycle_ticks = frame_ticks
+            + RACE_FINAL_HOLD_TICKS
+            + RACE_FINAL_DISSOLVE_TICKS
+            + RACE_INITIAL_COALESCE_TICKS;
 
         assert_eq!(race_frame_index(0, 3), 0);
         assert_eq!(race_frame_index(RACE_TWEEN_STEPS - 1, 3), 0);
         assert_eq!(race_frame_index(RACE_TWEEN_STEPS, 3), 1);
         assert_eq!(race_frame_index(frame_ticks, 3), 2);
-        assert_eq!(race_frame_index(cycle_ticks - 1, 3), 2);
+        assert_eq!(
+            race_frame_index(
+                frame_ticks + RACE_FINAL_HOLD_TICKS + RACE_FINAL_DISSOLVE_TICKS - 1,
+                3
+            ),
+            2
+        );
+        assert_eq!(race_frame_index(cycle_ticks - 1, 3), 0);
         assert_eq!(race_frame_index(cycle_ticks, 3), 0);
     }
 
     #[test]
-    fn race_tween_reaches_final_value_during_final_hold_and_fade() {
+    fn race_tween_reaches_final_value_during_final_hold_and_transition() {
         let frame_ticks = RACE_TWEEN_STEPS * 3;
-        let cycle_ticks = frame_ticks + RACE_FINAL_HOLD_TICKS + RACE_FINAL_FADE_TICKS;
+        let cycle_ticks = frame_ticks
+            + RACE_FINAL_HOLD_TICKS
+            + RACE_FINAL_DISSOLVE_TICKS
+            + RACE_INITIAL_COALESCE_TICKS;
 
         assert_eq!(race_tween(frame_ticks, 3), 1.0);
         assert_eq!(race_tween(cycle_ticks - 1, 3), 1.0);
     }
 
     #[test]
-    fn race_fade_starts_after_final_hold() {
+    fn race_phase_transitions_from_hold_to_dissolve_to_coalesce() {
         let frame_ticks = RACE_TWEEN_STEPS * 3;
-        let fade_start = frame_ticks + RACE_FINAL_HOLD_TICKS;
-        let cycle_ticks = fade_start + RACE_FINAL_FADE_TICKS;
+        let dissolve_start = frame_ticks + RACE_FINAL_HOLD_TICKS;
+        let coalesce_start = dissolve_start + RACE_FINAL_DISSOLVE_TICKS;
 
-        assert_eq!(race_fade(frame_ticks, 3), 0.0);
-        assert_eq!(race_fade(fade_start - 1, 3), 0.0);
-        assert!(race_fade(fade_start, 3) > 0.0);
-        assert_eq!(race_fade(cycle_ticks - 1, 3), 1.0);
-        assert_eq!(race_fade(cycle_ticks, 3), 0.0);
+        assert!(matches!(
+            race_phase(frame_ticks, 3),
+            RacePhase::HoldingLast { idx: 2 }
+        ));
+        assert!(matches!(
+            race_phase(dissolve_start - 1, 3),
+            RacePhase::HoldingLast { idx: 2 }
+        ));
+        assert!(matches!(
+            race_phase(dissolve_start, 3),
+            RacePhase::DissolvingLast { idx: 2, progress } if progress > 0.0
+        ));
+        assert!(matches!(
+            race_phase(coalesce_start, 3),
+            RacePhase::CoalescingFirst { idx: 0, progress } if progress > 0.0
+        ));
     }
 
     #[test]
-    fn fade_color_dims_to_black() {
-        assert_eq!(fade_color(Color::LightYellow, 0.0), Color::LightYellow);
-        assert_eq!(fade_color(Color::LightYellow, 1.0), Color::Rgb(0, 0, 0));
+    fn dissolve_mask_clears_all_cells_at_full_progress() {
+        let area = Rect::new(0, 0, 4, 2);
+        let mut buf = Buffer::empty(area);
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                buf.cell_mut((x, y))
+                    .expect("cell should be in bounds")
+                    .set_char('x');
+            }
+        }
+
+        apply_transition_mask(&mut buf, area, 1.0, TransitionMask::Dissolve);
+
+        assert!(buf.content().iter().all(|cell| cell.symbol() == " "));
+    }
+
+    #[test]
+    fn coalesce_mask_keeps_cells_visible_at_full_progress() {
+        let area = Rect::new(0, 0, 4, 2);
+        let mut buf = Buffer::empty(area);
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                buf.cell_mut((x, y))
+                    .expect("cell should be in bounds")
+                    .set_char('x');
+            }
+        }
+
+        apply_transition_mask(&mut buf, area, 1.0, TransitionMask::Coalesce);
+
+        assert!(buf.content().iter().all(|cell| cell.symbol() == "x"));
     }
 
     #[test]
