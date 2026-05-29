@@ -18,9 +18,7 @@ type ChartSeries = (String, Vec<f64>, Color);
 type ChartOccupancy = HashSet<(u16, u16)>;
 
 const MODEL_MIN_WIDTH: u16 = 18;
-const SHARE_WIDTH: u16 = 8;
-const TOTAL_WIDTH: u16 = 18;
-const AGENT_WIDTH: u16 = 18;
+const SHARE_WIDTH: u16 = 6;
 const TABLE_COLUMN_SPACING: u16 = 1;
 const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
 const STEP_CHART_MAX_WIDTH: u16 = 78;
@@ -579,19 +577,11 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                     format!("{:.1}%", pct),
                     Style::default().fg(Color::DarkGray),
                 )),
-                Cell::from(format!(
-                    "↑{} ↓{}",
-                    format_tokens(usage.in_tokens),
-                    format_tokens(usage.out_tokens)
-                )),
+                Cell::from(usage_cell_text(usage)),
             ];
             for (agent, _) in MATRIX_AGENTS {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
-                    Some(usage) => Cell::from(format!(
-                        "↑{} ↓{}",
-                        format_tokens(usage.in_tokens),
-                        format_tokens(usage.out_tokens)
-                    )),
+                    Some(usage) => Cell::from(usage_cell_text(usage)),
                     None => Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
                 };
                 row_cells.push(cell);
@@ -637,24 +627,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     .collect();
     let header = Row::new(header_cells);
 
-    let column_count = (3 + MATRIX_AGENTS.len()) as u16;
-    let inner_width = area.width.saturating_sub(2);
-    let non_model_width = SHARE_WIDTH + TOTAL_WIDTH + AGENT_WIDTH * MATRIX_AGENTS.len() as u16;
-    let spacing_width = TABLE_COLUMN_SPACING * column_count.saturating_sub(1);
-    let model_width = inner_width
-        .saturating_sub(non_model_width + spacing_width)
-        .max(MODEL_MIN_WIDTH);
-
-    let mut widths = vec![
-        Constraint::Length(model_width),
-        Constraint::Length(SHARE_WIDTH),
-        Constraint::Length(TOTAL_WIDTH),
-    ];
-    widths.extend(
-        MATRIX_AGENTS
-            .iter()
-            .map(|_| Constraint::Length(AGENT_WIDTH)),
-    );
+    let widths = model_table_widths(area.width, &sorted, &cells);
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
     let title = format!(" Models · {} of {} ", shown, sorted.len());
@@ -665,9 +638,80 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     f.render_widget(table, area);
 }
 
+fn usage_cell_text(usage: &UsageTotals) -> String {
+    format!(
+        "↑{} ↓{}",
+        format_tokens(usage.in_tokens),
+        format_tokens(usage.out_tokens)
+    )
+}
+
+fn text_width(text: &str) -> u16 {
+    text.chars().count().min(u16::MAX as usize) as u16
+}
+
+fn usage_column_width<'a, I>(header: &str, usages: I) -> u16
+where
+    I: IntoIterator<Item = &'a UsageTotals>,
+{
+    usages
+        .into_iter()
+        .map(|usage| text_width(&usage_cell_text(usage)))
+        .fold(text_width(header), u16::max)
+}
+
+fn model_table_widths(
+    area_width: u16,
+    sorted: &[(String, UsageTotals)],
+    cells: &HashMap<(String, String), UsageTotals>,
+) -> Vec<Constraint> {
+    let total_width = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
+    let agent_widths: Vec<u16> = MATRIX_AGENTS
+        .iter()
+        .map(|(agent, label)| {
+            let agent = (*agent).to_string();
+            let usages = sorted
+                .iter()
+                .filter_map(|(model, _)| cells.get(&(agent.clone(), model.clone())));
+            usage_column_width(label, usages)
+        })
+        .collect();
+
+    let column_count = (3 + MATRIX_AGENTS.len()) as u16;
+    let inner_width = area_width.saturating_sub(2);
+    let non_model_width = SHARE_WIDTH + total_width + agent_widths.iter().sum::<u16>();
+    let spacing_width = TABLE_COLUMN_SPACING * column_count.saturating_sub(1);
+    let model_width = inner_width
+        .saturating_sub(non_model_width + spacing_width)
+        .max(MODEL_MIN_WIDTH);
+
+    let mut widths = vec![
+        Constraint::Length(model_width),
+        Constraint::Length(SHARE_WIDTH),
+        Constraint::Length(total_width),
+    ];
+    widths.extend(agent_widths.into_iter().map(Constraint::Length));
+    widths
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn constraint_length(constraint: Constraint) -> u16 {
+        match constraint {
+            Constraint::Length(width) => width,
+            other => panic!("expected length constraint, got {other:?}"),
+        }
+    }
+
+    fn usage(in_tokens: u64, out_tokens: u64) -> UsageTotals {
+        UsageTotals {
+            in_tokens,
+            out_tokens,
+            ..UsageTotals::default()
+        }
+    }
 
     #[test]
     fn chart_area_is_capped_for_large_terminals() {
@@ -813,5 +857,34 @@ mod tests {
         ];
 
         assert_eq!(chart_legend_max_width(&datasets), 7);
+    }
+
+    #[test]
+    fn model_table_widths_keep_stat_columns_compact() {
+        let sorted = vec![
+            ("qwen3.7-max".to_string(), usage(174_400_000, 547_900)),
+            ("deepseek-v4-pro".to_string(), usage(45_700_000, 281_400)),
+        ];
+        let cells = HashMap::from([
+            (
+                ("claude".to_string(), "qwen3.7-max".to_string()),
+                usage(174_400_000, 547_900),
+            ),
+            (
+                ("claude".to_string(), "deepseek-v4-pro".to_string()),
+                usage(45_700_000, 281_400),
+            ),
+            (
+                ("copilot".to_string(), "qwen3.7-max".to_string()),
+                usage(510_900, 59_900),
+            ),
+        ]);
+
+        let widths = model_table_widths(103, &sorted, &cells);
+
+        assert!(constraint_length(widths[0]) >= 20);
+        assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
+        assert_eq!(constraint_length(widths[2]), text_width("↑174.4m ↓547.9k"));
+        assert_eq!(constraint_length(widths[5]), text_width("Zed Agent"));
     }
 }
