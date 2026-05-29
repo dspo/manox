@@ -2,7 +2,9 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use std::collections::HashMap;
 
@@ -233,6 +235,27 @@ fn draw_step_chart(
     let bottom_y = plot_bottom;
     let axis_style = Style::default().fg(Color::DarkGray);
 
+    let plot_area = Rect::new(
+        plot_left,
+        plot_top,
+        plot_right.saturating_sub(plot_left) + 1,
+        plot_bottom.saturating_sub(plot_top) + 1,
+    );
+    let step_segments: Vec<CanvasLine> = series
+        .iter()
+        .flat_map(|(_, values, color)| step_line_segments(values, *color))
+        .collect();
+    let canvas = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([0.0, day_count as f64])
+        .y_bounds([0.0, max_bound])
+        .paint(|ctx| {
+            for segment in &step_segments {
+                ctx.draw(segment);
+            }
+        });
+    f.render_widget(canvas, plot_area);
+
     let buf = f.buffer_mut();
     right_aligned_label(buf, area.x, top_y, label_width, &y_max_label, axis_style);
     right_aligned_label(buf, area.x, mid_y, label_width, &y_mid_label, axis_style);
@@ -245,19 +268,6 @@ fn draw_step_chart(
         buf.set_string(x, plot_bottom, "─", axis_style);
     }
     buf.set_string(axis_x, plot_bottom, "└", axis_style);
-
-    for (_, values, color) in series {
-        draw_step_series(
-            buf,
-            plot_left,
-            plot_right,
-            plot_top,
-            plot_bottom,
-            max_bound,
-            values,
-            *color,
-        );
-    }
 
     let x_label_y = plot_bottom + 1;
     buf.set_string(plot_left, x_label_y, short_date(min_date), axis_style);
@@ -288,59 +298,26 @@ fn right_aligned_label(
     buf.set_string(label_x, y, label, style);
 }
 
-fn draw_step_series(
-    buf: &mut ratatui::buffer::Buffer,
-    plot_left: u16,
-    plot_right: u16,
-    plot_top: u16,
-    plot_bottom: u16,
-    max_bound: f64,
-    values: &[f64],
-    color: Color,
-) {
+fn step_line_segments(values: &[f64], color: Color) -> Vec<CanvasLine> {
     if values.is_empty() {
-        return;
+        return Vec::new();
     }
 
-    let style = Style::default().fg(color);
+    let mut segments = Vec::with_capacity(values.len().saturating_mul(2).saturating_sub(1));
     for (idx, &value) in values.iter().enumerate() {
-        let x1 = day_boundary_x(idx, values.len(), plot_left, plot_right);
-        let x2 = day_boundary_x(idx + 1, values.len(), plot_left, plot_right);
-        let y = value_row(value, max_bound, plot_top, plot_bottom);
-        for x in x1..=x2 {
-            buf.set_string(x, y, "─", style);
-        }
+        let x = idx as f64;
+        let next_x = (idx + 1) as f64;
+        segments.push(CanvasLine::new(x, value, next_x, value, color));
 
         let Some(&next_value) = values.get(idx + 1) else {
             continue;
         };
-        let next_y = value_row(next_value, max_bound, plot_top, plot_bottom);
-        if next_y == y {
-            continue;
-        }
-
-        let (from_y, to_y) = if y < next_y { (y, next_y) } else { (next_y, y) };
-        for vertical_y in from_y + 1..to_y {
-            buf.set_string(x2, vertical_y, "│", style);
-        }
-        if next_y < y {
-            buf.set_string(x2, y, "┘", style);
-            buf.set_string(x2, next_y, "┌", style);
-        } else {
-            buf.set_string(x2, y, "┐", style);
-            buf.set_string(x2, next_y, "└", style);
+        if next_value != value {
+            segments.push(CanvasLine::new(next_x, value, next_x, next_value, color));
         }
     }
-}
 
-fn day_boundary_x(idx: usize, day_count: usize, plot_left: u16, plot_right: u16) -> u16 {
-    if day_count == 0 {
-        return plot_left;
-    }
-
-    let width = u32::from(plot_right.saturating_sub(plot_left));
-    let offset = (idx as u32 * width + day_count as u32 / 2) / day_count as u32;
-    plot_left + offset as u16
+    segments
 }
 
 fn value_row(value: f64, max_bound: f64, plot_top: u16, plot_bottom: u16) -> u16 {
@@ -524,36 +501,24 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::buffer::Buffer;
 
     #[test]
-    fn day_boundaries_span_plot_width() {
-        let left = 10;
-        let right = 50;
-        assert_eq!(day_boundary_x(0, 4, left, right), left);
-        assert_eq!(day_boundary_x(4, 4, left, right), right);
-        assert!(day_boundary_x(1, 4, left, right) < day_boundary_x(2, 4, left, right));
-    }
+    fn step_segments_are_axis_aligned() {
+        let segments = step_line_segments(&[1.0, 3.0, 2.0], Color::Red);
 
-    #[test]
-    fn step_series_uses_thin_box_drawing_chars() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 24, 8));
-        draw_step_series(
-            &mut buf,
-            0,
-            23,
-            0,
-            7,
-            100.0,
-            &[0.0, 100.0, 50.0],
-            Color::Red,
+        assert_eq!(segments.len(), 5);
+        assert_eq!(
+            segments.first().map(|line| (line.x1, line.x2)),
+            Some((0.0, 1.0))
         );
-
-        let symbols: String = buf.content.iter().map(|cell| cell.symbol()).collect();
-        assert!(symbols.contains('─'));
-        assert!(symbols.contains('│'));
-        assert!(!symbols.contains('█'));
-        assert!(!symbols.contains('▄'));
-        assert!(!symbols.contains('▀'));
+        assert_eq!(
+            segments.last().map(|line| (line.x1, line.x2)),
+            Some((2.0, 3.0))
+        );
+        assert!(
+            segments
+                .iter()
+                .all(|line| line.x1 == line.x2 || line.y1 == line.y2)
+        );
     }
 }
