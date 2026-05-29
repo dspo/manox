@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::aggregate::{top_models_covering, totals_by_agent_model, totals_by_model};
 use super::date::{date_offset, days_diff};
@@ -15,6 +15,7 @@ use super::types::{Period, UsageTotals};
 use super::{MATRIX_AGENTS, PALETTE};
 
 type ChartSeries = (String, Vec<f64>, Color);
+type ChartOccupancy = HashSet<(u16, u16)>;
 
 const MODEL_MIN_WIDTH: u16 = 18;
 const SHARE_WIDTH: u16 = 8;
@@ -254,8 +255,17 @@ fn draw_step_chart(
     }
     buf.set_string(axis_x, plot_bottom, "└", axis_style);
 
+    let mut occupied = ChartOccupancy::new();
     for (_, values, color) in series {
-        draw_rounded_step_series(buf, plot_area, day_count, max_bound, values, *color);
+        draw_rounded_step_series(
+            buf,
+            plot_area,
+            day_count,
+            max_bound,
+            values,
+            *color,
+            &mut occupied,
+        );
     }
 
     let x_label_y = plot_bottom + 1;
@@ -317,6 +327,7 @@ fn draw_rounded_step_series(
     max_bound: f64,
     values: &[f64],
     color: Color,
+    occupied: &mut ChartOccupancy,
 ) {
     if values.is_empty() || day_count == 0 || plot_area.width == 0 || plot_area.height == 0 {
         return;
@@ -332,29 +343,68 @@ fn draw_rounded_step_series(
         .map(|value| value_row(*value, max_bound, plot_top, plot_bottom))
         .collect();
 
+    let boundaries: Vec<u16> = (0..=values.len())
+        .map(|idx| chart_x_boundary(idx, day_count, plot_left, plot_right))
+        .collect();
+    let draw_rows: Vec<u16> = rows
+        .iter()
+        .enumerate()
+        .map(|(idx, &y)| {
+            let x0 = boundaries[idx];
+            let x1 = boundaries[idx + 1];
+            let previous_y = idx.checked_sub(1).and_then(|previous| rows.get(previous));
+            let next_y = rows.get(idx + 1);
+            let start = if previous_y.is_some_and(|previous| *previous != y) {
+                x0.saturating_add(1)
+            } else {
+                x0
+            };
+            let end = if next_y.is_some_and(|next| *next != y) {
+                x1.saturating_sub(1)
+            } else {
+                x1
+            };
+            choose_horizontal_row(start, end, y, plot_top, plot_bottom, occupied)
+        })
+        .collect();
+    let transition_xs: Vec<Option<u16>> = draw_rows
+        .windows(2)
+        .enumerate()
+        .map(|(idx, rows)| {
+            let from_y = rows[0];
+            let to_y = rows[1];
+            (from_y != to_y).then(|| {
+                choose_vertical_x(
+                    boundaries[idx + 1],
+                    from_y,
+                    to_y,
+                    plot_left,
+                    plot_right,
+                    occupied,
+                )
+            })
+        })
+        .collect();
+
     for idx in 0..values.len() {
-        let x0 = chart_x_boundary(idx, day_count, plot_left, plot_right);
-        let x1 = chart_x_boundary(idx + 1, day_count, plot_left, plot_right);
-        let y = rows[idx];
-        let previous_y = idx.checked_sub(1).and_then(|previous| rows.get(previous));
-        let next_y = rows.get(idx + 1);
+        let x0 = boundaries[idx];
+        let x1 = boundaries[idx + 1];
+        let y = draw_rows[idx];
+        let start = transition_xs
+            .get(idx.saturating_sub(1))
+            .copied()
+            .flatten()
+            .filter(|_| idx > 0)
+            .map_or(x0, |x| x.saturating_add(1));
+        let end = transition_xs
+            .get(idx)
+            .copied()
+            .flatten()
+            .map_or(x1, |x| x.saturating_sub(1));
+        draw_horizontal(buf, start, end, y, style, occupied);
 
-        let start = if previous_y.is_some_and(|previous| *previous != y) {
-            x0.saturating_add(1)
-        } else {
-            x0
-        };
-        let end = if next_y.is_some_and(|next| *next != y) {
-            x1.saturating_sub(1)
-        } else {
-            x1
-        };
-        draw_horizontal(buf, start, end, y, style);
-
-        if let Some(&next_y) = next_y {
-            if next_y != y {
-                draw_rounded_transition(buf, x1, y, next_y, style);
-            }
+        if let Some(Some(x)) = transition_xs.get(idx) {
+            draw_rounded_transition(buf, *x, y, draw_rows[idx + 1], style, occupied);
         }
     }
 }
@@ -369,25 +419,127 @@ fn chart_x_boundary(idx: usize, day_count: usize, plot_left: u16, plot_right: u1
     plot_left + offset.min(width) as u16
 }
 
-fn draw_horizontal(buf: &mut Buffer, start: u16, end: u16, y: u16, style: Style) {
+fn choose_horizontal_row(
+    start: u16,
+    end: u16,
+    preferred_y: u16,
+    plot_top: u16,
+    plot_bottom: u16,
+    occupied: &ChartOccupancy,
+) -> u16 {
+    let mut best = preferred_y;
+    let mut best_conflicts = count_horizontal_conflicts(start, end, preferred_y, occupied);
+    if best_conflicts == 0 {
+        return preferred_y;
+    }
+
+    for offset in 1..=plot_bottom.saturating_sub(plot_top) {
+        for candidate in [
+            preferred_y.saturating_add(offset),
+            preferred_y.saturating_sub(offset),
+        ] {
+            if !(plot_top..=plot_bottom).contains(&candidate) {
+                continue;
+            }
+            let conflicts = count_horizontal_conflicts(start, end, candidate, occupied);
+            if conflicts == 0 {
+                return candidate;
+            }
+            if conflicts < best_conflicts {
+                best = candidate;
+                best_conflicts = conflicts;
+            }
+        }
+    }
+
+    best
+}
+
+fn count_horizontal_conflicts(start: u16, end: u16, y: u16, occupied: &ChartOccupancy) -> usize {
+    if start > end {
+        return 0;
+    }
+
+    (start..=end)
+        .filter(|x| occupied.contains(&(*x, y)))
+        .count()
+}
+
+fn choose_vertical_x(
+    preferred_x: u16,
+    from_y: u16,
+    to_y: u16,
+    plot_left: u16,
+    plot_right: u16,
+    occupied: &ChartOccupancy,
+) -> u16 {
+    let mut best = preferred_x;
+    let mut best_conflicts = count_vertical_conflicts(preferred_x, from_y, to_y, occupied);
+    if best_conflicts == 0 {
+        return preferred_x;
+    }
+
+    for offset in 1..=plot_right.saturating_sub(plot_left) {
+        for candidate in [
+            preferred_x.saturating_add(offset),
+            preferred_x.saturating_sub(offset),
+        ] {
+            if !(plot_left..=plot_right).contains(&candidate) {
+                continue;
+            }
+            let conflicts = count_vertical_conflicts(candidate, from_y, to_y, occupied);
+            if conflicts == 0 {
+                return candidate;
+            }
+            if conflicts < best_conflicts {
+                best = candidate;
+                best_conflicts = conflicts;
+            }
+        }
+    }
+
+    best
+}
+
+fn count_vertical_conflicts(x: u16, from_y: u16, to_y: u16, occupied: &ChartOccupancy) -> usize {
+    (from_y.min(to_y)..=from_y.max(to_y))
+        .filter(|y| occupied.contains(&(x, *y)))
+        .count()
+}
+
+fn draw_horizontal(
+    buf: &mut Buffer,
+    start: u16,
+    end: u16,
+    y: u16,
+    style: Style,
+    occupied: &mut ChartOccupancy,
+) {
     if start > end {
         return;
     }
 
     for x in start..=end {
-        set_chart_symbol(buf, x, y, "─", style);
+        set_chart_symbol(buf, x, y, "─", style, occupied);
     }
 }
 
-fn draw_rounded_transition(buf: &mut Buffer, x: u16, from_y: u16, to_y: u16, style: Style) {
+fn draw_rounded_transition(
+    buf: &mut Buffer,
+    x: u16,
+    from_y: u16,
+    to_y: u16,
+    style: Style,
+    occupied: &mut ChartOccupancy,
+) {
     let (from_corner, to_corner) = rounded_transition_corners(from_y, to_y);
-    set_chart_symbol(buf, x, from_y, from_corner, style);
-    set_chart_symbol(buf, x, to_y, to_corner, style);
+    set_chart_symbol(buf, x, from_y, from_corner, style, occupied);
+    set_chart_symbol(buf, x, to_y, to_corner, style, occupied);
 
     let start = from_y.min(to_y).saturating_add(1);
     let end = from_y.max(to_y).saturating_sub(1);
     for y in start..=end {
-        set_chart_symbol(buf, x, y, "│", style);
+        set_chart_symbol(buf, x, y, "│", style, occupied);
     }
 }
 
@@ -399,15 +551,21 @@ fn rounded_transition_corners(from_y: u16, to_y: u16) -> (&'static str, &'static
     }
 }
 
-fn set_chart_symbol(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
-    let Some(cell) = buf.cell_mut((x, y)) else {
+fn set_chart_symbol(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    symbol: &str,
+    style: Style,
+    occupied: &mut ChartOccupancy,
+) {
+    if !occupied.insert((x, y)) {
         return;
-    };
-    let current = cell.symbol();
-    let symbol = if current == " " || current == symbol || current == "─" || current == "│" {
-        symbol
-    } else {
-        "┼"
+    }
+
+    let Some(cell) = buf.cell_mut((x, y)) else {
+        occupied.remove(&(x, y));
+        return;
     };
     cell.set_symbol(symbol).set_style(style);
 }
@@ -619,6 +777,7 @@ mod tests {
     #[test]
     fn rounded_step_series_draws_box_drawing_glyphs() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 12, 5));
+        let mut occupied = ChartOccupancy::new();
 
         draw_rounded_step_series(
             &mut buf,
@@ -627,12 +786,50 @@ mod tests {
             3.0,
             &[1.0, 3.0, 2.0],
             Color::Red,
+            &mut occupied,
         );
 
         let symbols: String = buf.content().iter().map(|cell| cell.symbol()).collect();
         assert!(symbols.contains('─'));
         assert!(symbols.contains('╯'));
         assert!(symbols.contains('╭'));
+    }
+
+    #[test]
+    fn later_series_avoids_existing_horizontal_line() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 5));
+        let mut occupied = ChartOccupancy::new();
+        let plot_area = Rect::new(0, 0, 12, 5);
+
+        draw_rounded_step_series(
+            &mut buf,
+            plot_area,
+            3,
+            3.0,
+            &[2.0, 2.0, 2.0],
+            Color::Red,
+            &mut occupied,
+        );
+        draw_rounded_step_series(
+            &mut buf,
+            plot_area,
+            3,
+            3.0,
+            &[2.0, 2.0, 2.0],
+            Color::Green,
+            &mut occupied,
+        );
+
+        let red_row = value_row(2.0, 3.0, plot_area.y, plot_area.bottom() - 1);
+        assert!((plot_area.x..plot_area.right()).all(|x| {
+            let cell = buf.cell((x, red_row)).expect("cell should be in bounds");
+            cell.symbol() == "─" && cell.fg == Color::Red
+        }));
+        assert!(
+            buf.content()
+                .iter()
+                .any(|cell| cell.symbol() == "─" && cell.fg == Color::Green)
+        );
     }
 
     #[test]
