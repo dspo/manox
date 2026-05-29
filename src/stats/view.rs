@@ -113,27 +113,29 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
 }
 
 fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(STEP_CHART_HEIGHT),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
     match app.chart_tab {
         ChartTab::Overview => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(STEP_CHART_HEIGHT),
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                ])
+                .split(area);
             draw_tokens_per_day_chart(f, chunks[0], app);
             draw_period_switch(f, chunks[1], app);
             draw_overview_model_list(f, chunks[2], app);
         }
         ChartTab::Dynamicview => {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(STEP_CHART_HEIGHT), Constraint::Min(0)])
+                .split(area);
             let frames = race_frames(&app.records);
             let fade = race_fade(app.race_tick, frames.len());
             draw_bar_chart_race(f, chunks[0], app, &frames);
-            draw_dynamic_context(f, chunks[1], app, &frames, fade);
-            draw_dynamic_model_list(f, chunks[2], app, &frames, fade);
+            draw_dynamic_model_list(f, chunks[1], app, &frames, fade);
         }
     }
 }
@@ -240,21 +242,12 @@ fn draw_race_frame(
     fade: f64,
     max_value: u64,
 ) {
-    let title = Line::from(Span::styled(
-        " Model Tokens Race · All time ",
-        Style::default()
-            .fg(fade_color(Color::White, fade))
-            .add_modifier(Modifier::BOLD),
-    ));
-    f.render_widget(
-        Paragraph::new(title),
-        Rect::new(chart_area.x, chart_area.y, chart_area.width, 1),
-    );
-
-    let date_line = Line::from(vec![
+    let title = Line::from(vec![
         Span::styled(
-            " Date ",
-            Style::default().fg(fade_color(Color::DarkGray, fade)),
+            " Model Tokens Race · All time ",
+            Style::default()
+                .fg(fade_color(Color::White, fade))
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             short_date(&current.date),
@@ -264,8 +257,8 @@ fn draw_race_frame(
         ),
     ]);
     f.render_widget(
-        Paragraph::new(date_line),
-        Rect::new(chart_area.x, chart_area.y + 1, chart_area.width, 1),
+        Paragraph::new(title),
+        Rect::new(chart_area.x, chart_area.y, chart_area.width, 1),
     );
 
     if current.entries.is_empty() {
@@ -276,9 +269,9 @@ fn draw_race_frame(
             ))),
             Rect::new(
                 chart_area.x,
-                chart_area.y + 3,
+                chart_area.y + 2,
                 chart_area.width,
-                chart_area.height.saturating_sub(3),
+                chart_area.height.saturating_sub(2),
             ),
         );
         return;
@@ -286,7 +279,7 @@ fn draw_race_frame(
 
     let row_count = RACE_VISIBLE_MODELS
         .min(current.entries.len())
-        .min(chart_area.height.saturating_sub(3) as usize);
+        .min(chart_area.height.saturating_sub(2) as usize);
     if row_count == 0 {
         return;
     }
@@ -317,7 +310,7 @@ fn draw_race_frame(
         return;
     }
 
-    let plot_top = chart_area.y + 3;
+    let plot_top = chart_area.y + 2;
     let plot_bottom = plot_top + row_count as u16 - 1;
     let previous_ranks = race_rank_map(previous);
     let previous_usages = race_usage_map(previous);
@@ -1134,26 +1127,6 @@ fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         };
         spans.push(Span::styled(p.label().to_string(), style));
     }
-    let p = Paragraph::new(Line::from(spans));
-    f.render_widget(p, area);
-}
-
-fn draw_dynamic_context(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    app: &StatsApp,
-    frames: &[RaceFrame],
-    fade: f64,
-) {
-    let text = current_race_frame(app, frames)
-        .map(|(_, current, _)| {
-            format!("All time cumulative tokens · {}", short_date(&current.date))
-        })
-        .unwrap_or_else(|| "All time cumulative tokens".to_string());
-    let spans = vec![Span::styled(
-        text,
-        Style::default().fg(fade_color(Color::DarkGray, fade)),
-    )];
     let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
