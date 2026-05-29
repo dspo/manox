@@ -267,11 +267,12 @@ fn draw_step_chart(
         buf.set_string(max_x, x_label_y, max_label, axis_style);
     }
 
-    let legend_width = chart_legend_width(series)
+    let legend_width = chart_legend_max_width(series)
         .min(plot_right.saturating_sub(plot_left) + 1)
         .max(1);
     let legend_x = plot_right.saturating_add(1).saturating_sub(legend_width);
-    let legend_area = Rect::new(legend_x, plot_top, legend_width, 1);
+    let legend_height = (series.len() as u16).min(plot_bottom.saturating_sub(plot_top) + 1);
+    let legend_area = Rect::new(legend_x, plot_top, legend_width, legend_height);
     draw_chart_legend(f, legend_area, series);
 }
 
@@ -293,57 +294,17 @@ fn step_line_segments(values: &[f64], color: Color) -> Vec<CanvasLine> {
         return Vec::new();
     }
 
-    const CORNER_X: f64 = 0.08;
-    const CORNER_Y_RATIO: f64 = 0.12;
-
-    let mut segments = Vec::with_capacity(values.len().saturating_mul(4));
+    let mut segments = Vec::with_capacity(values.len().saturating_mul(2).saturating_sub(1));
     for (idx, &value) in values.iter().enumerate() {
         let x = idx as f64;
         let next_x = (idx + 1) as f64;
-        let has_previous_corner = idx > 0 && values[idx - 1] != value;
-        let has_next_corner = values.get(idx + 1).is_some_and(|&next| next != value);
-        let horizontal_start = if has_previous_corner { x + CORNER_X } else { x };
-        let horizontal_end = if has_next_corner {
-            next_x - CORNER_X
-        } else {
-            next_x
-        };
-        if horizontal_end > horizontal_start {
-            segments.push(CanvasLine::new(
-                horizontal_start,
-                value,
-                horizontal_end,
-                value,
-                color,
-            ));
-        }
+        segments.push(CanvasLine::new(x, value, next_x, value, color));
 
         let Some(&next_value) = values.get(idx + 1) else {
             continue;
         };
         if next_value != value {
-            let corner_y = (next_value - value) * CORNER_Y_RATIO;
-            segments.push(CanvasLine::new(
-                horizontal_end,
-                value,
-                next_x,
-                value + corner_y,
-                color,
-            ));
-            segments.push(CanvasLine::new(
-                next_x,
-                value + corner_y,
-                next_x,
-                next_value - corner_y,
-                color,
-            ));
-            segments.push(CanvasLine::new(
-                next_x,
-                next_value - corner_y,
-                next_x + CORNER_X,
-                next_value,
-                color,
-            ));
+            segments.push(CanvasLine::new(next_x, value, next_x, next_value, color));
         }
     }
 
@@ -357,24 +318,25 @@ fn value_row(value: f64, max_bound: f64, plot_top: u16, plot_bottom: u16) -> u16
 }
 
 fn draw_chart_legend(f: &mut ratatui::Frame, area: Rect, datasets: &[ChartSeries]) {
-    let mut spans = Vec::new();
-    for (idx, (name, _, color)) in datasets.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-        }
-        spans.push(Span::styled("● ", Style::default().fg(*color)));
-        spans.push(Span::styled(name.clone(), Style::default().fg(*color)));
-    }
+    let lines: Vec<Line> = datasets
+        .iter()
+        .map(|(name, _, color)| {
+            Line::from(vec![
+                Span::styled("● ", Style::default().fg(*color)),
+                Span::styled(name.clone(), Style::default().fg(*color)),
+            ])
+        })
+        .collect();
 
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(Paragraph::new(lines), area);
 }
 
-fn chart_legend_width(datasets: &[ChartSeries]) -> u16 {
+fn chart_legend_max_width(datasets: &[ChartSeries]) -> u16 {
     datasets
         .iter()
-        .enumerate()
-        .map(|(idx, (name, _, _))| name.chars().count() + 2 + usize::from(idx > 0) * 3)
-        .sum::<usize>()
+        .map(|(name, _, _)| name.chars().count() + 2)
+        .max()
+        .unwrap_or(1)
         .min(u16::MAX as usize) as u16
 }
 
@@ -537,32 +499,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn step_segments_include_softened_corners() {
+    fn step_segments_are_axis_aligned() {
         let segments = step_line_segments(&[1.0, 3.0, 2.0], Color::Red);
 
-        assert_eq!(segments.len(), 9);
+        assert_eq!(segments.len(), 5);
         assert_eq!(
             segments.first().map(|line| (line.x1, line.x2)),
-            Some((0.0, 0.92))
+            Some((0.0, 1.0))
         );
         assert_eq!(
             segments.last().map(|line| (line.x1, line.x2)),
-            Some((2.08, 3.0))
+            Some((2.0, 3.0))
         );
         assert!(
             segments
                 .iter()
-                .any(|line| line.x1 != line.x2 && line.y1 != line.y2)
+                .all(|line| line.x1 == line.x2 || line.y1 == line.y2)
         );
     }
 
     #[test]
-    fn chart_legend_width_includes_separators() {
+    fn chart_legend_width_uses_longest_item() {
         let datasets = vec![
             ("alpha".to_string(), Vec::new(), Color::Red),
             ("beta".to_string(), Vec::new(), Color::Green),
         ];
 
-        assert_eq!(chart_legend_width(&datasets), 16);
+        assert_eq!(chart_legend_max_width(&datasets), 7);
     }
 }
