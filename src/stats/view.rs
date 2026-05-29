@@ -2,11 +2,8 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use std::collections::HashMap;
 
 use super::aggregate::{top_models_covering, totals_by_agent_model, totals_by_model};
@@ -16,8 +13,7 @@ use super::tui::StatsApp;
 use super::types::{Period, UsageTotals};
 use super::{MATRIX_AGENTS, PALETTE};
 
-type PlotPoint = (f64, f64);
-type DatasetData = (String, Vec<PlotPoint>, Color);
+type ChartSeries = (String, Vec<f64>, Color);
 
 const MODEL_MIN_WIDTH: u16 = 18;
 const SHARE_WIDTH: u16 = 8;
@@ -145,49 +141,17 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
     }
 
     let mut max_y: f64 = 1.0;
-    let mut datasets_data: Vec<DatasetData> = Vec::new();
+    let mut chart_series: Vec<ChartSeries> = Vec::new();
     for (idx, model) in top_models.iter().enumerate() {
         let color = PALETTE[idx % PALETTE.len()];
-        let pts: Vec<PlotPoint> = series
-            .get(model)
-            .map(|v| {
-                for &y in v {
-                    if y > max_y {
-                        max_y = y;
-                    }
-                }
-                daily_step_points(v)
-            })
-            .unwrap_or_default();
-        datasets_data.push((model.clone(), pts, color));
+        let values = series.get(model).cloned().unwrap_or_default();
+        for &y in &values {
+            if y > max_y {
+                max_y = y;
+            }
+        }
+        chart_series.push((model.clone(), values, color));
     }
-
-    let datasets: Vec<Dataset> = datasets_data
-        .iter()
-        .map(|(name, data, color)| {
-            Dataset::default()
-                .name(name.clone())
-                .marker(symbols::Marker::HalfBlock)
-                .graph_type(GraphType::Line)
-                .style(Style::default().fg(*color))
-                .data(data)
-        })
-        .collect();
-
-    let x_labels: Vec<Span> = if day_count <= 1 {
-        vec![Span::raw(min_date.clone())]
-    } else {
-        let mid_idx = day_count / 2;
-        let mid_date = date_offset(&min_date, mid_idx as i64).unwrap_or_else(|_| String::new());
-        vec![
-            Span::styled(short_date(&min_date), Style::default().fg(Color::DarkGray)),
-            Span::styled(short_date(&mid_date), Style::default().fg(Color::DarkGray)),
-            Span::styled(short_date(&max_date), Style::default().fg(Color::DarkGray)),
-        ]
-    };
-
-    let y_max_label = format_tokens(max_y as u64);
-    let y_mid_label = format_tokens((max_y / 2.0) as u64);
 
     let (chart_area, legend_area) = if area.height >= 8 {
         (
@@ -203,50 +167,189 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         (area, None)
     };
 
-    let chart = Chart::new(datasets)
-        .block(Block::default().title(format!(" Tokens per Day · {} ", app.period.label())))
-        .legend_position(None)
-        .x_axis(
-            Axis::default()
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, day_count as f64])
-                .labels(x_labels),
-        )
-        .y_axis(
-            Axis::default()
-                .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, max_y * 1.05])
-                .labels(vec![
-                    Span::styled("0", Style::default().fg(Color::DarkGray)),
-                    Span::styled(y_mid_label, Style::default().fg(Color::DarkGray)),
-                    Span::styled(y_max_label, Style::default().fg(Color::DarkGray)),
-                ]),
-        );
-
-    f.render_widget(chart, chart_area);
+    draw_step_chart(
+        f,
+        chart_area,
+        app.period.label(),
+        &min_date,
+        &max_date,
+        day_count,
+        max_y,
+        &chart_series,
+    );
     if let Some(legend_area) = legend_area {
-        draw_chart_legend(f, legend_area, &datasets_data);
+        draw_chart_legend(f, legend_area, &chart_series);
     }
 }
 
-fn daily_step_points(values: &[f64]) -> Vec<PlotPoint> {
-    let Some((&first, rest)) = values.split_first() else {
-        return Vec::new();
-    };
+fn draw_step_chart(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    period_label: &str,
+    min_date: &str,
+    max_date: &str,
+    day_count: usize,
+    max_y: f64,
+    series: &[ChartSeries],
+) {
+    if area.width < 24 || area.height < 6 {
+        f.render_widget(
+            Paragraph::new(format!("Tokens per Day · {period_label}")),
+            area,
+        );
+        return;
+    }
 
-    let mut points = Vec::with_capacity(values.len().saturating_mul(3));
-    points.push((0.0, first));
+    let y_max_label = format_tokens(max_y as u64);
+    let y_mid_label = format_tokens((max_y / 2.0) as u64);
+    let label_width = ["0", y_mid_label.as_str(), y_max_label.as_str()]
+        .iter()
+        .map(|label| label.chars().count() as u16)
+        .max()
+        .unwrap_or(1)
+        .max(4);
+
+    let title = Line::from(Span::styled(
+        format!(" Tokens per Day · {period_label} "),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(
+        Paragraph::new(title),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let axis_x = area.x + label_width;
+    let plot_left = axis_x + 1;
+    let plot_right = area.right().saturating_sub(1);
+    let plot_top = area.y + 2;
+    let plot_bottom = area.bottom().saturating_sub(2);
+    if plot_left >= plot_right || plot_top >= plot_bottom {
+        return;
+    }
+
+    let max_bound = (max_y * 1.05).max(1.0);
+    let mid_y = value_row(max_y / 2.0, max_bound, plot_top, plot_bottom);
+    let top_y = value_row(max_y, max_bound, plot_top, plot_bottom);
+    let bottom_y = plot_bottom;
+    let axis_style = Style::default().fg(Color::DarkGray);
+
+    let buf = f.buffer_mut();
+    right_aligned_label(buf, area.x, top_y, label_width, &y_max_label, axis_style);
+    right_aligned_label(buf, area.x, mid_y, label_width, &y_mid_label, axis_style);
+    right_aligned_label(buf, area.x, bottom_y, label_width, "0", axis_style);
+
+    for y in plot_top..=plot_bottom {
+        buf.set_string(axis_x, y, "│", axis_style);
+    }
+    for x in axis_x..=plot_right {
+        buf.set_string(x, plot_bottom, "─", axis_style);
+    }
+    buf.set_string(axis_x, plot_bottom, "└", axis_style);
+
+    for (_, values, color) in series {
+        draw_step_series(
+            buf,
+            plot_left,
+            plot_right,
+            plot_top,
+            plot_bottom,
+            max_bound,
+            values,
+            *color,
+        );
+    }
+
+    let x_label_y = plot_bottom + 1;
+    buf.set_string(plot_left, x_label_y, short_date(min_date), axis_style);
+    if day_count > 1 {
+        let mid_idx = day_count / 2;
+        let mid_date = date_offset(min_date, mid_idx as i64).unwrap_or_else(|_| String::new());
+        let mid_label = short_date(&mid_date);
+        let mid_x = plot_left + (plot_right - plot_left) / 2;
+        let mid_x = mid_x.saturating_sub((mid_label.chars().count() / 2) as u16);
+        buf.set_string(mid_x, x_label_y, mid_label, axis_style);
+
+        let max_label = short_date(max_date);
+        let max_x = plot_right.saturating_sub(max_label.chars().count() as u16);
+        buf.set_string(max_x, x_label_y, max_label, axis_style);
+    }
+}
+
+fn right_aligned_label(
+    buf: &mut ratatui::buffer::Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    label: &str,
+    style: Style,
+) {
+    let label_width = label.chars().count() as u16;
+    let label_x = x + width.saturating_sub(label_width);
+    buf.set_string(label_x, y, label, style);
+}
+
+fn draw_step_series(
+    buf: &mut ratatui::buffer::Buffer,
+    plot_left: u16,
+    plot_right: u16,
+    plot_top: u16,
+    plot_bottom: u16,
+    max_bound: f64,
+    values: &[f64],
+    color: Color,
+) {
+    if values.is_empty() {
+        return;
+    }
+
+    let style = Style::default().fg(color);
     for (idx, &value) in values.iter().enumerate() {
-        let next_x = (idx + 1) as f64;
-        points.push((next_x, value));
-        if let Some(&next_value) = rest.get(idx) {
-            points.push((next_x, next_value));
+        let x1 = day_boundary_x(idx, values.len(), plot_left, plot_right);
+        let x2 = day_boundary_x(idx + 1, values.len(), plot_left, plot_right);
+        let y = value_row(value, max_bound, plot_top, plot_bottom);
+        for x in x1..=x2 {
+            buf.set_string(x, y, "─", style);
+        }
+
+        let Some(&next_value) = values.get(idx + 1) else {
+            continue;
+        };
+        let next_y = value_row(next_value, max_bound, plot_top, plot_bottom);
+        if next_y == y {
+            continue;
+        }
+
+        let (from_y, to_y) = if y < next_y { (y, next_y) } else { (next_y, y) };
+        for vertical_y in from_y + 1..to_y {
+            buf.set_string(x2, vertical_y, "│", style);
+        }
+        if next_y < y {
+            buf.set_string(x2, y, "┘", style);
+            buf.set_string(x2, next_y, "┌", style);
+        } else {
+            buf.set_string(x2, y, "┐", style);
+            buf.set_string(x2, next_y, "└", style);
         }
     }
-    points
 }
 
-fn draw_chart_legend(f: &mut ratatui::Frame, area: Rect, datasets: &[DatasetData]) {
+fn day_boundary_x(idx: usize, day_count: usize, plot_left: u16, plot_right: u16) -> u16 {
+    if day_count == 0 {
+        return plot_left;
+    }
+
+    let width = u32::from(plot_right.saturating_sub(plot_left));
+    let offset = (idx as u32 * width + day_count as u32 / 2) / day_count as u32;
+    plot_left + offset as u16
+}
+
+fn value_row(value: f64, max_bound: f64, plot_top: u16, plot_bottom: u16) -> u16 {
+    let height = plot_bottom.saturating_sub(plot_top);
+    let ratio = (value / max_bound).clamp(0.0, 1.0);
+    plot_bottom.saturating_sub((ratio * f64::from(height)).round() as u16)
+}
+
+fn draw_chart_legend(f: &mut ratatui::Frame, area: Rect, datasets: &[ChartSeries]) {
     let mut spans = Vec::new();
     for (idx, (name, _, color)) in datasets.iter().enumerate() {
         if idx > 0 {
@@ -416,4 +519,41 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         .column_spacing(TABLE_COLUMN_SPACING)
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    #[test]
+    fn day_boundaries_span_plot_width() {
+        let left = 10;
+        let right = 50;
+        assert_eq!(day_boundary_x(0, 4, left, right), left);
+        assert_eq!(day_boundary_x(4, 4, left, right), right);
+        assert!(day_boundary_x(1, 4, left, right) < day_boundary_x(2, 4, left, right));
+    }
+
+    #[test]
+    fn step_series_uses_thin_box_drawing_chars() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 24, 8));
+        draw_step_series(
+            &mut buf,
+            0,
+            23,
+            0,
+            7,
+            100.0,
+            &[0.0, 100.0, 50.0],
+            Color::Red,
+        );
+
+        let symbols: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(symbols.contains('─'));
+        assert!(symbols.contains('│'));
+        assert!(!symbols.contains('█'));
+        assert!(!symbols.contains('▄'));
+        assert!(!symbols.contains('▀'));
+    }
 }
