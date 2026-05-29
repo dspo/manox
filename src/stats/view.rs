@@ -1,10 +1,9 @@
 //! TUI 渲染：header / footer / Models。
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::canvas::{Canvas, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use std::collections::HashMap;
 
@@ -23,6 +22,8 @@ const TOTAL_WIDTH: u16 = 18;
 const AGENT_WIDTH: u16 = 18;
 const TABLE_COLUMN_SPACING: u16 = 1;
 const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
+const STEP_CHART_MAX_WIDTH: u16 = 78;
+const STEP_CHART_HEIGHT: u16 = 14;
 
 pub(super) fn draw(f: &mut ratatui::Frame, app: &mut StatsApp) {
     let area = f.area();
@@ -81,7 +82,7 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(10),
+            Constraint::Length(STEP_CHART_HEIGHT),
             Constraint::Length(1),
             Constraint::Min(0),
         ])
@@ -177,10 +178,11 @@ fn draw_step_chart(
     max_y: f64,
     series: &[ChartSeries],
 ) {
-    if area.width < 24 || area.height < 6 {
+    let chart_area = fixed_chart_area(area);
+    if chart_area.width < 24 || chart_area.height < 6 {
         f.render_widget(
             Paragraph::new(format!("Tokens per Day · {period_label}")),
-            area,
+            chart_area,
         );
         return;
     }
@@ -200,14 +202,14 @@ fn draw_step_chart(
     ));
     f.render_widget(
         Paragraph::new(title),
-        Rect::new(area.x, area.y, area.width, 1),
+        Rect::new(chart_area.x, chart_area.y, chart_area.width, 1),
     );
 
-    let axis_x = area.x + label_width;
+    let axis_x = chart_area.x + label_width;
     let plot_left = axis_x + 1;
-    let plot_right = area.right().saturating_sub(1);
-    let plot_top = area.y + 2;
-    let plot_bottom = area.bottom().saturating_sub(2);
+    let plot_right = chart_area.right().saturating_sub(1);
+    let plot_top = chart_area.y + 2;
+    let plot_bottom = chart_area.bottom().saturating_sub(2);
     if plot_left >= plot_right || plot_top >= plot_bottom {
         return;
     }
@@ -224,25 +226,25 @@ fn draw_step_chart(
         plot_right.saturating_sub(plot_left) + 1,
         plot_bottom.saturating_sub(plot_top) + 1,
     );
-    let step_segments: Vec<CanvasLine> = series
-        .iter()
-        .flat_map(|(_, values, color)| step_line_segments(values, *color))
-        .collect();
-    let canvas = Canvas::default()
-        .marker(Marker::Braille)
-        .x_bounds([0.0, day_count as f64])
-        .y_bounds([0.0, max_bound])
-        .paint(|ctx| {
-            for segment in &step_segments {
-                ctx.draw(segment);
-            }
-        });
-    f.render_widget(canvas, plot_area);
 
     let buf = f.buffer_mut();
-    right_aligned_label(buf, area.x, top_y, label_width, &y_max_label, axis_style);
-    right_aligned_label(buf, area.x, mid_y, label_width, &y_mid_label, axis_style);
-    right_aligned_label(buf, area.x, bottom_y, label_width, "0", axis_style);
+    right_aligned_label(
+        buf,
+        chart_area.x,
+        top_y,
+        label_width,
+        &y_max_label,
+        axis_style,
+    );
+    right_aligned_label(
+        buf,
+        chart_area.x,
+        mid_y,
+        label_width,
+        &y_mid_label,
+        axis_style,
+    );
+    right_aligned_label(buf, chart_area.x, bottom_y, label_width, "0", axis_style);
 
     for y in plot_top..=plot_bottom {
         buf.set_string(axis_x, y, "│", axis_style);
@@ -251,6 +253,10 @@ fn draw_step_chart(
         buf.set_string(x, plot_bottom, "─", axis_style);
     }
     buf.set_string(axis_x, plot_bottom, "└", axis_style);
+
+    for (_, values, color) in series {
+        draw_rounded_step_series(buf, plot_area, day_count, max_bound, values, *color);
+    }
 
     let x_label_y = plot_bottom + 1;
     buf.set_string(plot_left, x_label_y, short_date(min_date), axis_style);
@@ -276,6 +282,15 @@ fn draw_step_chart(
     draw_chart_legend(f, legend_area, series);
 }
 
+fn fixed_chart_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        area.y,
+        area.width.min(STEP_CHART_MAX_WIDTH),
+        area.height.min(STEP_CHART_HEIGHT),
+    )
+}
+
 fn right_aligned_label(
     buf: &mut ratatui::buffer::Buffer,
     x: u16,
@@ -289,32 +304,112 @@ fn right_aligned_label(
     buf.set_string(label_x, y, label, style);
 }
 
-fn step_line_segments(values: &[f64], color: Color) -> Vec<CanvasLine> {
-    if values.is_empty() {
-        return Vec::new();
-    }
-
-    let mut segments = Vec::with_capacity(values.len().saturating_mul(2).saturating_sub(1));
-    for (idx, &value) in values.iter().enumerate() {
-        let x = idx as f64;
-        let next_x = (idx + 1) as f64;
-        segments.push(CanvasLine::new(x, value, next_x, value, color));
-
-        let Some(&next_value) = values.get(idx + 1) else {
-            continue;
-        };
-        if next_value != value {
-            segments.push(CanvasLine::new(next_x, value, next_x, next_value, color));
-        }
-    }
-
-    segments
-}
-
 fn value_row(value: f64, max_bound: f64, plot_top: u16, plot_bottom: u16) -> u16 {
     let height = plot_bottom.saturating_sub(plot_top);
     let ratio = (value / max_bound).clamp(0.0, 1.0);
     plot_bottom.saturating_sub((ratio * f64::from(height)).round() as u16)
+}
+
+fn draw_rounded_step_series(
+    buf: &mut Buffer,
+    plot_area: Rect,
+    day_count: usize,
+    max_bound: f64,
+    values: &[f64],
+    color: Color,
+) {
+    if values.is_empty() || day_count == 0 || plot_area.width == 0 || plot_area.height == 0 {
+        return;
+    }
+
+    let plot_left = plot_area.x;
+    let plot_right = plot_area.right().saturating_sub(1);
+    let plot_top = plot_area.y;
+    let plot_bottom = plot_area.bottom().saturating_sub(1);
+    let style = Style::default().fg(color);
+    let rows: Vec<u16> = values
+        .iter()
+        .map(|value| value_row(*value, max_bound, plot_top, plot_bottom))
+        .collect();
+
+    for idx in 0..values.len() {
+        let x0 = chart_x_boundary(idx, day_count, plot_left, plot_right);
+        let x1 = chart_x_boundary(idx + 1, day_count, plot_left, plot_right);
+        let y = rows[idx];
+        let previous_y = idx.checked_sub(1).and_then(|previous| rows.get(previous));
+        let next_y = rows.get(idx + 1);
+
+        let start = if previous_y.is_some_and(|previous| *previous != y) {
+            x0.saturating_add(1)
+        } else {
+            x0
+        };
+        let end = if next_y.is_some_and(|next| *next != y) {
+            x1.saturating_sub(1)
+        } else {
+            x1
+        };
+        draw_horizontal(buf, start, end, y, style);
+
+        if let Some(&next_y) = next_y {
+            if next_y != y {
+                draw_rounded_transition(buf, x1, y, next_y, style);
+            }
+        }
+    }
+}
+
+fn chart_x_boundary(idx: usize, day_count: usize, plot_left: u16, plot_right: u16) -> u16 {
+    if day_count == 0 || plot_left >= plot_right {
+        return plot_left;
+    }
+
+    let width = usize::from(plot_right - plot_left);
+    let offset = (idx.min(day_count) * width + day_count / 2) / day_count;
+    plot_left + offset.min(width) as u16
+}
+
+fn draw_horizontal(buf: &mut Buffer, start: u16, end: u16, y: u16, style: Style) {
+    if start > end {
+        return;
+    }
+
+    for x in start..=end {
+        set_chart_symbol(buf, x, y, "─", style);
+    }
+}
+
+fn draw_rounded_transition(buf: &mut Buffer, x: u16, from_y: u16, to_y: u16, style: Style) {
+    let (from_corner, to_corner) = rounded_transition_corners(from_y, to_y);
+    set_chart_symbol(buf, x, from_y, from_corner, style);
+    set_chart_symbol(buf, x, to_y, to_corner, style);
+
+    let start = from_y.min(to_y).saturating_add(1);
+    let end = from_y.max(to_y).saturating_sub(1);
+    for y in start..=end {
+        set_chart_symbol(buf, x, y, "│", style);
+    }
+}
+
+fn rounded_transition_corners(from_y: u16, to_y: u16) -> (&'static str, &'static str) {
+    if to_y < from_y {
+        ("╯", "╭")
+    } else {
+        ("╮", "╰")
+    }
+}
+
+fn set_chart_symbol(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
+    let Some(cell) = buf.cell_mut((x, y)) else {
+        return;
+    };
+    let current = cell.symbol();
+    let symbol = if current == " " || current == symbol || current == "─" || current == "│" {
+        symbol
+    } else {
+        "┼"
+    };
+    cell.set_symbol(symbol).set_style(style);
 }
 
 fn draw_chart_legend(f: &mut ratatui::Frame, area: Rect, datasets: &[ChartSeries]) {
@@ -499,23 +594,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn step_segments_are_axis_aligned() {
-        let segments = step_line_segments(&[1.0, 3.0, 2.0], Color::Red);
+    fn chart_area_is_capped_for_large_terminals() {
+        let area = fixed_chart_area(Rect::new(2, 3, 120, 30));
 
-        assert_eq!(segments.len(), 5);
         assert_eq!(
-            segments.first().map(|line| (line.x1, line.x2)),
-            Some((0.0, 1.0))
+            area,
+            Rect::new(2, 3, STEP_CHART_MAX_WIDTH, STEP_CHART_HEIGHT)
         );
-        assert_eq!(
-            segments.last().map(|line| (line.x1, line.x2)),
-            Some((2.0, 3.0))
+    }
+
+    #[test]
+    fn chart_x_boundaries_include_plot_edges() {
+        assert_eq!(chart_x_boundary(0, 7, 10, 30), 10);
+        assert_eq!(chart_x_boundary(7, 7, 10, 30), 30);
+        assert_eq!(chart_x_boundary(99, 7, 10, 30), 30);
+    }
+
+    #[test]
+    fn rounded_transitions_use_directional_corners() {
+        assert_eq!(rounded_transition_corners(8, 3), ("╯", "╭"));
+        assert_eq!(rounded_transition_corners(3, 8), ("╮", "╰"));
+    }
+
+    #[test]
+    fn rounded_step_series_draws_box_drawing_glyphs() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 5));
+
+        draw_rounded_step_series(
+            &mut buf,
+            Rect::new(0, 0, 12, 5),
+            3,
+            3.0,
+            &[1.0, 3.0, 2.0],
+            Color::Red,
         );
-        assert!(
-            segments
-                .iter()
-                .all(|line| line.x1 == line.x2 || line.y1 == line.y2)
-        );
+
+        let symbols: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(symbols.contains('─'));
+        assert!(symbols.contains('╯'));
+        assert!(symbols.contains('╭'));
     }
 
     #[test]
