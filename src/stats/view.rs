@@ -23,6 +23,7 @@ const TABLE_COLUMN_SPACING: u16 = 1;
 const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
 const STEP_CHART_MAX_WIDTH: u16 = 78;
 const STEP_CHART_HEIGHT: u16 = 14;
+const DAY_STEP_WIDTH: u16 = 2;
 const Y_TICK_COUNT: usize = 10;
 const X_TICK_MIN_COUNT: usize = 6;
 
@@ -201,7 +202,8 @@ fn draw_step_chart(
 
     let axis_x = chart_area.x + label_width;
     let plot_left = axis_x + 1;
-    let plot_right = chart_area.right().saturating_sub(1);
+    let available_plot_right = chart_area.right().saturating_sub(1);
+    let plot_right = compact_plot_right(plot_left, available_plot_right, day_count);
     let plot_top = chart_area.y + 2;
     let plot_bottom = chart_area.bottom().saturating_sub(2);
     if plot_left >= plot_right || plot_top >= plot_bottom {
@@ -250,9 +252,11 @@ fn draw_step_chart(
     );
 
     let legend_width = chart_legend_max_width(series)
-        .min(plot_right.saturating_sub(plot_left) + 1)
+        .min(available_plot_right.saturating_sub(plot_left) + 1)
         .max(1);
-    let legend_x = plot_right.saturating_add(1).saturating_sub(legend_width);
+    let legend_x = available_plot_right
+        .saturating_add(1)
+        .saturating_sub(legend_width);
     let legend_height = (series.len() as u16).min(plot_bottom.saturating_sub(plot_top) + 1);
     let legend_area = Rect::new(legend_x, plot_top, legend_width, legend_height);
     draw_chart_legend(f, legend_area, series);
@@ -351,22 +355,45 @@ fn draw_x_tick_labels(
         } else {
             date_offset(min_date, idx as i64).unwrap_or_else(|_| String::new())
         };
-        let label = short_date(&date);
+        let label = x_tick_label(&date, day_count, plot_left, plot_right);
         let label_width = label.chars().count() as u16;
-        let tick_x = chart_x_boundary(idx, day_count.max(1), plot_left, plot_right);
-        let label_x = tick_x
-            .saturating_sub(label_width / 2)
-            .max(plot_left)
-            .min(plot_right.saturating_sub(label_width.saturating_sub(1)));
+        let tick_x = chart_tick_x(idx, day_count.max(1), plot_left, plot_right);
+        let label_x = x_tick_label_x(tick_x, label_width, day_count, plot_left, plot_right);
         let label_end = label_x.saturating_add(label_width.saturating_sub(1));
         if (label_x..=label_end).any(|x| occupied_columns.contains(&x)) {
             continue;
         }
+
         for x in label_x..=label_end {
             occupied_columns.insert(x);
         }
         buf.set_string(label_x, y, label, style);
     }
+}
+
+fn x_tick_label(date: &str, day_count: usize, plot_left: u16, plot_right: u16) -> String {
+    if fixed_day_width(plot_left, plot_right, day_count) && day_count <= 7 {
+        return date.get(8..10).unwrap_or(date).to_string();
+    }
+
+    short_date(date).to_string()
+}
+
+fn x_tick_label_x(
+    tick_x: u16,
+    label_width: u16,
+    day_count: usize,
+    plot_left: u16,
+    plot_right: u16,
+) -> u16 {
+    if fixed_day_width(plot_left, plot_right, day_count) && day_count <= 7 {
+        return tick_x.min(plot_right.saturating_sub(label_width.saturating_sub(1)));
+    }
+
+    tick_x
+        .saturating_sub(label_width / 2)
+        .max(plot_left)
+        .min(plot_right.saturating_sub(label_width.saturating_sub(1)))
 }
 
 fn value_row(value: f64, max_bound: f64, plot_top: u16, plot_bottom: u16) -> u16 {
@@ -398,27 +425,21 @@ fn draw_rounded_step_series(
         .map(|value| value_row(*value, max_bound, plot_top, plot_bottom))
         .collect();
 
-    let boundaries: Vec<u16> = (0..=values.len())
-        .map(|idx| chart_x_boundary(idx, day_count, plot_left, plot_right))
+    let spans: Vec<(u16, u16)> = (0..values.len())
+        .map(|idx| chart_day_span(idx, day_count, plot_left, plot_right))
         .collect();
 
     for idx in 0..values.len() {
-        let x0 = boundaries[idx];
-        let x1 = boundaries[idx + 1];
+        let (x0, x1) = spans[idx];
         let y = rows[idx];
-        let previous_y = idx.checked_sub(1).and_then(|previous| rows.get(previous));
         let next_y = rows.get(idx + 1);
-        let start = if previous_y.is_some_and(|previous| *previous != y) {
-            x0.saturating_add(1)
-        } else {
-            x0
-        };
-        let end = if next_y.is_some_and(|next| *next != y) {
+        let changes_next = next_y.is_some_and(|next| *next != y);
+        let end = if changes_next {
             x1.saturating_sub(1)
         } else {
             x1
         };
-        draw_horizontal(buf, start, end, y, style, occupied);
+        draw_horizontal(buf, x0, end, y, style, occupied);
 
         if let Some(&next_y) = next_y {
             if next_y != y {
@@ -426,6 +447,49 @@ fn draw_rounded_step_series(
             }
         }
     }
+}
+
+fn compact_plot_right(plot_left: u16, plot_right: u16, day_count: usize) -> u16 {
+    if day_count == 0 || plot_left >= plot_right {
+        return plot_left;
+    }
+
+    let compact_width = day_count
+        .saturating_mul(DAY_STEP_WIDTH as usize)
+        .min(u16::MAX as usize) as u16;
+    plot_left + compact_width.saturating_sub(1).min(plot_right - plot_left)
+}
+
+fn fixed_day_width(plot_left: u16, plot_right: u16, day_count: usize) -> bool {
+    day_count > 0
+        && usize::from(plot_right.saturating_sub(plot_left) + 1)
+            >= day_count.saturating_mul(DAY_STEP_WIDTH as usize)
+}
+
+fn chart_day_span(idx: usize, day_count: usize, plot_left: u16, plot_right: u16) -> (u16, u16) {
+    if fixed_day_width(plot_left, plot_right, day_count) {
+        let x = plot_left.saturating_add(
+            idx.saturating_mul(DAY_STEP_WIDTH as usize)
+                .min(u16::MAX as usize) as u16,
+        );
+        return (x, x.saturating_add(DAY_STEP_WIDTH - 1).min(plot_right));
+    }
+
+    (
+        chart_x_boundary(idx, day_count, plot_left, plot_right),
+        chart_x_boundary(idx + 1, day_count, plot_left, plot_right),
+    )
+}
+
+fn chart_tick_x(idx: usize, day_count: usize, plot_left: u16, plot_right: u16) -> u16 {
+    if fixed_day_width(plot_left, plot_right, day_count) {
+        return plot_left.saturating_add(
+            idx.saturating_mul(DAY_STEP_WIDTH as usize)
+                .min(u16::MAX as usize) as u16,
+        );
+    }
+
+    chart_x_boundary(idx, day_count, plot_left, plot_right)
 }
 
 fn chart_x_boundary(idx: usize, day_count: usize, plot_left: u16, plot_right: u16) -> u16 {
@@ -802,6 +866,30 @@ mod tests {
     }
 
     #[test]
+    fn compact_plot_uses_two_columns_per_day_when_possible() {
+        let plot_right = compact_plot_right(10, 90, 7);
+
+        assert_eq!(plot_right, 23);
+        assert_eq!(chart_day_span(0, 7, 10, plot_right), (10, 11));
+        assert_eq!(chart_day_span(6, 7, 10, plot_right), (22, 23));
+    }
+
+    #[test]
+    fn compact_plot_falls_back_to_available_width_for_long_ranges() {
+        let plot_right = compact_plot_right(10, 30, 30);
+
+        assert_eq!(plot_right, 30);
+        assert!(!fixed_day_width(10, plot_right, 30));
+    }
+
+    #[test]
+    fn compact_last_seven_labels_use_day_numbers() {
+        assert_eq!(x_tick_label("2026-05-23", 7, 10, 23), "23");
+        assert_eq!(x_tick_label("2026-05-23", 30, 10, 69), "May 23");
+        assert_eq!(x_tick_label_x(12, 2, 7, 10, 23), 12);
+    }
+
+    #[test]
     fn y_tick_values_include_zero_and_max() {
         let ticks = y_tick_values(90.0, Y_TICK_COUNT);
 
@@ -877,7 +965,8 @@ mod tests {
         );
 
         let red_row = value_row(2.0, 3.0, plot_area.y, plot_area.bottom() - 1);
-        assert!((plot_area.x..plot_area.right()).all(|x| {
+        let compact_right = compact_plot_right(plot_area.x, plot_area.right() - 1, 3);
+        assert!((plot_area.x..=compact_right).all(|x| {
             let cell = buf.cell((x, red_row)).expect("cell should be in bounds");
             cell.symbol() == "─" && cell.fg == Color::Red
         }));
@@ -914,7 +1003,8 @@ mod tests {
         );
 
         let green_row = value_row(1.0, 3.0, plot_area.y, plot_area.bottom() - 1);
-        assert!((plot_area.x..plot_area.right()).all(|x| {
+        let compact_right = compact_plot_right(plot_area.x, plot_area.right() - 1, 3);
+        assert!((plot_area.x..=compact_right).all(|x| {
             let cell = buf.cell((x, green_row)).expect("cell should be in bounds");
             cell.symbol() == "─" && cell.fg == Color::Green
         }));
