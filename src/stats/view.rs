@@ -628,6 +628,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
 
     let mut sorted: Vec<(String, UsageTotals)> = totals.into_iter().collect();
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.total_tokens()));
+    let agent_columns = sorted_agents_by_usage(&cells);
 
     let visible = area.height.saturating_sub(3) as usize;
     let max_scroll = sorted.len().saturating_sub(visible.max(1));
@@ -658,7 +659,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                 )),
                 Cell::from(usage_cell_text(usage)),
             ];
-            for (agent, _) in MATRIX_AGENTS {
+            for (agent, _) in &agent_columns {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
                     Some(usage) => Cell::from(usage_cell_text(usage)),
                     None => Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
@@ -695,7 +696,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         )),
     ]
     .into_iter()
-    .chain(MATRIX_AGENTS.iter().map(|(_, label)| {
+    .chain(agent_columns.iter().map(|(_, label)| {
         Cell::from(Span::styled(
             *label,
             Style::default()
@@ -706,7 +707,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     .collect();
     let header = Row::new(header_cells);
 
-    let widths = model_table_widths(area.width, &sorted, &cells);
+    let widths = model_table_widths(area.width, &sorted, &cells, &agent_columns);
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
     let title = format!(" Models · {} of {} ", shown, sorted.len());
@@ -723,6 +724,29 @@ fn usage_cell_text(usage: &UsageTotals) -> String {
         format_tokens(usage.in_tokens),
         format_tokens(usage.out_tokens)
     )
+}
+
+fn sorted_agents_by_usage(
+    cells: &HashMap<(String, String), UsageTotals>,
+) -> Vec<(&'static str, &'static str)> {
+    let mut agents: Vec<(usize, &'static str, &'static str, u64)> = MATRIX_AGENTS
+        .iter()
+        .enumerate()
+        .map(|(idx, (agent, label))| {
+            let total = cells
+                .iter()
+                .filter(|((cell_agent, _), _)| cell_agent == agent)
+                .map(|(_, usage)| usage.total_tokens())
+                .sum();
+            (idx, *agent, *label, total)
+        })
+        .collect();
+
+    agents.sort_by(|left, right| right.3.cmp(&left.3).then(left.0.cmp(&right.0)));
+    agents
+        .into_iter()
+        .map(|(_, agent, label, _)| (agent, label))
+        .collect()
 }
 
 fn text_width(text: &str) -> u16 {
@@ -743,9 +767,10 @@ fn model_table_widths(
     area_width: u16,
     sorted: &[(String, UsageTotals)],
     cells: &HashMap<(String, String), UsageTotals>,
+    agent_columns: &[(&'static str, &'static str)],
 ) -> Vec<Constraint> {
     let total_width = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
-    let agent_widths: Vec<u16> = MATRIX_AGENTS
+    let agent_widths: Vec<u16> = agent_columns
         .iter()
         .map(|(agent, label)| {
             let agent = (*agent).to_string();
@@ -756,7 +781,7 @@ fn model_table_widths(
         })
         .collect();
 
-    let column_count = (3 + MATRIX_AGENTS.len()) as u16;
+    let column_count = (3 + agent_columns.len()) as u16;
     let inner_width = area_width.saturating_sub(2);
     let non_model_width = SHARE_WIDTH + total_width + agent_widths.iter().sum::<u16>();
     let spacing_width = TABLE_COLUMN_SPACING * column_count.saturating_sub(1);
@@ -1021,6 +1046,33 @@ mod tests {
     }
 
     #[test]
+    fn model_table_agent_columns_sort_by_usage() {
+        let cells = HashMap::from([
+            (
+                ("claude".to_string(), "qwen3.7-max".to_string()),
+                usage(100, 0),
+            ),
+            (("codex".to_string(), "gpt-5.4".to_string()), usage(300, 0)),
+            (
+                ("copilot".to_string(), "gpt-5.5".to_string()),
+                usage(200, 0),
+            ),
+        ]);
+
+        let agents = sorted_agents_by_usage(&cells);
+
+        assert_eq!(
+            agents,
+            vec![
+                ("codex", "Codex"),
+                ("copilot", "Copilot"),
+                ("claude", "Claude Code"),
+                ("zed", "Zed Agent"),
+            ]
+        );
+    }
+
+    #[test]
     fn model_table_widths_keep_stat_columns_compact() {
         let sorted = vec![
             ("qwen3.7-max".to_string(), usage(174_400_000, 547_900)),
@@ -1040,12 +1092,14 @@ mod tests {
                 usage(510_900, 59_900),
             ),
         ]);
+        let agent_columns = sorted_agents_by_usage(&cells);
 
-        let widths = model_table_widths(103, &sorted, &cells);
+        let widths = model_table_widths(103, &sorted, &cells, &agent_columns);
 
         assert!(constraint_length(widths[0]) >= 20);
         assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
         assert_eq!(constraint_length(widths[2]), text_width("↑174.4m ↓547.9k"));
-        assert_eq!(constraint_length(widths[5]), text_width("Zed Agent"));
+        assert_eq!(constraint_length(widths[5]), text_width("Codex"));
+        assert_eq!(constraint_length(widths[6]), text_width("Zed Agent"));
     }
 }
