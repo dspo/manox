@@ -16,6 +16,16 @@ This edition is designed for GitLab-hosted internal distribution:
 - for `codex`, `cx` injects a synthetic DashScope provider view before launch, so it does not depend on the user already having `~/.codex/config.toml`
 - `cx` does **not** proxy `codex app`
 
+## Stats dashboard
+
+`cx stats` opens a token usage dashboard for reviewing model and agent usage.
+The `Overview` view shows token trends and a model table with share, total
+tokens, and per-agent breakdowns. The `Dynamicview` view adds an All time
+cumulative token bar chart race for models, linked with the same model table as
+the race date advances.
+
+![cx stats Dynamicview](docs/dynamicview.gif)
+
 ## Install from GitLab
 
 This is the primary installation path for internal users.
