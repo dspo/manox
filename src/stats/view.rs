@@ -101,11 +101,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
             "  No data in selected period.",
             Style::default().fg(Color::DarkGray),
         )))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Tokens per Day "),
-        );
+        .block(Block::default().title(" Tokens per Day "));
         f.render_widget(p, area);
         return;
     }
@@ -155,15 +151,12 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         let pts: Vec<PlotPoint> = series
             .get(model)
             .map(|v| {
-                v.iter()
-                    .enumerate()
-                    .map(|(i, &y)| {
-                        if y > max_y {
-                            max_y = y;
-                        }
-                        (i as f64, y)
-                    })
-                    .collect()
+                for &y in v {
+                    if y > max_y {
+                        max_y = y;
+                    }
+                }
+                daily_step_points(v)
             })
             .unwrap_or_default();
         datasets_data.push((model.clone(), pts, color));
@@ -174,7 +167,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         .map(|(name, data, color)| {
             Dataset::default()
                 .name(name.clone())
-                .marker(symbols::Marker::Braille)
+                .marker(symbols::Marker::HalfBlock)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(*color))
                 .data(data)
@@ -196,16 +189,27 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
     let y_max_label = format_tokens(max_y as u64);
     let y_mid_label = format_tokens((max_y / 2.0) as u64);
 
-    let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Tokens per Day · {} ", app.period.label())),
+    let (chart_area, legend_area) = if area.height >= 8 {
+        (
+            Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1)),
+            Some(Rect::new(
+                area.x,
+                area.bottom().saturating_sub(1),
+                area.width,
+                1,
+            )),
         )
+    } else {
+        (area, None)
+    };
+
+    let chart = Chart::new(datasets)
+        .block(Block::default().title(format!(" Tokens per Day · {} ", app.period.label())))
+        .legend_position(None)
         .x_axis(
             Axis::default()
                 .style(Style::default().fg(Color::DarkGray))
-                .bounds([0.0, (day_count.saturating_sub(1)) as f64])
+                .bounds([0.0, day_count as f64])
                 .labels(x_labels),
         )
         .y_axis(
@@ -219,7 +223,45 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
                 ]),
         );
 
-    f.render_widget(chart, area);
+    f.render_widget(chart, chart_area);
+    if let Some(legend_area) = legend_area {
+        draw_chart_legend(f, legend_area, &datasets_data);
+    }
+}
+
+fn daily_step_points(values: &[f64]) -> Vec<PlotPoint> {
+    let Some((&first, rest)) = values.split_first() else {
+        return Vec::new();
+    };
+
+    let mut points = Vec::with_capacity(values.len().saturating_mul(3));
+    points.push((0.0, first));
+    for (idx, &value) in values.iter().enumerate() {
+        let next_x = (idx + 1) as f64;
+        points.push((next_x, value));
+        if let Some(&next_value) = rest.get(idx) {
+            points.push((next_x, next_value));
+        }
+    }
+    points
+}
+
+fn draw_chart_legend(f: &mut ratatui::Frame, area: Rect, datasets: &[DatasetData]) {
+    let mut spans = Vec::new();
+    for (idx, (name, _, color)) in datasets.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+        }
+        spans.push(Span::styled("● ", Style::default().fg(*color)));
+        spans.push(Span::styled(
+            name.clone(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
