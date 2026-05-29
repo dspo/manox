@@ -1,4 +1,4 @@
-//! TUI 渲染：header / footer / Models / Matrix。
+//! TUI 渲染：header / footer / Models。
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -13,7 +13,7 @@ use super::aggregate::{top_models_covering, totals_by_agent_model, totals_by_mod
 use super::date::{date_offset, days_diff};
 use super::format::{format_tokens, short_date};
 use super::tui::StatsApp;
-use super::types::{Period, UsageTotals, View};
+use super::types::{Period, UsageTotals};
 use super::{MATRIX_AGENTS, PALETTE};
 
 type PlotPoint = (f64, f64);
@@ -31,31 +31,11 @@ pub(super) fn draw(f: &mut ratatui::Frame, app: &mut StatsApp) {
         .split(area);
 
     draw_header(f, chunks[0], app);
-    match app.view {
-        View::Models => draw_models_view(f, chunks[1], app),
-        View::Matrix => draw_matrix_view(f, chunks[1], app),
-    }
+    draw_models_view(f, chunks[1], app);
     draw_footer(f, chunks[2], app);
 }
 
-fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
-    let active_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::LightCyan)
-        .add_modifier(Modifier::BOLD);
-    let inactive_style = Style::default().fg(Color::Gray);
-
-    let models_span = if app.view == View::Models {
-        Span::styled(" Models ", active_style)
-    } else {
-        Span::styled(" Models ", inactive_style)
-    };
-    let matrix_span = if app.view == View::Matrix {
-        Span::styled(" Matrix ", active_style)
-    } else {
-        Span::styled(" Matrix ", inactive_style)
-    };
-
+fn draw_header(f: &mut ratatui::Frame, area: Rect, _app: &StatsApp) {
     let title = Line::from(vec![
         Span::styled(
             " cx stats ",
@@ -64,9 +44,13 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw("· Token Usage Dashboard   "),
-        models_span,
-        Span::raw(" "),
-        matrix_span,
+        Span::styled(
+            " Models ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
 
     let block = Block::default().borders(Borders::BOTTOM);
@@ -80,7 +64,7 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         Period::Last30 => "1 7d  [2] 30d  3 All",
         Period::All => "1 7d  2 30d  [3] All",
     };
-    let text = format!("[Tab] toggle view   {period_hint}   r cycle dates   ↑↓ scroll   q quit");
+    let text = format!("{period_hint}   r cycle dates   ↑↓ scroll   q quit");
     let p = Paragraph::new(Line::from(Span::styled(
         text,
         Style::default().fg(Color::DarkGray),
@@ -255,6 +239,7 @@ fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
 
 fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     let records = app.period_records();
+    let cells = totals_by_agent_model(&records);
     let totals = totals_by_model(&records);
     let total_all: u64 = totals.values().map(|usage| usage.total_tokens()).sum();
 
@@ -271,7 +256,7 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     let mut sorted: Vec<(String, UsageTotals)> = totals.into_iter().collect();
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.total_tokens()));
 
-    let visible = area.height.saturating_sub(2) as usize;
+    let visible = area.height.saturating_sub(3) as usize;
     let max_scroll = sorted.len().saturating_sub(visible.max(1));
     if app.models_scroll > max_scroll {
         app.models_scroll = max_scroll;
@@ -289,86 +274,17 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                 0.0
             };
             let dot_color = PALETTE[idx % PALETTE.len()];
-            Row::new(vec![
-                Cell::from(Span::styled("●", Style::default().fg(dot_color))),
+            let mut row_cells = vec![
                 Cell::from(Span::styled(
                     model.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
                 )),
                 Cell::from(Span::styled(
                     format!("{:.1}%", pct),
                     Style::default().fg(Color::DarkGray),
                 )),
-                Cell::from(format!(
-                    "↑{} ↓{}",
-                    format_tokens(usage.in_tokens),
-                    format_tokens(usage.out_tokens)
-                )),
-            ])
-        })
-        .collect();
-
-    let widths = [
-        Constraint::Length(2),
-        Constraint::Length(28),
-        Constraint::Length(8),
-        Constraint::Length(24),
-    ];
-
-    let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
-    let title = format!(" Models · {} of {} ", shown, sorted.len());
-    let table = Table::new(rows, widths).block(Block::default().borders(Borders::ALL).title(title));
-    f.render_widget(table, area);
-}
-
-fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
-    let records = app.period_records();
-    let cells = totals_by_agent_model(&records);
-
-    let mut model_totals: HashMap<String, u64> = HashMap::new();
-    for ((_, model), usage) in &cells {
-        *model_totals.entry(model.clone()).or_insert(0) += usage.total_tokens();
-    }
-    let mut models: Vec<(String, u64)> = model_totals
-        .into_iter()
-        .filter(|(_, total)| *total > 0)
-        .collect();
-    models.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let models: Vec<String> = models.into_iter().map(|(m, _)| m).collect();
-
-    let visible = area.height.saturating_sub(4) as usize;
-    let max_scroll = models.len().saturating_sub(visible.max(1));
-    if app.matrix_scroll > max_scroll {
-        app.matrix_scroll = max_scroll;
-    }
-
-    let header_cells: Vec<Cell> = std::iter::once(Cell::from(Span::styled(
-        "model",
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )))
-    .chain(MATRIX_AGENTS.iter().map(|(_, label)| {
-        Cell::from(Span::styled(
-            *label,
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ))
-    }))
-    .collect();
-    let header = Row::new(header_cells).style(Style::default().bg(Color::Reset));
-
-    let rows: Vec<Row> = models
-        .iter()
-        .skip(app.matrix_scroll)
-        .take(visible)
-        .map(|model| {
-            let mut row_cells: Vec<Cell> = Vec::with_capacity(MATRIX_AGENTS.len() + 1);
-            row_cells.push(Cell::from(Span::styled(
-                model.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
+                Cell::from(format_tokens(usage.total_tokens())),
+            ];
             for (agent, _) in MATRIX_AGENTS {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
                     Some(usage) => Cell::from(format!(
@@ -384,15 +300,47 @@ fn draw_matrix_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         })
         .collect();
 
-    let mut widths = vec![Constraint::Length(28)];
+    let header_cells: Vec<Cell> = [
+        Cell::from(Span::styled(
+            "model id",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            "model share",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Cell::from(Span::styled(
+            "model total tokens",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ]
+    .into_iter()
+    .chain(MATRIX_AGENTS.iter().map(|(_, label)| {
+        Cell::from(Span::styled(
+            *label,
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+    }))
+    .collect();
+    let header = Row::new(header_cells);
+
+    let mut widths = vec![
+        Constraint::Length(32),
+        Constraint::Length(12),
+        Constraint::Length(18),
+    ];
     widths.extend(MATRIX_AGENTS.iter().map(|_| Constraint::Length(20)));
 
-    let title = format!(
-        " Agent × Model · {} ({}/{}) ",
-        app.period.label(),
-        models.len().min(app.matrix_scroll + visible),
-        models.len()
-    );
+    let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
+    let title = format!(" Models · {} of {} ", shown, sorted.len());
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title));

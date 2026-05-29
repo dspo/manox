@@ -11,16 +11,14 @@ use ratatui::backend::CrosstermBackend;
 use std::io;
 use std::time::Duration;
 
-use super::types::{Period, UsageRecord, View};
+use super::types::{Period, UsageRecord};
 use super::view::draw;
 
 pub(super) struct StatsApp {
     pub(super) records: Vec<UsageRecord>,
     pub(super) today: String,
-    pub(super) view: View,
     pub(super) period: Period,
     pub(super) models_scroll: usize,
-    pub(super) matrix_scroll: usize,
 }
 
 impl StatsApp {
@@ -28,10 +26,8 @@ impl StatsApp {
         Self {
             records,
             today,
-            view: View::Models,
             period: Period::Last7,
             models_scroll: 0,
-            matrix_scroll: 0,
         }
     }
 
@@ -80,24 +76,16 @@ fn event_loop<B: ratatui::backend::Backend>(
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Tab | KeyCode::BackTab => {
-                app.view = match app.view {
-                    View::Models => View::Matrix,
-                    View::Matrix => View::Models,
-                };
-            }
             KeyCode::Char('1') => app.period = Period::Last7,
             KeyCode::Char('2') => app.period = Period::Last30,
             KeyCode::Char('3') => app.period = Period::All,
             KeyCode::Char('r') => app.period = app.period.cycle(),
-            KeyCode::Down | KeyCode::Char('j') => match app.view {
-                View::Models => app.models_scroll = app.models_scroll.saturating_add(1),
-                View::Matrix => app.matrix_scroll = app.matrix_scroll.saturating_add(1),
-            },
-            KeyCode::Up | KeyCode::Char('k') => match app.view {
-                View::Models => app.models_scroll = app.models_scroll.saturating_sub(1),
-                View::Matrix => app.matrix_scroll = app.matrix_scroll.saturating_sub(1),
-            },
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.models_scroll = app.models_scroll.saturating_add(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.models_scroll = app.models_scroll.saturating_sub(1)
+            }
             _ => {}
         }
     }

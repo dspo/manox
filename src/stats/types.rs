@@ -64,12 +64,6 @@ impl ScanCache {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum View {
-    Models,
-    Matrix,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Period {
     All,
     Last7,

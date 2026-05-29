@@ -1,7 +1,7 @@
 //! cx stats — Token 用量统计 TUI
 //!
 //! 扫描各 agent 的本地日志，聚合 (agent, model, date) 维度的 token 用量，
-//! 提供 Models / Matrix 两种 TUI 视图。
+//! 提供 Models TUI 视图。
 //!
 //! 设计参考 ccusage `rust/crates/ccusage/src/adapter/`：
 //! - 解析阶段：每个文件解析为 `Vec<RawEntry>`（带去重主键）。
