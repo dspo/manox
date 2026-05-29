@@ -1058,7 +1058,7 @@ fn draw_overview_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsA
     let records = app.period_records();
     let cells = totals_by_agent_model(&records);
     let totals = totals_by_model(&records);
-    draw_model_table(f, area, app, "Models", cells, totals, None);
+    draw_model_table(f, area, app, "Models", cells, totals, None, false);
 }
 
 fn draw_dynamic_model_list(
@@ -1076,6 +1076,7 @@ fn draw_dynamic_model_list(
             HashMap::new(),
             HashMap::new(),
             None,
+            true,
         );
         return;
     };
@@ -1091,6 +1092,7 @@ fn draw_dynamic_model_list(
         displayed_cells,
         displayed_totals,
         Some(&color_map),
+        true,
     );
 }
 
@@ -1102,6 +1104,7 @@ fn draw_model_table(
     cells: HashMap<(String, String), UsageTotals>,
     totals: HashMap<String, UsageTotals>,
     color_map: Option<&HashMap<String, Color>>,
+    hide_empty_agents: bool,
 ) {
     let total_all: u64 = totals.values().map(|usage| usage.total_tokens()).sum();
 
@@ -1121,7 +1124,7 @@ fn draw_model_table(
 
     let mut sorted: Vec<(String, UsageTotals)> = totals.into_iter().collect();
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.total_tokens()));
-    let agent_columns = sorted_agents_by_usage(&cells);
+    let agent_columns = sorted_agents_by_usage(&cells, hide_empty_agents);
 
     let visible = area.height.saturating_sub(3) as usize;
     let max_scroll = sorted.len().saturating_sub(visible.max(1));
@@ -1223,6 +1226,7 @@ fn usage_cell_text(usage: &UsageTotals) -> String {
 
 fn sorted_agents_by_usage(
     cells: &HashMap<(String, String), UsageTotals>,
+    hide_empty_agents: bool,
 ) -> Vec<(&'static str, &'static str)> {
     let mut agents: Vec<(usize, &'static str, &'static str, u64)> = MATRIX_AGENTS
         .iter()
@@ -1237,6 +1241,9 @@ fn sorted_agents_by_usage(
         })
         .collect();
 
+    if hide_empty_agents {
+        agents.retain(|(_, _, _, total)| *total > 0);
+    }
     agents.sort_by(|left, right| right.3.cmp(&left.3).then(left.0.cmp(&right.0)));
     agents
         .into_iter()
@@ -1636,8 +1643,14 @@ mod tests {
                 .map(|usage| usage.total_tokens()),
             Some(100)
         );
-        assert_eq!(sorted_agents_by_usage(&frames[0].cells)[0], ("claude", "Claude Code"));
-        assert_eq!(sorted_agents_by_usage(&frames[1].cells)[0], ("codex", "Codex"));
+        assert_eq!(
+            sorted_agents_by_usage(&frames[0].cells, true),
+            vec![("claude", "Claude Code")]
+        );
+        assert_eq!(
+            sorted_agents_by_usage(&frames[1].cells, true)[0],
+            ("codex", "Codex")
+        );
     }
 
     #[test]
@@ -1662,7 +1675,7 @@ mod tests {
             ),
         ]);
 
-        let agents = sorted_agents_by_usage(&cells);
+        let agents = sorted_agents_by_usage(&cells, false);
 
         assert_eq!(
             agents,
@@ -1673,6 +1686,18 @@ mod tests {
                 ("zed", "Zed Agent"),
             ]
         );
+    }
+
+    #[test]
+    fn model_table_agent_columns_can_hide_empty_agents() {
+        let cells = HashMap::from([(
+            ("claude".to_string(), "qwen3.7-max".to_string()),
+            usage(100, 0),
+        )]);
+
+        let agents = sorted_agents_by_usage(&cells, true);
+
+        assert_eq!(agents, vec![("claude", "Claude Code")]);
     }
 
     #[test]
@@ -1695,7 +1720,7 @@ mod tests {
                 usage(510_900, 59_900),
             ),
         ]);
-        let agent_columns = sorted_agents_by_usage(&cells);
+        let agent_columns = sorted_agents_by_usage(&cells, false);
 
         let widths = model_table_widths(103, &sorted, &cells, &agent_columns);
 
