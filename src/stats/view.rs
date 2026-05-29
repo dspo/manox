@@ -24,7 +24,7 @@ const SHARE_WIDTH: u16 = 8;
 const TOTAL_WIDTH: u16 = 18;
 const AGENT_WIDTH: u16 = 18;
 const TABLE_COLUMN_SPACING: u16 = 1;
-const STRIPED_ROW_BG: Color = Color::Rgb(246, 248, 250);
+const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
 
 pub(super) fn draw(f: &mut ratatui::Frame, app: &mut StatsApp) {
     let area = f.area();
