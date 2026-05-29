@@ -14,11 +14,42 @@ use std::time::Duration;
 use super::types::{Period, UsageRecord};
 use super::view::draw;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChartTab {
+    Overview,
+    Funview,
+}
+
+impl ChartTab {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ChartTab::Overview => "Overview",
+            ChartTab::Funview => "Funview",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            ChartTab::Overview => ChartTab::Funview,
+            ChartTab::Funview => ChartTab::Overview,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FocusArea {
+    Models,
+    ChartTabs,
+}
+
 pub(super) struct StatsApp {
     pub(super) records: Vec<UsageRecord>,
     pub(super) today: String,
     pub(super) period: Period,
     pub(super) models_scroll: usize,
+    pub(super) chart_tab: ChartTab,
+    pub(super) focus: FocusArea,
+    pub(super) race_tick: usize,
 }
 
 impl StatsApp {
@@ -28,6 +59,9 @@ impl StatsApp {
             today,
             period: Period::Last7,
             models_scroll: 0,
+            chart_tab: ChartTab::Overview,
+            focus: FocusArea::Models,
+            race_tick: 0,
         }
     }
 
@@ -37,6 +71,19 @@ impl StatsApp {
             .iter()
             .filter(|r| self.period.includes(&r.date, &self.today))
             .collect()
+    }
+
+    fn advance_race(&mut self) {
+        if self.chart_tab == ChartTab::Funview {
+            self.race_tick = self.race_tick.saturating_add(1);
+        }
+    }
+
+    fn cycle_chart_tab(&mut self) {
+        self.chart_tab = self.chart_tab.next();
+        if self.chart_tab == ChartTab::Funview {
+            self.race_tick = 0;
+        }
     }
 }
 
@@ -66,6 +113,7 @@ fn event_loop<B: ratatui::backend::Backend>(
         terminal.draw(|f| draw(f, &mut app))?;
 
         if !event::poll(Duration::from_millis(250))? {
+            app.advance_race();
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -80,12 +128,13 @@ fn event_loop<B: ratatui::backend::Backend>(
             KeyCode::Char('2') => app.period = Period::Last30,
             KeyCode::Char('3') => app.period = Period::All,
             KeyCode::Char('r') => app.period = app.period.cycle(),
-            KeyCode::Down | KeyCode::Char('j') => {
-                app.models_scroll = app.models_scroll.saturating_add(1)
+            KeyCode::Down => app.focus = FocusArea::ChartTabs,
+            KeyCode::Up => app.focus = FocusArea::Models,
+            KeyCode::Tab | KeyCode::BackTab if app.focus == FocusArea::ChartTabs => {
+                app.cycle_chart_tab()
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.models_scroll = app.models_scroll.saturating_sub(1)
-            }
+            KeyCode::Char('j') => app.models_scroll = app.models_scroll.saturating_add(1),
+            KeyCode::Char('k') => app.models_scroll = app.models_scroll.saturating_sub(1),
             _ => {}
         }
     }

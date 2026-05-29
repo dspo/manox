@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use super::aggregate::{top_models_covering, totals_by_agent_model, totals_by_model};
 use super::date::{date_offset, days_diff};
 use super::format::{format_tokens, short_date};
-use super::tui::StatsApp;
+use super::tui::{ChartTab, FocusArea, StatsApp};
 use super::types::{Period, UsageRecord, UsageTotals};
 use super::{MATRIX_AGENTS, PALETTE};
 
@@ -25,6 +25,21 @@ const STEP_CHART_MAX_WIDTH: u16 = 78;
 const STEP_CHART_HEIGHT: u16 = 14;
 const Y_TICK_COUNT: usize = 10;
 const X_TICK_MIN_COUNT: usize = 6;
+const RACE_VISIBLE_MODELS: usize = 10;
+const RACE_TWEEN_STEPS: usize = 3;
+
+#[derive(Debug, Clone)]
+struct RaceEntry {
+    model: String,
+    value: u64,
+    color: Color,
+}
+
+#[derive(Debug, Clone)]
+struct RaceFrame {
+    date: String,
+    entries: Vec<RaceEntry>,
+}
 
 pub(super) fn draw(f: &mut ratatui::Frame, app: &mut StatsApp) {
     let area = f.area();
@@ -71,7 +86,11 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         Period::Last30 => "1 7d  [2] 30d  3 All",
         Period::All => "1 7d  2 30d  [3] All",
     };
-    let text = format!("{period_hint}   r cycle dates   ↑↓ scroll   q quit");
+    let focus_hint = match app.focus {
+        FocusArea::Models => "↓ tabs   j/k scroll",
+        FocusArea::ChartTabs => "↑ models   Tab switch view",
+    };
+    let text = format!("{period_hint}   r cycle dates   {focus_hint}   q quit");
     let p = Paragraph::new(Line::from(Span::styled(
         text,
         Style::default().fg(Color::DarkGray),
@@ -89,8 +108,11 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
         ])
         .split(area);
 
-    draw_tokens_per_day_chart(f, chunks[0], app);
-    draw_period_switch(f, chunks[1], app);
+    match app.chart_tab {
+        ChartTab::Overview => draw_tokens_per_day_chart(f, chunks[0], app),
+        ChartTab::Funview => draw_bar_chart_race(f, chunks[0], app),
+    }
+    draw_chart_tabs(f, chunks[1], app);
     draw_model_list(f, chunks[2], app);
 }
 
@@ -116,7 +138,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
     let day_count = (days_diff(&min_date, &max_date).unwrap_or(0).max(0) + 1) as usize;
     let day_count = day_count.max(1);
 
-    // 每个模型每天的 token 数（含 cache 的总量，与 ccusage 对齐）
+    // 每个模型每天的 token 数，使用与模型排行一致的 input + output 口径。
     let mut series: HashMap<String, Vec<f64>> = HashMap::new();
     for m in &top_models {
         series.insert(m.clone(), vec![0.0; day_count]);
@@ -157,6 +179,170 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         max_y,
         &chart_series,
     );
+}
+
+fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
+    let chart_area = fixed_chart_area(area);
+    if chart_area.width < 32 || chart_area.height < 6 {
+        f.render_widget(Paragraph::new("Model Tokens Race · All time"), chart_area);
+        return;
+    }
+
+    let frames = race_frames(&app.records);
+    if frames.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "  No data for bar chart race.",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(Block::default().title(" Model Tokens Race · All time "));
+        f.render_widget(p, chart_area);
+        return;
+    }
+
+    let current_idx = race_frame_index(app.race_tick, frames.len());
+    let previous_idx = current_idx.saturating_sub(1);
+    let current = &frames[current_idx];
+    let previous = &frames[previous_idx];
+    let tween = race_tween(app.race_tick);
+
+    draw_race_frame(f, chart_area, previous, current, tween);
+}
+
+fn draw_race_frame(
+    f: &mut ratatui::Frame,
+    chart_area: Rect,
+    previous: &RaceFrame,
+    current: &RaceFrame,
+    tween: f64,
+) {
+    let title = Line::from(Span::styled(
+        " Model Tokens Race · All time ",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(
+        Paragraph::new(title),
+        Rect::new(chart_area.x, chart_area.y, chart_area.width, 1),
+    );
+
+    let date_line = Line::from(vec![
+        Span::styled(" Date ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            short_date(&current.date),
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(date_line),
+        Rect::new(chart_area.x, chart_area.y + 1, chart_area.width, 1),
+    );
+
+    if current.entries.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  Waiting for the first model token usage...",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Rect::new(
+                chart_area.x,
+                chart_area.y + 3,
+                chart_area.width,
+                chart_area.height.saturating_sub(3),
+            ),
+        );
+        return;
+    }
+
+    let row_count = RACE_VISIBLE_MODELS
+        .min(current.entries.len())
+        .min(chart_area.height.saturating_sub(3) as usize);
+    if row_count == 0 {
+        return;
+    }
+
+    let model_width = current
+        .entries
+        .iter()
+        .take(row_count)
+        .map(|entry| text_width(&entry.model))
+        .max()
+        .unwrap_or(10)
+        .clamp(10, 22);
+    let max_value = current
+        .entries
+        .iter()
+        .take(row_count)
+        .map(|entry| entry.value)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let value_width = current
+        .entries
+        .iter()
+        .take(row_count)
+        .map(|entry| text_width(&format_tokens(entry.value)))
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let bar_left = chart_area.x + model_width + 2;
+    let bar_right = chart_area
+        .right()
+        .saturating_sub(value_width)
+        .saturating_sub(3);
+    if bar_left >= bar_right {
+        return;
+    }
+
+    let plot_top = chart_area.y + 3;
+    let plot_bottom = plot_top + row_count as u16 - 1;
+    let previous_ranks = race_rank_map(previous);
+    let previous_values = race_value_map(previous);
+    let eased = smoothstep(tween);
+    let bar_width = bar_right.saturating_sub(bar_left) + 1;
+    let mut occupied_rows = HashSet::new();
+
+    for (rank, entry) in current.entries.iter().take(row_count).enumerate() {
+        let previous_rank = previous_ranks
+            .get(&entry.model)
+            .copied()
+            .unwrap_or(row_count)
+            .min(row_count);
+        let interpolated_rank = previous_rank as f64 + (rank as f64 - previous_rank as f64) * eased;
+        let candidate_row = plot_top + interpolated_rank.round() as u16;
+        let Some(row) = nearest_free_row(candidate_row, plot_top, plot_bottom, &occupied_rows)
+        else {
+            continue;
+        };
+        occupied_rows.insert(row);
+
+        let previous_value = previous_values.get(&entry.model).copied().unwrap_or(0);
+        let value = interpolate_u64(previous_value, entry.value, eased);
+        let bar_len = ((value as f64 / max_value as f64) * f64::from(bar_width))
+            .round()
+            .max(if value > 0 { 1.0 } else { 0.0 }) as u16;
+        let label = truncate_text(&entry.model, model_width);
+        let value_label = format_tokens(value);
+        let style = Style::default().fg(entry.color);
+        let buf = f.buffer_mut();
+
+        buf.set_string(chart_area.x, row, label, style.add_modifier(Modifier::BOLD));
+        if bar_len > 0 {
+            buf.set_string(
+                bar_left,
+                row,
+                "█".repeat(bar_len.min(bar_width) as usize),
+                style,
+            );
+        }
+        buf.set_string(
+            bar_right + 2,
+            row,
+            value_label,
+            Style::default().fg(Color::DarkGray),
+        );
+    }
 }
 
 fn draw_step_chart(
@@ -285,16 +471,164 @@ fn chart_date_range(
             let mut min_date = first.date.clone();
             let mut max_date = first.date.clone();
             for record in records.iter().skip(1) {
-                if record.date < min_date {
+                if record.date.as_str() < min_date.as_str() {
                     min_date = record.date.clone();
                 }
-                if record.date > max_date {
+                if record.date.as_str() > max_date.as_str() {
                     max_date = record.date.clone();
                 }
             }
             Some((min_date, max_date))
         }
     }
+}
+
+fn race_frames(records: &[UsageRecord]) -> Vec<RaceFrame> {
+    let Some((min_date, max_date)) = all_time_date_range(records) else {
+        return Vec::new();
+    };
+    let day_count = (days_diff(&min_date, &max_date).unwrap_or(0).max(0) + 1) as usize;
+    let color_map = race_color_map(records);
+    let mut records_by_date: HashMap<String, Vec<&UsageRecord>> = HashMap::new();
+    for record in records {
+        records_by_date
+            .entry(record.date.clone())
+            .or_default()
+            .push(record);
+    }
+
+    let mut cumulative: HashMap<String, u64> = HashMap::new();
+    let mut frames = Vec::with_capacity(day_count);
+    for day_idx in 0..day_count {
+        let date = if day_idx + 1 == day_count {
+            max_date.clone()
+        } else {
+            date_offset(&min_date, day_idx as i64).unwrap_or_else(|_| min_date.clone())
+        };
+
+        for record in records_by_date.get(&date).into_iter().flatten() {
+            let tokens = record.in_tokens.saturating_add(record.out_tokens);
+            *cumulative.entry(record.model.clone()).or_default() += tokens;
+        }
+
+        let mut entries: Vec<RaceEntry> = cumulative
+            .iter()
+            .filter(|(_, value)| **value > 0)
+            .map(|(model, value)| RaceEntry {
+                model: model.clone(),
+                value: *value,
+                color: color_map.get(model).copied().unwrap_or(Color::White),
+            })
+            .collect();
+        entries.sort_by(|left, right| {
+            right
+                .value
+                .cmp(&left.value)
+                .then_with(|| left.model.cmp(&right.model))
+        });
+        entries.truncate(RACE_VISIBLE_MODELS);
+        frames.push(RaceFrame { date, entries });
+    }
+    frames
+}
+
+fn all_time_date_range(records: &[UsageRecord]) -> Option<(String, String)> {
+    let first = records.first()?;
+    let mut min_date = first.date.clone();
+    let mut max_date = first.date.clone();
+    for record in records.iter().skip(1) {
+        if record.date.as_str() < min_date.as_str() {
+            min_date = record.date.clone();
+        }
+        if record.date.as_str() > max_date.as_str() {
+            max_date = record.date.clone();
+        }
+    }
+    Some((min_date, max_date))
+}
+
+fn race_color_map(records: &[UsageRecord]) -> HashMap<String, Color> {
+    let record_refs = records.iter().collect::<Vec<_>>();
+    let totals = totals_by_model(&record_refs);
+    let mut models: Vec<(String, u64)> = totals
+        .into_iter()
+        .map(|(model, usage)| (model, usage.total_tokens()))
+        .collect();
+    models.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    models
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (model, _))| (model, PALETTE[idx % PALETTE.len()]))
+        .collect()
+}
+
+fn race_frame_index(tick: usize, frame_count: usize) -> usize {
+    if frame_count == 0 {
+        0
+    } else {
+        (tick / RACE_TWEEN_STEPS) % frame_count
+    }
+}
+
+fn race_tween(tick: usize) -> f64 {
+    (tick % RACE_TWEEN_STEPS) as f64 / RACE_TWEEN_STEPS as f64
+}
+
+fn smoothstep(value: f64) -> f64 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
+fn interpolate_u64(from: u64, to: u64, tween: f64) -> u64 {
+    (from as f64 + (to as f64 - from as f64) * tween)
+        .round()
+        .max(0.0) as u64
+}
+
+fn race_rank_map(frame: &RaceFrame) -> HashMap<String, usize> {
+    frame
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(rank, entry)| (entry.model.clone(), rank))
+        .collect()
+}
+
+fn race_value_map(frame: &RaceFrame) -> HashMap<String, u64> {
+    frame
+        .entries
+        .iter()
+        .map(|entry| (entry.model.clone(), entry.value))
+        .collect()
+}
+
+fn nearest_free_row(
+    candidate: u16,
+    top: u16,
+    bottom: u16,
+    occupied_rows: &HashSet<u16>,
+) -> Option<u16> {
+    if top > bottom {
+        return None;
+    }
+    let candidate = candidate.clamp(top, bottom);
+    if !occupied_rows.contains(&candidate) {
+        return Some(candidate);
+    }
+
+    let max_distance = bottom.saturating_sub(top);
+    for distance in 1..=max_distance {
+        if let Some(row) = candidate.checked_sub(distance) {
+            if row >= top && !occupied_rows.contains(&row) {
+                return Some(row);
+            }
+        }
+        let row = candidate.saturating_add(distance);
+        if row <= bottom && !occupied_rows.contains(&row) {
+            return Some(row);
+        }
+    }
+    None
 }
 
 fn right_aligned_label(
@@ -536,23 +870,38 @@ fn chart_legend_max_width(datasets: &[ChartSeries]) -> u16 {
         .min(u16::MAX as usize) as u16
 }
 
-fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
+fn draw_chart_tabs(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let mut spans: Vec<Span> = Vec::new();
-    for (i, p) in [Period::Last7, Period::Last30, Period::All]
-        .iter()
-        .enumerate()
-    {
+    if app.focus == FocusArea::ChartTabs {
+        spans.push(Span::styled("▸ ", Style::default().fg(Color::LightCyan)));
+    } else {
+        spans.push(Span::raw("  "));
+    }
+
+    for (i, tab) in [ChartTab::Overview, ChartTab::Funview].iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(" · "));
         }
-        let style = if app.period == *p {
+        let style = if app.chart_tab == *tab {
             Style::default()
-                .fg(Color::LightYellow)
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::default().fg(Color::Gray)
         };
-        spans.push(Span::styled(p.label().to_string(), style));
+        spans.push(Span::styled(tab.label(), style));
+    }
+
+    if app.chart_tab == ChartTab::Overview {
+        spans.push(Span::styled(
+            format!("   ·   {}", app.period.label()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else {
+        spans.push(Span::styled(
+            "   ·   All time cumulative tokens",
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
@@ -569,7 +918,11 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             "  No models in selected period.",
             Style::default().fg(Color::DarkGray),
         )))
-        .block(Block::default().borders(Borders::ALL).title(" Models "));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(model_list_title(app.focus, "Models".to_string())),
+        );
         f.render_widget(p, area);
         return;
     }
@@ -658,12 +1011,20 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     let widths = model_table_widths(area.width, &sorted, &cells, &agent_columns);
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
-    let title = format!(" Models · {} of {} ", shown, sorted.len());
+    let title = model_list_title(app.focus, format!("Models · {} of {}", shown, sorted.len()));
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(TABLE_COLUMN_SPACING)
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
+}
+
+fn model_list_title(focus: FocusArea, title: String) -> String {
+    if focus == FocusArea::Models {
+        format!(" ▸ {title} ")
+    } else {
+        format!(" {title} ")
+    }
 }
 
 fn usage_cell_text(usage: &UsageTotals) -> String {
@@ -699,6 +1060,23 @@ fn sorted_agents_by_usage(
 
 fn text_width(text: &str) -> u16 {
     text.chars().count().min(u16::MAX as usize) as u16
+}
+
+fn truncate_text(text: &str, max_width: u16) -> String {
+    let max_width = max_width as usize;
+    if text.chars().count() <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut output: String = text.chars().take(max_width - 1).collect();
+    output.push('…');
+    output
 }
 
 fn usage_column_width<'a, I>(header: &str, usages: I) -> u16
@@ -762,6 +1140,19 @@ mod tests {
             in_tokens,
             out_tokens,
             ..UsageTotals::default()
+        }
+    }
+
+    fn record(model: &str, date: &str, in_tokens: u64, out_tokens: u64) -> UsageRecord {
+        UsageRecord {
+            agent: "claude".to_string(),
+            model: model.to_string(),
+            date: date.to_string(),
+            in_tokens,
+            total_tokens: in_tokens + out_tokens,
+            out_tokens,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
         }
     }
 
@@ -975,6 +1366,55 @@ mod tests {
         ];
 
         assert_eq!(chart_legend_max_width(&datasets), 7);
+    }
+
+    #[test]
+    fn race_frames_are_cumulative_and_include_empty_days() {
+        let records = vec![
+            record("alpha", "2026-05-27", 100, 20),
+            record("beta", "2026-05-29", 200, 0),
+        ];
+
+        let frames = race_frames(&records);
+
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].date, "2026-05-27");
+        assert_eq!(frames[0].entries[0].model, "alpha");
+        assert_eq!(frames[0].entries[0].value, 120);
+        assert_eq!(frames[1].date, "2026-05-28");
+        assert_eq!(frames[1].entries[0].model, "alpha");
+        assert_eq!(frames[1].entries[0].value, 120);
+        assert_eq!(frames[2].date, "2026-05-29");
+        assert_eq!(frames[2].entries[0].model, "beta");
+        assert_eq!(frames[2].entries[0].value, 200);
+        assert_eq!(frames[2].entries[1].model, "alpha");
+        assert_eq!(frames[2].entries[1].value, 120);
+    }
+
+    #[test]
+    fn race_frames_keep_only_top_ten_models() {
+        let records: Vec<UsageRecord> = (0..12)
+            .map(|idx| record(&format!("model-{idx:02}"), "2026-05-29", idx + 1, 0))
+            .collect();
+
+        let frames = race_frames(&records);
+        let models: Vec<&str> = frames[0]
+            .entries
+            .iter()
+            .map(|entry| entry.model.as_str())
+            .collect();
+
+        assert_eq!(models.len(), RACE_VISIBLE_MODELS);
+        assert_eq!(models.first(), Some(&"model-11"));
+        assert_eq!(models.last(), Some(&"model-02"));
+    }
+
+    #[test]
+    fn race_frame_index_advances_by_tween_steps() {
+        assert_eq!(race_frame_index(0, 3), 0);
+        assert_eq!(race_frame_index(RACE_TWEEN_STEPS - 1, 3), 0);
+        assert_eq!(race_frame_index(RACE_TWEEN_STEPS, 3), 1);
+        assert_eq!(race_frame_index(RACE_TWEEN_STEPS * 3, 3), 0);
     }
 
     #[test]
