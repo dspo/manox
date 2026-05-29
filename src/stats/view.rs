@@ -19,6 +19,13 @@ use super::{MATRIX_AGENTS, PALETTE};
 type PlotPoint = (f64, f64);
 type DatasetData = (String, Vec<PlotPoint>, Color);
 
+const MODEL_MIN_WIDTH: u16 = 18;
+const SHARE_WIDTH: u16 = 8;
+const TOTAL_WIDTH: u16 = 18;
+const AGENT_WIDTH: u16 = 18;
+const TABLE_COLUMN_SPACING: u16 = 1;
+const STRIPED_ROW_BG: Color = Color::Rgb(246, 248, 250);
+
 pub(super) fn draw(f: &mut ratatui::Frame, app: &mut StatsApp) {
     let area = f.area();
     let chunks = Layout::default()
@@ -300,7 +307,12 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                 };
                 row_cells.push(cell);
             }
-            Row::new(row_cells)
+            let row_style = if idx % 2 == 0 {
+                Style::default()
+            } else {
+                Style::default().bg(STRIPED_ROW_BG)
+            };
+            Row::new(row_cells).style(row_style)
         })
         .collect();
 
@@ -336,17 +348,30 @@ fn draw_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     .collect();
     let header = Row::new(header_cells);
 
+    let column_count = (3 + MATRIX_AGENTS.len()) as u16;
+    let inner_width = area.width.saturating_sub(2);
+    let non_model_width = SHARE_WIDTH + TOTAL_WIDTH + AGENT_WIDTH * MATRIX_AGENTS.len() as u16;
+    let spacing_width = TABLE_COLUMN_SPACING * column_count.saturating_sub(1);
+    let model_width = inner_width
+        .saturating_sub(non_model_width + spacing_width)
+        .max(MODEL_MIN_WIDTH);
+
     let mut widths = vec![
-        Constraint::Length(32),
-        Constraint::Length(8),
-        Constraint::Length(20),
+        Constraint::Length(model_width),
+        Constraint::Length(SHARE_WIDTH),
+        Constraint::Length(TOTAL_WIDTH),
     ];
-    widths.extend(MATRIX_AGENTS.iter().map(|_| Constraint::Length(20)));
+    widths.extend(
+        MATRIX_AGENTS
+            .iter()
+            .map(|_| Constraint::Length(AGENT_WIDTH)),
+    );
 
     let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
     let title = format!(" Models · {} of {} ", shown, sorted.len());
     let table = Table::new(rows, widths)
         .header(header)
+        .column_spacing(TABLE_COLUMN_SPACING)
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
 }
