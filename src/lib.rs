@@ -97,6 +97,7 @@ struct ModelConfig {
     swe_p: Option<String>,
     tb2: Option<String>,
     desc: Option<String>,
+    context: Option<String>,
     agents: Vec<String>,
 }
 
@@ -110,6 +111,8 @@ struct ProviderModelConfig {
     tb2: Option<String>,
     #[serde(default)]
     desc: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
     #[serde(default)]
     wire_apis: Vec<String>,
     #[serde(default)]
@@ -258,6 +261,7 @@ impl ProviderConfig {
                         swe_p: model.swe_p.clone(),
                         tb2: model.tb2.clone(),
                         desc: model.desc.clone(),
+                        context: model.context.clone(),
                         agents: model.agents.clone(),
                     })
                     .collect();
@@ -291,6 +295,7 @@ struct ResolvedModel {
     swe_p: String,
     tb2: String,
     desc: String,
+    context: String,
     wire_api: WireApi,
     provider_name: String,
     endpoint_url: String,
@@ -311,6 +316,7 @@ impl ResolvedModel {
             swe_p: model.swe_p.clone().unwrap_or_else(|| "—".to_string()),
             tb2: model.tb2.clone().unwrap_or_else(|| "—".to_string()),
             desc: model.desc.clone().unwrap_or_default(),
+            context: model.context.clone().unwrap_or_else(|| "—".to_string()),
             wire_api: WireApi::from_str(&endpoint.wire_api),
             provider_name: provider.name.clone(),
             endpoint_url: endpoint.url.clone(),
@@ -344,6 +350,7 @@ struct ModelOption {
     swe_p: String,
     tb2: String,
     desc: String,
+    context: String,
     variants: Vec<ResolvedModel>,
 }
 
@@ -359,6 +366,7 @@ impl ModelOption {
             swe_p: first.swe_p.clone(),
             tb2: first.tb2.clone(),
             desc: first.desc.clone(),
+            context: first.context.clone(),
             variants,
         }
     }
@@ -390,12 +398,13 @@ impl ModelOption {
     fn formatted_row(&self, selected_wire_apis: &BTreeMap<String, usize>) -> String {
         let selected = self.selected_variant(selected_wire_apis);
         format!(
-            "{:<24} {:>4} {:>8} {:>6}  {:<11} {}",
+            "{:<24} {:>4} {:>8} {:>6}  {:<11} {:>8}  {}",
             self.id,
             self.arena,
             self.swe_p,
             self.tb2,
             selected.wire_api.display(),
+            self.context,
             self.desc
         )
     }
@@ -2674,6 +2683,19 @@ fn collect_model_draft(
         PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
     };
 
+    let context = match prompt_text(
+        terminal,
+        "cx add",
+        "可选：输入 model 上下文大小；留空则不写入",
+        "",
+        "示例：1M, 128K, 200K",
+        |value| Ok(value.trim().to_string()),
+    )? {
+        PromptOutcome::Submit(value) => value,
+        PromptOutcome::Back => return Ok(PromptOutcome::Back),
+        PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
+    };
+
     Ok(PromptOutcome::Submit((
         model_id,
         ProviderModelConfig {
@@ -2681,6 +2703,7 @@ fn collect_model_draft(
             swe_p: empty_string_as_none(&swe_p),
             tb2: empty_string_as_none(&tb2),
             desc: empty_string_as_none(&desc),
+            context: empty_string_as_none(&context),
             wire_apis: vec![wire_api.display().to_string()],
             agents: model_agents,
         },
@@ -3774,6 +3797,7 @@ mod tests {
             swe_p: "—".into(),
             tb2: "—".into(),
             desc: String::new(),
+            context: "—".into(),
             wire_api,
             provider_name: "DashScope".into(),
             endpoint_url: endpoint_url.into(),
@@ -3794,6 +3818,7 @@ mod tests {
                         swe_p: Some("80%".into()),
                         tb2: Some("70%".into()),
                         desc: Some("thinking".into()),
+                        context: None,
                         wire_apis: vec![],
                         agents: Vec::new(),
                     },
@@ -3986,6 +4011,7 @@ mod tests {
                 swe_p: "—".into(),
                 tb2: "—".into(),
                 desc: String::new(),
+                context: "—".into(),
                 wire_api: WireApi::Anthropic,
                 provider_name: "DashScope".into(),
                 endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
@@ -4040,6 +4066,7 @@ mod tests {
                 swe_p: "—".into(),
                 tb2: "—".into(),
                 desc: String::new(),
+                context: "—".into(),
                 wire_api: WireApi::Anthropic,
                 provider_name: "Packy API".into(),
                 endpoint_url: "https://www.packyapi.com/".into(),
@@ -4199,13 +4226,13 @@ mod tests {
         let existing = vec![AgentConfig {
             id: "copilot".into(),
             binary: "copilot".into(),
-                    args: vec![],
+            args: vec![],
             wire_apis: vec![],
         }];
         let incoming = vec![AgentConfig {
             id: "codex".into(),
             binary: "codex".into(),
-                    args: vec![],
+            args: vec![],
             wire_apis: vec![],
         }];
         let merged = merge_agents(&existing, &incoming);
@@ -4318,6 +4345,7 @@ mod tests {
                     swe_p: None,
                     tb2: None,
                     desc: Some("Agent/终端最强".into()),
+                    context: None,
                     wire_apis: vec!["responses".into()],
                     agents: vec!["codex".into()],
                 },
@@ -4360,6 +4388,7 @@ mod tests {
                         swe_p: None,
                         tb2: None,
                         desc: None,
+                        context: None,
                         wire_apis: vec!["anthropic".into()],
                         agents: Vec::new(),
                     },
