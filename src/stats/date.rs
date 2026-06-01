@@ -75,3 +75,77 @@ pub(super) fn days_diff(date: &str, today: &str) -> Option<i64> {
     let (y2, m2, d2) = parse_ymd(date)?;
     Some(days_from_civil(y1, m1, d1) - days_from_civil(y2, m2, d2))
 }
+
+/// 计算上个月有多少天（根据今天的日期）。
+/// 例如今天是 2026-06-01，则返回 5 月的天数 31。
+/// 如果日期解析失败，回退返回 30（4 个月中大多数月份的近似值）。
+pub(super) fn previous_month_days(today: &str) -> i64 {
+    let Some((year, month, _)) = parse_ymd(today) else {
+        return 30;
+    };
+    let prev_year = if month == 1 { year - 1 } else { year };
+    let prev_month = if month == 1 { 12 } else { month - 1 };
+    let days = match prev_month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (prev_year % 4 == 0 && prev_year % 100 != 0) || (prev_year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    };
+    days
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previous_month_days_varies_by_month() {
+        // 1 月 → 上年 12 月，31 天
+        assert_eq!(previous_month_days("2026-01-15"), 31);
+        // 2 月 → 1 月，31 天
+        assert_eq!(previous_month_days("2026-02-01"), 31);
+        // 3 月 → 2 月，平年 28 天
+        assert_eq!(previous_month_days("2026-03-01"), 28);
+        // 4 月 → 3 月，31 天
+        assert_eq!(previous_month_days("2026-04-01"), 31);
+        // 5 月 → 4 月，30 天
+        assert_eq!(previous_month_days("2026-05-01"), 30);
+        // 6 月 → 5 月，31 天
+        assert_eq!(previous_month_days("2026-06-01"), 31);
+        // 7 月 → 6 月，30 天
+        assert_eq!(previous_month_days("2026-07-01"), 30);
+        // 8 月 → 7 月，31 天
+        assert_eq!(previous_month_days("2026-08-01"), 31);
+        // 9 月 → 8 月，31 天
+        assert_eq!(previous_month_days("2026-09-01"), 31);
+        // 10 月 → 9 月，30 天
+        assert_eq!(previous_month_days("2026-10-01"), 30);
+        // 11 月 → 10 月，31 天
+        assert_eq!(previous_month_days("2026-11-01"), 31);
+        // 12 月 → 11 月，30 天
+        assert_eq!(previous_month_days("2026-12-01"), 30);
+    }
+
+    #[test]
+    fn previous_month_days_handles_leap_year() {
+        // 闰年 2 月
+        assert_eq!(previous_month_days("2020-03-01"), 29);
+        // 非闰年 2 月
+        assert_eq!(previous_month_days("2021-03-01"), 28);
+        // 整百年非闰年
+        assert_eq!(previous_month_days("1900-03-01"), 28);
+        // 整四百年闰年
+        assert_eq!(previous_month_days("2000-03-01"), 29);
+    }
+
+    #[test]
+    fn previous_month_days_returns_30_on_invalid_date() {
+        assert_eq!(previous_month_days("invalid"), 30);
+    }
+}

@@ -119,9 +119,11 @@ fn event_loop<B: ratatui::backend::Backend>(
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Char('1') => app.period = Period::Last7,
-            KeyCode::Char('2') => app.period = Period::Last30,
-            KeyCode::Char('3') => app.period = Period::All,
+            KeyCode::Char('1') => app.period = Period::Today,
+            KeyCode::Char('2') => app.period = Period::Last24Hours,
+            KeyCode::Char('3') => app.period = Period::Last7,
+            KeyCode::Char('4') => app.period = Period::Last30,
+            KeyCode::Char('5') => app.period = Period::All,
             KeyCode::Char('r') => app.period = app.period.cycle(),
             KeyCode::Tab | KeyCode::BackTab => app.cycle_chart_tab(),
             KeyCode::Down | KeyCode::Char('j') => {

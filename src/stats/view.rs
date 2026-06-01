@@ -116,9 +116,11 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let period_hint = match app.period {
-        Period::Last7 => "[1] 7d  2 30d  3 All",
-        Period::Last30 => "1 7d  [2] 30d  3 All",
-        Period::All => "1 7d  2 30d  [3] All",
+        Period::Today => "[1] Today  2 24h  3 7d  4 Mo  5 All",
+        Period::Last24Hours => "1 Today  [2] 24h  3 7d  4 Mo  5 All",
+        Period::Last7 => "1 Today  2 24h  [3] 7d  4 Mo  5 All",
+        Period::Last30 => "1 Today  2 24h  3 7d  [4] Mo  5 All",
+        Period::All => "1 Today  2 24h  3 7d  4 Mo  [5] All",
     };
     let view_hint = match app.chart_tab {
         ChartTab::Overview => "Overview",
@@ -219,10 +221,11 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         chart_series.push((model.clone(), values, color));
     }
 
+    let period_label = app.period.label(&app.today);
     draw_step_chart(
         f,
         area,
-        app.period.label(),
+        &period_label,
         &min_date,
         &max_date,
         day_count,
@@ -503,8 +506,13 @@ fn chart_date_range(
     records: &[&UsageRecord],
 ) -> Option<(String, String)> {
     match period {
+        Period::Today => Some((today.to_string(), today.to_string())),
+        Period::Last24Hours => Some((date_offset(today, -1).ok()?, today.to_string())),
         Period::Last7 => Some((date_offset(today, -6).ok()?, today.to_string())),
-        Period::Last30 => Some((date_offset(today, -29).ok()?, today.to_string())),
+        Period::Last30 => {
+            let days = super::date::previous_month_days(today) as i64;
+            Some((date_offset(today, -(days - 1)).ok()?, today.to_string()))
+        }
         Period::All => {
             let first = records.first()?;
             let mut min_date = first.date.clone();
@@ -1179,7 +1187,7 @@ fn chart_legend_max_width(datasets: &[ChartSeries]) -> u16 {
 
 fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let mut spans: Vec<Span> = Vec::new();
-    for (i, p) in [Period::Last7, Period::Last30, Period::All]
+    for (i, p) in [Period::Today, Period::Last24Hours, Period::Last7, Period::Last30, Period::All]
         .iter()
         .enumerate()
     {
@@ -1193,7 +1201,7 @@ fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         } else {
             Style::default().fg(Color::Gray)
         };
-        spans.push(Span::styled(p.label().to_string(), style));
+        spans.push(Span::styled(p.label(&app.today), style));
     }
     let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
