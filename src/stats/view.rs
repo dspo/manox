@@ -116,11 +116,10 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let period_hint = match app.period {
-        Period::Today => "[1] Today  2 24h  3 7d  4 Mo  5 All",
-        Period::Last24Hours => "1 Today  [2] 24h  3 7d  4 Mo  5 All",
-        Period::Last7 => "1 Today  2 24h  [3] 7d  4 Mo  5 All",
-        Period::Last30 => "1 Today  2 24h  3 7d  [4] Mo  5 All",
-        Period::All => "1 Today  2 24h  3 7d  4 Mo  [5] All",
+        Period::Today => "[1] Today  2 7d  3 Mo  4 All",
+        Period::Last7 => "1 Today  [2] 7d  3 Mo  4 All",
+        Period::Last30 => "1 Today  2 7d  [3] Mo  4 All",
+        Period::All => "1 Today  2 7d  3 Mo  [4] All",
     };
     let view_hint = match app.chart_tab {
         ChartTab::Overview => "Overview",
@@ -507,7 +506,6 @@ fn chart_date_range(
 ) -> Option<(String, String)> {
     match period {
         Period::Today => Some((today.to_string(), today.to_string())),
-        Period::Last24Hours => Some((date_offset(today, -1).ok()?, today.to_string())),
         Period::Last7 => Some((date_offset(today, -6).ok()?, today.to_string())),
         Period::Last30 => {
             let days = super::date::previous_month_days(today) as i64;
@@ -1187,7 +1185,7 @@ fn chart_legend_max_width(datasets: &[ChartSeries]) -> u16 {
 
 fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let mut spans: Vec<Span> = Vec::new();
-    for (i, p) in [Period::Today, Period::Last24Hours, Period::Last7, Period::Last30, Period::All]
+    for (i, p) in [Period::Today, Period::Last7, Period::Last30, Period::All]
         .iter()
         .enumerate()
     {
