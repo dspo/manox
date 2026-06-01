@@ -1836,6 +1836,10 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
             agent_id, provider.name
         ))?;
 
+        // Inject a unified model identifier so agents and their tooling can
+        // detect which model cx configured, regardless of the agent type.
+        env.insert("CX_MODEL".into(), model.id.clone());
+
         let apikey = if let Some(ref source) = provider.apikey_source {
             resolve_apikey_interactive(source)?
         } else {
