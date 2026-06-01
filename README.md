@@ -6,7 +6,6 @@ This edition is designed for GitLab-hosted internal distribution:
 - provider/model config lives in runtime YAML files
 - GitLab CI builds and publishes both rolling main artifacts and tag release assets
 - the rolling GitLab install script is the primary installation path
-- npm/npx is provided as a secondary GitLab-based distribution path
 
 ## Runtime model
 
@@ -64,19 +63,6 @@ The installer currently supports:
 If `~/.local/bin` is not already in `PATH`, the installer prints the export line
 to add before invoking `cx`.
 
-## Install with npx
-
-`npx` is available as a secondary GitLab-based path. If your environment can
-reach the GitLab npm registry directly, install the wrapper and then let it
-download the matching release binary.
-
-```bash
-npm config set @awesome:registry https://git.huayi.tech/api/v4/projects/<project-id>/packages/npm/
-npm config set -- //git.huayi.tech/api/v4/projects/<project-id>/packages/npm/:_authToken=<gitlab-token>
-
-npx @awesome/cx
-```
-
 ## Runtime provider config
 
 `cx` reads provider/model config from `~/.config/cx/cx.providers.config.yaml`
@@ -119,7 +105,6 @@ responses provider are exposed in the published baseline config.
 3. build jobs for `cx-linux-x86_64`, `cx-linux-arm64`, `cx-darwin-arm64`, and `cx-darwin-x86_64`
 4. a `publish-main` job whose raw artifacts provide a stable installer + checksum + binary URL for the latest successful `main` pipeline
 5. tag pipelines upload versioned assets to the GitLab Generic Package Registry and create a GitLab Release with permanent asset links
-6. tag pipelines publish the npm wrapper to the GitLab npm registry
 
 ## Local development
 
