@@ -14,11 +14,37 @@ use std::time::Duration;
 use super::types::{Period, UsageRecord};
 use super::view::draw;
 
+const RACE_FRAME_DURATION: Duration = Duration::from_millis(83);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChartTab {
+    Overview,
+    Dynamicview,
+}
+
+impl ChartTab {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ChartTab::Overview => "Overview",
+            ChartTab::Dynamicview => "Dynamicview",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            ChartTab::Overview => ChartTab::Dynamicview,
+            ChartTab::Dynamicview => ChartTab::Overview,
+        }
+    }
+}
+
 pub(super) struct StatsApp {
     pub(super) records: Vec<UsageRecord>,
     pub(super) today: String,
     pub(super) period: Period,
     pub(super) models_scroll: usize,
+    pub(super) chart_tab: ChartTab,
+    pub(super) race_tick: usize,
 }
 
 impl StatsApp {
@@ -28,6 +54,8 @@ impl StatsApp {
             today,
             period: Period::Last7,
             models_scroll: 0,
+            chart_tab: ChartTab::Overview,
+            race_tick: 0,
         }
     }
 
@@ -37,6 +65,20 @@ impl StatsApp {
             .iter()
             .filter(|r| self.period.includes(&r.date, &self.today))
             .collect()
+    }
+
+    fn advance_race(&mut self) {
+        if self.chart_tab == ChartTab::Dynamicview {
+            self.race_tick = self.race_tick.saturating_add(1);
+        }
+    }
+
+    fn cycle_chart_tab(&mut self) {
+        self.chart_tab = self.chart_tab.next();
+        self.models_scroll = 0;
+        if self.chart_tab == ChartTab::Dynamicview {
+            self.race_tick = 0;
+        }
     }
 }
 
@@ -65,7 +107,8 @@ fn event_loop<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|f| draw(f, &mut app))?;
 
-        if !event::poll(Duration::from_millis(250))? {
+        if !event::poll(RACE_FRAME_DURATION)? {
+            app.advance_race();
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -80,6 +123,7 @@ fn event_loop<B: ratatui::backend::Backend>(
             KeyCode::Char('2') => app.period = Period::Last30,
             KeyCode::Char('3') => app.period = Period::All,
             KeyCode::Char('r') => app.period = app.period.cycle(),
+            KeyCode::Tab | KeyCode::BackTab => app.cycle_chart_tab(),
             KeyCode::Down | KeyCode::Char('j') => {
                 app.models_scroll = app.models_scroll.saturating_add(1)
             }
