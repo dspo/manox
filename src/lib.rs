@@ -122,6 +122,8 @@ struct AgentConfig {
     #[serde(alias = "bin")]
     binary: String,
     #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
     wire_apis: Vec<String>,
 }
 
@@ -591,6 +593,7 @@ impl ResolvedProvider {
 struct Selection {
     agent_id: String,
     agent_binary: String,
+    agent_args: Vec<String>,
     provider: ResolvedProvider,
     model: Option<ResolvedModel>,
 }
@@ -599,6 +602,7 @@ struct Selection {
 struct ResolvedAgent {
     id: String,
     binary: String,
+    args: Vec<String>,
     supported_wire_apis: Vec<WireApi>,
 }
 
@@ -627,6 +631,7 @@ fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
         agents.push(ResolvedAgent {
             id,
             binary,
+            args: agent.args.clone(),
             supported_wire_apis,
         });
     }
@@ -638,16 +643,19 @@ fn default_agent_configs() -> Vec<AgentConfig> {
         AgentConfig {
             id: "copilot".into(),
             binary: "copilot".into(),
+            args: Vec::new(),
             wire_apis: vec!["anthropic".into(), "responses".into(), "completions".into()],
         },
         AgentConfig {
             id: "claude".into(),
             binary: "claude".into(),
+            args: Vec::new(),
             wire_apis: vec!["anthropic".into()],
         },
         AgentConfig {
             id: "codex".into(),
             binary: "codex".into(),
+            args: Vec::new(),
             wire_apis: vec!["responses".into()],
         },
     ]
@@ -1773,6 +1781,7 @@ struct LaunchSpec {
 fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Result<LaunchSpec> {
     let program = resolve_binary(&selection.agent_binary)?;
     let mut args = Vec::new();
+    args.extend(selection.agent_args.iter().cloned());
     let mut env = BTreeMap::new();
 
     let agent_id = &selection.agent_id;
@@ -3511,6 +3520,7 @@ impl AppState {
                     Some(Selection {
                         agent_id: agent.id.clone(),
                         agent_binary: agent.binary.clone(),
+                        agent_args: agent.args.clone(),
                         provider,
                         model: None,
                     })
@@ -3528,6 +3538,7 @@ impl AppState {
                 Some(Selection {
                     agent_id: agent.id.clone(),
                     agent_binary: agent.binary.clone(),
+                    agent_args: agent.args.clone(),
                     provider,
                     model: Some(selected_variant),
                 })
@@ -3723,16 +3734,19 @@ mod tests {
                 AgentConfig {
                     id: "copilot".into(),
                     binary: "copilot".into(),
+                    args: vec![],
                     wire_apis: vec![],
                 },
                 AgentConfig {
                     id: "claude".into(),
                     binary: "claude".into(),
+                    args: vec![],
                     wire_apis: vec![],
                 },
                 AgentConfig {
                     id: "codex".into(),
                     binary: "codex".into(),
+                    args: vec![],
                     wire_apis: vec![],
                 },
             ],
@@ -3909,6 +3923,7 @@ mod tests {
         let selection = Selection {
             agent_id: "codex".into(),
             agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
             provider: ResolvedProvider {
                 name: "Codex Default".into(),
                 has_endpoints: false,
@@ -3928,6 +3943,7 @@ mod tests {
         let selection = Selection {
             agent_id: "claude".into(),
             agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
             provider: ResolvedProvider {
                 name: "Test".into(),
                 has_endpoints: false,
@@ -3958,6 +3974,7 @@ mod tests {
         let selection = Selection {
             agent_id: "claude".into(),
             agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
             provider: ResolvedProvider {
                 name: "DashScope".into(),
                 has_endpoints: true,
@@ -4011,6 +4028,7 @@ mod tests {
         let selection = Selection {
             agent_id: "copilot".into(),
             agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
             provider: ResolvedProvider {
                 name: "Packy API".into(),
                 has_endpoints: true,
@@ -4060,6 +4078,7 @@ mod tests {
         let selection = Selection {
             agent_id: "codex".into(),
             agent_binary: "codex".into(),
+            agent_args: Vec::new(),
             provider: ResolvedProvider {
                 name: "Default".into(),
                 has_endpoints: false,
@@ -4161,11 +4180,13 @@ mod tests {
         let existing = vec![AgentConfig {
             id: "claude".into(),
             binary: "claude-old".into(),
+            args: vec![],
             wire_apis: vec![],
         }];
         let incoming = vec![AgentConfig {
             id: "claude".into(),
             binary: "claude-new".into(),
+            args: vec![],
             wire_apis: vec![],
         }];
         let merged = merge_agents(&existing, &incoming);
@@ -4178,11 +4199,13 @@ mod tests {
         let existing = vec![AgentConfig {
             id: "copilot".into(),
             binary: "copilot".into(),
+                    args: vec![],
             wire_apis: vec![],
         }];
         let incoming = vec![AgentConfig {
             id: "codex".into(),
             binary: "codex".into(),
+                    args: vec![],
             wire_apis: vec![],
         }];
         let merged = merge_agents(&existing, &incoming);
@@ -4195,16 +4218,19 @@ mod tests {
             AgentConfig {
                 id: "copilot".into(),
                 binary: "copilot".into(),
+                args: vec![],
                 wire_apis: vec![],
             },
             AgentConfig {
                 id: "claude".into(),
                 binary: "claude-old".into(),
+                args: vec![],
                 wire_apis: vec![],
             },
             AgentConfig {
                 id: "codex".into(),
                 binary: "codex".into(),
+                args: vec![],
                 wire_apis: vec![],
             },
         ];
@@ -4212,11 +4238,13 @@ mod tests {
             AgentConfig {
                 id: "claude".into(),
                 binary: "claude-new".into(),
+                args: vec![],
                 wire_apis: vec![],
             },
             AgentConfig {
                 id: "gemini".into(),
                 binary: "gemini".into(),
+                args: vec![],
                 wire_apis: vec![],
             },
         ];
@@ -4597,11 +4625,13 @@ trust_level = "trusted"
                 AgentConfig {
                     id: "codex".into(),
                     binary: "codex".into(),
+                    args: vec![],
                     wire_apis: vec![],
                 },
                 AgentConfig {
                     id: "codex-app".into(),
                     binary: "codex-app".into(),
+                    args: vec![],
                     wire_apis: vec![],
                 },
             ],
