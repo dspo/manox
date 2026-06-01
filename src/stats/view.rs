@@ -22,10 +22,10 @@ const SHARE_WIDTH: u16 = 6;
 const TABLE_COLUMN_SPACING: u16 = 1;
 const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
 const STEP_CHART_MAX_WIDTH: u16 = 78;
-const STEP_CHART_HEIGHT: u16 = 14;
+const STEP_CHART_HEIGHT: u16 = 17;
 const Y_TICK_COUNT: usize = 10;
 const X_TICK_MIN_COUNT: usize = 6;
-const RACE_VISIBLE_MODELS: usize = 10;
+const RACE_VISIBLE_MODELS: usize = 15;
 const RACE_TWEEN_STEPS: usize = 12;
 const RACE_FINAL_HOLD_TICKS: usize = RACE_TWEEN_STEPS * 3;
 const RACE_FINAL_DISSOLVE_TICKS: usize = RACE_TWEEN_STEPS * 2;
@@ -234,7 +234,7 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
 fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frames: &[RaceFrame]) {
     let chart_area = fixed_chart_area(area);
     if chart_area.width < 32 || chart_area.height < 6 {
-        f.render_widget(Paragraph::new("Model Tokens Race · All time"), chart_area);
+        f.render_widget(Paragraph::new("Model Tokens Top 15 · All time"), chart_area);
         return;
     }
 
@@ -243,7 +243,7 @@ fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frame
             "  No data for bar chart race.",
             Style::default().fg(Color::DarkGray),
         )))
-        .block(Block::default().title(" Model Tokens Race · All time "));
+        .block(Block::default().title(" Model Tokens Top 15 · All time "));
         f.render_widget(p, chart_area);
         return;
     }
@@ -265,7 +265,7 @@ fn draw_race_frame(
 ) {
     let title = Line::from(vec![
         Span::styled(
-            " Model Tokens Race · All time ",
+            " Model Tokens Top 15 · All time ",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -1748,8 +1748,8 @@ mod tests {
     }
 
     #[test]
-    fn race_frames_keep_only_top_ten_models() {
-        let records: Vec<UsageRecord> = (0..12)
+    fn race_frames_keep_only_top_fifteen_models() {
+        let records: Vec<UsageRecord> = (0..18)
             .map(|idx| record(&format!("model-{idx:02}"), "2026-05-29", idx + 1, 0))
             .collect();
 
@@ -1761,8 +1761,8 @@ mod tests {
             .collect();
 
         assert_eq!(models.len(), RACE_VISIBLE_MODELS);
-        assert_eq!(models.first(), Some(&"model-11"));
-        assert_eq!(models.last(), Some(&"model-02"));
+        assert_eq!(models.first(), Some(&"model-17"));
+        assert_eq!(models.last(), Some(&"model-03"));
     }
 
     #[test]
