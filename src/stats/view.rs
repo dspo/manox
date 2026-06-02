@@ -17,7 +17,7 @@ use super::{MATRIX_AGENTS, PALETTE};
 type ChartSeries = (String, Vec<f64>, Color);
 type ChartOccupancy = HashSet<(u16, u16)>;
 
-const MODEL_MIN_WIDTH: u16 = 18;
+const MODEL_MIN_WIDTH: u16 = 26;
 const SHARE_WIDTH: u16 = 6;
 const TABLE_COLUMN_SPACING: u16 = 1;
 const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
@@ -314,7 +314,7 @@ fn draw_race_frame(
         .map(|entry| text_width(&entry.model))
         .max()
         .unwrap_or(10)
-        .clamp(10, 22);
+        .clamp(10, 26);
     let value_width = current
         .entries
         .iter()
@@ -1444,7 +1444,19 @@ fn model_table_widths(
     agent_columns: &[(&'static str, &'static str)],
 ) -> Vec<Constraint> {
     let total_width = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
-    let agent_widths: Vec<u16> = agent_columns
+
+    // Model column: MODEL_MIN_WIDTH is the cap. Names longer than this (e.g.
+    // copilot-suggestions-himalia-001) are truncated — the column only needs to
+    // fit claude-haiku-4-5-20251001 (26 chars).
+    let model_width = MODEL_MIN_WIDTH;
+
+    let column_count = (3 + agent_columns.len()) as u16;
+    let inner_width = area_width.saturating_sub(2);
+    let spacing_width = TABLE_COLUMN_SPACING * column_count.saturating_sub(1);
+    let fixed_width = model_width + SHARE_WIDTH + total_width + spacing_width;
+    let available_for_agents = inner_width.saturating_sub(fixed_width);
+
+    let ideal_agent_widths: Vec<u16> = agent_columns
         .iter()
         .map(|(agent, label)| {
             let agent = (*agent).to_string();
@@ -1454,22 +1466,45 @@ fn model_table_widths(
             usage_column_width(label, usages)
         })
         .collect();
-
-    let column_count = (3 + agent_columns.len()) as u16;
-    let inner_width = area_width.saturating_sub(2);
-    let non_model_width = SHARE_WIDTH + total_width + agent_widths.iter().sum::<u16>();
-    let spacing_width = TABLE_COLUMN_SPACING * column_count.saturating_sub(1);
-    let model_width = inner_width
-        .saturating_sub(non_model_width + spacing_width)
-        .max(MODEL_MIN_WIDTH);
+    let agent_widths = shrink_agent_columns(&ideal_agent_widths, available_for_agents);
 
     let mut widths = vec![
-        Constraint::Length(model_width),
+        Constraint::Min(model_width),
         Constraint::Length(SHARE_WIDTH),
         Constraint::Length(total_width),
     ];
     widths.extend(agent_widths.into_iter().map(Constraint::Length));
     widths
+}
+
+/// Shrink agent columns proportionally to fit within `available` width.
+/// Each column retains at least 4 characters for readability.
+fn shrink_agent_columns(ideal: &[u16], available: u16) -> Vec<u16> {
+    if ideal.is_empty() {
+        return Vec::new();
+    }
+    let ideal_total = ideal.iter().sum::<u16>();
+    if ideal_total <= available {
+        return ideal.to_vec();
+    }
+    let min_per_col: u16 = 4;
+    let min_total = min_per_col * ideal.len() as u16;
+    if available <= min_total {
+        return ideal.iter().map(|_| min_per_col).collect();
+    }
+    let distributable = available.saturating_sub(min_total);
+    let excess: Vec<u16> = ideal.iter().map(|w| w.saturating_sub(min_per_col)).collect();
+    let excess_total = excess.iter().sum::<u16>();
+    if excess_total == 0 {
+        return ideal.iter().map(|_| min_per_col).collect();
+    }
+    excess
+        .iter()
+        .map(|w| {
+            min_per_col
+                + ((*w as f64 / excess_total as f64) * distributable as f64).round() as u16
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1478,8 +1513,8 @@ mod tests {
 
     fn constraint_length(constraint: Constraint) -> u16 {
         match constraint {
-            Constraint::Length(width) => width,
-            other => panic!("expected length constraint, got {other:?}"),
+            Constraint::Length(width) | Constraint::Min(width) => width,
+            other => panic!("expected length/min constraint, got {other:?}"),
         }
     }
 
@@ -1966,10 +2001,40 @@ mod tests {
 
         let widths = model_table_widths(103, &sorted, &cells, &agent_columns);
 
-        assert!(constraint_length(widths[0]) >= 20);
+        // Model column: Min constraint, capped at MODEL_MIN_WIDTH (26)
+        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
         assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
         assert_eq!(constraint_length(widths[2]), text_width("↑174.4m ↓547.9k"));
         assert_eq!(constraint_length(widths[5]), text_width("Codex"));
         assert_eq!(constraint_length(widths[6]), text_width("Zed Agent"));
+    }
+
+    #[test]
+    fn model_table_model_column_capped_at_min_width() {
+        // 26-char model name fits within MODEL_MIN_WIDTH
+        let sorted = vec![
+            ("claude-haiku-4-5-20251001".to_string(), usage(100, 0)),
+            ("short".to_string(), usage(50, 0)),
+        ];
+        let cells = HashMap::new();
+        let agent_columns: Vec<(&str, &str)> = vec![];
+
+        let widths = model_table_widths(60, &sorted, &cells, &agent_columns);
+        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
+
+        // 30-char model name still capped at MODEL_MIN_WIDTH, not expanded
+        let longer_sorted = vec![
+            ("copilot-suggestions-himalia-001".to_string(), usage(100, 0)),
+        ];
+        let widths = model_table_widths(60, &longer_sorted, &cells, &agent_columns);
+        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
+    }
+
+    #[test]
+    fn shrink_agent_columns_distributes_proportionally() {
+        assert_eq!(shrink_agent_columns(&[10, 20], 30), vec![10, 20]); // no shrink needed
+        assert_eq!(shrink_agent_columns(&[10, 20], 15), vec![6, 9]);   // shrink proportionally
+        assert_eq!(shrink_agent_columns(&[10, 20], 8), vec![4, 4]);   // min per col
+        assert_eq!(shrink_agent_columns(&[], 10), Vec::<u16>::new()); // empty input
     }
 }
