@@ -7,6 +7,7 @@
 
 pub(super) mod claude;
 pub(super) mod codex;
+pub(super) mod omp;
 pub(super) mod copilot;
 
 use serde::{Deserialize, Serialize};

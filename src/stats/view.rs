@@ -1961,6 +1961,7 @@ mod tests {
                 ("copilot", "Copilot"),
                 ("claude", "Claude Code"),
                 ("zed", "Zed Agent"),
+                ("omp", "OMP"),
             ]
         );
     }
