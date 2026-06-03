@@ -8,6 +8,7 @@
 pub(super) mod claude;
 pub(super) mod codex;
 pub(super) mod omp;
+pub(super) mod omp_session;
 pub(super) mod copilot;
 
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,8 @@ pub(super) enum SourceKind {
     CodexLike(&'static str),
     /// github copilot OpenTelemetry 导出。
     Copilot(&'static str),
+    /// OMP session jsonl（~/.omp/agent/sessions/）。
+    OmpSession,
 }
 
 pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Vec<RawEntry> {
@@ -66,6 +69,7 @@ pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Vec<RawEntry> {
             codex::parse(&content, agent, fallback_date.as_deref(), path)
         }
         SourceKind::Copilot(agent) => copilot::parse(&content, agent, path),
+        SourceKind::OmpSession => omp_session::parse(&content),
     }
 }
 
