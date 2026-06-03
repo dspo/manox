@@ -41,14 +41,13 @@ pub(crate) fn parse_omp_db(db_path: &Path) -> Vec<RawEntry> {
     let rows = match stmt.query_map([], |row| {
         let day: String = row.get(0)?;
         let model: String = row.get(1)?;
-        let provider: String = row.get(2)?;
         let input_tokens: u64 = row.get::<_, i64>(3)?.max(0) as u64;
         let output_tokens: u64 = row.get::<_, i64>(4)?.max(0) as u64;
         let cache_read: u64 = row.get::<_, i64>(5)?.max(0) as u64;
         let cache_write: u64 = row.get::<_, i64>(6)?.max(0) as u64;
         Ok(RawEntry {
             agent: AGENT_OMP.to_string(),
-            model: format!("{provider}/{model}"),
+            model,
             date: day,
             input_tokens,
             output_tokens,
@@ -120,10 +119,10 @@ mod tests {
                 .then_with(|| a.model.cmp(&b.model))
         });
 
-        // 2025-06-03: anthropic/claude-sonnet-4-20250514 — aggregated (1000+800=1800, 500+300=800)
+        // 2025-06-03: claude-sonnet-4-20250514 — aggregated (1000+800=1800, 500+300=800)
         assert_eq!(sorted[0].date, "2025-06-03");
         assert_eq!(sorted[0].agent, "omp");
-        assert_eq!(sorted[0].model, "anthropic/claude-sonnet-4-20250514");
+        assert_eq!(sorted[0].model, "claude-sonnet-4-20250514");
         assert_eq!(sorted[0].input_tokens, 1800);
         assert_eq!(sorted[0].output_tokens, 800);
         assert_eq!(sorted[0].cache_read_input_tokens, 300);
@@ -131,10 +130,10 @@ mod tests {
         assert_eq!(sorted[0].dedup_primary, None);
         assert_eq!(sorted[0].is_sidechain, false);
 
-        // 2025-06-04: openai/gpt-5.4
+        // 2025-06-04: gpt-5.4
         assert_eq!(sorted[1].date, "2025-06-04");
         assert_eq!(sorted[1].agent, "omp");
-        assert_eq!(sorted[1].model, "openai/gpt-5.4");
+        assert_eq!(sorted[1].model, "gpt-5.4");
         assert_eq!(sorted[1].input_tokens, 2000);
         assert_eq!(sorted[1].output_tokens, 800);
         assert_eq!(sorted[1].cache_read_input_tokens, 0);
