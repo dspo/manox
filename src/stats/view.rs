@@ -265,6 +265,13 @@ fn draw_race_frame(
     tween: f64,
     max_value: u64,
 ) {
+    let s = smoothstep(tween);
+    let prev_in: u64 = previous.cells.values().map(|u| u.in_tokens).sum();
+    let prev_out: u64 = previous.cells.values().map(|u| u.out_tokens).sum();
+    let curr_in: u64 = current.cells.values().map(|u| u.in_tokens).sum();
+    let curr_out: u64 = current.cells.values().map(|u| u.out_tokens).sum();
+    let total_in = interpolate_u64(prev_in, curr_in, s);
+    let total_out = interpolate_u64(prev_out, curr_out, s);
     let title = Line::from(vec![
         Span::styled(
             " Model Tokens Top 15 · All time ",
@@ -274,6 +281,12 @@ fn draw_race_frame(
         ),
         Span::styled(
             short_date(&current.date),
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" ↑{} ↓{}", format_tokens(total_in), format_tokens(total_out)),
             Style::default()
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
@@ -1242,7 +1255,7 @@ fn draw_dynamic_model_list(
     let model_count = displayed_totals.values().filter(|u| u.total_tokens() > 0).count();
     let total_in: u64 = displayed_totals.values().map(|u| u.in_tokens).sum();
     let total_out: u64 = displayed_totals.values().map(|u| u.out_tokens).sum();
-    let period_label = app.period.label(&app.today);
+    let period_label = Period::All.label(&app.today);
     let date_short = short_date(&current.date);
     let title = format!(
         "Model Tokens Top {} · {} {} ↑{} ↓{}",
