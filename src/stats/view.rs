@@ -1209,7 +1209,15 @@ fn draw_overview_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsA
     let records = app.period_records();
     let cells = totals_by_agent_model(&records);
     let totals = totals_by_model(&records);
-    draw_model_table(f, area, app, "Models", cells, totals, None, true);
+    let model_count = totals.values().filter(|u| u.total_tokens() > 0).count();
+    let visible = area.height.saturating_sub(3) as usize;
+    let max_scroll = model_count.saturating_sub(visible.max(1));
+    if app.models_scroll > max_scroll {
+        app.models_scroll = max_scroll;
+    }
+    let shown = model_count.saturating_sub(app.models_scroll).min(visible);
+    let title = format!("Models · {} of {}", shown, model_count);
+    draw_model_table(f, area, app, &title, cells, totals, None, true);
 }
 
 fn draw_dynamic_model_list(
@@ -1220,14 +1228,9 @@ fn draw_dynamic_model_list(
 ) {
     let Some((previous, current, tween)) = current_race_frame(app, frames) else {
         draw_model_table(
-            f,
-            area,
-            app,
-            "Dynamic Model Rankings",
-            HashMap::new(),
-            HashMap::new(),
-            None,
-            true,
+            f, area, app,
+            "Model Tokens Top 0",
+            HashMap::new(), HashMap::new(), None, true,
         );
         return;
     };
@@ -1235,15 +1238,23 @@ fn draw_dynamic_model_list(
         interpolate_usage_cells(&previous.cells, &current.cells, smoothstep(tween));
     let displayed_totals = totals_by_model_from_cells(&displayed_cells);
     let color_map = race_color_map(&app.records);
+
+    let model_count = displayed_totals.values().filter(|u| u.total_tokens() > 0).count();
+    let total_in: u64 = displayed_totals.values().map(|u| u.in_tokens).sum();
+    let total_out: u64 = displayed_totals.values().map(|u| u.out_tokens).sum();
+    let period_label = app.period.label(&app.today);
+    let date_short = short_date(&current.date);
+    let title = format!(
+        "Model Tokens Top {} · {} {} ↑{} ↓{}",
+        model_count,
+        period_label,
+        date_short,
+        format_tokens(total_in),
+        format_tokens(total_out),
+    );
     draw_model_table(
-        f,
-        area,
-        app,
-        "Dynamic Model Rankings",
-        displayed_cells,
-        displayed_totals,
-        Some(&color_map),
-        true,
+        f, area, app, &title,
+        displayed_cells, displayed_totals, Some(&color_map), true,
     );
 }
 
@@ -1251,7 +1262,7 @@ fn draw_model_table(
     f: &mut ratatui::Frame,
     area: Rect,
     app: &mut StatsApp,
-    title_prefix: &str,
+    title: &str,
     cells: HashMap<(String, String), UsageTotals>,
     totals: HashMap<String, UsageTotals>,
     color_map: Option<&HashMap<String, Color>>,
@@ -1267,7 +1278,7 @@ fn draw_model_table(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" {title_prefix} ")),
+                .title(format!(" {title} ")),
         );
         f.render_widget(p, area);
         return;
@@ -1359,12 +1370,11 @@ fn draw_model_table(
 
     let widths = model_table_widths(area.width, &sorted, &cells, &agent_columns);
 
-    let shown = sorted.len().saturating_sub(app.models_scroll).min(visible);
-    let title = format!(" {title_prefix} · {} of {} ", shown, sorted.len());
+    let title_text = format!(" {title} ");
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(TABLE_COLUMN_SPACING)
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(Block::default().borders(Borders::ALL).title(title_text));
     f.render_widget(table, area);
 }
 
