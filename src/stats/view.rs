@@ -1209,7 +1209,7 @@ fn draw_overview_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsA
     let records = app.period_records();
     let cells = totals_by_agent_model(&records);
     let totals = totals_by_model(&records);
-    draw_model_table(f, area, app, "Models", cells, totals, None, false);
+    draw_model_table(f, area, app, "Models", cells, totals, None, true);
 }
 
 fn draw_dynamic_model_list(
@@ -1274,6 +1274,7 @@ fn draw_model_table(
     }
 
     let mut sorted: Vec<(String, UsageTotals)> = totals.into_iter().collect();
+    sorted.retain(|(_, usage)| usage.total_tokens() > 0);
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.total_tokens()));
     let agent_columns = sorted_agents_by_usage(&cells, hide_empty_agents);
 
