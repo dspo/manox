@@ -96,6 +96,11 @@ fn log_sources() -> Vec<LogSource> {
             extra_file: copilot_extra,
             kind: SourceKind::Copilot(AGENT_COPILOT),
         },
+        LogSource {
+            root: home.join(".omp/agent/sessions"),
+            extra_file: None,
+            kind: SourceKind::OmpSession,
+        },
     ]
 }
 
@@ -189,17 +194,10 @@ pub fn run_stats() -> Result<()> {
         }
     }
 
-    // OMP (Oh My Pi) — 从 SQLite 数据库读取已聚合的用量数据。
-    if let Some(home) = home_dir() {
-        let omp_db = home.join(".omp/stats.db");
-        // 跳过空文件：rusqlite 在 0 字节文件上可能创建 header，
-        // 干扰 OMP 自身的写入，且空文件无数据可读。
-        if omp_db.exists()
-            && fs::metadata(&omp_db).map(|m| m.len() > 0).unwrap_or(false)
-        {
-            all_raw.extend(parser::omp::parse_omp_db(&omp_db));
-        }
-    }
+    // OMP — 直接从 session jsonl 文件解析，不再读取 ~/.omp/stats.db。
+    // stats.db 是 omp stats 命令手动同步的快照缓存，延迟较大且历史上有
+    // provider 遗漏问题（如 packyapi 未被记录）。session jsonl 是原始数据源，
+    // 包含所有 provider 的完整用量。
 
     cache.files.retain(|k, _| visited.contains(k));
     let _ = save_cache(&cache_path, &cache);
