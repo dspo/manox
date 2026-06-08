@@ -7,10 +7,8 @@
 
 pub(super) mod claude;
 pub(super) mod codex;
-pub(super) mod omp;
-pub(super) mod omp_session;
 pub(super) mod copilot;
-
+pub(super) mod omp_session;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;

@@ -558,15 +558,24 @@ mod tests {
     #[test]
     fn normalize_claude_model_dot_to_hyphen() {
         assert_eq!(normalize_model_name("claude-opus-4.7"), "claude-opus-4-7");
-        assert_eq!(normalize_model_name("claude-sonnet-4.5"), "claude-sonnet-4-5");
+        assert_eq!(
+            normalize_model_name("claude-sonnet-4.5"),
+            "claude-sonnet-4-5"
+        );
         assert_eq!(normalize_model_name("claude-haiku-4.5"), "claude-haiku-4-5");
     }
     #[test]
     fn normalize_claude_model_already_hyphen() {
         // 已经是连字符风格的模型名应保持不变
         assert_eq!(normalize_model_name("claude-opus-4-7"), "claude-opus-4-7");
-        assert_eq!(normalize_model_name("claude-sonnet-4-20250514"), "claude-sonnet-4-20250514");
-        assert_eq!(normalize_model_name("claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001");
+        assert_eq!(
+            normalize_model_name("claude-sonnet-4-20250514"),
+            "claude-sonnet-4-20250514"
+        );
+        assert_eq!(
+            normalize_model_name("claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5-20251001"
+        );
     }
     #[test]
     fn normalize_claude_model_dot_with_date_suffix() {
