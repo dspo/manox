@@ -276,10 +276,47 @@ fn should_replace(candidate: &RawEntry, existing: &RawEntry) -> bool {
     total(candidate) > total(existing)
 }
 
+/// 将模型名称归一化为统一的命名风格。
+///
+/// Anthropic 的 Claude 模型存在两种版本号分隔风格：
+/// - 点号风格（如 API 返回）：`claude-opus-4.7`
+/// - 连字符风格（如 Anthropic 官方文档）：`claude-opus-4-7`
+///
+/// 在统计中这两种写法会被视为两个不同模型，导致聚合拆分。
+/// 此函数将 `claude-*` 模型名中版本号部分的点号替换为连字符，
+/// 使之统一为 `claude-opus-4-7` 风格。非 Claude 模型保持原样（如 `gpt-5.4`）。
+fn normalize_model_name(model: &str) -> String {
+    // 仅对 claude- 前缀的模型做归一化：版本号中的 "." → "-"
+    if model.starts_with("claude-") {
+        let rest = &model[7..]; // "opus-4.7" 或 "sonnet-4-20250514" 等
+        // rest 的结构："<tier>-<version>"
+        // version 中 "." 表示次版本分隔符，应替换为 "-"。
+        // 例：opus-4.7 → opus-4-7, sonnet-4.5 → sonnet-4-5
+        // 已为连字符的（opus-4-7, sonnet-4-20250514）不受影响。
+        let mut result = String::with_capacity(model.len());
+        result.push_str("claude-");
+        let mut seen_first_hyphen = false;
+        for ch in rest.chars() {
+            if ch == '-' && !seen_first_hyphen {
+                seen_first_hyphen = true;
+                result.push(ch);
+            } else if ch == '.' && seen_first_hyphen {
+                // 在 tier 与 version 之间的分隔符之后，"." → "-"
+                result.push('-');
+            } else {
+                result.push(ch);
+            }
+        }
+        result
+    } else {
+        model.to_string()
+    }
+}
 fn bucket(deduped: Vec<RawEntry>) -> Vec<UsageRecord> {
     let mut acc: BTreeMap<(String, String, String), UsageTotals> = BTreeMap::new();
     for e in deduped {
-        let key = (e.agent.clone(), e.model.clone(), e.date.clone());
+        let model = normalize_model_name(&e.model);
+        let key = (e.agent.clone(), model, e.date.clone());
         let t = acc.entry(key).or_default();
         t.in_tokens += e.input_tokens;
         t.out_tokens += e.output_tokens;
@@ -517,5 +554,72 @@ mod tests {
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].in_tokens, 100);
         assert_eq!(recs[0].out_tokens, 7);
+    }
+    #[test]
+    fn normalize_claude_model_dot_to_hyphen() {
+        assert_eq!(normalize_model_name("claude-opus-4.7"), "claude-opus-4-7");
+        assert_eq!(normalize_model_name("claude-sonnet-4.5"), "claude-sonnet-4-5");
+        assert_eq!(normalize_model_name("claude-haiku-4.5"), "claude-haiku-4-5");
+    }
+    #[test]
+    fn normalize_claude_model_already_hyphen() {
+        // 已经是连字符风格的模型名应保持不变
+        assert_eq!(normalize_model_name("claude-opus-4-7"), "claude-opus-4-7");
+        assert_eq!(normalize_model_name("claude-sonnet-4-20250514"), "claude-sonnet-4-20250514");
+        assert_eq!(normalize_model_name("claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001");
+    }
+    #[test]
+    fn normalize_claude_model_dot_with_date_suffix() {
+        // 版本号用点号 + 日期后缀
+        assert_eq!(
+            normalize_model_name("claude-sonnet-4.5-20250514"),
+            "claude-sonnet-4-5-20250514"
+        );
+    }
+    #[test]
+    fn normalize_non_claude_model_unchanged() {
+        // 非 Claude 模型保持原样（点号是它们自己的命名风格）
+        assert_eq!(normalize_model_name("gpt-5.4"), "gpt-5.4");
+        assert_eq!(normalize_model_name("gpt-5.5"), "gpt-5.5");
+        assert_eq!(normalize_model_name("qwen3.6-plus"), "qwen3.6-plus");
+        assert_eq!(normalize_model_name("deepseek-v3.2"), "deepseek-v3.2");
+        assert_eq!(normalize_model_name("mimo-v2.5-pro"), "mimo-v2.5-pro");
+    }
+    #[test]
+    fn bucket_merges_dot_and_hyphen_variants() {
+        // claude-opus-4.7 和 claude-opus-4-7 应合并为同一模型
+        let raw = vec![
+            RawEntry {
+                agent: "claude".to_string(),
+                model: "claude-opus-4.7".to_string(),
+                date: "2026-05-27".to_string(),
+                input_tokens: 100,
+                output_tokens: 7,
+                cache_read_input_tokens: 20,
+                cache_creation_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                dedup_primary: None,
+                dedup_secondary: None,
+                is_sidechain: false,
+            },
+            RawEntry {
+                agent: "claude".to_string(),
+                model: "claude-opus-4-7".to_string(),
+                date: "2026-05-27".to_string(),
+                input_tokens: 200,
+                output_tokens: 14,
+                cache_read_input_tokens: 40,
+                cache_creation_input_tokens: 5,
+                reasoning_output_tokens: 0,
+                dedup_primary: None,
+                dedup_secondary: None,
+                is_sidechain: false,
+            },
+        ];
+        let recs = bucket(raw);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].model, "claude-opus-4-7");
+        assert_eq!(recs[0].in_tokens, 300);
+        assert_eq!(recs[0].out_tokens, 21);
     }
 }
