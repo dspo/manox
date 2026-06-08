@@ -67,6 +67,7 @@ impl ScanCache {
 pub(super) enum Period {
     All,
     Today,
+    Lastday,
     Last7,
     Last30,
 }
@@ -76,6 +77,7 @@ impl Period {
         match self {
             Period::All => "All time".to_string(),
             Period::Today => "Today".to_string(),
+            Period::Lastday => "Yesterday".to_string(),
             Period::Last7 => "Last 7 days".to_string(),
             Period::Last30 => {
                 let days = super::date::previous_month_days(today);
@@ -87,7 +89,8 @@ impl Period {
     pub(super) fn cycle(self) -> Self {
         match self {
             Period::All => Period::Today,
-            Period::Today => Period::Last7,
+            Period::Today => Period::Lastday,
+            Period::Lastday => Period::Last7,
             Period::Last7 => Period::Last30,
             Period::Last30 => Period::All,
         }
@@ -97,6 +100,7 @@ impl Period {
         match self {
             Period::All => true,
             Period::Today => date == today,
+            Period::Lastday => super::date::days_diff(date, today) == Some(1),
             Period::Last7 => {
                 super::date::days_diff(date, today).is_some_and(|d| (0..7).contains(&d))
             }
@@ -129,5 +133,13 @@ mod tests {
         assert!(Period::Today.includes("2026-05-29", "2026-05-29"));
         assert!(!Period::Today.includes("2026-05-28", "2026-05-29"));
         assert!(!Period::Today.includes("2026-05-30", "2026-05-29"));
+    }
+
+    #[test]
+    fn lastday_only_includes_yesterday() {
+        assert!(Period::Lastday.includes("2026-05-28", "2026-05-29"));
+        assert!(!Period::Lastday.includes("2026-05-29", "2026-05-29"));
+        assert!(!Period::Lastday.includes("2026-05-27", "2026-05-29"));
+        assert!(!Period::Lastday.includes("2026-05-30", "2026-05-29"));
     }
 }
