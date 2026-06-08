@@ -19,21 +19,24 @@ const RACE_FRAME_DURATION: Duration = Duration::from_millis(83);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChartTab {
     Overview,
-    Dynamicview,
+    AllTimeRace,
+    RollingRace,
 }
 
 impl ChartTab {
     pub(super) fn label(self) -> &'static str {
         match self {
             ChartTab::Overview => "Overview",
-            ChartTab::Dynamicview => "Dynamicview",
+            ChartTab::AllTimeRace => "All Time Race",
+            ChartTab::RollingRace => "7-Days Rolling Race",
         }
     }
 
     fn next(self) -> Self {
         match self {
-            ChartTab::Overview => ChartTab::Dynamicview,
-            ChartTab::Dynamicview => ChartTab::Overview,
+            ChartTab::Overview => ChartTab::AllTimeRace,
+            ChartTab::AllTimeRace => ChartTab::RollingRace,
+            ChartTab::RollingRace => ChartTab::Overview,
         }
     }
 }
@@ -68,7 +71,10 @@ impl StatsApp {
     }
 
     fn advance_race(&mut self) {
-        if self.chart_tab == ChartTab::Dynamicview {
+        if matches!(
+            self.chart_tab,
+            ChartTab::AllTimeRace | ChartTab::RollingRace
+        ) {
             self.race_tick = self.race_tick.saturating_add(1);
         }
     }
@@ -76,7 +82,10 @@ impl StatsApp {
     fn cycle_chart_tab(&mut self) {
         self.chart_tab = self.chart_tab.next();
         self.models_scroll = 0;
-        if self.chart_tab == ChartTab::Dynamicview {
+        if matches!(
+            self.chart_tab,
+            ChartTab::AllTimeRace | ChartTab::RollingRace
+        ) {
             self.race_tick = 0;
         }
     }

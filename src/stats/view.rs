@@ -16,6 +16,8 @@ use super::{MATRIX_AGENTS, PALETTE};
 
 type ChartSeries = (String, Vec<f64>, Color);
 type ChartOccupancy = HashSet<(u16, u16)>;
+/// `(day_idx, 该日累计 (agent, model) -> 用量)`：用于 race 动画的插值快照。
+type RaceSnapshot = (usize, HashMap<(String, String), UsageTotals>);
 
 const MODEL_MIN_WIDTH: u16 = 26;
 const SHARE_WIDTH: u16 = 6;
@@ -31,6 +33,24 @@ const RACE_FINAL_HOLD_TICKS: usize = RACE_TWEEN_STEPS * 3;
 const RACE_FINAL_DISSOLVE_TICKS: usize = RACE_TWEEN_STEPS * 2;
 const RACE_INITIAL_COALESCE_TICKS: usize = RACE_TWEEN_STEPS * 2;
 const RACE_TRANSITION_SEED: u32 = 0x1234_5678;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaceMode {
+    /// 自 day0 起累计 token 用量：典型问题为「先发优势」始终占据前列。
+    AllTime,
+    /// 滚动 7 天 token 用量：每个 frame 的值是该 frame 日期 + 前 6 天的合计。
+    /// 自首个能形成完整 7 天窗口的日期（min_date + 6）开始播放至最新记录日。
+    Rolling7,
+}
+
+impl RaceMode {
+    fn title(self) -> &'static str {
+        match self {
+            RaceMode::AllTime => "All time",
+            RaceMode::Rolling7 => "Last 7 days",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct RaceEntry {
@@ -93,7 +113,11 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         ),
         Span::raw("· Token Usage Dashboard   "),
     ];
-    for tab in [ChartTab::Overview, ChartTab::Dynamicview] {
+    for tab in [
+        ChartTab::Overview,
+        ChartTab::AllTimeRace,
+        ChartTab::RollingRace,
+    ] {
         let style = if app.chart_tab == tab {
             Style::default()
                 .fg(Color::Black)
@@ -124,7 +148,8 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     };
     let view_hint = match app.chart_tab {
         ChartTab::Overview => "Overview",
-        ChartTab::Dynamicview => "Dynamicview · All time cumulative",
+        ChartTab::AllTimeRace => "All Time Race · cumulative",
+        ChartTab::RollingRace => "7-Days Rolling Race · last 7 days",
     };
     let text = format!(
         "{period_hint}   r cycle dates   Tab switch view   ↑↓/j/k scroll   {view_hint}   q quit"
@@ -151,14 +176,19 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             draw_period_switch(f, chunks[1], app);
             draw_overview_model_list(f, chunks[2], app);
         }
-        ChartTab::Dynamicview => {
+        ChartTab::AllTimeRace | ChartTab::RollingRace => {
+            let mode = match app.chart_tab {
+                ChartTab::AllTimeRace => RaceMode::AllTime,
+                ChartTab::RollingRace => RaceMode::Rolling7,
+                _ => unreachable!(),
+            };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(STEP_CHART_HEIGHT), Constraint::Min(0)])
                 .split(area);
-            let frames = race_frames(&app.records);
-            draw_bar_chart_race(f, chunks[0], app, &frames);
-            draw_dynamic_model_list(f, chunks[1], app, &frames);
+            let frames = race_frames(&app.records, mode);
+            draw_bar_chart_race(f, chunks[0], app, &frames, mode);
+            draw_dynamic_model_list(f, chunks[1], app, &frames, mode);
             apply_dynamicview_transition(
                 f.buffer_mut(),
                 area,
@@ -234,10 +264,17 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
     );
 }
 
-fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frames: &[RaceFrame]) {
+fn draw_bar_chart_race(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &StatsApp,
+    frames: &[RaceFrame],
+    mode: RaceMode,
+) {
     let chart_area = fixed_chart_area(area);
+    let title = format!("Model Tokens Top 15 · {}", mode.title());
     if chart_area.width < 32 || chart_area.height < 6 {
-        f.render_widget(Paragraph::new("Model Tokens Top 15 · All time"), chart_area);
+        f.render_widget(Paragraph::new(title), chart_area);
         return;
     }
 
@@ -246,7 +283,7 @@ fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frame
             "  No data for bar chart race.",
             Style::default().fg(Color::DarkGray),
         )))
-        .block(Block::default().title(" Model Tokens Top 15 · All time "));
+        .block(Block::default().title(format!(" {title} ")));
         f.render_widget(p, chart_area);
         return;
     }
@@ -255,7 +292,7 @@ fn draw_bar_chart_race(f: &mut ratatui::Frame, area: Rect, app: &StatsApp, frame
         return;
     };
     let max_value = race_max_value(&frames);
-    draw_race_frame(f, chart_area, previous, current, tween, max_value);
+    draw_race_frame(f, chart_area, previous, current, tween, max_value, mode);
 }
 
 fn draw_race_frame(
@@ -265,6 +302,7 @@ fn draw_race_frame(
     current: &RaceFrame,
     tween: f64,
     max_value: u64,
+    mode: RaceMode,
 ) {
     let s = smoothstep(tween);
     let prev_in: u64 = previous.cells.values().map(|u| u.in_tokens).sum();
@@ -275,7 +313,7 @@ fn draw_race_frame(
     let total_out = interpolate_u64(prev_out, curr_out, s);
     let title = Line::from(vec![
         Span::styled(
-            " Model Tokens Top 15 · All time ",
+            format!(" Model Tokens Top 15 · {} ", mode.title()),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -287,7 +325,11 @@ fn draw_race_frame(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(" ↑{} ↓{}", format_tokens(total_in), format_tokens(total_out)),
+            format!(
+                " ↑{} ↓{}",
+                format_tokens(total_in),
+                format_tokens(total_out)
+            ),
             Style::default()
                 .fg(Color::LightYellow)
                 .add_modifier(Modifier::BOLD),
@@ -543,11 +585,18 @@ fn chart_date_range(
     }
 }
 
-fn race_frames(records: &[UsageRecord]) -> Vec<RaceFrame> {
-    let Some((min_date, max_date)) = all_time_date_range(records) else {
+/// 7 天滚动窗口长度（含当日）。第一个能形成完整窗口的 frame 日期为
+/// `min_date + 6`，此时累计 7 天数据。
+const ROLLING_WINDOW_DAYS: i64 = 7;
+
+fn race_frames(records: &[UsageRecord], mode: RaceMode) -> Vec<RaceFrame> {
+    let Some((min_date, max_date)) = record_date_range(records) else {
         return Vec::new();
     };
     let day_count = (days_diff(&min_date, &max_date).unwrap_or(0).max(0) + 1) as usize;
+    if day_count == 0 {
+        return Vec::new();
+    }
     let color_map = race_color_map(records);
     let mut deltas_by_date: HashMap<String, HashMap<(String, String), UsageTotals>> =
         HashMap::new();
@@ -560,20 +609,18 @@ fn race_frames(records: &[UsageRecord]) -> Vec<RaceFrame> {
             .add_record(record);
     }
 
-    let mut cumulative: HashMap<(String, String), UsageTotals> = HashMap::new();
-    let mut snapshots: Vec<(usize, HashMap<(String, String), UsageTotals>)> = Vec::new();
-    for day_idx in 0..day_count {
-        let date = date_for_day(&min_date, &max_date, day_idx, day_count);
-        if let Some(deltas) = deltas_by_date.get(&date) {
-            for (key, usage) in deltas {
-                add_usage_totals(cumulative.entry(key.clone()).or_default(), usage);
-            }
-            snapshots.push((day_idx, cumulative.clone()));
-        }
-    }
+    let snapshots = match mode {
+        RaceMode::AllTime => all_time_snapshots(&min_date, &max_date, day_count, &deltas_by_date),
+        RaceMode::Rolling7 => rolling_snapshots(&min_date, &max_date, day_count, &deltas_by_date),
+    };
 
-    let mut frames = Vec::with_capacity(day_count);
-    for day_idx in 0..day_count {
+    let start_idx = match mode {
+        RaceMode::AllTime => 0,
+        RaceMode::Rolling7 => (ROLLING_WINDOW_DAYS - 1) as usize,
+    };
+
+    let mut frames = Vec::with_capacity(day_count.saturating_sub(start_idx));
+    for day_idx in start_idx..day_count {
         let date = date_for_day(&min_date, &max_date, day_idx, day_count);
         let cells = interpolated_race_cells(day_idx, &snapshots);
         let totals = totals_by_model_from_cells(&cells);
@@ -587,6 +634,57 @@ fn race_frames(records: &[UsageRecord]) -> Vec<RaceFrame> {
     frames
 }
 
+/// All-Time race：自 day0 起累计，每发生记录的天生成一个 snapshot。
+/// 间隔天在 [`interpolated_race_cells`] 中通过线性插值得到中间帧。
+fn all_time_snapshots(
+    min_date: &str,
+    max_date: &str,
+    day_count: usize,
+    deltas_by_date: &HashMap<String, HashMap<(String, String), UsageTotals>>,
+) -> Vec<RaceSnapshot> {
+    let mut cumulative: HashMap<(String, String), UsageTotals> = HashMap::new();
+    let mut snapshots: Vec<RaceSnapshot> = Vec::new();
+    for day_idx in 0..day_count {
+        let date = date_for_day(min_date, max_date, day_idx, day_count);
+        if let Some(deltas) = deltas_by_date.get(&date) {
+            for (key, usage) in deltas {
+                add_usage_totals(cumulative.entry(key.clone()).or_default(), usage);
+            }
+            snapshots.push((day_idx, cumulative.clone()));
+        }
+    }
+    snapshots
+}
+
+/// 滚动 7 天 race：每个 day 生成一个 snapshot，cells 为
+/// 最近 7 天（含当日）的累计值。间隔天通过 [`interpolated_race_cells`]
+/// 在相邻 snapshot 之间线性插值。
+fn rolling_snapshots(
+    min_date: &str,
+    max_date: &str,
+    day_count: usize,
+    deltas_by_date: &HashMap<String, HashMap<(String, String), UsageTotals>>,
+) -> Vec<RaceSnapshot> {
+    let mut snapshots: Vec<RaceSnapshot> = Vec::with_capacity(day_count);
+    for day_idx in 0..day_count {
+        let mut cells: HashMap<(String, String), UsageTotals> = HashMap::new();
+        for offset in 0..ROLLING_WINDOW_DAYS {
+            let lookback_idx = day_idx as i64 - offset;
+            if lookback_idx < 0 {
+                break;
+            }
+            let lookback_date = date_for_day(min_date, max_date, lookback_idx as usize, day_count);
+            if let Some(deltas) = deltas_by_date.get(&lookback_date) {
+                for (key, usage) in deltas {
+                    add_usage_totals(cells.entry(key.clone()).or_default(), usage);
+                }
+            }
+        }
+        snapshots.push((day_idx, cells));
+    }
+    snapshots
+}
+
 fn date_for_day(min_date: &str, max_date: &str, day_idx: usize, day_count: usize) -> String {
     if day_idx + 1 == day_count {
         max_date.to_string()
@@ -597,7 +695,7 @@ fn date_for_day(min_date: &str, max_date: &str, day_idx: usize, day_count: usize
 
 fn interpolated_race_cells(
     day_idx: usize,
-    snapshots: &[(usize, HashMap<(String, String), UsageTotals>)],
+    snapshots: &[RaceSnapshot],
 ) -> HashMap<(String, String), UsageTotals> {
     let Some((first_idx, first_values)) = snapshots.first() else {
         return HashMap::new();
@@ -716,7 +814,7 @@ fn race_max_value(frames: &[RaceFrame]) -> u64 {
         .max(1)
 }
 
-fn all_time_date_range(records: &[UsageRecord]) -> Option<(String, String)> {
+fn record_date_range(records: &[UsageRecord]) -> Option<(String, String)> {
     let first = records.first()?;
     let mut min_date = first.date.clone();
     let mut max_date = first.date.clone();
@@ -1200,9 +1298,15 @@ fn chart_legend_max_width(datasets: &[ChartSeries]) -> u16 {
 
 fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let mut spans: Vec<Span> = Vec::new();
-    for (i, p) in [Period::Today, Period::Lastday, Period::Last7, Period::Last30, Period::All]
-        .iter()
-        .enumerate()
+    for (i, p) in [
+        Period::Today,
+        Period::Lastday,
+        Period::Last7,
+        Period::Last30,
+        Period::All,
+    ]
+    .iter()
+    .enumerate()
     {
         if i > 0 {
             spans.push(Span::raw(" · "));
@@ -1240,12 +1344,18 @@ fn draw_dynamic_model_list(
     area: Rect,
     app: &mut StatsApp,
     frames: &[RaceFrame],
+    mode: RaceMode,
 ) {
     let Some((previous, current, tween)) = current_race_frame(app, frames) else {
         draw_model_table(
-            f, area, app,
+            f,
+            area,
+            app,
             "Model Tokens Top 0",
-            HashMap::new(), HashMap::new(), None, true,
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            true,
         );
         return;
     };
@@ -1254,22 +1364,30 @@ fn draw_dynamic_model_list(
     let displayed_totals = totals_by_model_from_cells(&displayed_cells);
     let color_map = race_color_map(&app.records);
 
-    let model_count = displayed_totals.values().filter(|u| u.total_tokens() > 0).count();
+    let model_count = displayed_totals
+        .values()
+        .filter(|u| u.total_tokens() > 0)
+        .count();
     let total_in: u64 = displayed_totals.values().map(|u| u.in_tokens).sum();
     let total_out: u64 = displayed_totals.values().map(|u| u.out_tokens).sum();
-    let period_label = Period::All.label(&app.today);
     let date_short = short_date(&current.date);
     let title = format!(
         "Model Tokens Top {} · {} {} ↑{} ↓{}",
         model_count,
-        period_label,
+        mode.title(),
         date_short,
         format_tokens(total_in),
         format_tokens(total_out),
     );
     draw_model_table(
-        f, area, app, &title,
-        displayed_cells, displayed_totals, Some(&color_map), true,
+        f,
+        area,
+        app,
+        &title,
+        displayed_cells,
+        displayed_totals,
+        Some(&color_map),
+        true,
     );
 }
 
@@ -1377,70 +1495,73 @@ fn draw_model_table(
         })
         .collect();
 
-    let header_cells: Vec<Cell> = [
-        Cell::from(
-            Text::from(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Model",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )),
-            ])
-            .centered(),
-        ),
-        Cell::from(
-            Text::from(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "Share",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )),
-            ])
-            .centered(),
-        ),
-        Cell::from(
-            Text::from(vec![
-                Line::from(Span::styled(
-                    "Total",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    total_usage_text,
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )),
-            ])
-            .centered(),
-        ),
-    ]
-    .into_iter()
-    .chain(agent_columns.iter().zip(agent_header_texts.iter()).map(|((_, label), usage_text)| {
-        Cell::from(
-            Text::from(vec![
-                Line::from(Span::styled(
-                    *label,
-                    Style::default()
-                        .fg(Color::LightCyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    usage_text.clone(),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )),
-            ])
-            .centered(),
-        )
-    }))
-    .collect();
+    let header_cells: Vec<Cell> =
+        [
+            Cell::from(
+                Text::from(vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Model",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                ])
+                .centered(),
+            ),
+            Cell::from(
+                Text::from(vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Share",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                ])
+                .centered(),
+            ),
+            Cell::from(
+                Text::from(vec![
+                    Line::from(Span::styled(
+                        "Total",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        total_usage_text,
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                ])
+                .centered(),
+            ),
+        ]
+        .into_iter()
+        .chain(agent_columns.iter().zip(agent_header_texts.iter()).map(
+            |((_, label), usage_text)| {
+                Cell::from(
+                    Text::from(vec![
+                        Line::from(Span::styled(
+                            *label,
+                            Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            usage_text.clone(),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                    ])
+                    .centered(),
+                )
+            },
+        ))
+        .collect();
     let header = Row::new(header_cells).height(2);
 
     let widths = model_table_widths(area.width, &sorted, &cells, &agent_columns);
@@ -1579,7 +1700,10 @@ fn shrink_agent_columns(ideal: &[u16], available: u16) -> Vec<u16> {
         return ideal.iter().map(|_| min_per_col).collect();
     }
     let distributable = available.saturating_sub(min_total);
-    let excess: Vec<u16> = ideal.iter().map(|w| w.saturating_sub(min_per_col)).collect();
+    let excess: Vec<u16> = ideal
+        .iter()
+        .map(|w| w.saturating_sub(min_per_col))
+        .collect();
     let excess_total = excess.iter().sum::<u16>();
     if excess_total == 0 {
         return ideal.iter().map(|_| min_per_col).collect();
@@ -1587,8 +1711,7 @@ fn shrink_agent_columns(ideal: &[u16], available: u16) -> Vec<u16> {
     excess
         .iter()
         .map(|w| {
-            min_per_col
-                + ((*w as f64 / excess_total as f64) * distributable as f64).round() as u16
+            min_per_col + ((*w as f64 / excess_total as f64) * distributable as f64).round() as u16
         })
         .collect()
 }
@@ -1854,7 +1977,7 @@ mod tests {
             record("beta", "2026-05-29", 200, 0),
         ];
 
-        let frames = race_frames(&records);
+        let frames = race_frames(&records, RaceMode::AllTime);
 
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].date, "2026-05-27");
@@ -1880,7 +2003,7 @@ mod tests {
             .map(|idx| record(&format!("model-{idx:02}"), "2026-05-29", idx + 1, 0))
             .collect();
 
-        let frames = race_frames(&records);
+        let frames = race_frames(&records, RaceMode::AllTime);
         let models: Vec<&str> = frames[0]
             .entries
             .iter()
@@ -1899,10 +2022,102 @@ mod tests {
             record("beta", "2026-05-28", 1000, 0),
         ];
 
-        let frames = race_frames(&records);
+        let frames = race_frames(&records, RaceMode::AllTime);
 
         assert_eq!(frames[0].entries[0].value, 100);
         assert_eq!(race_max_value(&frames), 1000);
+    }
+
+    #[test]
+    fn rolling_race_sums_seven_day_window_for_each_frame() {
+        // 7 天连续数据，每天用量不同。第一个 frame 应是 day 6（7 天窗口的起点），
+        // 之后每帧滚动一格。
+        let records: Vec<UsageRecord> = (0..10)
+            .map(|day| {
+                let day_str = format!("2026-05-{:02}", 10 + day);
+                record("alpha", &day_str, 100 * (day as u64 + 1), 0)
+            })
+            .collect();
+
+        let frames = race_frames(&records, RaceMode::Rolling7);
+
+        // day0..day6（7 天）作为首个 frame，day1..day7（次 7 天）作为第二帧。
+        assert_eq!(frames.len(), 4); // day6, day7, day8, day9
+        assert_eq!(frames[0].date, "2026-05-16");
+        // 首个窗口：[day0, day6] = 100+200+300+400+500+600+700 = 2800
+        assert_eq!(frames[0].entries[0].model, "alpha");
+        assert_eq!(
+            frames[0].entries[0].value,
+            100 + 200 + 300 + 400 + 500 + 600 + 700
+        );
+        // 第二个窗口：[day1, day7] = 200+...+800 = 3500
+        assert_eq!(frames[1].date, "2026-05-17");
+        assert_eq!(
+            frames[1].entries[0].value,
+            200 + 300 + 400 + 500 + 600 + 700 + 800
+        );
+        // 末个窗口：[day3, day9] = 400+500+...+1000 = 4900
+        assert_eq!(frames[3].date, "2026-05-19");
+        assert_eq!(
+            frames[3].entries[0].value,
+            400 + 500 + 600 + 700 + 800 + 900 + 1000
+        );
+    }
+
+    #[test]
+    fn rolling_race_drops_models_with_empty_window() {
+        // `alpha` 仅有 day0 的数据；`beta` 覆盖 day0..day9。
+        // 第一个滚动 7 天窗口为 [05-10, 05-16]，包含 alpha 的全部数据；
+        // 后续窗口均不包含 05-10，故 alpha 在末个 frame 中应被过滤。
+        let records = vec![
+            record("alpha", "2026-05-10", 100, 0),
+            record("beta", "2026-05-10", 10, 0),
+            record("beta", "2026-05-11", 10, 0),
+            record("beta", "2026-05-12", 10, 0),
+            record("beta", "2026-05-13", 10, 0),
+            record("beta", "2026-05-14", 10, 0),
+            record("beta", "2026-05-15", 10, 0),
+            record("beta", "2026-05-16", 10, 0),
+            record("beta", "2026-05-17", 10, 0),
+            record("beta", "2026-05-18", 10, 0),
+            record("beta", "2026-05-19", 10, 0),
+        ];
+
+        let frames = race_frames(&records, RaceMode::Rolling7);
+        // 末个 frame (2026-05-19) 窗口 [05-13, 05-19]：alpha 在窗口外，值为 0。
+        let last = frames.last().expect("rolling race has frames");
+        let last_models: Vec<&str> = last
+            .entries
+            .iter()
+            .map(|entry| entry.model.as_str())
+            .collect();
+        assert!(!last_models.contains(&"alpha"));
+        assert!(last_models.contains(&"beta"));
+        // 末个窗口 beta 累计 = 7 × 10 = 70
+        assert_eq!(last.entries[0].value, 70);
+    }
+
+    #[test]
+    fn rolling_race_uses_global_max_across_frames() {
+        // 7 天后某模型冲高，应作为 `race_max_value` 的全局基准。
+        let records: Vec<UsageRecord> = (0..10)
+            .map(|day| {
+                let day_str = format!("2026-05-{:02}", 10 + day);
+                let value = if day == 9 { 5_000 } else { 10 };
+                record("alpha", &day_str, value, 0)
+            })
+            .collect();
+
+        let frames = race_frames(&records, RaceMode::Rolling7);
+        // 末个窗口的 alpha 累计应 = 6*10 + 5000
+        assert_eq!(
+            frames.last().unwrap().entries[0].value,
+            9 * 10 + 5_000 - 3 * 10
+        );
+        assert_eq!(
+            race_max_value(&frames),
+            frames.last().unwrap().entries[0].value
+        );
     }
 
     #[test]
@@ -1912,7 +2127,7 @@ mod tests {
             agent_record("codex", "beta", "2026-05-28", 300, 0),
         ];
 
-        let frames = race_frames(&records);
+        let frames = race_frames(&records, RaceMode::AllTime);
 
         assert_eq!(
             frames[0]
@@ -2110,9 +2325,7 @@ mod tests {
         assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
 
         // 30-char model name still capped at MODEL_MIN_WIDTH, not expanded
-        let longer_sorted = vec![
-            ("copilot-suggestions-himalia-001".to_string(), usage(100, 0)),
-        ];
+        let longer_sorted = vec![("copilot-suggestions-himalia-001".to_string(), usage(100, 0))];
         let widths = model_table_widths(60, &longer_sorted, &cells, &agent_columns);
         assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
     }
@@ -2120,8 +2333,8 @@ mod tests {
     #[test]
     fn shrink_agent_columns_distributes_proportionally() {
         assert_eq!(shrink_agent_columns(&[10, 20], 30), vec![10, 20]); // no shrink needed
-        assert_eq!(shrink_agent_columns(&[10, 20], 15), vec![6, 9]);   // shrink proportionally
-        assert_eq!(shrink_agent_columns(&[10, 20], 8), vec![4, 4]);   // min per col
+        assert_eq!(shrink_agent_columns(&[10, 20], 15), vec![6, 9]); // shrink proportionally
+        assert_eq!(shrink_agent_columns(&[10, 20], 8), vec![4, 4]); // min per col
         assert_eq!(shrink_agent_columns(&[], 10), Vec::<u16>::new()); // empty input
     }
 }

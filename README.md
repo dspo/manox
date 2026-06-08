@@ -19,11 +19,14 @@ This edition is designed for GitLab-hosted internal distribution:
 
 `cx stats` opens a token usage dashboard for reviewing model and agent usage.
 The `Overview` view shows token trends and a model table with share, total
-tokens, and per-agent breakdowns. The `Dynamicview` view adds an All time
-cumulative token bar chart race for models, linked with the same model table as
-the race date advances.
+tokens, and per-agent breakdowns. The `All Time Race` view adds an All time
+cumulative token bar chart race for models, linked with the same model table
+as the race date advances. The `7-Days Rolling Race` view shows a 7-day
+rolling total token bar chart race, useful for surfacing recent model
+preference shifts that get masked by the cumulative view's first-mover
+advantage.
 
-![cx stats Dynamicview](docs/dynamicview.gif)
+![cx stats All Time Race](docs/dynamicview.gif)
 
 ## Install from GitLab
 
