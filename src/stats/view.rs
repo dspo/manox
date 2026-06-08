@@ -189,7 +189,7 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             let frames = race_frames(&app.records, mode);
             draw_bar_chart_race(f, chunks[0], app, &frames, mode);
             draw_dynamic_model_list(f, chunks[1], app, &frames, mode);
-            apply_dynamicview_transition(
+            apply_race_transition(
                 f.buffer_mut(),
                 area,
                 race_phase(app.race_tick, frames.len()),
@@ -291,7 +291,7 @@ fn draw_bar_chart_race(
     let Some((previous, current, tween)) = current_race_frame(app, frames) else {
         return;
     };
-    let max_value = race_max_value(&frames);
+    let max_value = race_max_value(frames);
     draw_race_frame(f, chart_area, previous, current, tween, max_value, mode);
 }
 
@@ -648,7 +648,7 @@ fn all_time_snapshots(
         let date = date_for_day(min_date, max_date, day_idx, day_count);
         if let Some(deltas) = deltas_by_date.get(&date) {
             for (key, usage) in deltas {
-                add_usage_totals(cumulative.entry(key.clone()).or_default(), usage);
+                cumulative.entry(key.clone()).or_default().add(usage);
             }
             snapshots.push((day_idx, cumulative.clone()));
         }
@@ -676,7 +676,7 @@ fn rolling_snapshots(
             let lookback_date = date_for_day(min_date, max_date, lookback_idx as usize, day_count);
             if let Some(deltas) = deltas_by_date.get(&lookback_date) {
                 for (key, usage) in deltas {
-                    add_usage_totals(cells.entry(key.clone()).or_default(), usage);
+                    cells.entry(key.clone()).or_default().add(usage);
                 }
             }
         }
@@ -741,18 +741,6 @@ fn interpolate_usage_cells(
         .collect()
 }
 
-fn add_usage_totals(target: &mut UsageTotals, usage: &UsageTotals) {
-    target.in_tokens = target.in_tokens.saturating_add(usage.in_tokens);
-    target.total_tokens = target.total_tokens.saturating_add(usage.total_tokens);
-    target.out_tokens = target.out_tokens.saturating_add(usage.out_tokens);
-    target.cache_read_input_tokens = target
-        .cache_read_input_tokens
-        .saturating_add(usage.cache_read_input_tokens);
-    target.cache_creation_input_tokens = target
-        .cache_creation_input_tokens
-        .saturating_add(usage.cache_creation_input_tokens);
-}
-
 fn interpolate_usage_totals(from: UsageTotals, to: UsageTotals, tween: f64) -> UsageTotals {
     UsageTotals {
         in_tokens: interpolate_u64(from.in_tokens, to.in_tokens, tween),
@@ -776,7 +764,7 @@ fn totals_by_model_from_cells(
 ) -> HashMap<String, UsageTotals> {
     let mut totals: HashMap<String, UsageTotals> = HashMap::new();
     for ((_, model), usage) in cells {
-        add_usage_totals(totals.entry(model.clone()).or_default(), usage);
+        totals.entry(model.clone()).or_default().add(usage);
     }
     totals
 }
@@ -938,7 +926,7 @@ fn race_phase(tick: usize, frame_count: usize) -> RacePhase {
     }
 }
 
-fn apply_dynamicview_transition(buf: &mut Buffer, area: Rect, phase: RacePhase) {
+fn apply_race_transition(buf: &mut Buffer, area: Rect, phase: RacePhase) {
     match phase {
         RacePhase::DissolvingLast { progress, .. } => {
             apply_transition_mask(buf, area, progress, TransitionMask::Dissolve);
