@@ -47,7 +47,7 @@ impl RaceMode {
     fn title(self) -> &'static str {
         match self {
             RaceMode::AllTime => "All time",
-            RaceMode::Rolling7 => "Last 7 days",
+            RaceMode::Rolling7 => "Rolling 7 days",
         }
     }
 }
@@ -149,7 +149,7 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     let view_hint = match app.chart_tab {
         ChartTab::Overview => "Overview",
         ChartTab::AllTimeRace => "All Time Race · cumulative",
-        ChartTab::RollingRace => "7-Days Rolling Race · last 7 days",
+        ChartTab::RollingRace => "7-Days Rolling Race · rolling 7 days",
     };
     let text = format!(
         "{period_hint}   r cycle dates   Tab switch view   ↑↓/j/k scroll   {view_hint}   q quit"
