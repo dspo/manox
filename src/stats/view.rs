@@ -3,7 +3,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use std::collections::{HashMap, HashSet};
 
@@ -1284,6 +1284,10 @@ fn draw_model_table(
     hide_empty_agents: bool,
 ) {
     let total_all: u64 = totals.values().map(|usage| usage.total_tokens()).sum();
+    let mut total_usage = UsageTotals::default();
+    for u in totals.values() {
+        total_usage.add(u);
+    }
 
     if totals.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
@@ -1303,6 +1307,19 @@ fn draw_model_table(
     sorted.retain(|(_, usage)| usage.total_tokens() > 0);
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.total_tokens()));
     let agent_columns = sorted_agents_by_usage(&cells, hide_empty_agents);
+
+    let agent_totals: HashMap<&str, UsageTotals> = agent_columns
+        .iter()
+        .map(|(agent, _)| {
+            let mut total = UsageTotals::default();
+            for ((a, _), u) in &cells {
+                if a == agent {
+                    total.add(u);
+                }
+            }
+            (*agent, total)
+        })
+        .collect();
 
     let visible = area.height.saturating_sub(3) as usize;
     let max_scroll = sorted.len().saturating_sub(visible.max(1));
@@ -1351,37 +1368,80 @@ fn draw_model_table(
         })
         .collect();
 
+    let total_usage_text = usage_cell_text(&total_usage);
+    let agent_header_texts: Vec<String> = agent_columns
+        .iter()
+        .map(|(agent, _)| {
+            let total = agent_totals.get(agent).copied().unwrap_or_default();
+            usage_cell_text(&total)
+        })
+        .collect();
+
     let header_cells: Vec<Cell> = [
-        Cell::from(Span::styled(
-            "Model",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(
-            "Share",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Cell::from(Span::styled(
-            "Total",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
+        Cell::from(
+            Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Model",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            ])
+            .centered(),
+        ),
+        Cell::from(
+            Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Share",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            ])
+            .centered(),
+        ),
+        Cell::from(
+            Text::from(vec![
+                Line::from(Span::styled(
+                    "Total",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    total_usage_text,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            ])
+            .centered(),
+        ),
     ]
     .into_iter()
-    .chain(agent_columns.iter().map(|(_, label)| {
-        Cell::from(Span::styled(
-            *label,
-            Style::default()
-                .fg(Color::LightCyan)
-                .add_modifier(Modifier::BOLD),
-        ))
+    .chain(agent_columns.iter().zip(agent_header_texts.iter()).map(|((_, label), usage_text)| {
+        Cell::from(
+            Text::from(vec![
+                Line::from(Span::styled(
+                    *label,
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    usage_text.clone(),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            ])
+            .centered(),
+        )
     }))
     .collect();
-    let header = Row::new(header_cells);
+    let header = Row::new(header_cells).height(2);
 
     let widths = model_table_widths(area.width, &sorted, &cells, &agent_columns);
 

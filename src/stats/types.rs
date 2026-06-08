@@ -39,6 +39,14 @@ impl UsageTotals {
         self.cache_read_input_tokens += record.cache_read_input_tokens;
         self.cache_creation_input_tokens += record.cache_creation_input_tokens;
     }
+
+    pub(super) fn add(&mut self, other: &UsageTotals) {
+        self.in_tokens = self.in_tokens.saturating_add(other.in_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.out_tokens = self.out_tokens.saturating_add(other.out_tokens);
+        self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(other.cache_read_input_tokens);
+        self.cache_creation_input_tokens = self.cache_creation_input_tokens.saturating_add(other.cache_creation_input_tokens);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
