@@ -29,7 +29,7 @@ providers:
         wire_apis: [responses]
       qwen3-max:
         swe_pro: "-"
-        lcb_pro: "-"
+        lcb_pro: "1226"
         hle: "-"
         desc: "深度推理"
         context: "262.1K"
@@ -153,9 +153,9 @@ providers:
         desc: "Claude Opus 4.6"
         context: "1M"
       claude-opus-4-7:
-        swe_pro: "-"
+        swe_pro: "64.3%"
         lcb_pro: "-"
-        hle: "-"
+        hle: "46.9%"
         desc: "Claude Opus 4.7"
         context: "1M"
 
