@@ -14,29 +14,29 @@ providers:
         url: https://dashscope.aliyuncs.com/compatible-mode/v1
     models:
       qwen3.6-plus:
-        swe_pro: "-"
+        swe_pro: "56.6%"
         lcb_pro: "-"
-        hle: "-"
+        hle: "28.8%"
         desc: "Agent/终端最强"
         context: "1M"
         wire_apis: [responses]
       qwen3.5-plus:
-        swe_pro: "50.9%"
+        swe_pro: "-"
         lcb_pro: "-"
         hle: "-"
         desc: "通用"
         context: "262.1K"
         wire_apis: [responses]
       qwen3-max:
-        swe_pro: "31.3%"
-        lcb_pro: "1402"
-        hle: "32.1%"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         desc: "深度推理"
         context: "262.1K"
         wire_apis: [responses]
       qwen3-coder-plus:
         swe_pro: "-"
-        lcb_pro: "1199"
+        lcb_pro: "-"
         hle: "-"
         desc: "编码专用"
         context: "262.1K"
@@ -69,37 +69,37 @@ providers:
         context: "128K"
         wire_apis: [responses]
       deepseek-v4-pro[1m]:
-        swe_pro: "62.5%"
-        lcb_pro: "2086"
-        hle: "39.4%"
+        swe_pro: "55.4%"
+        lcb_pro: "-"
+        hle: "37.7%"
         wire_apis: [anthropic, completions]
         agents: [claude]
         context: "1M"
       glm-5.1:
-        swe_pro: "58.7%"
+        swe_pro: "58.4%"
         lcb_pro: "-"
-        hle: "42.1%"
+        hle: "31.0%"
         desc: "通用"
         context: "202.8K"
         wire_apis: [anthropic, completions]
       glm-5:
         swe_pro: "55.1%"
-        lcb_pro: "1801"
-        hle: "35.5%"
+        lcb_pro: "-"
+        hle: "30.5%"
         desc: "推理+知识可靠"
         context: "202.8K"
         wire_apis: [anthropic, completions]
       kimi-k2.5:
-        swe_pro: "53.8%"
-        lcb_pro: "1832"
-        hle: "36.7%"
+        swe_pro: "50.7%"
+        lcb_pro: "-"
+        hle: "30.1%"
         desc: "竞赛编程强"
         context: "262.1K"
         wire_apis: [anthropic, completions]
       MiniMax-M2.5:
-        swe_pro: "54.2%"
+        swe_pro: "55.4%"
         lcb_pro: "-"
-        hle: "30.9%"
+        hle: "19.4%"
         desc: "SWE-V 80.2%"
         context: "1M"
         wire_apis: [anthropic, completions]
@@ -111,27 +111,27 @@ providers:
         context: "128K"
         wire_apis: [anthropic, completions]
       deepseek-v4-pro:
-        swe_pro: "62.5%"
-        lcb_pro: "2086"
-        hle: "39.4%"
+        swe_pro: "55.4%"
+        lcb_pro: "-"
+        hle: "37.7%"
         wire_apis: [completions]
         context: "1M"
       deepseek-v4-flash:
-        swe_pro: "-"
+        swe_pro: "52.6%"
         lcb_pro: "-"
-        hle: "-"
+        hle: "34.8%"
         wire_apis: [completions]
         context: "1M"
       MiniMax-M2.7:
-        swe_pro: "-"
+        swe_pro: "56.2%"
         lcb_pro: "-"
-        hle: "-"
+        hle: "28.0%"
         desc: "自我迭代"
         context: "1M"
         wire_apis: [completions]
       deepseek-v3.2:
-        swe_pro: "33.0%"
-        lcb_pro: "1620"
+        swe_pro: "-"
+        lcb_pro: "-"
         hle: "25.1%"
         desc: "深度思考"
         context: "131.1K"
@@ -147,15 +147,15 @@ providers:
         copilot_auth: bearer_token
     models:
       claude-opus-4-6:
-        swe_pro: "67.6%"
-        lcb_pro: "2196"
-        hle: "40.2%"
+        swe_pro: "57.3%"
+        lcb_pro: "-"
+        hle: "-"
         desc: "Claude Opus 4.6"
         context: "1M"
       claude-opus-4-7:
-        swe_pro: "70.1%"
-        lcb_pro: "2244"
-        hle: "46.9%"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         desc: "Claude Opus 4.7"
         context: "1M"
 
@@ -169,7 +169,7 @@ providers:
         url: https://token-plan-cn.xiaomimimo.com/v1
     models:
       mimo-v2.5-pro:
-        swe_pro: "-"
+        swe_pro: "57.2%"
         lcb_pro: "-"
         hle: "-"
         context: "1M"
