@@ -14,116 +14,125 @@ providers:
         url: https://dashscope.aliyuncs.com/compatible-mode/v1
     models:
       qwen3.6-plus:
-        arena: "#8"
-        swe_p: "—"
-        tb2: "61.6%"
+        swe_pro: "56.6%"
+        lcb_pro: "-"
+        hle: "28.8%"
         desc: "Agent/终端最强"
         context: "1M"
         wire_apis: [responses]
       qwen3.5-plus:
-        arena: "#26"
-        swe_p: "50.9%"
-        tb2: "—"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         desc: "通用"
         context: "262.1K"
         wire_apis: [responses]
       qwen3-max:
-        arena: "—"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "-"
+        lcb_pro: "1226"
+        hle: "-"
         desc: "深度推理"
         context: "262.1K"
         wire_apis: [responses]
       qwen3-coder-plus:
-        arena: "#45"
-        swe_p: "~38.7%"
-        tb2: "—"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         desc: "编码专用"
         context: "262.1K"
         wire_apis: [responses]
       qwen3-coder-flash:
-        arena: "—"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         desc: "轻量编码"
         context: "131.1K"
       qwen3.5-flash:
-        arena: "#50"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         desc: "轻量快速"
         context: "1M"
         wire_apis: [responses]
       qwen-plus-latest:
-        arena: "—"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         desc: "旧版通用"
         context: "128K"
         wire_apis: [responses]
       qwen-turbo-latest:
-        arena: "—"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         desc: "最轻量"
         context: "128K"
         wire_apis: [responses]
       deepseek-v4-pro[1m]:
+        swe_pro: "55.4%"
+        lcb_pro: "-"
+        hle: "37.7%"
         wire_apis: [anthropic, completions]
         agents: [claude]
         context: "1M"
       glm-5.1:
-        arena: "#"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "58.4%"
+        lcb_pro: "-"
+        hle: "31.0%"
         desc: "通用"
         context: "202.8K"
         wire_apis: [anthropic, completions]
       glm-5:
-        arena: "#9"
-        swe_p: "55.1%"
-        tb2: "49.4%"
+        swe_pro: "55.1%"
+        lcb_pro: "-"
+        hle: "30.5%"
         desc: "推理+知识可靠"
         context: "202.8K"
         wire_apis: [anthropic, completions]
       kimi-k2.5:
-        arena: "#14"
-        swe_p: "53.8%"
-        tb2: "50.8%"
+        swe_pro: "50.7%"
+        lcb_pro: "-"
+        hle: "30.1%"
         desc: "竞赛编程强"
         context: "262.1K"
         wire_apis: [anthropic, completions]
       MiniMax-M2.5:
-        arena: "#20"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "55.4%"
+        lcb_pro: "-"
+        hle: "19.4%"
         desc: "SWE-V 80.2%"
         context: "1M"
         wire_apis: [anthropic, completions]
       qwen3-coder-next:
-        arena: "—"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         desc: "3B激活，性价比极高"
         context: "128K"
         wire_apis: [anthropic, completions]
       deepseek-v4-pro:
+        swe_pro: "55.4%"
+        lcb_pro: "-"
+        hle: "37.7%"
         wire_apis: [completions]
         context: "1M"
       deepseek-v4-flash:
+        swe_pro: "52.6%"
+        lcb_pro: "-"
+        hle: "34.8%"
         wire_apis: [completions]
         context: "1M"
       MiniMax-M2.7:
-        arena: "—"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "56.2%"
+        lcb_pro: "-"
+        hle: "28.0%"
         desc: "自我迭代"
         context: "1M"
         wire_apis: [completions]
       deepseek-v3.2:
-        arena: "—"
-        swe_p: "—"
-        tb2: "—"
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "25.1%"
         desc: "深度思考"
         context: "131.1K"
         wire_apis: [completions]
@@ -138,9 +147,15 @@ providers:
         copilot_auth: bearer_token
     models:
       claude-opus-4-6:
+        swe_pro: "57.3%"
+        lcb_pro: "-"
+        hle: "-"
         desc: "Claude Opus 4.6"
         context: "1M"
       claude-opus-4-7:
+        swe_pro: "64.3%"
+        lcb_pro: "-"
+        hle: "46.9%"
         desc: "Claude Opus 4.7"
         context: "1M"
 
@@ -154,20 +169,44 @@ providers:
         url: https://token-plan-cn.xiaomimimo.com/v1
     models:
       mimo-v2.5-pro:
+        swe_pro: "57.2%"
+        lcb_pro: "-"
+        hle: "-"
         context: "1M"
       mimo-v2.5:
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         context: "1M"
       mimo-v2.5-tts-voiceclone:
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         context: "262.1K"
       mimo-v2.5-tts-voicedesign:
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         context: "262.1K"
       mimo-v2.5-tts:
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         context: "262.1K"
       mimo-v2-pro:
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         context: "1M"
       mimo-v2-omni:
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         context: "262.1K"
       mimo-v2-tts:
+        swe_pro: "-"
+        lcb_pro: "-"
+        hle: "-"
         context: "262.1K"
 
 agents:

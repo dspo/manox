@@ -93,9 +93,9 @@ struct EndpointConfig {
 #[derive(Debug, Clone)]
 struct ModelConfig {
     id: String,
-    arena: Option<String>,
-    swe_p: Option<String>,
-    tb2: Option<String>,
+    swe_pro: Option<String>,
+    lcb_pro: Option<String>,
+    hle: Option<String>,
     desc: Option<String>,
     context: Option<String>,
     agents: Vec<String>,
@@ -104,11 +104,11 @@ struct ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct ProviderModelConfig {
     #[serde(default)]
-    arena: Option<String>,
+    swe_pro: Option<String>,
     #[serde(default)]
-    swe_p: Option<String>,
+    lcb_pro: Option<String>,
     #[serde(default)]
-    tb2: Option<String>,
+    hle: Option<String>,
     #[serde(default)]
     desc: Option<String>,
     #[serde(default)]
@@ -257,9 +257,9 @@ impl ProviderConfig {
                     })
                     .map(|(id, model)| ModelConfig {
                         id: id.clone(),
-                        arena: model.arena.clone(),
-                        swe_p: model.swe_p.clone(),
-                        tb2: model.tb2.clone(),
+                        swe_pro: model.swe_pro.clone(),
+                        lcb_pro: model.lcb_pro.clone(),
+                        hle: model.hle.clone(),
                         desc: model.desc.clone(),
                         context: model.context.clone(),
                         agents: model.agents.clone(),
@@ -291,9 +291,9 @@ impl ProviderConfig {
 #[derive(Debug, Clone)]
 struct ResolvedModel {
     id: String,
-    arena: String,
-    swe_p: String,
-    tb2: String,
+    swe_pro: String,
+    lcb_pro: String,
+    hle: String,
     desc: String,
     context: String,
     wire_api: WireApi,
@@ -312,9 +312,9 @@ impl ResolvedModel {
     ) -> Self {
         Self {
             id: model.id.clone(),
-            arena: model.arena.clone().unwrap_or_else(|| "—".to_string()),
-            swe_p: model.swe_p.clone().unwrap_or_else(|| "—".to_string()),
-            tb2: model.tb2.clone().unwrap_or_else(|| "—".to_string()),
+            swe_pro: model.swe_pro.clone().unwrap_or_else(|| "—".to_string()),
+            lcb_pro: model.lcb_pro.clone().unwrap_or_else(|| "—".to_string()),
+            hle: model.hle.clone().unwrap_or_else(|| "—".to_string()),
             desc: model.desc.clone().unwrap_or_default(),
             context: model.context.clone().unwrap_or_else(|| "—".to_string()),
             wire_api: WireApi::from_str(&endpoint.wire_api),
@@ -346,9 +346,9 @@ impl ResolvedModel {
 struct ModelOption {
     selection_key: String,
     id: String,
-    arena: String,
-    swe_p: String,
-    tb2: String,
+    swe_pro: String,
+    lcb_pro: String,
+    hle: String,
     desc: String,
     context: String,
     variants: Vec<ResolvedModel>,
@@ -362,9 +362,9 @@ impl ModelOption {
         Self {
             selection_key: format!("{}\t{}", first.provider_name, first.id),
             id: first.id.clone(),
-            arena: first.arena.clone(),
-            swe_p: first.swe_p.clone(),
-            tb2: first.tb2.clone(),
+            swe_pro: first.swe_pro.clone(),
+            lcb_pro: first.lcb_pro.clone(),
+            hle: first.hle.clone(),
             desc: first.desc.clone(),
             context: first.context.clone(),
             variants,
@@ -398,11 +398,11 @@ impl ModelOption {
     fn formatted_row(&self, selected_wire_apis: &BTreeMap<String, usize>) -> String {
         let selected = self.selected_variant(selected_wire_apis);
         format!(
-            "{:<24} {:>4} {:>8} {:>6}  {:<11} {:>8}  {}",
+            "{:<24} {:>7} {:>7} {:>6}  {:<11} {:>8}  {}",
             self.id,
-            self.arena,
-            self.swe_p,
-            self.tb2,
+            self.swe_pro,
+            self.lcb_pro,
+            self.hle,
             selected.wire_api.display(),
             self.context,
             self.desc
@@ -2635,12 +2635,12 @@ fn collect_model_draft(
         PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
     };
 
-    let arena = match prompt_text(
+    let swe_pro = match prompt_text(
         terminal,
         "cx add",
-        "可选：输入 arena 排名；留空则不写入",
+        "可选：输入 SWE-bench Pro 成绩；留空则不写入",
         "",
-        "示例：#8",
+        "示例：45.3%",
         |value| Ok(value.trim().to_string()),
     )? {
         PromptOutcome::Submit(value) => value,
@@ -2648,12 +2648,12 @@ fn collect_model_draft(
         PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
     };
 
-    let swe_p = match prompt_text(
+    let lcb_pro = match prompt_text(
         terminal,
         "cx add",
-        "可选：输入 SWE-P 指标；留空则不写入",
+        "可选：输入 LiveCodeBench Pro 成绩；留空则不写入",
         "",
-        "示例：50.9%",
+        "示例：2085",
         |value| Ok(value.trim().to_string()),
     )? {
         PromptOutcome::Submit(value) => value,
@@ -2661,12 +2661,12 @@ fn collect_model_draft(
         PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
     };
 
-    let tb2 = match prompt_text(
+    let hle = match prompt_text(
         terminal,
         "cx add",
-        "可选：输入 TB2 指标；留空则不写入",
+        "可选：输入 Humanity's Last Exam 成绩；留空则不写入",
         "",
-        "示例：61.6%",
+        "示例：30.2%",
         |value| Ok(value.trim().to_string()),
     )? {
         PromptOutcome::Submit(value) => value,
@@ -2703,9 +2703,9 @@ fn collect_model_draft(
     Ok(PromptOutcome::Submit((
         model_id,
         ProviderModelConfig {
-            arena: empty_string_as_none(&arena),
-            swe_p: empty_string_as_none(&swe_p),
-            tb2: empty_string_as_none(&tb2),
+            swe_pro: empty_string_as_none(&swe_pro),
+            lcb_pro: empty_string_as_none(&lcb_pro),
+            hle: empty_string_as_none(&hle),
             desc: empty_string_as_none(&desc),
             context: empty_string_as_none(&context),
             wire_apis: vec![wire_api.display().to_string()],
@@ -3797,9 +3797,9 @@ mod tests {
     fn test_resolved_model(model_id: &str, endpoint_url: &str, wire_api: WireApi) -> ResolvedModel {
         ResolvedModel {
             id: model_id.into(),
-            arena: "—".into(),
-            swe_p: "—".into(),
-            tb2: "—".into(),
+            swe_pro: "—".into(),
+            lcb_pro: "—".into(),
+            hle: "—".into(),
             desc: String::new(),
             context: "—".into(),
             wire_api,
@@ -3818,9 +3818,9 @@ mod tests {
                 models: BTreeMap::from([(
                     "mimo-v2.5-pro".into(),
                     ProviderModelConfig {
-                        arena: Some("#1".into()),
-                        swe_p: Some("80%".into()),
-                        tb2: Some("70%".into()),
+                        swe_pro: Some("80%".into()),
+                        lcb_pro: Some("2100".into()),
+                        hle: Some("70%".into()),
                         desc: Some("thinking".into()),
                         context: None,
                         wire_apis: vec![],
@@ -4011,9 +4011,9 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "qwen3.6-plus".into(),
-                arena: "—".into(),
-                swe_p: "—".into(),
-                tb2: "—".into(),
+                swe_pro: "—".into(),
+                lcb_pro: "—".into(),
+                hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4066,9 +4066,9 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "claude-opus-4-7".into(),
-                arena: "—".into(),
-                swe_p: "—".into(),
-                tb2: "—".into(),
+                swe_pro: "—".into(),
+                lcb_pro: "—".into(),
+                hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4345,9 +4345,9 @@ mod tests {
                 wire_api: WireApi::Responses,
                 model_id: "qwen3.6-plus".into(),
                 model: ProviderModelConfig {
-                    arena: Some("#8".into()),
-                    swe_p: None,
-                    tb2: None,
+                    swe_pro: Some("45.3%".into()),
+                    lcb_pro: None,
+                    hle: None,
                     desc: Some("Agent/终端最强".into()),
                     context: None,
                     wire_apis: vec!["responses".into()],
@@ -4388,9 +4388,9 @@ mod tests {
                 models: BTreeMap::from([(
                     "claude-opus-4-7".into(),
                     ProviderModelConfig {
-                        arena: None,
-                        swe_p: None,
-                        tb2: None,
+                        swe_pro: None,
+                        lcb_pro: None,
+                        hle: None,
                         desc: None,
                         context: None,
                         wire_apis: vec!["anthropic".into()],
