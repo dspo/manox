@@ -1,9 +1,6 @@
 //! 共享数据模型与视图/周期枚举。
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(super) struct UsageRecord {
     pub(super) agent: String,
     pub(super) model: String,
@@ -50,28 +47,6 @@ impl UsageTotals {
         self.cache_creation_input_tokens = self
             .cache_creation_input_tokens
             .saturating_add(other.cache_creation_input_tokens);
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct CacheEntry {
-    pub(super) mtime_secs: u64,
-    pub(super) size: u64,
-    pub(super) raw: Vec<super::parser::RawEntry>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub(super) struct ScanCache {
-    pub(super) version: u32,
-    pub(super) files: HashMap<String, CacheEntry>,
-}
-
-impl ScanCache {
-    pub(super) fn new(version: u32) -> Self {
-        Self {
-            version,
-            files: HashMap::new(),
-        }
     }
 }
 

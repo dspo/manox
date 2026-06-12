@@ -8,10 +8,13 @@
 //! - 全局去重阶段：只对解析器显式提供 `dedup_primary` 的 agent 去重。Claude Code
 //!   Stats 视图是 raw-sum 口径，因此 Claude 记录不提供去重键。
 //! - 聚合阶段：按 (agent, model, date) 累加成 [`UsageRecord`]，供视图使用。
+//!
+//! 用量数据持久化在 `~/.config/cx/cx.db` SQLite 数据库中，
+//! 避免每次启动都重新扫描所有本地文件。
 
 mod aggregate;
-mod cache;
 mod date;
+mod db;
 mod format;
 mod parser;
 mod tui;
@@ -26,17 +29,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use cache::{cache_path, load_cache, save_cache};
 use parser::{RawEntry, SourceKind, parse_file};
-use types::{CacheEntry, ScanCache, UsageRecord, UsageTotals};
-
-const CACHE_VERSION: u32 = 6;
+use types::{UsageRecord, UsageTotals};
 
 pub(crate) const AGENT_CLAUDE: &str = "claude";
 pub(crate) const AGENT_CODEX: &str = "codex";
 pub(crate) const AGENT_ZED: &str = "zed";
 pub(crate) const AGENT_COPILOT: &str = "copilot";
 pub(crate) const AGENT_OMP: &str = "omp";
+pub(crate) const AGENT_MIMO: &str = "mimo";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_CLAUDE, "Claude Code"),
@@ -44,6 +45,7 @@ pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_ZED, "Zed Agent"),
     (AGENT_OMP, "OMP"),
     (AGENT_COPILOT, "Copilot"),
+    (AGENT_MIMO, "Mimo"),
 ];
 
 /// 折线图调色板（与 Claude `/usage` 风格相近）。
@@ -101,6 +103,11 @@ fn log_sources() -> Vec<LogSource> {
             extra_file: None,
             kind: SourceKind::OmpSession,
         },
+        LogSource {
+            root: home.join(".local/share/mimocode"),
+            extra_file: None,
+            kind: SourceKind::MimoSession,
+        },
     ]
 }
 
@@ -135,17 +142,29 @@ fn collect_jsonl_files(root: &Path) -> Vec<PathBuf> {
 pub fn run_stats() -> Result<()> {
     let today = date::today_date_string()?;
 
-    let cache_path = cache_path()?;
-    let mut cache = load_cache(&cache_path).unwrap_or_else(|_| ScanCache::new(CACHE_VERSION));
-    if cache.version != CACHE_VERSION {
-        cache = ScanCache::new(CACHE_VERSION);
-    }
+    let db_path = db::db_path()?;
+    let conn = db::open_db(&db_path)?;
+    db::init_schema(&conn)?;
 
     let mut all_raw: Vec<RawEntry> = Vec::new();
     let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut active_source_roots: Vec<PathBuf> = Vec::new();
+    let mut active_extra_files: Vec<PathBuf> = Vec::new();
 
     for source in log_sources() {
-        let mut files = if source.root.exists() {
+        active_source_roots.push(source.root.clone());
+        if let Some(ref extra) = source.extra_file {
+            active_extra_files.push(extra.clone());
+        }
+
+let mut files = if matches!(source.kind, SourceKind::MimoSession) {
+            let db_path = source.root.join("mimocode.db");
+            if db_path.is_file() {
+                vec![db_path]
+            } else {
+                Vec::new()
+            }
+        } else if source.root.exists() {
             collect_jsonl_files(&source.root)
         } else {
             Vec::new()
@@ -171,39 +190,39 @@ pub fn run_stats() -> Result<()> {
                 .unwrap_or(0);
             let size = meta.len();
 
-            let raw_entries = if let Some(entry) = cache.files.get(&path_key) {
-                if entry.mtime_secs == mtime && entry.size == size {
-                    entry.raw.clone()
-                } else {
-                    parse_file(&path, source.kind)
+            let raw_entries = if db::file_unchanged(&conn, &path_key, mtime, size) {
+                // 缓存命中（mtime+size 匹配），但 JSON 可能损坏/截断；
+                // 反序列化失败时走 cache-miss 重新解析源文件。
+                match db::get_cached_raw(&conn, &path_key) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        eprintln!("cx: {e:#}");
+                        let entries = parse_file(&path, source.kind);
+                        db::store_file_entries(&conn, &path_key, mtime, size, &entries)?;
+                        entries
+                    }
                 }
             } else {
-                parse_file(&path, source.kind)
+                let entries = parse_file(&path, source.kind);
+                db::store_file_entries(&conn, &path_key, mtime, size, &entries)?;
+                entries
             };
-
-            cache.files.insert(
-                path_key,
-                CacheEntry {
-                    mtime_secs: mtime,
-                    size,
-                    raw: raw_entries.clone(),
-                },
-            );
 
             all_raw.extend(raw_entries);
         }
     }
 
-    // OMP — 直接从 session jsonl 文件解析，不再读取 ~/.omp/stats.db。
-    // stats.db 是 omp stats 命令手动同步的快照缓存，延迟较大且历史上有
-    // provider 遗漏问题（如 packyapi 未被记录）。session jsonl 是原始数据源，
-    // 包含所有 provider 的完整用量。
-
-    cache.files.retain(|k, _| visited.contains(k));
-    let _ = save_cache(&cache_path, &cache);
+    // 清理已卸载 agent 的 stale 缓存条目。
+    let roots_refs: Vec<&Path> = active_source_roots.iter().map(|p| p.as_path()).collect();
+    let extras_refs: Vec<&Path> = active_extra_files.iter().map(|p| p.as_path()).collect();
+if let Err(e) = db::cleanup_stale_entries(&conn, &roots_refs, &extras_refs) {
+        eprintln!("cx: 清理过期缓存失败: {e:#}");
+    }
 
     let deduped = dedupe(all_raw);
     let records = bucket(deduped);
+
+    db::replace_usage_records(&conn, &records)?;
 
     if std::env::var("CX_STATS_DUMP").ok().as_deref() == Some("1") {
         return dump_records(&records, &today);

@@ -8,6 +8,7 @@
 pub(super) mod claude;
 pub(super) mod codex;
 pub(super) mod copilot;
+pub(super) mod mimo;
 pub(super) mod omp_session;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -53,21 +54,35 @@ pub(super) enum SourceKind {
     Copilot(&'static str),
     /// OMP session jsonl（~/.omp/agent/sessions/）。
     OmpSession,
+    /// Mimo CLI session SQLite（~/.local/share/mimocode/mimocode.db）。
+    MimoSession,
 }
 
 pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Vec<RawEntry> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
     match kind {
-        SourceKind::Claude => claude::parse(&content),
-        SourceKind::CodexLike(agent) => {
-            let fallback_date = fallback_date_from_path(path);
-            codex::parse(&content, agent, fallback_date.as_deref(), path)
+        SourceKind::MimoSession => match mimo::parse(path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("cx: Mimo 解析失败 ({}): {e:#}", path.display());
+                Vec::new()
+            }
+        },
+        _ => {
+            let content = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            match kind {
+                SourceKind::Claude => claude::parse(&content),
+                SourceKind::CodexLike(agent) => {
+                    let fallback_date = fallback_date_from_path(path);
+                    codex::parse(&content, agent, fallback_date.as_deref(), path)
+                }
+                SourceKind::Copilot(agent) => copilot::parse(&content, agent, path),
+                SourceKind::OmpSession => omp_session::parse(&content),
+                SourceKind::MimoSession => unreachable!(),
+            }
         }
-        SourceKind::Copilot(agent) => copilot::parse(&content, agent, path),
-        SourceKind::OmpSession => omp_session::parse(&content),
     }
 }
 
