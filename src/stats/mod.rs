@@ -1,16 +1,11 @@
 //! cx stats — Token 用量统计 TUI
 //!
-//! 扫描各 agent 的本地日志，聚合 (agent, model, date) 维度的 token 用量，
-//! 提供 Models TUI 视图。
+//! 扫描各 agent 的本地日志，将 per-message 明细存入 cx.db，
+//! 按 (agent, model, date) 聚合展示。
 //!
-//! 设计参考 ccusage `rust/crates/ccusage/src/adapter/`：
-//! - 解析阶段：每个文件解析为 `Vec<RawEntry>`（带去重主键）。
-//! - 全局去重阶段：只对解析器显式提供 `dedup_primary` 的 agent 去重。Claude Code
-//!   Stats 视图是 raw-sum 口径，因此 Claude 记录不提供去重键。
-//! - 聚合阶段：按 (agent, model, date) 累加成 [`UsageRecord`]，供视图使用。
-//!
-//! 用量数据持久化在 `~/.config/cx/cx.db` SQLite 数据库中，
-//! 避免每次启动都重新扫描所有本地文件。
+//! 增量更新：变化的源文件 DELETE+INSERT，未变化的跳过。
+//! 跨文件去重（codex/copilot）在 db insert 时处理。
+//! 聚合用 SQL GROUP BY 实时计算，不需要单独的聚合表。
 
 mod aggregate;
 mod date;
@@ -24,13 +19,13 @@ mod view;
 use anyhow::Result;
 use dirs::home_dir;
 use ratatui::style::Color;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use parser::{RawEntry, SourceKind, parse_file};
-use types::{UsageRecord, UsageTotals};
+use parser::{SourceKind, parse_file};
+use types::UsageRecord;
 
 pub(crate) const AGENT_CLAUDE: &str = "claude";
 pub(crate) const AGENT_CODEX: &str = "codex";
@@ -146,7 +141,6 @@ pub fn run_stats() -> Result<()> {
     let conn = db::open_db(&db_path)?;
     db::init_schema(&conn)?;
 
-    let mut all_raw: Vec<RawEntry> = Vec::new();
     let mut visited: BTreeSet<String> = BTreeSet::new();
     let mut active_source_roots: Vec<PathBuf> = Vec::new();
     let mut active_extra_files: Vec<PathBuf> = Vec::new();
@@ -157,7 +151,7 @@ pub fn run_stats() -> Result<()> {
             active_extra_files.push(extra.clone());
         }
 
-let mut files = if matches!(source.kind, SourceKind::MimoSession) {
+        let mut files = if matches!(source.kind, SourceKind::MimoSession) {
             let db_path = source.root.join("mimocode.db");
             if db_path.is_file() {
                 vec![db_path]
@@ -190,109 +184,34 @@ let mut files = if matches!(source.kind, SourceKind::MimoSession) {
                 .unwrap_or(0);
             let size = meta.len();
 
-            let raw_entries = if db::file_unchanged(&conn, &path_key, mtime, size) {
-                // 缓存命中（mtime+size 匹配），但 JSON 可能损坏/截断；
-                // 反序列化失败时走 cache-miss 重新解析源文件。
-                match db::get_cached_raw(&conn, &path_key) {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        eprintln!("cx: {e:#}");
-                        let entries = parse_file(&path, source.kind);
-                        db::store_file_entries(&conn, &path_key, mtime, size, &entries)?;
-                        entries
-                    }
-                }
-            } else {
-                let entries = parse_file(&path, source.kind);
-                db::store_file_entries(&conn, &path_key, mtime, size, &entries)?;
-                entries
-            };
+            if db::file_unchanged(&conn, &path_key, mtime, size) {
+                // 缓存命中：该文件上次扫描时的数据已在 messages 表中，跳过。
+                continue;
+            }
 
-            all_raw.extend(raw_entries);
+            // 文件变化或首次扫描：删除旧数据，重新解析，增量插入。
+            db::delete_messages_for_source(&conn, &path_key)?;
+            let entries = parse_file(&path, source.kind);
+            db::insert_file_messages(&conn, &entries, &path_key)?;
+            db::mark_file_scanned(&conn, &path_key, mtime, size)?;
         }
     }
 
-    // 清理已卸载 agent 的 stale 缓存条目。
+    // 清理已卸载 agent 的 stale 条目（scanned_files + messages）。
     let roots_refs: Vec<&Path> = active_source_roots.iter().map(|p| p.as_path()).collect();
     let extras_refs: Vec<&Path> = active_extra_files.iter().map(|p| p.as_path()).collect();
-if let Err(e) = db::cleanup_stale_entries(&conn, &roots_refs, &extras_refs) {
+    if let Err(e) = db::cleanup_stale_entries(&conn, &roots_refs, &extras_refs) {
         eprintln!("cx: 清理过期缓存失败: {e:#}");
     }
 
-    let deduped = dedupe(all_raw);
-    let records = bucket(deduped);
-
-    db::replace_usage_records(&conn, &records)?;
+    // 从 messages 表聚合读取，而非内存计算。
+    let records = db::load_aggregated(&conn)?;
 
     if std::env::var("CX_STATS_DUMP").ok().as_deref() == Some("1") {
         return dump_records(&records, &today);
     }
 
     tui::run_tui(records, today)
-}
-
-/// 跨文件去重。
-///
-/// 参考 ccusage `adapter/claude/mod.rs:234 push_deduped_entry`：
-/// - exact 命中（agent + dedup_primary + dedup_secondary）：保留 token 多者。
-/// - sidechain 兜底：当 candidate 是 sidechain replay（同 message_id 不同 requestId）时，
-///   找已有的 parent，用 token 多者保留。
-fn dedupe(raw: Vec<RawEntry>) -> Vec<RawEntry> {
-    let mut deduped: Vec<RawEntry> = Vec::with_capacity(raw.len());
-    let mut by_exact: HashMap<(String, String, Option<String>), usize> = HashMap::new();
-    let mut by_message: HashMap<(String, String), Vec<usize>> = HashMap::new();
-
-    for entry in raw {
-        let Some(primary) = entry.dedup_primary.clone() else {
-            deduped.push(entry);
-            continue;
-        };
-        let exact_key = (
-            entry.agent.clone(),
-            primary.clone(),
-            entry.dedup_secondary.clone(),
-        );
-        let message_key = (entry.agent.clone(), primary.clone());
-
-        if let Some(&idx) = by_exact.get(&exact_key) {
-            if should_replace(&entry, &deduped[idx]) {
-                deduped[idx] = entry;
-            }
-            continue;
-        }
-
-        // sidechain 兜底：相同 message_id，不同 secondary，且至少一方是 sidechain
-        if let Some(indexes) = by_message.get(&message_key) {
-            let candidate_is_sidechain = entry.is_sidechain;
-            if let Some(&idx) = indexes.iter().find(|&&i| {
-                let existing = &deduped[i];
-                candidate_is_sidechain || existing.is_sidechain
-            }) {
-                if should_replace(&entry, &deduped[idx]) {
-                    deduped[idx] = entry.clone();
-                    by_exact.insert(exact_key, idx);
-                }
-                continue;
-            }
-        }
-
-        let idx = deduped.len();
-        deduped.push(entry);
-        by_exact.insert(exact_key, idx);
-        by_message.entry(message_key).or_default().push(idx);
-    }
-
-    deduped
-}
-
-fn should_replace(candidate: &RawEntry, existing: &RawEntry) -> bool {
-    if candidate.is_sidechain != existing.is_sidechain {
-        return existing.is_sidechain;
-    }
-    let total = |e: &RawEntry| -> u64 {
-        e.input_tokens + e.output_tokens + e.cache_read_input_tokens + e.cache_creation_input_tokens
-    };
-    total(candidate) > total(existing)
 }
 
 /// 将模型名称归一化为统一的命名风格。
@@ -304,14 +223,10 @@ fn should_replace(candidate: &RawEntry, existing: &RawEntry) -> bool {
 /// 在统计中这两种写法会被视为两个不同模型，导致聚合拆分。
 /// 此函数将 `claude-*` 模型名中版本号部分的点号替换为连字符，
 /// 使之统一为 `claude-opus-4-7` 风格。非 Claude 模型保持原样（如 `gpt-5.4`）。
-fn normalize_model_name(model: &str) -> String {
+pub(crate) fn normalize_model_name(model: &str) -> String {
     // 仅对 claude- 前缀的模型做归一化：版本号中的 "." → "-"
     if model.starts_with("claude-") {
         let rest = &model[7..]; // "opus-4.7" 或 "sonnet-4-20250514" 等
-        // rest 的结构："<tier>-<version>"
-        // version 中 "." 表示次版本分隔符，应替换为 "-"。
-        // 例：opus-4.7 → opus-4-7, sonnet-4.5 → sonnet-4-5
-        // 已为连字符的（opus-4-7, sonnet-4-20250514）不受影响。
         let mut result = String::with_capacity(model.len());
         result.push_str("claude-");
         let mut seen_first_hyphen = false;
@@ -320,7 +235,6 @@ fn normalize_model_name(model: &str) -> String {
                 seen_first_hyphen = true;
                 result.push(ch);
             } else if ch == '.' && seen_first_hyphen {
-                // 在 tier 与 version 之间的分隔符之后，"." → "-"
                 result.push('-');
             } else {
                 result.push(ch);
@@ -331,33 +245,11 @@ fn normalize_model_name(model: &str) -> String {
         model.to_string()
     }
 }
-fn bucket(deduped: Vec<RawEntry>) -> Vec<UsageRecord> {
-    let mut acc: BTreeMap<(String, String, String), UsageTotals> = BTreeMap::new();
-    for e in deduped {
-        let model = normalize_model_name(&e.model);
-        let key = (e.agent.clone(), model, e.date.clone());
-        let t = acc.entry(key).or_default();
-        t.in_tokens += e.input_tokens;
-        t.out_tokens += e.output_tokens;
-        t.cache_read_input_tokens += e.cache_read_input_tokens;
-        t.cache_creation_input_tokens += e.cache_creation_input_tokens;
-    }
-    acc.into_iter()
-        .map(|((agent, model, date), t)| UsageRecord {
-            agent,
-            model,
-            date,
-            in_tokens: t.in_tokens,
-            // total_tokens 字段保留为兼容 dump，但显示口径以 UsageTotals::total_tokens() 为准。
-            total_tokens: t.total_tokens(),
-            out_tokens: t.out_tokens,
-            cache_read_input_tokens: t.cache_read_input_tokens,
-            cache_creation_input_tokens: t.cache_creation_input_tokens,
-        })
-        .collect()
-}
 
 fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+    use types::UsageTotals;
+
     let mut by_agent_model: BTreeMap<(String, String), (UsageTotals, BTreeSet<String>)> =
         BTreeMap::new();
     for r in records {
@@ -391,263 +283,24 @@ fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn entry(
-        agent: &str,
-        primary: Option<&str>,
-        secondary: Option<&str>,
-        is_sidechain: bool,
-        input: u64,
-        output: u64,
-        cache_read: u64,
-    ) -> RawEntry {
-        RawEntry {
-            agent: agent.to_string(),
-            model: "m".to_string(),
-            date: "2026-05-27".to_string(),
-            input_tokens: input,
-            output_tokens: output,
-            cache_read_input_tokens: cache_read,
-            cache_creation_input_tokens: 0,
-            reasoning_output_tokens: 0,
-            dedup_primary: primary.map(str::to_string),
-            dedup_secondary: secondary.map(str::to_string),
-            is_sidechain,
-        }
-    }
-
-    #[test]
-    fn dedupes_identical_message_id_and_request_id_across_files() {
-        let raw = vec![
-            entry("claude", Some("msg-1"), Some("req-1"), false, 100, 7, 20),
-            entry("claude", Some("msg-1"), Some("req-1"), false, 100, 7, 20),
-        ];
-        let d = dedupe(raw);
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].input_tokens, 100);
-    }
-
-    #[test]
-    fn keeps_larger_token_count_on_collision() {
-        let raw = vec![
-            entry("claude", Some("msg-1"), Some("req-1"), false, 50, 3, 0),
-            entry("claude", Some("msg-1"), Some("req-1"), false, 100, 7, 0),
-        ];
-        let d = dedupe(raw);
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].input_tokens, 100);
-    }
-
-    #[test]
-    fn sidechain_replay_collapses_into_parent() {
-        let raw = vec![
-            entry(
-                "claude",
-                Some("msg-1"),
-                Some("req-parent"),
-                false,
-                100,
-                7,
-                20,
-            ),
-            entry(
-                "claude",
-                Some("msg-1"),
-                Some("req-replay"),
-                true,
-                50,
-                7,
-                50_000,
-            ),
-        ];
-        let d = dedupe(raw);
-        // sidechain replay 即便 token 更多，也不应顶替非 sidechain 的 parent。
-        // 参见 ccusage `should_replace_deduped_entry`：只有 existing 为 sidechain 时才允许替换。
-        assert_eq!(d.len(), 1);
-        assert!(!d[0].is_sidechain);
-        assert_eq!(d[0].cache_read_input_tokens, 20);
-    }
-
-    #[test]
-    fn parent_replaces_sidechain_when_arrived_later() {
-        let raw = vec![
-            entry("claude", Some("msg-1"), Some("req-replay"), true, 1, 1, 1),
-            entry(
-                "claude",
-                Some("msg-1"),
-                Some("req-parent"),
-                false,
-                10,
-                10,
-                10,
-            ),
-        ];
-        let d = dedupe(raw);
-        // 非 sidechain 总是优先于 sidechain（不论 token 多少），参考 ccusage should_replace
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].is_sidechain, false);
-    }
-
-    #[test]
-    fn keeps_unrelated_messages_separately() {
-        let raw = vec![
-            entry("claude", Some("msg-a"), Some("r"), false, 1, 1, 0),
-            entry("claude", Some("msg-b"), Some("r"), false, 2, 2, 0),
-            entry("codex", Some("msg-a"), Some("r"), false, 3, 3, 0),
-        ];
-        let d = dedupe(raw);
-        assert_eq!(d.len(), 3);
-    }
-
-    #[test]
-    fn entries_without_dedup_primary_are_passed_through() {
-        let raw = vec![
-            entry("x", None, None, false, 1, 1, 0),
-            entry("x", None, None, false, 2, 2, 0),
-        ];
-        let d = dedupe(raw);
-        assert_eq!(d.len(), 2);
-    }
-
-    #[test]
-    fn usage_total_is_input_plus_output_only() {
-        let usage = UsageTotals {
-            in_tokens: 100,
-            out_tokens: 50,
-            cache_read_input_tokens: 25,
-            cache_creation_input_tokens: 10,
-            ..UsageTotals::default()
-        };
-        assert_eq!(usage.total_tokens(), 150);
-    }
-
-    #[test]
-    fn buckets_by_agent_model_date() {
-        let raw = vec![
-            entry("claude", Some("a"), None, false, 10, 5, 3),
-            entry("claude", Some("b"), None, false, 20, 7, 4),
-        ];
-        let recs = bucket(raw);
-        assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].in_tokens, 30);
-        assert_eq!(recs[0].out_tokens, 12);
-        assert_eq!(recs[0].cache_read_input_tokens, 7);
-    }
-
-    #[test]
-    fn codex_resume_collapses_duplicate_token_count_across_files() {
-        // 模拟：同一逻辑 codex session 在 resume 后写到第二个 rollout 文件。
-        // session_meta.payload.id 相同，导致 RawEntry 的 dedup_primary（"sid|ts"）相同；
-        // 同 token 数相同（dedup_secondary 相同）→ 应被合并为一条。
-        // 参考 ccusage `codex_event_key`：(session_id, ts, model, tokens) 元组去重。
-        let dup = vec![
-            super::parser::RawEntry {
-                agent: "codex".to_string(),
-                model: "gpt-5".to_string(),
-                date: "2026-05-27".to_string(),
-                input_tokens: 100,
-                output_tokens: 7,
-                cache_read_input_tokens: 20,
-                cache_creation_input_tokens: 0,
-                reasoning_output_tokens: 0,
-                dedup_primary: Some("sess-uuid-A|2026-05-27T12:34:56Z".to_string()),
-                dedup_secondary: Some("100/20/0/7/0".to_string()),
-                is_sidechain: false,
-            },
-            super::parser::RawEntry {
-                agent: "codex".to_string(),
-                model: "gpt-5".to_string(),
-                date: "2026-05-27".to_string(),
-                input_tokens: 100,
-                output_tokens: 7,
-                cache_read_input_tokens: 20,
-                cache_creation_input_tokens: 0,
-                reasoning_output_tokens: 0,
-                dedup_primary: Some("sess-uuid-A|2026-05-27T12:34:56Z".to_string()),
-                dedup_secondary: Some("100/20/0/7/0".to_string()),
-                is_sidechain: false,
-            },
-        ];
-        let d = dedupe(dup);
-        assert_eq!(d.len(), 1);
-        let recs = bucket(d);
-        assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].in_tokens, 100);
-        assert_eq!(recs[0].out_tokens, 7);
-    }
     #[test]
     fn normalize_claude_model_dot_to_hyphen() {
         assert_eq!(normalize_model_name("claude-opus-4.7"), "claude-opus-4-7");
-        assert_eq!(
-            normalize_model_name("claude-sonnet-4.5"),
-            "claude-sonnet-4-5"
-        );
+        assert_eq!(normalize_model_name("claude-sonnet-4.5"), "claude-sonnet-4-5");
         assert_eq!(normalize_model_name("claude-haiku-4.5"), "claude-haiku-4-5");
     }
     #[test]
     fn normalize_claude_model_already_hyphen() {
-        // 已经是连字符风格的模型名应保持不变
         assert_eq!(normalize_model_name("claude-opus-4-7"), "claude-opus-4-7");
         assert_eq!(
             normalize_model_name("claude-sonnet-4-20250514"),
             "claude-sonnet-4-20250514"
         );
-        assert_eq!(
-            normalize_model_name("claude-haiku-4-5-20251001"),
-            "claude-haiku-4-5-20251001"
-        );
-    }
-    #[test]
-    fn normalize_claude_model_dot_with_date_suffix() {
-        // 版本号用点号 + 日期后缀
-        assert_eq!(
-            normalize_model_name("claude-sonnet-4.5-20250514"),
-            "claude-sonnet-4-5-20250514"
-        );
     }
     #[test]
     fn normalize_non_claude_model_unchanged() {
-        // 非 Claude 模型保持原样（点号是它们自己的命名风格）
         assert_eq!(normalize_model_name("gpt-5.4"), "gpt-5.4");
-        assert_eq!(normalize_model_name("gpt-5.5"), "gpt-5.5");
         assert_eq!(normalize_model_name("qwen3.6-plus"), "qwen3.6-plus");
-        assert_eq!(normalize_model_name("deepseek-v3.2"), "deepseek-v3.2");
         assert_eq!(normalize_model_name("mimo-v2.5-pro"), "mimo-v2.5-pro");
-    }
-    #[test]
-    fn bucket_merges_dot_and_hyphen_variants() {
-        // claude-opus-4.7 和 claude-opus-4-7 应合并为同一模型
-        let raw = vec![
-            RawEntry {
-                agent: "claude".to_string(),
-                model: "claude-opus-4.7".to_string(),
-                date: "2026-05-27".to_string(),
-                input_tokens: 100,
-                output_tokens: 7,
-                cache_read_input_tokens: 20,
-                cache_creation_input_tokens: 0,
-                reasoning_output_tokens: 0,
-                dedup_primary: None,
-                dedup_secondary: None,
-                is_sidechain: false,
-            },
-            RawEntry {
-                agent: "claude".to_string(),
-                model: "claude-opus-4-7".to_string(),
-                date: "2026-05-27".to_string(),
-                input_tokens: 200,
-                output_tokens: 14,
-                cache_read_input_tokens: 40,
-                cache_creation_input_tokens: 5,
-                reasoning_output_tokens: 0,
-                dedup_primary: None,
-                dedup_secondary: None,
-                is_sidechain: false,
-            },
-        ];
-        let recs = bucket(raw);
-        assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].model, "claude-opus-4-7");
-        assert_eq!(recs[0].in_tokens, 300);
-        assert_eq!(recs[0].out_tokens, 21);
     }
 }

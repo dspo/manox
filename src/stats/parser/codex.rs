@@ -127,6 +127,8 @@ pub(super) fn parse(
                     usage.reasoning_output_tokens,
                 )),
                 is_sidechain: false,
+                session_id: Some(sid.clone()),
+                message_id: None,
             })
         }
 
@@ -249,6 +251,8 @@ pub(super) fn parse(
             dedup_primary,
             dedup_secondary,
             is_sidechain: false,
+            session_id: Some(sid.clone()),
+            message_id: None,
         });
     }
 

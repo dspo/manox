@@ -88,6 +88,8 @@ fn parse_one(v: &Value) -> Option<RawEntry> {
             .get("isSidechain")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        session_id: v.get("sessionId").and_then(Value::as_str).map(str::to_string),
+        message_id: message.get("id").and_then(Value::as_str).map(str::to_string),
     })
 }
 

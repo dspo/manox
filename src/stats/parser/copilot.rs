@@ -100,6 +100,8 @@ pub(super) fn parse(content: &str, agent: &str, _path: &Path) -> Vec<RawEntry> {
                 c.input_tokens, c.cache_read_tokens, c.cache_creation_tokens, c.output_tokens
             )),
             is_sidechain: false,
+            session_id: Some(c.session_id.clone()),
+            message_id: c.response_id.clone(),
         })
         .collect()
 }

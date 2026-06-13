@@ -32,17 +32,23 @@ pub(super) struct RawEntry {
     #[serde(default)]
     pub(super) reasoning_output_tokens: u64,
     /// 用于跨文件去重的稳定主键（同一 agent 内唯一）。
-    /// - claude: None（Claude Code Stats raw-sum，不按 message id 去重）
+    /// - claude/omp/mimo: None（raw-sum 口径，不按 message id 去重）
     /// - codex/zed: `session_id|timestamp_iso`
     /// - copilot: 见 copilot 内部说明
     pub(super) dedup_primary: Option<String>,
     /// 次级主键（与 primary 联合一起去重）。
-    /// - claude: None
+    /// - claude/omp/mimo: None
     /// - codex 系列: 一组 token 数，让重复 snapshot 落到同一 key
     pub(super) dedup_secondary: Option<String>,
     /// 是否为 sidechain 记录（仅 claude 使用）。
     #[serde(default)]
     pub(super) is_sidechain: bool,
+    /// 会话标识（可选，用于明细展示和溯源）。
+    #[serde(default)]
+    pub(super) session_id: Option<String>,
+    /// 消息标识（可选，来自源数据中的自然 ID）。
+    #[serde(default)]
+    pub(super) message_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]

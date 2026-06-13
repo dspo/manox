@@ -80,6 +80,8 @@ fn parse_one(v: &Value) -> Option<RawEntry> {
         dedup_primary: None,
         dedup_secondary: None,
         is_sidechain: false,
+        session_id: None,
+        message_id: v.get("id").and_then(Value::as_str).map(str::to_string),
     })
 }
 

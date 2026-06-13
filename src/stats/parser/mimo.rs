@@ -10,7 +10,13 @@
 //! - `time.created`（unix 毫秒）、`modelID`、`providerID`
 //!
 //! 口径：raw-sum（不按 message id 去重），与 Claude Code Stats 保持一致。
-//! 同一 SQLite 文件不会出现跨文件重复，无需全局去重。
+//!
+//! 导入历史过滤：mimocode 首次启动时会从 `~/.claude/projects/` 自动导入
+//! Claude Code 的历史 session（`claude_import` 表记录了导入映射，
+//! 含 `message_ids` JSON 数组标记每条导入的 message ID）。
+//! 这些导入的 message 属于 Claude Code 产生的用量，不应重复计入 mimo。
+//! 排除粒度为 message（而非 session），保留 mimo 在导入 session 里追加的
+//! 原生 message。
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -27,29 +33,51 @@ pub(super) fn parse(db_path: &Path) -> Result<Vec<RawEntry>> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("打开 Mimo 数据库失败: {}", db_path.display()))?;
 
+    let has_import_table = has_claude_import_table(&conn)?;
+
+    // 有 claude_import 表时，收集所有导入的 message_id 并排除。
+    let imported_ids: std::collections::HashSet<String> = if has_import_table {
+        collect_imported_message_ids(&conn)?
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let mut stmt = conn
         .prepare(
-            "SELECT data FROM message WHERE data LIKE '%\"tokens\"%' AND data LIKE '%\"assistant\"%'",
+            "SELECT id, session_id, data FROM message \
+             WHERE data LIKE '%\"tokens\"%' AND data LIKE '%\"assistant\"%'",
         )
         .context("查询 Mimo message 表失败")?;
 
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
 
     let mut out = Vec::new();
     let mut row_errors = 0u32;
     for row in rows {
-        let data_str = match row {
-            Ok(s) => s,
+        let (msg_id, session_id, data_str) = match row {
+            Ok(t) => t,
             Err(_) => {
                 row_errors += 1;
                 continue;
             }
         };
+
+        // 按 message 排除：导入的 Claude Code message 不计入 mimo
+        if imported_ids.contains(&msg_id) {
+            continue;
+        }
+
         let Ok(v) = serde_json::from_str::<Value>(&data_str) else {
             row_errors += 1;
             continue;
         };
-        if let Some(entry) = parse_one(&v) {
+        if let Some(entry) = parse_one(&v, &session_id) {
             out.push(entry);
         }
     }
@@ -60,7 +88,39 @@ pub(super) fn parse(db_path: &Path) -> Result<Vec<RawEntry>> {
     Ok(out)
 }
 
-fn parse_one(v: &Value) -> Option<RawEntry> {
+fn has_claude_import_table(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='claude_import'")
+        .context("查询 sqlite_master 失败")?;
+    let exists = stmt.query_map([], |row| row.get::<_, String>(0))?.count() > 0;
+    Ok(exists)
+}
+
+/// 收集 claude_import 表中所有导入的 message_id。
+fn collect_imported_message_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn
+        .prepare("SELECT message_ids FROM claude_import")
+        .context("查询 claude_import 失败")?;
+
+    let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+
+    let mut ids = std::collections::HashSet::new();
+    for row in rows {
+        let json_str: Option<String> = match row {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let Some(json) = json_str else {
+            continue;
+        };
+        if let Ok(arr) = serde_json::from_str::<Vec<String>>(&json) {
+            ids.extend(arr);
+        }
+    }
+    Ok(ids)
+}
+
+fn parse_one(v: &Value, session_id: &str) -> Option<RawEntry> {
     if v.get("role").and_then(Value::as_str) != Some("assistant") {
         return None;
     }
@@ -114,6 +174,8 @@ fn parse_one(v: &Value) -> Option<RawEntry> {
         dedup_primary: None,
         dedup_secondary: None,
         is_sidechain: false,
+        session_id: Some(session_id.to_string()),
+        message_id: None, // mimo message.id 是内部生成的，对用户无意义
     })
 }
 
@@ -123,7 +185,7 @@ mod tests {
 
     fn parse_json(data: &str) -> Option<RawEntry> {
         let v: Value = serde_json::from_str(data).ok()?;
-        parse_one(&v)
+        parse_one(&v, "ses_test")
     }
 
     #[test]
@@ -137,6 +199,7 @@ mod tests {
         assert_eq!(entry.cache_read_input_tokens, 70789);
         assert_eq!(entry.cache_creation_input_tokens, 586);
         assert!(entry.dedup_primary.is_none());
+        assert_eq!(entry.session_id.as_deref(), Some("ses_test"));
     }
 
     #[test]
@@ -186,5 +249,47 @@ mod tests {
         let entry = parse_json(data).unwrap();
         assert_eq!(entry.reasoning_output_tokens, 1234);
         assert_eq!(entry.output_tokens, 200);
+    }
+
+    #[test]
+    fn parse_excludes_imported_message_ids() {
+        // 模拟：创建临时 db，插入 claude_import 和 message，验证排除
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_mimo.db");
+        let conn = Connection::open(&db_path).unwrap();
+
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, time_created INTEGER NOT NULL);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE claude_import (source_uuid TEXT PRIMARY KEY, session_id TEXT NOT NULL, source_path TEXT NOT NULL, source_mtime INTEGER NOT NULL, time_imported INTEGER NOT NULL, message_ids TEXT);",
+        ).unwrap();
+
+        // 插入一个导入的 session
+        conn.execute("INSERT INTO session (id, project_id, time_created) VALUES ('ses_imported', 'proj', 1000)", []).unwrap();
+        // 插入导入的 message_ids
+        conn.execute(
+            "INSERT INTO claude_import (source_uuid, session_id, source_path, source_mtime, time_imported, message_ids)
+             VALUES ('uuid1', 'ses_imported', '/path', 1000, 1000, '[\"msg_import1\",\"msg_import2\"]')",
+            [],
+        ).unwrap();
+
+        // 插入导入的 message（应被排除）
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data)
+             VALUES ('msg_import1', 'ses_imported', 1779772684681, '{\"role\":\"assistant\",\"time\":{\"created\":1779772684681},\"modelID\":\"claude-opus-4-7\",\"tokens\":{\"input\":100,\"output\":50}}')",
+            [],
+        ).unwrap();
+        // 插入 mimo 原生的 message（应保留）
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, data)
+             VALUES ('msg_native1', 'ses_imported', 1781188251308, '{\"role\":\"assistant\",\"time\":{\"created\":1781188251308},\"modelID\":\"mimo-auto\",\"tokens\":{\"input\":10,\"output\":5}}')",
+            [],
+        ).unwrap();
+
+        let entries = parse(&db_path).unwrap();
+        // msg_import1 应被排除，只保留 msg_native1
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "mimo-auto");
+        assert_eq!(entries[0].input_tokens, 10);
     }
 }
