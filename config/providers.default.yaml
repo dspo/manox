@@ -82,6 +82,8 @@ providers:
         desc: "通用"
         context: "202.8K"
         wire_apis: [anthropic, completions]
+        env:
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "1000000"
       glm-5:
         swe_pro: "55.1%"
         lcb_pro: "-"

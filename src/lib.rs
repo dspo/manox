@@ -90,15 +90,23 @@ struct EndpointConfig {
     models: Vec<ModelConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ModelConfig {
     id: String,
+    #[serde(default)]
     swe_pro: Option<String>,
+    #[serde(default)]
     lcb_pro: Option<String>,
+    #[serde(default)]
     hle: Option<String>,
+    #[serde(default)]
     desc: Option<String>,
+    #[serde(default)]
     context: Option<String>,
+    #[serde(default)]
     agents: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -117,6 +125,8 @@ struct ProviderModelConfig {
     wire_apis: Vec<String>,
     #[serde(default)]
     agents: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,6 +138,8 @@ struct AgentConfig {
     args: Vec<String>,
     #[serde(default)]
     wire_apis: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +275,7 @@ impl ProviderConfig {
                         desc: model.desc.clone(),
                         context: model.context.clone(),
                         agents: model.agents.clone(),
+                        env: model.env.clone(),
                     })
                     .collect();
 
@@ -301,6 +314,7 @@ struct ResolvedModel {
     endpoint_url: String,
     visible_agents: Vec<String>,
     copilot_auth: CopilotAuth,
+    env: BTreeMap<String, String>,
 }
 
 impl ResolvedModel {
@@ -322,6 +336,7 @@ impl ResolvedModel {
             endpoint_url: endpoint.url.clone(),
             visible_agents: effective_agents_for_model(config, provider, endpoint, model),
             copilot_auth: CopilotAuth::from_endpoint(endpoint),
+            env: model.env.clone(),
         }
     }
 
@@ -603,6 +618,7 @@ struct Selection {
     agent_id: String,
     agent_binary: String,
     agent_args: Vec<String>,
+    agent_env: BTreeMap<String, String>,
     provider: ResolvedProvider,
     model: Option<ResolvedModel>,
 }
@@ -613,6 +629,7 @@ struct ResolvedAgent {
     binary: String,
     args: Vec<String>,
     supported_wire_apis: Vec<WireApi>,
+    env: BTreeMap<String, String>,
 }
 
 impl ResolvedAgent {
@@ -642,6 +659,7 @@ fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
             binary,
             args: agent.args.clone(),
             supported_wire_apis,
+            env: agent.env.clone(),
         });
     }
     agents
@@ -654,18 +672,21 @@ fn default_agent_configs() -> Vec<AgentConfig> {
             binary: "copilot".into(),
             args: Vec::new(),
             wire_apis: vec!["anthropic".into(), "responses".into(), "completions".into()],
+            env: BTreeMap::new(),
         },
         AgentConfig {
             id: "claude".into(),
             binary: "claude".into(),
             args: Vec::new(),
             wire_apis: vec!["anthropic".into()],
+            env: BTreeMap::new(),
         },
         AgentConfig {
             id: "codex".into(),
             binary: "codex".into(),
             args: Vec::new(),
             wire_apis: vec!["responses".into()],
+            env: BTreeMap::new(),
         },
     ]
 }
@@ -1908,6 +1929,14 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         }
     }
 
+    // Agent 级别环境变量
+    env.extend(selection.agent_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+    // Model 级别环境变量（覆盖 agent 同名变量）
+    if let Some(ref model) = selection.model {
+        env.extend(model.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+
     let summary = match &selection.model {
         Some(model) => format!(
             "启动 {} | Provider: {} | Model: {}",
@@ -2710,6 +2739,7 @@ fn collect_model_draft(
             context: empty_string_as_none(&context),
             wire_apis: vec![wire_api.display().to_string()],
             agents: model_agents,
+            env: BTreeMap::new(),
         },
     )))
 }
@@ -3548,6 +3578,7 @@ impl AppState {
                         agent_id: agent.id.clone(),
                         agent_binary: agent.binary.clone(),
                         agent_args: agent.args.clone(),
+                        agent_env: agent.env.clone(),
                         provider,
                         model: None,
                     })
@@ -3566,6 +3597,7 @@ impl AppState {
                     agent_id: agent.id.clone(),
                     agent_binary: agent.binary.clone(),
                     agent_args: agent.args.clone(),
+                    agent_env: agent.env.clone(),
                     provider,
                     model: Some(selected_variant),
                 })
@@ -3763,18 +3795,21 @@ mod tests {
                     binary: "copilot".into(),
                     args: vec![],
                     wire_apis: vec![],
+                    env: BTreeMap::new(),
                 },
                 AgentConfig {
                     id: "claude".into(),
                     binary: "claude".into(),
                     args: vec![],
                     wire_apis: vec![],
+                    env: BTreeMap::new(),
                 },
                 AgentConfig {
                     id: "codex".into(),
                     binary: "codex".into(),
                     args: vec![],
                     wire_apis: vec![],
+                    env: BTreeMap::new(),
                 },
             ],
         }
@@ -3807,6 +3842,7 @@ mod tests {
             endpoint_url: endpoint_url.into(),
             visible_agents: vec!["codex".into(), "claude".into()],
             copilot_auth: CopilotAuth::ApiKey,
+            env: BTreeMap::new(),
         }
     }
 
@@ -3825,6 +3861,7 @@ mod tests {
                         context: None,
                         wire_apis: vec![],
                         agents: Vec::new(),
+                        env: BTreeMap::new(),
                     },
                 )]),
                 endpoints: BTreeMap::from([
@@ -3953,6 +3990,7 @@ mod tests {
             agent_id: "codex".into(),
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
             provider: ResolvedProvider {
                 name: "Codex Default".into(),
                 has_endpoints: false,
@@ -3973,6 +4011,7 @@ mod tests {
             agent_id: "claude".into(),
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
             provider: ResolvedProvider {
                 name: "Test".into(),
                 has_endpoints: false,
@@ -4004,6 +4043,7 @@ mod tests {
             agent_id: "claude".into(),
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
             provider: ResolvedProvider {
                 name: "DashScope".into(),
                 has_endpoints: true,
@@ -4021,6 +4061,7 @@ mod tests {
                 endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
                 visible_agents: vec!["claude".into()],
                 copilot_auth: CopilotAuth::ApiKey,
+                env: BTreeMap::new(),
             }),
         };
         let spec = build_launch_spec(&selection, &["mcp".into(), "list".into()]).unwrap();
@@ -4059,6 +4100,7 @@ mod tests {
             agent_id: "copilot".into(),
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
             provider: ResolvedProvider {
                 name: "Packy API".into(),
                 has_endpoints: true,
@@ -4076,6 +4118,7 @@ mod tests {
                 endpoint_url: "https://www.packyapi.com/".into(),
                 visible_agents: vec!["copilot".into()],
                 copilot_auth: CopilotAuth::BearerToken,
+                env: BTreeMap::new(),
             }),
         };
 
@@ -4110,6 +4153,7 @@ mod tests {
             agent_id: "codex".into(),
             agent_binary: "codex".into(),
             agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
             provider: ResolvedProvider {
                 name: "Default".into(),
                 has_endpoints: false,
@@ -4119,6 +4163,115 @@ mod tests {
         };
 
         assert!(apply_selected_model_tab_name(&selection).is_ok());
+    }
+
+    // ── env injection tests ──
+
+    #[test]
+    fn agent_env_is_injected_into_launch_spec() {
+        let fake_binary = create_fake_binary("claude");
+        let mut agent_env = BTreeMap::new();
+        agent_env.insert("MY_AGENT_VAR".into(), "from-agent".into());
+
+        let selection = Selection {
+            agent_id: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
+            agent_env,
+            provider: ResolvedProvider {
+                name: "Test".into(),
+                has_endpoints: false,
+                apikey_source: Some("literal:test-key".into()),
+            },
+            model: None,
+        };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert_eq!(spec.env.get("MY_AGENT_VAR"), Some(&"from-agent".into()));
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
+    fn model_env_is_injected_into_launch_spec() {
+        let fake_binary = create_fake_binary("claude");
+        let mut model_env = BTreeMap::new();
+        model_env.insert("CLAUDE_CODE_AUTO_COMPACT_WINDOW".into(), "1000000".into());
+
+        let selection = Selection {
+            agent_id: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
+            provider: ResolvedProvider {
+                name: "DashScope".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+            },
+            model: Some(ResolvedModel {
+                id: "glm-5.1".into(),
+                swe_pro: "—".into(),
+                lcb_pro: "—".into(),
+                hle: "—".into(),
+                desc: String::new(),
+                context: "—".into(),
+                wire_api: WireApi::Anthropic,
+                provider_name: "DashScope".into(),
+                endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
+                visible_agents: vec!["claude".into()],
+                copilot_auth: CopilotAuth::ApiKey,
+                env: model_env,
+            }),
+        };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert_eq!(
+            spec.env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
+            Some(&"1000000".into())
+        );
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
+    fn model_env_overrides_agent_env_on_collision() {
+        let fake_binary = create_fake_binary("claude");
+        let mut agent_env = BTreeMap::new();
+        agent_env.insert("SHARED_VAR".into(), "from-agent".into());
+        agent_env.insert("AGENT_ONLY_VAR".into(), "agent-value".into());
+
+        let mut model_env = BTreeMap::new();
+        model_env.insert("SHARED_VAR".into(), "from-model".into());
+        model_env.insert("MODEL_ONLY_VAR".into(), "model-value".into());
+
+        let selection = Selection {
+            agent_id: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
+            agent_env,
+            provider: ResolvedProvider {
+                name: "DashScope".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+            },
+            model: Some(ResolvedModel {
+                id: "glm-5.1".into(),
+                swe_pro: "—".into(),
+                lcb_pro: "—".into(),
+                hle: "—".into(),
+                desc: String::new(),
+                context: "—".into(),
+                wire_api: WireApi::Anthropic,
+                provider_name: "DashScope".into(),
+                endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
+                visible_agents: vec!["claude".into()],
+                copilot_auth: CopilotAuth::ApiKey,
+                env: model_env,
+            }),
+        };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        // Model env overrides agent env for the shared key
+        assert_eq!(spec.env.get("SHARED_VAR"), Some(&"from-model".into()));
+        // Both unique keys are present
+        assert_eq!(spec.env.get("AGENT_ONLY_VAR"), Some(&"agent-value".into()));
+        assert_eq!(spec.env.get("MODEL_ONLY_VAR"), Some(&"model-value".into()));
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
     // ── Merge tests ──
@@ -4213,12 +4366,14 @@ mod tests {
             binary: "claude-old".into(),
             args: vec![],
             wire_apis: vec![],
+            env: BTreeMap::new(),
         }];
         let incoming = vec![AgentConfig {
             id: "claude".into(),
             binary: "claude-new".into(),
             args: vec![],
             wire_apis: vec![],
+            env: BTreeMap::new(),
         }];
         let merged = merge_agents(&existing, &incoming);
         assert_eq!(merged.len(), 1);
@@ -4232,12 +4387,14 @@ mod tests {
             binary: "copilot".into(),
             args: vec![],
             wire_apis: vec![],
+            env: BTreeMap::new(),
         }];
         let incoming = vec![AgentConfig {
             id: "codex".into(),
             binary: "codex".into(),
             args: vec![],
             wire_apis: vec![],
+            env: BTreeMap::new(),
         }];
         let merged = merge_agents(&existing, &incoming);
         assert_eq!(merged.len(), 2);
@@ -4251,18 +4408,21 @@ mod tests {
                 binary: "copilot".into(),
                 args: vec![],
                 wire_apis: vec![],
+                env: BTreeMap::new(),
             },
             AgentConfig {
                 id: "claude".into(),
                 binary: "claude-old".into(),
                 args: vec![],
                 wire_apis: vec![],
+                env: BTreeMap::new(),
             },
             AgentConfig {
                 id: "codex".into(),
                 binary: "codex".into(),
                 args: vec![],
                 wire_apis: vec![],
+                env: BTreeMap::new(),
             },
         ];
         let incoming = vec![
@@ -4271,12 +4431,14 @@ mod tests {
                 binary: "claude-new".into(),
                 args: vec![],
                 wire_apis: vec![],
+                env: BTreeMap::new(),
             },
             AgentConfig {
                 id: "gemini".into(),
                 binary: "gemini".into(),
                 args: vec![],
                 wire_apis: vec![],
+                env: BTreeMap::new(),
             },
         ];
 
@@ -4352,6 +4514,7 @@ mod tests {
                     context: None,
                     wire_apis: vec!["responses".into()],
                     agents: vec!["codex".into()],
+                    env: BTreeMap::new(),
                 },
             },
         )
@@ -4395,6 +4558,7 @@ mod tests {
                         context: None,
                         wire_apis: vec!["anthropic".into()],
                         agents: Vec::new(),
+                        env: BTreeMap::new(),
                     },
                 )]),
                 endpoints: BTreeMap::from([(
@@ -4660,12 +4824,14 @@ trust_level = "trusted"
                     binary: "codex".into(),
                     args: vec![],
                     wire_apis: vec![],
+                    env: BTreeMap::new(),
                 },
                 AgentConfig {
                     id: "codex-app".into(),
                     binary: "codex-app".into(),
                     args: vec![],
                     wire_apis: vec![],
+                    env: BTreeMap::new(),
                 },
             ],
         };

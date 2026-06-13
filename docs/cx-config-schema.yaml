@@ -29,11 +29,15 @@ providers:
         desc: "string (optional)"
         wire_apis: ["enum: anthropic | responses | completions"]
         agents: ["string (optional override filter)"]
+        env:
+          VAR_NAME: "string (optional; 启动时注入的环境变量，仅用于配置值，不要存放密钥——密钥请用 apikey_source 或专用 env 文件)"
 
 agents:
   - id: "string (required, unique)"
     bin: "string (required; binary is accepted as alias)"
     wire_apis: ["enum: anthropic | responses | completions"]
+    env:
+      VAR_NAME: "string (optional; 启动时注入的环境变量，仅用于配置值，不要存放密钥——密钥请用 apikey_source 或专用 env 文件)"
 
 # 运行时语义
 #
