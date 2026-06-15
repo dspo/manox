@@ -13,7 +13,6 @@ use rand::RngCore;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -30,6 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 mod stats;
+mod probe;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
@@ -503,7 +503,7 @@ fn effective_agents_for_model(
     resolved
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WireApi {
     Responses,
     Completions,
@@ -540,10 +540,6 @@ impl WireApi {
         }
     }
 
-    fn cache_value(self) -> &'static str {
-        self.display()
-    }
-
     fn priority(self) -> u8 {
         match self {
             Self::Anthropic => 0,
@@ -566,7 +562,7 @@ impl WireApi {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CopilotAuth {
+pub(crate) enum CopilotAuth {
     ApiKey,
     BearerToken,
 }
@@ -584,7 +580,7 @@ fn probe_cache_key(
 }
 
 impl CopilotAuth {
-    fn from_endpoint(endpoint: &EndpointConfig) -> Self {
+    pub(crate) fn from_endpoint(endpoint: &EndpointConfig) -> Self {
         match endpoint.copilot_auth.as_deref() {
             Some("bearer_token") => Self::BearerToken,
             _ => Self::ApiKey,
@@ -1200,8 +1196,12 @@ enum CxCommand {
     Add,
     /// 探测模型的 completions / responses 支持情况
     Probe {
-        /// 模型 ID（可选，不指定则探测全部）
-        model_id: Option<String>,
+        /// 筛选要显示的 providers（逗号分隔）
+        #[arg(long, value_name = "PROVIDERS")]
+        provider: Option<String>,
+        /// 自动探测并退出（不启动 TUI）
+        #[arg(long)]
+        auto_probe: bool,
     },
     /// 从 URL 或本地文件读取 Provider 配置并合并到本地
     Patch {
@@ -1224,7 +1224,8 @@ enum DispatchCommand {
     Help,
     Add,
     Probe {
-        model_id: Option<String>,
+        provider: Option<String>,
+        auto_probe: bool,
     },
     Patch {
         source: Option<String>,
@@ -1251,7 +1252,7 @@ fn dispatch_command(raw_args: &[String]) -> DispatchCommand {
                 url,
                 refresh,
             },
-            Some(CxCommand::Probe { model_id }) => DispatchCommand::Probe { model_id },
+            Some(CxCommand::Probe { provider, auto_probe }) => DispatchCommand::Probe { provider, auto_probe },
             Some(CxCommand::Stats) => DispatchCommand::Stats,
             None => DispatchCommand::Launch { args: Vec::new() },
         },
@@ -1281,9 +1282,9 @@ pub fn run() -> Result<()> {
             url,
             refresh,
         } => run_patch(source, url, refresh),
-        DispatchCommand::Probe { model_id } => {
+        DispatchCommand::Probe { provider, auto_probe } => {
             let config = load_config()?;
-            run_probe(model_id, &config)
+            run_probe(provider, auto_probe, &config)
         }
         DispatchCommand::Stats => stats::run_stats(),
         DispatchCommand::Launch { args } => {
@@ -1414,6 +1415,11 @@ fn patch_input_from_source(source: &str) -> PatchInput {
 }
 
 fn run_patch(source: Option<String>, url: Option<String>, refresh: bool) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("初始化 tokio runtime 失败")?;
+    runtime.block_on(async_run_patch(source, url, refresh))
+}
+
+async fn async_run_patch(source: Option<String>, url: Option<String>, refresh: bool) -> Result<()> {
     let input = if refresh {
         PatchInput::Remote(load_patch_source()?)
     } else if let Some(source) = url.or(source) {
@@ -1426,7 +1432,7 @@ fn run_patch(source: Option<String>, url: Option<String>, refresh: bool) -> Resu
         PatchInput::Remote(url) => {
             println!("从 {} 下载 Provider 配置...", url);
 
-            let client = reqwest::blocking::Client::builder()
+            let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .context("初始化 HTTP 客户端失败")?;
@@ -1434,6 +1440,7 @@ fn run_patch(source: Option<String>, url: Option<String>, refresh: bool) -> Resu
             let response = client
                 .get(url)
                 .send()
+                .await
                 .with_context(|| format!("下载配置失败: {url}"))?;
 
             let status = response.status();
@@ -1441,7 +1448,7 @@ fn run_patch(source: Option<String>, url: Option<String>, refresh: bool) -> Resu
                 bail!("下载配置失败: HTTP {}", status.as_u16());
             }
 
-            response.text().context("读取响应失败")?
+            response.text().await.context("读取响应失败")?
         }
         PatchInput::Local(path) => {
             println!("从 {} 读取 Provider 配置...", path.display());
@@ -2048,241 +2055,12 @@ fn load_probe_cache() -> Result<ProbeCache> {
     Ok(cache)
 }
 
-fn save_probe_cache(cache: &ProbeCache) -> Result<()> {
-    let path = probe_cache_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建 probe 缓存目录失败: {}", parent.display()))?;
+fn run_probe(provider: Option<String>, auto_probe: bool, config: &CxConfig) -> Result<()> {
+    if auto_probe {
+        probe::run_probe_auto(config, provider)
+    } else {
+        probe::run_probe_tui(config, provider)
     }
-    fs::write(&path, serde_json::to_vec_pretty(cache)?)
-        .with_context(|| format!("写入 probe 缓存失败: {}", path.display()))?;
-    println!("\n缓存已保存到 {}", path.display());
-    Ok(())
-}
-
-fn run_probe(target_model: Option<String>, config: &CxConfig) -> Result<()> {
-    // Find the first OpenAI-compatible endpoint that can be probed with completions/responses.
-    let (probe_provider, probe_endpoint) = config
-        .providers
-        .iter()
-        .find_map(|provider| {
-            provider.apikey_source.as_ref()?;
-            provider
-                .normalized_endpoints()
-                .into_iter()
-                .find(|endpoint| {
-                    matches!(
-                        WireApi::from_str(&endpoint.wire_api),
-                        WireApi::Responses | WireApi::Completions
-                    )
-                })
-                .map(|endpoint| (provider, endpoint))
-        })
-        .context(
-            "没有可探测的 Provider（需要至少一个带 API Key 的 responses/completions endpoint）",
-        )?;
-
-    let apikey = resolve_apikey_interactive(probe_provider.apikey_source.as_ref().unwrap())?;
-    let probe_base_url = &probe_endpoint.url;
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("初始化 HTTP 客户端失败")?;
-
-    let mut deduped_models = BTreeMap::new();
-    for model in build_all_models(config).into_iter().filter(|model| {
-        model.provider_name == probe_provider.name
-            && model.endpoint_url == *probe_base_url
-            && model.wire_api != WireApi::Anthropic
-    }) {
-        deduped_models.entry(model.id.clone()).or_insert(model);
-    }
-    let mut all_models = deduped_models.into_values().collect::<Vec<_>>();
-    if let Some(ref target) = target_model {
-        all_models.retain(|model| model.id == *target);
-        if all_models.is_empty() {
-            let available_ids = build_all_models(config)
-                .into_iter()
-                .filter(|model| {
-                    model.provider_name == probe_provider.name
-                        && model.endpoint_url == *probe_base_url
-                        && model.wire_api != WireApi::Anthropic
-                })
-                .map(|m| m.id.clone())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!("未知模型 `{target}`，可用模型：{available_ids}");
-        }
-    }
-
-    println!("开始探测 {} 个模型...\n", all_models.len());
-
-    let mut cache = ProbeCache {
-        timestamp: chrono_like_timestamp(),
-        models: BTreeMap::new(),
-    };
-
-    for model in &mut all_models {
-        println!("探测 {}...", model.id);
-        let result = probe_model(&client, &apikey, &model.id, probe_base_url)?;
-
-        let completions_status = if result.completions.ok {
-            "✅ completions"
-        } else {
-            "❌ completions"
-        };
-        let responses_status = if result.responses.ok {
-            "✅ responses"
-        } else {
-            "❌ responses"
-        };
-        println!("  {} | {}", completions_status, responses_status);
-
-        if let (false, Some(error)) = (result.completions.ok, &result.completions.error) {
-            println!("  completions: {error}");
-        }
-        if let (false, Some(error)) = (result.responses.ok, &result.responses.error) {
-            println!("  responses: {error}");
-        }
-
-        model.wire_api = if result.responses.ok {
-            WireApi::Responses
-        } else if result.completions.ok {
-            WireApi::Completions
-        } else {
-            WireApi::Unavailable
-        };
-
-        cache.models.insert(
-            model.probe_cache_key(),
-            model.wire_api.cache_value().to_string(),
-        );
-        println!();
-    }
-
-    save_probe_cache(&cache)?;
-    Ok(())
-}
-
-fn chrono_like_timestamp() -> String {
-    let now = std::time::SystemTime::now();
-    match now.duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => format!("{}", duration.as_secs()),
-        Err(_) => "0".to_string(),
-    }
-}
-
-#[derive(Debug)]
-struct ProbeResult {
-    completions: EndpointResult,
-    responses: EndpointResult,
-}
-
-#[derive(Debug)]
-struct EndpointResult {
-    ok: bool,
-    error: Option<String>,
-}
-
-fn probe_model(
-    client: &reqwest::blocking::Client,
-    api_key: &str,
-    model_id: &str,
-    base_url: &str,
-) -> Result<ProbeResult> {
-    let completions = probe_endpoint(
-        client,
-        api_key,
-        base_url,
-        "chat/completions",
-        json!({
-            "model": model_id,
-            "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 5,
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "test",
-                    "description": "test",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"x": {"type": "string"}},
-                        "required": ["x"]
-                    }
-                }
-            }]
-        }),
-    )?;
-
-    let responses = probe_endpoint(
-        client,
-        api_key,
-        base_url,
-        "responses",
-        json!({
-            "model": model_id,
-            "input": [{"role": "user", "content": "Hi"}],
-            "max_output_tokens": 5,
-        }),
-    )?;
-
-    Ok(ProbeResult {
-        completions,
-        responses,
-    })
-}
-
-fn probe_endpoint(
-    client: &reqwest::blocking::Client,
-    api_key: &str,
-    base_url: &str,
-    path: &str,
-    body: serde_json::Value,
-) -> Result<EndpointResult> {
-    let url = format!("{base_url}/{path}");
-    let response = client
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .context("调用探测 API 失败")?;
-
-    let status = response.status();
-    let text = response.text().context("读取探测 API 响应失败")?;
-    let json: Option<serde_json::Value> = serde_json::from_str(&text).ok();
-
-    if status.is_success() {
-        if let Some(error) = json.as_ref().and_then(|json| json.get("error")) {
-            let message = error
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            return Ok(EndpointResult {
-                ok: false,
-                error: Some(message),
-            });
-        }
-        return Ok(EndpointResult {
-            ok: true,
-            error: None,
-        });
-    }
-
-    let error = json
-        .and_then(|json| {
-            json.get("error")
-                .and_then(|value| value.get("message"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
-
-    Ok(EndpointResult {
-        ok: false,
-        error: Some(error),
-    })
 }
 
 // ══════════════════════════════════════════════════
@@ -3906,15 +3684,22 @@ mod tests {
 
     #[test]
     fn clap_parse_probe_no_model() {
-        assert_eq!(parse(&["probe"]), Some(CxCommand::Probe { model_id: None }));
+        assert_eq!(
+            parse(&["probe"]),
+            Some(CxCommand::Probe {
+                provider: None,
+                auto_probe: false,
+            })
+        );
     }
 
     #[test]
-    fn clap_parse_probe_with_model() {
+    fn clap_parse_probe_with_provider() {
         assert_eq!(
-            parse(&["probe", "qwen3.6-plus"]),
+            parse(&["probe", "--provider", "百炼"]),
             Some(CxCommand::Probe {
-                model_id: Some("qwen3.6-plus".into())
+                provider: Some("百炼".into()),
+                auto_probe: false,
             })
         );
     }
