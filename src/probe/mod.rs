@@ -230,6 +230,32 @@ pub fn do_probe(
     // 解析 model_id，处理 [1m] 等后缀
     let resolved_model_id = resolve_api_model_id(model_id);
 
+    // 根据 wire_api 确定完整 URL（兼容基础 URL 和完整 URL）
+    let url = match wire_api {
+        WireApi::Anthropic => {
+            if endpoint_url.ends_with("/v1/messages") {
+                endpoint_url.to_string()
+            } else {
+                format!("{}/v1/messages", endpoint_url.trim_end_matches('/'))
+            }
+        }
+        WireApi::Completions => {
+            if endpoint_url.ends_with("/chat/completions") {
+                endpoint_url.to_string()
+            } else {
+                format!("{}/chat/completions", endpoint_url.trim_end_matches('/'))
+            }
+        }
+        WireApi::Responses => {
+            if endpoint_url.ends_with("/responses") {
+                endpoint_url.to_string()
+            } else {
+                format!("{}/responses", endpoint_url.trim_end_matches('/'))
+            }
+        }
+        WireApi::Unavailable => endpoint_url.to_string(),
+    };
+
     match wire_api {
         WireApi::Anthropic | WireApi::Completions | WireApi::Responses => {
             let body = match wire_api {
@@ -250,7 +276,7 @@ pub fn do_probe(
                 }),
                 _ => unreachable!(),
             };
-            probe_endpoint(endpoint_url, &api_key, auth, body)
+            probe_endpoint(&url, &api_key, auth, body)
         }
         WireApi::Unavailable => {
             Ok(ProbeCellResult {
