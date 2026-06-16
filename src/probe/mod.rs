@@ -276,7 +276,7 @@ pub fn do_probe(
                 }),
                 _ => unreachable!(),
             };
-            probe_endpoint(&url, &api_key, auth, body)
+            probe_endpoint(&url, &api_key, wire_api, auth, body)
         }
         WireApi::Unavailable => {
             Ok(ProbeCellResult {
@@ -293,6 +293,7 @@ pub fn do_probe(
 fn probe_endpoint(
     url: &str,
     api_key: &str,
+    wire_api: WireApi,
     auth: CopilotAuth,
     body: serde_json::Value,
 ) -> Result<ProbeCellResult> {
@@ -304,9 +305,23 @@ fn probe_endpoint(
             .header("Content-Type", "application/json")
             .json(&body);
 
-        request = match auth {
-            CopilotAuth::ApiKey => request.header("x-api-key", api_key),
-            CopilotAuth::BearerToken => request.bearer_auth(api_key),
+        // 认证头由协议决定：
+        // - OpenAI 协议（responses/completions）统一使用 Authorization: Bearer
+        // - Anthropic 协议默认使用 x-api-key，并补充 anthropic-version 头；
+        //   若端点显式配置 copilot_auth: bearer_token，则改用 Bearer
+        request = match wire_api {
+            WireApi::Responses | WireApi::Completions => request.bearer_auth(api_key),
+            WireApi::Anthropic => {
+                let request = request.header("anthropic-version", "2023-06-01");
+                match auth {
+                    CopilotAuth::BearerToken => request.bearer_auth(api_key),
+                    CopilotAuth::ApiKey => request.header("x-api-key", api_key),
+                }
+            }
+            WireApi::Unavailable => match auth {
+                CopilotAuth::BearerToken => request.bearer_auth(api_key),
+                CopilotAuth::ApiKey => request.header("x-api-key", api_key),
+            },
         };
 
         let response = request
