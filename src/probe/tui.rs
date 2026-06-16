@@ -1,4 +1,5 @@
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -202,16 +203,36 @@ fn start_probing(
         }
     }
 
+    // 限制并发探测数量
+    const MAX_CONCURRENT: usize = 10;
+    let active_count = Arc::new((Mutex::new(0usize), Condvar::new()));
+
     for (row_idx, wire_api, provider, url, model_id, auth) in probe_items {
         let tx = tx.clone();
+        let active_count = active_count.clone();
 
         std::thread::spawn(move || {
+            // 等待有空位（限制并发）
+            let (count, cv) = &*active_count;
+            let mut count = count.lock().unwrap();
+            while *count >= MAX_CONCURRENT {
+                count = cv.wait(count).unwrap();
+            }
+            *count += 1;
+            drop(count);
+
             let result = super::do_probe(&provider, &url, wire_api, &model_id, auth);
             let _ = tx.send(ProbeResultItem {
                 row_idx,
                 wire_api,
                 result,
             });
+
+            // 释放并发槽位
+            let (count, cv) = &*active_count;
+            let mut count = count.lock().unwrap();
+            *count -= 1;
+            cv.notify_one();
         });
     }
 

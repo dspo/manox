@@ -44,7 +44,7 @@ pub fn load_probe_results(conn: &Connection) -> Result<HashMap<String, ProbeCell
         };
 
         let key = format!(
-            "{}\t{}\t{}",
+            "{}\0{}\0{}",
             row.get::<_, String>(0)?,
             wire_api_str,
             row.get::<_, String>(1)?
@@ -69,6 +69,45 @@ pub fn load_probe_results(conn: &Connection) -> Result<HashMap<String, ProbeCell
     }
 
     Ok(results)
+}
+
+/// 获取指定 provider+model 的最佳可用 wire_api
+/// 返回状态为 Available 的 wire_api 中优先级最高的一个
+pub fn get_available_wire_api(
+    conn: &Connection,
+    provider_name: &str,
+    model_id: &str,
+) -> Result<Option<WireApi>> {
+    let mut stmt = conn.prepare(
+        "SELECT wire_api FROM probe_results
+         WHERE provider_name = ?1 AND model_id = ?2 AND status = 'available'",
+    )?;
+
+    let rows = stmt.query_map([provider_name, model_id], |row| {
+        let wire_api_str: String = row.get(0)?;
+        Ok(wire_api_str)
+    })?;
+
+    let mut best_api: Option<WireApi> = None;
+    let mut best_priority = u8::MAX;
+
+    for row in rows {
+        let wire_api_str = row?;
+        let wire_api = match wire_api_str.as_str() {
+            "anthropic" => WireApi::Anthropic,
+            "responses" => WireApi::Responses,
+            "completions" => WireApi::Completions,
+            _ => continue,
+        };
+
+        let priority = wire_api.priority();
+        if priority < best_priority {
+            best_priority = priority;
+            best_api = Some(wire_api);
+        }
+    }
+
+    Ok(best_api)
 }
 
 pub fn save_probe_result(

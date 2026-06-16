@@ -346,15 +346,6 @@ impl ResolvedModel {
             .iter()
             .any(|a| canonical_agent_id(a) == agent_id)
     }
-
-    fn probe_cache_key(&self) -> String {
-        probe_cache_key(
-            &self.provider_name,
-            &self.endpoint_url,
-            self.wire_api,
-            &self.id,
-        )
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -521,16 +512,6 @@ impl WireApi {
         }
     }
 
-    fn from_cache(value: &str) -> Option<Self> {
-        match value {
-            "responses" => Some(Self::Responses),
-            "completions" => Some(Self::Completions),
-            "anthropic" => Some(Self::Anthropic),
-            "unavailable" => Some(Self::Unavailable),
-            _ => None,
-        }
-    }
-
     fn display(self) -> &'static str {
         match self {
             Self::Responses => "responses",
@@ -565,18 +546,6 @@ impl WireApi {
 pub(crate) enum CopilotAuth {
     ApiKey,
     BearerToken,
-}
-
-fn probe_cache_key(
-    provider_name: &str,
-    endpoint_url: &str,
-    wire_api: WireApi,
-    model_id: &str,
-) -> String {
-    format!(
-        "{provider_name}\t{}\t{endpoint_url}\t{model_id}",
-        wire_api.display()
-    )
 }
 
 impl CopilotAuth {
@@ -1113,14 +1082,27 @@ fn provider_supports_agent(config: &CxConfig, provider: &ProviderConfig, agent_i
 }
 
 fn apply_probe_cache(models: &mut [ResolvedModel]) {
-    if let Ok(cache) = load_probe_cache() {
-        for model in models.iter_mut() {
-            if let Some(wire_api) = cache
-                .models
-                .get(&model.probe_cache_key())
-                .and_then(|value| WireApi::from_cache(value))
-            {
+    let db_path = match cx_state_dir().map(|d| d.join("cx.db")) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let conn = match rusqlite::Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    for model in models.iter_mut() {
+        match probe::db::get_available_wire_api(&conn, &model.provider_name, &model.id) {
+            Ok(Some(wire_api)) => {
                 model.wire_api = wire_api;
+            }
+            Ok(None) => {
+                // 没有可用的 wire_api，标记为 Unavailable
+                model.wire_api = WireApi::Unavailable;
+            }
+            Err(_) => {
+                // 查询失败，保持原有 wire_api
             }
         }
     }
@@ -1415,8 +1397,7 @@ fn patch_input_from_source(source: &str) -> PatchInput {
 }
 
 fn run_patch(source: Option<String>, url: Option<String>, refresh: bool) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new().context("初始化 tokio runtime 失败")?;
-    runtime.block_on(async_run_patch(source, url, refresh))
+    probe::runtime().block_on(async_run_patch(source, url, refresh))
 }
 
 async fn async_run_patch(source: Option<String>, url: Option<String>, refresh: bool) -> Result<()> {
@@ -2029,30 +2010,6 @@ fn keychain_secret(service: &str) -> Result<String> {
     }
 
     Ok(secret)
-}
-
-// ══════════════════════════════════════════════════
-// Probe
-// ══════════════════════════════════════════════════
-
-#[derive(Debug, Deserialize, Serialize, Default)]
-struct ProbeCache {
-    timestamp: String,
-    models: BTreeMap<String, String>,
-}
-
-fn probe_cache_path() -> Result<PathBuf> {
-    let home = home_dir().context("无法解析用户主目录")?;
-    Ok(home.join(".config/cx/probe_cache.json"))
-}
-
-fn load_probe_cache() -> Result<ProbeCache> {
-    let path = probe_cache_path()?;
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("读取 probe 缓存失败: {}", path.display()))?;
-    let cache = serde_json::from_str::<ProbeCache>(&content)
-        .with_context(|| format!("解析 probe 缓存失败: {}", path.display()))?;
-    Ok(cache)
 }
 
 fn run_probe(provider: Option<String>, auto_probe: bool, config: &CxConfig) -> Result<()> {

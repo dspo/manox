@@ -102,11 +102,11 @@ fn draw_table(f: &mut ratatui::Frame, area: Rect, app: &ProbeApp) {
         .collect();
 
     let widths = [
-        Constraint::Length(20),
-        Constraint::Length(30),
-        Constraint::Length(20),
-        Constraint::Length(20),
-        Constraint::Length(20),
+        Constraint::Min(12),  // Provider
+        Constraint::Min(20),  // Model
+        Constraint::Min(15),  // Anthropic Message
+        Constraint::Min(15),  // OpenAI Responses
+        Constraint::Min(15),  // OpenAI Completions
     ];
 
     let table = Table::new(rows, widths)
@@ -201,4 +201,167 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, _app: &ProbeApp) {
         .style(Style::default().fg(Color::DarkGray));
 
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::types::{ProbeCellResult, ProbeStatus};
+
+    #[test]
+    fn test_check_all_failed() {
+        // 全部失败
+        let row = ProbeRow {
+            provider_name: "test".to_string(),
+            model_id: "model".to_string(),
+            results: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(WireApi::Anthropic, ProbeCellResult {
+                    status: ProbeStatus::ServerError,
+                    latency_ms: None,
+                    http_status: Some(500),
+                    error_message: None,
+                    configured: true,
+                });
+                map.insert(WireApi::Responses, ProbeCellResult {
+                    status: ProbeStatus::ClientError,
+                    latency_ms: None,
+                    http_status: Some(401),
+                    error_message: None,
+                    configured: true,
+                });
+                map
+            },
+        };
+        assert!(check_all_failed(&row));
+
+        // 部分可用
+        let row = ProbeRow {
+            provider_name: "test".to_string(),
+            model_id: "model".to_string(),
+            results: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(WireApi::Anthropic, ProbeCellResult {
+                    status: ProbeStatus::Available,
+                    latency_ms: Some(100),
+                    http_status: Some(200),
+                    error_message: None,
+                    configured: true,
+                });
+                map.insert(WireApi::Responses, ProbeCellResult {
+                    status: ProbeStatus::ClientError,
+                    latency_ms: None,
+                    http_status: Some(401),
+                    error_message: None,
+                    configured: true,
+                });
+                map
+            },
+        };
+        assert!(!check_all_failed(&row));
+
+        // 全部未知（不算失败）
+        let row = ProbeRow {
+            provider_name: "test".to_string(),
+            model_id: "model".to_string(),
+            results: {
+                let mut map = std::collections::HashMap::new();
+                map.insert(WireApi::Anthropic, ProbeCellResult {
+                    status: ProbeStatus::Unknown,
+                    latency_ms: None,
+                    http_status: None,
+                    error_message: None,
+                    configured: true,
+                });
+                map
+            },
+        };
+        assert!(!check_all_failed(&row));
+    }
+
+    #[test]
+    fn test_format_cell_available() {
+        let result = ProbeCellResult {
+            status: ProbeStatus::Available,
+            latency_ms: Some(150),
+            http_status: Some(200),
+            error_message: None,
+            configured: true,
+        };
+        let (text, _) = format_cell(Some(&result), 0);
+        assert_eq!(text, "150ms");
+    }
+
+    #[test]
+    fn test_format_cell_not_applicable() {
+        let result = ProbeCellResult {
+            status: ProbeStatus::NotApplicable,
+            latency_ms: None,
+            http_status: None,
+            error_message: None,
+            configured: true,
+        };
+        let (text, _) = format_cell(Some(&result), 0);
+        assert_eq!(text, "-");
+    }
+
+    #[test]
+    fn test_format_cell_server_error() {
+        let result = ProbeCellResult {
+            status: ProbeStatus::ServerError,
+            latency_ms: None,
+            http_status: Some(500),
+            error_message: Some("internal error".to_string()),
+            configured: true,
+        };
+        let (text, _) = format_cell(Some(&result), 0);
+        assert!(text.contains("🔴"));
+        assert!(text.contains("500"));
+    }
+
+    #[test]
+    fn test_format_cell_client_error() {
+        let result = ProbeCellResult {
+            status: ProbeStatus::ClientError,
+            latency_ms: None,
+            http_status: Some(401),
+            error_message: Some("unauthorized".to_string()),
+            configured: true,
+        };
+        let (text, _) = format_cell(Some(&result), 0);
+        assert!(text.contains("🟡"));
+        assert!(text.contains("401"));
+    }
+
+    #[test]
+    fn test_format_cell_probing() {
+        let result = ProbeCellResult {
+            status: ProbeStatus::Probing,
+            latency_ms: None,
+            http_status: None,
+            error_message: None,
+            configured: true,
+        };
+        let (text, _) = format_cell(Some(&result), 0);
+        assert!(!text.is_empty());
+    }
+
+    #[test]
+    fn test_format_cell_unknown() {
+        let result = ProbeCellResult {
+            status: ProbeStatus::Unknown,
+            latency_ms: None,
+            http_status: None,
+            error_message: None,
+            configured: true,
+        };
+        let (text, _) = format_cell(Some(&result), 0);
+        assert_eq!(text, "?");
+    }
+
+    #[test]
+    fn test_format_cell_none() {
+        let (text, _) = format_cell(None, 0);
+        assert_eq!(text, "-");
+    }
 }

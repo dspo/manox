@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -17,7 +18,7 @@ pub mod tui;
 pub mod types;
 pub mod view;
 
-fn runtime() -> &'static Runtime {
+pub(crate) fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| Runtime::new().unwrap())
 }
@@ -180,18 +181,18 @@ pub(crate) fn build_probe_rows(
 }
 
 pub(crate) fn probe_result_key(provider_name: &str, model_id: &str, wire_api: WireApi) -> String {
-    format!("{}	{}	{}", provider_name, wire_api.display(), model_id)
+    format!("{}\0{}\0{}", provider_name, wire_api.display(), model_id)
 }
 
 /// 解析 model_id，处理 [1m], [3m] 等后缀
-fn resolve_api_model_id(model_id: &str) -> String {
+fn resolve_api_model_id(model_id: &str) -> Cow<'_, str> {
     use regex::Regex;
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"\[\d+[m]\]$").unwrap());
     if re.is_match(model_id) {
-        re.replace(model_id, "").to_string()
+        Cow::Owned(re.replace(model_id, "").to_string())
     } else {
-        model_id.to_string()
+        Cow::Borrowed(model_id)
     }
 }
 
@@ -230,9 +231,27 @@ pub fn do_probe(
     let resolved_model_id = resolve_api_model_id(model_id);
 
     match wire_api {
-        WireApi::Anthropic => probe_anthropic(&api_key, endpoint_url, &resolved_model_id, auth),
-        WireApi::Completions => probe_completions(&api_key, endpoint_url, &resolved_model_id, auth),
-        WireApi::Responses => probe_responses(&api_key, endpoint_url, &resolved_model_id, auth),
+        WireApi::Anthropic | WireApi::Completions | WireApi::Responses => {
+            let body = match wire_api {
+                WireApi::Anthropic => json!({
+                    "model": resolved_model_id,
+                    "max_tokens": 5,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+                WireApi::Completions => json!({
+                    "model": resolved_model_id,
+                    "max_tokens": 5,
+                    "messages": [{"role": "user", "content": "hi"}]
+                }),
+                WireApi::Responses => json!({
+                    "model": resolved_model_id,
+                    "max_output_tokens": 5,
+                    "input": [{"role": "user", "content": "hi"}]
+                }),
+                _ => unreachable!(),
+            };
+            probe_endpoint(endpoint_url, &api_key, auth, body)
+        }
         WireApi::Unavailable => {
             Ok(ProbeCellResult {
                 status: ProbeStatus::NotApplicable,
@@ -245,26 +264,19 @@ pub fn do_probe(
     }
 }
 
-fn probe_anthropic(
+fn probe_endpoint(
+    url: &str,
     api_key: &str,
-    endpoint_url: &str,
-    model_id: &str,
     auth: CopilotAuth,
+    body: serde_json::Value,
 ) -> Result<ProbeCellResult> {
-    let url = format!("{}/v1/messages", endpoint_url.trim_end_matches('/'));
-
     let start = Instant::now();
 
     runtime().block_on(async {
         let mut request = http_client()
             .post(url)
-            .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
-            .json(&json!({
-                "model": model_id,
-                "max_tokens": 5,
-                "messages": [{"role": "user", "content": "hi"}]
-            }));
+            .json(&body);
 
         request = match auth {
             CopilotAuth::ApiKey => request.header("x-api-key", api_key),
@@ -274,7 +286,7 @@ fn probe_anthropic(
         let response = request
             .send()
             .await
-            .context("调用 Anthropic API 失败")?;
+            .context("调用 API 失败")?;
 
         let status = response.status();
         let latency_ms = start.elapsed().as_millis() as u64;
@@ -300,110 +312,43 @@ fn probe_anthropic(
     })
 }
 
-fn probe_completions(
-    api_key: &str,
-    endpoint_url: &str,
-    model_id: &str,
-    auth: CopilotAuth,
-) -> Result<ProbeCellResult> {
-    let url = format!("{}/chat/completions", endpoint_url.trim_end_matches('/'));
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let start = Instant::now();
+    #[test]
+    fn test_resolve_api_model_id_with_suffix() {
+        assert_eq!(resolve_api_model_id("gpt-4o[1m]"), "gpt-4o");
+        assert_eq!(resolve_api_model_id("claude-3-opus[999m]"), "claude-3-opus");
+        assert_eq!(resolve_api_model_id("model[123m]"), "model");
+    }
 
-    runtime().block_on(async {
-        let mut request = http_client()
-            .post(url)
-            .header("Content-Type", "application/json")
-            .json(&json!({
-                "model": model_id,
-                "max_tokens": 5,
-                "messages": [{"role": "user", "content": "hi"}]
-            }));
+    #[test]
+    fn test_resolve_api_model_id_without_suffix() {
+        assert_eq!(resolve_api_model_id("gpt-4o"), "gpt-4o");
+        assert_eq!(resolve_api_model_id("claude-3-opus"), "claude-3-opus");
+        assert_eq!(resolve_api_model_id("model"), "model");
+    }
 
-        request = match auth {
-            CopilotAuth::ApiKey => request.header("x-api-key", api_key),
-            CopilotAuth::BearerToken => request.bearer_auth(api_key),
-        };
+    #[test]
+    fn test_resolve_api_model_id_edge_cases() {
+        // 空字符串
+        assert_eq!(resolve_api_model_id(""), "");
+        // 只有后缀
+        assert_eq!(resolve_api_model_id("[1m]"), "");
+        // 类似但不匹配的模式
+        assert_eq!(resolve_api_model_id("model[1]"), "model[1]");
+        assert_eq!(resolve_api_model_id("model[1mm]"), "model[1mm]");
+        assert_eq!(resolve_api_model_id("model[m]"), "model[m]");
+    }
 
-        let response = request
-            .send()
-            .await
-            .context("调用 Completions API 失败")?;
+    #[test]
+    fn test_probe_result_key() {
+        use crate::WireApi;
+        let key = probe_result_key("openai", "gpt-4o", WireApi::Completions);
+        assert_eq!(key, "openai\0completions\0gpt-4o");
 
-        let status = response.status();
-        let latency_ms = start.elapsed().as_millis() as u64;
-
-        if !status.is_success() {
-            let error_body = response.text().await.ok();
-            return Ok(ProbeCellResult {
-                status: if status.is_server_error() { ProbeStatus::ServerError } else { ProbeStatus::ClientError },
-                latency_ms: None,
-                http_status: Some(status.as_u16()),
-                error_message: error_body,
-                configured: true,
-            });
-        }
-
-        Ok(ProbeCellResult {
-            status: ProbeStatus::Available,
-            latency_ms: Some(latency_ms),
-            http_status: Some(status.as_u16()),
-            error_message: None,
-            configured: true,
-        })
-    })
-}
-
-fn probe_responses(
-    api_key: &str,
-    endpoint_url: &str,
-    model_id: &str,
-    auth: CopilotAuth,
-) -> Result<ProbeCellResult> {
-    let url = format!("{}/responses", endpoint_url.trim_end_matches('/'));
-
-    let start = Instant::now();
-
-    runtime().block_on(async {
-        let mut request = http_client()
-            .post(url)
-            .header("Content-Type", "application/json")
-            .json(&json!({
-                "model": model_id,
-                "max_output_tokens": 5,
-                "input": [{"role": "user", "content": "hi"}]
-            }));
-
-        request = match auth {
-            CopilotAuth::ApiKey => request.header("x-api-key", api_key),
-            CopilotAuth::BearerToken => request.bearer_auth(api_key),
-        };
-
-        let response = request
-            .send()
-            .await
-            .context("调用 Responses API 失败")?;
-
-        let status = response.status();
-        let latency_ms = start.elapsed().as_millis() as u64;
-
-        if !status.is_success() {
-            let error_body = response.text().await.ok();
-            return Ok(ProbeCellResult {
-                status: if status.is_server_error() { ProbeStatus::ServerError } else { ProbeStatus::ClientError },
-                latency_ms: None,
-                http_status: Some(status.as_u16()),
-                error_message: error_body,
-                configured: true,
-            });
-        }
-
-        Ok(ProbeCellResult {
-            status: ProbeStatus::Available,
-            latency_ms: Some(latency_ms),
-            http_status: Some(status.as_u16()),
-            error_message: None,
-            configured: true,
-        })
-    })
+        let key = probe_result_key("anthropic", "claude-3", WireApi::Anthropic);
+        assert_eq!(key, "anthropic\0anthropic\0claude-3");
+    }
 }
