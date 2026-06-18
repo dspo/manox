@@ -224,10 +224,15 @@ pub fn run_stats() -> Result<()> {
 /// 此函数将 `claude-*` 模型名中版本号部分的点号替换为连字符，
 /// 使之统一为 `claude-opus-4-7` 风格。非 Claude 模型保持原样（如 `gpt-5.4`）。
 pub(crate) fn normalize_model_name(model: &str) -> String {
+    let base_model = model
+        .rsplit_once('/')
+        .and_then(|(_, suffix)| (!suffix.is_empty()).then_some(suffix))
+        .unwrap_or(model);
+
     // 仅对 claude- 前缀的模型做归一化：版本号中的 "." → "-"
-    if model.starts_with("claude-") {
-        let rest = &model[7..]; // "opus-4.7" 或 "sonnet-4-20250514" 等
-        let mut result = String::with_capacity(model.len());
+    if base_model.starts_with("claude-") {
+        let rest = &base_model[7..]; // "opus-4.7" 或 "sonnet-4-20250514" 等
+        let mut result = String::with_capacity(base_model.len());
         result.push_str("claude-");
         let mut seen_first_hyphen = false;
         for ch in rest.chars() {
@@ -242,7 +247,7 @@ pub(crate) fn normalize_model_name(model: &str) -> String {
         }
         result
     } else {
-        model.to_string()
+        base_model.to_string()
     }
 }
 
@@ -302,5 +307,14 @@ mod tests {
         assert_eq!(normalize_model_name("gpt-5.4"), "gpt-5.4");
         assert_eq!(normalize_model_name("qwen3.6-plus"), "qwen3.6-plus");
         assert_eq!(normalize_model_name("mimo-v2.5-pro"), "mimo-v2.5-pro");
+    }
+
+    #[test]
+    fn normalize_model_name_strips_provider_prefix() {
+        assert_eq!(normalize_model_name("MiniMax/MiniMax-M2.7"), "MiniMax-M2.7");
+        assert_eq!(
+            normalize_model_name("Anthropic/claude-opus-4.7"),
+            "claude-opus-4-7"
+        );
     }
 }

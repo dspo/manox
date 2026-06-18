@@ -776,4 +776,47 @@ mod tests {
         assert_eq!(records[0].model, "claude-opus-4-7");
         assert_eq!(records[0].in_tokens, 300);
     }
+
+    #[test]
+    fn aggregate_merges_provider_prefixed_model_names() {
+        let (conn, _dir) = temp_db();
+        let entries = vec![
+            RawEntry {
+                agent: "claude".to_string(),
+                model: "MiniMax/MiniMax-M2.7".to_string(),
+                date: "2026-05-27".to_string(),
+                input_tokens: 100,
+                output_tokens: 7,
+                cache_read_input_tokens: 20,
+                cache_creation_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                dedup_primary: None,
+                dedup_secondary: None,
+                is_sidechain: false,
+                session_id: None,
+                message_id: None,
+            },
+            RawEntry {
+                agent: "claude".to_string(),
+                model: "MiniMax-M2.7".to_string(),
+                date: "2026-05-27".to_string(),
+                input_tokens: 200,
+                output_tokens: 14,
+                cache_read_input_tokens: 40,
+                cache_creation_input_tokens: 5,
+                reasoning_output_tokens: 0,
+                dedup_primary: None,
+                dedup_secondary: None,
+                is_sidechain: false,
+                session_id: None,
+                message_id: None,
+            },
+        ];
+        insert_file_messages(&conn, &entries, "/test/minimax.jsonl").unwrap();
+
+        let records = load_aggregated(&conn).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].model, "MiniMax-M2.7");
+        assert_eq!(records[0].in_tokens, 300);
+    }
 }
