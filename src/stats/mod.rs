@@ -21,10 +21,13 @@ use dirs::home_dir;
 use ratatui::style::Color;
 use std::collections::BTreeSet;
 use std::fs;
+use std::fs::Metadata;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use parser::{SourceKind, parse_file};
+use parser::{SourceKind, parse_file, parse_file_from_offset};
 use types::UsageRecord;
 
 pub(crate) const AGENT_CLAUDE: &str = "claude";
@@ -60,6 +63,12 @@ struct LogSource {
     /// 单文件路径（用于环境变量指定的 copilot 单文件）。
     extra_file: Option<PathBuf>,
     kind: SourceKind,
+}
+
+struct CurrentFileState {
+    mtime_secs: u64,
+    size: u64,
+    file_id: Option<String>,
 }
 
 fn log_sources() -> Vec<LogSource> {
@@ -134,6 +143,30 @@ fn collect_jsonl_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+fn current_file_state(meta: &Metadata) -> CurrentFileState {
+    let mtime_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    CurrentFileState {
+        mtime_secs,
+        size: meta.len(),
+        file_id: current_file_id(meta),
+    }
+}
+
+#[cfg(unix)]
+fn current_file_id(meta: &Metadata) -> Option<String> {
+    Some(format!("{}:{}", meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn current_file_id(_meta: &Metadata) -> Option<String> {
+    None
+}
+
 pub fn run_stats() -> Result<()> {
     let today = date::today_date_string()?;
 
@@ -176,24 +209,61 @@ pub fn run_stats() -> Result<()> {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let size = meta.len();
+            let current = current_file_state(&meta);
+            let cached = db::load_scan_state(&conn, &path_key);
 
-            if db::file_unchanged(&conn, &path_key, mtime, size) {
+            if cached.as_ref().is_some_and(|state| {
+                state.mtime_secs == current.mtime_secs && state.size == current.size
+            }) {
                 // 缓存命中：该文件上次扫描时的数据已在 messages 表中，跳过。
                 continue;
             }
 
-            // 文件变化或首次扫描：删除旧数据，重新解析，增量插入。
-            db::delete_messages_for_source(&conn, &path_key)?;
-            let entries = parse_file(&path, source.kind);
-            db::insert_file_messages(&conn, &entries, &path_key)?;
-            db::mark_file_scanned(&conn, &path_key, mtime, size)?;
+            if source.kind.supports_append_scan() {
+                if let Some(state) = cached.as_ref() {
+                    let can_append = state.file_id == current.file_id
+                        && current.size >= state.size
+                        && current.size >= state.parsed_upto_bytes;
+                    if can_append && current.size > state.parsed_upto_bytes {
+                        let parsed = match parse_file_from_offset(
+                            &path,
+                            source.kind,
+                            state.parsed_upto_bytes,
+                        ) {
+                            Ok(parsed) => parsed,
+                            Err(e) => {
+                                eprintln!("cx: 解析日志失败 ({}): {e:#}", path.display());
+                                continue;
+                            }
+                        };
+                        let new_state = db::ScanState {
+                            mtime_secs: current.mtime_secs,
+                            size: current.size,
+                            parsed_upto_bytes: state
+                                .parsed_upto_bytes
+                                .saturating_add(parsed.consumed_bytes),
+                            file_id: current.file_id.clone(),
+                        };
+                        db::append_file_messages(&conn, &parsed.entries, &path_key, &new_state)?;
+                        continue;
+                    }
+                }
+            }
+
+            let parsed = match parse_file(&path, source.kind) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    eprintln!("cx: 解析日志失败 ({}): {e:#}", path.display());
+                    continue;
+                }
+            };
+            let new_state = db::ScanState {
+                mtime_secs: current.mtime_secs,
+                size: current.size,
+                parsed_upto_bytes: parsed.consumed_bytes,
+                file_id: current.file_id.clone(),
+            };
+            db::replace_file_messages(&conn, &parsed.entries, &path_key, &new_state)?;
         }
     }
 
@@ -286,7 +356,10 @@ mod tests {
     #[test]
     fn normalize_claude_model_dot_to_hyphen() {
         assert_eq!(normalize_model_name("claude-opus-4.7"), "claude-opus-4-7");
-        assert_eq!(normalize_model_name("claude-sonnet-4.5"), "claude-sonnet-4-5");
+        assert_eq!(
+            normalize_model_name("claude-sonnet-4.5"),
+            "claude-sonnet-4-5"
+        );
         assert_eq!(normalize_model_name("claude-haiku-4.5"), "claude-haiku-4-5");
     }
     #[test]
