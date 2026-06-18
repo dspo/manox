@@ -75,7 +75,7 @@ pub(super) struct ParseResult {
 
 impl SourceKind {
     pub(super) fn supports_append_scan(self) -> bool {
-        !matches!(self, SourceKind::MimoSession)
+        matches!(self, SourceKind::Claude | SourceKind::OmpSession)
     }
 }
 
@@ -208,7 +208,7 @@ pub(super) fn codex_like_event_date(v: &Value, payload: &Value) -> Option<String
 
 #[cfg(test)]
 mod tests {
-    use super::consumed_jsonl_bytes;
+    use super::{SourceKind, consumed_jsonl_bytes};
 
     #[test]
     fn consumed_bytes_keeps_complete_tail_without_newline() {
@@ -222,5 +222,14 @@ mod tests {
         let bytes = br#"{"a":1}
 {"b":"#;
         assert_eq!(consumed_jsonl_bytes(bytes), 8);
+    }
+
+    #[test]
+    fn append_scan_is_enabled_only_for_self_contained_jsonl_sources() {
+        assert!(SourceKind::Claude.supports_append_scan());
+        assert!(SourceKind::OmpSession.supports_append_scan());
+        assert!(!SourceKind::CodexLike("codex").supports_append_scan());
+        assert!(!SourceKind::Copilot("copilot").supports_append_scan());
+        assert!(!SourceKind::MimoSession.supports_append_scan());
     }
 }

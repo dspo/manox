@@ -109,17 +109,10 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
         )?;
         set_schema_version(conn, DB_VERSION)?;
     } else if current_version == 2 {
-        if !column_exists(conn, "scanned_files", "parsed_upto_bytes")? {
-            conn.execute(
-                "ALTER TABLE scanned_files ADD COLUMN parsed_upto_bytes INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-        if !column_exists(conn, "scanned_files", "file_id")? {
-            conn.execute("ALTER TABLE scanned_files ADD COLUMN file_id TEXT", [])?;
-        }
+        ensure_scanned_files_columns(conn)?;
         set_schema_version(conn, DB_VERSION)?;
     } else if current_version == 0 {
+        ensure_scanned_files_columns(conn)?;
         set_schema_version(conn, DB_VERSION)?;
     }
 
@@ -144,6 +137,19 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+fn ensure_scanned_files_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "scanned_files", "parsed_upto_bytes")? {
+        conn.execute(
+            "ALTER TABLE scanned_files ADD COLUMN parsed_upto_bytes INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "scanned_files", "file_id")? {
+        conn.execute("ALTER TABLE scanned_files ADD COLUMN file_id TEXT", [])?;
+    }
+    Ok(())
 }
 
 /// 读取某源文件的扫描状态。
@@ -919,6 +925,32 @@ mod tests {
         let records = load_aggregated(&conn).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].in_tokens, 123);
+    }
+
+    #[test]
+    fn migration_without_schema_version_repairs_scanned_files_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scanned_files (
+                path       TEXT PRIMARY KEY,
+                mtime_secs INTEGER NOT NULL,
+                size       INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        mark_file_scanned(&conn, "/tmp/file.jsonl", 1000, 200, 180, Some("dev:inode")).unwrap();
+
+        let state = load_scan_state(&conn, "/tmp/file.jsonl").unwrap();
+        assert_eq!(state.parsed_upto_bytes, 180);
+        assert_eq!(state.file_id.as_deref(), Some("dev:inode"));
     }
 
     #[test]
