@@ -10,8 +10,11 @@ pub(super) mod codex;
 pub(super) mod copilot;
 pub(super) mod mimo;
 pub(super) mod omp_session;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use super::date::{date_field, parse_ymd};
@@ -64,31 +67,100 @@ pub(super) enum SourceKind {
     MimoSession,
 }
 
-pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Vec<RawEntry> {
+pub(super) struct ParseResult {
+    pub(super) entries: Vec<RawEntry>,
+    /// 可以安全跳过的字节位置；若尾部存在不完整 JSON，则停在最后一个完整记录之后。
+    pub(super) consumed_bytes: u64,
+}
+
+impl SourceKind {
+    pub(super) fn supports_append_scan(self) -> bool {
+        matches!(self, SourceKind::Claude | SourceKind::OmpSession)
+    }
+}
+
+pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Result<ParseResult> {
     match kind {
-        SourceKind::MimoSession => match mimo::parse(path) {
-            Ok(entries) => entries,
-            Err(e) => {
-                eprintln!("cx: Mimo 解析失败 ({}): {e:#}", path.display());
-                Vec::new()
-            }
-        },
+        SourceKind::MimoSession => mimo::parse(path)
+            .map(|entries| ParseResult {
+                entries,
+                consumed_bytes: 0,
+            })
+            .with_context(|| format!("Mimo 解析失败 ({})", path.display())),
         _ => {
-            let content = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            match kind {
-                SourceKind::Claude => claude::parse(&content),
-                SourceKind::CodexLike(agent) => {
-                    let fallback_date = fallback_date_from_path(path);
-                    codex::parse(&content, agent, fallback_date.as_deref(), path)
-                }
-                SourceKind::Copilot(agent) => copilot::parse(&content, agent, path),
-                SourceKind::OmpSession => omp_session::parse(&content),
-                SourceKind::MimoSession => unreachable!(),
-            }
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("读取日志失败 ({})", path.display()))?;
+            Ok(parse_jsonl_bytes(path, kind, &bytes))
         }
+    }
+}
+
+pub(super) fn parse_file_from_offset(
+    path: &Path,
+    kind: SourceKind,
+    offset: u64,
+) -> Result<ParseResult> {
+    match kind {
+        SourceKind::MimoSession => parse_file(path, kind),
+        _ => {
+            let mut file =
+                File::open(path).with_context(|| format!("打开日志失败 ({})", path.display()))?;
+            file.seek(SeekFrom::Start(offset))
+                .with_context(|| format!("定位日志失败 ({})", path.display()))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("读取日志尾部失败 ({})", path.display()))?;
+            Ok(parse_jsonl_bytes(path, kind, &bytes))
+        }
+    }
+}
+
+fn parse_jsonl_bytes(path: &Path, kind: SourceKind, bytes: &[u8]) -> ParseResult {
+    let content = String::from_utf8_lossy(bytes);
+    ParseResult {
+        entries: parse_jsonl_content(path, kind, &content),
+        consumed_bytes: consumed_jsonl_bytes(bytes),
+    }
+}
+
+fn parse_jsonl_content(path: &Path, kind: SourceKind, content: &str) -> Vec<RawEntry> {
+    match kind {
+        SourceKind::Claude => claude::parse(content),
+        SourceKind::CodexLike(agent) => {
+            let fallback_date = fallback_date_from_path(path);
+            codex::parse(content, agent, fallback_date.as_deref(), path)
+        }
+        SourceKind::Copilot(agent) => copilot::parse(content, agent, path),
+        SourceKind::OmpSession => omp_session::parse(content),
+        SourceKind::MimoSession => unreachable!(),
+    }
+}
+
+fn consumed_jsonl_bytes(bytes: &[u8]) -> u64 {
+    if bytes.is_empty() {
+        return 0;
+    }
+    if bytes.last() == Some(&b'\n') {
+        return bytes.len() as u64;
+    }
+
+    let last_newline = bytes.iter().rposition(|b| *b == b'\n');
+    let tail_start = last_newline.map_or(0, |idx| idx + 1);
+    let tail = &bytes[tail_start..];
+    if tail.is_empty() {
+        return tail_start as u64;
+    }
+
+    let is_complete_json = std::str::from_utf8(tail)
+        .ok()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.is_empty())
+        .is_some_and(|line| serde_json::from_str::<Value>(line).is_ok());
+
+    if is_complete_json {
+        bytes.len() as u64
+    } else {
+        tail_start as u64
     }
 }
 
@@ -132,4 +204,32 @@ pub(super) fn codex_like_event_date(v: &Value, payload: &Value) -> Option<String
                     .and_then(|last| last.get("timestamp")),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SourceKind, consumed_jsonl_bytes};
+
+    #[test]
+    fn consumed_bytes_keeps_complete_tail_without_newline() {
+        let bytes = br#"{"a":1}
+{"b":2}"#;
+        assert_eq!(consumed_jsonl_bytes(bytes), bytes.len() as u64);
+    }
+
+    #[test]
+    fn consumed_bytes_stops_before_incomplete_tail() {
+        let bytes = br#"{"a":1}
+{"b":"#;
+        assert_eq!(consumed_jsonl_bytes(bytes), 8);
+    }
+
+    #[test]
+    fn append_scan_is_enabled_only_for_self_contained_jsonl_sources() {
+        assert!(SourceKind::Claude.supports_append_scan());
+        assert!(SourceKind::OmpSession.supports_append_scan());
+        assert!(!SourceKind::CodexLike("codex").supports_append_scan());
+        assert!(!SourceKind::Copilot("copilot").supports_append_scan());
+        assert!(!SourceKind::MimoSession.supports_append_scan());
+    }
 }

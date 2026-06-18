@@ -65,7 +65,7 @@ struct Candidate {
 pub(super) fn parse(content: &str, agent: &str, _path: &Path) -> Vec<RawEntry> {
     let records: Vec<Map<String, Value>> = content
         .lines()
-        .filter(|line| line.contains("\"attributes\""))
+        .filter(|line| looks_like_usage_record(line))
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter_map(|v| v.as_object().cloned())
         .collect();
@@ -104,6 +104,19 @@ pub(super) fn parse(content: &str, agent: &str, _path: &Path) -> Vec<RawEntry> {
             message_id: c.response_id.clone(),
         })
         .collect()
+}
+
+fn looks_like_usage_record(line: &str) -> bool {
+    line.contains("\"attributes\"")
+        && !line.contains("\"scopeMetrics\"")
+        && (line.contains("\"gen_ai.operation.name\":\"chat\"")
+            || line.contains("\"gen_ai.operation.name\":\"invoke_agent\"")
+            || line.contains("\"event.name\":\"gen_ai.client.inference.operation.details\"")
+            || line.contains("\"event.name\":\"copilot_chat.agent.turn\"")
+            || line.contains("\"gen_ai.response.id\"")
+            || line.contains("\"traceId\"")
+            || line.contains("GenAI inference:")
+            || line.contains("copilot_chat.agent.turn"))
 }
 
 fn collect_trace_contexts(records: &[Map<String, Value>]) -> HashMap<String, TraceContext> {
@@ -493,5 +506,14 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].output_tokens, 50);
         assert_eq!(r[0].reasoning_output_tokens, 25);
+    }
+
+    #[test]
+    fn skips_metric_flush_records_before_json_parse() {
+        let metrics = r#"{"resource":{"_rawAttributes":[["service.name","copilot-chat"]]},"scopeMetrics":[{"scope":{"name":"copilot-chat"},"metrics":[{"descriptor":{"name":"gen_ai.client.operation.duration"}}]}]}"#;
+        let chat = r#"{"type":"span","traceId":"t1","spanId":"s1","name":"chat gpt-4o","startTime":[1779000000,0],"attributes":{"gen_ai.operation.name":"chat","gen_ai.response.model":"gpt-4o","gen_ai.response.id":"resp-1","gen_ai.usage.input_tokens":10,"gen_ai.usage.output_tokens":2,"gen_ai.conversation.id":"conv-1"}}"#;
+        let r = parse_lines(&format!("{metrics}\n{chat}\n"));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].message_id.as_deref(), Some("resp-1"));
     }
 }

@@ -1,22 +1,28 @@
 //! SQLite 持久化用量缓存（~/.config/cx/cx.db）。
 //!
-//! v2 schema：per-message 明细表替代 v1 的 per-day 聚合表，
+//! v3 schema：per-message 明细表替代 v1 的 per-day 聚合表，
 //! 单一真相来源，聚合用 SQL GROUP BY 实时计算。
 //!
-//! 增量更新：变化的源文件 DELETE + INSERT，未变化的跳过。
+//! 增量更新：append-only 文件按尾部增量解析；全量刷新时走事务化 DELETE + INSERT。
 //! 跨文件去重（codex/copilot）在 insert 时处理。
-//!
-//! cx stats 首次运行或 schema 升级后，会清空缓存强制全量重扫。
 
 use anyhow::{Context, Result};
 use dirs::home_dir;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
 use super::parser::RawEntry;
 use super::types::UsageRecord;
 
-pub(super) const DB_VERSION: u32 = 2;
+pub(super) const DB_VERSION: u32 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ScanState {
+    pub(super) mtime_secs: u64,
+    pub(super) size: u64,
+    pub(super) parsed_upto_bytes: u64,
+    pub(super) file_id: Option<String>,
+}
 
 pub(super) fn db_path() -> Result<PathBuf> {
     let home = home_dir().context("无法解析用户主目录")?;
@@ -28,8 +34,8 @@ pub(super) fn open_db(path: &Path) -> Result<Connection> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("创建数据库目录失败: {}", parent.display()))?;
     }
-    let conn = Connection::open(path)
-        .with_context(|| format!("打开数据库失败: {}", path.display()))?;
+    let conn =
+        Connection::open(path).with_context(|| format!("打开数据库失败: {}", path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
     Ok(conn)
 }
@@ -44,7 +50,9 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS scanned_files (
             path       TEXT PRIMARY KEY,
             mtime_secs INTEGER NOT NULL,
-            size       INTEGER NOT NULL
+            size       INTEGER NOT NULL,
+            parsed_upto_bytes INTEGER NOT NULL DEFAULT 0,
+            file_id    TEXT
         );
 
         CREATE TABLE IF NOT EXISTS messages (
@@ -70,51 +78,109 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_messages_source
             ON messages (source_path);
         CREATE INDEX IF NOT EXISTS idx_messages_dedup
-            ON messages (dedup_primary) WHERE dedup_primary IS NOT NULL;",
+            ON messages (dedup_primary) WHERE dedup_primary IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_messages_agent_dedup
+            ON messages (agent, dedup_primary) WHERE dedup_primary IS NOT NULL;",
     )?;
 
     let current_version: u32 = conn
         .query_row(
             "SELECT value FROM meta WHERE key = 'schema_version'",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
+        .ok()
+        .and_then(|value| value.parse().ok())
         .unwrap_or(0);
 
-    if current_version < DB_VERSION {
-        // v1 → v2 迁移：丢弃旧聚合表和 raw_json 缓存，
-        // 全量重扫将数据插入新的 messages 明细表。
-        conn.execute("DROP TABLE IF EXISTS usage_records", [])?;
-        // 删除旧 scanned_files 中含 raw_json 的记录，重建为无 raw_json 的新表。
-        conn.execute("DROP TABLE IF EXISTS scanned_files", [])?;
-        conn.execute_batch(
-            "CREATE TABLE scanned_files (
-                path       TEXT PRIMARY KEY,
-                mtime_secs INTEGER NOT NULL,
-                size       INTEGER NOT NULL
-            );",
-        )?;
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
-            params![DB_VERSION.to_string()],
-        )?;
+    if current_version == 1 {
+        // v1 was an unreleased aggregate-cache schema. Reset it instead of
+        // mixing per-day aggregates into the final per-message schema.
+        with_transaction(conn, |tx| {
+            tx.execute("DROP TABLE IF EXISTS usage_records", [])?;
+            tx.execute("DROP TABLE IF EXISTS scanned_files", [])?;
+            tx.execute("DELETE FROM messages", [])?;
+            tx.execute_batch(
+                "CREATE TABLE scanned_files (
+                    path       TEXT PRIMARY KEY,
+                    mtime_secs INTEGER NOT NULL,
+                    size       INTEGER NOT NULL,
+                    parsed_upto_bytes INTEGER NOT NULL DEFAULT 0,
+                    file_id    TEXT
+                );",
+            )?;
+            set_schema_version(tx, DB_VERSION)?;
+            Ok(())
+        })?;
+    } else if current_version == 2 {
+        ensure_scanned_files_columns(conn)?;
+        set_schema_version(conn, DB_VERSION)?;
+    } else if current_version == 0 {
+        ensure_scanned_files_columns(conn)?;
+        set_schema_version(conn, DB_VERSION)?;
     }
 
     Ok(())
 }
 
-/// 检查源文件是否已扫描且未变化（mtime + size 匹配）。
-pub(super) fn file_unchanged(conn: &Connection, path: &str, mtime: u64, size: u64) -> bool {
+fn set_schema_version(conn: &Connection, version: u32) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
+        params![version.to_string()],
+    )?;
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_scanned_files_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "scanned_files", "parsed_upto_bytes")? {
+        conn.execute(
+            "ALTER TABLE scanned_files ADD COLUMN parsed_upto_bytes INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE scanned_files SET parsed_upto_bytes = size WHERE parsed_upto_bytes = 0",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "scanned_files", "file_id")? {
+        conn.execute("ALTER TABLE scanned_files ADD COLUMN file_id TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// 读取某源文件的扫描状态。
+pub(super) fn load_scan_state(conn: &Connection, path: &str) -> Option<ScanState> {
     conn.query_row(
-        "SELECT mtime_secs, size FROM scanned_files WHERE path = ?1",
+        "SELECT mtime_secs, size, parsed_upto_bytes, file_id
+         FROM scanned_files WHERE path = ?1",
         params![path],
         |row| {
-            let cached_mtime: u64 = row.get(0)?;
-            let cached_size: u64 = row.get(1)?;
-            Ok(cached_mtime == mtime && cached_size == size)
+            Ok(ScanState {
+                mtime_secs: row.get(0)?,
+                size: row.get(1)?,
+                parsed_upto_bytes: row.get(2)?,
+                file_id: row.get(3)?,
+            })
         },
     )
-    .unwrap_or(false)
+    .ok()
+}
+
+/// 检查源文件是否已扫描且未变化（mtime + size 匹配）。
+pub(super) fn file_unchanged(conn: &Connection, path: &str, mtime: u64, size: u64) -> bool {
+    load_scan_state(conn, path).is_some_and(|state| state.mtime_secs == mtime && state.size == size)
 }
 
 /// 删除某源文件的所有旧 message，为重新解析做准备。
@@ -231,19 +297,79 @@ pub(super) fn insert_file_messages(
     Ok(inserted)
 }
 
+fn with_transaction<T, F>(conn: &Connection, f: F) -> Result<T>
+where
+    F: FnOnce(&Connection) -> Result<T>,
+{
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match f(conn) {
+        Ok(value) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
 /// 记录源文件扫描状态（mtime + size）。
 pub(super) fn mark_file_scanned(
     conn: &Connection,
     path: &str,
     mtime: u64,
     size: u64,
+    parsed_upto_bytes: u64,
+    file_id: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO scanned_files (path, mtime_secs, size)
-         VALUES (?1, ?2, ?3)",
-        params![path, mtime, size],
+        "INSERT OR REPLACE INTO scanned_files (path, mtime_secs, size, parsed_upto_bytes, file_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![path, mtime, size, parsed_upto_bytes, file_id],
     )?;
     Ok(())
+}
+
+pub(super) fn replace_file_messages(
+    conn: &Connection,
+    entries: &[RawEntry],
+    source_path: &str,
+    state: &ScanState,
+) -> Result<u64> {
+    with_transaction(conn, |tx| {
+        delete_messages_for_source(tx, source_path)?;
+        let inserted = insert_file_messages(tx, entries, source_path)?;
+        mark_file_scanned(
+            tx,
+            source_path,
+            state.mtime_secs,
+            state.size,
+            state.parsed_upto_bytes,
+            state.file_id.as_deref(),
+        )?;
+        Ok(inserted)
+    })
+}
+
+pub(super) fn append_file_messages(
+    conn: &Connection,
+    entries: &[RawEntry],
+    source_path: &str,
+    state: &ScanState,
+) -> Result<u64> {
+    with_transaction(conn, |tx| {
+        let inserted = insert_file_messages(tx, entries, source_path)?;
+        mark_file_scanned(
+            tx,
+            source_path,
+            state.mtime_secs,
+            state.size,
+            state.parsed_upto_bytes,
+            state.file_id.as_deref(),
+        )?;
+        Ok(inserted)
+    })
 }
 
 /// 从 messages 表按 (agent, model, date) 聚合，返回 UsageRecord 列表。
@@ -321,13 +447,17 @@ pub(super) fn cleanup_stale_entries(
         let is_active = active_source_roots
             .iter()
             .any(|root| path.starts_with(root))
-            || active_extra_files
-                .iter()
-                .any(|extra| path == *extra);
+            || active_extra_files.iter().any(|extra| path == *extra);
         if !is_active {
             // 先删该文件的所有 message，再删 scanned_files 记录
-            conn.execute("DELETE FROM messages WHERE source_path = ?1", params![path_str])?;
-            conn.execute("DELETE FROM scanned_files WHERE path = ?1", params![path_str])?;
+            conn.execute(
+                "DELETE FROM messages WHERE source_path = ?1",
+                params![path_str],
+            )?;
+            conn.execute(
+                "DELETE FROM scanned_files WHERE path = ?1",
+                params![path_str],
+            )?;
         }
     }
     Ok(())
@@ -382,6 +512,22 @@ mod tests {
     }
 
     #[test]
+    fn scan_state_round_trip() {
+        let (conn, _dir) = temp_db();
+        mark_file_scanned(&conn, "/tmp/file.jsonl", 100, 200, 180, Some("dev:inode")).unwrap();
+        let state = load_scan_state(&conn, "/tmp/file.jsonl").unwrap();
+        assert_eq!(
+            state,
+            ScanState {
+                mtime_secs: 100,
+                size: 200,
+                parsed_upto_bytes: 180,
+                file_id: Some("dev:inode".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn insert_and_aggregate_messages() {
         let (conn, _dir) = temp_db();
         let entries = vec![
@@ -405,7 +551,7 @@ mod tests {
         let inserted = insert_file_messages(&conn, &entries, "/test/file.jsonl").unwrap();
         assert_eq!(inserted, 2);
 
-        mark_file_scanned(&conn, "/test/file.jsonl", 1000, 200).unwrap();
+        mark_file_scanned(&conn, "/test/file.jsonl", 1000, 200, 200, None).unwrap();
         assert!(file_unchanged(&conn, "/test/file.jsonl", 1000, 200));
 
         let records = load_aggregated(&conn).unwrap();
@@ -608,7 +754,7 @@ mod tests {
             message_id: None,
         }];
         insert_file_messages(&conn, &updated, "/test/file.jsonl").unwrap();
-        mark_file_scanned(&conn, "/test/file.jsonl", 1001, 200).unwrap();
+        mark_file_scanned(&conn, "/test/file.jsonl", 1001, 200, 200, None).unwrap();
 
         let records = load_aggregated(&conn).unwrap();
         assert_eq!(records.len(), 1);
@@ -635,9 +781,9 @@ mod tests {
             message_id: None,
         }];
         insert_file_messages(&conn, &active_entries, "/active/file.jsonl").unwrap();
-        mark_file_scanned(&conn, "/active/file.jsonl", 1000, 200).unwrap();
+        mark_file_scanned(&conn, "/active/file.jsonl", 1000, 200, 200, None).unwrap();
         insert_file_messages(&conn, &stale_entries, "/removed/file.jsonl").unwrap();
-        mark_file_scanned(&conn, "/removed/file.jsonl", 1000, 200).unwrap();
+        mark_file_scanned(&conn, "/removed/file.jsonl", 1000, 200, 200, None).unwrap();
 
         cleanup_stale_entries(&conn, &[Path::new("/active")], &[]).unwrap();
 
@@ -654,7 +800,7 @@ mod tests {
         let (conn, _dir) = temp_db();
         let entries = vec![sample_entry()];
         insert_file_messages(&conn, &entries, "/extra/copilot.log").unwrap();
-        mark_file_scanned(&conn, "/extra/copilot.log", 1000, 200).unwrap();
+        mark_file_scanned(&conn, "/extra/copilot.log", 1000, 200, 200, None).unwrap();
 
         cleanup_stale_entries(
             &conn,
@@ -667,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v1_to_v2_clears_old_data() {
+    fn migration_v1_to_v3_resets_unreleased_aggregate_cache() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let conn = open_db(&path).unwrap();
@@ -701,10 +847,10 @@ mod tests {
         )
         .unwrap();
 
-        // 运行 v2 init_schema
+        // 运行 v3 init_schema
         init_schema(&conn).unwrap();
 
-        // usage_records 应被 DROP
+        // v1 是未发布的旧聚合缓存；终版 schema 不混入旧聚合数据。
         assert!(conn
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_records'",
@@ -722,7 +868,10 @@ mod tests {
             )
             .is_ok());
 
-        // schema_version 应为 2
+        let records = load_aggregated(&conn).unwrap();
+        assert!(records.is_empty());
+
+        // schema_version 应为 3
         let version_str: String = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'schema_version'",
@@ -732,6 +881,85 @@ mod tests {
             .unwrap();
         let version: u32 = version_str.parse().unwrap();
         assert_eq!(version, DB_VERSION);
+    }
+
+    #[test]
+    fn migration_v2_to_v3_preserves_existing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scanned_files (
+                path       TEXT PRIMARY KEY,
+                mtime_secs INTEGER NOT NULL,
+                size       INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent TEXT NOT NULL,
+                model TEXT NOT NULL,
+                date TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+                session_id TEXT,
+                message_id TEXT,
+                dedup_primary TEXT,
+                dedup_secondary TEXT,
+                is_sidechain INTEGER NOT NULL DEFAULT 0,
+                source_path TEXT NOT NULL
+            );
+            INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '2');
+            INSERT INTO scanned_files (path, mtime_secs, size)
+                VALUES ('/tmp/file.jsonl', 1000, 200);
+            INSERT INTO messages (agent, model, date, input_tokens, source_path)
+                VALUES ('claude', 'opus', '2026-01-01', 123, '/tmp/file.jsonl');",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let state = load_scan_state(&conn, "/tmp/file.jsonl").unwrap();
+        assert_eq!(state.mtime_secs, 1000);
+        assert_eq!(state.size, 200);
+        assert_eq!(state.parsed_upto_bytes, 200);
+        assert!(state.file_id.is_none());
+
+        let records = load_aggregated(&conn).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].in_tokens, 123);
+    }
+
+    #[test]
+    fn migration_without_schema_version_repairs_scanned_files_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS scanned_files (
+                path       TEXT PRIMARY KEY,
+                mtime_secs INTEGER NOT NULL,
+                size       INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        mark_file_scanned(&conn, "/tmp/file.jsonl", 1000, 200, 180, Some("dev:inode")).unwrap();
+
+        let state = load_scan_state(&conn, "/tmp/file.jsonl").unwrap();
+        assert_eq!(state.parsed_upto_bytes, 180);
+        assert_eq!(state.file_id.as_deref(), Some("dev:inode"));
     }
 
     #[test]

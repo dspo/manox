@@ -82,7 +82,10 @@ pub(super) fn parse(db_path: &Path) -> Result<Vec<RawEntry>> {
         }
     }
     if row_errors > 0 {
-        eprintln!("cx: Mimo: {row_errors} rows skipped in {}", db_path.display());
+        eprintln!(
+            "cx: Mimo: {row_errors} rows skipped in {}",
+            db_path.display()
+        );
     }
 
     Ok(out)
