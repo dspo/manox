@@ -206,18 +206,38 @@ fn migrate_legacy_usage_records(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn delete_legacy_usage_overlaps(conn: &Connection, entries: &[RawEntry]) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "DELETE FROM messages
-         WHERE source_path = ?1 AND agent = ?2 AND model = ?3 AND date = ?4",
+fn delete_legacy_usage_overlaps(
+    conn: &Connection,
+    entries: &[RawEntry],
+    source_path: &str,
+) -> Result<()> {
+    if source_path == LEGACY_USAGE_SOURCE {
+        return Ok(());
+    }
+
+    let mut select_stmt = conn.prepare(
+        "SELECT id, model FROM messages
+         WHERE source_path = ?1 AND agent = ?2 AND date = ?3",
     )?;
+    let mut ids_to_delete = Vec::new();
     for entry in entries {
-        stmt.execute(params![
-            LEGACY_USAGE_SOURCE,
-            entry.agent,
-            entry.model,
-            entry.date
-        ])?;
+        let model = super::normalize_model_name(&entry.model);
+        let mut rows = select_stmt.query(params![LEGACY_USAGE_SOURCE, entry.agent, entry.date])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let legacy_model: String = row.get(1)?;
+            if super::normalize_model_name(&legacy_model) == model {
+                ids_to_delete.push(id);
+            }
+        }
+    }
+
+    ids_to_delete.sort_unstable();
+    ids_to_delete.dedup();
+
+    let mut delete_stmt = conn.prepare("DELETE FROM messages WHERE id = ?1")?;
+    for id in ids_to_delete {
+        delete_stmt.execute(params![id])?;
     }
     Ok(())
 }
@@ -350,7 +370,7 @@ pub(super) fn insert_file_messages(
     entries: &[RawEntry],
     source_path: &str,
 ) -> Result<u64> {
-    delete_legacy_usage_overlaps(conn, entries)?;
+    delete_legacy_usage_overlaps(conn, entries, source_path)?;
     let mut inserted: u64 = 0;
     for entry in entries {
         if insert_one(conn, entry, source_path)? {
@@ -981,6 +1001,43 @@ mod tests {
 
         let records = load_aggregated(&conn).unwrap();
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].in_tokens, 100);
+        assert_eq!(records[0].out_tokens, 10);
+    }
+
+    #[test]
+    fn real_messages_replace_normalized_legacy_model_overlap() {
+        let (conn, _dir) = temp_db();
+        let legacy = RawEntry {
+            agent: "claude".to_string(),
+            model: "claude-opus-4.7".to_string(),
+            date: "2026-01-01".to_string(),
+            input_tokens: 999,
+            output_tokens: 1,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            reasoning_output_tokens: 0,
+            dedup_primary: None,
+            dedup_secondary: None,
+            is_sidechain: false,
+            session_id: None,
+            message_id: None,
+        };
+        insert_one(&conn, &legacy, LEGACY_USAGE_SOURCE).unwrap();
+
+        let real = RawEntry {
+            model: "claude-opus-4-7".to_string(),
+            input_tokens: 100,
+            output_tokens: 10,
+            ..legacy
+        };
+        insert_file_messages(&conn, &[real], "/real/file.jsonl").unwrap();
+
+        let records = load_aggregated(&conn).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].agent, "claude");
+        assert_eq!(records[0].model, "claude-opus-4-7");
+        assert_eq!(records[0].date, "2026-01-01");
         assert_eq!(records[0].in_tokens, 100);
         assert_eq!(records[0].out_tokens, 10);
     }
