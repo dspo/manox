@@ -149,6 +149,10 @@ fn ensure_scanned_files_columns(conn: &Connection) -> Result<()> {
             "ALTER TABLE scanned_files ADD COLUMN parsed_upto_bytes INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
+        conn.execute(
+            "UPDATE scanned_files SET parsed_upto_bytes = size WHERE parsed_upto_bytes = 0",
+            [],
+        )?;
     }
     if !column_exists(conn, "scanned_files", "file_id")? {
         conn.execute("ALTER TABLE scanned_files ADD COLUMN file_id TEXT", [])?;
@@ -924,7 +928,7 @@ mod tests {
         let state = load_scan_state(&conn, "/tmp/file.jsonl").unwrap();
         assert_eq!(state.mtime_secs, 1000);
         assert_eq!(state.size, 200);
-        assert_eq!(state.parsed_upto_bytes, 0);
+        assert_eq!(state.parsed_upto_bytes, 200);
         assert!(state.file_id.is_none());
 
         let records = load_aggregated(&conn).unwrap();
