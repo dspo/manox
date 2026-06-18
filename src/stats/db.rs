@@ -8,14 +8,13 @@
 
 use anyhow::{Context, Result};
 use dirs::home_dir;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
 use super::parser::RawEntry;
 use super::types::UsageRecord;
 
 pub(super) const DB_VERSION: u32 = 3;
-const LEGACY_USAGE_SOURCE: &str = "__legacy_usage_records__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ScanState {
@@ -95,21 +94,24 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
         .unwrap_or(0);
 
     if current_version == 1 {
-        // v1 → v3 迁移：先把旧聚合数据迁成 synthetic messages，
-        // 防止已卸载 agent 的历史用量只存在于 cx.db 时被丢弃。
-        migrate_legacy_usage_records(conn)?;
-        conn.execute("DROP TABLE IF EXISTS usage_records", [])?;
-        conn.execute("DROP TABLE IF EXISTS scanned_files", [])?;
-        conn.execute_batch(
-            "CREATE TABLE scanned_files (
-                path       TEXT PRIMARY KEY,
-                mtime_secs INTEGER NOT NULL,
-                size       INTEGER NOT NULL,
-                parsed_upto_bytes INTEGER NOT NULL DEFAULT 0,
-                file_id    TEXT
-            );",
-        )?;
-        set_schema_version(conn, DB_VERSION)?;
+        // v1 was an unreleased aggregate-cache schema. Reset it instead of
+        // mixing per-day aggregates into the final per-message schema.
+        with_transaction(conn, |tx| {
+            tx.execute("DROP TABLE IF EXISTS usage_records", [])?;
+            tx.execute("DROP TABLE IF EXISTS scanned_files", [])?;
+            tx.execute("DELETE FROM messages", [])?;
+            tx.execute_batch(
+                "CREATE TABLE scanned_files (
+                    path       TEXT PRIMARY KEY,
+                    mtime_secs INTEGER NOT NULL,
+                    size       INTEGER NOT NULL,
+                    parsed_upto_bytes INTEGER NOT NULL DEFAULT 0,
+                    file_id    TEXT
+                );",
+            )?;
+            set_schema_version(tx, DB_VERSION)?;
+            Ok(())
+        })?;
     } else if current_version == 2 {
         ensure_scanned_files_columns(conn)?;
         set_schema_version(conn, DB_VERSION)?;
@@ -141,17 +143,6 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(false)
 }
 
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    let exists: i64 = conn.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
-        )",
-        params![table],
-        |row| row.get(0),
-    )?;
-    Ok(exists != 0)
-}
-
 fn ensure_scanned_files_columns(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "scanned_files", "parsed_upto_bytes")? {
         conn.execute(
@@ -161,83 +152,6 @@ fn ensure_scanned_files_columns(conn: &Connection) -> Result<()> {
     }
     if !column_exists(conn, "scanned_files", "file_id")? {
         conn.execute("ALTER TABLE scanned_files ADD COLUMN file_id TEXT", [])?;
-    }
-    Ok(())
-}
-
-fn migrate_legacy_usage_records(conn: &Connection) -> Result<()> {
-    if !table_exists(conn, "usage_records")? {
-        return Ok(());
-    }
-
-    let cache_read_expr = if column_exists(conn, "usage_records", "cache_read_input_tokens")? {
-        "cache_read_input_tokens"
-    } else {
-        "0"
-    };
-    let cache_creation_expr =
-        if column_exists(conn, "usage_records", "cache_creation_input_tokens")? {
-            "cache_creation_input_tokens"
-        } else {
-            "0"
-        };
-
-    let sql = format!(
-        "INSERT INTO messages (
-            agent, model, date,
-            input_tokens, output_tokens,
-            cache_read_input_tokens, cache_creation_input_tokens,
-            reasoning_output_tokens,
-            session_id, message_id,
-            dedup_primary, dedup_secondary, is_sidechain,
-            source_path
-         )
-         SELECT
-            agent, model, date,
-            in_tokens, out_tokens,
-            {cache_read_expr}, {cache_creation_expr},
-            0,
-            NULL, NULL,
-            NULL, NULL, 0,
-            ?1
-         FROM usage_records"
-    );
-    conn.execute(&sql, params![LEGACY_USAGE_SOURCE])?;
-    Ok(())
-}
-
-fn delete_legacy_usage_overlaps(
-    conn: &Connection,
-    entries: &[RawEntry],
-    source_path: &str,
-) -> Result<()> {
-    if source_path == LEGACY_USAGE_SOURCE {
-        return Ok(());
-    }
-
-    let mut select_stmt = conn.prepare(
-        "SELECT id, model FROM messages
-         WHERE source_path = ?1 AND agent = ?2 AND date = ?3",
-    )?;
-    let mut ids_to_delete = Vec::new();
-    for entry in entries {
-        let model = super::normalize_model_name(&entry.model);
-        let mut rows = select_stmt.query(params![LEGACY_USAGE_SOURCE, entry.agent, entry.date])?;
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            let legacy_model: String = row.get(1)?;
-            if super::normalize_model_name(&legacy_model) == model {
-                ids_to_delete.push(id);
-            }
-        }
-    }
-
-    ids_to_delete.sort_unstable();
-    ids_to_delete.dedup();
-
-    let mut delete_stmt = conn.prepare("DELETE FROM messages WHERE id = ?1")?;
-    for id in ids_to_delete {
-        delete_stmt.execute(params![id])?;
     }
     Ok(())
 }
@@ -370,7 +284,6 @@ pub(super) fn insert_file_messages(
     entries: &[RawEntry],
     source_path: &str,
 ) -> Result<u64> {
-    delete_legacy_usage_overlaps(conn, entries, source_path)?;
     let mut inserted: u64 = 0;
     for entry in entries {
         if insert_one(conn, entry, source_path)? {
@@ -896,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v1_to_v3_preserves_legacy_usage_records() {
+    fn migration_v1_to_v3_resets_unreleased_aggregate_cache() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let conn = open_db(&path).unwrap();
@@ -933,32 +846,26 @@ mod tests {
         // 运行 v3 init_schema
         init_schema(&conn).unwrap();
 
-        // usage_records 应被 DROP，但旧聚合数据应迁移到 messages。
-        assert!(
-            conn.query_row(
+        // v1 是未发布的旧聚合缓存；终版 schema 不混入旧聚合数据。
+        assert!(conn
+            .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_records'",
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .is_err()
-        );
+            .is_err());
 
         // messages 表应存在
-        assert!(
-            conn.query_row(
+        assert!(conn
+            .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .is_ok()
-        );
+            .is_ok());
 
         let records = load_aggregated(&conn).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].agent, "claude");
-        assert_eq!(records[0].model, "opus");
-        assert_eq!(records[0].date, "2026-01-01");
-        assert_eq!(records[0].in_tokens, 999);
+        assert!(records.is_empty());
 
         // schema_version 应为 3
         let version_str: String = conn
@@ -970,76 +877,6 @@ mod tests {
             .unwrap();
         let version: u32 = version_str.parse().unwrap();
         assert_eq!(version, DB_VERSION);
-    }
-
-    #[test]
-    fn real_messages_replace_overlapping_legacy_usage_records() {
-        let (conn, _dir) = temp_db();
-        let legacy = RawEntry {
-            agent: "claude".to_string(),
-            model: "opus".to_string(),
-            date: "2026-01-01".to_string(),
-            input_tokens: 999,
-            output_tokens: 1,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            reasoning_output_tokens: 0,
-            dedup_primary: None,
-            dedup_secondary: None,
-            is_sidechain: false,
-            session_id: None,
-            message_id: None,
-        };
-        insert_one(&conn, &legacy, LEGACY_USAGE_SOURCE).unwrap();
-
-        let real = RawEntry {
-            input_tokens: 100,
-            output_tokens: 10,
-            ..legacy
-        };
-        insert_file_messages(&conn, &[real], "/real/file.jsonl").unwrap();
-
-        let records = load_aggregated(&conn).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].in_tokens, 100);
-        assert_eq!(records[0].out_tokens, 10);
-    }
-
-    #[test]
-    fn real_messages_replace_normalized_legacy_model_overlap() {
-        let (conn, _dir) = temp_db();
-        let legacy = RawEntry {
-            agent: "claude".to_string(),
-            model: "claude-opus-4.7".to_string(),
-            date: "2026-01-01".to_string(),
-            input_tokens: 999,
-            output_tokens: 1,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
-            reasoning_output_tokens: 0,
-            dedup_primary: None,
-            dedup_secondary: None,
-            is_sidechain: false,
-            session_id: None,
-            message_id: None,
-        };
-        insert_one(&conn, &legacy, LEGACY_USAGE_SOURCE).unwrap();
-
-        let real = RawEntry {
-            model: "claude-opus-4-7".to_string(),
-            input_tokens: 100,
-            output_tokens: 10,
-            ..legacy
-        };
-        insert_file_messages(&conn, &[real], "/real/file.jsonl").unwrap();
-
-        let records = load_aggregated(&conn).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].agent, "claude");
-        assert_eq!(records[0].model, "claude-opus-4-7");
-        assert_eq!(records[0].date, "2026-01-01");
-        assert_eq!(records[0].in_tokens, 100);
-        assert_eq!(records[0].out_tokens, 10);
     }
 
     #[test]
