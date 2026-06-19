@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use super::types::{ProbeCellResult, ProbeStatus};
 use crate::WireApi;

@@ -8,7 +8,7 @@ use serde_json::json;
 use tokio::runtime::Runtime;
 
 use crate::{
-    build_all_models, cx_state_dir, resolve_apikey, CopilotAuth, CxConfig, ProviderConfig, WireApi,
+    CopilotAuth, CxConfig, ProviderConfig, WireApi, build_all_models, cx_state_dir, resolve_apikey,
 };
 
 use crate::probe::types::{ProbeCellResult, ProbeRow, ProbeStatus};
@@ -56,7 +56,11 @@ pub fn run_probe_auto(config: &CxConfig, provider_filter: Option<String>) -> Res
                     continue;
                 }
 
-                if let Some(provider) = config.providers.iter().find(|p| p.name == row.provider_name) {
+                if let Some(provider) = config
+                    .providers
+                    .iter()
+                    .find(|p| p.name == row.provider_name)
+                {
                     let endpoint = provider
                         .normalized_endpoints()
                         .into_iter()
@@ -65,8 +69,13 @@ pub fn run_probe_auto(config: &CxConfig, provider_filter: Option<String>) -> Res
                     if let Some(endpoint) = endpoint {
                         total += 1;
                         let auth = CopilotAuth::from_endpoint(&endpoint);
-                        let configured = row.results.get(&wire_api).map(|r| r.configured).unwrap_or(true);
-                        let result = do_probe(provider, &endpoint.url, wire_api, &row.model_id, auth);
+                        let configured = row
+                            .results
+                            .get(&wire_api)
+                            .map(|r| r.configured)
+                            .unwrap_or(true);
+                        let result =
+                            do_probe(provider, &endpoint.url, wire_api, &row.model_id, auth);
 
                         match result {
                             Ok(mut result) => {
@@ -80,15 +89,33 @@ pub fn run_probe_auto(config: &CxConfig, provider_filter: Option<String>) -> Res
                                 )?;
                                 if result.status == ProbeStatus::Available {
                                     success += 1;
-                                    println!("✓ {} {} {} - {}ms", row.provider_name, row.model_id, wire_api.display(), result.latency_ms.unwrap_or(0));
+                                    println!(
+                                        "✓ {} {} {} - {}ms",
+                                        row.provider_name,
+                                        row.model_id,
+                                        wire_api.display(),
+                                        result.latency_ms.unwrap_or(0)
+                                    );
                                 } else {
                                     failed += 1;
-                                    println!("✗ {} {} {} - {:?}", row.provider_name, row.model_id, wire_api.display(), result.status);
+                                    println!(
+                                        "✗ {} {} {} - {:?}",
+                                        row.provider_name,
+                                        row.model_id,
+                                        wire_api.display(),
+                                        result.status
+                                    );
                                 }
                             }
                             Err(e) => {
                                 failed += 1;
-                                println!("✗ {} {} {} - 错误: {}", row.provider_name, row.model_id, wire_api.display(), e);
+                                println!(
+                                    "✗ {} {} {} - 错误: {}",
+                                    row.provider_name,
+                                    row.model_id,
+                                    wire_api.display(),
+                                    e
+                                );
                             }
                         }
                     }
@@ -97,7 +124,10 @@ pub fn run_probe_auto(config: &CxConfig, provider_filter: Option<String>) -> Res
         }
     }
 
-    println!("\n探测完成: 总计={}, 成功={}, 失败={}", total, success, failed);
+    println!(
+        "\n探测完成: 总计={}, 成功={}, 失败={}",
+        total, success, failed
+    );
     Ok(())
 }
 
@@ -160,13 +190,16 @@ pub(crate) fn build_probe_rows(
                 results.insert(wire_api, result);
             } else {
                 // 未探测过，但始终显示（不隐藏未配置的）
-                results.insert(wire_api, ProbeCellResult {
-                    status: ProbeStatus::Unknown,
-                    latency_ms: None,
-                    http_status: None,
-                    error_message: None,
-                    configured,
-                });
+                results.insert(
+                    wire_api,
+                    ProbeCellResult {
+                        status: ProbeStatus::Unknown,
+                        latency_ms: None,
+                        http_status: None,
+                        error_message: None,
+                        configured,
+                    },
+                );
             }
         }
 
@@ -278,15 +311,13 @@ pub fn do_probe(
             };
             probe_endpoint(&url, &api_key, wire_api, auth, body)
         }
-        WireApi::Unavailable => {
-            Ok(ProbeCellResult {
-                status: ProbeStatus::NotApplicable,
-                latency_ms: None,
-                http_status: None,
-                error_message: None,
-                configured: true,
-            })
-        }
+        WireApi::Unavailable => Ok(ProbeCellResult {
+            status: ProbeStatus::NotApplicable,
+            latency_ms: None,
+            http_status: None,
+            error_message: None,
+            configured: true,
+        }),
     }
 }
 
@@ -324,10 +355,7 @@ fn probe_endpoint(
             },
         };
 
-        let response = request
-            .send()
-            .await
-            .context("调用 API 失败")?;
+        let response = request.send().await.context("调用 API 失败")?;
 
         let status = response.status();
         let latency_ms = start.elapsed().as_millis() as u64;
@@ -335,7 +363,11 @@ fn probe_endpoint(
         if !status.is_success() {
             let error_body = response.text().await.ok();
             return Ok(ProbeCellResult {
-                status: if status.is_server_error() { ProbeStatus::ServerError } else { ProbeStatus::ClientError },
+                status: if status.is_server_error() {
+                    ProbeStatus::ServerError
+                } else {
+                    ProbeStatus::ClientError
+                },
                 latency_ms: None,
                 http_status: Some(status.as_u16()),
                 error_message: error_body,

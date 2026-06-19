@@ -54,14 +54,17 @@ fn draw_table(f: &mut ratatui::Frame, area: Rect, app: &ProbeApp) {
     let end = (app.scroll_offset + visible_height).min(app.rows.len());
 
     // 按 provider 首次出现顺序编号，用于斑马纹分组（rows 已按 provider 排序，行连续）。
-    let mut provider_group: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut provider_group: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
     let mut next_group = 0usize;
     for row in &app.rows {
-        provider_group.entry(row.provider_name.as_str()).or_insert_with(|| {
-            let idx = next_group;
-            next_group += 1;
-            idx
-        });
+        provider_group
+            .entry(row.provider_name.as_str())
+            .or_insert_with(|| {
+                let idx = next_group;
+                next_group += 1;
+                idx
+            });
     }
 
     let selected_style = Style::default().add_modifier(Modifier::REVERSED);
@@ -89,7 +92,10 @@ fn draw_table(f: &mut ratatui::Frame, area: Rect, app: &ProbeApp) {
                 format_cell(row.results.get(&WireApi::Completions), app.spinner_tick);
 
             // 该 provider 的斑马纹底色（白/浅灰交替），贯穿整行。
-            let group_idx = provider_group.get(row.provider_name.as_str()).copied().unwrap_or(0);
+            let group_idx = provider_group
+                .get(row.provider_name.as_str())
+                .copied()
+                .unwrap_or(0);
             let tint = zebra_tint(group_idx);
 
             // 浅底上文字统一用黑色前景；全部失败时 model 仍用红色突出。
@@ -119,11 +125,11 @@ fn draw_table(f: &mut ratatui::Frame, area: Rect, app: &ProbeApp) {
         .collect();
 
     let widths = [
-        Constraint::Min(12),  // Provider
-        Constraint::Min(20),  // Model
-        Constraint::Min(15),  // Anthropic Message
-        Constraint::Min(15),  // OpenAI Responses
-        Constraint::Min(15),  // OpenAI Completions
+        Constraint::Min(12), // Provider
+        Constraint::Min(20), // Model
+        Constraint::Min(15), // Anthropic Message
+        Constraint::Min(15), // OpenAI Responses
+        Constraint::Min(15), // OpenAI Completions
     ];
 
     let table = Table::new(rows, widths)
@@ -149,11 +155,17 @@ fn zebra_tint(provider_group_idx: usize) -> Color {
 
 fn check_all_failed(row: &ProbeRow) -> bool {
     row.results.values().all(|result| {
-        matches!(result.status, ProbeStatus::ServerError | ProbeStatus::ClientError)
+        matches!(
+            result.status,
+            ProbeStatus::ServerError | ProbeStatus::ClientError
+        )
     })
 }
 
-fn format_cell(result: Option<&super::types::ProbeCellResult>, spinner_tick: usize) -> (String, Style) {
+fn format_cell(
+    result: Option<&super::types::ProbeCellResult>,
+    spinner_tick: usize,
+) -> (String, Style) {
     match result {
         Some(result) => {
             match result.status {
@@ -166,14 +178,20 @@ fn format_cell(result: Option<&super::types::ProbeCellResult>, spinner_tick: usi
                     // 浅底斑马纹上用深绿字表示可用（不再用绿底，避免盖掉行底色）；
                     // 未配置用稍浅的绿字区分。
                     if result.configured {
-                        (text, Style::default().fg(Color::Rgb(0, 128, 0)).add_modifier(Modifier::BOLD))
+                        (
+                            text,
+                            Style::default()
+                                .fg(Color::Rgb(0, 128, 0))
+                                .add_modifier(Modifier::BOLD),
+                        )
                     } else {
                         (text, Style::default().fg(Color::Rgb(60, 140, 60)))
                     }
                 }
-                ProbeStatus::NotApplicable => {
-                    ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
-                }
+                ProbeStatus::NotApplicable => (
+                    "-".to_string(),
+                    Style::default().fg(Color::Rgb(120, 120, 120)),
+                ),
                 ProbeStatus::ServerError => {
                     let text = if let Some(status) = result.http_status {
                         if let Some(ref msg) = result.error_message {
@@ -188,7 +206,10 @@ fn format_cell(result: Option<&super::types::ProbeCellResult>, spinner_tick: usi
                     if result.configured {
                         (text, Style::default().fg(Color::Rgb(176, 0, 0)))
                     } else {
-                        ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
+                        (
+                            "-".to_string(),
+                            Style::default().fg(Color::Rgb(120, 120, 120)),
+                        )
                     }
                 }
                 ProbeStatus::ClientError => {
@@ -205,30 +226,45 @@ fn format_cell(result: Option<&super::types::ProbeCellResult>, spinner_tick: usi
                     if result.configured {
                         (text, Style::default().fg(Color::Rgb(150, 110, 0)))
                     } else {
-                        ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
+                        (
+                            "-".to_string(),
+                            Style::default().fg(Color::Rgb(120, 120, 120)),
+                        )
                     }
                 }
                 ProbeStatus::Probing => {
                     let frame = SPINNER_FRAMES[spinner_tick % SPINNER_FRAMES.len()];
-                    (format!("{}", frame), Style::default().fg(Color::Rgb(0, 120, 120)))
+                    (
+                        format!("{}", frame),
+                        Style::default().fg(Color::Rgb(0, 120, 120)),
+                    )
                 }
                 ProbeStatus::Unknown => {
                     if result.configured {
-                        ("?".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
+                        (
+                            "?".to_string(),
+                            Style::default().fg(Color::Rgb(120, 120, 120)),
+                        )
                     } else {
-                        ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
+                        (
+                            "-".to_string(),
+                            Style::default().fg(Color::Rgb(120, 120, 120)),
+                        )
                     }
                 }
             }
         }
-        None => ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120))),
+        None => (
+            "-".to_string(),
+            Style::default().fg(Color::Rgb(120, 120, 120)),
+        ),
     }
 }
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, _app: &ProbeApp) {
     let text = "r: 开始探测  ↑↓/jk: 滚动  q/Esc: 退出";
-    let paragraph = ratatui::widgets::Paragraph::new(text)
-        .style(Style::default().fg(Color::DarkGray));
+    let paragraph =
+        ratatui::widgets::Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
 
     f.render_widget(paragraph, area);
 }
@@ -246,20 +282,26 @@ mod tests {
             model_id: "model".to_string(),
             results: {
                 let mut map = std::collections::HashMap::new();
-                map.insert(WireApi::Anthropic, ProbeCellResult {
-                    status: ProbeStatus::ServerError,
-                    latency_ms: None,
-                    http_status: Some(500),
-                    error_message: None,
-                    configured: true,
-                });
-                map.insert(WireApi::Responses, ProbeCellResult {
-                    status: ProbeStatus::ClientError,
-                    latency_ms: None,
-                    http_status: Some(401),
-                    error_message: None,
-                    configured: true,
-                });
+                map.insert(
+                    WireApi::Anthropic,
+                    ProbeCellResult {
+                        status: ProbeStatus::ServerError,
+                        latency_ms: None,
+                        http_status: Some(500),
+                        error_message: None,
+                        configured: true,
+                    },
+                );
+                map.insert(
+                    WireApi::Responses,
+                    ProbeCellResult {
+                        status: ProbeStatus::ClientError,
+                        latency_ms: None,
+                        http_status: Some(401),
+                        error_message: None,
+                        configured: true,
+                    },
+                );
                 map
             },
         };
@@ -271,20 +313,26 @@ mod tests {
             model_id: "model".to_string(),
             results: {
                 let mut map = std::collections::HashMap::new();
-                map.insert(WireApi::Anthropic, ProbeCellResult {
-                    status: ProbeStatus::Available,
-                    latency_ms: Some(100),
-                    http_status: Some(200),
-                    error_message: None,
-                    configured: true,
-                });
-                map.insert(WireApi::Responses, ProbeCellResult {
-                    status: ProbeStatus::ClientError,
-                    latency_ms: None,
-                    http_status: Some(401),
-                    error_message: None,
-                    configured: true,
-                });
+                map.insert(
+                    WireApi::Anthropic,
+                    ProbeCellResult {
+                        status: ProbeStatus::Available,
+                        latency_ms: Some(100),
+                        http_status: Some(200),
+                        error_message: None,
+                        configured: true,
+                    },
+                );
+                map.insert(
+                    WireApi::Responses,
+                    ProbeCellResult {
+                        status: ProbeStatus::ClientError,
+                        latency_ms: None,
+                        http_status: Some(401),
+                        error_message: None,
+                        configured: true,
+                    },
+                );
                 map
             },
         };
@@ -296,13 +344,16 @@ mod tests {
             model_id: "model".to_string(),
             results: {
                 let mut map = std::collections::HashMap::new();
-                map.insert(WireApi::Anthropic, ProbeCellResult {
-                    status: ProbeStatus::Unknown,
-                    latency_ms: None,
-                    http_status: None,
-                    error_message: None,
-                    configured: true,
-                });
+                map.insert(
+                    WireApi::Anthropic,
+                    ProbeCellResult {
+                        status: ProbeStatus::Unknown,
+                        latency_ms: None,
+                        http_status: None,
+                        error_message: None,
+                        configured: true,
+                    },
+                );
                 map
             },
         };

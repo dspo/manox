@@ -179,6 +179,7 @@ pub(super) fn load_scan_state(conn: &Connection, path: &str) -> Option<ScanState
 }
 
 /// 检查源文件是否已扫描且未变化（mtime + size 匹配）。
+#[cfg(test)]
 pub(super) fn file_unchanged(conn: &Connection, path: &str, mtime: u64, size: u64) -> bool {
     load_scan_state(conn, path).is_some_and(|state| state.mtime_secs == mtime && state.size == size)
 }

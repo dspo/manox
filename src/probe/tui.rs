@@ -1,4 +1,4 @@
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -7,14 +7,14 @@ use crossterm::event;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use crate::probe::db;
 use crate::probe::types::{ProbeCellResult, ProbeRow, ProbeStatus};
-use crate::{CxConfig, WireApi, CopilotAuth};
+use crate::{CopilotAuth, CxConfig, WireApi};
 
 pub struct ProbeApp {
     pub rows: Vec<ProbeRow>,
@@ -32,11 +32,7 @@ pub struct ProbeResultItem {
     pub result: Result<ProbeCellResult>,
 }
 
-pub fn run_tui(
-    rows: Vec<ProbeRow>,
-    config: &CxConfig,
-    conn: &rusqlite::Connection,
-) -> Result<()> {
+pub fn run_tui(rows: Vec<ProbeRow>, config: &CxConfig, conn: &rusqlite::Connection) -> Result<()> {
     enable_raw_mode().context("启用 raw mode 失败")?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen).context("进入 alt screen 失败")?;
@@ -110,22 +106,24 @@ fn event_loop(
                         let row = &app.rows[item.row_idx];
 
                         // 获取当前的 configured 状态
-                        let configured = row.results.get(&item.wire_api).map(|r| r.configured).unwrap_or(true);
+                        let configured = row
+                            .results
+                            .get(&item.wire_api)
+                            .map(|r| r.configured)
+                            .unwrap_or(true);
 
                         let result = match item.result {
                             Ok(result) => ProbeCellResult {
                                 configured,
                                 ..result
                             },
-                            Err(e) => {
-                                ProbeCellResult {
-                                    status: ProbeStatus::ClientError,
-                                    latency_ms: None,
-                                    http_status: None,
-                                    error_message: Some(format!("探测异常: {e}")),
-                                    configured,
-                                }
-                            }
+                            Err(e) => ProbeCellResult {
+                                status: ProbeStatus::ClientError,
+                                latency_ms: None,
+                                http_status: None,
+                                error_message: Some(format!("探测异常: {e}")),
+                                configured,
+                            },
                         };
 
                         db::save_probe_result(
@@ -136,8 +134,7 @@ fn event_loop(
                             &result,
                         )?;
 
-                        if let Some(cell) = app.rows[item.row_idx].results.get_mut(&item.wire_api)
-                        {
+                        if let Some(cell) = app.rows[item.row_idx].results.get_mut(&item.wire_api) {
                             *cell = result;
                         }
                     }
@@ -166,7 +163,9 @@ fn ensure_visible(app: &mut ProbeApp, visible_height: usize) {
     if app.selected_row < app.scroll_offset {
         app.scroll_offset = app.selected_row;
     } else if app.selected_row >= app.scroll_offset + table_height {
-        app.scroll_offset = app.selected_row.saturating_sub(table_height.saturating_sub(1));
+        app.scroll_offset = app
+            .selected_row
+            .saturating_sub(table_height.saturating_sub(1));
     }
 }
 
@@ -182,7 +181,11 @@ fn start_probing(
 
     for (row_idx, row) in app.rows.iter().enumerate() {
         for wire_api in [WireApi::Anthropic, WireApi::Responses, WireApi::Completions] {
-            if let Some(provider) = config.providers.iter().find(|p| p.name == row.provider_name) {
+            if let Some(provider) = config
+                .providers
+                .iter()
+                .find(|p| p.name == row.provider_name)
+            {
                 let endpoint = provider
                     .normalized_endpoints()
                     .into_iter()
@@ -190,7 +193,14 @@ fn start_probing(
 
                 if let Some(endpoint) = endpoint {
                     let auth = CopilotAuth::from_endpoint(&endpoint);
-                    probe_items.push((row_idx, wire_api, provider.clone(), endpoint.url, row.model_id.clone(), auth));
+                    probe_items.push((
+                        row_idx,
+                        wire_api,
+                        provider.clone(),
+                        endpoint.url,
+                        row.model_id.clone(),
+                        auth,
+                    ));
                     total += 1;
                 }
             }
