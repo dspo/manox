@@ -1433,6 +1433,13 @@ fn draw_model_table(
         app.models_scroll = max_scroll;
     }
 
+    let constraints = model_table_widths(area.width, &sorted, &cells, &agent_columns);
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints.clone())
+        .split(area);
+    let model_col_width = layout[0].width.saturating_sub(2) as usize;
+
     let rows: Vec<Row> = sorted
         .iter()
         .enumerate()
@@ -1444,14 +1451,53 @@ fn draw_model_table(
             } else {
                 0.0
             };
-            let dot_color = color_map
-                .and_then(|colors| colors.get(model).copied())
-                .unwrap_or(PALETTE[idx % PALETTE.len()]);
-            let mut row_cells = vec![
+            let model_cell = if color_map.is_some() {
+                let dot_color = color_map
+                    .and_then(|colors| colors.get(model).copied())
+                    .unwrap_or(PALETTE[idx % PALETTE.len()]);
                 Cell::from(Span::styled(
                     model.clone(),
                     Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
-                )),
+                ))
+            } else {
+                let share_width = (model_col_width as f64 * pct / 100.0).round() as usize;
+                let model_len = model.chars().count();
+                let share_chars = share_width.min(model_len);
+
+                let model_color = PALETTE[idx % PALETTE.len()];
+                let mut chars = model.chars();
+                let model_prefix: String = chars.by_ref().take(share_chars).collect();
+                let model_suffix: String = chars.collect();
+
+                let mut model_spans = Vec::new();
+                if !model_prefix.is_empty() {
+                    model_spans.push(Span::styled(
+                        model_prefix,
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(model_color)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if !model_suffix.is_empty() {
+                    model_spans.push(Span::styled(
+                        model_suffix,
+                        Style::default()
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if share_width > model_len {
+                    model_spans.push(Span::styled(
+                        " ".repeat(share_width - model_len),
+                        Style::default().bg(model_color),
+                    ));
+                }
+                Cell::from(Line::from(model_spans))
+            };
+
+            let mut row_cells = vec![
+                model_cell,
                 Cell::from(Span::styled(
                     format!("{:.1}%", pct),
                     Style::default().fg(Color::DarkGray),
@@ -2296,8 +2342,10 @@ mod tests {
         // Model column: Min constraint, capped at MODEL_MIN_WIDTH (26)
         assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
         assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
-        assert_eq!(constraint_length(widths[2]), text_width("↑174.4m ↓547.9k"));
-        assert_eq!(constraint_length(widths[5]), text_width("Codex"));
+        assert_eq!(constraint_length(widths[2]), text_width("↑174m,400k ↓547k,900"));
+        // Total column grew after compact token formatting changed, so agent
+        // columns are proportionally compressed; Codex label (5) shrinks to 4.
+        assert_eq!(constraint_length(widths[5]), 4);
         // Mimo column (index 6) should be at least min width (4)
         assert!(constraint_length(widths[6]) >= 4);
     }
