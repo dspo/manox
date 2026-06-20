@@ -36,6 +36,7 @@ pub(crate) const AGENT_ZED: &str = "zed";
 pub(crate) const AGENT_COPILOT: &str = "copilot";
 pub(crate) const AGENT_OMP: &str = "omp";
 pub(crate) const AGENT_MIMO: &str = "mimo";
+pub(crate) const AGENT_REMORA: &str = "remora";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_CLAUDE, "Claude Code"),
@@ -44,6 +45,7 @@ pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_OMP, "OMP"),
     (AGENT_COPILOT, "Copilot"),
     (AGENT_MIMO, "Mimo"),
+    (AGENT_REMORA, "Remora"),
 ];
 
 /// 折线图调色板（与 Claude `/usage` 风格相近）。
@@ -111,6 +113,11 @@ fn log_sources() -> Vec<LogSource> {
             root: home.join(".local/share/mimocode"),
             extra_file: None,
             kind: SourceKind::MimoSession,
+        },
+        LogSource {
+            root: home.join(".remora/projects"),
+            extra_file: None,
+            kind: SourceKind::RemoraSession,
         },
     ]
 }
