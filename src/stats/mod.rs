@@ -174,6 +174,130 @@ fn current_file_id(_meta: &Metadata) -> Option<String> {
     None
 }
 
+/// 单次会话的 token 用量统计。
+pub(crate) struct SessionTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+impl SessionTokens {
+    /// 返回总 token 数（input + output，不含 cache）。
+    pub fn total(&self) -> u64 {
+        self.input + self.output
+    }
+}
+
+/// 查找指定 agent 在 `since` 之后修改的最新日志文件并汇总 token 用量。
+///
+/// 用于 agent 退出后在退出摘要中显示本次会话的 token 消耗。
+/// 如果找不到匹配的日志文件或解析失败，返回 `None`（静默降级）。
+pub(crate) fn count_recent_session_tokens(
+    agent_id: &str,
+    since: std::time::SystemTime,
+) -> Option<SessionTokens> {
+    let since_secs = since
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let source = log_sources().into_iter().find(|s| match agent_id {
+        "claude" => matches!(s.kind, SourceKind::Claude),
+        "codex" | "Codex.app" => {
+            matches!(s.kind, SourceKind::CodexLike(a) if a == AGENT_CODEX)
+        }
+        "copilot" => {
+            matches!(s.kind, SourceKind::Copilot(a) if a == AGENT_COPILOT)
+        }
+        _ => false,
+    })?;
+
+    // 收集日志文件，筛选 session 开始后修改的
+    let mut files = collect_jsonl_files(&source.root);
+    if let Some(ref extra) = source.extra_file {
+        files.push(extra.clone());
+    }
+
+    let mut recent: Vec<_> = files
+        .into_iter()
+        .filter_map(|path| {
+            let meta = fs::metadata(&path).ok()?;
+            let mtime_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if mtime_secs >= since_secs {
+                Some((path, mtime_secs))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if recent.is_empty() {
+        return None;
+    }
+
+    // 按 mtime 降序排列，取最新的文件
+    recent.sort_by(|a, b| b.1.cmp(&a.1));
+    let newest_path = &recent[0].0;
+
+    // 解析日志文件
+    let result = parse_file(newest_path, source.kind).ok()?;
+
+    let mut tokens = SessionTokens {
+        input: 0,
+        output: 0,
+        cache_read: 0,
+        cache_creation: 0,
+    };
+    for entry in &result.entries {
+        tokens.input += entry.input_tokens;
+        tokens.output += entry.output_tokens;
+        tokens.cache_read += entry.cache_read_input_tokens;
+        tokens.cache_creation += entry.cache_creation_input_tokens;
+    }
+
+    Some(tokens)
+}
+
+/// 将 token 数格式化为紧凑的人类可读表示。
+///
+/// - `0` → `"0"`
+/// - `1234` → `"1.2k"`
+/// - `123456` → `"123k"`
+/// - `3123000` → `"3m123k"`
+pub(crate) fn format_tokens_compact(n: u64) -> String {
+    if n == 0 {
+        return "0".into();
+    }
+    if n < 1_000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        let k = n / 1_000;
+        let rem = (n % 1_000) / 100;
+        if k >= 10 || rem == 0 {
+            format!("{k}k")
+        } else {
+            format!("{k}.{rem}k")
+        }
+    } else {
+        let m = n / 1_000_000;
+        let k = (n % 1_000_000) / 1_000;
+        if k == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{k}k")
+        }
+    }
+}
+
+
 pub fn run_stats() -> Result<()> {
     let today = date::today_date_string()?;
 
