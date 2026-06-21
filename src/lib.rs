@@ -31,6 +31,7 @@ use url::Url;
 mod stats;
 mod probe;
 mod warp;
+mod codex_app;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
@@ -601,6 +602,10 @@ struct Selection {
     selected_wire_api: WireApi,
     provider: ResolvedProvider,
     model: Option<ResolvedModel>,
+    /// 仅 Codex.app 等注入型 agent 使用：注入给桌面端的完整模型列表。
+    /// 首个元素为默认模型（写入 config.toml 的 `model =`，并在注入脚本里标记 `isDefault`）。
+    /// 非 Codex.app agent 始终为空 Vec。
+    injected_models: Vec<ResolvedModel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -813,14 +818,57 @@ fn write_private_file(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// 若 `dst` 已存在，在重建符号链接前先移除，保证 `materialize_passthrough_dir` 幂等。
+///
+/// 需处理的两种残留：
+/// - 上次创建的**符号链接**（持久目录二次启动）；
+/// - Codex.app 用 atomic-rename 写状态文件时，把我们的符号链接**替换成的普通文件**
+///   （`rename(tmp, target)` 会覆盖符号链接，产生真实文件，如 `.codex-global-state.json.bak`、
+///   `logs_2.sqlite-wal`）。此时 `real` 目录里有真实数据源，重新符号链接到 `real` 即可，不丢数据。
+///
+/// 仅移除符号链接与普通文件；**真实目录予以保留**，避免误删 Codex 写入的状态目录（如 `sessions/`）。
+fn remove_existing_entry(dst: &Path) {
+    let Ok(meta) = fs::symlink_metadata(dst) else {
+        return; // 不存在，无需处理
+    };
+    let ft = meta.file_type();
+    if ft.is_dir() && !ft.is_symlink() {
+        // 真实目录（非指向目录的符号链接）：保留，交由调用方决定是否覆盖。
+        return;
+    }
+    // 符号链接（含指向目录的）或普通文件：移除后由 symlink_path 重建。
+    #[cfg(unix)]
+    {
+        let _ = fs::remove_file(dst); // remove_file 对符号链接（含指向目录的）与普通文件均有效
+    }
+    #[cfg(windows)]
+    {
+        let _ = if ft.is_dir() {
+            fs::remove_dir(dst)
+        } else {
+            fs::remove_file(dst)
+        };
+    }
+}
+
 #[cfg(unix)]
 fn symlink_path(src: &Path, dst: &Path) -> Result<()> {
+    remove_existing_entry(dst);
+    // 若 dst 仍存在，说明是一个保留的真实目录（见 remove_existing_entry）：
+    // 不覆盖、不报错，跳过本次符号链接（如 Codex 在 CODEX_HOME 自建的 sessions/）。
+    if dst.exists() {
+        return Ok(());
+    }
     std::os::unix::fs::symlink(src, dst)
         .with_context(|| format!("创建符号链接失败: {} -> {}", dst.display(), src.display()))
 }
 
 #[cfg(windows)]
 fn symlink_path(src: &Path, dst: &Path) -> Result<()> {
+    remove_existing_entry(dst);
+    if dst.exists() {
+        return Ok(());
+    }
     let result = if src.is_dir() {
         symlink_dir(src, dst)
     } else {
@@ -930,16 +978,81 @@ fn toml_basic_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// 把 provider 名称转成 ASCII-safe 的 config.toml provider key。
+/// 非字母数字/`-`/`_` 字符被丢弃（如中文「百炼」→ ""）；结果为空时回落到 "custom"。
+fn provider_config_key(provider_name: &str) -> String {
+    let slug: String = provider_name
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if c == '-' || c == '_' {
+                Some(c)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if slug.is_empty() {
+        "custom".to_string()
+    } else {
+        slug
+    }
+}
+
+/// 从 apikey_source 推导 Codex config.toml 的 `env_key`（Codex 运行时读取 API Key 的环境变量名）。
+/// `keychain:VAR` / `env:VAR` → `VAR`；其余（`literal:` / `$(shell ...)` / None）回落到 `CX_PROVIDER_KEY`。
+fn env_key_for_apikey_source(source: Option<&str>) -> String {
+    if let Some(s) = source {
+        if let Some(rest) = s.strip_prefix("keychain:").or_else(|| s.strip_prefix("env:")) {
+            let v = rest.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    "CX_PROVIDER_KEY".to_string()
+}
+
+/// 从既有 config.toml 文本中提取顶层 `model_reasoning_effort` 的值（去引号）。
+/// 用于在重写 config 时保留用户偏好，而非硬编码覆盖。
+/// 仅匹配任何 `[section]` 之前的顶层键，避免误取 `[model_providers.*]` 等段内同名字段。
+fn extract_reasoning_effort(existing: Option<&str>) -> Option<String> {
+    let existing = existing?;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        // 进入任意 section 后，顶层键已结束，停止扫描。
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if let Some(after) = trimmed.strip_prefix("model_reasoning_effort") {
+            let after = after.trim_start();
+            if let Some(rhs) = after.strip_prefix('=') {
+                let v = rhs.trim().trim_matches('"');
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn merge_codex_config(
     existing: Option<&str>,
     model: &ResolvedModel,
     workspace_root: &Path,
     wire_api: WireApi,
+    provider_key: &str,
+    provider_name: &str,
+    env_key: &str,
 ) -> Result<String> {
     let project_section = format!(
         "[projects.{}]",
         toml_basic_string(&workspace_root.to_string_lossy())
     );
+    // 保留用户已设置的 reasoning effort（若无则回落到 "high"，与 POC 一致）。
+    let reasoning_effort = extract_reasoning_effort(existing).unwrap_or_else(|| "high".to_string());
     let mut retained = Vec::new();
     let mut skipping_section = false;
 
@@ -954,13 +1067,16 @@ fn merge_codex_config(
                 }
             }
 
-            if trimmed == "[model_providers.dashscope]" || trimmed == project_section {
+            // 所有 [model_providers.*] section（含历史硬编码的 dashscope）都由本次重新生成，保留时整体跳过
+            if trimmed.starts_with("[model_providers.") || trimmed == project_section {
                 skipping_section = true;
                 continue;
             }
 
             if !trimmed.starts_with('[')
-                && (trimmed.starts_with("model =") || trimmed.starts_with("model_provider ="))
+                && (trimmed.starts_with("model =")
+                    || trimmed.starts_with("model_provider =")
+                    || trimmed.starts_with("model_reasoning_effort ="))
             {
                 continue;
             }
@@ -971,9 +1087,14 @@ fn merge_codex_config(
 
     let wire_api_str = wire_api.launch_value()?;
     let mut rendered = format!(
-        "model = {}\nmodel_provider = \"dashscope\"\n\n[model_providers.dashscope]\nname = \"DashScope\"\nbase_url = {}\nenv_key = \"DASHSCOPE_API_KEY\"\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
+        "model = {}\nmodel_provider = {}\nmodel_reasoning_effort = {}\n\n[model_providers.{}]\nname = {}\nbase_url = {}\nenv_key = {}\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
         toml_basic_string(&model.id),
+        toml_basic_string(provider_key),
+        toml_basic_string(&reasoning_effort),
+        toml_basic_string(provider_key),
+        toml_basic_string(provider_name),
         toml_basic_string(&model.endpoint_url),
+        toml_basic_string(env_key),
         toml_basic_string(wire_api_str),
         project_section,
         "\n"
@@ -991,6 +1112,8 @@ fn merge_codex_config(
 
 fn prepare_codex_launch_home(
     model: &ResolvedModel,
+    provider: &ResolvedProvider,
+    apikey: String,
     env: &mut BTreeMap<String, String>,
     wire_api: WireApi,
 ) -> Result<()> {
@@ -1002,11 +1125,21 @@ fn prepare_codex_launch_home(
     let fake_codex_dir = fake_home.join(".codex");
     materialize_passthrough_dir(&real_codex_dir, &fake_codex_dir, &["config.toml"])?;
 
+    let provider_key = provider_config_key(&provider.name);
+    let env_key = env_key_for_apikey_source(provider.apikey_source.as_deref());
     let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
-    let merged_config =
-        merge_codex_config(existing_config.as_deref(), model, &env::current_dir()?, wire_api)?;
+    let merged_config = merge_codex_config(
+        existing_config.as_deref(),
+        model,
+        &env::current_dir()?,
+        wire_api,
+        &provider_key,
+        &provider.name,
+        &env_key,
+    )?;
     write_private_file(&fake_codex_dir.join("config.toml"), &merged_config)?;
 
+    env.insert(env_key.clone(), apikey);
     env.insert("HOME".into(), fake_home.display().to_string());
     env.insert(
         "XDG_CONFIG_HOME".into(),
@@ -1018,13 +1151,16 @@ fn prepare_codex_launch_home(
 
 /// 为 Codex Desktop App 准备注入配置。
 /// 使用固定目录 ~/.config/cx/.codex/，Symlink 真实 ~/.codex/ 内容（config.toml 除外），
-/// 写入我们注入的 config.toml + DASHSCOPE_API_KEY，Codex Desktop 读 CODEX_HOME 指向此目录。
+/// 写入我们注入的 config.toml（动态 provider key / env_key）。Codex Desktop 读 CODEX_HOME 指向此目录。
+///
+/// 返回 `CodexAppPrepared`：codex_home 供调用方在启动子进程时设 `CODEX_HOME` 环境变量，
+/// env_key 是 config.toml 里 Codex 运行时读取 API Key 的环境变量名，
+/// reasoning_effort 是解析出的（或默认 "high"）推理强度，供注入脚本与下拉默认值保持一致。
 fn prepare_codex_launch_home_for_app(
     model: &ResolvedModel,
-    apikey: String,
-    env: &mut BTreeMap<String, String>,
+    provider: &ResolvedProvider,
     wire_api: WireApi,
-) -> Result<()> {
+) -> Result<CodexAppPrepared> {
     let real_home = home_dir().context("无法解析用户主目录")?;
     let codex_dir = cx_state_dir()?.join(".codex");
     let real_codex_dir = real_home.join(".codex");
@@ -1037,19 +1173,36 @@ fn prepare_codex_launch_home_for_app(
     // Symlink 真实 .codex 内容（auth.json 等），config.toml 除外
     materialize_passthrough_dir(&real_codex_dir, &codex_dir, &["config.toml"])?;
 
+    let provider_key = provider_config_key(&provider.name);
+    let env_key = env_key_for_apikey_source(provider.apikey_source.as_deref());
     // 读取真实 config.toml（如有）做保留
     let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
-    let merged_config =
-        merge_codex_config(existing_config.as_deref(), model, &env::current_dir()?, wire_api)?;
+    let reasoning_effort =
+        extract_reasoning_effort(existing_config.as_deref()).unwrap_or_else(|| "high".to_string());
+    let merged_config = merge_codex_config(
+        existing_config.as_deref(),
+        model,
+        &env::current_dir()?,
+        wire_api,
+        &provider_key,
+        &provider.name,
+        &env_key,
+    )?;
     write_private_file(&codex_dir.join("config.toml"), &merged_config)?;
     println!("[cx] 注入配置: {}", codex_dir.join("config.toml").display());
 
-    if apikey.is_empty() {
-        anyhow::bail!("Codex.app 需要 API Key，但未提供");
-    }
-    env.insert("CODEX_HOME".into(), codex_dir.display().to_string());
-    env.insert("DASHSCOPE_API_KEY".into(), apikey);
-    Ok(())
+    Ok(CodexAppPrepared {
+        codex_home: codex_dir,
+        env_key,
+        reasoning_effort,
+    })
+}
+
+/// `prepare_codex_launch_home_for_app` 的产物，供 codex_app 启动编排使用。
+struct CodexAppPrepared {
+    codex_home: PathBuf,
+    env_key: String,
+    reasoning_effort: String,
 }
 
 fn load_config() -> Result<CxConfig> {
@@ -1220,6 +1373,45 @@ fn model_options_for_provider(
         .collect()
 }
 
+/// 解析 swe_pro 字符串（如 "56.6%"）为可比较的分数；"—" 等无法解析的视为 0.0。
+fn swe_pro_score(s: &str) -> f64 {
+    s.trim()
+        .trim_end_matches('%')
+        .parse::<f64>()
+        .unwrap_or(0.0)
+}
+
+/// 收集某 provider 下所有支持 Codex.app（即 wire 含 Responses）的模型，作为注入桌面端的完整列表。
+///
+/// 同一 model id 仅保留一条（取 swe_pro 最优的变体），并按「默认模型优先」排序：
+/// swe_pro 高者在前，平局按 model id 升序。首个元素即默认模型。
+fn injected_models_for_codex_app(
+    all_models: &[ResolvedModel],
+    provider_name: &str,
+) -> Vec<ResolvedModel> {
+    let mut models: Vec<ResolvedModel> = all_models
+        .iter()
+        .filter(|m| {
+            m.provider_name == provider_name
+                && m.supports_agent("Codex.app")
+                // 显式确认模型支持 Responses wire api。supports_agent 已隐含这点
+                // （Codex.app agent 仅兼容 Responses endpoint），但这里再过滤一次，
+                // 防止配置层不变量将来变动时把非 Responses 模型注入、生成错误的 wire_api。
+                && m.model_wire_apis.contains(&WireApi::Responses)
+        })
+        .cloned()
+        .collect();
+    models.sort_by(|a, b| {
+        swe_pro_score(&b.swe_pro)
+            .partial_cmp(&swe_pro_score(&a.swe_pro))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut seen = std::collections::HashSet::new();
+    models.retain(|m| seen.insert(m.id.clone()));
+    models
+}
+
 // ══════════════════════════════════════════════════
 // CLI definition（clap derive）
 // ══════════════════════════════════════════════════
@@ -1381,6 +1573,12 @@ fn run_launcher(
             return run_launcher(rerun_agent_hint, &refreshed, passthrough_args);
         }
         return Ok(());
+    }
+
+    // Codex.app 走专门的启动 + renderer 注入路径，不经通用 build_launch_spec/launch_agent。
+    if selection.agent_id == "Codex.app" {
+        apply_selected_model_tab_name(&selection)?;
+        return codex_app::launch_with_injection(&selection, &passthrough_args);
     }
 
     let spec = build_launch_spec(&selection, &passthrough_args)?;
@@ -1863,37 +2061,110 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
         .status()
         .with_context(|| format!("启动 `{}` 失败", spec.program.display()))?;
 
+    finalize_agent_exit(
+        &spec.agent_id,
+        &spec.provider_name,
+        spec.model_id.as_deref(),
+        &status,
+        started_at,
+        started_sys,
+        &warp_session,
+    );
+}
+
+/// 子进程退出后的统一收尾：提取 token 用量、打印退出摘要、发出 Warp stop 事件、
+/// 按子进程退出码退出 cx。供 `launch_agent`（同步 spawn+wait）与 `codex_app` 注入路径
+/// （spawn → CDP 注入 → wait）共用，避免 Warp 集成与退出摘要逻辑分叉。
+fn finalize_agent_exit(
+    agent_id: &str,
+    provider_name: &str,
+    model_id: Option<&str>,
+    status: &std::process::ExitStatus,
+    started_at: std::time::Instant,
+    started_sys: std::time::SystemTime,
+    warp_session: &Option<warp::WarpSession>,
+) -> ! {
     let duration = started_at.elapsed();
 
     // 从 agent 日志中提取本次会话的 token 用量
-    let tokens = stats::count_recent_session_tokens(&spec.agent_id, started_sys);
+    let tokens = stats::count_recent_session_tokens(agent_id, started_sys);
 
     // 打印退出摘要
-    let termination = format_exit_status(&status);
+    let termination = format_exit_status(status);
     println!();
     println!(
         "{}",
-        format_exit_summary(&spec, duration, termination.as_deref(), tokens.as_ref())
+        format_exit_summary_inline(
+            agent_id,
+            provider_name,
+            model_id,
+            duration,
+            termination.as_deref(),
+            tokens.as_ref(),
+        )
     );
     println!();
 
     // Warp 集成：agent 退出后发出 stop 事件（WarpSession 的 Drop 也会兜底）
-    if let Some(ref session) = warp_session {
+    if let Some(session) = warp_session {
         session.emit_stop(status.code());
     }
 
     // 退出码：正常退出用 exit code，信号终止用 128+signal（与 shell 惯例一致）
-    let exit_code = status.code().unwrap_or_else(|| {
-        #[cfg(unix)]
-        {
-            status.signal().map(|s| 128 + s).unwrap_or(1)
-        }
-        #[cfg(not(unix))]
-        {
-            1
-        }
-    });
+    let exit_code = exit_code_from(status);
     std::process::exit(exit_code);
+}
+
+/// `format_exit_summary` 的字段版本，供不持有完整 `LaunchSpec` 的调用方（codex_app 注入路径）复用。
+fn format_exit_summary_inline(
+    agent_id: &str,
+    provider_name: &str,
+    model_id: Option<&str>,
+    duration: std::time::Duration,
+    termination: Option<&str>,
+    tokens: Option<&stats::SessionTokens>,
+) -> String {
+    let dur_str = format_duration(duration);
+    let mut msg = format!(
+        "退出 {} | Provider: {} | {}",
+        agent_id,
+        provider_name,
+        match model_id {
+            Some(m) => format!("Model: {m}"),
+            None => "Model: default".into(),
+        },
+    );
+    msg.push_str(" | ");
+    msg.push_str(&dur_str);
+    if let Some(t) = tokens {
+        let total = t.total();
+        if total > 0 {
+            msg.push_str(" | ");
+            msg.push_str(&stats::format_tokens_compact(total));
+            msg.push_str(" Tokens");
+        }
+    }
+    if let Some(term) = termination {
+        msg.push_str(&format!(" | {term}"));
+    }
+    msg
+}
+
+/// 从 `ExitStatus` 计算 cx 退出码：正常退出用 exit code，信号终止用 128+signal。
+fn exit_code_from(status: &std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|s| 128 + s).unwrap_or(1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        1
+    }
 }
 
 /// 将 `ExitStatus` 转换为人类可读的终止描述。
@@ -1916,36 +2187,23 @@ fn format_exit_status(status: &std::process::ExitStatus) -> Option<String> {
 /// 格式化退出摘要，包含 agent 信息、会话时长和 token 用量。
 ///
 /// 示例：`退出 claude | Provider: 百炼 | Model: MiniMax-M2.7 | 3m12s | 123k Tokens`
+///
+/// 仅测试使用（生产路径走 `format_exit_summary_inline`），故 gate 在 `cfg(test)` 下避免 release 死代码告警。
+#[cfg(test)]
 fn format_exit_summary(
     spec: &LaunchSpec,
     duration: std::time::Duration,
     termination: Option<&str>,
     tokens: Option<&stats::SessionTokens>,
 ) -> String {
-    let dur_str = format_duration(duration);
-    let mut msg = format!(
-        "退出 {} | Provider: {} | {}",
-        spec.agent_id,
-        spec.provider_name,
-        match &spec.model_id {
-            Some(m) => format!("Model: {m}"),
-            None => "Model: default".into(),
-        },
-    );
-    msg.push_str(" | ");
-    msg.push_str(&dur_str);
-    if let Some(t) = tokens {
-        let total = t.total();
-        if total > 0 {
-            msg.push_str(" | ");
-            msg.push_str(&stats::format_tokens_compact(total));
-            msg.push_str(" Tokens");
-        }
-    }
-    if let Some(term) = termination {
-        msg.push_str(&format!(" | {term}"));
-    }
-    msg
+    format_exit_summary_inline(
+        &spec.agent_id,
+        &spec.provider_name,
+        spec.model_id.as_deref(),
+        duration,
+        termination,
+        tokens,
+    )
 }
 
 /// 将时长格式化为人类友好的简短表示。
@@ -2094,15 +2352,20 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                 args.push(model.id.clone());
                 args.extend(passthrough_args.iter().cloned());
             }
-            "codex" | "Codex.app" => {
-                let is_desktop_app = agent_id == "Codex.app";
-                if is_desktop_app {
-                    prepare_codex_launch_home_for_app(model, apikey, &mut env, selection.selected_wire_api)?;
-                } else {
-                    env.insert("DASHSCOPE_API_KEY".into(), apikey);
-                    prepare_codex_launch_home(model, &mut env, selection.selected_wire_api)?;
-                }
+            "codex" => {
+                prepare_codex_launch_home(
+                    model,
+                    provider,
+                    apikey,
+                    &mut env,
+                    selection.selected_wire_api,
+                )?;
                 args.extend(passthrough_args.iter().cloned());
+            }
+            "Codex.app" => {
+                // Codex.app 不走通用 LaunchSpec 流程；run_launcher 已分流到 codex_app::launch_with_injection。
+                // 此处仅在误入时给出明确错误，避免静默走 generic passthrough。
+                bail!("Codex.app 应由注入路径启动，不应进入 build_launch_spec");
             }
             _ => {
                 // Generic fallback: just pass through
@@ -3508,6 +3771,22 @@ impl AppState {
             Step::Provider => {
                 let providers = providers_for_agent(&self.config, &self.selected_agent_id);
                 let provider = providers[self.provider_index].clone();
+                // Codex.app 跳过 Model 选择步：直接把该 provider 下所有 Responses 模型
+                // 作为完整列表注入桌面端，由 cx 在启动时经 CDP 注入 renderer。
+                if self.selected_agent_id == "Codex.app" {
+                    let injected = injected_models_for_codex_app(models, &provider.name);
+                    let agent = find_agent(&self.config, &self.selected_agent_id).unwrap();
+                    return Some(Selection {
+                        agent_id: agent.id.clone(),
+                        agent_binary: agent.binary.clone(),
+                        agent_args: agent.args.clone(),
+                        agent_env: agent.env.clone(),
+                        selected_wire_api: WireApi::Responses,
+                        provider,
+                        model: injected.first().cloned(),
+                        injected_models: injected,
+                    });
+                }
                 if provider.requires_model() {
                     self.model_index = 0;
                     self.step = Step::Model;
@@ -3524,6 +3803,7 @@ impl AppState {
                         selected_wire_api,
                         provider,
                         model: None,
+                        injected_models: Vec::new(),
                     })
                 }
             }
@@ -3552,6 +3832,7 @@ impl AppState {
                     selected_wire_api,
                     provider,
                     model: Some(selected_variant),
+                    injected_models: Vec::new(),
                 })
             }
         }
@@ -3958,6 +4239,7 @@ mod tests {
                 apikey_source: None,
             },
             model: None,
+            injected_models: Vec::new(),
         };
 
         let spec = build_launch_spec(&selection, &["mcp".into(), "serve".into()]).unwrap();
@@ -3980,6 +4262,7 @@ mod tests {
                 apikey_source: Some("literal:test-key".into()),
             },
             model: None,
+            injected_models: Vec::new(),
         };
         let spec = build_launch_spec(&selection, &[]).unwrap();
         assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
@@ -4027,6 +4310,7 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: BTreeMap::new(),
             }),
+            injected_models: Vec::new(),
         };
         let spec = build_launch_spec(&selection, &["mcp".into(), "list".into()]).unwrap();
         assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
@@ -4086,6 +4370,7 @@ mod tests {
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
             }),
+            injected_models: Vec::new(),
         };
 
         let spec = build_launch_spec(&selection, &[]).unwrap();
@@ -4127,6 +4412,7 @@ mod tests {
                 apikey_source: None,
             },
             model: None,
+            injected_models: Vec::new(),
         };
 
         assert!(apply_selected_model_tab_name(&selection).is_ok());
@@ -4152,6 +4438,7 @@ mod tests {
                 apikey_source: Some("literal:test-key".into()),
             },
             model: None,
+            injected_models: Vec::new(),
         };
         let spec = build_launch_spec(&selection, &[]).unwrap();
         assert_eq!(spec.env.get("MY_AGENT_VAR"), Some(&"from-agent".into()));
@@ -4190,6 +4477,7 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: model_env,
             }),
+            injected_models: Vec::new(),
         };
         let spec = build_launch_spec(&selection, &[]).unwrap();
         assert_eq!(
@@ -4236,6 +4524,7 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: model_env,
             }),
+            injected_models: Vec::new(),
         };
         let spec = build_launch_spec(&selection, &[]).unwrap();
         // Model env overrides agent env for the shared key
@@ -4665,6 +4954,25 @@ agents:
     }
 
     #[test]
+    fn provider_config_key_slugifies_names() {
+        assert_eq!(provider_config_key("DashScope"), "dashscope");
+        assert_eq!(provider_config_key("Packy API"), "packyapi");
+        assert_eq!(provider_config_key("百炼"), "custom");
+        assert_eq!(provider_config_key("My-Provider_1"), "my-provider_1");
+    }
+
+    #[test]
+    fn env_key_for_apikey_source_extracts_var_name() {
+        assert_eq!(
+            env_key_for_apikey_source(Some("keychain:DASHSCOPE_API_KEY")),
+            "DASHSCOPE_API_KEY"
+        );
+        assert_eq!(env_key_for_apikey_source(Some("env:MY_KEY")), "MY_KEY");
+        assert_eq!(env_key_for_apikey_source(Some("literal:abc")), "CX_PROVIDER_KEY");
+        assert_eq!(env_key_for_apikey_source(None), "CX_PROVIDER_KEY");
+    }
+
+    #[test]
     fn text_input_appends_bracketed_paste_as_single_line() {
         let mut value = "https://".to_string();
         let paste = Event::Paste("example.com/v1\n".into());
@@ -4704,6 +5012,9 @@ trust_level = "trusted"
             ),
             Path::new("/tmp/workspace"),
             WireApi::Responses,
+            "dashscope",
+            "DashScope",
+            "DASHSCOPE_API_KEY",
         )
         .unwrap();
 
@@ -4713,7 +5024,70 @@ trust_level = "trusted"
         assert!(merged.contains(r#"trust_level = "trusted""#));
         assert!(merged.contains(r#"approval_policy = "on-request""#));
         assert!(merged.contains(r#"[projects."/tmp/other"]"#));
+        assert!(merged.contains(r#"model_reasoning_effort = "high""#));
+        assert!(merged.contains(r#"env_key = "DASHSCOPE_API_KEY""#));
         assert!(!merged.contains("https://old.example.com"));
+        // 旧的 dashscope section 应被剥离，由动态 provider key 重新生成
+        assert!(merged.contains(r#"model_provider = "dashscope""#));
+    }
+
+    #[test]
+    fn merge_codex_config_preserves_user_reasoning_effort() {
+        // 用户偏好 low，cx 重写时应保留而非硬编码 high。
+        let existing = "model_reasoning_effort = \"low\"\n";
+        let merged = merge_codex_config(
+            Some(existing),
+            &test_resolved_model("qwen3.6-plus", "https://example.com/v1", WireApi::Responses),
+            Path::new("/tmp/workspace"),
+            WireApi::Responses,
+            "custom",
+            "Custom",
+            "CX_PROVIDER_KEY",
+        )
+        .unwrap();
+        assert!(merged.contains(r#"model_reasoning_effort = "low""#));
+        assert!(!merged.contains(r#"model_reasoning_effort = "high""#));
+        // 不应出现重复的 reasoning effort 行
+        assert_eq!(
+            merged.matches("model_reasoning_effort").count(),
+            1,
+            "reasoning effort 行不应重复"
+        );
+    }
+
+    #[test]
+    fn merge_codex_config_defaults_reasoning_effort_to_high_when_absent() {
+        let merged = merge_codex_config(
+            None,
+            &test_resolved_model("qwen3.6-plus", "https://example.com/v1", WireApi::Responses),
+            Path::new("/tmp/workspace"),
+            WireApi::Responses,
+            "custom",
+            "Custom",
+            "CX_PROVIDER_KEY",
+        )
+        .unwrap();
+        assert!(merged.contains(r#"model_reasoning_effort = "high""#));
+    }
+
+    #[test]
+    fn extract_reasoning_effort_strips_quotes_and_ignores_empty() {
+        assert_eq!(
+            extract_reasoning_effort(Some("model_reasoning_effort = \"medium\"")),
+            Some("medium".to_string())
+        );
+        assert_eq!(
+            extract_reasoning_effort(Some("model_reasoning_effort=high")),
+            Some("high".to_string())
+        );
+        assert_eq!(extract_reasoning_effort(Some("model = \"x\"")), None);
+        assert_eq!(extract_reasoning_effort(None), None);
+        // 只取顶层键，不误取 [model_providers.*] 段内同名字段
+        let cfg = "model = \"qwen\"\n\n[model_providers.foo]\nmodel_reasoning_effort = \"low\"\n";
+        assert_eq!(extract_reasoning_effort(Some(cfg)), None);
+        // 顶层值存在时正常取，即使后面 section 里也有
+        let cfg2 = "model_reasoning_effort = \"high\"\n\n[model_providers.foo]\nmodel_reasoning_effort = \"low\"\n";
+        assert_eq!(extract_reasoning_effort(Some(cfg2)), Some("high".to_string()));
     }
 
     #[test]
@@ -4736,6 +5110,92 @@ trust_level = "trusted"
                 .file_type()
                 .is_symlink()
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_passthrough_dir_is_idempotent_on_rerun() {
+        // 持久目录（如 ~/.config/cx/.codex/）二次启动时，上次创建的符号链接已存在，
+        // materialize 必须能幂等地重建而非报 EEXIST。
+        let root = temp_test_dir("passthrough-idempotent");
+        let real = root.join("real");
+        let fake = root.join("fake");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("logs.sqlite-wal"), "data").unwrap();
+
+        materialize_passthrough_dir(&real, &fake, &["config.toml"]).unwrap();
+        // 第二次：symlink 已存在，必须不报错并仍指向真实文件
+        materialize_passthrough_dir(&real, &fake, &["config.toml"]).unwrap();
+
+        assert!(fake.join("logs.sqlite-wal").exists());
+        #[cfg(unix)]
+        assert!(
+            fs::symlink_metadata(fake.join("logs.sqlite-wal"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(fake.join("logs.sqlite-wal")).unwrap(),
+            "data"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_passthrough_dir_replaces_file_left_by_atomic_rename() {
+        // Codex.app 用 atomic-rename 写状态文件时会把我们的符号链接替换成普通文件
+        // （如 .codex-global-state.json.bak）。real 目录里有真实数据源，重新符号链接即可。
+        let root = temp_test_dir("passthrough-atomic-rename");
+        let real = root.join("real");
+        let fake = root.join("fake");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("state.json.bak"), "real-source").unwrap();
+        // fake 里已有一个普通文件（模拟 Codex rename 覆盖了符号链接后的状态）
+        fs::create_dir_all(&fake).unwrap();
+        fs::write(fake.join("state.json.bak"), "stale-local").unwrap();
+
+        // 之前会报 EEXIST；现在应替换为指向 real 的符号链接
+        materialize_passthrough_dir(&real, &fake, &["config.toml"]).unwrap();
+
+        #[cfg(unix)]
+        assert!(
+            fs::symlink_metadata(fake.join("state.json.bak"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // 读到的是 real 的数据，而非残留的本地文件
+        assert_eq!(
+            fs::read_to_string(fake.join("state.json.bak")).unwrap(),
+            "real-source"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_passthrough_dir_preserves_real_directory_at_dst() {
+        // 若 dst 已是真实目录（非符号链接），不强行删除以免误删 Codex 状态目录。
+        let root = temp_test_dir("passthrough-real-dir");
+        let real = root.join("real");
+        let fake = root.join("fake");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(real.join("sessions")).unwrap();
+        fs::write(real.join("sessions").join("a.json"), "session").unwrap();
+        // fake 里 sessions 已是真实目录（模拟 Codex 在 CODEX_HOME 自建目录）
+        fs::create_dir_all(fake.join("sessions")).unwrap();
+        fs::write(fake.join("sessions").join("local.json"), "local").unwrap();
+
+        materialize_passthrough_dir(&real, &fake, &["config.toml"]).unwrap();
+        // 真实目录被保留，未被替换为符号链接、未被清空
+        assert!(fs::symlink_metadata(fake.join("sessions"))
+            .unwrap()
+            .file_type()
+            .is_dir());
+        assert!(fake.join("sessions").join("local.json").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
