@@ -1440,6 +1440,15 @@ fn draw_model_table(
         .split(area);
     let model_col_width = layout[0].width.saturating_sub(2) as usize;
 
+    // Overview 的 Model 列底纹按 Total tokens 归一化：统一除以最大模型的
+    // Total tokens，使最大者填满整列、其余按比例缩短，让份额差异视觉上更突出。
+    // 仅影响底纹绘制，Share 列仍显示真实占比 (pct)。
+    let max_total_tokens: u64 = sorted
+        .iter()
+        .map(|(_, usage)| usage.total_tokens())
+        .max()
+        .unwrap_or(0);
+
     let rows: Vec<Row> = sorted
         .iter()
         .enumerate()
@@ -1460,7 +1469,12 @@ fn draw_model_table(
                     Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
                 ))
             } else {
-                let share_width = (model_col_width as f64 * pct / 100.0).round() as usize;
+                let ratio = if max_total_tokens > 0 {
+                    usage.total_tokens() as f64 / max_total_tokens as f64
+                } else {
+                    0.0
+                };
+                let share_width = (model_col_width as f64 * ratio).round() as usize;
                 let model_len = model.chars().count();
                 let share_chars = share_width.min(model_len);
 
@@ -2375,5 +2389,63 @@ mod tests {
         assert_eq!(shrink_agent_columns(&[10, 20], 15), vec![6, 9]); // shrink proportionally
         assert_eq!(shrink_agent_columns(&[10, 20], 8), vec![4, 4]); // min per col
         assert_eq!(shrink_agent_columns(&[], 10), Vec::<u16>::new()); // empty input
+    }
+
+    // Overview 的 Model 列底纹按 Total tokens 归一化（除以最大值，非总和）。
+    // 以下两组测试复刻 draw_model_table 中 ratio -> share_width 的计算公式，
+    // 锁定其行为契约：最大模型填满整列、其余按比例、不溢出列宽、空数据安全。
+    fn normalized_bar_width(total_tokens: u64, max_total_tokens: u64, col_width: usize) -> usize {
+        let ratio = if max_total_tokens > 0 {
+            total_tokens as f64 / max_total_tokens as f64
+        } else {
+            0.0
+        };
+        (col_width as f64 * ratio).round() as usize
+    }
+
+    #[test]
+    fn overview_bar_max_normalization_boundary_values() {
+        let col_width = 24;
+        let max_tokens = 1_000_000u64;
+
+        // 最大模型：ratio 恒为 1.0（同值自除），填满整列
+        assert_eq!(
+            normalized_bar_width(max_tokens, max_tokens, col_width),
+            col_width
+        );
+
+        // 半量模型：恰好半宽
+        assert_eq!(normalized_bar_width(500_000, max_tokens, col_width), 12);
+
+        // 微量模型：四舍五入到 0
+        assert_eq!(normalized_bar_width(1, max_tokens, col_width), 0);
+
+        // 无数据（max_total_tokens = 0）：ratio = 0.0，安全降级为空底纹
+        assert_eq!(normalized_bar_width(0, 0, col_width), 0);
+
+        // 即使 total_tokens 等于 max（并列最大）也填满整列，不溢出
+        assert_eq!(
+            normalized_bar_width(max_tokens, max_tokens, col_width),
+            col_width
+        );
+    }
+
+    #[test]
+    fn overview_bar_max_normalization_is_proportional_and_capped() {
+        let col_width = 24;
+        let tokens = [1000u64, 500, 250, 125]; // max = 1000
+        let max_tokens = *tokens.iter().max().unwrap();
+
+        let widths: Vec<usize> = tokens
+            .iter()
+            .map(|&t| normalized_bar_width(t, max_tokens, col_width))
+            .collect();
+
+        // 比例正确：500 恰为 1000 的一半宽度
+        assert_eq!(widths, vec![24, 12, 6, 3]);
+        assert_eq!(widths[1], widths[0] / 2);
+
+        // 任何模型底纹都不超过列宽（ratio <= 1.0 保证）
+        assert!(widths.iter().all(|&w| w <= col_width));
     }
 }
