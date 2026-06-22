@@ -425,10 +425,15 @@ pub fn run_stats() -> Result<()> {
 /// 此函数将 `claude-*` 模型名中版本号部分的点号替换为连字符，
 /// 使之统一为 `claude-opus-4-7` 风格。非 Claude 模型保持原样（如 `gpt-5.4`）。
 pub(crate) fn normalize_model_name(model: &str) -> String {
+    // 先剥离 provider 前缀（取最后一个 '/' 之后的部分）
     let base_model = model
         .rsplit_once('/')
         .and_then(|(_, suffix)| (!suffix.is_empty()).then_some(suffix))
         .unwrap_or(model);
+
+    // 剥离尾部上下文窗口变体后缀，如 glm-5.2[1m] / gpt-4o[3m]
+    // 这类后缀只是同模型的上下文长度变体，统计与展示上应与原模型归并
+    let base_model = strip_context_variant_suffix(base_model);
 
     // 仅对 claude- 前缀的模型做归一化：版本号中的 "." → "-"
     if base_model.starts_with("claude-") {
@@ -449,6 +454,19 @@ pub(crate) fn normalize_model_name(model: &str) -> String {
         result
     } else {
         base_model.to_string()
+    }
+}
+
+/// 剥离尾部上下文窗口变体后缀，如 `[1m]` / `[3m]`。
+/// 正则与 probe 模块的 `resolve_api_model_id` 相同（`\[\d+m\]$`，大小写不敏感），
+/// 但当后缀是字符串全部内容时（如 `[1m]`）保留原样，避免产生空模型名。
+fn strip_context_variant_suffix(model: &str) -> &str {
+    use regex::Regex;
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)\[\d+m\]$").unwrap());
+    match re.find(model) {
+        Some(m) if m.start() > 0 => &model[..m.start()],
+        _ => model,
     }
 }
 
@@ -520,5 +538,34 @@ mod tests {
             normalize_model_name("Anthropic/claude-opus-4.7"),
             "claude-opus-4-7"
         );
+    }
+
+    #[test]
+    fn normalize_model_name_strips_context_variant_suffix() {
+        // 上下文窗口变体后缀应当被剥离，与原模型归并
+        assert_eq!(normalize_model_name("glm-5.2[1m]"), "glm-5.2");
+        assert_eq!(normalize_model_name("gpt-4o[3m]"), "gpt-4o");
+        assert_eq!(normalize_model_name("gpt-5.4[1m]"), "gpt-5.4");
+        // 大小写不敏感
+        assert_eq!(normalize_model_name("glm-5.2[1M]"), "glm-5.2");
+    }
+
+    #[test]
+    fn normalize_model_name_strips_variant_after_provider_prefix() {
+        assert_eq!(normalize_model_name("OpenAI/gpt-4o[1m]"), "gpt-4o");
+        assert_eq!(
+            normalize_model_name("Anthropic/claude-opus-4.7[1m]"),
+            "claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn normalize_model_name_keeps_unrelated_brackets() {
+        // 非变体后缀的括号不应被剥离
+        assert_eq!(normalize_model_name("model[1mm]"), "model[1mm]");
+        assert_eq!(normalize_model_name("[1m]"), "[1m]");
+        assert_eq!(normalize_model_name("model"), "model");
+        // 空串不应崩溃
+        assert_eq!(normalize_model_name(""), "");
     }
 }

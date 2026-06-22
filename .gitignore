@@ -1,3 +1,6 @@
 /target
 .omx/
 cx.db
+
+# remora local session state
+.remora/
