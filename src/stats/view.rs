@@ -1638,13 +1638,8 @@ fn draw_model_table(
         .collect();
     let header = Row::new(header_cells).height(2);
 
-    let widths = model_table_widths_with_agent_widths(
-        &sorted,
-        &visible_agent_widths,
-    );
-
     let title_text = format!(" {title} ");
-    let table = Table::new(rows, widths)
+    let table = Table::new(rows, constraints)
         .header(header)
         .column_spacing(TABLE_COLUMN_SPACING)
         .block(Block::default().borders(Borders::ALL).title(title_text));
@@ -2396,6 +2391,36 @@ mod tests {
         assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
         // With 103px wide terminal, all agents get ideal widths (no shrinking).
         // Only agents that fit at their ideal width are shown.
+    }
+
+    #[test]
+    fn model_table_narrow_terminal_hides_low_usage_agents() {
+        let sorted = vec![
+            ("qwen3.7-max".to_string(), usage(174_400_000, 547_900)),
+            ("deepseek-v4-pro".to_string(), usage(45_700_000, 281_400)),
+        ];
+        let cells = HashMap::from([
+            (
+                ("claude".to_string(), "qwen3.7-max".to_string()),
+                usage(174_400_000, 547_900),
+            ),
+            (
+                ("copilot".to_string(), "qwen3.7-max".to_string()),
+                usage(510_900, 59_900),
+            ),
+            (
+                ("codex".to_string(), "qwen3.7-max".to_string()),
+                usage(300, 100),
+            ),
+        ]);
+        let agent_columns = sorted_agents_by_usage(&cells, true);
+
+        // Narrow terminal (50px) — only fixed columns + the highest-usage agent
+        // can fit; low-usage agents are hidden entirely.
+        let widths = model_table_widths(50, &sorted, &cells, &agent_columns);
+        // Should have 3 fixed columns + at most 1 visible agent column
+        assert!(widths.len() <= 4);
+        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
     }
 
     #[test]
