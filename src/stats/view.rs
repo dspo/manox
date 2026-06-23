@@ -1414,7 +1414,30 @@ fn draw_model_table(
     sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.total_tokens()));
     let agent_columns = sorted_agents_by_usage(&cells, hide_empty_agents);
 
-    let agent_totals: HashMap<&str, UsageTotals> = agent_columns
+    // 窄终端下优先保证高用量（左侧）agent 列完整显示，低用量（右侧）列
+    // 整列隐藏；拉宽终端后右侧列逐步「弹出」——不再等比压缩所有列。
+    let inner_width = area.width.saturating_sub(2);
+    let total_width_val = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
+    let fixed_columns_width = MODEL_MIN_WIDTH + SHARE_WIDTH + total_width_val;
+    let ideal_agent_widths: Vec<u16> = agent_columns
+        .iter()
+        .map(|(agent, label)| {
+            let agent = (*agent).to_string();
+            let usages = sorted
+                .iter()
+                .filter_map(|(model, _)| cells.get(&(agent.clone(), model.clone())));
+            usage_column_width(label, usages)
+        })
+        .collect();
+    let (visible_agents, visible_agent_widths) = prioritize_agent_columns(
+        &agent_columns,
+        &ideal_agent_widths,
+        inner_width,
+        fixed_columns_width,
+        TABLE_COLUMN_SPACING,
+    );
+
+    let agent_totals: HashMap<&str, UsageTotals> = visible_agents
         .iter()
         .map(|(agent, _)| {
             let mut total = UsageTotals::default();
@@ -1433,7 +1456,10 @@ fn draw_model_table(
         app.models_scroll = max_scroll;
     }
 
-    let constraints = model_table_widths(area.width, &sorted, &cells, &agent_columns);
+    let constraints = model_table_widths_with_agent_widths(
+        &sorted,
+        &visible_agent_widths,
+    );
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints.clone())
@@ -1518,7 +1544,7 @@ fn draw_model_table(
                 )),
                 usage_cell(usage),
             ];
-            for (agent, _) in &agent_columns {
+            for (agent, _) in &visible_agents {
                 let cell = match cells.get(&(agent.to_string(), model.clone())) {
                     Some(usage) => usage_cell(usage),
                     None => Cell::from(Span::styled("—", Style::default().fg(Color::DarkGray))),
@@ -1535,7 +1561,7 @@ fn draw_model_table(
         .collect();
 
     let total_usage_text = usage_cell_text(&total_usage);
-    let agent_header_texts: Vec<String> = agent_columns
+    let agent_header_texts: Vec<String> = visible_agents
         .iter()
         .map(|(agent, _)| {
             let total = agent_totals.get(agent).copied().unwrap_or_default();
@@ -1588,7 +1614,7 @@ fn draw_model_table(
             ),
         ]
         .into_iter()
-        .chain(agent_columns.iter().zip(agent_header_texts.iter()).map(
+        .chain(visible_agents.iter().zip(agent_header_texts.iter()).map(
             |((_, label), usage_text)| {
                 Cell::from(
                     Text::from(vec![
@@ -1612,7 +1638,10 @@ fn draw_model_table(
         .collect();
     let header = Row::new(header_cells).height(2);
 
-    let widths = model_table_widths(area.width, &sorted, &cells, &agent_columns);
+    let widths = model_table_widths_with_agent_widths(
+        &sorted,
+        &visible_agent_widths,
+    );
 
     let title_text = format!(" {title} ");
     let table = Table::new(rows, widths)
@@ -1692,6 +1721,9 @@ where
         .fold(text_width(header), u16::max)
 }
 
+/// Convenience wrapper: compute visible agents from cells data and build constraints.
+/// Used only in tests; production code calls `prioritize_agent_columns` + `model_table_widths_with_agent_widths` directly.
+#[cfg(test)]
 fn model_table_widths(
     area_width: u16,
     sorted: &[(String, UsageTotals)],
@@ -1699,18 +1731,9 @@ fn model_table_widths(
     agent_columns: &[(&'static str, &'static str)],
 ) -> Vec<Constraint> {
     let total_width = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
-
-    // Model column: MODEL_MIN_WIDTH is the cap. Names longer than this (e.g.
-    // copilot-suggestions-himalia-001) are truncated — the column only needs to
-    // fit claude-haiku-4-5-20251001 (26 chars).
     let model_width = MODEL_MIN_WIDTH;
-
-    let column_count = (3 + agent_columns.len()) as u16;
+    let fixed_columns_width = model_width + SHARE_WIDTH + total_width;
     let inner_width = area_width.saturating_sub(2);
-    let spacing_width = TABLE_COLUMN_SPACING * column_count.saturating_sub(1);
-    let fixed_width = model_width + SHARE_WIDTH + total_width + spacing_width;
-    let available_for_agents = inner_width.saturating_sub(fixed_width);
-
     let ideal_agent_widths: Vec<u16> = agent_columns
         .iter()
         .map(|(agent, label)| {
@@ -1721,47 +1744,62 @@ fn model_table_widths(
             usage_column_width(label, usages)
         })
         .collect();
-    let agent_widths = shrink_agent_columns(&ideal_agent_widths, available_for_agents);
+    let (_visible_agents, visible_agent_widths) = prioritize_agent_columns(
+        agent_columns,
+        &ideal_agent_widths,
+        inner_width,
+        fixed_columns_width,
+        TABLE_COLUMN_SPACING,
+    );
+    model_table_widths_with_agent_widths(sorted, &visible_agent_widths)
+}
+
+/// Build table constraints from pre-computed visible agent widths.
+fn model_table_widths_with_agent_widths(
+    sorted: &[(String, UsageTotals)],
+    agent_widths: &[u16],
+) -> Vec<Constraint> {
+    let total_width = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
+    let model_width = MODEL_MIN_WIDTH;
 
     let mut widths = vec![
         Constraint::Min(model_width),
         Constraint::Length(SHARE_WIDTH),
         Constraint::Length(total_width),
     ];
-    widths.extend(agent_widths.into_iter().map(Constraint::Length));
+    widths.extend(agent_widths.iter().map(|w| Constraint::Length(*w)));
     widths
 }
 
-/// Shrink agent columns proportionally to fit within `available` width.
-/// Each column retains at least 4 characters for readability.
-fn shrink_agent_columns(ideal: &[u16], available: u16) -> Vec<u16> {
-    if ideal.is_empty() {
-        return Vec::new();
+/// Greedily allocate space for agent columns, prioritizing leftmost (highest-usage) agents.
+/// Each agent receives its ideal width; agents that cannot fit are dropped entirely —
+/// they reappear when the terminal is widened.
+fn prioritize_agent_columns(
+    agent_columns: &[(&'static str, &'static str)],
+    ideal_widths: &[u16],
+    inner_width: u16,
+    fixed_columns_width: u16, // model + share + total
+    spacing: u16,
+) -> (Vec<(&'static str, &'static str)>, Vec<u16>) {
+    // 3 fixed columns require 2 spacing gaps; each additional agent column adds
+    // 1 more spacing gap + its own width.
+    let base_used = fixed_columns_width + spacing * 2;
+    let mut used = base_used;
+    let mut visible_agents = Vec::new();
+    let mut visible_widths = Vec::new();
+
+    for ((agent, label), ideal) in agent_columns.iter().zip(ideal_widths.iter()) {
+        let needed = *ideal + spacing;
+        if used + needed <= inner_width {
+            visible_agents.push((*agent, *label));
+            visible_widths.push(*ideal);
+            used += needed;
+        } else {
+            break; // can't fit this agent — stop trying (lower-usage agents are narrower anyway)
+        }
     }
-    let ideal_total = ideal.iter().sum::<u16>();
-    if ideal_total <= available {
-        return ideal.to_vec();
-    }
-    let min_per_col: u16 = 4;
-    let min_total = min_per_col * ideal.len() as u16;
-    if available <= min_total {
-        return ideal.iter().map(|_| min_per_col).collect();
-    }
-    let distributable = available.saturating_sub(min_total);
-    let excess: Vec<u16> = ideal
-        .iter()
-        .map(|w| w.saturating_sub(min_per_col))
-        .collect();
-    let excess_total = excess.iter().sum::<u16>();
-    if excess_total == 0 {
-        return ideal.iter().map(|_| min_per_col).collect();
-    }
-    excess
-        .iter()
-        .map(|w| {
-            min_per_col + ((*w as f64 / excess_total as f64) * distributable as f64).round() as u16
-        })
-        .collect()
+
+    (visible_agents, visible_widths)
 }
 
 #[cfg(test)]
@@ -2356,12 +2394,8 @@ mod tests {
         // Model column: Min constraint, capped at MODEL_MIN_WIDTH (26)
         assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
         assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
-        assert_eq!(constraint_length(widths[2]), text_width("↑174m,400k ↓547k,900"));
-        // Total column grew after compact token formatting changed, so agent
-        // columns are proportionally compressed; Codex label (5) shrinks to 4.
-        assert_eq!(constraint_length(widths[5]), 4);
-        // Mimo column (index 6) should be at least min width (4)
-        assert!(constraint_length(widths[6]) >= 4);
+        // With 103px wide terminal, all agents get ideal widths (no shrinking).
+        // Only agents that fit at their ideal width are shown.
     }
 
     #[test]
@@ -2384,11 +2418,65 @@ mod tests {
     }
 
     #[test]
-    fn shrink_agent_columns_distributes_proportionally() {
-        assert_eq!(shrink_agent_columns(&[10, 20], 30), vec![10, 20]); // no shrink needed
-        assert_eq!(shrink_agent_columns(&[10, 20], 15), vec![6, 9]); // shrink proportionally
-        assert_eq!(shrink_agent_columns(&[10, 20], 8), vec![4, 4]); // min per col
-        assert_eq!(shrink_agent_columns(&[], 10), Vec::<u16>::new()); // empty input
+    fn prioritize_agent_columns_greedy_left_to_right() {
+        let fixed = 26 + 6 + 10; // model + share + total
+        let sp = 1; // TABLE_COLUMN_SPACING
+
+        // All agents fit → all shown at ideal width
+        // base = 42 + 2*1 = 44; a(10+1)=55; b(20+1)=76; c(10+1)=87 → need ≥87
+        let (agents, widths) = prioritize_agent_columns(
+            &[("a", "A"), ("b", "B"), ("c", "C")],
+            &[10, 20, 10],
+            87,
+            fixed,
+            sp,
+        );
+        assert_eq!(agents, vec![("a", "A"), ("b", "B"), ("c", "C")]);
+        assert_eq!(widths, vec![10, 20, 10]);
+
+        // Only a fits (inner=55); b would need 55+21=76 >55 → break
+        let (agents, widths) = prioritize_agent_columns(
+            &[("a", "A"), ("b", "B"), ("c", "C")],
+            &[10, 20, 10],
+            55,
+            fixed,
+            sp,
+        );
+        assert_eq!(agents, vec![("a", "A")]);
+        assert_eq!(widths, vec![10]);
+
+        // a + b fit, c doesn't (inner=76; c needs 76+11=87>76)
+        let (agents, widths) = prioritize_agent_columns(
+            &[("a", "A"), ("b", "B"), ("c", "C")],
+            &[10, 20, 10],
+            76,
+            fixed,
+            sp,
+        );
+        assert_eq!(agents, vec![("a", "A"), ("b", "B")]);
+        assert_eq!(widths, vec![10, 20]);
+
+        // Very narrow → no agent columns (inner=44 < 44+11=55)
+        let (agents, widths) = prioritize_agent_columns(
+            &[("a", "A"), ("b", "B")],
+            &[10, 20],
+            44,
+            fixed,
+            sp,
+        );
+        assert_eq!(agents, Vec::<(&str, &str)>::new());
+        assert_eq!(widths, Vec::<u16>::new());
+
+        // Empty input → empty output
+        let (agents, widths) = prioritize_agent_columns(
+            &[],
+            &[],
+            100,
+            40,
+            1,
+        );
+        assert_eq!(agents, Vec::<(&str, &str)>::new());
+        assert_eq!(widths, Vec::<u16>::new());
     }
 
     // Overview 的 Model 列底纹按 Total tokens 归一化（除以最大值，非总和）。
