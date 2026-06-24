@@ -24,7 +24,6 @@ providers:
     models:
       model-id:
         swe_pro: "string (optional; SWE-bench Pro 成绩)"
-        lcb_pro: "string (optional; LiveCodeBench Pro 成绩)"
         hle: "string (optional; Humanity's Last Exam 成绩)"
         desc: "string (optional)"
         wire_apis: ["enum: anthropic | responses | completions"]
