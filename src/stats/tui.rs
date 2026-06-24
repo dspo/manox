@@ -11,7 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use std::io;
 use std::time::Duration;
 
-use super::types::{Period, UsageRecord};
+use super::types::{Period, RaceInterval, RaceWindow, UsageRecord};
 use super::view::draw;
 
 const RACE_FRAME_DURATION: Duration = Duration::from_millis(83);
@@ -19,24 +19,21 @@ const RACE_FRAME_DURATION: Duration = Duration::from_millis(83);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChartTab {
     Overview,
-    AllTimeRace,
-    RollingRace,
+    Race,
 }
 
 impl ChartTab {
     pub(super) fn label(self) -> &'static str {
         match self {
             ChartTab::Overview => "Overview",
-            ChartTab::AllTimeRace => "All Time Race",
-            ChartTab::RollingRace => "7-Days Rolling Race",
+            ChartTab::Race => "Models Tokens Race",
         }
     }
 
     fn next(self) -> Self {
         match self {
-            ChartTab::Overview => ChartTab::AllTimeRace,
-            ChartTab::AllTimeRace => ChartTab::RollingRace,
-            ChartTab::RollingRace => ChartTab::Overview,
+            ChartTab::Overview => ChartTab::Race,
+            ChartTab::Race => ChartTab::Overview,
         }
     }
 }
@@ -48,6 +45,8 @@ pub(super) struct StatsApp {
     pub(super) models_scroll: usize,
     pub(super) chart_tab: ChartTab,
     pub(super) race_tick: usize,
+    pub(super) race_interval: RaceInterval,
+    pub(super) race_window: RaceWindow,
 }
 
 impl StatsApp {
@@ -59,6 +58,8 @@ impl StatsApp {
             models_scroll: 0,
             chart_tab: ChartTab::Overview,
             race_tick: 0,
+            race_interval: RaceInterval::AllTime,
+            race_window: RaceWindow::PerDay,
         }
     }
 
@@ -71,10 +72,7 @@ impl StatsApp {
     }
 
     fn advance_race(&mut self) {
-        if matches!(
-            self.chart_tab,
-            ChartTab::AllTimeRace | ChartTab::RollingRace
-        ) {
+        if matches!(self.chart_tab, ChartTab::Race) {
             self.race_tick = self.race_tick.saturating_add(1);
         }
     }
@@ -82,10 +80,21 @@ impl StatsApp {
     fn cycle_chart_tab(&mut self) {
         self.chart_tab = self.chart_tab.next();
         self.models_scroll = 0;
-        if matches!(
-            self.chart_tab,
-            ChartTab::AllTimeRace | ChartTab::RollingRace
-        ) {
+        if matches!(self.chart_tab, ChartTab::Race) {
+            self.race_tick = 0;
+        }
+    }
+
+    fn cycle_race_interval(&mut self) {
+        if matches!(self.chart_tab, ChartTab::Race) {
+            self.race_interval = self.race_interval.cycle();
+            self.race_tick = 0;
+        }
+    }
+
+    fn cycle_race_window(&mut self) {
+        if matches!(self.chart_tab, ChartTab::Race) {
+            self.race_window = self.race_window.cycle();
             self.race_tick = 0;
         }
     }
@@ -133,7 +142,14 @@ fn event_loop<B: ratatui::backend::Backend>(
             KeyCode::Char('3') => app.period = Period::Last7,
             KeyCode::Char('4') => app.period = Period::Last30,
             KeyCode::Char('5') => app.period = Period::All,
-            KeyCode::Char('r') => app.period = app.period.cycle(),
+            KeyCode::Char('r') => {
+                if matches!(app.chart_tab, ChartTab::Overview) {
+                    app.period = app.period.cycle();
+                } else {
+                    app.cycle_race_interval();
+                }
+            }
+            KeyCode::Char('d') => app.cycle_race_window(),
             KeyCode::Tab | KeyCode::BackTab => app.cycle_chart_tab(),
             KeyCode::Down | KeyCode::Char('j') => {
                 app.models_scroll = app.models_scroll.saturating_add(1)

@@ -99,6 +99,63 @@ impl Period {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RaceInterval {
+    AllTime,
+    LastMonthDays,
+}
+
+impl RaceInterval {
+    pub(super) fn label(self, today: &str) -> String {
+        match self {
+            RaceInterval::AllTime => "All time".to_string(),
+            RaceInterval::LastMonthDays => {
+                let days = super::date::previous_month_days(today);
+                format!("Last {days} days")
+            }
+        }
+    }
+
+    pub(super) fn cycle(self) -> Self {
+        match self {
+            RaceInterval::AllTime => RaceInterval::LastMonthDays,
+            RaceInterval::LastMonthDays => RaceInterval::AllTime,
+        }
+    }
+
+    pub(super) fn includes(self, date: &str, today: &str) -> bool {
+        match self {
+            RaceInterval::AllTime => true,
+            RaceInterval::LastMonthDays => {
+                let days = super::date::previous_month_days(today) as i64;
+                super::date::days_diff(date, today).is_some_and(|d| (0..days).contains(&d))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RaceWindow {
+    PerDay,
+    Rolling7,
+}
+
+impl RaceWindow {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            RaceWindow::PerDay => "Per day",
+            RaceWindow::Rolling7 => "Rolling 7 days",
+        }
+    }
+
+    pub(super) fn cycle(self) -> Self {
+        match self {
+            RaceWindow::PerDay => RaceWindow::Rolling7,
+            RaceWindow::Rolling7 => RaceWindow::PerDay,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +185,40 @@ mod tests {
         assert!(!Period::Lastday.includes("2026-05-29", "2026-05-29"));
         assert!(!Period::Lastday.includes("2026-05-27", "2026-05-29"));
         assert!(!Period::Lastday.includes("2026-05-30", "2026-05-29"));
+    }
+
+    #[test]
+    fn race_interval_cycle_alternates() {
+        assert_eq!(RaceInterval::AllTime.cycle(), RaceInterval::LastMonthDays);
+        assert_eq!(RaceInterval::LastMonthDays.cycle(), RaceInterval::AllTime);
+    }
+
+    #[test]
+    fn race_interval_label() {
+        assert_eq!(RaceInterval::AllTime.label("2026-06-24"), "All time");
+        // 6 月 → 上月 5 月有 31 天
+        assert_eq!(RaceInterval::LastMonthDays.label("2026-06-24"), "Last 31 days");
+    }
+
+    #[test]
+    fn race_interval_last_month_days_includes_matches_period_last30() {
+        // 6 月 24 → 上月 5 月有 31 天，所以 Last 31 days 覆盖 5 月 25 ~ 6 月 24（不含 5 月 24）
+        // 这与 Period::Last30 的行为一致：(0..days).contains
+        assert!(RaceInterval::LastMonthDays.includes("2026-05-25", "2026-06-24"));
+        assert!(RaceInterval::LastMonthDays.includes("2026-06-24", "2026-06-24"));
+        assert!(!RaceInterval::LastMonthDays.includes("2026-05-24", "2026-06-24"));
+        assert!(!RaceInterval::LastMonthDays.includes("2026-06-25", "2026-06-24"));
+    }
+
+    #[test]
+    fn race_window_cycle_alternates() {
+        assert_eq!(RaceWindow::PerDay.cycle(), RaceWindow::Rolling7);
+        assert_eq!(RaceWindow::Rolling7.cycle(), RaceWindow::PerDay);
+    }
+
+    #[test]
+    fn race_window_label() {
+        assert_eq!(RaceWindow::PerDay.label(), "Per day");
+        assert_eq!(RaceWindow::Rolling7.label(), "Rolling 7 days");
     }
 }

@@ -11,7 +11,7 @@ use super::aggregate::{top_models_covering, totals_by_agent_model, totals_by_mod
 use super::date::{date_offset, days_diff};
 use super::format::{format_tokens, short_date};
 use super::tui::{ChartTab, StatsApp};
-use super::types::{Period, UsageRecord, UsageTotals};
+use super::types::{Period, RaceInterval, RaceWindow, UsageRecord, UsageTotals};
 use super::{MATRIX_AGENTS, PALETTE};
 
 type ChartSeries = (String, Vec<f64>, Color);
@@ -34,23 +34,6 @@ const RACE_FINAL_DISSOLVE_TICKS: usize = RACE_TWEEN_STEPS * 2;
 const RACE_INITIAL_COALESCE_TICKS: usize = RACE_TWEEN_STEPS * 2;
 const RACE_TRANSITION_SEED: u32 = 0x1234_5678;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RaceMode {
-    /// 自 day0 起累计 token 用量：典型问题为「先发优势」始终占据前列。
-    AllTime,
-    /// 滚动 7 天 token 用量：每个 frame 的值是该 frame 日期 + 前 6 天的合计。
-    /// 自首个能形成完整 7 天窗口的日期（min_date + 6）开始播放至最新记录日。
-    Rolling7,
-}
-
-impl RaceMode {
-    fn title(self) -> &'static str {
-        match self {
-            RaceMode::AllTime => "All time",
-            RaceMode::Rolling7 => "Rolling 7 days",
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 struct RaceEntry {
@@ -113,11 +96,7 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         ),
         Span::raw("· Token Usage Dashboard   "),
     ];
-    for tab in [
-        ChartTab::Overview,
-        ChartTab::AllTimeRace,
-        ChartTab::RollingRace,
-    ] {
+    for tab in [ChartTab::Overview, ChartTab::Race] {
         let style = if app.chart_tab == tab {
             Style::default()
                 .fg(Color::Black)
@@ -147,12 +126,19 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         Period::All => "1 Today  2 Yda  3 7d  4 Mo  [5] All",
     };
     let view_hint = match app.chart_tab {
-        ChartTab::Overview => "Overview",
-        ChartTab::AllTimeRace => "All Time Race · cumulative",
-        ChartTab::RollingRace => "7-Days Rolling Race · rolling 7 days",
+        ChartTab::Overview => "Overview".to_string(),
+        ChartTab::Race => {
+            let interval_label = app.race_interval.label(&app.today);
+            let window_label = app.race_window.label();
+            format!("Race · {interval_label} · {window_label}")
+        }
+    };
+    let keys_hint = match app.chart_tab {
+        ChartTab::Overview => "r cycle period",
+        ChartTab::Race => "r cycle interval   d cycle window",
     };
     let text = format!(
-        "{period_hint}   r cycle dates   Tab switch view   ↑↓/j/k scroll   {view_hint}   q quit"
+        "{period_hint}   {keys_hint}   Tab switch view   ↑↓/j/k scroll   {view_hint}   q quit"
     );
     let p = Paragraph::new(Line::from(Span::styled(
         text,
@@ -167,28 +153,38 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(STEP_CHART_HEIGHT),
                     Constraint::Length(1),
+                    Constraint::Length(STEP_CHART_HEIGHT),
                     Constraint::Min(0),
                 ])
                 .split(area);
-            draw_tokens_per_day_chart(f, chunks[0], app);
-            draw_period_switch(f, chunks[1], app);
+            draw_period_switch(f, chunks[0], app);
+            draw_tokens_per_day_chart(f, chunks[1], app);
             draw_overview_model_list(f, chunks[2], app);
         }
-        ChartTab::AllTimeRace | ChartTab::RollingRace => {
-            let mode = match app.chart_tab {
-                ChartTab::AllTimeRace => RaceMode::AllTime,
-                ChartTab::RollingRace => RaceMode::Rolling7,
-                _ => unreachable!(),
+        ChartTab::Race => {
+            let filtered_records: Vec<UsageRecord> = if matches!(
+                app.race_interval,
+                RaceInterval::AllTime
+            ) {
+                app.records.clone()
+            } else {
+                app.records
+                    .iter()
+                    .filter(|r| app.race_interval.includes(&r.date, &app.today))
+                    .cloned()
+                    .collect()
             };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(STEP_CHART_HEIGHT), Constraint::Min(0)])
                 .split(area);
-            let frames = race_frames(&app.records, mode);
-            draw_bar_chart_race(f, chunks[0], app, &frames, mode);
-            draw_dynamic_model_list(f, chunks[1], app, &frames, mode);
+            let frames = race_frames(&filtered_records, app.race_window);
+            let interval_label = app.race_interval.label(&app.today);
+            let window_label = app.race_window.label();
+            let title_suffix = format!("{interval_label} · {window_label}");
+            draw_bar_chart_race(f, chunks[0], app, &frames, &title_suffix);
+            draw_dynamic_model_list(f, chunks[1], app, &frames, app.race_window);
             apply_race_transition(
                 f.buffer_mut(),
                 area,
@@ -251,11 +247,9 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         chart_series.push((model.clone(), values, color));
     }
 
-    let period_label = app.period.label(&app.today);
     draw_step_chart(
         f,
         area,
-        &period_label,
         &min_date,
         &max_date,
         day_count,
@@ -269,10 +263,10 @@ fn draw_bar_chart_race(
     area: Rect,
     app: &StatsApp,
     frames: &[RaceFrame],
-    mode: RaceMode,
+    title_suffix: &str,
 ) {
     let chart_area = fixed_chart_area(area);
-    let title = format!("Model Tokens Top 15 · {}", mode.title());
+    let title = format!("Model Tokens Top 15 · {title_suffix}");
     if chart_area.width < 32 || chart_area.height < 6 {
         f.render_widget(Paragraph::new(title), chart_area);
         return;
@@ -292,7 +286,7 @@ fn draw_bar_chart_race(
         return;
     };
     let max_value = race_max_value(frames);
-    draw_race_frame(f, chart_area, previous, current, tween, max_value, mode);
+    draw_race_frame(f, chart_area, previous, current, tween, max_value, title_suffix);
 }
 
 fn draw_race_frame(
@@ -302,7 +296,7 @@ fn draw_race_frame(
     current: &RaceFrame,
     tween: f64,
     max_value: u64,
-    mode: RaceMode,
+    title_suffix: &str,
 ) {
     let s = smoothstep(tween);
     let prev_in: u64 = previous.cells.values().map(|u| u.in_tokens).sum();
@@ -313,7 +307,7 @@ fn draw_race_frame(
     let total_out = interpolate_u64(prev_out, curr_out, s);
     let title = Line::from(vec![
         Span::styled(
-            format!(" Model Tokens Top 15 · {} ", mode.title()),
+            format!(" Model Tokens Top 15 · {title_suffix} "),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -445,7 +439,6 @@ fn draw_race_frame(
 fn draw_step_chart(
     f: &mut ratatui::Frame,
     area: Rect,
-    period_label: &str,
     min_date: &str,
     max_date: &str,
     day_count: usize,
@@ -454,10 +447,7 @@ fn draw_step_chart(
 ) {
     let chart_area = fixed_chart_area(area);
     if chart_area.width < 24 || chart_area.height < 6 {
-        f.render_widget(
-            Paragraph::new(format!("Tokens per Day · {period_label}")),
-            chart_area,
-        );
+        f.render_widget(Paragraph::new("Tokens per Day"), chart_area);
         return;
     }
 
@@ -474,7 +464,7 @@ fn draw_step_chart(
         .max(4);
 
     let title = Line::from(Span::styled(
-        format!(" Tokens per Day · {period_label} "),
+        " Tokens per Day ",
         Style::default().add_modifier(Modifier::BOLD),
     ));
     f.render_widget(
@@ -589,7 +579,7 @@ fn chart_date_range(
 /// `min_date + 6`，此时累计 7 天数据。
 const ROLLING_WINDOW_DAYS: i64 = 7;
 
-fn race_frames(records: &[UsageRecord], mode: RaceMode) -> Vec<RaceFrame> {
+fn race_frames(records: &[UsageRecord], window: RaceWindow) -> Vec<RaceFrame> {
     let Some((min_date, max_date)) = record_date_range(records) else {
         return Vec::new();
     };
@@ -609,14 +599,14 @@ fn race_frames(records: &[UsageRecord], mode: RaceMode) -> Vec<RaceFrame> {
             .add_record(record);
     }
 
-    let snapshots = match mode {
-        RaceMode::AllTime => all_time_snapshots(&min_date, &max_date, day_count, &deltas_by_date),
-        RaceMode::Rolling7 => rolling_snapshots(&min_date, &max_date, day_count, &deltas_by_date),
+    let snapshots = match window {
+        RaceWindow::PerDay => all_time_snapshots(&min_date, &max_date, day_count, &deltas_by_date),
+        RaceWindow::Rolling7 => rolling_snapshots(&min_date, &max_date, day_count, &deltas_by_date),
     };
 
-    let start_idx = match mode {
-        RaceMode::AllTime => 0,
-        RaceMode::Rolling7 => (ROLLING_WINDOW_DAYS - 1) as usize,
+    let start_idx = match window {
+        RaceWindow::PerDay => 0,
+        RaceWindow::Rolling7 => (ROLLING_WINDOW_DAYS - 1) as usize,
     };
 
     let mut frames = Vec::with_capacity(day_count.saturating_sub(start_idx));
@@ -1333,7 +1323,7 @@ fn draw_dynamic_model_list(
     area: Rect,
     app: &mut StatsApp,
     frames: &[RaceFrame],
-    mode: RaceMode,
+    window: RaceWindow,
 ) {
     let Some((previous, current, tween)) = current_race_frame(app, frames) else {
         draw_model_table(
@@ -1359,14 +1349,13 @@ fn draw_dynamic_model_list(
         .count();
     let total_in: u64 = displayed_totals.values().map(|u| u.in_tokens).sum();
     let total_out: u64 = displayed_totals.values().map(|u| u.out_tokens).sum();
+    let interval_label = app.race_interval.label(&app.today);
+    let window_label = window.label();
     let date_short = short_date(&current.date);
+    let total_in_fmt = format_tokens(total_in);
+    let total_out_fmt = format_tokens(total_out);
     let title = format!(
-        "Model Tokens Top {} · {} {} ↑{} ↓{}",
-        model_count,
-        mode.title(),
-        date_short,
-        format_tokens(total_in),
-        format_tokens(total_out),
+        "Model Tokens Top {model_count} · {interval_label} · {window_label} {date_short} ↑{total_in_fmt} ↓{total_out_fmt}"
     );
     draw_model_table(
         f,
@@ -2060,7 +2049,7 @@ mod tests {
             record("beta", "2026-05-29", 200, 0),
         ];
 
-        let frames = race_frames(&records, RaceMode::AllTime);
+        let frames = race_frames(&records, RaceWindow::PerDay);
 
         assert_eq!(frames.len(), 3);
         // day0: alpha 的真实数据
@@ -2088,7 +2077,7 @@ mod tests {
             record("alpha", "2026-05-27", 100, 20),
             record("beta", "2026-05-31", 200, 0),
         ];
-        let frames = race_frames(&records, RaceMode::AllTime);
+        let frames = race_frames(&records, RaceWindow::PerDay);
 
         assert_eq!(frames.len(), 5);
         // day0: alpha 真实数据
@@ -2113,7 +2102,7 @@ mod tests {
             .map(|idx| record(&format!("model-{idx:02}"), "2026-05-29", idx + 1, 0))
             .collect();
 
-        let frames = race_frames(&records, RaceMode::AllTime);
+        let frames = race_frames(&records, RaceWindow::PerDay);
         let models: Vec<&str> = frames[0]
             .entries
             .iter()
@@ -2132,7 +2121,7 @@ mod tests {
             record("beta", "2026-05-28", 1000, 0),
         ];
 
-        let frames = race_frames(&records, RaceMode::AllTime);
+        let frames = race_frames(&records, RaceWindow::PerDay);
 
         assert_eq!(frames[0].entries[0].value, 100);
         assert_eq!(race_max_value(&frames), 1000);
@@ -2149,7 +2138,7 @@ mod tests {
             })
             .collect();
 
-        let frames = race_frames(&records, RaceMode::Rolling7);
+        let frames = race_frames(&records, RaceWindow::Rolling7);
 
         // day0..day6（7 天）作为首个 frame，day1..day7（次 7 天）作为第二帧。
         assert_eq!(frames.len(), 4); // day6, day7, day8, day9
@@ -2193,7 +2182,7 @@ mod tests {
             record("beta", "2026-05-19", 10, 0),
         ];
 
-        let frames = race_frames(&records, RaceMode::Rolling7);
+        let frames = race_frames(&records, RaceWindow::Rolling7);
         // 末个 frame (2026-05-19) 窗口 [05-13, 05-19]：alpha 在窗口外，值为 0。
         let last = frames.last().expect("rolling race has frames");
         let last_models: Vec<&str> = last
@@ -2218,7 +2207,7 @@ mod tests {
             })
             .collect();
 
-        let frames = race_frames(&records, RaceMode::Rolling7);
+        let frames = race_frames(&records, RaceWindow::Rolling7);
         // 末个窗口的 alpha 累计应 = 6*10 + 5000
         assert_eq!(
             frames.last().unwrap().entries[0].value,
@@ -2237,7 +2226,7 @@ mod tests {
             agent_record("codex", "beta", "2026-05-28", 300, 0),
         ];
 
-        let frames = race_frames(&records, RaceMode::AllTime);
+        let frames = race_frames(&records, RaceWindow::PerDay);
 
         assert_eq!(
             frames[0]
