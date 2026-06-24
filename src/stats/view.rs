@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::aggregate::{top_models_covering, totals_by_agent_model, totals_by_model};
 use super::date::{date_offset, days_diff};
-use super::format::{format_tokens, short_date};
+use super::format::{format_share, format_tokens, short_date};
 use super::tui::{ChartTab, StatsApp};
 use super::types::{Period, RaceInterval, RaceWindow, UsageRecord, UsageTotals};
 use super::{MATRIX_AGENTS, PALETTE};
@@ -1529,7 +1529,7 @@ fn draw_model_table(
             let mut row_cells = vec![
                 model_cell,
                 Cell::from(Span::styled(
-                    format!("{:.1}%", pct),
+                    format_share(pct),
                     Style::default().fg(Color::DarkGray),
                 )),
                 usage_cell(usage),

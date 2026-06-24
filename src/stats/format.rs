@@ -53,9 +53,46 @@ pub(super) fn iso_from_unix_ms(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// 格式化占比百分比。
+///
+/// 正常值保留 1 位小数（如 `42.3%`）。
+/// 当值大于 0 但四舍五入后会变成 `0.0%`（即 pct < 0.05），
+/// 显示为 `<0.1%` 以避免歧义——`0.0%` 容易让人误以为模型未被使用。
+pub(super) fn format_share(pct: f64) -> String {
+    if pct > 0.0 && pct < 0.05 {
+        "<0.1%".to_string()
+    } else {
+        format!("{:.1}%", pct)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_tokens;
+    use super::{format_share, format_tokens};
+
+    #[test]
+    fn format_share_normal_values() {
+        assert_eq!(format_share(42.3), "42.3%");
+        assert_eq!(format_share(0.1), "0.1%");
+        assert_eq!(format_share(100.0), "100.0%");
+        assert_eq!(format_share(0.0), "0.0%");
+    }
+
+    #[test]
+    fn format_share_small_nonzero_values() {
+        // 大于 0 但四舍五入为 0.0% 的值，显示 <0.1% 避免歧义
+        assert_eq!(format_share(0.04), "<0.1%");
+        assert_eq!(format_share(0.01), "<0.1%");
+        assert_eq!(format_share(0.001), "<0.1%");
+    }
+
+    #[test]
+    fn format_share_boundary() {
+        // 0.05 是四舍五入的边界：0.05 → 0.1%（刚好不会变成 0.0%）
+        assert_eq!(format_share(0.05), "0.1%");
+        // 0.049 四舍五入为 0.0%，所以显示 <0.1%
+        assert_eq!(format_share(0.049), "<0.1%");
+    }
 
     #[test]
     fn format_tokens_uses_integer_units_with_remainder() {
