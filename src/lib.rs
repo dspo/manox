@@ -65,6 +65,8 @@ struct ProviderConfig {
     models: BTreeMap<String, ProviderModelConfig>,
     #[serde(default)]
     endpoints: BTreeMap<String, ProviderEndpointSpec>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -332,6 +334,10 @@ impl ResolvedModel {
                 .filter(|w| *w != WireApi::Unavailable)
                 .collect()
         };
+        // 合并 provider 级和 model 级环境变量：provider 为底，model 覆盖同名变量。
+        let mut merged_env = provider.env.clone();
+        merged_env.extend(model.env.clone());
+
         Self {
             id: model.id.clone(),
             swe_pro: model.swe_pro.clone().unwrap_or_else(|| "—".to_string()),
@@ -344,7 +350,7 @@ impl ResolvedModel {
             endpoint_url: endpoint.url.clone(),
             visible_agents: effective_agents_for_model(config, provider, endpoint, model),
             copilot_auth: CopilotAuth::from_endpoint(endpoint),
-            env: model.env.clone(),
+            env: merged_env,
         }
     }
 
@@ -581,6 +587,7 @@ struct ResolvedProvider {
     name: String,
     has_endpoints: bool,
     apikey_source: Option<String>,
+    env: BTreeMap<String, String>,
 }
 
 impl ResolvedProvider {
@@ -589,6 +596,7 @@ impl ResolvedProvider {
             name: config.name.clone(),
             has_endpoints: config.has_endpoints(),
             apikey_source: config.apikey_source.clone(),
+            env: config.env.clone(),
         }
     }
 
@@ -1346,6 +1354,7 @@ fn providers_for_agent(config: &CxConfig, agent_id: &str) -> Vec<ResolvedProvide
         name: ADD_PROVIDER_SENTINEL.to_string(),
         has_endpoints: false,
         apikey_source: None,
+        env: BTreeMap::new(),
     });
     providers
 }
@@ -2378,12 +2387,16 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         }
     }
 
-    // Agent 级别环境变量
+    // Agent 级别环境变量（最低优先级）
     env.extend(selection.agent_env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
-    // Model 级别环境变量（覆盖 agent 同名变量）
+    // Provider + Model 级别环境变量。
+    // ResolvedModel.env 已在 from_config 中合并 provider + model env（model 优先），
+    // 无 model 时回落为 provider env。均覆盖 agent 同名变量。
     if let Some(ref model) = selection.model {
         env.extend(model.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    } else {
+        env.extend(provider.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 
     let summary = match &selection.model {
@@ -2693,6 +2706,7 @@ fn collect_new_provider_operation(
         apikey_source,
         models: BTreeMap::new(),
         endpoints,
+        env: BTreeMap::new(),
     };
 
     if add_model_now {
@@ -4043,6 +4057,7 @@ mod tests {
                 apikey_source: Some("literal:test".into()),
                 models: BTreeMap::new(),
                 endpoints: BTreeMap::new(),
+                env: BTreeMap::new(),
             }],
             agents: vec![
                 AgentConfig {
@@ -4128,6 +4143,7 @@ mod tests {
                         ProviderEndpointSpec::Url("https://example.com/v1".into()),
                     ),
                 ]),
+                env: BTreeMap::new(),
             }],
             agents: default_agent_configs(),
         }
@@ -4257,6 +4273,7 @@ mod tests {
                 name: "Codex Default".into(),
                 has_endpoints: false,
                 apikey_source: None,
+                env: BTreeMap::new(),
             },
             model: None,
             injected_models: Vec::new(),
@@ -4280,6 +4297,7 @@ mod tests {
                 name: "Test".into(),
                 has_endpoints: false,
                 apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
             },
             model: None,
             injected_models: Vec::new(),
@@ -4314,6 +4332,7 @@ mod tests {
                 name: "DashScope".into(),
                 has_endpoints: true,
                 apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
             },
             model: Some(ResolvedModel {
                 id: "qwen3.6-plus".into(),
@@ -4373,6 +4392,7 @@ mod tests {
                 name: "Packy API".into(),
                 has_endpoints: true,
                 apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
             },
             model: Some(ResolvedModel {
                 id: "claude-opus-4-7".into(),
@@ -4428,6 +4448,7 @@ mod tests {
                 name: "Default".into(),
                 has_endpoints: false,
                 apikey_source: None,
+                env: BTreeMap::new(),
             },
             model: None,
             injected_models: Vec::new(),
@@ -4454,6 +4475,7 @@ mod tests {
                 name: "Test".into(),
                 has_endpoints: false,
                 apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
             },
             model: None,
             injected_models: Vec::new(),
@@ -4479,6 +4501,7 @@ mod tests {
                 name: "DashScope".into(),
                 has_endpoints: true,
                 apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
             },
             model: Some(ResolvedModel {
                 id: "glm-5.1".into(),
@@ -4525,6 +4548,7 @@ mod tests {
                 name: "DashScope".into(),
                 has_endpoints: true,
                 apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
             },
             model: Some(ResolvedModel {
                 id: "glm-5.1".into(),
@@ -4551,6 +4575,135 @@ mod tests {
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
+    #[test]
+    fn provider_env_is_injected_and_overrides_agent_env() {
+        let fake_binary = create_fake_binary("claude");
+        let mut agent_env = BTreeMap::new();
+        agent_env.insert("SHARED".into(), "from-agent".into());
+        agent_env.insert("AGENT_ONLY".into(), "agent".into());
+
+        let mut provider_env = BTreeMap::new();
+        provider_env.insert("SHARED".into(), "from-provider".into());
+        provider_env.insert("PROVIDER_ONLY".into(), "provider".into());
+
+        let selection = Selection {
+            agent_id: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
+            agent_env,
+            selected_wire_api: WireApi::Anthropic,
+            provider: ResolvedProvider {
+                name: "Test".into(),
+                has_endpoints: false,
+                apikey_source: Some("literal:test-key".into()),
+                env: provider_env,
+            },
+            model: None,
+            injected_models: Vec::new(),
+        };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        // Provider overrides agent
+        assert_eq!(spec.env.get("SHARED"), Some(&"from-provider".into()));
+        assert_eq!(spec.env.get("AGENT_ONLY"), Some(&"agent".into()));
+        assert_eq!(spec.env.get("PROVIDER_ONLY"), Some(&"provider".into()));
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
+    fn model_env_overrides_provider_env() {
+        let fake_binary = create_fake_binary("claude");
+        let mut provider_env = BTreeMap::new();
+        provider_env.insert("SHARED".into(), "from-provider".into());
+        provider_env.insert("PROVIDER_ONLY".into(), "provider".into());
+
+        let mut model_env = BTreeMap::new();
+        model_env.insert("SHARED".into(), "from-model".into());
+
+        let mut merged_env = provider_env.clone();
+        merged_env.extend(model_env.clone());
+
+        let selection = Selection {
+            agent_id: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Responses,
+            provider: ResolvedProvider {
+                name: "DashScope".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+                env: provider_env,
+            },
+            model: Some(ResolvedModel {
+                id: "glm-5.1".into(),
+                swe_pro: "—".into(),
+                hle: "—".into(),
+                desc: String::new(),
+                context: "—".into(),
+                wire_api: WireApi::Anthropic,
+                model_wire_apis: vec![WireApi::Anthropic],
+                provider_name: "DashScope".into(),
+                endpoint_url: "https://example.com/anthropic".into(),
+                visible_agents: vec!["claude".into()],
+                copilot_auth: CopilotAuth::ApiKey,
+                env: merged_env,
+            }),
+            injected_models: Vec::new(),
+        };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        // Model overrides provider for shared key
+        assert_eq!(spec.env.get("SHARED"), Some(&"from-model".into()));
+        // Provider-only key is still present (via merged model.env)
+        assert_eq!(spec.env.get("PROVIDER_ONLY"), Some(&"provider".into()));
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
+    fn resolved_model_env_merges_provider_and_model_env() {
+        let mut provider_env = BTreeMap::new();
+        provider_env.insert("PROVIDER_VAR".into(), "pv".into());
+        provider_env.insert("SHARED".into(), "from-provider".into());
+
+        let mut model_only_env = BTreeMap::new();
+        model_only_env.insert("MODEL_VAR".into(), "mv".into());
+        model_only_env.insert("SHARED".into(), "from-model".into());
+
+        let provider = ProviderConfig {
+            name: "Test".into(),
+            apikey_source: None,
+            models: BTreeMap::from([(
+                "m1".into(),
+                ProviderModelConfig {
+                    swe_pro: None,
+                    hle: None,
+                    desc: None,
+                    context: None,
+                    wire_apis: vec![],
+                    agents: Vec::new(),
+                    env: model_only_env,
+                },
+            )]),
+            endpoints: BTreeMap::from([(
+                "anthropic".into(),
+                ProviderEndpointSpec::Url("https://example.com".into()),
+            )]),
+            env: provider_env,
+        };
+        let config = CxConfig {
+            providers: vec![provider.clone()],
+            agents: default_agent_configs(),
+        };
+        let endpoints = provider.normalized_endpoints();
+        let model = &endpoints[0].models[0];
+        let resolved = ResolvedModel::from_config(&config, &provider, &endpoints[0], model);
+
+        // Model env overrides provider env for shared key
+        assert_eq!(resolved.env.get("SHARED"), Some(&"from-model".into()));
+        // Both unique keys are present
+        assert_eq!(resolved.env.get("PROVIDER_VAR"), Some(&"pv".into()));
+        assert_eq!(resolved.env.get("MODEL_VAR"), Some(&"mv".into()));
+    }
+
     // ── Merge tests ──
 
     #[test]
@@ -4560,12 +4713,14 @@ mod tests {
             apikey_source: Some("literal:old".into()),
             models: BTreeMap::new(),
             endpoints: BTreeMap::new(),
+            env: BTreeMap::new(),
         }];
         let incoming = vec![ProviderConfig {
             name: "A".into(),
             apikey_source: Some("literal:new".into()),
             models: BTreeMap::new(),
             endpoints: BTreeMap::new(),
+            env: BTreeMap::new(),
         }];
         let merged = merge_providers(&existing, &incoming);
         assert_eq!(merged.len(), 1);
@@ -4579,12 +4734,14 @@ mod tests {
             apikey_source: None,
             models: BTreeMap::new(),
             endpoints: BTreeMap::new(),
+            env: BTreeMap::new(),
         }];
         let incoming = vec![ProviderConfig {
             name: "B".into(),
             apikey_source: None,
             models: BTreeMap::new(),
             endpoints: BTreeMap::new(),
+            env: BTreeMap::new(),
         }];
         let merged = merge_providers(&existing, &incoming);
         assert_eq!(merged.len(), 2);
@@ -4598,18 +4755,21 @@ mod tests {
                 apikey_source: Some("literal:a".into()),
                 models: BTreeMap::new(),
                 endpoints: BTreeMap::new(),
+                env: BTreeMap::new(),
             },
             ProviderConfig {
                 name: "B".into(),
                 apikey_source: Some("literal:old".into()),
                 models: BTreeMap::new(),
                 endpoints: BTreeMap::new(),
+                env: BTreeMap::new(),
             },
             ProviderConfig {
                 name: "C".into(),
                 apikey_source: Some("literal:c".into()),
                 models: BTreeMap::new(),
                 endpoints: BTreeMap::new(),
+                env: BTreeMap::new(),
             },
         ];
         let incoming = vec![
@@ -4618,12 +4778,14 @@ mod tests {
                 apikey_source: Some("literal:new".into()),
                 models: BTreeMap::new(),
                 endpoints: BTreeMap::new(),
+                env: BTreeMap::new(),
             },
             ProviderConfig {
                 name: "D".into(),
                 apikey_source: Some("literal:d".into()),
                 models: BTreeMap::new(),
                 endpoints: BTreeMap::new(),
+                env: BTreeMap::new(),
             },
         ];
 
@@ -4736,6 +4898,7 @@ mod tests {
                 "anthropic".into(),
                 ProviderEndpointSpec::Url("https://example.com/anthropic".into()),
             )]),
+            env: BTreeMap::new(),
         };
 
         let result = apply_add_operation(&mut config, AddOperation::Provider { provider }).unwrap();
@@ -4840,6 +5003,7 @@ mod tests {
                     "anthropic".into(),
                     ProviderEndpointSpec::Url("https://example.com/anthropic".into()),
                 )]),
+                env: BTreeMap::new(),
             }],
             agents: default_agent_configs(),
         };
@@ -5469,5 +5633,95 @@ agents:
         assert_eq!(model.swe_pro.as_deref(), Some("56.6%"));
         assert_eq!(model.hle.as_deref(), Some("28.8%"));
         // lcb_pro 已从结构体中移除，旧 YAML 的 lcb_pro 键被 serde 静默忽略
+    }
+
+    #[test]
+    fn provider_env_is_deserialized_from_yaml() {
+        let yaml = r#"
+providers:
+  - name: 百炼
+    apikey_source: "keychain:DASHSCOPE_API_KEY"
+    env:
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "qwen3.7-max"
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "qwen3.7-max"
+    endpoints:
+      anthropic:
+        url: https://example.com/anthropic
+    models:
+      glm-5.1:
+        wire_apis: [anthropic]
+        env:
+          CLAUDE_CODE_AUTO_COMPACT_WINDOW: "1000000"
+agents:
+  - id: claude
+    bin: claude
+    wire_apis: [anthropic]
+"#;
+        let config: CxConfig = serde_yaml::from_str(yaml).unwrap();
+        let provider = &config.providers[0];
+
+        // Provider-level env
+        assert_eq!(provider.env.len(), 2);
+        assert_eq!(
+            provider.env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(&"qwen3.7-max".to_string())
+        );
+        assert_eq!(
+            provider.env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            Some(&"qwen3.7-max".to_string())
+        );
+
+        // Model-level env preserved
+        let model = provider.models.get("glm-5.1").unwrap();
+        assert_eq!(
+            model.env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
+            Some(&"1000000".to_string())
+        );
+
+        // ResolvedModel merges provider + model env
+        let endpoints = provider.normalized_endpoints();
+        let resolved =
+            ResolvedModel::from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
+        assert_eq!(resolved.env.len(), 3);
+        assert_eq!(
+            resolved.env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+            Some(&"qwen3.7-max".to_string())
+        );
+        assert_eq!(
+            resolved.env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
+            Some(&"1000000".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_env_model_env_conflict_model_wins() {
+        let yaml = r#"
+providers:
+  - name: Test
+    env:
+      SHARED_VAR: "from-provider"
+      PROVIDER_ONLY: "yes"
+    endpoints:
+      anthropic:
+        url: https://example.com
+    models:
+      m1:
+        env:
+          SHARED_VAR: "from-model"
+          MODEL_ONLY: "yes"
+agents:
+  - id: claude
+    bin: claude
+    wire_apis: [anthropic]
+"#;
+        let config: CxConfig = serde_yaml::from_str(yaml).unwrap();
+        let provider = &config.providers[0];
+        let endpoints = provider.normalized_endpoints();
+        let resolved =
+            ResolvedModel::from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
+
+        assert_eq!(resolved.env.get("SHARED_VAR"), Some(&"from-model".to_string()));
+        assert_eq!(resolved.env.get("PROVIDER_ONLY"), Some(&"yes".to_string()));
+        assert_eq!(resolved.env.get("MODEL_ONLY"), Some(&"yes".to_string()));
     }
 }

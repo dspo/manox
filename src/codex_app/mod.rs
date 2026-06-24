@@ -101,6 +101,11 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
         command.env("CX_WARP_SESSION_ID", session.session_id());
     }
 
+    // Provider 级 + Model 级自定义环境变量（ResolvedModel.env 已合并 provider + model，model 优先）
+    for (k, v) in &default_model.env {
+        command.env(k, v);
+    }
+
     // 打印启动摘要
     println!();
     println!(
