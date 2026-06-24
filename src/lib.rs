@@ -5442,4 +5442,32 @@ trust_level = "trusted"
         assert_eq!(stats::format_tokens_compact(3_123_000), "3m123k");
         assert_eq!(stats::format_tokens_compact(10_500_000), "10m500k");
     }
+
+    /// 向前兼容测试：旧配置文件中含已移除的 lcb_pro 字段时，
+    /// serde 应静默忽略该未知键，不报错。
+    #[test]
+    fn deserialization_ignores_removed_lcb_pro_field() {
+        let old_yaml = r#"
+providers:
+  - name: Test
+    apikey_source: "literal:test"
+    models:
+      test-model:
+        swe_pro: "56.6%"
+        lcb_pro: "1226"
+        hle: "28.8%"
+        desc: "test"
+        context: "1M"
+        wire_apis: [responses]
+agents:
+  - id: claude
+    bin: claude
+    wire_apis: [anthropic]
+"#;
+        let config: CxConfig = serde_yaml::from_str(old_yaml).unwrap();
+        let model = config.providers[0].models.get("test-model").unwrap();
+        assert_eq!(model.swe_pro.as_deref(), Some("56.6%"));
+        assert_eq!(model.hle.as_deref(), Some("28.8%"));
+        // lcb_pro 已从结构体中移除，旧 YAML 的 lcb_pro 键被 serde 静默忽略
+    }
 }
