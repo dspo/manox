@@ -104,10 +104,7 @@ impl Drop for WarpSession {
 ///
 /// 返回的 `WarpSession` 可用于后续发出 stop 事件。
 /// 非 Warp 环境或 `/dev/tty` 不可用时返回 `None`。
-pub fn maybe_emit_session_start(
-    agent_id: &str,
-    model: Option<&str>,
-) -> Option<WarpSession> {
+pub fn maybe_emit_session_start(agent_id: &str, model: Option<&str>) -> Option<WarpSession> {
     if !is_warp_terminal() {
         return None;
     }

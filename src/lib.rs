@@ -28,10 +28,10 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
-mod stats;
-mod probe;
-mod warp;
 mod codex_app;
+mod probe;
+mod stats;
+mod warp;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
@@ -272,7 +272,7 @@ impl ProviderConfig {
                     .map(|(id, model)| ModelConfig {
                         id: id.clone(),
                         swe_pro: model.swe_pro.clone(),
-                                    hle: model.hle.clone(),
+                        hle: model.hle.clone(),
                         desc: model.desc.clone(),
                         context: model.context.clone(),
                         wire_apis: model.wire_apis.clone(),
@@ -329,7 +329,9 @@ impl ResolvedModel {
         let model_wire_apis: Vec<WireApi> = if model.wire_apis.is_empty() {
             vec![WireApi::from_str(&endpoint.wire_api)]
         } else {
-            model.wire_apis.iter()
+            model
+                .wire_apis
+                .iter()
                 .map(|s| WireApi::from_str(s))
                 .filter(|w| *w != WireApi::Unavailable)
                 .collect()
@@ -394,9 +396,7 @@ impl ModelOption {
             .variants
             .iter()
             .enumerate()
-            .filter(|(_, v)| {
-                agent_wire_apis.map_or(true, |apis| apis.contains(&v.wire_api))
-            })
+            .filter(|(_, v)| agent_wire_apis.map_or(true, |apis| apis.contains(&v.wire_api)))
             .collect();
         filtered
             .into_iter()
@@ -446,7 +446,9 @@ impl ModelOption {
 /// Model 列表表头，与 `ModelOption::formatted_row()` 使用相同的列宽格式。
 /// 左侧 3 spaces 对齐 `highlight_symbol("✨ ")` 的 3 列宽偏移。
 fn model_header_row() -> Line<'static> {
-    let hdr_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let hdr_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
     let header_text = format!(
         "{:<24} {:>7} {:>6}  {:<11} {:>8}",
         "Model", "SWE", "HLE", "wire_api", "context"
@@ -1016,7 +1018,10 @@ fn provider_config_key(provider_name: &str) -> String {
 /// `keychain:VAR` / `env:VAR` → `VAR`；其余（`literal:` / `$(shell ...)` / None）回落到 `CX_PROVIDER_KEY`。
 fn env_key_for_apikey_source(source: Option<&str>) -> String {
     if let Some(s) = source {
-        if let Some(rest) = s.strip_prefix("keychain:").or_else(|| s.strip_prefix("env:")) {
+        if let Some(rest) = s
+            .strip_prefix("keychain:")
+            .or_else(|| s.strip_prefix("env:"))
+        {
             let v = rest.trim();
             if !v.is_empty() {
                 return v.to_string();
@@ -1388,10 +1393,7 @@ fn model_options_for_provider(
 
 /// 解析 swe_pro 字符串（如 "56.6%"）为可比较的分数；"—" 等无法解析的视为 0.0。
 fn swe_pro_score(s: &str) -> f64 {
-    s.trim()
-        .trim_end_matches('%')
-        .parse::<f64>()
-        .unwrap_or(0.0)
+    s.trim().trim_end_matches('%').parse::<f64>().unwrap_or(0.0)
 }
 
 /// 收集某 provider 下所有支持 Codex.app（即 wire 含 Responses）的模型，作为注入桌面端的完整列表。
@@ -1506,7 +1508,13 @@ fn dispatch_command(raw_args: &[String]) -> DispatchCommand {
                 url,
                 refresh,
             },
-            Some(CxCommand::Probe { provider, auto_probe }) => DispatchCommand::Probe { provider, auto_probe },
+            Some(CxCommand::Probe {
+                provider,
+                auto_probe,
+            }) => DispatchCommand::Probe {
+                provider,
+                auto_probe,
+            },
             Some(CxCommand::Stats) => DispatchCommand::Stats,
             None => DispatchCommand::Launch { args: Vec::new() },
         },
@@ -1536,7 +1544,10 @@ pub fn run() -> Result<()> {
             url,
             refresh,
         } => run_patch(source, url, refresh),
-        DispatchCommand::Probe { provider, auto_probe } => {
+        DispatchCommand::Probe {
+            provider,
+            auto_probe,
+        } => {
             let config = load_config()?;
             run_probe(provider, auto_probe, &config)
         }
@@ -2045,10 +2056,7 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
     }
 
     // Warp 集成：在启动 agent 前发出 session_start 事件
-    let warp_session = warp::maybe_emit_session_start(
-        &spec.agent_id,
-        spec.model_id.as_deref(),
-    );
+    let warp_session = warp::maybe_emit_session_start(&spec.agent_id, spec.model_id.as_deref());
 
     // 将 Warp session ID 传递给子进程，以便 agent 的 hooks/plugins
     // 可以使用同一 session ID 发出后续 OSC 777 事件。
@@ -2388,7 +2396,12 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
     }
 
     // Agent 级别环境变量（最低优先级）
-    env.extend(selection.agent_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    env.extend(
+        selection
+            .agent_env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
 
     // Provider + Model 级别环境变量。
     // ResolvedModel.env 已在 from_config 中合并 provider + model env（model 优先），
@@ -3680,7 +3693,9 @@ impl AppState {
             Step::Model => self
                 .current_model_options(models)
                 .iter()
-                .map(|model| model.formatted_row(&self.model_wire_api_indexes, Some(&self.agent_wire_apis())))
+                .map(|model| {
+                    model.formatted_row(&self.model_wire_api_indexes, Some(&self.agent_wire_apis()))
+                })
                 .collect(),
         }
     }
@@ -3746,7 +3761,8 @@ impl AppState {
             return;
         }
 
-        let current = option.selected_variant_index(&self.model_wire_api_indexes, Some(&self.agent_wire_apis()));
+        let current = option
+            .selected_variant_index(&self.model_wire_api_indexes, Some(&self.agent_wire_apis()));
         let next = if move_right {
             (current + 1) % option.variants.len()
         } else if current == 0 {
@@ -3798,7 +3814,10 @@ impl AppState {
                 } else {
                     let agent = find_agent(&self.config, &self.selected_agent_id).unwrap();
                     let agent_wire_apis = self.agent_wire_apis();
-                    let selected_wire_api = agent_wire_apis.first().copied().unwrap_or(WireApi::Unavailable);
+                    let selected_wire_api = agent_wire_apis
+                        .first()
+                        .copied()
+                        .unwrap_or(WireApi::Unavailable);
                     Some(Selection {
                         agent_id: agent.id.clone(),
                         agent_binary: agent.binary.clone(),
@@ -4337,7 +4356,7 @@ mod tests {
             model: Some(ResolvedModel {
                 id: "qwen3.6-plus".into(),
                 swe_pro: "—".into(),
-                    hle: "—".into(),
+                hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4397,7 +4416,7 @@ mod tests {
             model: Some(ResolvedModel {
                 id: "claude-opus-4-7".into(),
                 swe_pro: "—".into(),
-                    hle: "—".into(),
+                hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4506,7 +4525,7 @@ mod tests {
             model: Some(ResolvedModel {
                 id: "glm-5.1".into(),
                 swe_pro: "—".into(),
-                    hle: "—".into(),
+                hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4553,7 +4572,7 @@ mod tests {
             model: Some(ResolvedModel {
                 id: "glm-5.1".into(),
                 swe_pro: "—".into(),
-                    hle: "—".into(),
+                hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4991,7 +5010,7 @@ mod tests {
                     "claude-opus-4-7".into(),
                     ProviderModelConfig {
                         swe_pro: None,
-                            hle: None,
+                        hle: None,
                         desc: None,
                         context: None,
                         wire_apis: vec!["anthropic".into()],
@@ -5146,7 +5165,10 @@ agents:
             "DASHSCOPE_API_KEY"
         );
         assert_eq!(env_key_for_apikey_source(Some("env:MY_KEY")), "MY_KEY");
-        assert_eq!(env_key_for_apikey_source(Some("literal:abc")), "CX_PROVIDER_KEY");
+        assert_eq!(
+            env_key_for_apikey_source(Some("literal:abc")),
+            "CX_PROVIDER_KEY"
+        );
         assert_eq!(env_key_for_apikey_source(None), "CX_PROVIDER_KEY");
     }
 
@@ -5265,7 +5287,10 @@ trust_level = "trusted"
         assert_eq!(extract_reasoning_effort(Some(cfg)), None);
         // 顶层值存在时正常取，即使后面 section 里也有
         let cfg2 = "model_reasoning_effort = \"high\"\n\n[model_providers.foo]\nmodel_reasoning_effort = \"low\"\n";
-        assert_eq!(extract_reasoning_effort(Some(cfg2)), Some("high".to_string()));
+        assert_eq!(
+            extract_reasoning_effort(Some(cfg2)),
+            Some("high".to_string())
+        );
     }
 
     #[test]
@@ -5369,10 +5394,12 @@ trust_level = "trusted"
 
         materialize_passthrough_dir(&real, &fake, &["config.toml"]).unwrap();
         // 真实目录被保留，未被替换为符号链接、未被清空
-        assert!(fs::symlink_metadata(fake.join("sessions"))
-            .unwrap()
-            .file_type()
-            .is_dir());
+        assert!(
+            fs::symlink_metadata(fake.join("sessions"))
+                .unwrap()
+                .file_type()
+                .is_dir()
+        );
         assert!(fake.join("sessions").join("local.json").exists());
 
         let _ = fs::remove_dir_all(&root);
@@ -5508,7 +5535,10 @@ trust_level = "trusted"
             model_id: Some("MiniMax-M2.7".into()),
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(192), None, None);
-        assert_eq!(msg, "退出 claude | Provider: 百炼 | Model: MiniMax-M2.7 | 3m12s");
+        assert_eq!(
+            msg,
+            "退出 claude | Provider: 百炼 | Model: MiniMax-M2.7 | 3m12s"
+        );
     }
 
     #[test]
@@ -5525,7 +5555,10 @@ trust_level = "trusted"
             model_id: None,
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(45), None, None);
-        assert_eq!(msg, "退出 copilot | Provider: default | Model: default | 45s");
+        assert_eq!(
+            msg,
+            "退出 copilot | Provider: default | Model: default | 45s"
+        );
     }
 
     #[test]
@@ -5720,7 +5753,10 @@ agents:
         let resolved =
             ResolvedModel::from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
 
-        assert_eq!(resolved.env.get("SHARED_VAR"), Some(&"from-model".to_string()));
+        assert_eq!(
+            resolved.env.get("SHARED_VAR"),
+            Some(&"from-model".to_string())
+        );
         assert_eq!(resolved.env.get("PROVIDER_ONLY"), Some(&"yes".to_string()));
         assert_eq!(resolved.env.get("MODEL_ONLY"), Some(&"yes".to_string()));
     }

@@ -20,12 +20,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::CodexAppPrepared;
 use crate::Selection;
+use crate::prepare_codex_launch_home_for_app;
 use crate::probe::runtime;
 use crate::resolve_apikey_interactive;
-use crate::prepare_codex_launch_home_for_app;
 use crate::warp;
-use crate::CodexAppPrepared;
 
 const DEFAULT_APP_PATH: &str = "/Applications/Codex.app";
 /// 等待 Codex.app renderer 注册到 CDP 的最长时长。
@@ -133,10 +133,7 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
         println!(
             "[cx] 已注入 {} 个模型（默认 {}，effort {}）",
             injected_clone.len(),
-            injected_clone
-                .first()
-                .map(|m| m.id.as_str())
-                .unwrap_or(""),
+            injected_clone.first().map(|m| m.id.as_str()).unwrap_or(""),
             reasoning_effort_clone
         );
         Result::<()>::Ok(())
@@ -183,7 +180,11 @@ fn resolve_codex_binary() -> Result<PathBuf> {
         );
     }
     let output = Command::new("/usr/libexec/PlistBuddy")
-        .args(["-c", "Print :CFBundleExecutable", &info_plist.to_string_lossy()])
+        .args([
+            "-c",
+            "Print :CFBundleExecutable",
+            &info_plist.to_string_lossy(),
+        ])
         .output()
         .context("读取 Codex.app CFBundleExecutable 失败")?;
     if !output.status.success() {

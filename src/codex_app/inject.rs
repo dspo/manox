@@ -29,7 +29,10 @@ use serde_json::json;
 /// reasoning effort 集合（与实测 GPT-5.5 描述符一致的 4 档）。每档结构 `{reasoningEffort, description}`。
 const REASONING_EFFORTS: &[(&str, &str)] = &[
     ("low", "Fast responses with lighter reasoning"),
-    ("medium", "Balances speed and reasoning depth for everyday tasks"),
+    (
+        "medium",
+        "Balances speed and reasoning depth for everyday tasks",
+    ),
     ("high", "Greater reasoning depth for complex problems"),
     ("xhigh", "Extra high reasoning depth for complex problems"),
 ];
@@ -352,4 +355,3 @@ mod tests {
         assert!(script.contains("window.__cxDefaultModel = \"\""));
     }
 }
-

@@ -297,7 +297,6 @@ pub(crate) fn format_tokens_compact(n: u64) -> String {
     }
 }
 
-
 pub fn run_stats() -> Result<()> {
     let today = date::today_date_string()?;
 
