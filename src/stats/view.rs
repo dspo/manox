@@ -657,8 +657,7 @@ fn all_time_snapshots(
 }
 
 /// 滚动 7 天 race：每个 day 生成一个 snapshot，cells 为
-/// 最近 7 天（含当日）的累计值。间隔天通过 [`interpolated_race_cells`]
-/// 在相邻 snapshot 之间线性插值。
+/// 最近 7 天（含当日）的累计值。Rolling7 每天都有 snapshot，无需插值。
 fn rolling_snapshots(
     min_date: &str,
     max_date: &str,
@@ -706,10 +705,6 @@ fn interpolated_race_cells(
         return first_values.clone();
     }
 
-    // 找到 day_idx 之前最近的 snapshot（用于空白天：沿用前值，零增长）
-    let mut last_before_idx = *first_idx;
-    let mut last_before_values = first_values;
-
     for window in snapshots.windows(2) {
         let (previous_idx, previous_values) = &window[0];
         let (next_idx, next_values) = &window[1];
@@ -723,18 +718,13 @@ fn interpolated_race_cells(
             // 空白天：使用前一个 snapshot 的值，表示零增长而非虚假增长
             return previous_values.clone();
         }
-        // 跟踪最近的前值，用于 day_idx 超出所有 snapshot 的情况
-        if *previous_idx > last_before_idx {
-            last_before_idx = *previous_idx;
-            last_before_values = previous_values;
-        }
-        if *next_idx > last_before_idx {
-            last_before_idx = *next_idx;
-            last_before_values = next_values;
-        }
     }
 
-    last_before_values.clone()
+    // day_idx 超出所有 snapshot 范围：沿用最后一个 snapshot
+    snapshots
+        .last()
+        .map(|(_, values)| values.clone())
+        .unwrap_or_default()
 }
 
 fn interpolate_usage_cells(
@@ -2089,6 +2079,32 @@ mod tests {
         assert_eq!(frames[2].entries[0].value, 200);
         assert_eq!(frames[2].entries[1].model, "alpha");
         assert_eq!(frames[2].entries[1].value, 120);
+    }
+
+    #[test]
+    fn race_frames_consecutive_empty_days_hold_previous_values() {
+        // May 27: alpha 100+20, May 28-30: 无数据, May 31: beta 200+0
+        let records = vec![
+            record("alpha", "2026-05-27", 100, 20),
+            record("beta", "2026-05-31", 200, 0),
+        ];
+        let frames = race_frames(&records, RaceMode::AllTime);
+
+        assert_eq!(frames.len(), 5);
+        // day0: alpha 真实数据
+        assert_eq!(frames[0].entries[0].model, "alpha");
+        assert_eq!(frames[0].entries[0].value, 120);
+        // day1-3: 连续空白天，始终沿用 alpha 前值，不出现 beta
+        for i in 1..4 {
+            assert_eq!(frames[i].entries.len(), 1);
+            assert_eq!(frames[i].entries[0].model, "alpha");
+            assert_eq!(frames[i].entries[0].value, 120);
+        }
+        // day4: beta 真实数据 + alpha 累计
+        assert_eq!(frames[4].entries[0].model, "beta");
+        assert_eq!(frames[4].entries[0].value, 200);
+        assert_eq!(frames[4].entries[1].model, "alpha");
+        assert_eq!(frames[4].entries[1].value, 120);
     }
 
     #[test]
