@@ -61,9 +61,8 @@ pub async fn wait_for_page_target(debug_port: u16, timeout: Duration) -> Result<
             if let Ok(targets) = resp.json::<Vec<Value>>().await {
                 for target in &targets {
                     if target.get("type").and_then(|v| v.as_str()) == Some("page") {
-                        if let Some(ws) = target
-                            .get("webSocketDebuggerUrl")
-                            .and_then(|v| v.as_str())
+                        if let Some(ws) =
+                            target.get("webSocketDebuggerUrl").and_then(|v| v.as_str())
                         {
                             return Ok(ws.to_string());
                         }
@@ -87,8 +86,20 @@ pub async fn inject_script(ws_url: &str, script: &str) -> Result<()> {
         .await
         .with_context(|| format!("连接 CDP WebSocket 失败: {ws_url}"))?;
 
-    send_command(&mut ws, 1, "Page.addScriptToEvaluateOnNewDocument", json!({ "source": script })).await?;
-    send_command(&mut ws, 2, "Runtime.evaluate", json!({ "expression": script, "awaitPromise": false })).await?;
+    send_command(
+        &mut ws,
+        1,
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({ "source": script }),
+    )
+    .await?;
+    send_command(
+        &mut ws,
+        2,
+        "Runtime.evaluate",
+        json!({ "expression": script, "awaitPromise": false }),
+    )
+    .await?;
 
     Ok(())
 }
@@ -103,7 +114,9 @@ async fn send_command(
     params: Value,
 ) -> Result<Value> {
     let cmd = json!({ "id": id, "method": method, "params": params });
-    ws.send(Message::Text(cmd.to_string())).await.context("发送 CDP 命令失败")?;
+    ws.send(Message::Text(cmd.to_string()))
+        .await
+        .context("发送 CDP 命令失败")?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

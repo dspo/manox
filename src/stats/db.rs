@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use dirs::home_dir;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 
 use super::parser::RawEntry;
@@ -852,22 +852,24 @@ mod tests {
         init_schema(&conn).unwrap();
 
         // v1 是未发布的旧聚合缓存；终版 schema 不混入旧聚合数据。
-        assert!(conn
-            .query_row(
+        assert!(
+            conn.query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_records'",
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .is_err());
+            .is_err()
+        );
 
         // messages 表应存在
-        assert!(conn
-            .query_row(
+        assert!(
+            conn.query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'",
                 [],
                 |row| row.get::<_, String>(0),
             )
-            .is_ok());
+            .is_ok()
+        );
 
         let records = load_aggregated(&conn).unwrap();
         assert!(records.is_empty());

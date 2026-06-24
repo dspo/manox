@@ -197,7 +197,10 @@ mod tests {
     fn race_interval_label() {
         assert_eq!(RaceInterval::AllTime.label("2026-06-24"), "All time");
         // 6 月 → 上月 5 月有 31 天
-        assert_eq!(RaceInterval::LastMonthDays.label("2026-06-24"), "Last 31 days");
+        assert_eq!(
+            RaceInterval::LastMonthDays.label("2026-06-24"),
+            "Last 31 days"
+        );
     }
 
     #[test]

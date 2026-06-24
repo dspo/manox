@@ -34,7 +34,6 @@ const RACE_FINAL_DISSOLVE_TICKS: usize = RACE_TWEEN_STEPS * 2;
 const RACE_INITIAL_COALESCE_TICKS: usize = RACE_TWEEN_STEPS * 2;
 const RACE_TRANSITION_SEED: u32 = 0x1234_5678;
 
-
 #[derive(Debug, Clone)]
 struct RaceEntry {
     model: String,
@@ -130,7 +129,7 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         ChartTab::Race => {
             let interval_label = app.race_interval.label(&app.today);
             let window_label = app.race_window.label();
-            format!("Race · {interval_label} · {window_label}")
+            format!("Race · {window_label} in {interval_label}")
         }
     };
     let keys_hint = match app.chart_tab {
@@ -163,18 +162,16 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             draw_overview_model_list(f, chunks[2], app);
         }
         ChartTab::Race => {
-            let filtered_records: Vec<UsageRecord> = if matches!(
-                app.race_interval,
-                RaceInterval::AllTime
-            ) {
-                app.records.clone()
-            } else {
-                app.records
-                    .iter()
-                    .filter(|r| app.race_interval.includes(&r.date, &app.today))
-                    .cloned()
-                    .collect()
-            };
+            let filtered_records: Vec<UsageRecord> =
+                if matches!(app.race_interval, RaceInterval::AllTime) {
+                    app.records.clone()
+                } else {
+                    app.records
+                        .iter()
+                        .filter(|r| app.race_interval.includes(&r.date, &app.today))
+                        .cloned()
+                        .collect()
+                };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(STEP_CHART_HEIGHT), Constraint::Min(0)])
@@ -182,7 +179,7 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
             let frames = race_frames(&filtered_records, app.race_window);
             let interval_label = app.race_interval.label(&app.today);
             let window_label = app.race_window.label();
-            let title_suffix = format!("{interval_label} · {window_label}");
+            let title_suffix = format!("{window_label} in {interval_label}");
             draw_bar_chart_race(f, chunks[0], app, &frames, &title_suffix);
             draw_dynamic_model_list(f, chunks[1], app, &frames, app.race_window);
             apply_race_transition(
@@ -286,7 +283,15 @@ fn draw_bar_chart_race(
         return;
     };
     let max_value = race_max_value(frames);
-    draw_race_frame(f, chart_area, previous, current, tween, max_value, title_suffix);
+    draw_race_frame(
+        f,
+        chart_area,
+        previous,
+        current,
+        tween,
+        max_value,
+        title_suffix,
+    );
 }
 
 fn draw_race_frame(
@@ -1355,7 +1360,7 @@ fn draw_dynamic_model_list(
     let total_in_fmt = format_tokens(total_in);
     let total_out_fmt = format_tokens(total_out);
     let title = format!(
-        "Model Tokens Top {model_count} · {interval_label} · {window_label} {date_short} ↑{total_in_fmt} ↓{total_out_fmt}"
+        "Model Tokens Top {model_count} · {window_label} in {interval_label} {date_short} ↑{total_in_fmt} ↓{total_out_fmt}"
     );
     draw_model_table(
         f,
@@ -1446,10 +1451,7 @@ fn draw_model_table(
         app.models_scroll = max_scroll;
     }
 
-    let constraints = model_table_widths_with_agent_widths(
-        &sorted,
-        &visible_agent_widths,
-    );
+    let constraints = model_table_widths_with_agent_widths(&sorted, &visible_agent_widths);
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints.clone())
@@ -2500,24 +2502,13 @@ mod tests {
         assert_eq!(widths, vec![10, 20]);
 
         // Very narrow → no agent columns (inner=44 < 44+11=55)
-        let (agents, widths) = prioritize_agent_columns(
-            &[("a", "A"), ("b", "B")],
-            &[10, 20],
-            44,
-            fixed,
-            sp,
-        );
+        let (agents, widths) =
+            prioritize_agent_columns(&[("a", "A"), ("b", "B")], &[10, 20], 44, fixed, sp);
         assert_eq!(agents, Vec::<(&str, &str)>::new());
         assert_eq!(widths, Vec::<u16>::new());
 
         // Empty input → empty output
-        let (agents, widths) = prioritize_agent_columns(
-            &[],
-            &[],
-            100,
-            40,
-            1,
-        );
+        let (agents, widths) = prioritize_agent_columns(&[], &[], 100, 40, 1);
         assert_eq!(agents, Vec::<(&str, &str)>::new());
         assert_eq!(widths, Vec::<u16>::new());
     }
