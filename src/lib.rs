@@ -98,8 +98,6 @@ struct ModelConfig {
     #[serde(default)]
     swe_pro: Option<String>,
     #[serde(default)]
-    lcb_pro: Option<String>,
-    #[serde(default)]
     hle: Option<String>,
     #[serde(default)]
     desc: Option<String>,
@@ -117,8 +115,6 @@ struct ModelConfig {
 struct ProviderModelConfig {
     #[serde(default)]
     swe_pro: Option<String>,
-    #[serde(default)]
-    lcb_pro: Option<String>,
     #[serde(default)]
     hle: Option<String>,
     #[serde(default)]
@@ -274,8 +270,7 @@ impl ProviderConfig {
                     .map(|(id, model)| ModelConfig {
                         id: id.clone(),
                         swe_pro: model.swe_pro.clone(),
-                        lcb_pro: model.lcb_pro.clone(),
-                        hle: model.hle.clone(),
+                                    hle: model.hle.clone(),
                         desc: model.desc.clone(),
                         context: model.context.clone(),
                         wire_apis: model.wire_apis.clone(),
@@ -310,7 +305,6 @@ impl ProviderConfig {
 struct ResolvedModel {
     id: String,
     swe_pro: String,
-    lcb_pro: String,
     hle: String,
     desc: String,
     context: String,
@@ -341,7 +335,6 @@ impl ResolvedModel {
         Self {
             id: model.id.clone(),
             swe_pro: model.swe_pro.clone().unwrap_or_else(|| "—".to_string()),
-            lcb_pro: model.lcb_pro.clone().unwrap_or_else(|| "—".to_string()),
             hle: model.hle.clone().unwrap_or_else(|| "—".to_string()),
             desc: model.desc.clone().unwrap_or_default(),
             context: model.context.clone().unwrap_or_else(|| "—".to_string()),
@@ -368,7 +361,6 @@ struct ModelOption {
     selection_key: String,
     id: String,
     swe_pro: String,
-    lcb_pro: String,
     hle: String,
     desc: String,
     context: String,
@@ -384,7 +376,6 @@ impl ModelOption {
             selection_key: format!("{}\t{}", first.provider_name, first.id),
             id: first.id.clone(),
             swe_pro: first.swe_pro.clone(),
-            lcb_pro: first.lcb_pro.clone(),
             hle: first.hle.clone(),
             desc: first.desc.clone(),
             context: first.context.clone(),
@@ -435,10 +426,9 @@ impl ModelOption {
     ) -> String {
         let selected = self.selected_variant(selected_wire_apis, agent_wire_apis);
         format!(
-            "{:<24} {:>7} {:>7} {:>6}  {:<11} {:>8}  {}",
+            "{:<24} {:>7} {:>6}  {:<11} {:>8}  {}",
             self.id,
             self.swe_pro,
-            self.lcb_pro,
             self.hle,
             selected.wire_api.display(),
             self.context,
@@ -452,8 +442,8 @@ impl ModelOption {
 fn model_header_row() -> Line<'static> {
     let hdr_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
     let header_text = format!(
-        "{:<24} {:>7} {:>7} {:>6}  {:<11} {:>8}",
-        "Model", "SWE", "LCB", "HLE", "wire_api", "context"
+        "{:<24} {:>7} {:>6}  {:<11} {:>8}",
+        "Model", "SWE", "HLE", "wire_api", "context"
     );
     Line::from(vec![
         Span::styled("   ", Style::default()),
@@ -2886,19 +2876,6 @@ fn collect_model_draft(
         PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
     };
 
-    let lcb_pro = match prompt_text(
-        terminal,
-        "cx add",
-        "可选：输入 LiveCodeBench Pro 成绩；留空则不写入",
-        "",
-        "示例：2085",
-        |value| Ok(value.trim().to_string()),
-    )? {
-        PromptOutcome::Submit(value) => value,
-        PromptOutcome::Back => return Ok(PromptOutcome::Back),
-        PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
-    };
-
     let hle = match prompt_text(
         terminal,
         "cx add",
@@ -2942,7 +2919,6 @@ fn collect_model_draft(
         model_id,
         ProviderModelConfig {
             swe_pro: empty_string_as_none(&swe_pro),
-            lcb_pro: empty_string_as_none(&lcb_pro),
             hle: empty_string_as_none(&hle),
             desc: empty_string_as_none(&desc),
             context: empty_string_as_none(&context),
@@ -4112,7 +4088,6 @@ mod tests {
         ResolvedModel {
             id: model_id.into(),
             swe_pro: "—".into(),
-            lcb_pro: "—".into(),
             hle: "—".into(),
             desc: String::new(),
             context: "—".into(),
@@ -4135,7 +4110,6 @@ mod tests {
                     "mimo-v2.5-pro".into(),
                     ProviderModelConfig {
                         swe_pro: Some("80%".into()),
-                        lcb_pro: Some("2100".into()),
                         hle: Some("70%".into()),
                         desc: Some("thinking".into()),
                         context: None,
@@ -4344,8 +4318,7 @@ mod tests {
             model: Some(ResolvedModel {
                 id: "qwen3.6-plus".into(),
                 swe_pro: "—".into(),
-                lcb_pro: "—".into(),
-                hle: "—".into(),
+                    hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4404,8 +4377,7 @@ mod tests {
             model: Some(ResolvedModel {
                 id: "claude-opus-4-7".into(),
                 swe_pro: "—".into(),
-                lcb_pro: "—".into(),
-                hle: "—".into(),
+                    hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4511,8 +4483,7 @@ mod tests {
             model: Some(ResolvedModel {
                 id: "glm-5.1".into(),
                 swe_pro: "—".into(),
-                lcb_pro: "—".into(),
-                hle: "—".into(),
+                    hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4558,8 +4529,7 @@ mod tests {
             model: Some(ResolvedModel {
                 id: "glm-5.1".into(),
                 swe_pro: "—".into(),
-                lcb_pro: "—".into(),
-                hle: "—".into(),
+                    hle: "—".into(),
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
@@ -4815,7 +4785,6 @@ mod tests {
                 model_id: "qwen3.6-plus".into(),
                 model: ProviderModelConfig {
                     swe_pro: Some("45.3%".into()),
-                    lcb_pro: None,
                     hle: None,
                     desc: Some("Agent/终端最强".into()),
                     context: None,
@@ -4859,8 +4828,7 @@ mod tests {
                     "claude-opus-4-7".into(),
                     ProviderModelConfig {
                         swe_pro: None,
-                        lcb_pro: None,
-                        hle: None,
+                            hle: None,
                         desc: None,
                         context: None,
                         wire_apis: vec!["anthropic".into()],

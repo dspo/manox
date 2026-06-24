@@ -310,7 +310,6 @@ mod tests {
         ResolvedModel {
             id: id.into(),
             swe_pro: "—".into(),
-            lcb_pro: "—".into(),
             hle: "—".into(),
             desc: String::new(),
             context: "—".into(),
