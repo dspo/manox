@@ -447,6 +447,20 @@ impl ModelOption {
     }
 }
 
+/// Model 列表表头，与 `ModelOption::formatted_row()` 使用相同的列宽格式。
+/// 左侧 3 spaces 对齐 `highlight_symbol("✨ ")` 的 3 列宽偏移。
+fn model_header_row() -> Line<'static> {
+    let hdr_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+    let header_text = format!(
+        "{:<24} {:>7} {:>7} {:>6}  {:<11} {:>8}",
+        "Model", "SWE", "LCB", "HLE", "wire_api", "context"
+    );
+    Line::from(vec![
+        Span::styled("   ", Style::default()),
+        Span::styled(header_text, hdr_style),
+    ])
+}
+
 fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
         // Backward-compat for legacy config entries only; the CLI no longer proxies `codex app`.
@@ -3959,19 +3973,51 @@ fn render(frame: &mut Frame<'_>, state: &AppState, models: &[ResolvedModel]) {
         .map(|item| ListItem::new(item.clone()))
         .collect::<Vec<_>>();
     let mut list_state = ListState::default().with_selected(Some(state.current_index()));
-    let list = List::new(list_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(current_title(state)),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("✨ ");
-    frame.render_stateful_widget(list, layout[2], &mut list_state);
+    let highlight = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+
+    if state.step == Step::Model {
+        // Model 步：先渲染 block（边框 + 标题），再在 inner area 中渲染表头 + 列表。
+        // 表头始终可见、不可选中，列表由外层 block 提供边框。
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(current_title(state));
+        let inner = block.inner(layout[2]);
+        frame.render_widget(block, layout[2]);
+
+        let header_rect = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        };
+        let list_rect = Rect {
+            x: inner.x,
+            y: inner.y + 1,
+            width: inner.width,
+            height: inner.height.saturating_sub(1),
+        };
+
+        let header = Paragraph::new(model_header_row());
+        frame.render_widget(header, header_rect);
+
+        let list = List::new(list_items)
+            .highlight_style(highlight)
+            .highlight_symbol("✨ ");
+        frame.render_stateful_widget(list, list_rect, &mut list_state);
+    } else {
+        // Agent / Provider 步：原有 List + Block 渲染逻辑不变。
+        let list = List::new(list_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(current_title(state)),
+            )
+            .highlight_style(highlight)
+            .highlight_symbol("✨ ");
+        frame.render_stateful_widget(list, layout[2], &mut list_state);
+    }
 
     let footer = Paragraph::new(current_footer(state))
         .style(Style::default().fg(Color::DarkGray))
