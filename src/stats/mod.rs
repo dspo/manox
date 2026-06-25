@@ -11,17 +11,12 @@ mod aggregate;
 mod date;
 mod db;
 mod format;
-#[cfg(feature = "image-output")]
-mod image;
 mod parser;
-mod svg;
 mod tui;
 mod types;
 mod view;
 
 use anyhow::Result;
-#[cfg(not(feature = "image-output"))]
-use anyhow::anyhow;
 use dirs::home_dir;
 use ratatui::style::Color;
 use std::collections::BTreeSet;
@@ -34,104 +29,6 @@ use std::time::UNIX_EPOCH;
 
 use parser::{SourceKind, parse_file, parse_file_from_offset};
 use types::UsageRecord;
-
-/// 统计输出格式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
-    Svg,
-    Png,
-    Jpg,
-}
-
-impl OutputFormat {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "svg" => Some(Self::Svg),
-            "png" => Some(Self::Png),
-            "jpg" | "jpeg" => Some(Self::Jpg),
-            _ => None,
-        }
-    }
-    #[cfg(feature = "image-output")]
-    pub fn extension(self) -> &'static str {
-        match self {
-            Self::Svg => "svg",
-            Self::Png => "png",
-            Self::Jpg => "jpg",
-        }
-    }
-}
-
-/// 统计视图选择。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatsView {
-    Overview,
-    Race,
-}
-
-impl StatsView {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "overview" => Some(Self::Overview),
-            "race" => Some(Self::Race),
-            _ => None,
-        }
-    }
-}
-
-/// CLI 可指定的时间段（映射到内部 Period enum）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatsPeriod {
-    Today,
-    Yesterday,
-    Last7Days,
-    Last30Days,
-    All,
-}
-
-impl StatsPeriod {
-    /// 从 CLI 简称解析：today / yda / 7d / 30d / all。
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "today" => Some(Self::Today),
-            "yda" | "yesterday" => Some(Self::Yesterday),
-            "7d" | "last-7-days" => Some(Self::Last7Days),
-            "30d" | "last-30-days" | "mo" => Some(Self::Last30Days),
-            "all" => Some(Self::All),
-            _ => None,
-        }
-    }
-    fn to_period(self) -> types::Period {
-        match self {
-            Self::Today => types::Period::Today,
-            Self::Yesterday => types::Period::Lastday,
-            Self::Last7Days => types::Period::Last7,
-            Self::Last30Days => types::Period::Last30,
-            Self::All => types::Period::All,
-        }
-    }
-}
-
-/// `run_stats()` 的配置参数。
-#[derive(Debug, Clone)]
-pub struct StatsOutputConfig {
-    /// 输出格式；None 表示交互式 TUI。
-    pub output_format: Option<OutputFormat>,
-    /// 视图选择。
-    pub view: StatsView,
-    /// 时间段；None 表示默认 Last7。
-    pub period: Option<StatsPeriod>,
-}
-
-impl Default for StatsOutputConfig {
-    fn default() -> Self {
-        Self {
-            output_format: None,
-            view: StatsView::Overview,
-            period: None,
-        }
-    }
-}
 
 pub(crate) const AGENT_CLAUDE: &str = "claude";
 pub(crate) const AGENT_CODEX: &str = "codex";
@@ -400,7 +297,7 @@ pub(crate) fn format_tokens_compact(n: u64) -> String {
     }
 }
 
-pub fn run_stats(config: StatsOutputConfig) -> Result<()> {
+pub fn run_stats() -> Result<()> {
     let today = date::today_date_string()?;
 
     let db_path = db::db_path()?;
@@ -448,6 +345,7 @@ pub fn run_stats(config: StatsOutputConfig) -> Result<()> {
             if cached.as_ref().is_some_and(|state| {
                 state.mtime_secs == current.mtime_secs && state.size == current.size
             }) {
+                // 缓存命中：该文件上次扫描时的数据已在 messages 表中，跳过。
                 continue;
             }
 
@@ -499,53 +397,21 @@ pub fn run_stats(config: StatsOutputConfig) -> Result<()> {
         }
     }
 
+    // 清理已卸载 agent 的 stale 条目（scanned_files + messages）。
     let roots_refs: Vec<&Path> = active_source_roots.iter().map(|p| p.as_path()).collect();
     let extras_refs: Vec<&Path> = active_extra_files.iter().map(|p| p.as_path()).collect();
     if let Err(e) = db::cleanup_stale_entries(&conn, &roots_refs, &extras_refs) {
         eprintln!("cx: 清理过期缓存失败: {e:#}");
     }
 
+    // 从 messages 表聚合读取，而非内存计算。
     let records = db::load_aggregated(&conn)?;
 
     if std::env::var("CX_STATS_DUMP").ok().as_deref() == Some("1") {
         return dump_records(&records, &today);
     }
 
-    let period = config
-        .period
-        .map(|p| p.to_period())
-        .unwrap_or(types::Period::Last7);
-
-    match config.output_format {
-        None => tui::run_tui(records, today),
-        Some(format) => {
-            let svg_content = svg::render_to_string(&records, &today, period, config.view)?;
-            match format {
-                OutputFormat::Svg => {
-                    println!("{svg_content}");
-                    Ok(())
-                }
-                OutputFormat::Png | OutputFormat::Jpg => {
-                    #[cfg(feature = "image-output")]
-                    {
-                        let ext = format.extension();
-                        let filename = format!("cx-stats.{ext}");
-                        let path = std::path::PathBuf::from(&filename);
-                        image::render_to_image(&svg_content, format, &path)?;
-                        println!("Written to {}", path.display());
-                        Ok(())
-                    }
-                    #[cfg(not(feature = "image-output"))]
-                    {
-                        Err(anyhow!(
-                            "PNG/JPG output requires the `image-output` feature. \
-                             Rebuild with: cargo build --features image-output"
-                        ))?
-                    }
-                }
-            }
-        }
-    }
+    tui::run_tui(records, today)
 }
 
 /// 将模型名称归一化为统一的命名风格。
