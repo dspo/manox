@@ -24,6 +24,14 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 url = "2.5"
 which = "7.0"
+resvg = { version = "0.47", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+image-output = ["resvg", "image"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"image-output\"))"] }
