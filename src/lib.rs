@@ -1471,19 +1471,10 @@ enum CxCommand {
         #[arg(long, conflicts_with_all = ["source", "url"])]
         refresh: bool,
     },
-    /// 查看各 agent × model 的 token 用量统计（TUI），或输出为 SVG/PNG/JPG
-    Stats {
-        /// 输出格式（svg/png/jpg），不指定则启动交互式 TUI
-        #[arg(long, value_name = "FORMAT")]
-        output: Option<String>,
-        /// 视图选择（overview/race）
-        #[arg(long, value_name = "VIEW", default_value = "overview")]
-        view: String,
-        /// 时间段（today/yda/7d/30d/all）
-        #[arg(long, value_name = "PERIOD")]
-        period: Option<String>,
-    },
+    /// 查看各 agent × model 的 token 用量统计（TUI）
+    Stats,
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DispatchCommand {
     Help,
@@ -1497,11 +1488,7 @@ enum DispatchCommand {
         url: Option<String>,
         refresh: bool,
     },
-    Stats {
-        output: Option<stats::OutputFormat>,
-        view: stats::StatsView,
-        period: Option<stats::StatsPeriod>,
-    },
+    Stats,
     Launch {
         args: Vec<String>,
     },
@@ -1528,47 +1515,7 @@ fn dispatch_command(raw_args: &[String]) -> DispatchCommand {
                 provider,
                 auto_probe,
             },
-            Some(CxCommand::Stats {
-                output,
-                view,
-                period,
-            }) => {
-                let output_format = match output {
-                    None => None,
-                    Some(s) => match stats::OutputFormat::parse(&s) {
-                        Some(f) => Some(f),
-                        None => {
-                            eprintln!("cx: unsupported output format '{}'. Use: svg, png, jpg", s);
-                            std::process::exit(1);
-                        }
-                    },
-                };
-                let stats_view = match stats::StatsView::parse(&view) {
-                    Some(v) => v,
-                    None => {
-                        eprintln!("cx: unsupported view '{}'. Use: overview, race", view);
-                        std::process::exit(1);
-                    }
-                };
-                let stats_period = match period {
-                    None => None,
-                    Some(s) => match stats::StatsPeriod::parse(&s) {
-                        Some(p) => Some(p),
-                        None => {
-                            eprintln!(
-                                "cx: unsupported period '{}'. Use: today, yda, 7d, 30d, all",
-                                s
-                            );
-                            std::process::exit(1);
-                        }
-                    },
-                };
-                DispatchCommand::Stats {
-                    output: output_format,
-                    view: stats_view,
-                    period: stats_period,
-                }
-            }
+            Some(CxCommand::Stats) => DispatchCommand::Stats,
             None => DispatchCommand::Launch { args: Vec::new() },
         },
         Err(_) => DispatchCommand::Launch {
@@ -1604,15 +1551,7 @@ pub fn run() -> Result<()> {
             let config = load_config()?;
             run_probe(provider, auto_probe, &config)
         }
-        DispatchCommand::Stats {
-            output,
-            view,
-            period,
-        } => stats::run_stats(stats::StatsOutputConfig {
-            output_format: output,
-            view,
-            period,
-        }),
+        DispatchCommand::Stats => stats::run_stats(),
         DispatchCommand::Launch { args } => {
             // No subcommand or an unknown one → treat as Launch with optional agent hint.
             let config = load_config()?;
