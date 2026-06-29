@@ -2479,7 +2479,9 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         // Inject a unified model identifier so agents and their tooling can
         // detect which model cx configured, regardless of the agent type.
         // 用剥除 `[Nm]` 后缀的 base id（如 glm-5.2），provider 不识别 cx 的上下文后缀。
-        let (api_model_id, _ctx_hint) = parse_model_context_suffix(&model.id);
+        // ctx_hint（[1m] → 1_000_000）由各 agent 分支按需消费：copilot 写入
+        // COPILOT_PROVIDER_MAX_PROMPT_TOKENS，codex 写入 model_context_window。
+        let (api_model_id, ctx_hint) = parse_model_context_suffix(&model.id);
         env.insert("CX_MODEL".into(), api_model_id.to_string());
 
         let apikey = if let Some(ref source) = provider.apikey_source {
@@ -2498,6 +2500,13 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                     model.endpoint_url.clone(),
                 );
                 env.insert("COPILOT_MODEL".into(), api_model_id.to_string());
+                // 透传 `[Nm]` 上下文后缀：copilot BYOK 用 COPILOT_PROVIDER_MAX_PROMPT_TOKENS
+                // 声明输入上下文窗口（覆盖其内置 catalog 与默认 128K）。
+                // 见 `copilot help providers`：token 限制解析顺序为
+                // manual env vars → built-in catalog → defaults。
+                if let Some(n) = ctx_hint {
+                    env.insert("COPILOT_PROVIDER_MAX_PROMPT_TOKENS".into(), n.to_string());
+                }
                 configure_copilot_auth(&mut env, model.copilot_auth, apikey);
                 match model.wire_api {
                     WireApi::Anthropic => {
@@ -4672,6 +4681,89 @@ mod tests {
             spec.env.get("COPILOT_PROVIDER_BASE_URL"),
             Some(&"https://www.packyapi.com/".to_string())
         );
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
+    fn copilot_passes_1m_suffix_as_max_prompt_tokens() {
+        // `glm-5.2[1m]` → copilot 收到 COPILOT_MODEL=glm-5.2（后缀剥除），
+        // 同时 COPILOT_PROVIDER_MAX_PROMPT_TOKENS=1000000 透传 1M 上下文窗口。
+        let fake_binary = create_fake_binary("copilot");
+        let selection = Selection {
+            agent_id: "copilot".into(),
+            agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Responses,
+            provider: ResolvedProvider {
+                name: "Packy API".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
+            },
+            model: Some(ResolvedModel {
+                id: "glm-5.2[1m]".into(),
+                swe_pro: "—".into(),
+                hle: "—".into(),
+                desc: String::new(),
+                context: "—".into(),
+                wire_api: WireApi::Completions,
+                model_wire_apis: vec![WireApi::Completions],
+                provider_name: "Packy API".into(),
+                endpoint_url: "https://www.packyapi.com/".into(),
+                visible_agents: vec!["copilot".into()],
+                copilot_auth: CopilotAuth::BearerToken,
+                env: BTreeMap::new(),
+            }),
+            injected_models: Vec::new(),
+        };
+
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert_eq!(spec.env.get("COPILOT_MODEL"), Some(&"glm-5.2".to_string()));
+        assert_eq!(
+            spec.env.get("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"),
+            Some(&"1000000".to_string())
+        );
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
+    fn copilot_omits_max_prompt_tokens_without_suffix() {
+        // 无 `[Nm]` 后缀时不设 COPILOT_PROVIDER_MAX_PROMPT_TOKENS，
+        // 让 copilot 走 catalog / 默认值，行为不变。
+        let fake_binary = create_fake_binary("copilot");
+        let selection = Selection {
+            agent_id: "copilot".into(),
+            agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Responses,
+            provider: ResolvedProvider {
+                name: "Packy API".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
+            },
+            model: Some(ResolvedModel {
+                id: "claude-opus-4-7".into(),
+                swe_pro: "—".into(),
+                hle: "—".into(),
+                desc: String::new(),
+                context: "—".into(),
+                wire_api: WireApi::Anthropic,
+                model_wire_apis: vec![WireApi::Anthropic],
+                provider_name: "Packy API".into(),
+                endpoint_url: "https://www.packyapi.com/".into(),
+                visible_agents: vec!["copilot".into()],
+                copilot_auth: CopilotAuth::BearerToken,
+                env: BTreeMap::new(),
+            }),
+            injected_models: Vec::new(),
+        };
+
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert!(spec.env.get("COPILOT_MODEL").is_some());
+        assert!(!spec.env.contains_key("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"));
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
