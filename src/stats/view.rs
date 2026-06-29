@@ -2346,6 +2346,7 @@ mod tests {
                 ("omp", "OMP"),
                 ("mimo", "Mimo"),
                 ("remora", "Remora"),
+                ("pi", "Pi"),
             ]
         );
     }

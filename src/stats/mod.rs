@@ -125,6 +125,7 @@ pub(crate) const AGENT_COPILOT: &str = "copilot";
 pub(crate) const AGENT_OMP: &str = "omp";
 pub(crate) const AGENT_MIMO: &str = "mimo";
 pub(crate) const AGENT_REMORA: &str = "remora";
+pub(crate) const AGENT_PI: &str = "pi";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_CLAUDE, "Claude Code"),
@@ -134,6 +135,7 @@ pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_COPILOT, "Copilot"),
     (AGENT_MIMO, "Mimo"),
     (AGENT_REMORA, "Remora"),
+    (AGENT_PI, "Pi"),
 ];
 
 /// 折线图调色板（与 Claude `/usage` 风格相近）。
@@ -206,6 +208,11 @@ fn log_sources() -> Vec<LogSource> {
             root: home.join(".remora/projects"),
             extra_file: None,
             kind: SourceKind::RemoraSession,
+        },
+        LogSource {
+            root: home.join(".pi/agent/sessions"),
+            extra_file: None,
+            kind: SourceKind::PiSession,
         },
     ]
 }
@@ -299,6 +306,7 @@ pub(crate) fn count_recent_session_tokens(
         "copilot" => {
             matches!(s.kind, SourceKind::Copilot(a) if a == AGENT_COPILOT)
         }
+        "pi" => matches!(s.kind, SourceKind::PiSession),
         _ => false,
     })?;
 
