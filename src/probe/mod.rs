@@ -217,16 +217,12 @@ pub(crate) fn probe_result_key(provider_name: &str, model_id: &str, wire_api: Wi
     format!("{}\0{}\0{}", provider_name, wire_api.display(), model_id)
 }
 
-/// 解析 model_id，处理 [1m], [3m] 等后缀
+/// 解析 model_id，处理 [1m], [3m] 等后缀。复用 lib 的 `parse_model_context_suffix`，
+/// 仅取剥除后缀的 base id（上下文 token 数由 launch 路径使用）。
 fn resolve_api_model_id(model_id: &str) -> Cow<'_, str> {
-    use regex::Regex;
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\[\d+[m]\]$").unwrap());
-    if re.is_match(model_id) {
-        Cow::Owned(re.replace(model_id, "").to_string())
-    } else {
-        Cow::Borrowed(model_id)
-    }
+    let (base, _hint) = crate::parse_model_context_suffix(model_id);
+    // base 始终是 model_id 的切片（有/无后缀均借用原字符串）。
+    Cow::Borrowed(base)
 }
 
 pub fn do_probe(
