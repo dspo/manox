@@ -1,7 +1,7 @@
 //! pi coding-agent session jsonl 解析。
 //!
 //! pi 将 agent session 存放在 `~/.pi/agent/sessions/` 下，
-//! 格式为树形 JSONL（Remora 基于 pi 底座构建，共享同一 session 格式）：
+//! 格式为树形 JSONL：
 //! - `type: "session"` 行提供 session header（含 id、timestamp、cwd）
 //! - `type: "model_change"` 行记录模型切换（provider + modelId）
 //! - `type: "thinking_level_change"` 行记录思考级别变化
@@ -23,7 +23,7 @@
 //! 与 `cacheWrite`（≥5 分钟 TTL）可能重叠：同一 cache 内容在写入后 5 分钟到
 //! 1 小时之间会被计为 cacheRead，而非 cacheWrite1h，因此两者不简单叠加。
 //!
-//! 当前做法：忽略 `cacheWrite1h`，仅统计 `cacheWrite`（与 Remora 口径一致）。
+//! 当前做法：忽略 `cacheWrite1h`，仅统计 `cacheWrite`。
 //! **潜在风险**：若 pi 单独核算 1h cache 写入成本，此处 `cache_creation` 会少计。
 //! 后续若需纳入，应将 `cacheWrite1h` 作为独立列展示，而非归入 `cache_creation`，
 //! 以避免与 `cacheWrite` 重复计数。
@@ -33,10 +33,7 @@ use serde_json::Value;
 use super::RawEntry;
 use crate::stats::date::date_field;
 
-/// 泛型 pi-family session JSONL 解析，供 pi 和 Remora 共用。
-///
-/// Remora 基于 pi 底座构建，两者共享同一 session JSONL 格式；
-/// 解析逻辑完全相同，仅 agent 标识不同。
+/// 泛型 pi-family session JSONL 解析。
 pub(super) fn parse_with_agent(content: &str, agent: &str) -> Vec<RawEntry> {
     let mut out: Vec<RawEntry> = Vec::new();
     let mut session_id: Option<String> = None;
@@ -233,7 +230,7 @@ mod tests {
         let entries_pi = parse_with_agent(line, "pi");
         assert_eq!(entries_pi[0].agent, "pi");
 
-        let entries_remora = parse_with_agent(line, "remora");
-        assert_eq!(entries_remora[0].agent, "remora");
+        let entries_other = parse_with_agent(line, "test-agent");
+        assert_eq!(entries_other[0].agent, "test-agent");
     }
 }
