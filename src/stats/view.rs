@@ -2345,7 +2345,6 @@ mod tests {
                 ("zed", "Zed Agent"),
                 ("omp", "OMP"),
                 ("mimo", "Mimo"),
-                ("remora", "Remora"),
                 ("pi", "Pi"),
             ]
         );
