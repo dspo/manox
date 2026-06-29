@@ -135,7 +135,7 @@ pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_COPILOT, "Copilot"),
     (AGENT_MIMO, "Mimo"),
     (AGENT_REMORA, "Remora"),
-    (AGENT_PI, "pi"),
+    (AGENT_PI, "Pi"),
 ];
 
 /// 折线图调色板（与 Claude `/usage` 风格相近）。

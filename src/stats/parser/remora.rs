@@ -1,106 +1,16 @@
 //! Remora session jsonl 解析。
 //!
-//! Remora 管理多个 agent session，日志存放在 `~/.remora/projects/` 下，
-//! 格式与 OMP session jsonl 相似：
-//! - `type: "message"` + `message.role: "assistant"` 标记 assistant 消息
-//! - usage 字段为 camelCase：`input` / `output` / `cacheRead` / `cacheWrite`
-//! - `type: "session"` 行提供 session header（含 id、timestamp、cwd）
-//! - `type: "compaction"` 等非 message 类型不含 per-message usage，跳过
+//! Remora 基于 pi 底座构建，日志存放在 `~/.remora/projects/` 下，
+//! 与 pi 共享同一 session JSONL 格式（树形、camelCase usage）。
+//! 解析逻辑复用 `pi::parse_with_agent`，仅 agent 标识不同。
 //!
-//! 口径：raw-sum（不按 message id 去重），与 OMP/Claude 保持一致。
-//!
-//! 注意：session_id 从 `type: "session"` header 行提取。append-scan 只解析
-//! 文件尾部，看不到 header，因此追加部分的 session_id 为 None。此字段仅
-//! 用于信息展示和溯源，不参与去重或聚合，所以可接受；source_path 列已
-//! 可唯一标识 session 来源。
-
-use serde_json::Value;
-
-use super::RawEntry;
-use crate::stats::date::date_field;
-
-const AGENT: &str = super::super::AGENT_REMORA;
+//! 口径：raw-sum（不按 message id 去重），与 pi/OMP/Claude 保持一致。
 
 pub(super) fn parse(content: &str) -> Vec<RawEntry> {
-    let mut out: Vec<RawEntry> = Vec::new();
-    let mut session_id: Option<String> = None;
-
-    for line in content.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-
-        // 从 type: "session" header 行提取 session_id
-        if v.get("type").and_then(Value::as_str) == Some("session") {
-            if let Some(id) = v.get("id").and_then(Value::as_str) {
-                session_id = Some(id.to_string());
-            }
-            continue;
-        }
-
-        if let Some(entry) = parse_one(&v, session_id.as_deref()) {
-            out.push(entry);
-        }
-    }
-    out
+    super::pi::parse_with_agent(content, super::super::AGENT_REMORA)
 }
 
-fn parse_one(v: &Value, session_id: Option<&str>) -> Option<RawEntry> {
-    // Remora assistant 消息为 type="message" + role="assistant"
-    if v.get("type").and_then(Value::as_str) != Some("message") {
-        return None;
-    }
-
-    let message = v.get("message")?;
-    if message.get("role").and_then(Value::as_str) != Some("assistant") {
-        return None;
-    }
-
-    let usage = message.get("usage")?;
-    if usage.is_null() {
-        return None;
-    }
-
-    let model = message
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)?;
-    if model.is_empty() || model == "<synthetic>" {
-        return None;
-    }
-
-    // 日期从顶层 timestamp（ISO 8601）提取
-    let date = date_field(v.get("timestamp"))?;
-
-    // Remora usage 字段为 camelCase，与 OMP 一致
-    let input_tokens = usage.get("input").and_then(Value::as_u64).unwrap_or(0);
-    let output_tokens = usage.get("output").and_then(Value::as_u64).unwrap_or(0);
-    let cache_read = usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0);
-    let cache_write = usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0);
-
-    if input_tokens == 0 && cache_read == 0 && cache_write == 0 && output_tokens == 0 {
-        return None;
-    }
-
-    Some(RawEntry {
-        agent: AGENT.to_string(),
-        model: model.to_string(),
-        date,
-        input_tokens,
-        output_tokens,
-        cache_read_input_tokens: cache_read,
-        cache_creation_input_tokens: cache_write,
-        reasoning_output_tokens: 0,
-        dedup_primary: None,
-        dedup_secondary: None,
-        is_sidechain: false,
-        session_id: session_id.map(str::to_string),
-        message_id: v.get("id").and_then(Value::as_str).map(str::to_string),
-    })
-}
+use super::RawEntry;
 
 #[cfg(test)]
 mod tests {
@@ -108,8 +18,6 @@ mod tests {
 
     #[test]
     fn parses_assistant_message() {
-        // 使用本地时区日期：UTC "2026-06-19T16:06:52.416Z" 在 UTC+8 为 2026-06-20
-        // 为避免时区依赖，使用不含时区偏移的日期字符串
         let line = r#"{"type":"message","id":"abc","parentId":"xyz","timestamp":"2026-06-19T00:00:00.000Z","message":{"role":"assistant","provider":"dashscope","model":"qwen3.7-max","usage":{"input":832,"output":109,"cacheRead":2048,"cacheWrite":500,"totalTokens":3489}}}"#;
         let entries = parse(line);
         assert_eq!(entries.len(), 1);

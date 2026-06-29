@@ -1,30 +1,43 @@
 //! pi coding-agent session jsonl 解析。
 //!
 //! pi 将 agent session 存放在 `~/.pi/agent/sessions/` 下，
-//! 格式为树形 JSONL（与 Remora 共享同一 session 格式）：
+//! 格式为树形 JSONL（Remora 基于 pi 底座构建，共享同一 session 格式）：
 //! - `type: "session"` 行提供 session header（含 id、timestamp、cwd）
 //! - `type: "model_change"` 行记录模型切换（provider + modelId）
 //! - `type: "thinking_level_change"` 行记录思考级别变化
 //! - `type: "message"` + `message.role: "assistant"` 标记 assistant 消息
 //! - usage 字段为 camelCase：`input` / `output` / `cacheRead` / `cacheWrite`
-//!   此外还有 `cacheWrite1h` 字段（pi 独有，暂不参与统计）
+//!   此外还有 `cacheWrite1h` 字段（pi 独有，暂不参与统计，见下方说明）
 //! - `type: "leaf"` / `type: "label"` / `type: "compaction"` 等不含 per-message usage，跳过
 //!
-//! 口径：raw-sum（不按 message id 去重），与 Remora/OMP/Claude 保持一致。
+//! 口径：raw-sum（不按 message id 去重），与 OMP/Claude 保持一致。
 //!
 //! 注意：session_id 从 `type: "session"` header 行提取。append-scan 只解析
 //! 文件尾部，看不到 header，因此追加部分的 session_id 为 None。此字段仅
 //! 用于信息展示和溯源，不参与去重或聚合，所以可接受；source_path 列已
 //! 可唯一标识 session 来源。
+//!
+//! ## cacheWrite1h 说明
+//!
+//! pi 的 usage 中有 `cacheWrite1h` 字段，语义为"1 小时内的 cache 写入"，
+//! 与 `cacheWrite`（≥5 分钟 TTL）可能重叠：同一 cache 内容在写入后 5 分钟到
+//! 1 小时之间会被计为 cacheRead，而非 cacheWrite1h，因此两者不简单叠加。
+//!
+//! 当前做法：忽略 `cacheWrite1h`，仅统计 `cacheWrite`（与 Remora 口径一致）。
+//! **潜在风险**：若 pi 单独核算 1h cache 写入成本，此处 `cache_creation` 会少计。
+//! 后续若需纳入，应将 `cacheWrite1h` 作为独立列展示，而非归入 `cache_creation`，
+//! 以避免与 `cacheWrite` 重复计数。
 
 use serde_json::Value;
 
 use super::RawEntry;
 use crate::stats::date::date_field;
 
-const AGENT: &str = super::super::AGENT_PI;
-
-pub(super) fn parse(content: &str) -> Vec<RawEntry> {
+/// 泛型 pi-family session JSONL 解析，供 pi 和 Remora 共用。
+///
+/// Remora 基于 pi 底座构建，两者共享同一 session JSONL 格式；
+/// 解析逻辑完全相同，仅 agent 标识不同。
+pub(super) fn parse_with_agent(content: &str, agent: &str) -> Vec<RawEntry> {
     let mut out: Vec<RawEntry> = Vec::new();
     let mut session_id: Option<String> = None;
 
@@ -44,15 +57,15 @@ pub(super) fn parse(content: &str) -> Vec<RawEntry> {
             continue;
         }
 
-        if let Some(entry) = parse_one(&v, session_id.as_deref()) {
+        if let Some(entry) = parse_one(&v, agent, session_id.as_deref()) {
             out.push(entry);
         }
     }
     out
 }
 
-fn parse_one(v: &Value, session_id: Option<&str>) -> Option<RawEntry> {
-    // pi assistant 消息为 type="message" + role="assistant"
+fn parse_one(v: &Value, agent: &str, session_id: Option<&str>) -> Option<RawEntry> {
+    // pi-family assistant 消息为 type="message" + role="assistant"
     if v.get("type").and_then(Value::as_str) != Some("message") {
         return None;
     }
@@ -78,21 +91,19 @@ fn parse_one(v: &Value, session_id: Option<&str>) -> Option<RawEntry> {
     // 日期从顶层 timestamp（ISO 8601）提取
     let date = date_field(v.get("timestamp"))?;
 
-    // pi usage 字段为 camelCase
+    // pi-family usage 字段为 camelCase
     let input_tokens = usage.get("input").and_then(Value::as_u64).unwrap_or(0);
     let output_tokens = usage.get("output").and_then(Value::as_u64).unwrap_or(0);
     let cache_read = usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0);
     let cache_write = usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0);
-    // pi 独有 cacheWrite1h 字段，暂不单独统计，归入 cache_creation 总量不合适，
-    // 因为语义是"1 小时内的 cache 写入"，与 cacheWrite 可能重叠。
-    // 当前做法：忽略 cacheWrite1h，仅统计 cacheWrite（与 Remora 口径一致）。
+    // cacheWrite1h（pi 独有）暂忽略，见模块顶部说明。
 
     if input_tokens == 0 && cache_read == 0 && cache_write == 0 && output_tokens == 0 {
         return None;
     }
 
     Some(RawEntry {
-        agent: AGENT.to_string(),
+        agent: agent.to_string(),
         model: model.to_string(),
         date,
         input_tokens,
@@ -106,6 +117,11 @@ fn parse_one(v: &Value, session_id: Option<&str>) -> Option<RawEntry> {
         session_id: session_id.map(str::to_string),
         message_id: v.get("id").and_then(Value::as_str).map(str::to_string),
     })
+}
+
+/// pi 入口：使用 AGENT_PI 标识。
+pub(super) fn parse(content: &str) -> Vec<RawEntry> {
+    parse_with_agent(content, super::super::AGENT_PI)
 }
 
 #[cfg(test)]
@@ -209,5 +225,15 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].session_id, Some("sess-1".to_string()));
         assert_eq!(entries[1].session_id, Some("sess-2".to_string()));
+    }
+
+    #[test]
+    fn generic_parse_with_agent_uses_correct_agent_name() {
+        let line = r#"{"type":"message","id":"abc","parentId":"xyz","timestamp":"2026-06-19T00:00:00.000Z","message":{"role":"assistant","model":"qwen3.7-max","usage":{"input":832,"output":109,"cacheRead":2048,"cacheWrite":500,"totalTokens":3489}}}"#;
+        let entries_pi = parse_with_agent(line, "pi");
+        assert_eq!(entries_pi[0].agent, "pi");
+
+        let entries_remora = parse_with_agent(line, "remora");
+        assert_eq!(entries_remora[0].agent, "remora");
     }
 }
