@@ -54,7 +54,7 @@ impl StatsApp {
         Self {
             records,
             today,
-            period: Period::Last7,
+            period: Period::LastDays(7),
             models_scroll: 0,
             chart_tab: ChartTab::Overview,
             race_tick: 0,
@@ -62,15 +62,6 @@ impl StatsApp {
             race_window: RaceWindow::PerDay,
         }
     }
-
-    /// 当前 period 内的记录。
-    pub(super) fn period_records(&self) -> Vec<&UsageRecord> {
-        self.records
-            .iter()
-            .filter(|r| self.period.includes(&r.date, &self.today))
-            .collect()
-    }
-
     fn advance_race(&mut self) {
         if matches!(self.chart_tab, ChartTab::Race) {
             self.race_tick = self.race_tick.saturating_add(1);
@@ -139,8 +130,8 @@ fn event_loop<B: ratatui::backend::Backend>(
             KeyCode::Char('q') | KeyCode::Esc => break,
             KeyCode::Char('1') => app.period = Period::Today,
             KeyCode::Char('2') => app.period = Period::Lastday,
-            KeyCode::Char('3') => app.period = Period::Last7,
-            KeyCode::Char('4') => app.period = Period::Last30,
+            KeyCode::Char('3') => app.period = Period::LastDays(7),
+            KeyCode::Char('4') => app.period = Period::LastMonthDays,
             KeyCode::Char('5') => app.period = Period::All,
             KeyCode::Char('r') => {
                 if matches!(app.chart_tab, ChartTab::Overview) {

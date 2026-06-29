@@ -7,12 +7,15 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use std::collections::{HashMap, HashSet};
 
-use super::aggregate::{top_models_covering, totals_by_agent_model, totals_by_model};
+use super::PALETTE;
+use super::aggregate::totals_by_model;
 use super::date::{date_offset, days_diff};
 use super::format::{format_share, format_tokens, short_date};
+use super::overview::{
+    self, OverviewChartData, OverviewTableData, OverviewTableRow, build_overview_data,
+};
 use super::tui::{ChartTab, StatsApp};
 use super::types::{Period, RaceInterval, RaceWindow, UsageRecord, UsageTotals};
-use super::{MATRIX_AGENTS, PALETTE};
 
 type ChartSeries = (String, Vec<f64>, Color);
 type ChartOccupancy = HashSet<(u16, u16)>;
@@ -117,12 +120,16 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
 }
 
 fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
+    let month_days = super::date::previous_month_days(&app.today);
     let period_hint = match app.period {
-        Period::Today => "[1] Today  2 Yda  3 7d  4 Mo  5 All",
-        Period::Lastday => "1 Today  [2] Yda  3 7d  4 Mo  5 All",
-        Period::Last7 => "1 Today  2 Yda  [3] 7d  4 Mo  5 All",
-        Period::Last30 => "1 Today  2 Yda  3 7d  [4] Mo  5 All",
-        Period::All => "1 Today  2 Yda  3 7d  4 Mo  [5] All",
+        Period::Today => format!("[1] Today  2 Yda  3 7d  4 {month_days}d  5 All"),
+        Period::Lastday => format!("1 Today  [2] Yda  3 7d  4 {month_days}d  5 All"),
+        Period::LastDays(7) => format!("1 Today  2 Yda  [3] 7d  4 {month_days}d  5 All"),
+        Period::LastMonthDays => {
+            format!("1 Today  2 Yda  3 7d  [4] {month_days}d  5 All")
+        }
+        Period::LastDays(_) => format!("1 Today  2 Yda  3 7d  4 {month_days}d  5 All"),
+        Period::All => format!("1 Today  2 Yda  3 7d  4 {month_days}d  [5] All"),
     };
     let view_hint = match app.chart_tab {
         ChartTab::Overview => "Overview".to_string(),
@@ -140,7 +147,7 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
         "{period_hint}   {keys_hint}   Tab switch view   ↑↓/j/k scroll   {view_hint}   q quit"
     );
     let p = Paragraph::new(Line::from(Span::styled(
-        text,
+        &text,
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(p, area);
@@ -149,6 +156,7 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
 fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     match app.chart_tab {
         ChartTab::Overview => {
+            let overview = build_overview_data(&app.records, &app.today, app.period);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -158,8 +166,8 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
                 ])
                 .split(area);
             draw_period_switch(f, chunks[0], app);
-            draw_tokens_per_day_chart(f, chunks[1], app);
-            draw_overview_model_list(f, chunks[2], app);
+            draw_tokens_per_day_chart(f, chunks[1], &overview.chart);
+            draw_overview_model_list(f, chunks[2], app, &overview.table);
         }
         ChartTab::Race => {
             let filtered_records: Vec<UsageRecord> =
@@ -191,9 +199,8 @@ fn draw_models_view(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
     }
 }
 
-fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
-    let records = app.period_records();
-    if records.is_empty() {
+fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, chart: &OverviewChartData) {
+    if !chart.has_records {
         let p = Paragraph::new(Line::from(Span::styled(
             "  No data in selected period.",
             Style::default().fg(Color::DarkGray),
@@ -203,54 +210,26 @@ fn draw_tokens_per_day_chart(f: &mut ratatui::Frame, area: Rect, app: &StatsApp)
         return;
     }
 
-    let totals = totals_by_model(&records);
-    let top_models: Vec<String> = top_models_covering(&totals, 0.80);
-
-    let Some((min_date, max_date)) = chart_date_range(app.period, &app.today, &records) else {
-        return;
-    };
-
-    let day_count = (days_diff(&min_date, &max_date).unwrap_or(0).max(0) + 1) as usize;
-    let day_count = day_count.max(1);
-
-    // 每个模型每天的 token 数，使用与模型排行一致的 input + output 口径。
-    let mut series: HashMap<String, Vec<f64>> = HashMap::new();
-    for m in &top_models {
-        series.insert(m.clone(), vec![0.0; day_count]);
-    }
-    for r in &records {
-        let idx = days_diff(&min_date, &r.date).unwrap_or(0).max(0) as usize;
-        if idx >= day_count {
-            continue;
-        }
-        let mut totals = UsageTotals::default();
-        totals.add_record(r);
-        let tokens = totals.total_tokens() as f64;
-        if let Some(v) = series.get_mut(&r.model) {
-            v[idx] += tokens;
-        }
-    }
-
-    let mut max_y: f64 = 1.0;
-    let mut chart_series: Vec<ChartSeries> = Vec::new();
-    for (idx, model) in top_models.iter().enumerate() {
-        let color = PALETTE[idx % PALETTE.len()];
-        let values = series.get(model).cloned().unwrap_or_default();
-        for &y in &values {
-            if y > max_y {
-                max_y = y;
-            }
-        }
-        chart_series.push((model.clone(), values, color));
-    }
+    let day_count = chart.dates.len().max(1);
+    let chart_series: Vec<ChartSeries> = chart
+        .series
+        .iter()
+        .map(|series| {
+            (
+                series.model.clone(),
+                series.values.clone(),
+                PALETTE[series.color_index % PALETTE.len()],
+            )
+        })
+        .collect();
 
     draw_step_chart(
         f,
         area,
-        &min_date,
-        &max_date,
+        &chart.min_date,
+        &chart.max_date,
         day_count,
-        max_y,
+        chart.max_y.max(1.0),
         &chart_series,
     );
 }
@@ -548,36 +527,6 @@ fn fixed_chart_area(area: Rect) -> Rect {
         area.width.min(STEP_CHART_MAX_WIDTH),
         area.height.min(STEP_CHART_HEIGHT),
     )
-}
-
-fn chart_date_range(
-    period: Period,
-    today: &str,
-    records: &[&UsageRecord],
-) -> Option<(String, String)> {
-    match period {
-        Period::Today => Some((today.to_string(), today.to_string())),
-        Period::Lastday => Some((date_offset(today, -1).ok()?, date_offset(today, -1).ok()?)),
-        Period::Last7 => Some((date_offset(today, -6).ok()?, today.to_string())),
-        Period::Last30 => {
-            let days = super::date::previous_month_days(today) as i64;
-            Some((date_offset(today, -(days - 1)).ok()?, today.to_string()))
-        }
-        Period::All => {
-            let first = records.first()?;
-            let mut min_date = first.date.clone();
-            let mut max_date = first.date.clone();
-            for record in records.iter().skip(1) {
-                if record.date.as_str() < min_date.as_str() {
-                    min_date = record.date.clone();
-                }
-                if record.date.as_str() > max_date.as_str() {
-                    max_date = record.date.clone();
-                }
-            }
-            Some((min_date, max_date))
-        }
-    }
 }
 
 /// 7 天滚动窗口长度（含当日）。第一个能形成完整窗口的 frame 日期为
@@ -1285,8 +1234,8 @@ fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     for (i, p) in [
         Period::Today,
         Period::Lastday,
-        Period::Last7,
-        Period::Last30,
+        Period::LastDays(7),
+        Period::LastMonthDays,
         Period::All,
     ]
     .iter()
@@ -1308,11 +1257,13 @@ fn draw_period_switch(f: &mut ratatui::Frame, area: Rect, app: &StatsApp) {
     f.render_widget(p, area);
 }
 
-fn draw_overview_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsApp) {
-    let records = app.period_records();
-    let cells = totals_by_agent_model(&records);
-    let totals = totals_by_model(&records);
-    let model_count = totals.values().filter(|u| u.total_tokens() > 0).count();
+fn draw_overview_model_list(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut StatsApp,
+    table: &OverviewTableData,
+) {
+    let model_count = table.rows.len();
     let visible = area.height.saturating_sub(3) as usize;
     let max_scroll = model_count.saturating_sub(visible.max(1));
     if app.models_scroll > max_scroll {
@@ -1320,7 +1271,17 @@ fn draw_overview_model_list(f: &mut ratatui::Frame, area: Rect, app: &mut StatsA
     }
     let shown = model_count.saturating_sub(app.models_scroll).min(visible);
     let title = format!("Models · {} of {}", shown, model_count);
-    draw_model_table(f, area, app, &title, cells, totals, None, true);
+    draw_model_table_rows(
+        f,
+        area,
+        app,
+        &title,
+        &table.rows,
+        &table.cells,
+        &table.agent_columns,
+        table.total_all,
+        None,
+    );
 }
 
 fn draw_dynamic_model_list(
@@ -1347,13 +1308,13 @@ fn draw_dynamic_model_list(
         interpolate_usage_cells(&previous.cells, &current.cells, smoothstep(tween));
     let displayed_totals = totals_by_model_from_cells(&displayed_cells);
     let color_map = race_color_map(&app.records);
+    let sorted_rows = overview::sort_model_rows(&displayed_totals);
+    let agent_columns = overview::sorted_agents_by_usage(&displayed_cells, true);
 
-    let model_count = displayed_totals
-        .values()
-        .filter(|u| u.total_tokens() > 0)
-        .count();
-    let total_in: u64 = displayed_totals.values().map(|u| u.in_tokens).sum();
-    let total_out: u64 = displayed_totals.values().map(|u| u.out_tokens).sum();
+    let model_count = sorted_rows.len();
+    let total_in: u64 = sorted_rows.iter().map(|row| row.usage.in_tokens).sum();
+    let total_out: u64 = sorted_rows.iter().map(|row| row.usage.out_tokens).sum();
+    let total_all: u64 = sorted_rows.iter().map(|row| row.usage.total_tokens()).sum();
     let interval_label = app.race_interval.label(&app.today);
     let window_label = window.label();
     let date_short = short_date(&current.date);
@@ -1362,15 +1323,16 @@ fn draw_dynamic_model_list(
     let title = format!(
         "Model Tokens Top {model_count} · {window_label} in {interval_label} {date_short} ↑{total_in_fmt} ↓{total_out_fmt}"
     );
-    draw_model_table(
+    draw_model_table_rows(
         f,
         area,
         app,
         &title,
-        displayed_cells,
-        displayed_totals,
+        &sorted_rows,
+        &displayed_cells,
+        &agent_columns,
+        total_all,
         Some(&color_map),
-        true,
     );
 }
 
@@ -1384,12 +1346,6 @@ fn draw_model_table(
     color_map: Option<&HashMap<String, Color>>,
     hide_empty_agents: bool,
 ) {
-    let total_all: u64 = totals.values().map(|usage| usage.total_tokens()).sum();
-    let mut total_usage = UsageTotals::default();
-    for u in totals.values() {
-        total_usage.add(u);
-    }
-
     if totals.is_empty() {
         let p = Paragraph::new(Line::from(Span::styled(
             "  No models to display.",
@@ -1404,15 +1360,56 @@ fn draw_model_table(
         return;
     }
 
-    let mut sorted: Vec<(String, UsageTotals)> = totals.into_iter().collect();
-    sorted.retain(|(_, usage)| usage.total_tokens() > 0);
-    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.total_tokens()));
-    let agent_columns = sorted_agents_by_usage(&cells, hide_empty_agents);
+    let agent_columns = overview::sorted_agents_by_usage(&cells, hide_empty_agents);
+    let sorted = overview::sort_model_rows(&totals);
+    let total_all: u64 = sorted.iter().map(|row| row.usage.total_tokens()).sum();
+    draw_model_table_rows(
+        f,
+        area,
+        app,
+        title,
+        &sorted,
+        &cells,
+        &agent_columns,
+        total_all,
+        color_map,
+    );
+}
+
+fn draw_model_table_rows(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    app: &mut StatsApp,
+    title: &str,
+    sorted: &[OverviewTableRow],
+    cells: &HashMap<(String, String), UsageTotals>,
+    agent_columns: &[(&'static str, &'static str)],
+    total_all: u64,
+    color_map: Option<&HashMap<String, Color>>,
+) {
+    if sorted.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            "  No models to display.",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {title} ")),
+        );
+        f.render_widget(p, area);
+        return;
+    }
+
+    let mut total_usage = UsageTotals::default();
+    for row in sorted {
+        total_usage.add(&row.usage);
+    }
 
     // 窄终端下优先保证高用量（左侧）agent 列完整显示，低用量（右侧）列
     // 整列隐藏；拉宽终端后右侧列逐步「弹出」——不再等比压缩所有列。
     let inner_width = area.width.saturating_sub(2);
-    let total_width_val = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
+    let total_width_val = usage_column_width("Total", sorted.iter().map(|row| &row.usage));
     let fixed_columns_width = MODEL_MIN_WIDTH + SHARE_WIDTH + total_width_val;
     let ideal_agent_widths: Vec<u16> = agent_columns
         .iter()
@@ -1420,7 +1417,7 @@ fn draw_model_table(
             let agent = (*agent).to_string();
             let usages = sorted
                 .iter()
-                .filter_map(|(model, _)| cells.get(&(agent.clone(), model.clone())));
+                .filter_map(|row| cells.get(&(agent.clone(), row.model.clone())));
             usage_column_width(label, usages)
         })
         .collect();
@@ -1436,7 +1433,7 @@ fn draw_model_table(
         .iter()
         .map(|(agent, _)| {
             let mut total = UsageTotals::default();
-            for ((a, _), u) in &cells {
+            for ((a, _), u) in cells {
                 if a == agent {
                     total.add(u);
                 }
@@ -1463,7 +1460,7 @@ fn draw_model_table(
     // 仅影响底纹绘制，Share 列仍显示真实占比 (pct)。
     let max_total_tokens: u64 = sorted
         .iter()
-        .map(|(_, usage)| usage.total_tokens())
+        .map(|row| row.usage.total_tokens())
         .max()
         .unwrap_or(0);
 
@@ -1472,7 +1469,9 @@ fn draw_model_table(
         .enumerate()
         .skip(app.models_scroll)
         .take(visible)
-        .map(|(idx, (model, usage))| {
+        .map(|(idx, row)| {
+            let model = &row.model;
+            let usage = &row.usage;
             let pct = if total_all > 0 {
                 usage.total_tokens() as f64 * 100.0 / total_all as f64
             } else {
@@ -1481,7 +1480,7 @@ fn draw_model_table(
             let model_cell = if color_map.is_some() {
                 let dot_color = color_map
                     .and_then(|colors| colors.get(model).copied())
-                    .unwrap_or(PALETTE[idx % PALETTE.len()]);
+                    .unwrap_or(PALETTE[row.color_index % PALETTE.len()]);
                 Cell::from(Span::styled(
                     model.clone(),
                     Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
@@ -1496,7 +1495,7 @@ fn draw_model_table(
                 let model_len = model.chars().count();
                 let share_chars = share_width.min(model_len);
 
-                let model_color = PALETTE[idx % PALETTE.len()];
+                let model_color = PALETTE[row.color_index % PALETTE.len()];
                 let mut chars = model.chars();
                 let model_prefix: String = chars.by_ref().take(share_chars).collect();
                 let model_suffix: String = chars.collect();
@@ -1650,33 +1649,6 @@ fn usage_cell_text(usage: &UsageTotals) -> String {
     )
 }
 
-fn sorted_agents_by_usage(
-    cells: &HashMap<(String, String), UsageTotals>,
-    hide_empty_agents: bool,
-) -> Vec<(&'static str, &'static str)> {
-    let mut agents: Vec<(usize, &'static str, &'static str, u64)> = MATRIX_AGENTS
-        .iter()
-        .enumerate()
-        .map(|(idx, (agent, label))| {
-            let total = cells
-                .iter()
-                .filter(|((cell_agent, _), _)| cell_agent == agent)
-                .map(|(_, usage)| usage.total_tokens())
-                .sum();
-            (idx, *agent, *label, total)
-        })
-        .collect();
-
-    if hide_empty_agents {
-        agents.retain(|(_, _, _, total)| *total > 0);
-    }
-    agents.sort_by(|left, right| right.3.cmp(&left.3).then(left.0.cmp(&right.0)));
-    agents
-        .into_iter()
-        .map(|(_, agent, label, _)| (agent, label))
-        .collect()
-}
-
 fn text_width(text: &str) -> u16 {
     text.chars().count().min(u16::MAX as usize) as u16
 }
@@ -1713,11 +1685,11 @@ where
 #[cfg(test)]
 fn model_table_widths(
     area_width: u16,
-    sorted: &[(String, UsageTotals)],
+    sorted: &[OverviewTableRow],
     cells: &HashMap<(String, String), UsageTotals>,
     agent_columns: &[(&'static str, &'static str)],
 ) -> Vec<Constraint> {
-    let total_width = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
+    let total_width = usage_column_width("Total", sorted.iter().map(|row| &row.usage));
     let model_width = MODEL_MIN_WIDTH;
     let fixed_columns_width = model_width + SHARE_WIDTH + total_width;
     let inner_width = area_width.saturating_sub(2);
@@ -1727,7 +1699,7 @@ fn model_table_widths(
             let agent = (*agent).to_string();
             let usages = sorted
                 .iter()
-                .filter_map(|(model, _)| cells.get(&(agent.clone(), model.clone())));
+                .filter_map(|row| cells.get(&(agent.clone(), row.model.clone())));
             usage_column_width(label, usages)
         })
         .collect();
@@ -1743,10 +1715,10 @@ fn model_table_widths(
 
 /// Build table constraints from pre-computed visible agent widths.
 fn model_table_widths_with_agent_widths(
-    sorted: &[(String, UsageTotals)],
+    sorted: &[OverviewTableRow],
     agent_widths: &[u16],
 ) -> Vec<Constraint> {
-    let total_width = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
+    let total_width = usage_column_width("Total", sorted.iter().map(|row| &row.usage));
     let model_width = MODEL_MIN_WIDTH;
 
     let mut widths = vec![
@@ -1808,6 +1780,14 @@ mod tests {
         }
     }
 
+    fn sorted_rows(rows: &[(&str, UsageTotals)]) -> Vec<OverviewTableRow> {
+        let totals: HashMap<String, UsageTotals> = rows
+            .iter()
+            .map(|(model, usage)| ((*model).to_string(), *usage))
+            .collect();
+        overview::sort_model_rows(&totals)
+    }
+
     fn record(model: &str, date: &str, in_tokens: u64, out_tokens: u64) -> UsageRecord {
         agent_record("claude", model, date, in_tokens, out_tokens)
     }
@@ -1856,11 +1836,11 @@ mod tests {
         let record_refs = records.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            chart_date_range(Period::Last7, "2026-05-29", &record_refs),
+            overview::chart_date_range(Period::LastDays(7), "2026-05-29", &record_refs),
             Some(("2026-05-23".to_string(), "2026-05-29".to_string()))
         );
         assert_eq!(
-            chart_date_range(Period::Last30, "2026-05-29", &record_refs),
+            overview::chart_date_range(Period::LastMonthDays, "2026-05-29", &record_refs),
             Some(("2026-04-30".to_string(), "2026-05-29".to_string()))
         );
     }
@@ -1892,7 +1872,7 @@ mod tests {
         let record_refs = records.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            chart_date_range(Period::All, "2026-05-29", &record_refs),
+            overview::chart_date_range(Period::All, "2026-05-29", &record_refs),
             Some(("2026-05-12".to_string(), "2026-05-27".to_string()))
         );
     }
@@ -2238,11 +2218,11 @@ mod tests {
             Some(100)
         );
         assert_eq!(
-            sorted_agents_by_usage(&frames[0].cells, true),
+            overview::sorted_agents_by_usage(&frames[0].cells, true),
             vec![("claude", "Claude Code")]
         );
         assert_eq!(
-            sorted_agents_by_usage(&frames[1].cells, true)[0],
+            overview::sorted_agents_by_usage(&frames[1].cells, true)[0],
             ("codex", "Codex")
         );
     }
@@ -2354,7 +2334,7 @@ mod tests {
             ),
         ]);
 
-        let agents = sorted_agents_by_usage(&cells, false);
+        let agents = overview::sorted_agents_by_usage(&cells, false);
 
         assert_eq!(
             agents,
@@ -2377,17 +2357,17 @@ mod tests {
             usage(100, 0),
         )]);
 
-        let agents = sorted_agents_by_usage(&cells, true);
+        let agents = overview::sorted_agents_by_usage(&cells, true);
 
         assert_eq!(agents, vec![("claude", "Claude Code")]);
     }
 
     #[test]
     fn model_table_widths_keep_stat_columns_compact() {
-        let sorted = vec![
-            ("qwen3.7-max".to_string(), usage(174_400_000, 547_900)),
-            ("deepseek-v4-pro".to_string(), usage(45_700_000, 281_400)),
-        ];
+        let sorted = sorted_rows(&[
+            ("qwen3.7-max", usage(174_400_000, 547_900)),
+            ("deepseek-v4-pro", usage(45_700_000, 281_400)),
+        ]);
         let cells = HashMap::from([
             (
                 ("claude".to_string(), "qwen3.7-max".to_string()),
@@ -2402,7 +2382,7 @@ mod tests {
                 usage(510_900, 59_900),
             ),
         ]);
-        let agent_columns = sorted_agents_by_usage(&cells, false);
+        let agent_columns = overview::sorted_agents_by_usage(&cells, false);
 
         let widths = model_table_widths(103, &sorted, &cells, &agent_columns);
 
@@ -2415,10 +2395,10 @@ mod tests {
 
     #[test]
     fn model_table_narrow_terminal_hides_low_usage_agents() {
-        let sorted = vec![
-            ("qwen3.7-max".to_string(), usage(174_400_000, 547_900)),
-            ("deepseek-v4-pro".to_string(), usage(45_700_000, 281_400)),
-        ];
+        let sorted = sorted_rows(&[
+            ("qwen3.7-max", usage(174_400_000, 547_900)),
+            ("deepseek-v4-pro", usage(45_700_000, 281_400)),
+        ]);
         let cells = HashMap::from([
             (
                 ("claude".to_string(), "qwen3.7-max".to_string()),
@@ -2433,7 +2413,7 @@ mod tests {
                 usage(300, 100),
             ),
         ]);
-        let agent_columns = sorted_agents_by_usage(&cells, true);
+        let agent_columns = overview::sorted_agents_by_usage(&cells, true);
 
         // Narrow terminal (50px) — only fixed columns + the highest-usage agent
         // can fit; low-usage agents are hidden entirely.
@@ -2446,10 +2426,10 @@ mod tests {
     #[test]
     fn model_table_model_column_capped_at_min_width() {
         // 26-char model name fits within MODEL_MIN_WIDTH
-        let sorted = vec![
-            ("claude-haiku-4-5-20251001".to_string(), usage(100, 0)),
-            ("short".to_string(), usage(50, 0)),
-        ];
+        let sorted = sorted_rows(&[
+            ("claude-haiku-4-5-20251001", usage(100, 0)),
+            ("short", usage(50, 0)),
+        ]);
         let cells = HashMap::new();
         let agent_columns: Vec<(&str, &str)> = vec![];
 
@@ -2457,7 +2437,7 @@ mod tests {
         assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
 
         // 30-char model name still capped at MODEL_MIN_WIDTH, not expanded
-        let longer_sorted = vec![("copilot-suggestions-himalia-001".to_string(), usage(100, 0))];
+        let longer_sorted = sorted_rows(&[("copilot-suggestions-himalia-001", usage(100, 0))]);
         let widths = model_table_widths(60, &longer_sorted, &cells, &agent_columns);
         assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
     }

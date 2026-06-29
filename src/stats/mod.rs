@@ -8,15 +8,25 @@
 //! 聚合用 SQL GROUP BY 实时计算，不需要单独的聚合表。
 
 mod aggregate;
+mod chart;
 mod date;
 mod db;
 mod format;
+#[cfg(feature = "image-output")]
+mod image;
+mod layout;
+mod overview;
+mod palette;
 mod parser;
+mod race;
+mod table;
 mod tui;
 mod types;
 mod view;
 
 use anyhow::Result;
+#[cfg(not(feature = "image-output"))]
+use anyhow::anyhow;
 use dirs::home_dir;
 use ratatui::style::Color;
 use std::collections::BTreeSet;
@@ -27,8 +37,86 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use overview::build_overview_data;
 use parser::{SourceKind, parse_file, parse_file_from_offset};
 use types::UsageRecord;
+
+/// 统计输出格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Svg,
+    Png,
+    Jpg,
+}
+
+impl OutputFormat {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "svg" => Some(Self::Svg),
+            "png" => Some(Self::Png),
+            "jpg" | "jpeg" => Some(Self::Jpg),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "image-output")]
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpg => "jpg",
+            Self::Svg => "svg",
+        }
+    }
+}
+
+/// 统计视图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsView {
+    Overview,
+    Race,
+}
+
+impl StatsView {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "overview" => Some(Self::Overview),
+            "race" => Some(Self::Race),
+            _ => None,
+        }
+    }
+}
+
+/// 统计时间区间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsPeriod {
+    Days(u16),
+}
+
+impl StatsPeriod {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_lowercase();
+        let day_count = s.strip_suffix('d')?.parse::<u16>().ok()?;
+        if day_count == 0 {
+            None
+        } else {
+            Some(Self::Days(day_count))
+        }
+    }
+
+    fn to_period(self) -> types::Period {
+        match self {
+            Self::Days(day_count) => types::Period::LastDays(day_count),
+        }
+    }
+}
+
+/// 图片输出配置。
+#[derive(Debug, Clone, Default)]
+pub struct StatsOutputConfig {
+    pub output_format: Option<OutputFormat>,
+    pub view: Option<StatsView>,
+    pub period: Option<StatsPeriod>,
+}
 
 pub(crate) const AGENT_CLAUDE: &str = "claude";
 pub(crate) const AGENT_CODEX: &str = "codex";
@@ -297,7 +385,7 @@ pub(crate) fn format_tokens_compact(n: u64) -> String {
     }
 }
 
-pub fn run_stats() -> Result<()> {
+pub fn run_stats(config: StatsOutputConfig) -> Result<()> {
     let today = date::today_date_string()?;
 
     let db_path = db::db_path()?;
@@ -411,7 +499,106 @@ pub fn run_stats() -> Result<()> {
         return dump_records(&records, &today);
     }
 
-    tui::run_tui(records, today)
+    match config.output_format {
+        None => tui::run_tui(records, today),
+        Some(format) => {
+            let period = config
+                .period
+                .map(|p| p.to_period())
+                .unwrap_or(types::Period::LastMonthDays);
+            let svg = render_to_string(&records, &today, period, config.view)?;
+            match format {
+                OutputFormat::Svg => {
+                    println!("{svg}");
+                    Ok(())
+                }
+                OutputFormat::Png | OutputFormat::Jpg => {
+                    #[cfg(feature = "image-output")]
+                    {
+                        let ext = format.extension();
+                        let path = PathBuf::from(format!("cx-stats.{ext}"));
+                        image::render_to_image(&svg, format, &path)?;
+                        Ok(())
+                    }
+                    #[cfg(not(feature = "image-output"))]
+                    {
+                        Err(anyhow!(
+                            "PNG/JPG output requires the `image-output` feature"
+                        ))?
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_to_string(
+    records: &[UsageRecord],
+    today: &str,
+    period: types::Period,
+    view: Option<StatsView>,
+) -> Result<String> {
+    let view = view.unwrap_or(StatsView::Overview);
+    match view {
+        StatsView::Overview => render_overview(records, today, period),
+        StatsView::Race => render_race(records, today, period),
+    }
+}
+
+/// Map Period enum to period tab index (0–4) used by layout::ov_document.
+fn period_to_tab_index(period: types::Period, today: &str) -> Option<usize> {
+    match period {
+        types::Period::Today => Some(0),
+        types::Period::Lastday => Some(1),
+        types::Period::LastDays(7) => Some(2),
+        types::Period::LastMonthDays => Some(3),
+        types::Period::LastDays(days) if i64::from(days) == date::previous_month_days(today) => {
+            Some(3)
+        }
+        types::Period::All => Some(4),
+        types::Period::LastDays(_) => None,
+    }
+}
+
+fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) -> Result<String> {
+    let overview = build_overview_data(records, today, period);
+
+    let period_idx = period_to_tab_index(period, today);
+    let period_label = period.label(today);
+    // ── 布局计算 ──────────────────────────────────────────
+    let row_count = overview.table.rows.len();
+    let table_h = table::table_height(row_count);
+    // chart 固定高度 350px（足够展示面积图数据）
+    let chart_h: u32 = 350;
+    let chart_bottom: u32 = layout::OV_MARGIN.top + chart_h;
+    // 总高度 = top margin + chart + x_axis + gap + table + bottom margin
+    let total_height: u32 = layout::OV_MARGIN.top
+        + chart_h
+        + layout::X_AXIS_LABEL_H
+        + layout::SECTION_GAP
+        + table_h as u32
+        + layout::OV_MARGIN.bottom;
+    let (prefix, suffix) = layout::ov_document("CX Stats", &period_label, period_idx, total_height);
+
+    let bounds = chart::PlotBounds {
+        left: layout::OV_MARGIN.left,
+        right: layout::OV_WIDTH - layout::OV_MARGIN.right,
+        top: layout::OV_MARGIN.top,
+        bottom: chart_bottom,
+    };
+    let chart_svg = chart::area_chart(&overview.chart, &bounds);
+
+    let tbl_x = layout::OV_MARGIN.left as f64;
+    let tbl_y = chart_bottom as f64 + layout::X_AXIS_LABEL_H as f64 + layout::SECTION_GAP as f64;
+    let tbl_w = (layout::OV_WIDTH - layout::OV_MARGIN.left - 24) as f64;
+    let table_svg = table::model_table(&overview.table, (tbl_x, tbl_y, tbl_w));
+
+    Ok(format!("{prefix}{chart_svg}{table_svg}{suffix}"))
+}
+
+fn render_race(records: &[UsageRecord], today: &str, period: types::Period) -> Result<String> {
+    // race_chart is self-contained: includes its own layout document skeleton.
+    Ok(race::race_chart(records, today, period))
 }
 
 /// 将模型名称归一化为统一的命名风格。
@@ -566,5 +753,18 @@ mod tests {
         assert_eq!(normalize_model_name("model"), "model");
         // 空串不应崩溃
         assert_eq!(normalize_model_name(""), "");
+    }
+
+    #[test]
+    fn stats_period_parse_accepts_positive_day_counts_only() {
+        assert_eq!(StatsPeriod::parse("7d"), Some(StatsPeriod::Days(7)));
+        assert_eq!(StatsPeriod::parse("10d"), Some(StatsPeriod::Days(10)));
+        assert_eq!(StatsPeriod::parse("31D"), Some(StatsPeriod::Days(31)));
+
+        assert_eq!(StatsPeriod::parse("0d"), None);
+        assert_eq!(StatsPeriod::parse("month"), None);
+        assert_eq!(StatsPeriod::parse("7days"), None);
+        assert_eq!(StatsPeriod::parse("today"), None);
+        assert_eq!(StatsPeriod::parse("all"), None);
     }
 }

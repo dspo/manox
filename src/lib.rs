@@ -1574,8 +1574,15 @@ enum CxCommand {
         #[arg(long, conflicts_with_all = ["source", "url"])]
         refresh: bool,
     },
-    /// 查看各 agent × model 的 token 用量统计（TUI）
-    Stats,
+    /// 查看各 agent × model 的 token 用量统计（TUI / 图片输出）
+    Stats {
+        #[arg(long, value_name = "FORMAT")]
+        output: Option<String>,
+        #[arg(long, value_name = "VIEW")]
+        view: Option<String>,
+        #[arg(long, value_name = "PERIOD")]
+        period: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1591,7 +1598,11 @@ enum DispatchCommand {
         url: Option<String>,
         refresh: bool,
     },
-    Stats,
+    Stats {
+        output: Option<String>,
+        view: Option<String>,
+        period: Option<String>,
+    },
     Launch {
         args: Vec<String>,
     },
@@ -1618,7 +1629,15 @@ fn dispatch_command(raw_args: &[String]) -> DispatchCommand {
                 provider,
                 auto_probe,
             },
-            Some(CxCommand::Stats) => DispatchCommand::Stats,
+            Some(CxCommand::Stats {
+                output,
+                view,
+                period,
+            }) => DispatchCommand::Stats {
+                output,
+                view,
+                period,
+            },
             None => DispatchCommand::Launch { args: Vec::new() },
         },
         Err(_) => DispatchCommand::Launch {
@@ -1654,7 +1673,41 @@ pub fn run() -> Result<()> {
             let config = load_config()?;
             run_probe(provider, auto_probe, &config)
         }
-        DispatchCommand::Stats => stats::run_stats(),
+        DispatchCommand::Stats {
+            output,
+            view,
+            period,
+        } => {
+            let output_format = output
+                .map(|value| {
+                    stats::OutputFormat::parse(&value).ok_or_else(|| {
+                        anyhow!("invalid --output `{value}`; expected one of: svg, png, jpg")
+                    })
+                })
+                .transpose()?;
+            let view = view
+                .map(|value| {
+                    stats::StatsView::parse(&value).ok_or_else(|| {
+                        anyhow!("invalid --view `{value}`; expected one of: overview, race")
+                    })
+                })
+                .transpose()?;
+            let period = period
+                .map(|value| {
+                    stats::StatsPeriod::parse(&value).ok_or_else(|| {
+                        anyhow!(
+                            "invalid --period `{value}`; expected format [n]d, for example: 7d, 10d"
+                        )
+                    })
+                })
+                .transpose()?;
+            let config = stats::StatsOutputConfig {
+                output_format,
+                view,
+                period,
+            };
+            stats::run_stats(config)
+        }
         DispatchCommand::Launch { args } => {
             // No subcommand or an unknown one → treat as Launch with optional agent hint.
             let config = load_config()?;
@@ -4326,6 +4379,26 @@ mod tests {
                 provider: Some("百炼".into()),
                 auto_probe: false,
             })
+        );
+    }
+
+    #[test]
+    fn stats_dispatch_preserves_raw_period_value_for_validation() {
+        assert_eq!(
+            dispatch(&["stats", "--period", "10d", "--output", "jpg"]),
+            DispatchCommand::Stats {
+                output: Some("jpg".into()),
+                view: None,
+                period: Some("10d".into()),
+            }
+        );
+        assert_eq!(
+            dispatch(&["stats", "--period", "31d"]),
+            DispatchCommand::Stats {
+                output: None,
+                view: None,
+                period: Some("31d".into()),
+            }
         );
     }
 

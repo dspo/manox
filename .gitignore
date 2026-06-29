@@ -4,3 +4,8 @@ cx.db
 
 # remora local session state
 .remora/
+
+# cx stats image outputs (build artifacts)
+cx-stats.jpg
+cx-stats.png
+cx-stats.svg

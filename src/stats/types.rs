@@ -55,8 +55,8 @@ pub(super) enum Period {
     All,
     Today,
     Lastday,
-    Last7,
-    Last30,
+    LastDays(u16),
+    LastMonthDays,
 }
 
 impl Period {
@@ -65,8 +65,8 @@ impl Period {
             Period::All => "All time".to_string(),
             Period::Today => "Today".to_string(),
             Period::Lastday => "Yesterday".to_string(),
-            Period::Last7 => "Last 7 days".to_string(),
-            Period::Last30 => {
+            Period::LastDays(days) => format!("Last {days} days"),
+            Period::LastMonthDays => {
                 let days = super::date::previous_month_days(today);
                 format!("Last {days} days")
             }
@@ -77,9 +77,9 @@ impl Period {
         match self {
             Period::All => Period::Today,
             Period::Today => Period::Lastday,
-            Period::Lastday => Period::Last7,
-            Period::Last7 => Period::Last30,
-            Period::Last30 => Period::All,
+            Period::Lastday => Period::LastDays(7),
+            Period::LastDays(_) => Period::LastMonthDays,
+            Period::LastMonthDays => Period::All,
         }
     }
 
@@ -88,10 +88,9 @@ impl Period {
             Period::All => true,
             Period::Today => date == today,
             Period::Lastday => super::date::days_diff(date, today) == Some(1),
-            Period::Last7 => {
-                super::date::days_diff(date, today).is_some_and(|d| (0..7).contains(&d))
-            }
-            Period::Last30 => {
+            Period::LastDays(days) => super::date::days_diff(date, today)
+                .is_some_and(|d| (0..i64::from(days)).contains(&d)),
+            Period::LastMonthDays => {
                 let days = super::date::previous_month_days(today) as i64;
                 super::date::days_diff(date, today).is_some_and(|d| (0..days).contains(&d))
             }
@@ -162,14 +161,22 @@ mod tests {
 
     #[test]
     fn relative_periods_exclude_future_dates() {
-        assert!(Period::Last7.includes("2026-05-23", "2026-05-29"));
-        assert!(Period::Last7.includes("2026-05-29", "2026-05-29"));
-        assert!(!Period::Last7.includes("2026-05-22", "2026-05-29"));
-        assert!(!Period::Last7.includes("2026-05-30", "2026-05-29"));
+        assert!(Period::LastDays(7).includes("2026-05-23", "2026-05-29"));
+        assert!(Period::LastDays(7).includes("2026-05-29", "2026-05-29"));
+        assert!(!Period::LastDays(7).includes("2026-05-22", "2026-05-29"));
+        assert!(!Period::LastDays(7).includes("2026-05-30", "2026-05-29"));
 
-        assert!(Period::Last30.includes("2026-04-30", "2026-05-29"));
-        assert!(!Period::Last30.includes("2026-04-29", "2026-05-29"));
-        assert!(!Period::Last30.includes("2026-05-30", "2026-05-29"));
+        assert!(Period::LastMonthDays.includes("2026-04-30", "2026-05-29"));
+        assert!(!Period::LastMonthDays.includes("2026-04-29", "2026-05-29"));
+        assert!(!Period::LastMonthDays.includes("2026-05-30", "2026-05-29"));
+    }
+
+    #[test]
+    fn custom_last_days_period_uses_exact_window_size() {
+        assert!(Period::LastDays(10).includes("2026-05-20", "2026-05-29"));
+        assert!(Period::LastDays(10).includes("2026-05-29", "2026-05-29"));
+        assert!(!Period::LastDays(10).includes("2026-05-19", "2026-05-29"));
+        assert!(!Period::LastDays(10).includes("2026-05-30", "2026-05-29"));
     }
 
     #[test]
@@ -206,7 +213,7 @@ mod tests {
     #[test]
     fn race_interval_last_month_days_includes_matches_period_last30() {
         // 6 月 24 → 上月 5 月有 31 天，所以 Last 31 days 覆盖 5 月 25 ~ 6 月 24（不含 5 月 24）
-        // 这与 Period::Last30 的行为一致：(0..days).contains
+        // 这与 Period::LastMonthDays 的行为一致：(0..days).contains
         assert!(RaceInterval::LastMonthDays.includes("2026-05-25", "2026-06-24"));
         assert!(RaceInterval::LastMonthDays.includes("2026-06-24", "2026-06-24"));
         assert!(!RaceInterval::LastMonthDays.includes("2026-05-24", "2026-06-24"));
