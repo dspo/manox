@@ -10,6 +10,7 @@ pub(super) mod codex;
 pub(super) mod copilot;
 pub(super) mod mimo;
 pub(super) mod omp_session;
+pub(super) mod pi;
 pub(super) mod remora;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,8 @@ pub(super) enum SourceKind {
     MimoSession,
     /// Remora session jsonl（~/.remora/projects/）。
     RemoraSession,
+    /// pi coding-agent session jsonl（~/.pi/agent/sessions/）。
+    PiSession,
 }
 
 pub(super) struct ParseResult {
@@ -80,7 +83,7 @@ impl SourceKind {
     pub(super) fn supports_append_scan(self) -> bool {
         matches!(
             self,
-            SourceKind::Claude | SourceKind::OmpSession | SourceKind::RemoraSession
+            SourceKind::Claude | SourceKind::OmpSession | SourceKind::RemoraSession | SourceKind::PiSession
         )
     }
 }
@@ -139,6 +142,7 @@ fn parse_jsonl_content(path: &Path, kind: SourceKind, content: &str) -> Vec<RawE
         SourceKind::Copilot(agent) => copilot::parse(content, agent, path),
         SourceKind::OmpSession => omp_session::parse(content),
         SourceKind::RemoraSession => remora::parse(content),
+        SourceKind::PiSession => pi::parse(content),
         SourceKind::MimoSession => unreachable!(),
     }
 }
@@ -236,6 +240,7 @@ mod tests {
         assert!(SourceKind::Claude.supports_append_scan());
         assert!(SourceKind::OmpSession.supports_append_scan());
         assert!(SourceKind::RemoraSession.supports_append_scan());
+        assert!(SourceKind::PiSession.supports_append_scan());
         assert!(!SourceKind::CodexLike("codex").supports_append_scan());
         assert!(!SourceKind::Copilot("copilot").supports_append_scan());
         assert!(!SourceKind::MimoSession.supports_append_scan());
