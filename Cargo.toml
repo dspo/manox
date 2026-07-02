@@ -36,6 +36,8 @@ grep-searcher = "0.1"
 grep-regex = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
+similar = "2"
 
 # GPUI 栈 —— rev 必须与 gpui-component 锁定值一致（1d217ee...）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }

@@ -655,9 +655,23 @@ fn truncate_summary(s: &str, max_chars: usize) -> String {
 /// Build a human-readable title for a tool call.
 fn tool_title(name: &str, input: &serde_json::Value) -> String {
     match name {
-        "read_file" | "write_file" | "edit_file" | "list_directory" => {
+        "read_file" | "write_file" | "list_directory" => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
             format!("{name} {path}")
+        }
+        // edit_file's input is a single `patch` string whose first `[PATH#TAG]`
+        // header names the target file.
+        "edit_file" => {
+            let patch = input.get("patch").and_then(|v| v.as_str()).unwrap_or("");
+            let path = patch
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    let inner = l.strip_prefix('[')?.strip_suffix(']')?;
+                    Some(inner.rsplit('#').next()?.to_string())
+                })
+                .unwrap_or_default();
+            format!("edit_file {path}")
         }
         "bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");

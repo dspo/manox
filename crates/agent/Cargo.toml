@@ -22,6 +22,8 @@ ignore.workspace = true
 grep-searcher.workspace = true
 grep-regex.workspace = true
 tracing.workspace = true
+xxhash-rust.workspace = true
+similar.workspace = true
 
 gpui.workspace = true
 
