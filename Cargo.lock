@@ -136,7 +136,7 @@ dependencies = [
  "async-channel 2.5.0",
  "chrono",
  "futures",
- "glob",
+ "globset",
  "gpui",
  "grep-regex",
  "grep-searcher",

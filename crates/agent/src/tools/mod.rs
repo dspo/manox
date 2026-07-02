@@ -3,7 +3,7 @@
 //! - read_file / write_file / edit_file / list_directory: std::fs via gpui `background_spawn`.
 //! - bash: tokio::process, spawned on the runtime handle and bridged back to a gpui `Task` via `async_channel`.
 //! - grep: ripgrep library (grep-searcher + grep-regex + ignore), in-process via `background_spawn`.
-//! - glob: the `glob` crate (pure Rust).
+//! - glob: the `ignore` crate (gitignore-aware walk) + `globset` (pattern match).
 //!
 //! Each tool generates its `input_schema` from a typed Input via `schemars`. Tools
 //! requiring approval (write_file / edit_file / bash) override `requires_approval`
@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{App, AppContext as _, Task};
+use globset::{Glob, GlobSetBuilder};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
@@ -400,8 +401,27 @@ pub struct GlobTool {
 
 #[derive(Deserialize, JsonSchema)]
 struct GlobInput {
-    /// Glob pattern (e.g. `**/*.rs`), relative to cwd.
+    /// Glob pattern (e.g. `**/*.rs`), relative to `path`/cwd.
+    /// Supports `{a,b}` alternation, `[ab]` classes, `**` recursion.
+    /// `*.rs` matches top-level only; use `**/*.rs` for recursion.
     pattern: String,
+    /// Search root, defaults to cwd.
+    #[serde(default)]
+    path: Option<String>,
+    /// When true, ignore all `.gitignore`/`.ignore`/global gitignore rules.
+    #[serde(default)]
+    no_ignore: bool,
+    /// When true, do not skip hidden (dot) files and directories.
+    #[serde(default)]
+    include_hidden: bool,
+    /// When true, also yield directory entries that match the pattern.
+    #[serde(default)]
+    include_dirs: bool,
+    /// Max results to return. Default 100. No hard ceiling — raising this
+    /// risks blowing up your own context window with a huge repo; narrow
+    /// `pattern` instead of raising `limit` when possible.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 impl AgentTool for GlobTool {
@@ -409,7 +429,7 @@ impl AgentTool for GlobTool {
         "glob"
     }
     fn description(&self) -> &str {
-        "按 glob 模式查找文件路径（相对 cwd）。"
+        "按 glob 模式查找文件路径（相对 cwd）。默认尊重 .gitignore 并跳过隐藏文件；返回相对路径，上限 100。可传 no_ignore/include_hidden/include_dirs/limit 放宽。注意：limit 无硬顶，调大可能撑爆上下文，优先收窄 pattern。"
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<GlobInput>()
@@ -420,17 +440,55 @@ impl AgentTool for GlobTool {
         };
         let cwd = self.cwd.as_ref().clone();
         cx.background_spawn(async move {
-            let full = cwd.join(&parsed.pattern);
-            let display = full.display().to_string();
-            let matches: Vec<String> = glob::glob(&display)
-                .map_err(|e| format!("glob 模式无效: {e}"))?
-                .filter_map(Result::ok)
-                .map(|p| p.display().to_string())
-                .collect();
-            if matches.is_empty() {
+            let root = parsed.path.map(PathBuf::from).unwrap_or_else(|| cwd.clone());
+            let matcher = GlobSetBuilder::new()
+                .add(Glob::new(&parsed.pattern).map_err(|e| format!("glob 模式无效: {e}"))?)
+                .build()
+                .map_err(|e| format!("glob 编译失败: {e}"))?;
+            let limit = parsed.limit.unwrap_or(100);
+            // Default flags enforce the strongest filtering; each toggle relaxes one axis.
+            let mut builder = WalkBuilder::new(&root);
+            builder
+                .hidden(!parsed.include_hidden)
+                .ignore(!parsed.no_ignore)
+                .git_ignore(!parsed.no_ignore)
+                .git_global(!parsed.no_ignore)
+                .git_exclude(!parsed.no_ignore)
+                .parents(!parsed.no_ignore);
+            let mut out: Vec<String> = Vec::new();
+            let mut truncated = false;
+            for entry in builder.build().by_ref() {
+                let Ok(e) = entry else { continue };
+                let path = e.path();
+                let is_dir = path.is_dir();
+                if is_dir {
+                    if !parsed.include_dirs {
+                        continue;
+                    }
+                } else if !path.is_file() {
+                    // Skip symlinks-to-nonfiles and special nodes.
+                    continue;
+                }
+                let rel = path.strip_prefix(&root).unwrap_or(path);
+                if matcher.is_match(rel) {
+                    out.push(rel.display().to_string());
+                    if out.len() >= limit {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+            out.sort();
+            if out.is_empty() {
                 Ok("无匹配文件".to_string())
+            } else if truncated {
+                Ok(format!(
+                    "{}\n... (truncated to {}, more matches exist — raise `limit` or narrow `pattern`)",
+                    out.join("\n"),
+                    limit
+                ))
             } else {
-                Ok(matches.join("\n"))
+                Ok(out.join("\n"))
             }
         })
     }
