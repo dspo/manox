@@ -12,8 +12,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, Task};
 use globset::{Glob, GlobSetBuilder};
+use gpui::{App, AppContext as _, Task};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
@@ -61,7 +61,8 @@ impl AgentTool for ReadFileTool {
         "read_file"
     }
     fn description(&self) -> &str {
-        "读取指定文件的完整内容。用于查看源码、配置等。"
+        "读取指定文件的完整内容。输出格式：首行 `[PATH#TAG]`（TAG 是 4-hex 快照标签），\
+         随后是 `N:TEXT` 行号格式（1-indexed）。后续 edit_file 必须复用此 TAG 与行号。"
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<ReadFileInput>()
@@ -71,7 +72,18 @@ impl AgentTool for ReadFileTool {
             return cx.background_spawn(async { Err("input 解析失败".to_string()) });
         };
         cx.background_spawn(async move {
-            std::fs::read_to_string(&parsed.path).map_err(|e| format!("read_file 失败: {e}"))
+            let raw = std::fs::read_to_string(&parsed.path)
+                .map_err(|e| format!("read_file 失败: {e}"))?;
+            let text = crate::hashline::normalize_to_lf(&raw);
+            let snap = crate::hashline::global()
+                .lock()
+                .expect("hashline store poisoned")
+                .record(std::path::Path::new(&parsed.path), &text);
+            Ok(crate::hashline::format_numbered(
+                &parsed.path,
+                &text,
+                &snap.tag,
+            ))
         })
     }
 }
@@ -122,12 +134,18 @@ pub struct EditFileTool;
 
 #[derive(Deserialize, JsonSchema)]
 struct EditFileInput {
-    /// File path to edit.
-    path: String,
-    /// Old text to replace; must occur uniquely in the file.
-    old_string: String,
-    /// New text to substitute in.
-    new_string: String,
+    /// Hashline patch text. Each file section starts with `[PATH#TAG]` where TAG
+    /// is the 4-hex snapshot tag from your latest `read_file`. Operations:
+    /// `SWAP N.=M:` replace lines N..=M (inclusive) with the `+TEXT` body rows;
+    /// `DEL N.=M` delete lines N..=M (no body); `INS.PRE N:` / `INS.POST N:` /
+    /// `INS.HEAD:` / `INS.TAIL:` insert body rows; `SWAP.BLK N:` / `DEL.BLK N` /
+    /// `INS.BLK.POST N:` operate on the bracket-block beginning at line N. Body
+    /// rows are `+TEXT` (`+` alone = blank line; `+-x`/`++x` escapes a literal
+    /// leading `-`/`+`). Line numbers reference the ORIGINAL file from read_file
+    /// and do not shift across hunks. Ranges cover only changed lines; pure
+    /// additions use `INS`, never a widened `SWAP`. On a stale-TAG rejection,
+    /// re-`read_file` before retrying.
+    patch: String,
 }
 
 impl AgentTool for EditFileTool {
@@ -135,7 +153,7 @@ impl AgentTool for EditFileTool {
         "edit_file"
     }
     fn description(&self) -> &str {
-        "把文件中 old_string 替换为 new_string（old_string 必须唯一匹配）。"
+        "用 hashline patch 编辑已存在文件（行号锚定 + TAG 校验）。见 input.patch 字段说明。"
     }
     fn requires_approval(&self) -> bool {
         true
@@ -148,23 +166,92 @@ impl AgentTool for EditFileTool {
             return cx.background_spawn(async { Err("input 解析失败".to_string()) });
         };
         cx.background_spawn(async move {
-            let content = std::fs::read_to_string(&parsed.path)
-                .map_err(|e| format!("edit_file 读取失败: {e}"))?;
-            let count = content.matches(&parsed.old_string).count();
-            if count == 0 {
-                return Err("edit_file 失败: 未找到 old_string".to_string());
+            let patches = crate::hashline::parse_patch(&parsed.patch).map_err(|e| e.to_string())?;
+            let mut results: Vec<String> = Vec::new();
+            for fp in patches {
+                let path = fp.path.clone();
+                let path_display = path.display().to_string();
+                let raw = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("edit_file 读取失败 {path_display}: {e}"))?;
+                let had_bom = crate::hashline::has_bom(&raw);
+                let is_crlf = crate::hashline::detect_crlf(&raw);
+                let had_trailing_nl = raw.ends_with('\n');
+                let current = crate::hashline::normalize_to_lf(&raw);
+                let current_tag = crate::hashline::compute_tag(&current);
+
+                let new_text = if current_tag == fp.tag {
+                    crate::hashline::apply(&current, &fp.ops)
+                        .map_err(|e| format!("edit_file 应用失败 {path_display}: {e}"))?
+                        .text
+                } else {
+                    let store = crate::hashline::global()
+                        .lock()
+                        .expect("hashline store poisoned");
+                    crate::hashline::try_recover(&current, &fp.tag, &fp.ops, &store, &path)
+                        .map_err(|e| format!("edit_file {path_display}: {e}"))?
+                };
+
+                // Restore original line endings, trailing newline, and BOM so
+                // the write is a minimal content delta, not a full-rewrite that
+                // flattens formatting or drops the file's terminating newline.
+                let persisted = persist(&new_text, is_crlf, had_bom, had_trailing_nl);
+                std::fs::write(&path, persisted.as_bytes())
+                    .map_err(|e| format!("edit_file 写入失败 {path_display}: {e}"))?;
+
+                let new_snap = crate::hashline::global()
+                    .lock()
+                    .expect("hashline store poisoned")
+                    .record(std::path::Path::new(&path), &new_text);
+                let diff = unified_diff(&current, &new_text);
+                results.push(format!("[{}#{}]\n{}", path_display, new_snap.tag, diff));
             }
-            if count > 1 {
-                return Err(format!(
-                    "edit_file 失败: old_string 匹配 {count} 处，需唯一"
-                ));
-            }
-            let new_content = content.replacen(&parsed.old_string, &parsed.new_string, 1);
-            std::fs::write(&parsed.path, new_content.as_bytes())
-                .map(|_| format!("已编辑 {}", parsed.path))
-                .map_err(|e| format!("edit_file 写入失败: {e}"))
+            Ok(results.join("\n---\n"))
         })
     }
+}
+
+/// Render a minimal unified diff for the edit result preview.
+fn unified_diff(old: &str, new: &str) -> String {
+    use similar::TextDiff;
+    let diff = TextDiff::from_lines(old, new);
+    let rendered = diff.unified_diff().to_string();
+    if rendered.is_empty() {
+        "(无变更)".to_string()
+    } else {
+        rendered
+    }
+}
+
+/// Restore the file's original line-ending style, trailing newline, and optional
+/// BOM on write. `apply`/`recover` model files as content lines without
+/// terminators, so the trailing newline the source file carried is restored
+/// here rather than dropped.
+fn persist(text: &str, crlf: bool, bom: bool, trailing_nl: bool) -> String {
+    let mut out = String::with_capacity(text.len() + 3);
+    if bom {
+        out.push('\u{feff}');
+    }
+    if crlf {
+        let mut iter = text.split('\n').peekable();
+        while let Some(line) = iter.next() {
+            out.push_str(line);
+            if iter.peek().is_some() {
+                out.push_str("\r\n");
+            }
+        }
+    } else {
+        out.push_str(text);
+    }
+    // Re-attach a trailing terminator if the original file had one and the
+    // edited content is non-empty (an emptied file stays empty).
+    if trailing_nl && !text.is_empty() {
+        if crlf {
+            out.push_str("\r\n");
+        } else {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 // ─── list_directory ───────────────────────────────────────────────────────
@@ -199,15 +286,12 @@ impl AgentTool for ListDirectoryTool {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.cwd.as_ref().clone());
         cx.background_spawn(async move {
-            let entries = std::fs::read_dir(&base).map_err(|e| format!("list_directory 失败: {e}"))?;
+            let entries =
+                std::fs::read_dir(&base).map_err(|e| format!("list_directory 失败: {e}"))?;
             let mut lines: Vec<String> = Vec::new();
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                let tag = if entry
-                    .file_type()
-                    .map(|t| t.is_dir())
-                    .unwrap_or(false)
-                {
+                let tag = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     "/"
                 } else {
                     ""
@@ -380,7 +464,10 @@ fn run_grep(pattern: &str, root: &PathBuf, glob: Option<&str>) -> Result<String,
             path: file_path.display().to_string(),
             results: Vec::new(),
         };
-        if searcher.search_path(&matcher, file_path, &mut sink).is_err() {
+        if searcher
+            .search_path(&matcher, file_path, &mut sink)
+            .is_err()
+        {
             continue;
         }
         all_results.append(&mut sink.results);
@@ -503,9 +590,7 @@ pub fn default_registry(cwd: PathBuf) -> ToolRegistry {
     reg.register(std::sync::Arc::new(ReadFileTool) as AnyAgentTool);
     reg.register(std::sync::Arc::new(WriteFileTool) as AnyAgentTool);
     reg.register(std::sync::Arc::new(EditFileTool) as AnyAgentTool);
-    reg.register(std::sync::Arc::new(ListDirectoryTool {
-        cwd: cwd.clone(),
-    }) as AnyAgentTool);
+    reg.register(std::sync::Arc::new(ListDirectoryTool { cwd: cwd.clone() }) as AnyAgentTool);
     reg.register(std::sync::Arc::new(BashTool { cwd: cwd.clone() }) as AnyAgentTool);
     reg.register(std::sync::Arc::new(GrepTool { cwd: cwd.clone() }) as AnyAgentTool);
     reg.register(std::sync::Arc::new(GlobTool { cwd }) as AnyAgentTool);
@@ -540,5 +625,19 @@ mod tests {
         ] {
             assert_eq!(v["type"], "object");
         }
+    }
+
+    #[test]
+    fn persist_restores_trailing_newline_and_crlf() {
+        // apply yields content without a terminator; persist re-attaches the
+        // file's original trailing newline (LF or CRLF) and BOM.
+        assert_eq!(persist("a\nb", false, false, true), "a\nb\n");
+        assert_eq!(persist("a\nb", true, false, true), "a\r\nb\r\n");
+        // No trailing newline originally → none added.
+        assert_eq!(persist("a\nb", false, false, false), "a\nb");
+        // Emptied content stays empty even if the original had a newline.
+        assert_eq!(persist("", false, false, true), "");
+        // BOM is re-prepended.
+        assert_eq!(persist("x", false, true, false), "\u{feff}x");
     }
 }

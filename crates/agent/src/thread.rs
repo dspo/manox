@@ -655,9 +655,24 @@ fn truncate_summary(s: &str, max_chars: usize) -> String {
 /// Build a human-readable title for a tool call.
 fn tool_title(name: &str, input: &serde_json::Value) -> String {
     match name {
-        "read_file" | "write_file" | "edit_file" | "list_directory" => {
+        "read_file" | "write_file" | "list_directory" => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
             format!("{name} {path}")
+        }
+        // edit_file's input is a single `patch` string whose first `[PATH#TAG]`
+        // header names the target file. The path is everything before the last
+        // `#`, so paths containing `#` survive.
+        "edit_file" => {
+            let patch = input.get("patch").and_then(|v| v.as_str()).unwrap_or("");
+            let path = patch
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    let inner = l.strip_prefix('[')?.strip_suffix(']')?;
+                    Some(inner.rsplit_once('#')?.0.to_string())
+                })
+                .unwrap_or_default();
+            format!("edit_file {path}")
         }
         "bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -679,5 +694,31 @@ fn tool_title(name: &str, input: &serde_json::Value) -> String {
             format!("glob {p}")
         }
         _ => name.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_title;
+    use serde_json::json;
+
+    #[test]
+    fn edit_file_title_extracts_path_not_tag() {
+        // The `[PATH#TAG]` header must surface the path, not the 4-hex tag.
+        let input = json!({ "patch": "[src/main.rs#1A2B]\nSWAP 5.=5:\n+X" });
+        assert_eq!(tool_title("edit_file", &input), "edit_file src/main.rs");
+    }
+
+    #[test]
+    fn edit_file_title_path_with_hash_survives() {
+        // A path containing `#` keeps everything before the LAST `#`.
+        let input = json!({ "patch": "[a/b#issue.rs#FF0E]\nDEL 1" });
+        assert_eq!(tool_title("edit_file", &input), "edit_file a/b#issue.rs");
+    }
+
+    #[test]
+    fn edit_file_title_missing_header_is_empty() {
+        let input = json!({ "patch": "SWAP 5.=5:\n+X" });
+        assert_eq!(tool_title("edit_file", &input), "edit_file ");
     }
 }
