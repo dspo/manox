@@ -62,8 +62,6 @@ impl Workspace {
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .line_number(false)
-                .folding(false)
                 .rows(4)
                 .submit_on_enter(true)
                 .placeholder("输入消息…")
