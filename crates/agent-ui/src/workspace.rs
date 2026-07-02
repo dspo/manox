@@ -340,9 +340,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Build a PopupMenu where each Provider is a submenu whose children
-    /// are the Provider's Models. Clicking a Model calls `set_model` and
-    /// Map WireApi to TagVariant + display label for the model menu.
+    /// WireApi → Tag variant + label mapping for the model menu.
     fn wire_tag_variant(wire: WireApi) -> (TagVariant, &'static str) {
         match wire {
             WireApi::Anthropic => (TagVariant::Primary, "Anthropic"),
@@ -352,7 +350,7 @@ impl Workspace {
         }
     }
 
-    /// the PopupMenu's DismissEvent closes the selector.
+    /// Cascading model menu grouped by provider; each model row shows a wire-api Tag.
     fn build_model_popup_menu(
         menu: PopupMenu,
         workspace: Entity<Workspace>,
@@ -373,6 +371,9 @@ impl Workspace {
         }
 
         let mut menu = menu;
+        if providers.is_empty() {
+            menu = menu.item(PopupMenuItem::Label("No models configured".into()));
+        }
         for (prov_name, models) in providers {
             let ws = workspace.clone();
             menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
