@@ -1,0 +1,52 @@
+# manox —— 进程内 native agent 工作台（按 zed agent 架构重新实现）。
+#
+# workspace 根。三 crate（镜像 zed 的 agent / agent_ui / zed 三分）：
+#   - agent:     agent 逻辑核心（Thread + LanguageModel + tools + db，gpui-native，不依赖 gpui-component）
+#   - agent-ui:  UI 层（Workspace + ConversationState + views，gpui + gpui-component）
+#   - manox:     薄 bin（窗口 + 主题 + 接线）
+#
+# LLM 直连 ~/.config/cx/cx.providers.config.yaml 定义的 providers（不走 codex / Zed Cloud）。
+#
+# gpui 相关依赖严格对齐 gpui-component 锁定的 zed rev，保证 gpui 单一版本。
+[workspace]
+members = ["crates/agent", "crates/agent-ui", "crates/manox"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+anyhow = "1"
+async-channel = "2"
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+schemars = { version = "0.8", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+glob = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# GPUI 栈 —— rev 必须与 gpui-component 锁定值一致（1d217ee...）
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+
+# gpui-component（longbridge）
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
+
+# psm 用 stacker 的版本（对齐 gpui-component，WASM 支持更好；桌面构建同样无害）
+[patch.crates-io]
+psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
+
+# gpui 在 debug 下也需要 opt-level 3，否则渲染极慢（对齐 gpui-component）
+[profile.dev.package]
+gpui = { opt-level = 3 }
+gpui_platform = { opt-level = 3 }

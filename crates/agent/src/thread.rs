@@ -1,0 +1,683 @@
+//! `Thread` state machine.
+//!
+//! gpui-native: `Thread` is an `Entity<Thread>` + `EventEmitter<ThreadEvent>`.
+//! `run_turn` spawns a task on the gpui executor that loops:
+//!   1. `build_completion_request` → `model.stream_completion` yields a `BoxStream`;
+//!   2. drain events via `handle_completion_event`, collecting `pending_tool_uses`;
+//!   3. after the stream ends, if tool_uses were collected: authorize (if needed) → `tool.run` → append a ToolResult message → loop back to 1;
+//!   4. otherwise (EndTurn) exit.
+//!
+//! Authorization uses a `tokio::sync::oneshot`: `Thread` emits `ToolCallAuthorization`
+//! carrying a `Sender`; the UI resolves the prompt and sends back a
+//! `PermissionDecision`, which the task `await`s on the gpui executor.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::Result;
+use futures::StreamExt as _;
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task};
+
+use crate::language_model::{
+    AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role, StopReason,
+};
+use crate::message::Message;
+use crate::tool::{PermissionCache, PermissionDecision, ToolRegistry};
+use crate::tools;
+use crate::db::ThreadRecord;
+
+/// Stable `Thread` id used for persistence.
+#[derive(Debug, Clone)]
+pub struct ThreadId(pub String);
+
+/// Tool call status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallStatus {
+    PendingApproval,
+    Running,
+    Success,
+    Error,
+    Denied,
+}
+
+/// Events emitted by `Thread` to the UI.
+#[derive(Debug)]
+pub enum ThreadEvent {
+    /// Assistant text delta.
+    AgentText(String),
+    /// Assistant thinking delta.
+    AgentThinking(String),
+    /// Tool call status change.
+    ToolCall {
+        id: String,
+        name: String,
+        title: String,
+        status: ToolCallStatus,
+    },
+    /// Tool execution result (output fed back to the model and shown in the UI).
+    ToolResult {
+        id: String,
+        output: String,
+        is_error: bool,
+    },
+    /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with the decision.
+    ToolCallAuthorization {
+        id: String,
+        tool_name: String,
+        summary: String,
+        input: serde_json::Value,
+    },
+    /// A completion turn ended.
+    Stop(StopReason),
+    /// An error during streaming.
+    Error(anyhow::Error),
+}
+
+pub struct Thread {
+    pub id: ThreadId,
+    messages: Vec<Message>,
+    model: Option<AnyLanguageModel>,
+    tools: Arc<ToolRegistry>,
+    permission: Arc<PermissionCache>,
+    cwd: PathBuf,
+    /// tool_uses collected during the current turn, processed after the stream ends.
+    pending_tool_uses: Vec<LanguageModelToolUse>,
+    /// The pending authorization awaiting a UI decision (id + responder).
+    pending_authorization: Option<(String, tokio::sync::oneshot::Sender<PermissionDecision>)>,
+    /// The running turn task; dropping it aborts the turn.
+    running_turn: Option<Task<()>>,
+}
+
+impl EventEmitter<ThreadEvent> for Thread {}
+
+impl Thread {
+    /// Construct a new `Thread`, defaulting to the registry's first model and registering the 7 built-in tools.
+    pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
+        cx.new(|_cx| Self {
+            id,
+            messages: Vec::new(),
+            model: crate::provider::registry::global().models().first().cloned(),
+            tools: Arc::new(tools::default_registry(cwd.clone())),
+            permission: Arc::new(PermissionCache::default()),
+            cwd,
+            pending_tool_uses: Vec::new(),
+            pending_authorization: None,
+            running_turn: None,
+        })
+    }
+
+    /// Restore a `Thread` from a persisted record (messages + model rebuilt; tools rebuilt from cwd).
+    pub fn restore(
+        id: ThreadId,
+        cwd: PathBuf,
+        messages: Vec<Message>,
+        model: Option<AnyLanguageModel>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|_cx| Self {
+            id,
+            messages,
+            model,
+            tools: Arc::new(tools::default_registry(cwd.clone())),
+            permission: Arc::new(PermissionCache::default()),
+            cwd,
+            pending_tool_uses: Vec::new(),
+            pending_authorization: None,
+            running_turn: None,
+        })
+    }
+
+    /// Build a persistable snapshot (with the first user message as summary). Returns `None` when there is no model (not persisted).
+    pub fn snapshot(&self) -> Option<ThreadRecord> {
+        let model_id = self.model.as_ref().map(|m| m.id())?;
+        Some(ThreadRecord {
+            id: self.id.0.clone(),
+            summary: self.summary(),
+            model_id,
+            cwd: self.cwd.display().to_string(),
+            messages: self.messages.clone(),
+        })
+    }
+
+    /// First user message text, truncated to 60 chars; falls back to the localized default when absent.
+    fn summary(&self) -> String {
+        for m in &self.messages {
+            if m.role != Role::User {
+                continue;
+            }
+            let mut text = String::new();
+            for c in &m.content {
+                if let MessageContent::Text(t) = c {
+                    text.push_str(t);
+                }
+            }
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return truncate_summary(trimmed, 60);
+            }
+        }
+        "(新对话)".to_string()
+    }
+
+    /// Called after the UI resolves authorization: forward the decision to the matching pending responder by id.
+    /// Silently ignored when no id matches (the responder may have timed out or belonged to a cancelled turn).
+    pub fn respond_authorization(
+        &mut self,
+        id: &str,
+        decision: PermissionDecision,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((pending_id, tx)) = self.pending_authorization.take()
+            && pending_id == id
+            && tx.send(decision).is_ok()
+        {
+        }
+        let _ = cx;
+    }
+
+    pub fn model(&self) -> Option<&AnyLanguageModel> {
+        self.model.as_ref()
+    }
+
+    pub fn set_model(&mut self, model: AnyLanguageModel, cx: &mut Context<Self>) {
+        self.model = Some(model);
+        cx.notify();
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running_turn.is_some()
+    }
+
+    /// Append a user message.
+    pub fn insert_user_message(&mut self, text: String, cx: &mut Context<Self>) {
+        self.messages.push(Message::user(text));
+        cx.notify();
+    }
+
+    /// Start a completion turn. No-ops when a turn is already running or there is no model.
+    pub fn run_turn(&mut self, cx: &mut Context<Self>) {
+        if self.running_turn.is_some() {
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            cx.emit(ThreadEvent::Error(anyhow::anyhow!("未配置模型")));
+            return;
+        };
+
+        let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
+            if let Err(e) = Self::run_turn_loop(&this, &model, cx).await {
+                let _ = this.update(cx, |_, cx| {
+                    cx.emit(ThreadEvent::Error(e));
+                });
+            }
+            this.update(cx, |this, cx| {
+                this.running_turn = None;
+                cx.notify();
+            })
+            .ok();
+        });
+
+        self.running_turn = Some(task);
+        cx.notify();
+    }
+
+    /// Abort the current turn.
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if self.running_turn.take().is_some() {
+            cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
+            cx.notify();
+        }
+    }
+
+    async fn run_turn_loop(
+        this: &gpui::WeakEntity<Self>,
+        model: &AnyLanguageModel,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        loop {
+            let request = this.update(cx, |this, cx| {
+                this.pending_tool_uses.clear();
+                this.reconcile_tool_uses(cx);
+                this.build_completion_request()
+            })?;
+
+            let mut stream = model.stream_completion(request, cx).await?;
+            while let Some(event) = stream.next().await {
+                let is_stop = matches!(event, Ok(LanguageModelCompletionEvent::Stop(_)));
+                this.update(cx, |this, cx| {
+                    this.handle_completion_event(event, cx);
+                })?;
+                if is_stop {
+                    break;
+                }
+            }
+
+            let tool_uses = this.update(cx, |this, _cx| {
+                std::mem::take(&mut this.pending_tool_uses)
+            })?;
+            if tool_uses.is_empty() {
+                break;
+            }
+
+            for tu in tool_uses {
+                Self::run_tool(this, tu, cx).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a single tool call: authorize (if needed) → run → append a ToolResult message → emit.
+    async fn run_tool(
+        this: &gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let name = tu.name.to_string();
+        let title = tool_title(&name, &tu.input);
+
+        let tool = this.read_with(cx, |this, _| this.tools.get(&name).cloned())?;
+
+        let Some(tool) = tool else {
+            let msg = format!("未知工具: {name}");
+            Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
+            Self::append_tool_result(this, tu, msg.clone(), true, cx)?;
+            return Ok(());
+        };
+
+        let needs_approval = tool.requires_approval()
+            && !this.read_with(cx, |this, _| this.permission.is_always_allowed(&name))?;
+        if needs_approval {
+            this.update(cx, |_, cx| {
+                cx.emit(ThreadEvent::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    title: title.clone(),
+                    status: ToolCallStatus::PendingApproval,
+                });
+            })?;
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            this.update(cx, |this, _cx| {
+                this.pending_authorization = Some((id.clone(), tx));
+            })?;
+            this.update(cx, |_, cx| {
+                cx.emit(ThreadEvent::ToolCallAuthorization {
+                    id: id.clone(),
+                    tool_name: name.clone(),
+                    summary: title.clone(),
+                    input: tu.input.clone(),
+                });
+            })?;
+
+            let decision = rx.await.unwrap_or(PermissionDecision::Deny);
+            match decision {
+                PermissionDecision::Deny => {
+                    let msg = "用户拒绝执行".to_string();
+                    Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
+                    Self::append_tool_result(this, tu, msg, true, cx)?;
+                    return Ok(());
+                }
+                PermissionDecision::AlwaysAllow => {
+                    this.read_with(cx, |this, _| this.permission.set_always_allowed(&name))?;
+                }
+                PermissionDecision::AllowOnce => {}
+            }
+        }
+
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: ToolCallStatus::Running,
+            });
+        })?;
+
+        let input = tu.input.clone();
+        let result_task: Task<Result<String, String>> =
+            this.update(cx, |_this, cx| tool.run(input, cx))?;
+        let output = result_task.await;
+        let (output_str, is_error) = match output {
+            Ok(o) => (o, false),
+            Err(e) => (e, true),
+        };
+
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: if is_error {
+                    ToolCallStatus::Error
+                } else {
+                    ToolCallStatus::Success
+                },
+            });
+        })?;
+
+        Self::emit_tool_result(this, &id, &name, &title, &output_str, is_error, cx)?;
+        Self::append_tool_result(this, tu, output_str, is_error, cx)?;
+        Ok(())
+    }
+
+    fn emit_tool_result(
+        this: &gpui::WeakEntity<Self>,
+        id: &str,
+        _name: &str,
+        _title: &str,
+        output: &str,
+        is_error: bool,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolResult {
+                id: id.to_string(),
+                output: output.to_string(),
+                is_error,
+            });
+        })?;
+        Ok(())
+    }
+
+    /// Apply a single completion event: accumulate into the assistant message, emit a `ThreadEvent`, and collect tool_uses.
+    fn handle_completion_event(
+        &mut self,
+        event: Result<LanguageModelCompletionEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            Ok(LanguageModelCompletionEvent::Text(text)) => {
+                self.append_assistant_text(text.clone(), cx);
+                cx.emit(ThreadEvent::AgentText(text));
+            }
+            Ok(LanguageModelCompletionEvent::Thinking { text, signature }) => {
+                self.append_assistant_thinking(text.clone(), signature, cx);
+                cx.emit(ThreadEvent::AgentThinking(text));
+            }
+            Ok(LanguageModelCompletionEvent::UsageUpdate(_)) => {}
+            Ok(LanguageModelCompletionEvent::Stop(reason)) => {
+                self.finalize_assistant_message(cx);
+                cx.emit(ThreadEvent::Stop(reason));
+            }
+            Ok(LanguageModelCompletionEvent::ToolUse(tu)) => {
+                // Only persist/enqueue once the input is complete (ContentBlockStop).
+                // The mapper also emits ToolUse events on successful incremental
+                // InputJsonDelta parses (is_input_complete=false) for live UI preview;
+                // those are ignored here, otherwise the same tool would be enqueued
+                // multiple times and the assistant message would hold duplicate ToolUse blocks.
+                if tu.is_input_complete {
+                    self.append_assistant_tool_use(tu.clone(), cx);
+                    self.pending_tool_uses.push(tu);
+                }
+            }
+            Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
+                id,
+                tool_name,
+                raw_input,
+                json_parse_error,
+            }) => {
+                // Insert a placeholder ToolUse block into the assistant message so the
+                // later tool_result has a matching tool_use; otherwise Anthropic rejects
+                // an orphan tool_result with HTTP 400.
+                let placeholder = LanguageModelToolUse {
+                    id: id.clone(),
+                    name: tool_name.clone(),
+                    raw_input: raw_input.clone(),
+                    input: serde_json::Value::Null,
+                    is_input_complete: true,
+                    thought_signature: None,
+                };
+                self.append_assistant_tool_use(placeholder, cx);
+                // Surface the parse failure back to the model as an error tool_result (in a user message).
+                let result = LanguageModelToolResult {
+                    tool_use_id: id.clone(),
+                    tool_name: tool_name.clone(),
+                    is_error: true,
+                    content: format!(
+                        "工具输入 JSON 解析失败: {json_parse_error}\nraw: {raw_input}"
+                    ),
+                };
+                self.push_tool_result(result, cx);
+                cx.emit(ThreadEvent::ToolResult {
+                    id,
+                    output: json_parse_error,
+                    is_error: true,
+                });
+            }
+            Err(e) => {
+                cx.emit(ThreadEvent::Error(e));
+            }
+        }
+    }
+
+    fn append_tool_result(
+        this: &gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        output: String,
+        is_error: bool,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        this.update(cx, |this, cx| {
+            let result = LanguageModelToolResult {
+                tool_use_id: tu.id.clone(),
+                tool_name: tu.name.clone(),
+                is_error,
+                content: output,
+            };
+            this.push_tool_result(result, cx);
+        })?;
+        Ok(())
+    }
+
+    /// Append a tool_result to a user message. Per the Anthropic wire contract,
+    /// tool_results must live in a user-role message paired with the preceding
+    /// assistant turn's tool_use. Multiple consecutive tool_results accumulate
+    /// into the same user message.
+    fn push_tool_result(&mut self, result: LanguageModelToolResult, cx: &mut Context<Self>) {
+        let needs_new = match self.messages.last() {
+            Some(m) => m.role != Role::User,
+            None => true,
+        };
+        if needs_new {
+            self.messages.push(Message {
+                role: Role::User,
+                content: Vec::new(),
+            });
+        }
+        if let Some(m) = self.messages.last_mut() {
+            m.push_content(MessageContent::ToolResult(result));
+        }
+        let _ = cx;
+    }
+
+    fn append_assistant_text(&mut self, text: String, _cx: &mut Context<Self>) {
+        let needs_new = match self.messages.last() {
+            Some(m) => m.role != Role::Assistant,
+            None => true,
+        };
+        if needs_new {
+            self.messages.push(Message::assistant(Vec::new()));
+        }
+        if let Some(m) = self.messages.last_mut() {
+            match m.content.last_mut() {
+                Some(MessageContent::Text(existing)) => existing.push_str(&text),
+                _ => m.push_text(text),
+            }
+        }
+    }
+
+    /// Accumulate thinking deltas into the current assistant message: consecutive
+    /// ThinkingDelta merge into one thinking block (the first non-empty signature
+    /// is retained, since Anthropic requires a signature when echoing thinking back).
+    fn append_assistant_thinking(
+        &mut self,
+        text: String,
+        signature: Option<String>,
+        _cx: &mut Context<Self>,
+    ) {
+        let needs_new = match self.messages.last() {
+            Some(m) => m.role != Role::Assistant,
+            None => true,
+        };
+        if needs_new {
+            self.messages.push(Message::assistant(Vec::new()));
+        }
+        if let Some(m) = self.messages.last_mut() {
+            match m.content.last_mut() {
+                Some(MessageContent::Thinking {
+                    text: existing,
+                    signature: sig,
+                }) => {
+                    existing.push_str(&text);
+                    if sig.is_none() {
+                        *sig = signature;
+                    }
+                }
+                _ => m.push_content(MessageContent::Thinking { text, signature }),
+            }
+        }
+    }
+
+    /// Append a tool_use block to the current assistant message (alongside text/thinking, as one turn's output).
+    fn append_assistant_tool_use(&mut self, tu: LanguageModelToolUse, _cx: &mut Context<Self>) {
+        let needs_new = match self.messages.last() {
+            Some(m) => m.role != Role::Assistant,
+            None => true,
+        };
+        if needs_new {
+            self.messages.push(Message::assistant(Vec::new()));
+        }
+        if let Some(m) = self.messages.last_mut() {
+            m.push_content(MessageContent::ToolUse(tu));
+        }
+    }
+
+    fn finalize_assistant_message(&mut self, cx: &mut Context<Self>) {
+        if let Some(m) = self.messages.last_mut()
+            && m.role == Role::Assistant
+            && m.content.is_empty()
+        {
+            m.push_text(String::new());
+        }
+        cx.notify();
+    }
+
+    /// Backfill a trailing unpaired tool_use: if the last assistant message holds a
+    /// tool_use block with no matching tool_result (after a cancelled turn or a
+    /// crash-recovery reload), synthesize an error tool_result into a user message.
+    /// Otherwise Anthropic rejects the dangling assistant tool_use with HTTP 400,
+    /// freezing the conversation.
+    fn reconcile_tool_uses(&mut self, cx: &mut Context<Self>) {
+        let orphans: Vec<(String, std::sync::Arc<str>)> = match self.messages.last() {
+            Some(m) if m.role == Role::Assistant => {
+                let paired: std::collections::HashSet<&str> = self
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.content.iter())
+                    .filter_map(|c| match c {
+                        MessageContent::ToolResult(tr) => Some(tr.tool_use_id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                m.content
+                    .iter()
+                    .filter_map(|c| match c {
+                        MessageContent::ToolUse(tu) if !paired.contains(tu.id.as_str()) => {
+                            Some((tu.id.clone(), tu.name.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        if orphans.is_empty() {
+            return;
+        }
+        let content: Vec<MessageContent> = orphans
+            .into_iter()
+            .map(|(id, name)| {
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: id,
+                    tool_name: name,
+                    is_error: true,
+                    content: "工具未执行（会话中断或被取消）".to_string(),
+                })
+            })
+            .collect();
+        self.messages.push(Message {
+            role: Role::User,
+            content,
+        });
+        cx.notify();
+    }
+
+    /// Map `messages` into a `LanguageModelRequest` (including tool definitions).
+    fn build_completion_request(&self) -> LanguageModelRequest {
+        let messages: Vec<LanguageModelRequestMessage> = self
+            .messages
+            .iter()
+            .map(|m| LanguageModelRequestMessage {
+                role: m.role,
+                content: m.content.clone(),
+                cache: false,
+            })
+            .collect();
+        LanguageModelRequest {
+            messages,
+            tools: self.tools.to_request_tools(),
+            ..Default::default()
+        }
+    }
+}
+
+/// Truncate a summary to `max_chars` (appending an ellipsis when cut) and collapse it to a single line.
+fn truncate_summary(s: &str, max_chars: usize) -> String {
+    let one_line = s.replace('\n', " ");
+    if one_line.chars().count() > max_chars {
+        let t: String = one_line.chars().take(max_chars).collect();
+        format!("{t}…")
+    } else {
+        one_line
+    }
+}
+
+/// Build a human-readable title for a tool call.
+fn tool_title(name: &str, input: &serde_json::Value) -> String {
+    match name {
+        "read_file" | "write_file" | "edit_file" | "list_directory" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{name} {path}")
+        }
+        "bash" => {
+            let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let single = cmd.lines().next().unwrap_or("").trim().to_string();
+            let trimmed = if single.chars().count() > 80 {
+                let t: String = single.chars().take(80).collect();
+                format!("{t}…")
+            } else {
+                single
+            };
+            format!("bash: {trimmed}")
+        }
+        "grep" => {
+            let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            format!("grep {p}")
+        }
+        "glob" => {
+            let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+            format!("glob {p}")
+        }
+        _ => name.to_string(),
+    }
+}

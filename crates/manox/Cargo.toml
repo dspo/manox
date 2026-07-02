@@ -1,0 +1,23 @@
+[package]
+name = "manox"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "manox"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+
+agent-ui = { path = "../agent-ui" }
+agent = { path = "../agent" }
+
+tracing-subscriber.workspace = true
+
+[lints.clippy]
+dbg_macro = "deny"

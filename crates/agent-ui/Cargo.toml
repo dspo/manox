@@ -1,0 +1,28 @@
+[package]
+name = "agent-ui"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "agent_ui"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+chrono.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+
+agent = { path = "../agent" }
+
+[lints.clippy]
+dbg_macro = "deny"
