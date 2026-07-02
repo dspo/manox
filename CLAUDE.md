@@ -141,6 +141,6 @@ crates/
 - **技术选型喜新厌旧**：能选择最新稳定版就选最新稳定版。依赖、工具链、API 都优先用最新的 stable release。
 - **禁止 vendor / submodule 依赖**：所有依赖通过包管理器（Cargo）声明，不允许 vendor 目录或 git submodule 引入第三方代码。
 - **只允许单二进制、单进程交付**：最终产物是一个二进制文件，运行时只有一个进程。不允许拆分多个独立可执行文件或需要多进程协作。
-- **PR 前先与 remora 达成一致**：每当认为 PR 可以被 review 时，先运行 `/remora:adversarial-review [prompt]`，与 remora 达成意见一致后再提交 PR。
+- **PR 提交后与 remora 达成一致**：先提交 PR，再运行 `/remora:adversarial-review [prompt]`，与 remora 多轮交锋直到双方达成一致后再合并。
 - **禁止抄袭第三方 crate 代码**：若想引入第三方 crate 的特性，应规范引入该 crate 作为依赖。对于不便规范引入的（过重、未暴露相关接口、archived 等），可以参考其架构思想、设计思路、实现方法，但禁止抄袭代码（复制粘贴后修改）。
 - **注释规范**：注释一律用英文，面向终态（描述代码维持的不变量/意图）而非过程流水账，非必要不注释。详见 `~/.claude/rules/code-comments.md`。
