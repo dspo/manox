@@ -266,7 +266,10 @@ impl Thread {
                 this.build_completion_request()
             })?;
 
-            let mut stream = model.stream_completion(request, cx).await?;
+            let mut stream = tokio::select! {
+                s = model.stream_completion(request, cx) => s?,
+                _ = cancel.cancelled() => break,
+            };
             let mut cancelled = false;
             loop {
                 let event = tokio::select! {
@@ -291,20 +294,29 @@ impl Thread {
                 break;
             }
 
-            let tool_uses = this.update(cx, |this, _cx| {
+            let mut tool_uses = this.update(cx, |this, _cx| {
                 std::mem::take(&mut this.pending_tool_uses)
             })?;
             if tool_uses.is_empty() {
                 break;
             }
 
-            for tu in tool_uses {
+            while !tool_uses.is_empty() {
+                let tu = tool_uses.remove(0);
                 Self::run_tool(this, tu, cancel, cx).await?;
-                // A user-initiated stop cancels the token; stop processing
-                // further tool calls and end the turn.
                 if cancel.is_cancelled() {
                     break;
                 }
+            }
+            // Pair tool_uses that never started: a dangling tool_use in the
+            // next request makes Anthropic reject with HTTP 400. The one
+            // mid-flight when cancel fired already got a "cancelled" result
+            // from the tool itself.
+            for tu in tool_uses {
+                Self::synthesize_unrun_tool_result(this, tu, cx)?;
+            }
+            if cancel.is_cancelled() {
+                break;
             }
         }
         Ok(())
@@ -355,7 +367,16 @@ impl Thread {
                 });
             })?;
 
-            let decision = rx.await.unwrap_or(PermissionDecision::Deny);
+            let decision = tokio::select! {
+                d = rx => d.unwrap_or(PermissionDecision::Deny),
+                _ = cancel.cancelled() => PermissionDecision::Deny,
+            };
+            // The pending responder is spent whether the UI answered or cancel
+            // fired; drop any stale sender so a late `respond_authorization`
+            // cannot revive a cancelled turn.
+            this.update(cx, |this, _cx| {
+                this.pending_authorization = None;
+            })?;
             match decision {
                 PermissionDecision::Deny => {
                     let msg = "用户拒绝执行".to_string();
@@ -403,6 +424,32 @@ impl Thread {
 
         Self::emit_tool_result(this, &id, &name, &title, &output_str, is_error, cx)?;
         Self::append_tool_result(this, tu, output_str, is_error, cx)?;
+        Ok(())
+    }
+
+    /// Synthesize an error `ToolResult` for a tool_use that never executed
+    /// (because the turn was cancelled before it started). Every tool_use in
+    /// the preceding assistant message must be paired with a tool_result, or
+    /// Anthropic rejects the next request with HTTP 400.
+    fn synthesize_unrun_tool_result(
+        this: &gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let name = tu.name.to_string();
+        let title = tool_title(&name, &tu.input);
+        let msg = "工具未执行（会话被取消）".to_string();
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: ToolCallStatus::Denied,
+            });
+        })?;
+        Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
+        Self::append_tool_result(this, tu, msg, true, cx)?;
         Ok(())
     }
 
