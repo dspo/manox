@@ -13,8 +13,6 @@
 //! opener or neutral. Ambiguous cases fall through unchanged and let the
 //! model's payload stand.
 
-use std::collections::BTreeMap;
-
 use super::block;
 use super::parser::{InsPos, Op};
 
@@ -51,29 +49,46 @@ pub fn apply(text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
         resolved.push(resolve_op(op, &lines)?);
     }
 
-    // Detect overlapping CONSUMING ranges (Swap/Del) before mutating. Pure
-    // insertions do not consume lines, so they are exempt: two insertions may
-    // share an anchor, and an insertion adjacent to a swap is resolved by the
-    // back-to-front ordering below. A zero range (0,0) is the HEAD/TAIL
-    // sentinel and never conflicts.
-    let mut occupied: BTreeMap<usize, usize> = BTreeMap::new(); // start -> end
+    // Detect range conflicts before mutating. Two kinds conflict:
+    //   1. Two consuming ops (Swap/Del) whose `[start, end]` ranges overlap.
+    //   2. An insertion whose landing index falls inside a consuming op's range
+    //      — back-to-front application would let the consumer eat the inserted
+    //      rows (e.g. `INS.PRE 5` + `SWAP 5.=5` loses the inserted rows).
+    // Pure insertions may share an anchor (they stack by stable order). The
+    // HEAD/TAIL sentinels land at file boundaries; HEAD can still collide with a
+    // range starting at line 1, so it is checked like any other insertion.
+    let mut consumed: Vec<(usize, usize)> = Vec::new(); // 1-indexed [start, end]
     for r in &resolved {
-        let (s, e) = r.range();
-        if s == 0 {
-            continue; // HEAD/TAIL sentinel — no real line consumed.
-        }
-        if !matches!(r, ResolvedOp::Swap { .. } | ResolvedOp::Del { .. }) {
-            continue; // insertions do not consume the anchor line.
-        }
-        for (os, oe) in occupied.iter() {
-            let overlap = *os <= e && s <= *oe;
-            if overlap {
+        let (ResolvedOp::Swap { start, end, .. } | ResolvedOp::Del { start, end }) = r else {
+            continue;
+        };
+        for (os, oe) in &consumed {
+            if *os <= *end && *start <= *oe {
                 return Err(ApplyError {
-                    message: format!("操作范围 {s}..={e} 与已有范围 {os}..={oe} 重叠"),
+                    message: format!("操作范围 {start}..={end} 与已有范围 {os}..={oe} 重叠"),
                 });
             }
         }
-        occupied.insert(s, e);
+        consumed.push((*start, *end));
+    }
+    for r in &resolved {
+        let ResolvedOp::Ins { pos, anchor, .. } = r else {
+            continue;
+        };
+        let Some(p) = insertion_index(pos, *anchor) else {
+            continue; // TAIL lands past the last line — no consuming range reaches it.
+        };
+        for (s, e) in &consumed {
+            // The range consumes 0-indexed [s-1, e-1]; an insertion at p inside
+            // that span would be spliced out when the consumer runs.
+            if (*s - 1..=*e - 1).contains(&p) {
+                return Err(ApplyError {
+                    message: format!(
+                        "INS（锚点 {anchor:?}、{pos:?}）的插入点落在操作范围 {s}..={e} 内，会被该 SWAP/DEL 吞掉；请把插入内容并入该 SWAP，或改用范围外的锚点"
+                    ),
+                });
+            }
+        }
     }
 
     // Apply back-to-front: highest primary line first. Insertions are ordered by
@@ -120,14 +135,17 @@ impl ResolvedOp {
             ResolvedOp::Ins { anchor: None, .. } => 0, // HEAD sorts last (lowest)
         }
     }
-    fn range(&self) -> (usize, usize) {
-        match self {
-            ResolvedOp::Swap { start, end, .. } | ResolvedOp::Del { start, end } => (*start, *end),
-            ResolvedOp::Ins {
-                anchor: Some(a), ..
-            } => (*a, *a),
-            ResolvedOp::Ins { anchor: None, .. } => (0, 0),
-        }
+}
+
+/// 0-indexed landing position for an insertion, or `None` for TAIL (lands past
+/// the last line, where no consuming range can reach). Used by the conflict
+/// check to catch insertions that would be eaten by a Swap/Del on the same span.
+fn insertion_index(pos: &InsPos, anchor: Option<usize>) -> Option<usize> {
+    match pos {
+        InsPos::Head => Some(0),
+        InsPos::Tail => None,
+        InsPos::Pre => anchor.map(|a| a.saturating_sub(1)),
+        InsPos::Post => anchor,
     }
 }
 
@@ -265,7 +283,9 @@ fn apply_resolved(lines: &mut Vec<String>, op: &ResolvedOp) -> Result<(), ApplyE
 /// closer or neutral (net balance ≤ 0): an opener restated below the range is
 /// still a structural opener the model asked for, so it is kept. Symmetrically,
 /// a prefix echo is dropped only when the row is an opener or neutral
-/// (net balance ≥ 0); a closer restated above is kept.
+/// (net balance ≥ 0); a closer restated above is kept. The body is never
+/// trimmed past a single row, so a fully-echoed body never silently turns a
+/// SWAP into a deletion.
 pub(super) fn repair_boundaries(
     lines: &[&str],
     start: usize,
@@ -279,8 +299,8 @@ pub(super) fn repair_boundaries(
 
     // Drop a trailing row that duplicates the line just below the range.
     loop {
-        if repaired.is_empty() {
-            break;
+        if repaired.len() <= 1 {
+            break; // never empty the body — that would change SWAP into DEL.
         }
         let below_idx = end; // 0-indexed line after the range
         let last = repaired.last().unwrap();
@@ -296,8 +316,8 @@ pub(super) fn repair_boundaries(
 
     // Drop a leading row that duplicates the line just above the range.
     loop {
-        if repaired.is_empty() {
-            break;
+        if repaired.len() <= 1 {
+            break; // never empty the body — that would change SWAP into DEL.
         }
         let first = repaired.first().unwrap();
         let above_idx = start.checked_sub(2); // 0-indexed line before the range
@@ -548,5 +568,77 @@ mod tests {
             body: vec![],
         }];
         assert!(apply("A", &ops).is_err());
+    }
+
+    #[test]
+    fn ins_pre_inside_swap_range_rejected() {
+        // INS.PRE 5 lands at the start of SWAP 5.=5's consumed span; applying
+        // it back-to-front would let the swap eat the inserted rows. Reject
+        // rather than silently drop them.
+        let ops = [
+            Op::Ins {
+                pos: InsPos::Pre,
+                anchor: Some(5),
+                body: vec!["X".into()],
+            },
+            Op::Swap {
+                start: 5,
+                end: 5,
+                body: vec!["Y".into()],
+            },
+        ];
+        assert!(apply("A\nB\nC\nD\nE", &ops).is_err());
+    }
+
+    #[test]
+    fn ins_post_inside_swap_range_rejected() {
+        // SWAP 5.=6 consumes indices 4..6; INS.POST 5 lands at index 5, inside
+        // that span — reject.
+        let ops = [
+            Op::Ins {
+                pos: InsPos::Post,
+                anchor: Some(5),
+                body: vec!["Z".into()],
+            },
+            Op::Swap {
+                start: 5,
+                end: 6,
+                body: vec!["Y".into()],
+            },
+        ];
+        assert!(apply("A\nB\nC\nD\nE\nF", &ops).is_err());
+    }
+
+    #[test]
+    fn ins_post_adjacent_to_single_line_swap_ok() {
+        // INS.POST 5 lands at index 5, just past SWAP 5.=5's consumed index 4 —
+        // no collision, both apply.
+        let ops = [
+            Op::Ins {
+                pos: InsPos::Post,
+                anchor: Some(5),
+                body: vec!["Z".into()],
+            },
+            Op::Swap {
+                start: 5,
+                end: 5,
+                body: vec!["Y".into()],
+            },
+        ];
+        assert_eq!(apply_str("A\nB\nC\nD\nE", &ops), "A\nB\nC\nD\nY\nZ");
+    }
+
+    #[test]
+    fn boundary_repair_never_empties_body() {
+        // Every body row echoes the line below the range; repair trims echoes
+        // but keeps at least one row so SWAP does not silently become DEL.
+        let ops = [Op::Swap {
+            start: 2,
+            end: 2,
+            body: vec!["}".into(), "}".into()],
+        }];
+        // File line 3 is `}` (below the range). Both body rows echo it; the last
+        // is dropped, the remaining `}` stays rather than emptying the body.
+        assert_eq!(apply_str("A\nB\n}\n", &ops), "A\n}\n}");
     }
 }

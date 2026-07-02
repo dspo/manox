@@ -64,6 +64,18 @@ pub fn try_recover_with_snapshot(
     let snap_lines: Vec<&str> = snapshot.text.lines().collect();
     let cur_lines: Vec<&str> = current.lines().collect();
 
+    // Validate the ops against the snapshot exactly as the fast path would, so
+    // a stale-tag recovery never accepts a patch (overlapping ranges, insertion
+    // landing inside a consumer, out-of-bounds lines, empty insertions) that the
+    // fast path would reject. The applied text is discarded — recovery re-roots
+    // the same changes by content onto `current`.
+    if let Err(e) = super::apply::apply(&snapshot.text, ops) {
+        return Err(RecoverError {
+            message: e.to_string(),
+            current_tag,
+        });
+    }
+
     // Resolve each op to a content-anchored change against the snapshot, then
     // project onto current. Block ops resolve to concrete snapshot ranges first.
     let changes = resolve_changes(ops, &snap_lines, &current_tag)?;
