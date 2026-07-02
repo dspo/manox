@@ -480,6 +480,11 @@ impl Render for RichTextState {
                                                 .text_size(px(f32::from(base_text_size) * 1.2))
                                                 .font_weight(gpui::FontWeight::SEMIBOLD),
                                         },
+                                        BlockKind::BlockQuote => content
+                                            .border_l_2()
+                                            .border_color(muted_foreground)
+                                            .pl(px(12.))
+                                            .text_color(muted_foreground),
                                         _ => match block.size {
                                             BlockTextSize::Small => content
                                                 .text_size(px(f32::from(base_text_size) * 0.875)),

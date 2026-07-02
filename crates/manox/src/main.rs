@@ -33,10 +33,21 @@ fn main() {
             gpui::KeyBinding::new("cmd-ctrl-f", ToggleFullscreen, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("f11", ToggleFullscreen, None),
+            // Ctrl-G opens the editor, mirroring Claude Code's external-editor shortcut.
+            gpui::KeyBinding::new("ctrl-g", agent_ui::ToggleEditor, None),
+            // Cmd/Ctrl-Enter submits the editor only while it is focused (RichText context).
             #[cfg(target_os = "macos")]
-            gpui::KeyBinding::new("cmd-shift-e", agent_ui::ToggleEditor, None),
+            gpui::KeyBinding::new(
+                "cmd-enter",
+                agent_ui::SubmitEditor,
+                Some(gpui_rich_text::CONTEXT),
+            ),
             #[cfg(not(target_os = "macos"))]
-            gpui::KeyBinding::new("ctrl-shift-e", agent_ui::ToggleEditor, None),
+            gpui::KeyBinding::new(
+                "ctrl-enter",
+                agent_ui::SubmitEditor,
+                Some(gpui_rich_text::CONTEXT),
+            ),
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &ToggleFullscreen, cx: &mut App| {

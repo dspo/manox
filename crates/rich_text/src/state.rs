@@ -19,7 +19,7 @@ use crate::value::RichTextValue;
 
 use super::style::InlineStyle;
 
-pub(super) const CONTEXT: &str = "RichText";
+pub const CONTEXT: &str = "RichText";
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = rich_text, no_json)]
@@ -264,7 +264,7 @@ impl RichTextState {
         self.scroll_cursor_into_view(window, cx);
     }
 
-    pub(crate) fn cursor(&self) -> usize {
+    pub fn cursor(&self) -> usize {
         self.ime_marked_range
             .map(|r| r.end)
             .unwrap_or(self.selection.end)
@@ -289,16 +289,52 @@ impl RichTextState {
         start..end
     }
 
-    pub(crate) fn set_selection(&mut self, anchor: usize, focus: usize) {
+    pub fn set_selection(&mut self, anchor: usize, focus: usize) {
         self.selection.start = anchor.min(self.text.len());
         self.selection.end = focus.min(self.text.len());
     }
 
-    pub(crate) fn set_cursor(&mut self, offset: usize) {
+    pub fn set_cursor(&mut self, offset: usize) {
         let offset = offset.min(self.text.len());
         self.selection = (offset..offset).into();
         self.preferred_x = None;
         self.active_style = self.style_at(offset);
+    }
+
+    /// Replace an arbitrary byte range with `new_text`, pushing an undo snapshot
+    /// and moving the cursor to the end of the inserted text. Exposed so the
+    /// markdown glue can strip prefixes / inline delimiters without resetting
+    /// the cursor to (0, 0) the way `set_value` does.
+    pub fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        new_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_bytes_range(range, new_text, window, cx, true, false, None);
+    }
+
+    /// The byte offset of the start of `row` in the flat text rope.
+    pub fn line_start_offset(&self, row: usize) -> usize {
+        self.text.line_start_offset(row)
+    }
+
+    /// `(row, byte_column, line_text)` at the current cursor. Lets the markdown
+    /// glue inspect the edited line without reaching into the crate's private
+    /// `document` / `text` fields.
+    pub fn cursor_line(&self) -> (usize, usize, String) {
+        let offset = self.cursor();
+        let point = self.text.offset_to_point(offset);
+        let row = point.row.min(self.document.blocks.len().saturating_sub(1));
+        let col = point.column;
+        let line_text = self
+            .document
+            .blocks
+            .get(row)
+            .map(|b| b.to_plain_text())
+            .unwrap_or_default();
+        (row, col, line_text)
     }
 
     fn sync_layout_cache_to_document(&mut self) {
@@ -845,6 +881,10 @@ impl RichTextState {
         self.toggle_attr(window, cx, |s| s.strikethrough, |s, v| s.strikethrough = v);
     }
 
+    pub fn toggle_code_mark(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_attr(window, cx, |s| s.code, |s, v| s.code = v);
+    }
+
     pub fn set_block_kind(&mut self, kind: BlockKind, window: &mut Window, cx: &mut Context<Self>) {
         self.push_undo_snapshot();
         let (start_row, end_row) = self.selected_rows();
@@ -1018,6 +1058,9 @@ impl RichTextState {
                         color: text.style.fg,
                     });
                 }
+                if text.style.code {
+                    highlight.background_color = Some(self.theme.code_bg);
+                }
                 if let Some(color) = text.style.fg {
                     highlight.color = Some(color);
                 }
@@ -1123,6 +1166,7 @@ impl RichTextState {
                 BlockKind::Heading { .. }
                     | BlockKind::UnorderedListItem
                     | BlockKind::OrderedListItem
+                    | BlockKind::BlockQuote
             ) {
                 self.push_undo_snapshot();
                 self.document.blocks[pos.row].format.kind = BlockKind::Paragraph;

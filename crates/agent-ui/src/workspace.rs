@@ -23,7 +23,7 @@ use gpui_component::{
     tree::{TreeItem, TreeState, tree},
     v_flex,
 };
-use gpui_rich_text::{BlockKind, RichTextEditor, RichTextState};
+use gpui_rich_text::{RichTextEditor, RichTextState};
 
 use crate::conversation::ConversationState;
 use crate::editor::try_apply_markdown_shortcut;
@@ -76,9 +76,7 @@ impl Workspace {
                 .folding(false)
                 .rows(3)
                 .submit_on_enter(true)
-                .placeholder(
-                    "给 agent 发消息…（Enter 发送，Shift+Enter 换行，Cmd-Shift-E 打开编辑器）",
-                )
+                .placeholder("给 agent 发消息…（Enter 发送，Shift+Enter 换行，Ctrl-G 打开编辑器）")
         });
 
         let editor_state = cx.new(|cx| RichTextState::new(window, cx).default_value(""));
@@ -427,124 +425,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_editor_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let editor = self.editor_state.clone();
-        let editor_for_h1 = editor.clone();
-        let editor_for_h2 = editor.clone();
-        let editor_for_h3 = editor.clone();
-        let editor_for_p = editor.clone();
-        let editor_for_b = editor.clone();
-        let editor_for_i = editor.clone();
-        let editor_for_ul = editor.clone();
-        let editor_for_ol = editor.clone();
-        h_flex()
-            .gap_1()
-            .items_center()
-            .child(
-                Button::new("editor-h1")
-                    .ghost()
-                    .xsmall()
-                    .label("H1")
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        editor_for_h1.update(cx, |s, cx| {
-                            s.set_block_kind(BlockKind::Heading { level: 1 }, window, cx);
-                        });
-                    })),
-            )
-            .child(
-                Button::new("editor-h2")
-                    .ghost()
-                    .xsmall()
-                    .label("H2")
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        editor_for_h2.update(cx, |s, cx| {
-                            s.set_block_kind(BlockKind::Heading { level: 2 }, window, cx);
-                        });
-                    })),
-            )
-            .child(
-                Button::new("editor-h3")
-                    .ghost()
-                    .xsmall()
-                    .label("H3")
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        editor_for_h3.update(cx, |s, cx| {
-                            s.set_block_kind(BlockKind::Heading { level: 3 }, window, cx);
-                        });
-                    })),
-            )
-            .child(
-                Button::new("editor-p")
-                    .ghost()
-                    .xsmall()
-                    .label("P")
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        editor_for_p.update(cx, |s, cx| {
-                            s.set_block_kind(BlockKind::Paragraph, window, cx);
-                        });
-                    })),
-            )
-            .child(gpui::div().w(px(4.)).h(px(16.)).bg(cx.theme().border))
-            .child(
-                Button::new("editor-bold")
-                    .ghost()
-                    .xsmall()
-                    .label("B")
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        editor_for_b.update(cx, |s, cx| {
-                            s.toggle_bold_mark(window, cx);
-                        });
-                    })),
-            )
-            .child(
-                Button::new("editor-italic")
-                    .ghost()
-                    .xsmall()
-                    .label("I")
-                    .italic()
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        editor_for_i.update(cx, |s, cx| {
-                            s.toggle_italic_mark(window, cx);
-                        });
-                    })),
-            )
-            .child(gpui::div().w(px(4.)).h(px(16.)).bg(cx.theme().border))
-            .child(
-                Button::new("editor-ul")
-                    .ghost()
-                    .xsmall()
-                    .label("•")
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        editor_for_ul.update(cx, |s, cx| {
-                            s.toggle_list(BlockKind::UnorderedListItem, window, cx);
-                        });
-                    })),
-            )
-            .child(
-                Button::new("editor-ol")
-                    .ghost()
-                    .xsmall()
-                    .label("1.")
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        editor_for_ol.update(cx, |s, cx| {
-                            s.toggle_list(BlockKind::OrderedListItem, window, cx);
-                        });
-                    })),
-            )
-            .child(gpui::div().flex_1())
-            .child(
-                Button::new("editor-close")
-                    .ghost()
-                    .small()
-                    .icon(IconName::Close)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_editor(window, cx);
-                    })),
-            )
-            .into_any_element()
-    }
-
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let auth = self.pending_auth.as_ref()?;
         let summary = auth.summary.clone();
@@ -672,52 +552,7 @@ impl Render for Workspace {
             .border_l_1()
             .border_color(theme.border)
             .bg(theme.background)
-            .p_3()
-            .gap_2()
-            .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("编辑器"),
-                    )
-                    .child(self.render_editor_toolbar(cx)),
-            )
-            .child(
-                gpui::div()
-                    .flex_1()
-                    .min_h_0()
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(theme.radius)
-                    .child(
-                        RichTextEditor::new(&self.editor_state)
-                            .bordered(false)
-                            .h_full(),
-                    ),
-            )
-            .child(h_flex().justify_end().gap_2().child(if running {
-                Button::new("editor-stop")
-                    .ghost()
-                    .small()
-                    .label("停止")
-                    .icon(IconName::Pause)
-                    .on_click(cx.listener(|this, _, _window, cx| {
-                        this.cancel_turn(cx);
-                    }))
-                    .into_any_element()
-            } else {
-                Button::new("editor-send")
-                    .primary()
-                    .small()
-                    .label("发送")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.submit_editor(window, cx);
-                    }))
-                    .into_any_element()
-            }));
+            .child(RichTextEditor::new(&self.editor_state).h_full());
 
         h_flex()
             .size_full()
@@ -725,6 +560,9 @@ impl Render for Workspace {
             .text_color(theme.foreground)
             .on_action(cx.listener(|this, _: &crate::ToggleEditor, window, cx| {
                 this.toggle_editor(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::SubmitEditor, window, cx| {
+                this.submit_editor(window, cx);
             }))
             // Left sidebar
             .child(self.sidebar.clone())

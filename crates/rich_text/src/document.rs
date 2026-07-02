@@ -13,6 +13,7 @@ pub enum BlockKind {
     Heading { level: u8 },
     UnorderedListItem,
     OrderedListItem,
+    BlockQuote,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,9 +35,10 @@ impl BlockFormat {
     pub(crate) fn split_successor(self) -> Self {
         match self.kind {
             BlockKind::Heading { .. } => BlockFormat::default(),
-            BlockKind::Paragraph | BlockKind::UnorderedListItem | BlockKind::OrderedListItem => {
-                self
-            }
+            BlockKind::Paragraph
+            | BlockKind::UnorderedListItem
+            | BlockKind::OrderedListItem
+            | BlockKind::BlockQuote => self,
         }
     }
 }

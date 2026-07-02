@@ -158,6 +158,7 @@ fn block_to_element(block: &BlockNode) -> SlateElement {
         BlockKind::Heading { level } => ("heading".to_string(), Some(level)),
         BlockKind::UnorderedListItem => ("list-item".to_string(), None),
         BlockKind::OrderedListItem => ("list-item".to_string(), None),
+        BlockKind::BlockQuote => ("blockquote".to_string(), None),
     };
 
     let text_size = block_text_size_to_string(block.format.size);
@@ -395,6 +396,7 @@ fn slate_text_to_text_node(text: &SlateText) -> TextNode {
             italic: text.italic.unwrap_or(false),
             underline: text.underline.unwrap_or(false),
             strikethrough: text.strikethrough.unwrap_or(false),
+            code: false,
             fg,
             bg,
         },
