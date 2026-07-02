@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Bundle manox as a macOS .app.
+#
+# Usage: script/bundle-mac [options]
+# Options:
+#   -d    Compile in debug mode
+#   -o    Open the resulting .app after bundling
+#   -h    Display this help and exit
+
+build_flag="--release"
+target_dir="release"
+open_result=false
+
+help_info() {
+    echo "
+Usage: ${0##*/} [options]
+Bundle manox as a macOS .app.
+
+Options:
+  -d    Compile in debug mode
+  -o    Open the resulting .app after bundling
+  -h    Display this help and exit
+"
+}
+
+while getopts 'doh' flag; do
+    case "${flag}" in
+        o) open_result=true;;
+        d) build_flag=""; target_dir="debug";;
+        h) help_info; exit 0;;
+    esac
+done
+
+# --- Detect target triple ---
+version_info=$(rustc --version --verbose)
+host_line=$(echo "$version_info" | grep host)
+target_triple=${host_line#*: }
+
+if [[ "$target_triple" != *-apple-darwin ]]; then
+    echo "Error: this script only runs on macOS (detected $target_triple)"
+    exit 1
+fi
+
+# --- Build ---
+echo "Building manox binary"
+cargo build ${build_flag} --package manox --target "$target_triple"
+
+# --- Read bundle configuration from Cargo.toml ---
+# Single source of truth: [package.metadata.bundle] in crates/manox/Cargo.toml.
+bundle_toml="crates/manox/Cargo.toml"
+# Extract values from the bundle section (not the [package] section).
+# The bundle "name" is the display name ("Manox"), distinct from the crate name ("manox").
+bundle_id=$(sed -n '/\[package.metadata.bundle\]/,/^\[/ s/^identifier = "\(.*\)"/\1/p' "${bundle_toml}" | head -1)
+app_name=$(sed -n '/\[package.metadata.bundle\]/,/^\[/ s/^name = "\(.*\)"/\1/p' "${bundle_toml}" | head -1)
+# version is workspace-inherited; resolve via cargo metadata
+app_version=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | python3 -c "import sys,json; pkgs=json.load(sys.stdin)['packages']; \
+                   p=[x for x in pkgs if x['name']=='manox']; \
+                   print(p[0]['version'] if p else '0.1.0')")
+
+# --- Determine paths ---
+app_path="target/${target_triple}/${target_dir}/${app_name}.app"
+macos_dir="${app_path}/Contents/MacOS"
+resources_dir="${app_path}/Contents/Resources"
+icon_resources_dir="crates/manox/resources"
+
+# --- Assemble .app bundle ---
+echo "Creating .app bundle at ${app_path}"
+rm -rf "${app_path}"
+mkdir -p "${macos_dir}" "${resources_dir}"
+
+# Copy binary
+cp "target/${target_triple}/${target_dir}/manox" "${macos_dir}/manox"
+
+# Copy icons (if present)
+if [[ -f "${icon_resources_dir}/app-icon.icns" ]]; then
+    cp "${icon_resources_dir}/app-icon.icns" "${resources_dir}/app-icon.icns"
+elif [[ -f "${icon_resources_dir}/app-icon@2x.png" ]]; then
+    cp "${icon_resources_dir}/app-icon.png" "${resources_dir}/app-icon.png" 2>/dev/null || true
+    cp "${icon_resources_dir}/app-icon@2x.png" "${resources_dir}/app-icon@2x.png"
+fi
+
+# Copy entitlements into the bundle
+if [[ -f "${icon_resources_dir}/manox.entitlements" ]]; then
+    cp "${icon_resources_dir}/manox.entitlements" "${resources_dir}/manox.entitlements"
+fi
+
+# --- Generate Info.plist ---
+icon_file="app-icon.icns"
+if [[ ! -f "${resources_dir}/app-icon.icns" ]]; then
+    icon_file="app-icon@2x.png"
+fi
+
+cat > "${app_path}/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>manox</string>
+    <key>CFBundleIdentifier</key>
+    <string>${bundle_id}</string>
+    <key>CFBundleName</key>
+    <string>${app_name}</string>
+    <key>CFBundleDisplayName</key>
+    <string>${app_name}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${app_version}</string>
+    <key>CFBundleVersion</key>
+    <string>${app_version}</string>
+    <key>CFBundleIconFile</key>
+    <string>${icon_file}</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15.7</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright 2024-2026 DSPo. All rights reserved.</string>
+
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Manox agent tools need to send Apple Events to run shell commands and interact with other applications.</string>
+</dict>
+</plist>
+PLIST
+
+echo "Info.plist written to ${app_path}/Contents/Info.plist"
+
+# --- Code signing ---
+# Ad-hoc sign with entitlements (required for JIT / unsigned-executable-memory
+# that GPUI uses for runtime shaders). A proper Apple Developer certificate
+# signing can override this if env vars are present.
+entitlements_path="${icon_resources_dir}/manox.entitlements"
+
+if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
+    echo "Setting up keychain for code signing..."
+    security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" manox.keychain || true
+    security default-keychain -s manox.keychain
+    security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" manox.keychain
+    security set-keychain-settings manox.keychain
+    echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/manox-certificate.p12
+    security import /tmp/manox-certificate.p12 -k manox.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+    rm /tmp/manox-certificate.p12
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" manox.keychain
+
+    function cleanup_keychain() {
+        echo "Cleaning up keychain"
+        security default-keychain -s login.keychain
+        security delete-keychain manox.keychain || true
+    }
+    trap cleanup_keychain EXIT
+
+    echo "Code signing with Apple Developer certificate"
+    /usr/bin/codesign --force --deep --timestamp --options runtime \
+        --entitlements "${entitlements_path}" \
+        --sign "${MACOS_SIGNING_IDENTITY:-}" "${app_path}" -v
+
+    # Clear the trap since cleanup is done
+    trap - EXIT
+    cleanup_keychain
+else
+    echo "Ad-hoc signing with entitlements (no Apple Developer certificate)"
+    codesign --force --deep \
+        --entitlements "${entitlements_path}" \
+        --sign - "${app_path}" -v
+fi
+
+echo ""
+echo "Bundle complete: ${app_path}"
+echo "Binary:  ${macos_dir}/manox"
+echo ""
+
+if [[ "$open_result" = true ]]; then
+    echo "Opening ${app_path}"
+    open "${app_path}"
+fi

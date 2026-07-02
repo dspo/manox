@@ -19,5 +19,11 @@ agent = { path = "../agent" }
 
 tracing-subscriber.workspace = true
 
+[package.metadata.bundle]
+identifier = "dev.dspo.manox"
+name = "Manox"
+icon = ["resources/app-icon@2x.png", "resources/app-icon.png"]
+osx_minimum_system_version = "10.15.7"
+
 [lints.clippy]
 dbg_macro = "deny"
