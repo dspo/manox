@@ -564,7 +564,11 @@ impl Workspace {
             .items_center()
             .child(self.render_cwd_chip(theme))
             .child(gpui::div().flex_1())
-            .child(self.render_model_selector(theme, cx))
+            .child(
+                gpui::div()
+                    .flex_shrink_0()
+                    .child(self.render_model_selector(theme, cx)),
+            )
             .into_any_element()
     }
 
