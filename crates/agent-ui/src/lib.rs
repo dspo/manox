@@ -4,6 +4,7 @@
 //! `Entity<agent::Thread>` and subscribes to `ThreadEvent` for incremental rendering.
 
 pub mod conversation;
+pub mod editor;
 pub mod views;
 pub mod workspace;
 

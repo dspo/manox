@@ -9,21 +9,24 @@
 
 use std::path::PathBuf;
 
-use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use agent::language_model::StopReason;
 use agent::provider::registry;
-use gpui::{AnyElement, Context, Entity, Render, Subscription, Window, prelude::*, px};
+use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
+use gpui::{AnyElement, Context, Entity, Focusable, Render, Subscription, Window, prelude::*, px};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
     button::{Button, ButtonVariants as _},
+    h_flex,
     input::{Input, InputEvent, InputState},
     list::ListItem,
     popover::Popover,
     tree::{TreeItem, TreeState, tree},
-    h_flex, v_flex, TitleBar,
+    v_flex,
 };
+use gpui_rich_text::{BlockKind, RichTextEditor, RichTextState};
 
 use crate::conversation::ConversationState;
+use crate::editor::try_apply_markdown_shortcut;
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::views::{centered, message::render_item};
 
@@ -40,8 +43,8 @@ pub struct Workspace {
     sidebar: Entity<Sidebar>,
     conversation: ConversationState,
     input_state: Entity<InputState>,
-    /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
-    editor_state: Entity<InputState>,
+    /// Right-side WYSIWYG markdown composer; opened via the `ToggleEditor` shortcut.
+    editor_state: Entity<RichTextState>,
     editor_open: bool,
     pending_auth: Option<PendingAuth>,
     model_open: bool,
@@ -50,7 +53,13 @@ pub struct Workspace {
     thread_sub: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
+    editor_sub: Option<Subscription>,
 }
+
+/// Right-side WYSIWYG composer width. Wide enough for rendered markdown
+/// (headings, lists) alongside the 1100px window without crowding the
+/// conversation thread.
+const EDITOR_PANEL_WIDTH: f32 = 640.;
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -67,18 +76,12 @@ impl Workspace {
                 .folding(false)
                 .rows(3)
                 .submit_on_enter(true)
-                .placeholder("给 agent 发消息…（Enter 发送，Shift+Enter 换行，Cmd-Shift-E 打开编辑器）")
+                .placeholder(
+                    "给 agent 发消息…（Enter 发送，Shift+Enter 换行，Cmd-Shift-E 打开编辑器）",
+                )
         });
 
-        let editor_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("markdown")
-                .line_number(false)
-                .folding(false)
-                .rows(20)
-                .submit_on_enter(false)
-                .placeholder("在此撰写较长的 Markdown 消息，点「发送」提交并关闭…")
-        });
+        let editor_state = cx.new(|cx| RichTextState::new(window, cx).default_value(""));
 
         let sidebar = cx.new(Sidebar::new);
 
@@ -102,10 +105,12 @@ impl Workspace {
             thread_sub: None,
             sidebar_sub: None,
             input_sub: None,
+            editor_sub: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
+        ws.editor_sub = Some(ws.observe_editor(window, cx));
         let id = ws.thread.read(cx).id.0.clone();
         ws.sidebar.update(cx, |s, cx| s.set_selected(Some(id), cx));
         ws
@@ -118,8 +123,7 @@ impl Workspace {
         expanded_provider: Option<String>,
         cx: &mut Context<Self>,
     ) -> Entity<TreeState> {
-        let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> =
-            Vec::new();
+        let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> = Vec::new();
         for m in registry::global().models() {
             let prov = m.provider_name();
             if let Some(last) = providers.last_mut()
@@ -182,12 +186,10 @@ impl Workspace {
 
     fn subscribe_sidebar(&self, cx: &mut Context<Self>) -> Subscription {
         let sidebar = self.sidebar.clone();
-        cx.subscribe(&sidebar, |this, _sidebar, ev: &SidebarEvent, cx| {
-            match ev {
-                SidebarEvent::NewThread => this.start_new_thread(cx),
-                SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), cx),
-                SidebarEvent::DeleteThread(id) => this.delete_thread(id.clone(), cx),
-            }
+        cx.subscribe(&sidebar, |this, _sidebar, ev: &SidebarEvent, cx| match ev {
+            SidebarEvent::NewThread => this.start_new_thread(cx),
+            SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), cx),
+            SidebarEvent::DeleteThread(id) => this.delete_thread(id.clone(), cx),
         })
     }
 
@@ -202,21 +204,34 @@ impl Workspace {
         })
     }
 
+    /// Observe the right-side editor: every state change fires the markdown
+    /// shortcut detector (see `editor::try_apply_markdown_shortcut`).
+    fn observe_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        let editor = self.editor_state.clone();
+        cx.observe_in(&editor, window, move |_this, editor, window, cx| {
+            // The closure receives a `&mut Window` per call; pass it through to
+            // the entity via `Entity::update`, capturing the reborrowed window.
+            // `Context<Workspace>` doesn't implement `VisualContext`, so we
+            // can't use `update_in` here.
+            let window: &mut Window = window;
+            editor.update(cx, |state, cx| {
+                try_apply_markdown_shortcut(state, window, cx);
+            });
+        })
+    }
+
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
     fn attach_thread(&mut self, new_thread: Entity<Thread>, cx: &mut Context<Self>) {
         save_thread(self.thread.clone(), cx);
 
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
-        let messages: Vec<agent::Message> = self
-            .thread
-            .read(cx)
-            .messages()
-            .to_vec();
+        let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
         self.conversation = ConversationState::rebuild_from_messages(&messages);
         self.pending_auth = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
-        self.sidebar.update(cx, |s, cx| s.set_selected(Some(id), cx));
+        self.sidebar
+            .update(cx, |s, cx| s.set_selected(Some(id), cx));
         cx.notify();
     }
 
@@ -263,16 +278,14 @@ impl Workspace {
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_open = !self.editor_open;
         if self.editor_open {
-            self.editor_state
-                .update(cx, |s, cx| s.focus(window, cx));
+            self.editor_state.focus_handle(cx).focus(window, cx);
         } else {
-            self.input_state
-                .update(cx, |s, cx| s.focus(window, cx));
+            self.input_state.update(cx, |s, cx| s.focus(window, cx));
         }
         cx.notify();
     }
 
-    /// Submit the composer text to the thread, then close the panel and return
+    /// Submit the editor text to the thread, then close the panel and return
     /// focus to the inline input.
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
@@ -285,11 +298,11 @@ impl Workspace {
             thread.run_turn(cx);
         });
         save_thread(self.thread.clone(), cx);
-        self.editor_state
-            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.editor_state.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
         self.editor_open = false;
-        self.input_state
-            .update(cx, |s, cx| s.focus(window, cx));
+        self.input_state.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
     }
 
@@ -359,10 +372,7 @@ impl Workspace {
                 });
 
             if let Some(ch) = chevron {
-                li = li.child(
-                    ch.xsmall()
-                        .text_color(theme_clone.muted_foreground),
-                );
+                li = li.child(ch.xsmall().text_color(theme_clone.muted_foreground));
             } else {
                 li = li.child(gpui::div().w(px(16.)));
             }
@@ -414,6 +424,124 @@ impl Workspace {
                     .icon(IconName::ChevronDown),
             )
             .child(tree)
+            .into_any_element()
+    }
+
+    fn render_editor_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let editor = self.editor_state.clone();
+        let editor_for_h1 = editor.clone();
+        let editor_for_h2 = editor.clone();
+        let editor_for_h3 = editor.clone();
+        let editor_for_p = editor.clone();
+        let editor_for_b = editor.clone();
+        let editor_for_i = editor.clone();
+        let editor_for_ul = editor.clone();
+        let editor_for_ol = editor.clone();
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                Button::new("editor-h1")
+                    .ghost()
+                    .xsmall()
+                    .label("H1")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        editor_for_h1.update(cx, |s, cx| {
+                            s.set_block_kind(BlockKind::Heading { level: 1 }, window, cx);
+                        });
+                    })),
+            )
+            .child(
+                Button::new("editor-h2")
+                    .ghost()
+                    .xsmall()
+                    .label("H2")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        editor_for_h2.update(cx, |s, cx| {
+                            s.set_block_kind(BlockKind::Heading { level: 2 }, window, cx);
+                        });
+                    })),
+            )
+            .child(
+                Button::new("editor-h3")
+                    .ghost()
+                    .xsmall()
+                    .label("H3")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        editor_for_h3.update(cx, |s, cx| {
+                            s.set_block_kind(BlockKind::Heading { level: 3 }, window, cx);
+                        });
+                    })),
+            )
+            .child(
+                Button::new("editor-p")
+                    .ghost()
+                    .xsmall()
+                    .label("P")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        editor_for_p.update(cx, |s, cx| {
+                            s.set_block_kind(BlockKind::Paragraph, window, cx);
+                        });
+                    })),
+            )
+            .child(gpui::div().w(px(4.)).h(px(16.)).bg(cx.theme().border))
+            .child(
+                Button::new("editor-bold")
+                    .ghost()
+                    .xsmall()
+                    .label("B")
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        editor_for_b.update(cx, |s, cx| {
+                            s.toggle_bold_mark(window, cx);
+                        });
+                    })),
+            )
+            .child(
+                Button::new("editor-italic")
+                    .ghost()
+                    .xsmall()
+                    .label("I")
+                    .italic()
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        editor_for_i.update(cx, |s, cx| {
+                            s.toggle_italic_mark(window, cx);
+                        });
+                    })),
+            )
+            .child(gpui::div().w(px(4.)).h(px(16.)).bg(cx.theme().border))
+            .child(
+                Button::new("editor-ul")
+                    .ghost()
+                    .xsmall()
+                    .label("•")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        editor_for_ul.update(cx, |s, cx| {
+                            s.toggle_list(BlockKind::UnorderedListItem, window, cx);
+                        });
+                    })),
+            )
+            .child(
+                Button::new("editor-ol")
+                    .ghost()
+                    .xsmall()
+                    .label("1.")
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        editor_for_ol.update(cx, |s, cx| {
+                            s.toggle_list(BlockKind::OrderedListItem, window, cx);
+                        });
+                    })),
+            )
+            .child(gpui::div().flex_1())
+            .child(
+                Button::new("editor-close")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Close)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_editor(window, cx);
+                    })),
+            )
             .into_any_element()
     }
 
@@ -538,7 +666,7 @@ impl Render for Workspace {
 
         let editor_open = self.editor_open;
         let editor_panel = v_flex()
-            .w(px(440.))
+            .w(px(EDITOR_PANEL_WIDTH))
             .h_full()
             .flex_shrink_0()
             .border_l_1()
@@ -555,47 +683,41 @@ impl Render for Workspace {
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child("编辑器"),
                     )
-                    .child(
-                        Button::new("editor-close")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_editor(window, cx);
-                            })),
-                    ),
+                    .child(self.render_editor_toolbar(cx)),
             )
             .child(
                 gpui::div()
                     .flex_1()
                     .min_h_0()
-                    .child(Input::new(&self.editor_state)),
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(theme.radius)
+                    .child(
+                        RichTextEditor::new(&self.editor_state)
+                            .bordered(false)
+                            .h_full(),
+                    ),
             )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(if running {
-                        Button::new("editor-stop")
-                            .ghost()
-                            .small()
-                            .label("停止")
-                            .icon(IconName::Pause)
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.cancel_turn(cx);
-                            }))
-                            .into_any_element()
-                    } else {
-                        Button::new("editor-send")
-                            .primary()
-                            .small()
-                            .label("发送")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.submit_editor(window, cx);
-                            }))
-                            .into_any_element()
-                    }),
-            );
+            .child(h_flex().justify_end().gap_2().child(if running {
+                Button::new("editor-stop")
+                    .ghost()
+                    .small()
+                    .label("停止")
+                    .icon(IconName::Pause)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.cancel_turn(cx);
+                    }))
+                    .into_any_element()
+            } else {
+                Button::new("editor-send")
+                    .primary()
+                    .small()
+                    .label("发送")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.submit_editor(window, cx);
+                    }))
+                    .into_any_element()
+            }));
 
         h_flex()
             .size_full()

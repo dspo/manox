@@ -21,6 +21,7 @@ uuid.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
+gpui-rich-text.workspace = true
 
 agent = { path = "../agent" }
 

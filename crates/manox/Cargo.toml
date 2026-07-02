@@ -13,6 +13,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
+gpui-rich-text.workspace = true
 
 agent-ui = { path = "../agent-ui" }
 agent = { path = "../agent" }
