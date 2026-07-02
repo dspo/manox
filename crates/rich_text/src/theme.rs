@@ -9,6 +9,7 @@ pub struct RichTextTheme {
     pub muted_foreground: Hsla,
     pub selection: Hsla,
     pub code_bg: Hsla,
+    pub link_color: Hsla,
 }
 
 impl Default for RichTextTheme {
@@ -21,6 +22,7 @@ impl Default for RichTextTheme {
             muted_foreground: hsla(0., 0., 0.42, 1.),
             selection: hsla(0.58, 1.0, 0.5, 0.25),
             code_bg: hsla(0., 0., 0.5, 0.12),
+            link_color: hsla(0.62, 0.6, 0.45, 1.),
         }
     }
 }

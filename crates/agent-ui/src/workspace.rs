@@ -286,7 +286,7 @@ impl Workspace {
     /// Submit the editor text to the thread, then close the panel and return
     /// focus to the inline input.
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.editor_state.read(cx).value().to_string();
+        let text = self.editor_state.read(cx).markdown();
         if text.trim().is_empty() || self.thread.read(cx).is_running() {
             return;
         }

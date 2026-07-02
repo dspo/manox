@@ -38,6 +38,31 @@ pub fn try_apply_markdown_shortcut(
         return;
     }
 
+    if let Some((inner, url)) = detect_link(&line, col) {
+        // `[` sits one byte before the inner text; `](url)` spans from inner.end
+        // to the cursor (col).
+        let open_start = inner.start - 1;
+        let close_start = inner.end;
+        let close_len = col - inner.end;
+        let inner_rope = (row_start + inner.start)..(row_start + inner.end);
+        state.set_selection(inner_rope.start, inner_rope.end);
+        state.toggle_link_mark(url, window, cx);
+        state.replace_range(
+            (row_start + close_start)..(row_start + close_start + close_len),
+            "",
+            window,
+            cx,
+        );
+        state.replace_range(
+            (row_start + open_start)..(row_start + open_start + 1),
+            "",
+            window,
+            cx,
+        );
+        state.set_cursor(row_start + open_start + (inner.end - inner.start));
+        return;
+    }
+
     if let Some((mark, delim_len, inner)) = detect_inline(&line, col) {
         let open_start = inner.start - delim_len;
         let close_start = inner.end;
@@ -66,6 +91,8 @@ enum ConvertAction {
     UnorderedList,
     OrderedList,
     BlockQuote,
+    HorizontalRule,
+    CodeBlock,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -84,6 +111,18 @@ fn detect_block_prefix(line: &str) -> Option<(usize, ConvertAction)> {
     if line.starts_with(' ') {
         return None;
     }
+
+    // Code fence: three or more backticks optionally followed by a language
+    // tag. The whole line is the marker, so the cursor must be at EOL.
+    if let Some(action) = detect_code_fence(line) {
+        return Some((line.len(), action));
+    }
+
+    // Horizontal rule: three or more of `-`, `*`, or `_` and nothing else.
+    if let Some(action) = detect_horizontal_rule(line) {
+        return Some((line.len(), action));
+    }
+
     // Longest headings first so `## ` is not shadowed by `# `.
     const HEADINGS: &[(&str, u8)] = &[
         ("###### ", 6),
@@ -110,6 +149,73 @@ fn detect_block_prefix(line: &str) -> Option<(usize, ConvertAction)> {
         return Some((2, ConvertAction::BlockQuote));
     }
     None
+}
+
+/// A code fence line is three or more backticks followed by an optional
+/// language tag (word chars, `-`, `+`, `#`, or whitespace only).
+fn detect_code_fence(line: &str) -> Option<ConvertAction> {
+    let backticks = line.bytes().take_while(|&b| b == b'`').count();
+    if backticks < 3 {
+        return None;
+    }
+    let rest = &line[backticks..];
+    let valid = rest.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'_' | b'#' | b' ' | b'\t')
+    });
+    valid.then_some(ConvertAction::CodeBlock)
+}
+
+/// A horizontal rule line is three or more of the same character (`-`, `*`,
+/// or `_`) with nothing else.
+fn detect_horizontal_rule(line: &str) -> Option<ConvertAction> {
+    if line.len() < 3 {
+        return None;
+    }
+    let first = line.as_bytes()[0];
+    if !matches!(first, b'-' | b'*' | b'_') {
+        return None;
+    }
+    if line.bytes().all(|b| b == first) {
+        Some(ConvertAction::HorizontalRule)
+    } else {
+        None
+    }
+}
+
+/// If the cursor sits right after the closing `)` of a `[text](url)` link and
+/// the `[` is not preceded by `!` (which would make it an image), return the
+/// inner-text range (line-local byte offsets) and the URL.
+fn detect_link(line: &str, col: usize) -> Option<(Range<usize>, String)> {
+    let col = col.min(line.len());
+    let prefix = &line[..col];
+    if !prefix.ends_with(')') {
+        return None;
+    }
+
+    let close_paren_pos = col - 1;
+    let open_paren_pos = prefix[..close_paren_pos].rfind('(')?;
+    let url = &prefix[open_paren_pos + 1..close_paren_pos];
+    if url.is_empty() {
+        return None;
+    }
+
+    let close_bracket_pos = open_paren_pos.checked_sub(1)?;
+    if prefix.as_bytes()[close_bracket_pos] != b']' {
+        return None;
+    }
+
+    let open_bracket_pos = prefix[..close_bracket_pos].rfind('[')?;
+    let text_start = open_bracket_pos + 1;
+    if text_start >= close_bracket_pos {
+        return None;
+    }
+
+    // `[` preceded by `!` is an image, not a link — leave it as literal text.
+    if open_bracket_pos > 0 && prefix.as_bytes()[open_bracket_pos - 1] == b'!' {
+        return None;
+    }
+
+    Some((text_start..close_bracket_pos, url.to_string()))
 }
 
 /// If the cursor sits right after a closing inline delimiter, find the matching
@@ -175,6 +281,12 @@ fn apply_block_action(
         }
         ConvertAction::BlockQuote => {
             state.set_block_kind(BlockKind::BlockQuote, window, cx);
+        }
+        ConvertAction::HorizontalRule => {
+            state.set_block_kind(BlockKind::HorizontalRule, window, cx);
+        }
+        ConvertAction::CodeBlock => {
+            state.set_block_kind(BlockKind::CodeBlock, window, cx);
         }
     }
 }
@@ -308,5 +420,89 @@ mod tests {
         assert_eq!(detect_inline("a **b", 5), None); // no closing delim at cursor
         assert_eq!(detect_inline("a ****", 6), None); // empty inner
         assert_eq!(detect_inline("a **b**", 5), None); // cursor not after closing delim
+    }
+
+    #[test]
+    fn detect_block_prefix_horizontal_rule() {
+        assert_eq!(
+            detect_block_prefix("---"),
+            Some((3, ConvertAction::HorizontalRule))
+        );
+        assert_eq!(
+            detect_block_prefix("----"),
+            Some((4, ConvertAction::HorizontalRule))
+        );
+        assert_eq!(
+            detect_block_prefix("***"),
+            Some((3, ConvertAction::HorizontalRule))
+        );
+        assert_eq!(
+            detect_block_prefix("___"),
+            Some((3, ConvertAction::HorizontalRule))
+        );
+    }
+
+    #[test]
+    fn detect_horizontal_rule_rejects_incomplete() {
+        assert_eq!(detect_horizontal_rule("--"), None);
+        assert_eq!(detect_horizontal_rule("-a-"), None);
+        assert_eq!(detect_horizontal_rule("--- "), None); // trailing space breaks all-same
+        assert_eq!(detect_horizontal_rule("abc"), None);
+        assert_eq!(detect_horizontal_rule(""), None);
+    }
+
+    #[test]
+    fn detect_block_prefix_code_fence() {
+        assert_eq!(
+            detect_block_prefix("```"),
+            Some((3, ConvertAction::CodeBlock))
+        );
+        assert_eq!(
+            detect_block_prefix("```rust"),
+            Some((7, ConvertAction::CodeBlock))
+        );
+        assert_eq!(
+            detect_block_prefix("`````"),
+            Some((5, ConvertAction::CodeBlock))
+        );
+    }
+
+    #[test]
+    fn detect_code_fence_rejects_incomplete() {
+        assert_eq!(detect_code_fence("``"), None);
+        assert_eq!(detect_code_fence("``a``"), None); // backtick after non-backtick run
+        assert_eq!(detect_code_fence("`code`"), None);
+    }
+
+    #[test]
+    fn detect_link_basic() {
+        // "[b](u)" — cursor at col 7 (after closing `)`).
+        let line = "[b](u)";
+        let want = Some((1usize..2usize, "u".to_string()));
+        assert_eq!(detect_link(line, line.len()), want);
+    }
+
+    #[test]
+    fn detect_link_multichar() {
+        let line = "[hello](https://example.com)";
+        assert_eq!(
+            detect_link(line, line.len()),
+            Some((1usize..6usize, "https://example.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn detect_link_rejects_image() {
+        // `![alt](url)` is an image; the `[` is preceded by `!`.
+        let line = "![alt](url)";
+        assert_eq!(detect_link(line, line.len()), None);
+    }
+
+    #[test]
+    fn detect_link_rejects_incomplete() {
+        assert_eq!(detect_link("[b](u", 5), None); // no closing `)`
+        assert_eq!(detect_link("[b]u)", 5), None); // no `(`
+        assert_eq!(detect_link("[]()", 4), None); // empty text and url
+        assert_eq!(detect_link("[b]", 3), None); // no `(url)`
     }
 }

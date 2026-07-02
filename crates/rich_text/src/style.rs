@@ -7,6 +7,8 @@ pub struct InlineStyle {
     pub underline: bool,
     pub strikethrough: bool,
     pub code: bool,
+    pub image_placeholder: bool,
+    pub link_url: Option<String>,
     pub fg: Option<Hsla>,
     pub bg: Option<Hsla>,
 }

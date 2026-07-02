@@ -1,8 +1,8 @@
 use std::ops::Range;
 
 use gpui::{
-    Action, App, Bounds, ClipboardItem, Context, EntityInputHandler, FocusHandle, FontStyle,
-    FontWeight, HighlightStyle, KeyBinding, Pixels, Point, ScrollHandle, SharedString,
+    Action, App, Bounds, ClipboardEntry, ClipboardItem, Context, EntityInputHandler, FocusHandle,
+    FontStyle, FontWeight, HighlightStyle, KeyBinding, Pixels, Point, ScrollHandle, SharedString,
     StrikethroughStyle, UTF16Selection, UnderlineStyle, Window, actions, point, px,
 };
 use ropey::Rope;
@@ -145,6 +145,9 @@ pub struct RichTextState {
     pub(crate) viewport_bounds: Bounds<Pixels>,
     pub(crate) layout_cache: Vec<Option<LineLayoutCache>>,
 
+    /// Monotonic counter for `[ImageN]` placeholders pasted this session.
+    pub(crate) image_counter: usize,
+
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
 }
@@ -170,6 +173,7 @@ impl RichTextState {
             preferred_x: None,
             viewport_bounds: Bounds::default(),
             layout_cache,
+            image_counter: 0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         }
@@ -193,6 +197,12 @@ impl RichTextState {
 
     pub fn value(&self) -> SharedString {
         SharedString::new(self.text.to_string())
+    }
+
+    /// Markdown source reconstructed from the document model, preserving the
+    /// structure the user authored. Use this when handing content to the LLM.
+    pub fn markdown(&self) -> String {
+        self.document.to_markdown()
     }
 
     pub fn richtext_value(&self) -> RichTextValue {
@@ -885,6 +895,36 @@ impl RichTextState {
         self.toggle_attr(window, cx, |s| s.code, |s, v| s.code = v);
     }
 
+    /// Toggle a link on the selection. If the selection already carries a link
+    /// URL, clear it; otherwise attach the given URL.
+    pub fn toggle_link_mark(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        let range = self.ordered_selection();
+        if range.is_empty() {
+            let new_val = if self.active_style.link_url.is_some() {
+                None
+            } else {
+                Some(url)
+            };
+            self.active_style.link_url = new_val;
+            cx.notify();
+            return;
+        }
+
+        self.push_undo_snapshot();
+        let enabled = self.is_attr_enabled(range.clone(), |s| s.link_url.is_some());
+        let mut block_ranges: Vec<(usize, Range<usize>)> = Vec::new();
+        self.for_each_block_range_in_selection(range, |row, local_range| {
+            block_ranges.push((row, local_range));
+        });
+        for (row, local_range) in block_ranges {
+            self.update_inline_styles_in_block_range(row, local_range, |style| {
+                style.link_url = if enabled { None } else { Some(url.clone()) };
+            });
+        }
+        cx.notify();
+        self.scroll_cursor_into_view(window, cx);
+    }
+
     pub fn set_block_kind(&mut self, kind: BlockKind, window: &mut Window, cx: &mut Context<Self>) {
         self.push_undo_snapshot();
         let (start_row, end_row) = self.selected_rows();
@@ -1061,6 +1101,19 @@ impl RichTextState {
                 if text.style.code {
                     highlight.background_color = Some(self.theme.code_bg);
                 }
+                if text.style.image_placeholder {
+                    highlight.background_color = Some(self.theme.code_bg);
+                    highlight.font_style = Some(FontStyle::Italic);
+                    highlight.color = Some(self.theme.muted_foreground);
+                }
+                if text.style.link_url.is_some() {
+                    highlight.color = Some(self.theme.link_color);
+                    highlight.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(self.theme.link_color),
+                        wavy: false,
+                    });
+                }
                 if let Some(color) = text.style.fg {
                     highlight.color = Some(color);
                 }
@@ -1131,16 +1184,25 @@ impl RichTextState {
     }
 
     pub(crate) fn move_vertically(&mut self, direction: i32) -> Option<usize> {
+        // Target the vertical center of the adjacent row so the point lands inside
+        // its bounds — `offset_for_point` otherwise picks the current row when the
+        // naive `caret_top + line_height` lands on the boundary between rows.
         let cursor = self.cursor();
         let caret_bounds = self.caret_bounds_for_offset(cursor)?;
         let x = self.preferred_x.unwrap_or(caret_bounds.left());
 
         let row = self.text.offset_to_point(cursor).row;
-        let cache = self.layout_cache.get(row)?.as_ref()?;
-        let line_height = cache.text_layout.line_height();
-
-        let y = caret_bounds.top() + (direction as f32) * line_height;
-        self.offset_for_point(point(x, y))
+        let target = if direction > 0 {
+            row + 1
+        } else {
+            row.saturating_sub(1)
+        };
+        let cache = self.layout_cache.get(target)?.as_ref()?;
+        let y = cache.bounds.top() + cache.text_layout.line_height() * 0.5;
+        let local = match cache.text_layout.index_for_position(point(x, y)) {
+            Ok(ix) | Err(ix) => ix,
+        };
+        Some((cache.start_offset + local).min(self.text.len()))
     }
 
     // --- Action handlers ---
@@ -1167,6 +1229,8 @@ impl RichTextState {
                     | BlockKind::UnorderedListItem
                     | BlockKind::OrderedListItem
                     | BlockKind::BlockQuote
+                    | BlockKind::HorizontalRule
+                    | BlockKind::CodeBlock
             ) {
                 self.push_undo_snapshot();
                 self.document.blocks[pos.row].format.kind = BlockKind::Paragraph;
@@ -1208,7 +1272,7 @@ impl RichTextState {
         if row < self.document.blocks.len()
             && matches!(
                 self.document.blocks[row].format.kind,
-                BlockKind::UnorderedListItem | BlockKind::OrderedListItem
+                BlockKind::UnorderedListItem | BlockKind::OrderedListItem | BlockKind::CodeBlock
             )
             && self.document.blocks[row].is_text_empty()
         {
@@ -1382,6 +1446,35 @@ impl RichTextState {
         let Some(clipboard) = cx.read_from_clipboard() else {
             return;
         };
+
+        // Pasted images become `[ImageN]` placeholder chips. The image bytes
+        // are not attached to the LLM message in this layer (multimodal is a
+        // follow-up); the placeholder is an editor-side affordance.
+        let image_count = clipboard
+            .entries()
+            .iter()
+            .filter(|e| matches!(e, ClipboardEntry::Image(_)))
+            .count();
+        if image_count > 0 {
+            let mut placeholder = String::new();
+            for _ in 0..image_count {
+                self.image_counter += 1;
+                if !placeholder.is_empty() {
+                    placeholder.push(' ');
+                }
+                placeholder.push_str(&format!("[Image{}]", self.image_counter));
+            }
+            let saved = self.active_style.clone();
+            self.active_style = InlineStyle {
+                image_placeholder: true,
+                ..InlineStyle::default()
+            };
+            let range = self.ordered_selection();
+            self.replace_bytes_range(range, &placeholder, window, cx, true, false, None);
+            self.active_style = saved;
+            return;
+        }
+
         let mut new_text = clipboard.text().unwrap_or_default();
         new_text = new_text.replace("\r\n", "\n").replace('\r', "\n");
         let range = self.ordered_selection();

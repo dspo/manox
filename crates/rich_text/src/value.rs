@@ -159,6 +159,8 @@ fn block_to_element(block: &BlockNode) -> SlateElement {
         BlockKind::UnorderedListItem => ("list-item".to_string(), None),
         BlockKind::OrderedListItem => ("list-item".to_string(), None),
         BlockKind::BlockQuote => ("blockquote".to_string(), None),
+        BlockKind::HorizontalRule => ("hr".to_string(), None),
+        BlockKind::CodeBlock => ("code-block".to_string(), None),
     };
 
     let text_size = block_text_size_to_string(block.format.size);
@@ -356,6 +358,8 @@ fn parse_block_kind(element: &SlateElement) -> BlockKind {
             Some("unordered") => BlockKind::UnorderedListItem,
             _ => BlockKind::UnorderedListItem,
         },
+        "hr" | "horizontal-rule" | "thematic-break" => BlockKind::HorizontalRule,
+        "code-block" | "code_block" | "codeblock" => BlockKind::CodeBlock,
         _ => BlockKind::Paragraph,
     }
 }
@@ -397,6 +401,8 @@ fn slate_text_to_text_node(text: &SlateText) -> TextNode {
             underline: text.underline.unwrap_or(false),
             strikethrough: text.strikethrough.unwrap_or(false),
             code: false,
+            image_placeholder: false,
+            link_url: None,
             fg,
             bg,
         },

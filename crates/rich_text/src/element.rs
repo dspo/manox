@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, CursorStyle, Element, ElementId, ElementInputHandler, GlobalElementId,
+    AnyElement, App, Bounds, CursorStyle, Element, ElementId, ElementInputHandler, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, InteractiveElement as _,
     IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement as _, Pixels, Point, Render, SharedString, StatefulInteractiveElement as _,
@@ -164,6 +164,7 @@ impl Element for RichTextInputHandlerElement {
 pub(crate) struct RichTextLineElement {
     state: gpui::Entity<RichTextState>,
     row: usize,
+    monospace: bool,
     text: SharedString,
     highlights: Vec<(Range<usize>, HighlightStyle)>,
     styled_text: StyledText,
@@ -174,6 +175,7 @@ impl RichTextLineElement {
         Self {
             state,
             row,
+            monospace: false,
             text: SharedString::default(),
             highlights: Vec::new(),
             styled_text: StyledText::new(SharedString::default()),
@@ -301,10 +303,21 @@ impl Element for RichTextLineElement {
         let state = self.state.read(cx);
         let text: SharedString = state.text.slice_line(self.row).to_string().into();
         let highlights = state.highlight_styles_for_line(self.row, window.text_style().color);
+        // CodeBlock lines render in a monospace face; the per-run HighlightStyle
+        // cannot switch font_family, so inject it on the base text style here.
+        self.monospace = state
+            .document
+            .blocks
+            .get(self.row)
+            .map(|b| matches!(b.format.kind, BlockKind::CodeBlock))
+            .unwrap_or(false);
         self.text = text.clone();
         self.highlights = highlights.clone();
 
-        let text_style = window.text_style();
+        let mut text_style = window.text_style();
+        if self.monospace {
+            text_style.font_family = "monospace".into();
+        }
 
         let mut runs = Vec::new();
         let mut ix = 0;
@@ -427,16 +440,123 @@ impl Element for RichTextLineElement {
 impl Render for RichTextState {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let state = cx.entity().clone();
+        let theme = self.theme;
         let muted_foreground = self.theme.muted_foreground;
         let base_text_size = window.text_style().font_size.to_pixels(window.rem_size());
 
-        let mut ordered_counter = 1usize;
         let blocks = self
             .document
             .blocks
             .iter()
             .map(|block| block.format)
             .collect::<Vec<_>>();
+
+        // Build the per-block element list, grouping contiguous CodeBlock rows
+        // into one visual box and rendering HorizontalRule as a divider.
+        let mut ordered_counter = 1usize;
+        let mut elements: Vec<AnyElement> = Vec::with_capacity(blocks.len());
+        let mut row = 0usize;
+        while row < blocks.len() {
+            let block = blocks[row];
+            match block.kind {
+                BlockKind::HorizontalRule => {
+                    ordered_counter = 1;
+                    elements.push(
+                        div()
+                            .h(px(2.))
+                            .w_full()
+                            .my(px(6.))
+                            .bg(theme.border)
+                            .into_any_element(),
+                    );
+                    row += 1;
+                }
+                BlockKind::CodeBlock => {
+                    ordered_counter = 1;
+                    let start = row;
+                    while row < blocks.len() && matches!(blocks[row].kind, BlockKind::CodeBlock) {
+                        row += 1;
+                    }
+                    // Contiguous code lines share one box with no inter-line gap.
+                    let lines: Vec<AnyElement> = (start..row)
+                        .map(|r| RichTextLineElement::new(state.clone(), r).into_any_element())
+                        .collect();
+                    elements.push(
+                        div()
+                            .bg(theme.code_bg)
+                            .rounded(theme.radius)
+                            .py(px(8.))
+                            .px(px(12.))
+                            .flex_col()
+                            .gap_0()
+                            .children(lines)
+                            .into_any_element(),
+                    );
+                }
+                _ => {
+                    let line = RichTextLineElement::new(state.clone(), row);
+                    let content = div().flex_1().child(line);
+
+                    let content = match block.kind {
+                        BlockKind::Heading { level } => match level {
+                            1 => content
+                                .text_size(px(f32::from(base_text_size) * 1.8))
+                                .font_weight(gpui::FontWeight::SEMIBOLD),
+                            2 => content
+                                .text_size(px(f32::from(base_text_size) * 1.4))
+                                .font_weight(gpui::FontWeight::SEMIBOLD),
+                            _ => content
+                                .text_size(px(f32::from(base_text_size) * 1.2))
+                                .font_weight(gpui::FontWeight::SEMIBOLD),
+                        },
+                        BlockKind::BlockQuote => content
+                            .border_l_2()
+                            .border_color(muted_foreground)
+                            .pl(px(12.))
+                            .text_color(muted_foreground),
+                        _ => match block.size {
+                            BlockTextSize::Small => {
+                                content.text_size(px(f32::from(base_text_size) * 0.875))
+                            }
+                            BlockTextSize::Normal => content,
+                            BlockTextSize::Large => {
+                                content.text_size(px(f32::from(base_text_size) * 1.125))
+                            }
+                        },
+                    };
+
+                    let row_element = match block.kind {
+                        BlockKind::UnorderedListItem => {
+                            ordered_counter = 1;
+                            div()
+                                .flex_row()
+                                .items_baseline()
+                                .gap(px(8.))
+                                .child(div().w(px(28.)).text_color(muted_foreground).child("•"))
+                                .child(content)
+                                .into_any_element()
+                        }
+                        BlockKind::OrderedListItem => {
+                            let prefix = format!("{}.", ordered_counter);
+                            ordered_counter += 1;
+                            div()
+                                .flex_row()
+                                .items_baseline()
+                                .gap(px(8.))
+                                .child(div().w(px(28.)).text_color(muted_foreground).child(prefix))
+                                .child(content)
+                                .into_any_element()
+                        }
+                        _ => {
+                            ordered_counter = 1;
+                            content.into_any_element()
+                        }
+                    };
+                    elements.push(row_element);
+                    row += 1;
+                }
+            }
+        }
 
         div()
             .id("rich-text-state")
@@ -463,74 +583,7 @@ impl Render for RichTextState {
                             .flex_col()
                             .w_full()
                             .gap(px(4.))
-                            .children(blocks.into_iter().enumerate().map(move |(row, block)| {
-                                let line = RichTextLineElement::new(state.clone(), row);
-                                let content = div().flex_1().child(line);
-
-                                let content =
-                                    match block.kind {
-                                        BlockKind::Heading { level } => match level {
-                                            1 => content
-                                                .text_size(px(f32::from(base_text_size) * 1.8))
-                                                .font_weight(gpui::FontWeight::SEMIBOLD),
-                                            2 => content
-                                                .text_size(px(f32::from(base_text_size) * 1.4))
-                                                .font_weight(gpui::FontWeight::SEMIBOLD),
-                                            _ => content
-                                                .text_size(px(f32::from(base_text_size) * 1.2))
-                                                .font_weight(gpui::FontWeight::SEMIBOLD),
-                                        },
-                                        BlockKind::BlockQuote => content
-                                            .border_l_2()
-                                            .border_color(muted_foreground)
-                                            .pl(px(12.))
-                                            .text_color(muted_foreground),
-                                        _ => match block.size {
-                                            BlockTextSize::Small => content
-                                                .text_size(px(f32::from(base_text_size) * 0.875)),
-                                            BlockTextSize::Normal => content,
-                                            BlockTextSize::Large => content
-                                                .text_size(px(f32::from(base_text_size) * 1.125)),
-                                        },
-                                    };
-
-                                match block.kind {
-                                    BlockKind::UnorderedListItem => {
-                                        ordered_counter = 1;
-                                        div()
-                                            .flex_row()
-                                            .items_start()
-                                            .gap(px(8.))
-                                            .child(
-                                                div()
-                                                    .w(px(28.))
-                                                    .text_color(muted_foreground)
-                                                    .child("•"),
-                                            )
-                                            .child(content)
-                                    }
-                                    BlockKind::OrderedListItem => {
-                                        let prefix = format!("{}.", ordered_counter);
-                                        ordered_counter += 1;
-
-                                        div()
-                                            .flex_row()
-                                            .items_start()
-                                            .gap(px(8.))
-                                            .child(
-                                                div()
-                                                    .w(px(28.))
-                                                    .text_color(muted_foreground)
-                                                    .child(prefix),
-                                            )
-                                            .child(content)
-                                    }
-                                    _ => {
-                                        ordered_counter = 1;
-                                        content
-                                    }
-                                }
-                            })),
+                            .children(elements),
                     ),
             )
     }
