@@ -48,12 +48,24 @@ fi
 echo "Building manox binary"
 cargo build ${build_flag} --package manox --target "$target_triple"
 
-# --- Determine app name & paths ---
-app_name="Manox"
-bundle_id="dev.dspo.manox"
+# --- Read bundle configuration from Cargo.toml ---
+# Single source of truth: [package.metadata.bundle] in crates/manox/Cargo.toml.
+bundle_toml="crates/manox/Cargo.toml"
+# Extract values from the bundle section (not the [package] section).
+# The bundle "name" is the display name ("Manox"), distinct from the crate name ("manox").
+bundle_id=$(sed -n '/\[package.metadata.bundle\]/,/^\[/ s/^identifier = "\(.*\)"/\1/p' "${bundle_toml}" | head -1)
+app_name=$(sed -n '/\[package.metadata.bundle\]/,/^\[/ s/^name = "\(.*\)"/\1/p' "${bundle_toml}" | head -1)
+# version is workspace-inherited; resolve via cargo metadata
+app_version=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | python3 -c "import sys,json; pkgs=json.load(sys.stdin)['packages']; \
+                   p=[x for x in pkgs if x['name']=='manox']; \
+                   print(p[0]['version'] if p else '0.1.0')")
+
+# --- Determine paths ---
 app_path="target/${target_triple}/${target_dir}/${app_name}.app"
 macos_dir="${app_path}/Contents/MacOS"
 resources_dir="${app_path}/Contents/Resources"
+icon_resources_dir="crates/manox/resources"
 
 # --- Assemble .app bundle ---
 echo "Creating .app bundle at ${app_path}"
@@ -64,25 +76,19 @@ mkdir -p "${macos_dir}" "${resources_dir}"
 cp "target/${target_triple}/${target_dir}/manox" "${macos_dir}/manox"
 
 # Copy icons (if present)
-icon_resources_dir="crates/manox/resources"
 if [[ -f "${icon_resources_dir}/app-icon.icns" ]]; then
     cp "${icon_resources_dir}/app-icon.icns" "${resources_dir}/app-icon.icns"
 elif [[ -f "${icon_resources_dir}/app-icon@2x.png" ]]; then
-    # cargo-bundle convention: PNG icons are accepted; we place both sizes
     cp "${icon_resources_dir}/app-icon.png" "${resources_dir}/app-icon.png" 2>/dev/null || true
     cp "${icon_resources_dir}/app-icon@2x.png" "${resources_dir}/app-icon@2x.png"
 fi
 
-# Copy entitlements into the bundle (useful for ad-hoc signing)
+# Copy entitlements into the bundle
 if [[ -f "${icon_resources_dir}/manox.entitlements" ]]; then
     cp "${icon_resources_dir}/manox.entitlements" "${resources_dir}/manox.entitlements"
 fi
 
 # --- Generate Info.plist ---
-# Read the version from Cargo.toml
-# Extract the version portion from cargo pkgid output (format: path#VER or name@VER)
-app_version=$(cargo pkgid --package manox 2>/dev/null | grep -oE '#[0-9]+\.[0-9]+\.[0-9]+' | tr -d '#' || echo "0.1.0")
-
 icon_file="app-icon.icns"
 if [[ ! -f "${resources_dir}/app-icon.icns" ]]; then
     icon_file="app-icon@2x.png"
@@ -124,11 +130,8 @@ cat > "${app_path}/Contents/Info.plist" <<PLIST
     <key>NSHumanReadableCopyright</key>
     <string>Copyright 2024-2026 DSPo. All rights reserved.</string>
 
-    <!-- Privacy usage descriptions for agent tool capabilities -->
     <key>NSAppleEventsUsageDescription</key>
     <string>Manox agent tools need to send Apple Events to run shell commands and interact with other applications.</string>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>Manox does not use the microphone; this declaration satisfies App Store review requirements.</string>
 </dict>
 </plist>
 PLIST
