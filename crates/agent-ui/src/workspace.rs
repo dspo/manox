@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use agent::language_model::StopReason;
 use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
-use gpui::{AnyElement, Context, Entity, Focusable, Render, Subscription, Window, prelude::*, px};
+use gpui::{AnyElement, Context, Entity, Render, Subscription, Window, prelude::*, px};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
     button::{Button, ButtonVariants as _},
@@ -20,13 +20,12 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     list::ListItem,
     popover::Popover,
+    text::TextView,
     tree::{TreeItem, TreeState, tree},
     v_flex,
 };
-use gpui_rich_text::{RichTextEditor, RichTextState};
 
 use crate::conversation::ConversationState;
-use crate::editor::try_apply_markdown_shortcut;
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::views::{centered, message::render_item};
 
@@ -43,9 +42,12 @@ pub struct Workspace {
     sidebar: Entity<Sidebar>,
     conversation: ConversationState,
     input_state: Entity<InputState>,
-    /// Right-side WYSIWYG markdown composer; opened via the `ToggleEditor` shortcut.
-    editor_state: Entity<RichTextState>,
+    /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
+    /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
+    /// rendered markdown preview (gpui-component `TextView::markdown`).
+    editor_state: Entity<InputState>,
     editor_open: bool,
+    editor_preview: bool,
     pending_auth: Option<PendingAuth>,
     model_open: bool,
     /// Two-level tree (Provider → Model) for the model selector popover.
@@ -56,9 +58,8 @@ pub struct Workspace {
     editor_sub: Option<Subscription>,
 }
 
-/// Right-side WYSIWYG composer width. Wide enough for rendered markdown
-/// (headings, lists) alongside the 1100px window without crowding the
-/// conversation thread.
+/// Right-side composer width. Wide enough for rendered markdown
+/// (headings, lists, code blocks) alongside the 1100px window.
 const EDITOR_PANEL_WIDTH: f32 = 640.;
 
 impl Workspace {
@@ -79,7 +80,14 @@ impl Workspace {
                 .placeholder("给 agent 发消息…（Enter 发送，Shift+Enter 换行，Ctrl-G 打开编辑器）")
         });
 
-        let editor_state = cx.new(|cx| RichTextState::new(window, cx).default_value(""));
+        let editor_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .code_editor("markdown")
+                .line_number(false)
+                .folding(true)
+                .submit_on_enter(false)
+                .placeholder("编写 markdown…（Cmd-Shift-P 切换预览，Cmd-Enter 发送）")
+        });
 
         let sidebar = cx.new(Sidebar::new);
 
@@ -97,6 +105,7 @@ impl Workspace {
             input_state,
             editor_state,
             editor_open: false,
+            editor_preview: false,
             pending_auth: None,
             model_open: false,
             tree_state,
@@ -108,7 +117,7 @@ impl Workspace {
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
-        ws.editor_sub = Some(ws.observe_editor(window, cx));
+        ws.editor_sub = Some(ws.subscribe_editor(window, cx));
         let id = ws.thread.read(cx).id.0.clone();
         ws.sidebar.update(cx, |s, cx| s.set_selected(Some(id), cx));
         ws
@@ -202,19 +211,18 @@ impl Workspace {
         })
     }
 
-    /// Observe the right-side editor: every state change fires the markdown
-    /// shortcut detector (see `editor::try_apply_markdown_shortcut`).
-    fn observe_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+    /// Submit the right-side editor on Cmd/Ctrl-Enter (`InputEvent::PressEnter`
+    /// with `secondary` set). Plain Enter inserts a newline (submit_on_enter
+    /// is off for the panel editor).
+    fn subscribe_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
         let editor = self.editor_state.clone();
-        cx.observe_in(&editor, window, move |_this, editor, window, cx| {
-            // The closure receives a `&mut Window` per call; pass it through to
-            // the entity via `Entity::update`, capturing the reborrowed window.
-            // `Context<Workspace>` doesn't implement `VisualContext`, so we
-            // can't use `update_in` here.
-            let window: &mut Window = window;
-            editor.update(cx, |state, cx| {
-                try_apply_markdown_shortcut(state, window, cx);
-            });
+        cx.subscribe_in(&editor, window, |this, _, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { secondary, shift } = ev
+                && *secondary
+                && !shift
+            {
+                this.submit_editor(window, cx);
+            }
         })
     }
 
@@ -273,20 +281,10 @@ impl Workspace {
         cx.notify();
     }
 
-    fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor_open = !self.editor_open;
-        if self.editor_open {
-            self.editor_state.focus_handle(cx).focus(window, cx);
-        } else {
-            self.input_state.update(cx, |s, cx| s.focus(window, cx));
-        }
-        cx.notify();
-    }
-
     /// Submit the editor text to the thread, then close the panel and return
     /// focus to the inline input.
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.editor_state.read(cx).markdown();
+        let text = self.editor_state.read(cx).value().to_string();
         if text.trim().is_empty() || self.thread.read(cx).is_running() {
             return;
         }
@@ -300,7 +298,33 @@ impl Workspace {
             state.set_value("", window, cx);
         });
         self.editor_open = false;
+        self.editor_preview = false;
         self.input_state.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor_open = !self.editor_open;
+        if self.editor_open {
+            self.editor_preview = false;
+            self.editor_state.update(cx, |s, cx| s.focus(window, cx));
+        } else {
+            self.input_state.update(cx, |s, cx| s.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Toggle the right-side composer between plain-text edit and rendered
+    /// markdown preview. No-op when the panel is closed.
+    fn toggle_editor_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor_open {
+            return;
+        }
+        self.editor_preview = !self.editor_preview;
+        if !self.editor_preview {
+            // Returning to edit mode: focus the editor so typing works immediately.
+            self.editor_state.update(cx, |s, cx| s.focus(window, cx));
+        }
         cx.notify();
     }
 
@@ -545,6 +569,7 @@ impl Render for Workspace {
         let overlay = self.render_auth_overlay(&theme, cx);
 
         let editor_open = self.editor_open;
+        let editor_preview = self.editor_preview;
         let editor_panel = v_flex()
             .w(px(EDITOR_PANEL_WIDTH))
             .h_full()
@@ -552,7 +577,18 @@ impl Render for Workspace {
             .border_l_1()
             .border_color(theme.border)
             .bg(theme.background)
-            .child(RichTextEditor::new(&self.editor_state).h_full());
+            .child(if editor_preview {
+                TextView::markdown(
+                    "editor-preview",
+                    self.editor_state.read(cx).value().to_string(),
+                )
+                .selectable(true)
+                .scrollable(true)
+                .h_full()
+                .into_any_element()
+            } else {
+                Input::new(&self.editor_state).h_full().into_any_element()
+            });
 
         h_flex()
             .size_full()
@@ -561,9 +597,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &crate::ToggleEditor, window, cx| {
                 this.toggle_editor(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &crate::SubmitEditor, window, cx| {
-                this.submit_editor(window, cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::ToggleEditorPreview, window, cx| {
+                    this.toggle_editor_preview(window, cx);
+                }),
+            )
             // Left sidebar
             .child(self.sidebar.clone())
             // Main column
