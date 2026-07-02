@@ -221,10 +221,7 @@ fn build_request_body(model: &str, max_tokens: u64, request: &LanguageModelReque
     body
 }
 
-/// Convert manox messages to OpenAI Chat Completions messages. A single
-/// manox message with tool_use / tool_result content expands into multiple
-/// OpenAI messages (assistant with `tool_calls`, then one `role:"tool"`
-/// message per tool result).
+/// Chat Completions wire input: tool calls live inside assistant `tool_calls` arrays; tool results become separate `role:"tool"` messages keyed by `tool_call_id`.
 fn messages_to_openai(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
     let mut out = Vec::new();
     for m in messages {
@@ -716,9 +713,4 @@ mod tests {
         assert!(texts > 0, "应至少收到一个 Text 事件");
         assert!(stopped, "应收到 Stop 事件");
     }
-
-    // Reference LanguageModelToolResult to ensure the type remains imported
-    // (used in the multi-turn integration path even when not used in unit tests).
-    #[allow(dead_code)]
-    fn _force_use(_tr: LanguageModelToolResult) {}
 }

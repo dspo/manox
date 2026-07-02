@@ -216,8 +216,8 @@ fn build_request_body(model: &str, max_tokens: u64, request: &LanguageModelReque
     body
 }
 
-/// Responses-wire input: a flat item list. Each `LanguageModelRequestMessage` may
-/// expand into multiple items when it carries tool calls / tool results.
+/// Responses-wire input is a flat list of `message` / `function_call` / `function_call_output` items.
+/// Tool calls and their results are emitted as separate top-level items per the wire spec.
 fn build_input(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for m in messages {
@@ -805,9 +805,4 @@ mod tests {
         assert!(texts > 0, "应至少收到一个 Text 事件");
         assert!(stopped, "应收到 Stop 事件");
     }
-
-    // Reference LanguageModelToolResult to ensure path remains valid even if
-    // the import list is later trimmed.
-    #[allow(dead_code)]
-    fn _force_use(_tr: LanguageModelToolResult) {}
 }
