@@ -30,6 +30,7 @@ jobs:
             libxrender-dev \
             libxrandr-dev \
             libxkbcommon-dev \
+            libxkbcommon-x11-dev \
             libxi-dev \
             libxcursor-dev \
             libxinerama-dev \
