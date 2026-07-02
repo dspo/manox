@@ -1,24 +1,32 @@
 //! `LanguageModel` implementation for the OpenAI Responses wire.
 //!
 //! - Request: POST `{endpoint}/responses`, `Authorization: Bearer`, body
-//!   `{model, input, max_output_tokens, stream:true}`.
+//!   `{model, input, max_output_tokens, stream:true, tools}`.
 //! - Response: SSE event stream; key event types:
 //!   - `response.output_text.delta` → text delta
+//!   - `response.output_item.added` / `response.output_item.done` → item lifecycle
+//!   - `response.function_call_arguments.delta` / `.done` → tool-input streaming
 //!   - `response.completed` → done
 //!   - `response.failed` / `error` → error
 //!
-//! Text-only streaming (no reasoning/tool mapping; same policy as the Completions wire).
+//! Tool calls flow as separate `function_call` items in the response output;
+//! the mapper tracks per-`output_index` state to stitch streamed argument
+//! fragments into complete `LanguageModelToolUse` events.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::{StreamExt as _, future::BoxFuture, stream::BoxStream};
 use gpui::AsyncApp;
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::language_model::{
     LanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
-    MessageContent, Role, StopReason,
+    LanguageModelToolUse, MessageContent, Role, StopReason, TokenUsage,
 };
-use crate::provider::sse::extract_data_line;
+use crate::provider::sse::{extract_data_line, fix_streamed_json};
 
 pub struct ResponsesModel {
     id: String,
@@ -67,6 +75,9 @@ impl LanguageModel for ResponsesModel {
     fn provider_name(&self) -> String {
         self.provider_name.clone()
     }
+    fn wire_api(&self) -> crate::provider::config::WireApi {
+        crate::provider::config::WireApi::Responses
+    }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
     }
@@ -114,7 +125,9 @@ pub async fn stream_responses(
     tx: async_channel::Sender<Result<LanguageModelCompletionEvent>>,
 ) -> Result<()> {
     let body = build_request_body(model, max_tokens, &request);
-    let client = reqwest::Client::builder().build().context("构建 reqwest client 失败")?;
+    let client = reqwest::Client::builder()
+        .build()
+        .context("构建 reqwest client 失败")?;
 
     let response = client
         .post(url)
@@ -131,9 +144,9 @@ pub async fn stream_responses(
         return Err(anyhow!("Responses API 返回 {status}: {body}"));
     }
 
+    let mut mapper = ResponsesEventMapper::new();
     let mut stream = response.bytes_stream();
     let mut buf = String::new();
-    let mut stopped = false;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("读取 SSE chunk 失败")?;
@@ -144,131 +157,594 @@ pub async fn stream_responses(
             let Some(data) = extract_data_line(&line) else {
                 continue;
             };
-            let value: serde_json::Value = match serde_json::from_str(data) {
+            let value: Value = match serde_json::from_str(data) {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = tx.send(Err(anyhow!("解析 SSE 事件失败: {e}"))).await;
                     continue;
                 }
             };
-            for event in map_event(&value) {
-                if matches!(event, Ok(LanguageModelCompletionEvent::Stop(_))) {
-                    stopped = true;
-                }
-                if tx.send(event).await.is_err() {
+            for mapped in mapper.map_event(&value) {
+                if tx.send(mapped).await.is_err() {
                     return Ok(());
                 }
             }
         }
     }
-    if !stopped {
-        let _ = tx.send(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn))).await;
+
+    // Flush any tool_use that received deltas but never received `.done` nor `output_item.done`.
+    for pending in mapper.flush_pending() {
+        if tx.send(Ok(pending)).await.is_err() {
+            return Ok(());
+        }
+    }
+    if !mapper.stop_emitted()
+        && tx
+            .send(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)))
+            .await
+            .is_err()
+    {
+        return Ok(());
     }
     Ok(())
 }
 
-fn build_request_body(
-    model: &str,
-    max_tokens: u64,
-    request: &LanguageModelRequest,
-) -> serde_json::Value {
-    use serde_json::json;
+fn build_request_body(model: &str, max_tokens: u64, request: &LanguageModelRequest) -> Value {
     let input = build_input(&request.messages);
-    json!({
+    let mut body = json!({
         "model": model,
         "input": input,
         "max_output_tokens": max_tokens,
         "stream": true,
-    })
+    });
+    if !request.tools.is_empty() {
+        body["tools"] = Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    })
+                })
+                .collect(),
+        );
+    }
+    body
 }
 
-/// Responses-wire input: a message array with role user/system/assistant and
-/// string content (text parts concatenated; non-text folded into a placeholder).
-fn build_input(messages: &[LanguageModelRequestMessage]) -> Vec<serde_json::Value> {
-    use serde_json::json;
-    messages
-        .iter()
-        .filter_map(|m| {
-            let role = match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
+/// Responses-wire input is a flat list of `message` / `function_call` / `function_call_output` items.
+/// Tool calls and their results are emitted as separate top-level items per the wire spec.
+fn build_input(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for m in messages {
+        let mut text_buf = String::new();
+        let mut tool_uses: Vec<&LanguageModelToolUse> = Vec::new();
+        let mut tool_results: Vec<&crate::language_model::LanguageModelToolResult> = Vec::new();
+
+        for c in &m.content {
+            match c {
+                MessageContent::Text(t) => text_buf.push_str(t),
+                MessageContent::Thinking { text, .. } => text_buf.push_str(text),
+                MessageContent::ToolUse(tu) => tool_uses.push(tu),
+                MessageContent::ToolResult(tr) => tool_results.push(tr),
+            }
+        }
+
+        let has_text = !text_buf.trim().is_empty();
+        let has_tool_uses = !tool_uses.is_empty();
+        let has_tool_results = !tool_results.is_empty();
+
+        if has_text {
+            let (role, text_kind) = match m.role {
+                Role::User => ("user", "input_text"),
+                Role::Assistant => ("assistant", "output_text"),
+                Role::System => ("system", "input_text"),
             };
-            let mut text = String::new();
-            for c in &m.content {
-                match c {
-                    MessageContent::Text(t) => text.push_str(t),
-                    MessageContent::Thinking { text: t, .. } => text.push_str(t),
-                    MessageContent::ToolResult(tr) => {
-                        text.push_str(&format!("[tool_result {}]: {}", tr.tool_name, tr.content));
-                    }
-                    MessageContent::ToolUse(_) => {}
-                }
-            }
-            if text.trim().is_empty() {
-                return None;
-            }
-            Some(json!({"role": role, "content": text}))
-        })
-        .collect()
+            out.push(json!({
+                "type": "message",
+                "role": role,
+                "content": [{"type": text_kind, "text": text_buf}],
+            }));
+        }
+
+        for tu in tool_uses {
+            let arguments = if !tu.raw_input.is_empty() {
+                tu.raw_input.clone()
+            } else {
+                tu.input.to_string()
+            };
+            out.push(json!({
+                "type": "function_call",
+                "call_id": tu.id,
+                "name": tu.name,
+                "arguments": arguments,
+            }));
+        }
+
+        for tr in tool_results {
+            // DashScope Responses endpoint rejects `is_error` on function_call_output;
+            // fold the error bit into the output string instead (matches how kimi
+            // compatibility is handled in other openai-compat providers).
+            let output = if tr.is_error {
+                format!("[error] {}", tr.content)
+            } else {
+                tr.content.clone()
+            };
+            out.push(json!({
+                "type": "function_call_output",
+                "call_id": tr.tool_use_id,
+                "output": output,
+            }));
+        }
+
+        // Skip a message that contributed nothing (e.g. an assistant message
+        // whose only content was a single empty-text block).
+        if !has_text && !has_tool_uses && !has_tool_results {
+            continue;
+        }
+    }
+    out
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ResponsesEvent {
     #[serde(rename = "type")]
     ty: String,
     #[serde(default)]
     delta: Option<String>,
     #[serde(default)]
-    response: Option<serde_json::Value>,
+    response: Option<Value>,
+    #[serde(default)]
+    item: Option<Value>,
+    #[serde(default)]
+    output_index: Option<usize>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
-fn map_event(value: &serde_json::Value) -> Vec<Result<LanguageModelCompletionEvent>> {
-    let Ok(ev) = serde_json::from_value::<ResponsesEvent>(value.clone()) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    match ev.ty.as_str() {
-        "response.output_text.delta" => {
-            if let Some(d) = ev.delta
-                && !d.is_empty()
+struct RawToolUse {
+    id: String,
+    name: Arc<str>,
+    input_json: String,
+}
+
+struct ResponsesEventMapper {
+    tool_uses_by_index: HashMap<usize, RawToolUse>,
+    finished_call_ids: HashSet<String>,
+    stop_reason: StopReason,
+    stop_emitted: bool,
+    usage: TokenUsage,
+}
+
+impl ResponsesEventMapper {
+    fn new() -> Self {
+        Self {
+            tool_uses_by_index: HashMap::new(),
+            finished_call_ids: HashSet::new(),
+            stop_reason: StopReason::EndTurn,
+            stop_emitted: false,
+            usage: TokenUsage::default(),
+        }
+    }
+
+    fn stop_emitted(&self) -> bool {
+        self.stop_emitted
+    }
+
+    fn map_event(&mut self, value: &Value) -> Vec<Result<LanguageModelCompletionEvent>> {
+        let Ok(ev) = serde_json::from_value::<ResponsesEvent>(value.clone()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        match ev.ty.as_str() {
+            "response.output_text.delta" => {
+                if let Some(d) = ev.delta
+                    && !d.is_empty()
+                {
+                    out.push(Ok(LanguageModelCompletionEvent::Text(d)));
+                }
+            }
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                if let Some(d) = ev.delta
+                    && !d.is_empty()
+                {
+                    out.push(Ok(LanguageModelCompletionEvent::Thinking {
+                        text: d,
+                        signature: None,
+                    }));
+                }
+            }
+            "response.output_item.added" => {
+                if let (Some(idx), Some(item)) = (ev.output_index, ev.item.as_ref())
+                    && is_function_call_item(item)
+                {
+                    let id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    self.tool_uses_by_index.insert(
+                        idx,
+                        RawToolUse {
+                            id,
+                            name: Arc::from(name),
+                            input_json: String::new(),
+                        },
+                    );
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if let (Some(idx), Some(delta)) = (ev.output_index, ev.delta.as_ref())
+                    && let Some(slot) = self.tool_uses_by_index.get_mut(&idx)
+                {
+                    slot.input_json.push_str(delta);
+                    if let Some(event) = Self::try_emit_partial(slot) {
+                        out.push(Ok(event));
+                    }
+                }
+            }
+            "response.function_call_arguments.done" => {
+                if let Some(idx) = ev.output_index
+                    && let Some(mut slot) = self.tool_uses_by_index.remove(&idx)
+                {
+                    if let Some(final_args) = ev.arguments {
+                        slot.input_json = final_args;
+                    }
+                    if let Some(event) = self.emit_complete(&mut slot) {
+                        out.push(Ok(event));
+                    }
+                }
+            }
+            "response.output_item.done" => {
+                if let (Some(idx), Some(item)) = (ev.output_index, ev.item.as_ref())
+                    && is_function_call_item(item)
+                {
+                    // Use the canonical id/name/arguments from the done event.
+                    // The slot is still in the map only when the matching
+                    // `function_call_arguments.done` was missed — in that case
+                    // the `arguments` here are the authoritative final value.
+                    let canonical_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .map(String::from);
+                    let canonical_name = item.get("name").and_then(Value::as_str).map(Arc::from);
+                    if let Some(mut slot) = self.tool_uses_by_index.remove(&idx) {
+                        if let Some(cid) = canonical_id {
+                            slot.id = cid;
+                        }
+                        if let Some(cname) = canonical_name {
+                            slot.name = cname;
+                        }
+                        if let Some(args) = item.get("arguments") {
+                            slot.input_json = match args {
+                                Value::String(s) => s.clone(),
+                                _ => args.to_string(),
+                            };
+                        }
+                        if let Some(event) = self.emit_complete(&mut slot) {
+                            out.push(Ok(event));
+                        }
+                    }
+                }
+            }
+            "response.completed" => {
+                if let Some(resp) = ev.response.as_ref() {
+                    if let Some(u) = resp.get("usage") {
+                        update_responses_usage(&mut self.usage, u);
+                    }
+                    if let Some(reason) = resp.get("status").and_then(Value::as_str) {
+                        self.stop_reason = match reason {
+                            "completed" => StopReason::EndTurn,
+                            "incomplete" => StopReason::MaxTokens,
+                            "failed" => StopReason::Refusal,
+                            _ => StopReason::EndTurn,
+                        };
+                    }
+                }
+                if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
+                    out.push(Ok(LanguageModelCompletionEvent::UsageUpdate(self.usage)));
+                }
+                out.push(Ok(LanguageModelCompletionEvent::Stop(self.stop_reason)));
+                self.stop_emitted = true;
+            }
+            "response.incomplete" => {
+                if let Some(resp) = ev.response.as_ref()
+                    && let Some(u) = resp.get("usage")
+                {
+                    update_responses_usage(&mut self.usage, u);
+                }
+                out.push(Ok(LanguageModelCompletionEvent::Stop(
+                    StopReason::MaxTokens,
+                )));
+                self.stop_emitted = true;
+            }
+            "response.failed" | "error" => {
+                let msg = ev
+                    .response
+                    .as_ref()
+                    .and_then(|r| r.get("error"))
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .unwrap_or_else(|| "Responses API 返回错误".to_string());
+                out.push(Err(anyhow!(msg)));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Emit a `ToolUse { is_input_complete: false }` if the current partial buffer parses cleanly.
+    fn try_emit_partial(slot: &RawToolUse) -> Option<LanguageModelCompletionEvent> {
+        if slot.id.is_empty() {
+            return None;
+        }
+        let input = fix_streamed_json(&slot.input_json).ok()?;
+        Some(LanguageModelCompletionEvent::ToolUse(
+            LanguageModelToolUse {
+                id: slot.id.clone(),
+                name: slot.name.clone(),
+                is_input_complete: false,
+                raw_input: slot.input_json.clone(),
+                input,
+                thought_signature: None,
+            },
+        ))
+    }
+
+    /// Emit the final `ToolUse { is_input_complete: true }` and mark the call as finished.
+    fn emit_complete(&mut self, slot: &mut RawToolUse) -> Option<LanguageModelCompletionEvent> {
+        if slot.id.is_empty() {
+            return None;
+        }
+        if !self.finished_call_ids.insert(slot.id.clone()) {
+            return None;
+        }
+        let input = match fix_streamed_json(&slot.input_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(LanguageModelCompletionEvent::ToolUseJsonParseError {
+                    id: slot.id.clone(),
+                    tool_name: slot.name.clone(),
+                    raw_input: slot.input_json.clone(),
+                    json_parse_error: e.to_string(),
+                });
+            }
+        };
+        Some(LanguageModelCompletionEvent::ToolUse(
+            LanguageModelToolUse {
+                id: slot.id.clone(),
+                name: slot.name.clone(),
+                is_input_complete: true,
+                raw_input: slot.input_json.clone(),
+                input,
+                thought_signature: None,
+            },
+        ))
+    }
+
+    /// Drain any still-open tool slots at end of stream (e.g. provider closed the
+    /// stream without sending `function_call_arguments.done`).
+    fn flush_pending(&mut self) -> Vec<LanguageModelCompletionEvent> {
+        let mut out = Vec::new();
+        let indices: Vec<usize> = self.tool_uses_by_index.keys().copied().collect();
+        for idx in indices {
+            if let Some(mut slot) = self.tool_uses_by_index.remove(&idx)
+                && let Some(ev) = self.emit_complete(&mut slot)
             {
-                out.push(Ok(LanguageModelCompletionEvent::Text(d)));
+                out.push(ev);
             }
         }
-        "response.completed" => {
-            out.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
-        }
-        "response.incomplete" => {
-            out.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::MaxTokens)));
-        }
-        "response.failed" | "error" => {
-            let msg = ev
-                .response
-                .and_then(|r| r.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).map(String::from))
-                .unwrap_or_else(|| "Responses API 返回错误".to_string());
-            out.push(Err(anyhow!(msg)));
-        }
-        _ => {}
+        out
     }
-    out
+}
+
+fn is_function_call_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("function_call")
+}
+
+fn update_responses_usage(usage: &mut TokenUsage, value: &Value) {
+    if let Some(v) = value.get("input_tokens").and_then(Value::as_u64) {
+        usage.input_tokens = v;
+    }
+    if let Some(v) = value.get("output_tokens").and_then(Value::as_u64) {
+        usage.output_tokens = v;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::language_model::{LanguageModelRequestMessage, MessageContent};
+    use crate::language_model::{
+        LanguageModelRequestMessage, LanguageModelRequestTool, LanguageModelToolResult,
+    };
     use crate::provider::config::WireApi;
+    use std::sync::Arc;
 
-    fn simple_request(text: &str) -> LanguageModelRequest {
+    fn req_with_tool() -> LanguageModelRequest {
         LanguageModelRequest {
             messages: vec![LanguageModelRequestMessage {
                 role: Role::User,
-                content: vec![MessageContent::Text(text.to_string())],
+                content: vec![MessageContent::Text("hi".to_string())],
                 cache: false,
+            }],
+            tools: vec![LanguageModelRequestTool {
+                name: "bash".to_string(),
+                description: "run a shell command".to_string(),
+                input_schema: json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
+                use_input_streaming: false,
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn build_request_body_includes_tools() {
+        let body = build_request_body("m", 64, &req_with_tool());
+        let tools = body.get("tools").and_then(Value::as_array).expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "bash");
+        assert!(tools[0]["description"].is_string());
+        assert!(tools[0]["parameters"].is_object());
+    }
+
+    #[test]
+    fn build_input_emits_function_call_and_output() {
+        let tu = LanguageModelToolUse {
+            id: "call_1".to_string(),
+            name: Arc::from("bash"),
+            raw_input: r#"{"cmd":"ls"}"#.to_string(),
+            input: json!({"cmd": "ls"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let tr = LanguageModelToolResult {
+            tool_use_id: "call_1".to_string(),
+            tool_name: Arc::from("bash"),
+            is_error: false,
+            content: "file.rs".to_string(),
+        };
+        let messages = vec![
+            LanguageModelRequestMessage {
+                role: Role::Assistant,
+                content: vec![MessageContent::ToolUse(tu)],
+                cache: false,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::ToolResult(tr)],
+                cache: false,
+            },
+        ];
+        let input = build_input(&messages);
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[0]["name"], "bash");
+        assert_eq!(input[0]["arguments"], r#"{"cmd":"ls"}"#);
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["output"], "file.rs");
+    }
+
+    #[test]
+    fn build_input_keeps_text_message_separate() {
+        let messages = vec![LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::Text("hello".to_string())],
+            cache: false,
+        }];
+        let input = build_input(&messages);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "hello");
+    }
+
+    fn make_added(index: usize, call_id: &str, name: &str) -> Value {
+        json!({
+            "type": "response.output_item.added",
+            "output_index": index,
+            "item": {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": "",
+            }
+        })
+    }
+
+    fn make_delta(index: usize, delta: &str) -> Value {
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": index,
+            "delta": delta,
+        })
+    }
+
+    fn make_done(index: usize, args: &str) -> Value {
+        json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": index,
+            "arguments": args,
+        })
+    }
+
+    #[test]
+    fn map_event_assembles_streamed_tool_input() {
+        let mut m = ResponsesEventMapper::new();
+        let events: Vec<Value> = vec![
+            make_added(0, "call_1", "bash"),
+            make_delta(0, r#"{"cmd":"#),
+            make_delta(0, r#""ls"}"#),
+            make_done(0, r#"{"cmd":"ls"}"#),
+            json!({"type": "response.completed", "response": {"status": "completed"}}),
+        ];
+        let mut all = Vec::new();
+        for ev in &events {
+            all.extend(m.map_event(ev));
+        }
+        let tools: Vec<_> = all
+            .iter()
+            .filter_map(|r| match r {
+                Ok(LanguageModelCompletionEvent::ToolUse(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        // Expect at least one partial (is_input_complete=false) and exactly one final.
+        assert!(tools.iter().any(|t| !t.is_input_complete));
+        let finals: Vec<_> = tools.iter().filter(|t| t.is_input_complete).collect();
+        assert_eq!(finals.len(), 1, "exactly one complete tool_use");
+        assert_eq!(finals[0].id, "call_1");
+        assert_eq!(&*finals[0].name, "bash");
+        assert_eq!(finals[0].input["cmd"], "ls");
+        // Stop emitted.
+        assert!(m.stop_emitted());
+    }
+
+    #[test]
+    fn map_event_handles_missing_done_via_output_item_done() {
+        let mut m = ResponsesEventMapper::new();
+        let events: Vec<Value> = vec![
+            make_added(0, "call_x", "read_file"),
+            make_delta(0, r#"{"path":"a"#),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_x",
+                    "name": "read_file",
+                    "arguments": r#"{"path":"a.rs"}"#
+                }
+            }),
+        ];
+        let mut all = Vec::new();
+        for ev in &events {
+            all.extend(m.map_event(ev));
+        }
+        let finals: Vec<_> = all
+            .iter()
+            .filter_map(|r| match r {
+                Ok(LanguageModelCompletionEvent::ToolUse(t)) if t.is_input_complete => {
+                    Some(t.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].input["path"], "a.rs");
     }
 
     /// Live streaming test: send "hi" via the Bailian qwen3.7-plus responses wire.
@@ -282,11 +758,16 @@ mod tests {
             .resolve_all_models()
             .into_iter()
             .find(|m| {
-                m.provider_name == "百炼" && m.id.contains("qwen3.7-plus") && m.wire_api == WireApi::Responses
+                m.provider_name == "百炼"
+                    && m.id.contains("qwen3.7-plus")
+                    && m.wire_api == WireApi::Responses
             })
             .expect("应含百炼 qwen3.7-plus responses");
         let api_key = crate::provider::resolve_apikey(
-            model.apikey_source.as_deref().unwrap_or("env:DASHSCOPE_API_KEY"),
+            model
+                .apikey_source
+                .as_deref()
+                .unwrap_or("env:DASHSCOPE_API_KEY"),
         )
         .expect("resolve api key");
 
@@ -294,9 +775,15 @@ mod tests {
         let tx_clone = tx.clone();
         let url = responses_url(&model.endpoint_url);
         let api_model = model.api_model_id();
+        let mut request = LanguageModelRequest::default();
+        request.messages.push(LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::Text("hi".to_string())],
+            cache: false,
+        });
         tokio::spawn(async move {
             if let Err(e) =
-                stream_responses(&url, &api_key, &api_model, 64, simple_request("hi"), tx_clone).await
+                stream_responses(&url, &api_key, &api_model, 64, request, tx_clone).await
             {
                 let _ = tx.send(Err(e)).await;
             }

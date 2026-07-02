@@ -10,18 +10,20 @@
 use std::path::PathBuf;
 
 use agent::language_model::StopReason;
+use agent::provider::config::WireApi;
 use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
-use gpui::{AnyElement, Context, Entity, Render, Subscription, Window, prelude::*, px};
+use gpui::{
+    AnyElement, Context, DismissEvent, Entity, Render, Subscription, Window, prelude::*, px,
+};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
-    list::ListItem,
-    popover::Popover,
+    menu::{PopupMenu, PopupMenuItem},
+    tag::{Tag, TagVariant},
     text::TextView,
-    tree::{TreeItem, TreeState, tree},
     v_flex,
 };
 
@@ -50,8 +52,9 @@ pub struct Workspace {
     editor_preview: bool,
     pending_auth: Option<PendingAuth>,
     model_open: bool,
-    /// Two-level tree (Provider → Model) for the model selector popover.
-    tree_state: Entity<TreeState>,
+    /// PopupMenu entity for the open model selector; created on open, destroyed on close.
+    model_menu: Option<Entity<PopupMenu>>,
+    model_menu_sub: Option<Subscription>,
     thread_sub: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
@@ -72,12 +75,9 @@ impl Workspace {
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .code_editor("markdown")
-                .line_number(false)
-                .folding(false)
-                .rows(3)
+                .rows(4)
                 .submit_on_enter(true)
-                .placeholder("给 agent 发消息…（Enter 发送，Shift+Enter 换行，Ctrl-G 打开编辑器）")
+                .placeholder("输入消息…")
         });
 
         let editor_state = cx.new(|cx| {
@@ -91,12 +91,6 @@ impl Workspace {
 
         let sidebar = cx.new(Sidebar::new);
 
-        let tree_state = Self::build_tree_state(
-            cx.new(|cx| TreeState::new(cx)),
-            thread.read(cx).model().map(|m| m.provider_name()),
-            cx,
-        );
-
         let mut ws = Self {
             cwd,
             thread,
@@ -108,7 +102,8 @@ impl Workspace {
             editor_preview: false,
             pending_auth: None,
             model_open: false,
-            tree_state,
+            model_menu: None,
+            model_menu_sub: None,
             thread_sub: None,
             sidebar_sub: None,
             input_sub: None,
@@ -121,41 +116,6 @@ impl Workspace {
         let id = ws.thread.read(cx).id.0.clone();
         ws.sidebar.update(cx, |s, cx| s.set_selected(Some(id), cx));
         ws
-    }
-
-    /// Group registry models by provider into a two-level tree.
-    /// The provider holding the current model is expanded by default.
-    fn build_tree_state(
-        state: Entity<TreeState>,
-        expanded_provider: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> Entity<TreeState> {
-        let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> = Vec::new();
-        for m in registry::global().models() {
-            let prov = m.provider_name();
-            if let Some(last) = providers.last_mut()
-                && last.0 == prov
-            {
-                last.1.push(m.clone());
-            } else {
-                providers.push((prov, vec![m.clone()]));
-            }
-        }
-
-        let items: Vec<TreeItem> = providers
-            .into_iter()
-            .map(|(provider, models)| {
-                let is_open = expanded_provider.as_deref() == Some(provider.as_str());
-                let mut node = TreeItem::new(provider.clone(), provider).expanded(is_open);
-                for m in models {
-                    node = node.child(TreeItem::new(m.id(), m.name()));
-                }
-                node
-            })
-            .collect();
-
-        state.update(cx, |s, cx| s.set_items(items, cx));
-        state
     }
 
     fn subscribe_thread(&self, cx: &mut Context<Self>) -> Subscription {
@@ -281,28 +241,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Submit the editor text to the thread, then close the panel and return
-    /// focus to the inline input.
-    fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.editor_state.read(cx).value().to_string();
-        if text.trim().is_empty() || self.thread.read(cx).is_running() {
-            return;
-        }
-        self.conversation.push_user(text.clone());
-        self.thread.update(cx, |thread, cx| {
-            thread.insert_user_message(text, cx);
-            thread.run_turn(cx);
-        });
-        save_thread(self.thread.clone(), cx);
-        self.editor_state.update(cx, |state, cx| {
-            state.set_value("", window, cx);
-        });
-        self.editor_open = false;
-        self.editor_preview = false;
-        self.input_state.update(cx, |s, cx| s.focus(window, cx));
-        cx.notify();
-    }
-
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_open = !self.editor_open;
         if self.editor_open {
@@ -325,6 +263,28 @@ impl Workspace {
             // Returning to edit mode: focus the editor so typing works immediately.
             self.editor_state.update(cx, |s, cx| s.focus(window, cx));
         }
+        cx.notify();
+    }
+
+    /// Submit the editor text to the thread, then close the panel and return
+    /// focus to the inline input.
+    fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor_state.read(cx).value().to_string();
+        if text.trim().is_empty() || self.thread.read(cx).is_running() {
+            return;
+        }
+        self.conversation.push_user(text.clone());
+        self.thread.update(cx, |thread, cx| {
+            thread.insert_user_message(text, cx);
+            thread.run_turn(cx);
+        });
+        save_thread(self.thread.clone(), cx);
+        self.editor_state.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.editor_open = false;
+        self.editor_preview = false;
+        self.input_state.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
     }
 
@@ -353,100 +313,151 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Model selector: a button showing the current model, whose popover hosts a
-    /// two-level tree (Provider folders → Model leaves). Clicking a leaf picks
-    /// the model and closes the popover (wired via the leaf `on_click`).
-    fn render_model_selector(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// Cascading model selector using PopupMenu with Provider → Model submenus.
+    ///
+    /// Closed: a ghost button showing the current model with a chevron.
+    /// Open: an absolute-positioned PopupMenu; hovering a Provider row expands
+    /// a flyout submenu listing its Models. PopupMenu handles all hover,
+    /// click-outside, and keyboard-dismiss behavior internally.
+    fn render_model_selector(&mut self, _theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let label = self.model_label(cx);
-        let current_id = self.thread.read(cx).model().map(|m| m.id());
         let open = self.model_open;
-        let theme_clone = theme.clone();
-        let view = cx.entity();
 
-        let state = self.tree_state.clone();
-        let tree = tree(&state, move |ix, entry, selected, _window, _cx| {
-            let depth = entry.depth();
-            let item = entry.item();
-            let is_folder = entry.is_folder();
-            let is_current = !is_folder && current_id.as_deref() == Some(item.id.as_ref());
-
-            let chevron = if is_folder {
-                Some(Icon::new(if entry.is_expanded() {
-                    IconName::ChevronDown
+        let trigger = Button::new("model-trigger")
+            .ghost()
+            .small()
+            .label(label)
+            .icon(if open {
+                IconName::ChevronUp
+            } else {
+                IconName::ChevronDown
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.model_open {
+                    this.model_open = false;
+                    this.model_menu = None;
+                    this.model_menu_sub = None;
                 } else {
-                    IconName::ChevronRight
-                }))
-            } else {
-                None
-            };
-
-            let mut li = ListItem::new(ix)
-                .w_full()
-                .rounded(theme_clone.radius)
-                .px_2()
-                .pl(px(16.) * depth as f32 + px(4.))
-                .py_1p5()
-                .gap_2()
-                .items_center()
-                .selected(selected || is_current)
-                .when(is_folder, |this| {
-                    this.font_weight(gpui::FontWeight::SEMIBOLD)
-                });
-
-            if let Some(ch) = chevron {
-                li = li.child(ch.xsmall().text_color(theme_clone.muted_foreground));
-            } else {
-                li = li.child(gpui::div().w(px(16.)));
-            }
-
-            li = li.child(
-                gpui::div()
-                    .flex_1()
-                    .text_sm()
-                    .text_color(if is_current {
-                        theme_clone.accent
-                    } else {
-                        theme_clone.foreground
-                    })
-                    .child(item.label.clone()),
-            );
-
-            // Leaves: pick the model and close on click (mouse only, so keyboard
-            // navigation within the tree does not auto-select).
-            if !is_folder {
-                let id = item.id.clone();
-                let view = view.clone();
-                li = li.on_click(move |_, _window, cx: &mut gpui::App| {
-                    view.update(cx, |this, cx| {
-                        if let Some(m) = registry::global().get_model(id.as_ref()) {
-                            this.thread.update(cx, |t, cx| t.set_model(m, cx));
-                        }
-                        this.model_open = false;
-                        cx.notify();
+                    this.model_open = true;
+                    let workspace = cx.entity();
+                    let menu = PopupMenu::build(window, cx, |menu, window, cx| {
+                        Self::build_model_popup_menu(menu, workspace, window, cx)
                     });
-                });
-            }
-
-            li
-        })
-        .w(px(300.))
-        .max_h(px(440.));
-
-        Popover::new("model-selector")
-            .open(open)
-            .on_open_change(cx.listener(|this, open: &bool, _window, cx| {
-                this.model_open = *open;
+                    let sub = cx.subscribe(
+                        &menu,
+                        |this: &mut Workspace,
+                         _menu: Entity<PopupMenu>,
+                         _: &DismissEvent,
+                         cx: &mut Context<Workspace>| {
+                            this.model_open = false;
+                            this.model_menu = None;
+                            this.model_menu_sub = None;
+                            cx.notify();
+                        },
+                    );
+                    this.model_menu = Some(menu);
+                    this.model_menu_sub = Some(sub);
+                }
                 cx.notify();
-            }))
-            .trigger(
-                Button::new("model-trigger")
-                    .ghost()
-                    .small()
-                    .label(label)
-                    .icon(IconName::ChevronDown),
+            }));
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        let menu = self
+            .model_menu
+            .clone()
+            .expect("model_menu exists when open");
+
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                // PopupMenu has its own bg/border/shadow and on_mouse_down_out.
+                // `.occlude()` renders the dropdown above all non-occluded elements
+                // (footer borders, message list, etc.).
+                gpui::div()
+                    .id("model-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .right_0()
+                    .occlude()
+                    .child(menu),
             )
-            .child(tree)
             .into_any_element()
+    }
+
+    /// WireApi → Tag variant + label mapping for the model menu.
+    fn wire_tag_variant(wire: WireApi) -> (TagVariant, &'static str) {
+        match wire {
+            WireApi::Anthropic => (TagVariant::Primary, "Anthropic"),
+            WireApi::Responses => (TagVariant::Info, "Responses"),
+            WireApi::Completions => (TagVariant::Warning, "Completions"),
+            WireApi::Unavailable => (TagVariant::Secondary, "N/A"),
+        }
+    }
+
+    /// Cascading model menu grouped by provider; each model row shows a wire-api Tag.
+    fn build_model_popup_menu(
+        menu: PopupMenu,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> = Vec::new();
+        for m in registry::global().models() {
+            let prov = m.provider_name();
+            if let Some(last) = providers.last_mut()
+                && last.0 == prov
+            {
+                last.1.push(m.clone());
+            } else {
+                providers.push((prov, vec![m.clone()]));
+            }
+        }
+
+        let mut menu = menu;
+        if providers.is_empty() {
+            menu = menu.item(PopupMenuItem::Label("No models configured".into()));
+        }
+        for (prov_name, models) in providers {
+            let ws = workspace.clone();
+            menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
+                let mut submenu = submenu;
+                for m in &models {
+                    let model_id = m.id();
+                    let model_name = m.name().to_string();
+                    let wire = m.wire_api();
+                    let (variant, label) = Self::wire_tag_variant(wire);
+                    let ws = ws.clone();
+                    submenu = submenu.item(
+                        PopupMenuItem::element(move |_window, _cx| {
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Tag::new()
+                                        .with_variant(variant)
+                                        .outline()
+                                        .small()
+                                        .child(label),
+                                )
+                                .child(model_name.clone())
+                        })
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            ws.update(cx, |this, cx| {
+                                if let Some(m) = registry::global().get_model(model_id.as_ref()) {
+                                    this.thread.update(cx, |t, cx| t.set_model(m, cx));
+                                }
+                            });
+                        }),
+                    );
+                }
+                submenu
+            });
+        }
+        menu
     }
 
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -549,6 +560,97 @@ impl Workspace {
                 .into_any_element(),
         )
     }
+
+    /// Composer row: a rounded container with `+` (reserved, disabled), `Input`, and a circular send/stop button.
+    fn render_composer(&self, running: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .w_full()
+            .items_end()
+            .gap_2()
+            .p_2()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary)
+            .child(
+                Button::new("composer-plus")
+                    .ghost()
+                    .icon(IconName::Plus)
+                    .disabled(true),
+            )
+            .child(gpui::div().flex_1().child(Input::new(&self.input_state)))
+            .child(self.render_send_button(running, cx))
+            .into_any_element()
+    }
+
+    /// Circular icon-only send/stop button.
+    ///
+    /// Reuses `Button` for built-in focus ring, keyboard activation, and disabled handling;
+    /// `.rounded(px(16.))` renders the button as a 32px disc.
+    fn render_send_button(&self, running: bool, cx: &mut Context<Self>) -> AnyElement {
+        Button::new("send-btn")
+            .icon(if running {
+                IconName::Pause
+            } else {
+                IconName::ArrowUp
+            })
+            .when(running, |b| b.danger())
+            .when(!running, |b| b.primary())
+            .rounded(px(16.))
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.thread.read(cx).is_running() {
+                    this.cancel_turn(cx);
+                } else {
+                    this.submit_input(window, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// Chip row: a plain `cwd` label on the left, model selector on the right.
+    fn render_chip_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        // Self-contained centering (not `centered()` helper) so the absolute-positioned
+        // model dropdown is not clipped by any `max_w` ancestor.
+        h_flex()
+            .w_full()
+            .justify_center()
+            .child(
+                h_flex()
+                    .w_full()
+                    .max_w(px(crate::views::CONTENT_MAX_W))
+                    .items_center()
+                    .child(self.render_cwd_chip(theme))
+                    .child(gpui::div().flex_1())
+                    .child(
+                        gpui::div()
+                            .flex_shrink_0()
+                            .child(self.render_model_selector(theme, cx)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Static label of the current working directory's basename.
+    ///
+    /// Rendered as a plain `div` (not `Button`) until a directory-switcher popover exists; an
+    /// unclickable `Button` would invite clicks that do nothing.
+    fn render_cwd_chip(&self, theme: &Theme) -> AnyElement {
+        let name = self
+            .cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| *s != ".")
+            .unwrap_or("project");
+        gpui::div()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(name.to_string())
+            .into_any_element()
+    }
 }
 
 impl Render for Workspace {
@@ -556,7 +658,6 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         let model_label = self.model_label(cx);
         let running = self.thread.read(cx).is_running();
-        let model_selector = self.render_model_selector(&theme, cx);
 
         let items: Vec<_> = self
             .conversation
@@ -570,6 +671,8 @@ impl Render for Workspace {
 
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
+        // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
+        // toggles preview — all keyboard-driven per the no-button constraint.
         let editor_panel = v_flex()
             .w(px(EDITOR_PANEL_WIDTH))
             .h_full()
@@ -636,70 +739,17 @@ impl Render for Workspace {
                             .overflow_y_scroll()
                             .children(items.into_iter().map(centered)),
                     )
-                    // Input area: statusline (model selector + running indicator) + editor row
+                    // Separator line (standalone div so the PopupMenu inside
+                    // the footer can render on top of it without z-order issues).
+                    .child(gpui::div().w_full().h(px(1.)).bg(theme.border))
+                    // Input area: composer (rounded container with input + actions) + chip row
                     .child(
                         v_flex()
                             .w_full()
                             .py_2()
                             .gap_2()
-                            .border_t_1()
-                            .border_color(theme.border)
-                            // Statusline: model chip on the left, running indicator on the right
-                            .child(centered(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .child(model_selector)
-                                    .child(gpui::div().flex_1())
-                                    .when(running, |this| {
-                                        this.child(
-                                            h_flex()
-                                                .gap_1()
-                                                .items_center()
-                                                .child(
-                                                    Icon::new(IconName::LoaderCircle)
-                                                        .xsmall()
-                                                        .text_color(theme.muted_foreground),
-                                                )
-                                                .child(
-                                                    gpui::div()
-                                                        .text_xs()
-                                                        .text_color(theme.muted_foreground)
-                                                        .child("思考中…"),
-                                                ),
-                                        )
-                                    }),
-                            ))
-                            // Editor row
-                            .child(centered(
-                                h_flex()
-                                    .w_full()
-                                    .gap_2()
-                                    .items_end()
-                                    .child(
-                                        gpui::div().flex_1().child(Input::new(&self.input_state)),
-                                    )
-                                    .child(if running {
-                                        Button::new("stop")
-                                            .ghost()
-                                            .small()
-                                            .label("停止")
-                                            .icon(IconName::Pause)
-                                            .on_click(cx.listener(|this, _, _window, cx| {
-                                                this.cancel_turn(cx);
-                                            }))
-                                            .into_any_element()
-                                    } else {
-                                        Button::new("send")
-                                            .primary()
-                                            .small()
-                                            .label("发送")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit_input(window, cx);
-                                            }))
-                                            .into_any_element()
-                                    }),
-                            )),
+                            .child(centered(self.render_composer(running, &theme, cx)))
+                            .child(self.render_chip_row(&theme, cx)),
                     )
                     // Approval overlay (if any)
                     .children(overlay),

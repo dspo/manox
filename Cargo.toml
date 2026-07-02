@@ -22,6 +22,8 @@ anyhow = "1"
 async-channel = "2"
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util"] }
+tokio-util = "0.7"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -36,6 +38,8 @@ grep-searcher = "0.1"
 grep-regex = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
+similar = "2"
 
 # GPUI 栈 —— git 仓库地址（规则允许）。gpui-component 锁定 zed rev 1d217ee，三者必须一致。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }

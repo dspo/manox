@@ -15,7 +15,7 @@ use crate::language_model::{
     LanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
     LanguageModelToolUse, MessageContent, Role, StopReason, TokenUsage,
 };
-use crate::provider::sse::extract_data_line;
+use crate::provider::sse::{extract_data_line, fix_streamed_json};
 
 /// Language model over the Anthropic wire.
 pub struct AnthropicModel {
@@ -69,6 +69,9 @@ impl LanguageModel for AnthropicModel {
     fn provider_name(&self) -> String {
         self.provider_name.clone()
     }
+    fn wire_api(&self) -> crate::provider::config::WireApi {
+        crate::provider::config::WireApi::Anthropic
+    }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
     }
@@ -87,8 +90,8 @@ impl LanguageModel for AnthropicModel {
             let (tx, rx) = async_channel::bounded::<Result<LanguageModelCompletionEvent>>(64);
             let tx_clone = tx.clone();
             crate::runtime::handle().spawn(async move {
-                if let Err(e) = stream_anthropic(&url, &api_key, &model, max_tokens, request, tx_clone)
-                    .await
+                if let Err(e) =
+                    stream_anthropic(&url, &api_key, &model, max_tokens, request, tx_clone).await
                 {
                     let _ = tx.send(Err(e)).await;
                 }
@@ -232,11 +235,7 @@ fn build_request_body(
 
 fn string_of_message(msg: &LanguageModelRequestMessage) -> Option<String> {
     let s = msg.string_contents();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// Convert a `MessageContent` into an Anthropic content-block JSON value.
@@ -276,7 +275,9 @@ fn content_to_anthropic(c: &MessageContent) -> Option<serde_json::Value> {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicEvent {
-    MessageStart { message: AnthropicMessage },
+    MessageStart {
+        message: AnthropicMessage,
+    },
     ContentBlockStart {
         index: usize,
         content_block: AnthropicContentBlock,
@@ -285,13 +286,17 @@ enum AnthropicEvent {
         index: usize,
         delta: AnthropicDelta,
     },
-    ContentBlockStop { index: usize },
+    ContentBlockStop {
+        index: usize,
+    },
     MessageDelta {
         delta: AnthropicMessageDelta,
         usage: Option<AnthropicUsage>,
     },
     MessageStop,
-    Error { error: AnthropicErrorPayload },
+    Error {
+        error: AnthropicErrorPayload,
+    },
     #[serde(other)]
     Other,
 }
@@ -319,9 +324,16 @@ struct AnthropicUsage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicContentBlock {
-    Text { text: String },
-    Thinking { thinking: String },
-    ToolUse { id: String, name: String },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -329,10 +341,18 @@ enum AnthropicContentBlock {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AnthropicDelta {
-    TextDelta { text: String },
-    ThinkingDelta { thinking: String },
-    SignatureDelta { signature: String },
-    InputJsonDelta { partial_json: String },
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        thinking: String,
+    },
+    SignatureDelta {
+        signature: String,
+    },
+    InputJsonDelta {
+        partial_json: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -393,8 +413,14 @@ impl AnthropicEventMapper {
                     })]
                 }
                 AnthropicContentBlock::ToolUse { id, name } => {
-                    self.tool_uses_by_index
-                        .insert(index, RawToolUse { id, name, input_json: String::new() });
+                    self.tool_uses_by_index.insert(
+                        index,
+                        RawToolUse {
+                            id,
+                            name,
+                            input_json: String::new(),
+                        },
+                    );
                     Vec::new()
                 }
                 AnthropicContentBlock::Other => Vec::new(),
@@ -502,44 +528,6 @@ fn update_usage(usage: &mut TokenUsage, new: &AnthropicUsage) {
     }
 }
 
-/// Repair a streamed (possibly incomplete) JSON fragment into a complete JSON value that serde accepts.
-fn fix_streamed_json(s: &str) -> Result<serde_json::Value> {
-    serde_json::from_str::<serde_json::Value>(s).or_else(|_| {
-        // Track each open delimiter by kind so it can be closed with its matching
-        // closer; a scalar depth counter would close every `[` with `}`, corrupting
-        // any tool input that contains an array literal.
-        let mut fixed = String::from(s);
-        let mut stack: Vec<char> = Vec::new();
-        let mut in_string = false;
-        let mut escaped = false;
-        for ch in fixed.chars() {
-            if in_string {
-                if escaped {
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == '"' {
-                    in_string = false;
-                }
-            } else if ch == '"' {
-                in_string = true;
-            } else if ch == '{' || ch == '[' {
-                stack.push(ch);
-            } else if ch == '}' || ch == ']' {
-                stack.pop();
-            }
-        }
-        if in_string {
-            fixed.push('"');
-        }
-        while let Some(open) = stack.pop() {
-            fixed.push(if open == '{' { '}' } else { ']' });
-        }
-        serde_json::from_str::<serde_json::Value>(&fixed)
-            .map_err(|e| anyhow!("fix_streamed_json failed: {e}"))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,26 +545,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fix_streamed_json_closes_arrays_and_objects() {
-        // Truncated object containing an array literal: a scalar depth counter
-        // would close the `[` with `}`, yielding invalid JSON.
-        let fixed = fix_streamed_json(r#"{"files": ["a.rs"#).expect("repair array");
-        assert_eq!(fixed["files"][0], "a.rs");
-
-        // Truncated nested objects.
-        let fixed = fix_streamed_json(r#"{"a": {"b": 1"#).expect("repair nested");
-        assert_eq!(fixed["a"]["b"], 1);
-
-        // Unterminated string inside an object.
-        let fixed = fix_streamed_json(r#"{"note": "hello"#).expect("repair string");
-        assert_eq!(fixed["note"], "hello");
-
-        // Already-complete JSON passes through unchanged in value.
-        let fixed = fix_streamed_json(r#"{"ok": true}"#).expect("passthrough");
-        assert!(fixed["ok"].is_boolean());
-    }
-
     /// Live streaming test: send "hi" via the Bailian glm-5.2[1m] anthropic wire.
     /// Requires `MANOX_RUN_LIVE=1` and DASHSCOPE_API_KEY in the macOS Keychain.
     #[tokio::test]
@@ -589,11 +557,16 @@ mod tests {
             .resolve_all_models()
             .into_iter()
             .find(|m| {
-                m.provider_name == "百炼" && m.id.contains("glm-5.2") && m.wire_api == WireApi::Anthropic
+                m.provider_name == "百炼"
+                    && m.id.contains("glm-5.2")
+                    && m.wire_api == WireApi::Anthropic
             })
             .expect("应含百炼 glm-5.2[1m] anthropic");
         let api_key = crate::provider::resolve_apikey(
-            model.apikey_source.as_deref().unwrap_or("env:DASHSCOPE_API_KEY"),
+            model
+                .apikey_source
+                .as_deref()
+                .unwrap_or("env:DASHSCOPE_API_KEY"),
         )
         .expect("resolve api key");
 
@@ -602,8 +575,15 @@ mod tests {
         let url = messages_url(&model.endpoint_url);
         let api_model = model.api_model_id();
         tokio::spawn(async move {
-            if let Err(e) =
-                stream_anthropic(&url, &api_key, &api_model, 512, simple_request("hi"), tx_clone).await
+            if let Err(e) = stream_anthropic(
+                &url,
+                &api_key,
+                &api_model,
+                512,
+                simple_request("hi"),
+                tx_clone,
+            )
+            .await
             {
                 let _ = tx.send(Err(e)).await;
             }
@@ -623,7 +603,10 @@ mod tests {
                 Err(e) => panic!("stream error: {e}"),
             }
         }
-        assert!(content_events > 0, "应至少收到一个内容事件（Text/Thinking）");
+        assert!(
+            content_events > 0,
+            "应至少收到一个内容事件（Text/Thinking）"
+        );
         assert!(stopped, "应收到 Stop 事件");
     }
 }
