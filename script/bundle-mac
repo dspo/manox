@@ -152,14 +152,21 @@ if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; th
     rm /tmp/manox-certificate.p12
     security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" manox.keychain
 
+    function cleanup_keychain() {
+        echo "Cleaning up keychain"
+        security default-keychain -s login.keychain
+        security delete-keychain manox.keychain || true
+    }
+    trap cleanup_keychain EXIT
+
     echo "Code signing with Apple Developer certificate"
     /usr/bin/codesign --force --deep --timestamp --options runtime \
         --entitlements "${entitlements_path}" \
         --sign "${MACOS_SIGNING_IDENTITY:-}" "${app_path}" -v
 
-    # Clean up keychain
-    security default-keychain -s login.keychain
-    security delete-keychain manox.keychain || true
+    # Clear the trap since cleanup is done
+    trap - EXIT
+    cleanup_keychain
 else
     echo "Ad-hoc signing with entitlements (no Apple Developer certificate)"
     codesign --force --deep \
