@@ -1,0 +1,42 @@
+name: no-coauthor
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  reject-co-author:
+    name: Reject Co-Authored-By trailers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail if any commit carries a Co-Authored-By trailer
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          found=0
+          shas=$(git rev-list --no-merges "$BASE_SHA..$HEAD_SHA")
+          if [ -z "$shas" ]; then
+            echo "No commits to check."
+            exit 0
+          fi
+          for sha in $shas; do
+            msg=$(git log -1 --format=%B "$sha")
+            if printf '%s' "$msg" | grep -qiE '^Co-Authored-By:[[:space:]]*.+'; then
+              echo "::error::Commit $sha contains a forbidden 'Co-Authored-By:' trailer"
+              git log -1 --format='    %h %s' "$sha"
+              found=1
+            else
+              echo "OK: $sha has no Co-Authored-By trailer"
+            fi
+          done
+          exit $found
