@@ -18,6 +18,9 @@ rusqlite.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 glob.workspace = true
+ignore.workspace = true
+grep-searcher.workspace = true
+grep-regex.workspace = true
 tracing.workspace = true
 
 gpui.workspace = true

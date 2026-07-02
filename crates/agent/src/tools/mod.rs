@@ -2,7 +2,7 @@
 //!
 //! - read_file / write_file / edit_file / list_directory: std::fs via gpui `background_spawn`.
 //! - bash: tokio::process, spawned on the runtime handle and bridged back to a gpui `Task` via `async_channel`.
-//! - grep: ripgrep subprocess (same bridge as bash).
+//! - grep: ripgrep library (grep-searcher + grep-regex + ignore), in-process via `background_spawn`.
 //! - glob: the `glob` crate (pure Rust).
 //!
 //! Each tool generates its `input_schema` from a typed Input via `schemars`. Tools
@@ -13,6 +13,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{App, AppContext as _, Task};
+use grep_regex::RegexMatcherBuilder;
+use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -310,29 +313,82 @@ impl AgentTool for GrepTool {
             .path
             .map(PathBuf::from)
             .unwrap_or_else(|| self.cwd.as_ref().clone());
-        bridge_tokio(cx, async move {
-            let mut cmd = tokio::process::Command::new("rg");
-            cmd.arg("--line-number").arg("--color=never").arg("-n");
-            if let Some(g) = &parsed.glob {
-                cmd.arg("--glob").arg(g);
-            }
-            cmd.arg(&parsed.pattern).arg(&base);
-            let output = cmd
-                .output()
-                .await
-                .map_err(|e| anyhow::anyhow!("grep 启动失败（需安装 ripgrep）: {e}"))?;
-            // rg exit code 1 means no matches; not an error.
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            if output.status.success() || output.status.code() == Some(1) {
-                if stdout.is_empty() {
-                    return Ok("无匹配".to_string());
-                }
-                Ok(stdout)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                Err(anyhow::anyhow!("grep 失败: {stderr}"))
-            }
-        })
+        cx.background_spawn(async move { run_grep(&parsed.pattern, &base, parsed.glob.as_deref()) })
+    }
+}
+
+// ─── grep sink & runner ───────────────────────────────────────────────────
+
+/// Accumulates search results as "file:line:content" lines.
+struct GrepSink {
+    path: String,
+    results: Vec<String>,
+}
+
+impl Sink for GrepSink {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        mat: &SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        let line = mat.line_number().unwrap_or(0);
+        let content = String::from_utf8_lossy(mat.bytes()).trim_end().to_string();
+        self.results
+            .push(format!("{}:{}:{}", self.path, line, content));
+        Ok(true)
+    }
+}
+
+fn run_grep(pattern: &str, root: &PathBuf, glob: Option<&str>) -> Result<String, String> {
+    let matcher = RegexMatcherBuilder::new()
+        .build(pattern)
+        .map_err(|e| format!("grep 正则无效: {e}"))?;
+
+    let mut walker = WalkBuilder::new(root);
+    walker.standard_filters(true);
+    walker.hidden(false);
+
+    if let Some(g) = glob {
+        let overrides = OverrideBuilder::new(root)
+            .add(g)
+            .map_err(|e| format!("grep glob 无效: {e}"))?
+            .build()
+            .map_err(|e| format!("grep glob 构建失败: {e}"))?;
+        walker.overrides(overrides);
+    }
+
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
+        .build();
+
+    let mut all_results: Vec<String> = Vec::new();
+    for result in walker.build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+        let file_path = entry.path();
+        let mut sink = GrepSink {
+            path: file_path.display().to_string(),
+            results: Vec::new(),
+        };
+        if searcher.search_path(&matcher, file_path, &mut sink).is_err() {
+            continue;
+        }
+        all_results.append(&mut sink.results);
+    }
+
+    if all_results.is_empty() {
+        Ok("无匹配".to_string())
+    } else {
+        Ok(all_results.join("\n"))
     }
 }
 
