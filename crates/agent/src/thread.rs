@@ -17,6 +17,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::StreamExt as _;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task};
+use tokio_util::sync::CancellationToken;
 
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
@@ -87,6 +88,10 @@ pub struct Thread {
     pending_authorization: Option<(String, tokio::sync::oneshot::Sender<PermissionDecision>)>,
     /// The running turn task; dropping it aborts the turn.
     running_turn: Option<Task<()>>,
+    /// Cancellation token for the running turn. Cancelled by `cancel()` so the
+    /// in-flight tool (e.g. `bash`) can reap its process group promptly instead
+    /// of relying on task-drop, which does not reach the detached tokio child.
+    turn_cancel: Option<CancellationToken>,
 }
 
 impl EventEmitter<ThreadEvent> for Thread {}
@@ -104,6 +109,7 @@ impl Thread {
             pending_tool_uses: Vec::new(),
             pending_authorization: None,
             running_turn: None,
+            turn_cancel: None,
         })
     }
 
@@ -125,6 +131,7 @@ impl Thread {
             pending_tool_uses: Vec::new(),
             pending_authorization: None,
             running_turn: None,
+            turn_cancel: None,
         })
     }
 
@@ -213,14 +220,19 @@ impl Thread {
             return;
         };
 
+        let cancel = CancellationToken::new();
+        self.turn_cancel = Some(cancel.clone());
+
         let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
-            if let Err(e) = Self::run_turn_loop(&this, &model, cx).await {
+            let result = Self::run_turn_loop(&this, &model, &cancel, cx).await;
+            if let Err(e) = result {
                 let _ = this.update(cx, |_, cx| {
                     cx.emit(ThreadEvent::Error(e));
                 });
             }
             this.update(cx, |this, cx| {
                 this.running_turn = None;
+                this.turn_cancel = None;
                 cx.notify();
             })
             .ok();
@@ -230,9 +242,12 @@ impl Thread {
         cx.notify();
     }
 
-    /// Abort the current turn.
+    /// Abort the current turn. Cancels the turn token so an in-flight tool (e.g.
+    /// `bash`) can kill its process group and append a clean "aborted" result;
+    /// the turn task then winds down on its own and clears `running_turn`.
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
-        if self.running_turn.take().is_some() {
+        if let Some(cancel) = self.turn_cancel.take() {
+            cancel.cancel();
             cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
             cx.notify();
         }
@@ -241,6 +256,7 @@ impl Thread {
     async fn run_turn_loop(
         this: &gpui::WeakEntity<Self>,
         model: &AnyLanguageModel,
+        cancel: &CancellationToken,
         cx: &mut AsyncApp,
     ) -> Result<()> {
         loop {
@@ -250,8 +266,22 @@ impl Thread {
                 this.build_completion_request()
             })?;
 
-            let mut stream = model.stream_completion(request, cx).await?;
-            while let Some(event) = stream.next().await {
+            let mut stream = tokio::select! {
+                s = model.stream_completion(request, cx) => s?,
+                _ = cancel.cancelled() => break,
+            };
+            let mut cancelled = false;
+            loop {
+                let event = tokio::select! {
+                    ev = stream.next() => match ev {
+                        Some(e) => e,
+                        None => break,
+                    },
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        break;
+                    }
+                };
                 let is_stop = matches!(event, Ok(LanguageModelCompletionEvent::Stop(_)));
                 this.update(cx, |this, cx| {
                     this.handle_completion_event(event, cx);
@@ -260,16 +290,33 @@ impl Thread {
                     break;
                 }
             }
+            if cancelled {
+                break;
+            }
 
-            let tool_uses = this.update(cx, |this, _cx| {
+            let mut tool_uses = this.update(cx, |this, _cx| {
                 std::mem::take(&mut this.pending_tool_uses)
             })?;
             if tool_uses.is_empty() {
                 break;
             }
 
+            while !tool_uses.is_empty() {
+                let tu = tool_uses.remove(0);
+                Self::run_tool(this, tu, cancel, cx).await?;
+                if cancel.is_cancelled() {
+                    break;
+                }
+            }
+            // Pair tool_uses that never started: a dangling tool_use in the
+            // next request makes Anthropic reject with HTTP 400. The one
+            // mid-flight when cancel fired already got a "cancelled" result
+            // from the tool itself.
             for tu in tool_uses {
-                Self::run_tool(this, tu, cx).await?;
+                Self::synthesize_unrun_tool_result(this, tu, cx)?;
+            }
+            if cancel.is_cancelled() {
+                break;
             }
         }
         Ok(())
@@ -279,6 +326,7 @@ impl Thread {
     async fn run_tool(
         this: &gpui::WeakEntity<Self>,
         tu: LanguageModelToolUse,
+        cancel: &CancellationToken,
         cx: &mut AsyncApp,
     ) -> Result<()> {
         let id = tu.id.clone();
@@ -319,7 +367,16 @@ impl Thread {
                 });
             })?;
 
-            let decision = rx.await.unwrap_or(PermissionDecision::Deny);
+            let decision = tokio::select! {
+                d = rx => d.unwrap_or(PermissionDecision::Deny),
+                _ = cancel.cancelled() => PermissionDecision::Deny,
+            };
+            // The pending responder is spent whether the UI answered or cancel
+            // fired; drop any stale sender so a late `respond_authorization`
+            // cannot revive a cancelled turn.
+            this.update(cx, |this, _cx| {
+                this.pending_authorization = None;
+            })?;
             match decision {
                 PermissionDecision::Deny => {
                     let msg = "用户拒绝执行".to_string();
@@ -345,7 +402,7 @@ impl Thread {
 
         let input = tu.input.clone();
         let result_task: Task<Result<String, String>> =
-            this.update(cx, |_this, cx| tool.run(input, cx))?;
+            this.update(cx, |_this, cx| tool.run(input, cancel.clone(), cx))?;
         let output = result_task.await;
         let (output_str, is_error) = match output {
             Ok(o) => (o, false),
@@ -367,6 +424,32 @@ impl Thread {
 
         Self::emit_tool_result(this, &id, &name, &title, &output_str, is_error, cx)?;
         Self::append_tool_result(this, tu, output_str, is_error, cx)?;
+        Ok(())
+    }
+
+    /// Synthesize an error `ToolResult` for a tool_use that never executed
+    /// (because the turn was cancelled before it started). Every tool_use in
+    /// the preceding assistant message must be paired with a tool_result, or
+    /// Anthropic rejects the next request with HTTP 400.
+    fn synthesize_unrun_tool_result(
+        this: &gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let name = tu.name.to_string();
+        let title = tool_title(&name, &tu.input);
+        let msg = "工具未执行（会话被取消）".to_string();
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: ToolCallStatus::Denied,
+            });
+        })?;
+        Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
+        Self::append_tool_result(this, tu, msg, true, cx)?;
         Ok(())
     }
 

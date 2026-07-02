@@ -22,6 +22,8 @@ anyhow = "1"
 async-channel = "2"
 futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util"] }
+tokio-util = "0.7"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
