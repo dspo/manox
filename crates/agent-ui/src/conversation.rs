@@ -33,6 +33,9 @@ pub struct ToolCallItem {
     pub status: ToolCallStatus,
     pub output: String,
     pub is_error: bool,
+    /// True while live `ToolOutput` chunks are still streaming in; flipped to
+    /// false once the final `ToolResult` lands the canonical output.
+    pub streaming: bool,
 }
 
 #[derive(Debug, Default)]
@@ -118,7 +121,16 @@ impl ConversationState {
                         status: *status,
                         output: String::new(),
                         is_error: false,
+                        streaming: matches!(*status, ToolCallStatus::Running),
                     }));
+                }
+            }
+            ThreadEvent::ToolOutput { id, chunk } => {
+                if let Some(ix) = self.find_tool(id) {
+                    if let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix) {
+                        t.output.push_str(chunk);
+                        t.streaming = true;
+                    }
                 }
             }
             ThreadEvent::ToolResult {
@@ -130,6 +142,7 @@ impl ConversationState {
                     if let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix) {
                         t.output = output.clone();
                         t.is_error = *is_error;
+                        t.streaming = false;
                         t.status = if *is_error {
                             ToolCallStatus::Error
                         } else {
@@ -149,6 +162,7 @@ impl ConversationState {
                         },
                         output: output.clone(),
                         is_error: *is_error,
+                        streaming: false,
                     }));
                 }
             }
@@ -228,6 +242,7 @@ impl ConversationState {
                                     status: ToolCallStatus::Success,
                                     output: String::new(),
                                     is_error: false,
+                                    streaming: false,
                                 }));
                             }
                             MessageContent::ToolResult(tr) => {
@@ -270,6 +285,7 @@ fn pair_tool_result(state: &mut ConversationState, tr: &LanguageModelToolResult)
             status,
             output: tr.content.clone(),
             is_error: tr.is_error,
+            streaming: false,
         }));
     }
 }

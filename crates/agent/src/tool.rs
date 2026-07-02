@@ -20,6 +20,35 @@ use crate::language_model::LanguageModelRequestTool;
 
 pub use permission::{PermissionCache, PermissionDecision};
 
+/// Cloneable handle for live tool output. Tools that stream (e.g. `bash`)
+/// call [`ToolOutputSink::try_emit`] per output chunk; the owning `Thread`
+/// drains the receiver into `ThreadEvent::ToolOutput` for the UI. The channel
+/// is bounded; overflow drops chunks silently — real-time liveness is
+/// preferred over completeness, and the final `ThreadEvent::ToolResult`
+/// carries the canonical (truncated) full output.
+#[derive(Clone)]
+pub struct ToolOutputSink {
+    tool_call_id: Arc<str>,
+    tx: async_channel::Sender<String>,
+}
+
+impl ToolOutputSink {
+    /// Create a sink bound to a tool-call id and its matching receiver.
+    pub fn channel(tool_call_id: Arc<str>) -> (Self, async_channel::Receiver<String>) {
+        let (tx, rx) = async_channel::bounded(256);
+        (Self { tool_call_id, tx }, rx)
+    }
+
+    pub fn tool_call_id(&self) -> &str {
+        &self.tool_call_id
+    }
+
+    /// Best-effort emit; dropped silently if the channel is full or closed.
+    pub fn try_emit(&self, chunk: &str) {
+        let _ = self.tx.try_send(chunk.to_string());
+    }
+}
+
 /// Tool trait. `run` executes on the gpui executor and returns a `Task`.
 pub trait AgentTool: Send + Sync + 'static {
     fn name(&self) -> &str;
@@ -40,6 +69,21 @@ pub trait AgentTool: Send + Sync + 'static {
         cancel: CancellationToken,
         cx: &mut App,
     ) -> Task<Result<String, String>>;
+
+    /// Streaming variant. Streaming tools (e.g. `bash`) override this to emit
+    /// live output chunks via `sink` while running; the returned `Task` still
+    /// yields the canonical final result. The default delegates to [`run`],
+    /// ignoring the sink, so non-streaming tools are unaffected.
+    fn run_streaming(
+        &self,
+        input: serde_json::Value,
+        cancel: CancellationToken,
+        sink: ToolOutputSink,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
+        let _ = sink;
+        self.run(input, cancel, cx)
+    }
 }
 
 pub type AnyAgentTool = Arc<dyn AgentTool>;

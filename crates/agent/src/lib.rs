@@ -22,7 +22,7 @@ pub use message::Message;
 pub use thread::{Thread, ThreadEvent, ThreadId, ToolCallStatus};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
 pub use tool::permission::{PermissionCache, PermissionDecision};
-pub use tool::{AgentTool, AnyAgentTool, ToolRegistry};
+pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};
 
 /// Register the tokio runtime + `ProviderRegistry` + `ThreadStore` + the
 /// hashline snapshot store. Call at App startup.
