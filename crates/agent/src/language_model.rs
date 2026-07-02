@@ -198,12 +198,15 @@ impl std::ops::Add for TokenUsage {
     }
 }
 
+use crate::provider::config::WireApi;
+
 /// Language model abstraction.
 pub trait LanguageModel: Send + Sync {
     fn id(&self) -> String;
     fn name(&self) -> String;
     fn provider_id(&self) -> String;
     fn provider_name(&self) -> String;
+    fn wire_api(&self) -> WireApi;
 
     fn supports_thinking(&self) -> bool {
         false

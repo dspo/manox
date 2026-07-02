@@ -65,6 +65,9 @@ impl LanguageModel for CompletionsModel {
     fn provider_name(&self) -> String {
         self.provider_name.clone()
     }
+    fn wire_api(&self) -> crate::provider::config::WireApi {
+        crate::provider::config::WireApi::Completions
+    }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
     }

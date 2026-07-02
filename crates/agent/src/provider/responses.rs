@@ -67,6 +67,9 @@ impl LanguageModel for ResponsesModel {
     fn provider_name(&self) -> String {
         self.provider_name.clone()
     }
+    fn wire_api(&self) -> crate::provider::config::WireApi {
+        crate::provider::config::WireApi::Responses
+    }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
     }
