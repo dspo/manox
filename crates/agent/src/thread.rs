@@ -62,6 +62,13 @@ pub enum ThreadEvent {
         output: String,
         is_error: bool,
     },
+    /// Live output chunk from a streaming tool (e.g. `bash` stdout/stderr).
+    /// Accumulated into the matching tool-call item's `output` until the
+    /// final `ToolResult` overwrites it with the canonical (truncated) text.
+    ToolOutput {
+        id: String,
+        chunk: String,
+    },
     /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with the decision.
     ToolCallAuthorization {
         id: String,
@@ -401,8 +408,28 @@ impl Thread {
         })?;
 
         let input = tu.input.clone();
+        let (sink, rx) = crate::tool::ToolOutputSink::channel(id.clone().into());
+        let id_for_drain = id.clone();
         let result_task: Task<Result<String, String>> =
-            this.update(cx, |_this, cx| tool.run(input, cancel.clone(), cx))?;
+            this.update(cx, |_this, cx| tool.run_streaming(input, cancel.clone(), sink, cx))?;
+        // Drain live output chunks to the UI while the tool runs. A foreground
+        // spawn is used (not background_spawn) because emitting requires an
+        // `AsyncApp`, which is `!Send` (`Rc`-backed). The receiver closes once
+        // the tool task drops the sink, so this detaches cleanly when
+        // `result_task` completes.
+        this.update(cx, |_, cx| {
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                while let Ok(chunk) = rx.recv().await {
+                    let _ = this.update(cx, |_, cx| {
+                        cx.emit(ThreadEvent::ToolOutput {
+                            id: id_for_drain.clone(),
+                            chunk,
+                        });
+                    });
+                }
+            })
+            .detach();
+        })?;
         let output = result_task.await;
         let (output_str, is_error) = match output {
             Ok(o) => (o, false),

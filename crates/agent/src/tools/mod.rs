@@ -1,7 +1,7 @@
-//! Seven built-in tools.
+//! Six file-system tools plus a brush-backed `bash` tool (see [`bash`]).
 //!
 //! - read_file / write_file / edit_file / list_directory: std::fs via gpui `background_spawn`.
-//! - bash: tokio::process, spawned on the runtime handle and bridged back to a gpui `Task` via `async_channel`.
+//! - bash: in-process brush shell, spawned on the runtime handle and bridged back to a gpui `Task` via `async_channel`.
 //! - grep: ripgrep library (grep-searcher + grep-regex + ignore), in-process via `background_spawn`.
 //! - glob: the `ignore` crate (gitignore-aware walk) + `globset` (pattern match).
 //!
@@ -9,11 +9,10 @@
 //! requiring approval (write_file / edit_file / bash) override `requires_approval`
 //! to return true.
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
-use std::time::Duration;
+pub mod bash;
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use globset::{Glob, GlobSetBuilder};
 use gpui::{App, AppContext as _, Task};
 use grep_regex::RegexMatcherBuilder;
@@ -26,12 +25,12 @@ use tokio_util::sync::CancellationToken;
 use crate::tool::{AgentTool, AnyAgentTool, ToolRegistry};
 
 /// Convert a schemars schema to a `serde_json::Value`.
-fn schema<T: JsonSchema>() -> serde_json::Value {
+pub(crate) fn schema<T: JsonSchema>() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(T)).expect("schema serialization")
 }
 
 /// Bridge a tokio task back to a gpui background `Task` via `async_channel`.
-fn bridge_tokio<F, R>(cx: &mut App, fut: F) -> Task<Result<String, String>>
+pub(crate) fn bridge_tokio<F, R>(cx: &mut App, fut: F) -> Task<Result<String, String>>
 where
     F: std::future::Future<Output = Result<R, anyhow::Error>> + Send + 'static,
     R: std::fmt::Display + Send + 'static,
@@ -327,254 +326,6 @@ impl AgentTool for ListDirectoryTool {
     }
 }
 
-// ─── bash ─────────────────────────────────────────────────────────────────
-
-pub struct BashTool {
-    cwd: Arc<PathBuf>,
-}
-
-/// Wall-clock limit before a hung command is killed. Prevents a
-/// non-terminating process (e.g. a network call with no response) from
-/// stalling the turn indefinitely.
-const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
-/// Hard cap on retained stdout/stderr so a runaway command cannot OOM the app.
-const BASH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
-/// Grace window given to a SIGTERM'd process group before escalating to SIGKILL.
-const CANCELLATION_GRACE_MS: u64 = 50;
-/// Upper bound on draining the stdout/stderr pipes after the child is killed:
-/// grandchildren that inherited the pipes can otherwise keep them open.
-const IO_DRAIN_TIMEOUT_MS: u64 = 2_000;
-
-#[derive(Deserialize, JsonSchema)]
-struct BashInput {
-    /// Shell command to run (via `sh -c`).
-    command: String,
-    /// Working directory (defaults to cwd).
-    #[serde(default)]
-    cwd: Option<String>,
-    /// Kill the command after this many seconds (defaults to 120).
-    #[serde(default)]
-    timeout_secs: Option<u64>,
-}
-
-/// Why the wait ended after the natural-exit path: wall-clock timeout or user
-/// cancellation. (Natural exit returns early and never constructs this.)
-enum WaitEnd {
-    TimedOut,
-    Cancelled,
-}
-
-impl AgentTool for BashTool {
-    fn name(&self) -> &str {
-        "bash"
-    }
-    fn description(&self) -> &str {
-        "执行 shell 命令并返回 stdout。命令经 `sh -c`，工作目录默认 cwd。\
-         默认 120s 超时（可用 timeout_secs 覆盖）；超时或取消时整个进程组被终止。"
-    }
-    fn requires_approval(&self) -> bool {
-        true
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        schema::<BashInput>()
-    }
-    fn run(
-        &self,
-        input: serde_json::Value,
-        cancel: CancellationToken,
-        cx: &mut App,
-    ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<BashInput>(input) else {
-            return cx.background_spawn(async { Err("input 解析失败".to_string()) });
-        };
-        let cwd = parsed
-            .cwd
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.cwd.as_ref().clone());
-        bridge_tokio(cx, async move {
-            run_bash(&parsed.command, &cwd, parsed.timeout_secs, cancel).await
-        })
-    }
-}
-
-/// Execute `sh -c <command>` in its own process group, enforce a wall-clock
-/// timeout and cancellation, and return capped stdout/stderr. On timeout or
-/// cancellation the entire process group is reaped (SIGTERM → SIGKILL) so
-/// orphaned grandchildren cannot keep the pipes open.
-async fn run_bash(
-    command: &str,
-    cwd: &Path,
-    timeout_secs: Option<u64>,
-    cancel: CancellationToken,
-) -> Result<String, anyhow::Error> {
-    let timeout = Duration::from_secs(timeout_secs.unwrap_or(BASH_DEFAULT_TIMEOUT_SECS));
-
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(cwd)
-        // stdin null prevents commands that read stdin from hanging the turn.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    // Become a new session leader: the child's process-group id equals its pid,
-    // so `kill(-pid)` later reaches the whole tree (curl, pipelines, etc.).
-    #[cfg(unix)]
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("bash 启动失败: {e}"))?;
-
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
-    let out_task = tokio::spawn(async move { read_capped(stdout, BASH_OUTPUT_MAX_BYTES).await });
-    let err_task = tokio::spawn(async move { read_capped(stderr, BASH_OUTPUT_MAX_BYTES).await });
-
-    let end = tokio::select! {
-        s = child.wait() => match s {
-            Ok(status) => {
-                let (stdout_str, stdout_trunc) = drain(out_task).await;
-                let (stderr_str, stderr_trunc) = drain(err_task).await;
-                return finish_exited(status, stdout_str, stdout_trunc, stderr_str, stderr_trunc);
-            }
-            Err(e) => return Err(anyhow::anyhow!("bash wait 失败: {e}")),
-        },
-        _ = tokio::time::sleep(timeout) => WaitEnd::TimedOut,
-        _ = cancel.cancelled() => WaitEnd::Cancelled,
-    };
-
-    // Two-stage teardown: SIGTERM the group, give it a brief grace period, then
-    // SIGKILL. Mirrors codex's cancellation escalation.
-    if let Some(pid) = child.id() {
-        kill_process_group(pid, libc::SIGTERM);
-    }
-    let status = match tokio::time::timeout(
-        Duration::from_millis(CANCELLATION_GRACE_MS),
-        child.wait(),
-    )
-    .await
-    {
-        Ok(s) => s?,
-        Err(_) => {
-            if let Some(pid) = child.id() {
-                kill_process_group(pid, libc::SIGKILL);
-            }
-            child.wait().await?
-        }
-    };
-    let _ = status;
-
-    let (stdout_str, stdout_trunc) = drain(out_task).await;
-    let (stderr_str, stderr_trunc) = drain(err_task).await;
-    let stdout_str = with_truncation_note(&stdout_str, stdout_trunc);
-    let stderr_str = with_truncation_note(&stderr_str, stderr_trunc);
-    match end {
-        WaitEnd::TimedOut => Err(anyhow::anyhow!(
-            "bash 命令超时（{}s）已被终止\nstdout:\n{stdout_str}\nstderr:\n{stderr_str}",
-            timeout.as_secs()
-        )),
-        WaitEnd::Cancelled => Err(anyhow::anyhow!(
-            "bash 命令已被取消（用户中止）\nstdout:\n{stdout_str}\nstderr:\n{stderr_str}"
-        )),
-    }
-}
-
-/// Format the natural-exit outcome: success returns stdout (or stderr when
-/// stdout is empty); non-zero returns an error carrying both streams.
-fn finish_exited(
-    status: std::process::ExitStatus,
-    stdout_str: String,
-    stdout_trunc: bool,
-    stderr_str: String,
-    stderr_trunc: bool,
-) -> Result<String, anyhow::Error> {
-    let stdout_str = with_truncation_note(&stdout_str, stdout_trunc);
-    let stderr_str = with_truncation_note(&stderr_str, stderr_trunc);
-    if status.success() {
-        let combined = if stdout_str.is_empty() {
-            stderr_str
-        } else {
-            stdout_str
-        };
-        Ok(combined)
-    } else {
-        let code = status.code().unwrap_or(-1);
-        Err(anyhow::anyhow!(
-            "bash 退出码 {code}\nstdout:\n{stdout_str}\nstderr:\n{stderr_str}"
-        ))
-    }
-}
-
-/// Drain a capped read task within the IO drain deadline. Returns an empty
-/// string when the deadline is missed (grandchildren may hold the pipe open).
-async fn drain(task: tokio::task::JoinHandle<(String, bool)>) -> (String, bool) {
-    match tokio::time::timeout(Duration::from_millis(IO_DRAIN_TIMEOUT_MS), task).await {
-        Ok(Ok(v)) => v,
-        _ => (String::new(), false),
-    }
-}
-
-/// Read up to `max` bytes from `r`; the boolean signals whether more was dropped.
-async fn read_capped<R>(mut r: R, max: usize) -> (String, bool)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt as _;
-    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-    let mut chunk = [0u8; 8192];
-    let mut truncated = false;
-    loop {
-        let n = match r.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        if buf.len() + n <= max {
-            buf.extend_from_slice(&chunk[..n]);
-        } else {
-            let take = max - buf.len();
-            buf.extend_from_slice(&chunk[..take]);
-            truncated = true;
-            break;
-        }
-    }
-    (String::from_utf8_lossy(&buf).into_owned(), truncated)
-}
-
-/// Append a truncation notice when the captured stream exceeded the byte cap.
-fn with_truncation_note(s: &str, truncated: bool) -> String {
-    if truncated {
-        format!(
-            "{s}\n... [output truncated: cap {} bytes]",
-            BASH_OUTPUT_MAX_BYTES
-        )
-    } else {
-        s.to_string()
-    }
-}
-
-/// Signal an entire process group. The child was made a session leader via
-/// `setsid`, so its pgid equals its pid; `kill(-pid, sig)` reaches the group.
-#[cfg(unix)]
-fn kill_process_group(pid: u32, sig: i32) {
-    // Best-effort: the group may already be gone by the time we escalate.
-    unsafe {
-        let _ = libc::kill(-(pid as libc::pid_t), sig);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_pid: u32, _sig: i32) {}
-
 // ─── grep ─────────────────────────────────────────────────────────────────
 
 pub struct GrepTool {
@@ -814,7 +565,7 @@ pub fn default_registry(cwd: PathBuf) -> ToolRegistry {
     reg.register(std::sync::Arc::new(WriteFileTool) as AnyAgentTool);
     reg.register(std::sync::Arc::new(EditFileTool) as AnyAgentTool);
     reg.register(std::sync::Arc::new(ListDirectoryTool { cwd: cwd.clone() }) as AnyAgentTool);
-    reg.register(std::sync::Arc::new(BashTool { cwd: cwd.clone() }) as AnyAgentTool);
+    reg.register(std::sync::Arc::new(bash::BashTool::new(cwd.as_ref().clone())) as AnyAgentTool);
     reg.register(std::sync::Arc::new(GrepTool { cwd: cwd.clone() }) as AnyAgentTool);
     reg.register(std::sync::Arc::new(GlobTool { cwd }) as AnyAgentTool);
     reg
@@ -862,84 +613,5 @@ mod tests {
         assert_eq!(persist("", false, false, true), "");
         // BOM is re-prepended.
         assert_eq!(persist("x", false, true, false), "\u{feff}x");
-    }
-
-    // ── bash harness ──
-    // These exercise `run_bash` directly (no gpui App) so the process-group
-    // spawn, timeout escalation, and cancellation paths are covered.
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bash_success_returns_stdout() {
-        let out = run_bash("printf hello", &PathBuf::from("."), None, CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(out, "hello");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bash_nonzero_exit_is_error_with_code() {
-        let err = run_bash("exit 7", &PathBuf::from("."), None, CancellationToken::new())
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("退出码 7"), "got: {msg}");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bash_timeout_kills_command() {
-        let start = std::time::Instant::now();
-        let err = run_bash(
-            "sleep 30",
-            &PathBuf::from("."),
-            Some(1),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-        // The 1s timeout must reap the process, not wait out the full 30s sleep.
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(10),
-            "elapsed {:?}",
-            start.elapsed()
-        );
-        let msg = err.to_string();
-        assert!(msg.contains("超时"), "got: {msg}");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bash_cancel_aborts_command() {
-        let cancel = CancellationToken::new();
-        let cancel2 = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            cancel2.cancel();
-        });
-        let err = run_bash("sleep 30", &PathBuf::from("."), Some(60), cancel)
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("取消"), "got: {msg}");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bash_timeout_reaps_orphaned_grandchild() {
-        // `sleep 30 &` detaches a grandchild from the foreground group only if
-        // the shell doesn't put it in its own group; with setsid the whole tree
-        // shares one group, so the timeout's group-kill must reach it. We can't
-        // observe the grandchild directly, but the turn must not block past the
-        // timeout waiting on a pipe the grandchild keeps open.
-        let start = std::time::Instant::now();
-        let _ = run_bash(
-            "sleep 30 & wait",
-            &PathBuf::from("."),
-            Some(1),
-            CancellationToken::new(),
-        )
-        .await;
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(10),
-            "elapsed {:?}",
-            start.elapsed()
-        );
     }
 }
