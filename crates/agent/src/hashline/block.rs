@@ -64,10 +64,11 @@ pub fn resolve_block_range(
         .ok_or(BlockError::NotABlock { line: start_line })?;
 
     let opener_net = net_balance(lines[opener_idx]);
-    if opener_net == 0 {
-        // No bracket activity on the opener line — either a single-line statement
-        // or an indentation-language block. Distinguish by content shape.
-        if looks_like_indent_block(lines, opener_idx) {
+    if opener_net <= 0 {
+        // A block opener must open brackets on its first line. A bare closer
+        // (net < 0) or a net-neutral line is not a block start; the latter may
+        // still be an indentation-language block, which gets a more specific error.
+        if opener_net == 0 && looks_like_indent_block(lines, opener_idx) {
             return Err(BlockError::UnsupportedLanguage {
                 line: opener_idx + 1,
             });
@@ -230,5 +231,16 @@ mod tests {
         let land = block_post_insertion_line(&src, 1).unwrap();
         // End is line 3 (`}`); insert after it → line 4.
         assert_eq!(land, 3);
+    }
+
+    #[test]
+    fn bare_closer_anchor_rejected() {
+        // Anchoring `.BLK` on a bare `}` (net < 0) must not scan forward and
+        // mistake `}` + the next opener as a block.
+        let src = lines("}\nfn a() {\n    x();\n}");
+        assert_eq!(
+            resolve_block_range(&src, 1),
+            Err(BlockError::NotABlock { line: 1 })
+        );
     }
 }
