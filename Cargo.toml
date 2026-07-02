@@ -9,7 +9,7 @@
 #
 # gpui 相关依赖严格对齐 gpui-component 锁定的 zed rev，保证 gpui 单一版本。
 [workspace]
-members = ["crates/agent", "crates/agent-ui", "crates/manox"]
+members = ["crates/agent", "crates/agent-ui", "crates/manox", "crates/rich_text"]
 resolver = "2"
 
 [workspace.package]
@@ -37,28 +37,44 @@ grep-regex = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# GPUI 栈 —— rev 必须与 gpui-component 锁定值一致（1d217ee...）
+# GPUI 栈 —— git 仓库地址（规则允许）。gpui-component 锁定 zed rev 1d217ee，三者必须一致。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 
-# gpui-component（longbridge）
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
+# gpui-component（longbridge）—— git rev a9a7341（upstream main HEAD，2026-07-02）
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "a9a7341c35b62f27ff512371c62419342264710c" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "a9a7341c35b62f27ff512371c62419342264710c" }
 
-# gpui-rich-text：gpui-component 仓库内 crates/rich_text（RichTextState + RichTextEditor）。
-# 上游目前未把此 crate 加入 workspace members 也未发布，故用 path 依赖指向本地克隆。
-# 要求 `~/projects/gpui-project/gpui-component` 与本仓平级存在；待上游发布后改成 git rev 依赖。
-gpui-rich-text = { path = "../../gpui-project/gpui-component/crates/rich_text" }
+# gpui-rich-text —— manox first-party crate（作者本人代码，并入 workspace 自维护）。
+# 官方 gpui-component 仓库无此 crate，故作为 manox 成员引入，非第三方依赖。
+gpui-rich-text = { path = "crates/rich_text" }
 
-# gpui-rich-text 的 workspace 间接依赖：ropey + sum-tree(zed-sum-tree)。
-# 版本与 gpui-component workspace 中一致 —— rich_text 的 `gpui.workspace = true` /
-# `ropey.workspace = true` / `sum-tree.workspace = true` 解析依赖这两个。
+# rich_text 依赖（与 gpui-component main 的 workspace.dependencies 对齐）
 ropey = { version = "=2.0.0-beta.1", features = ["metric_lines_lf", "metric_utf16"] }
 sum-tree = { version = "0.2.0", package = "zed-sum-tree" }
 
-# psm 用 stacker 的版本（对齐 gpui-component，WASM 支持更好；桌面构建同样无害）
+# psm 用 stacker 的版本（对齐 gpui-component）
 [patch.crates-io]
 psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
+
+# rich_text 作为 workspace 成员继承此 clippy 表（与 gpui-component main 对齐，避免 clippy 噪音）。
+# agent / agent-ui / manox 用各自 inline [lints.clippy]，不继承，不受影响。
+[workspace.lints.clippy]
+almost_complete_range = "allow"
+arc_with_non_send_sync = "allow"
+borrowed_box = "allow"
+dbg_macro = "deny"
+let_underscore_future = "allow"
+manual_is_multiple_of = "allow"
+map_entry = "allow"
+module_inception = "allow"
+non_canonical_partial_ord_impl = "allow"
+reversed_empty_ranges = "allow"
+single_range_in_vec_init = "allow"
+style = { level = "allow", priority = -1 }
+todo = "deny"
+too_many_arguments = "allow"
+type_complexity = "allow"
 
 # gpui 在 debug 下也需要 opt-level 3，否则渲染极慢（对齐 gpui-component）
 [profile.dev.package]

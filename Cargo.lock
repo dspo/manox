@@ -2304,7 +2304,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.18",
- "windows 0.62.2",
+ "windows 0.57.0",
 ]
 
 [[package]]
@@ -2412,7 +2412,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/longbridge/gpui-component?rev=1505b1487131adbb443f6c69e87847db35bfa2d1#1505b1487131adbb443f6c69e87847db35bfa2d1"
+source = "git+https://github.com/longbridge/gpui-component?rev=a9a7341c35b62f27ff512371c62419342264710c#a9a7341c35b62f27ff512371c62419342264710c"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2462,7 +2462,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component?rev=1505b1487131adbb443f6c69e87847db35bfa2d1#1505b1487131adbb443f6c69e87847db35bfa2d1"
+source = "git+https://github.com/longbridge/gpui-component?rev=a9a7341c35b62f27ff512371c62419342264710c#a9a7341c35b62f27ff512371c62419342264710c"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2476,7 +2476,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component?rev=1505b1487131adbb443f6c69e87847db35bfa2d1#1505b1487131adbb443f6c69e87847db35bfa2d1"
+source = "git+https://github.com/longbridge/gpui-component?rev=a9a7341c35b62f27ff512371c62419342264710c#a9a7341c35b62f27ff512371c62419342264710c"
 dependencies = [
  "proc-macro2",
  "quote",

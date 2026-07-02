@@ -125,9 +125,11 @@ crates/
 
 ## GPUI 依赖版本锁定
 
-- gpui 和 gpui_platform 的 rev 必须与 gpui-component 锁定的 zed rev 一致（当前 `1d217ee39d381ac101b7cf49d3d22451ac1093fe`）
-- gpui-component 和 gpui-component-assets 的 rev 必须一致（当前 `1505b1487131adbb443f6c69e87847db35bfa2d1`）
-- `psm` crate 被 patch 到 stacker 的 master 分支（对齐 gpui-component）
+- GPUI 栈走 git 仓库地址（规则允许，crates.io 无 gpui-component）：`gpui` / `gpui_platform` pin 到 zed rev `1d217ee39d381ac101b7cf49d3d22451ac1093fe`；`gpui-component` / `gpui-component-assets` pin 到 longbridge rev `a9a7341c35b62f27ff512371c62419342264710c`（upstream main HEAD，2026-07-02）
+- gpui-component 锁定 zed rev `1d217ee`，三者（gpui / gpui_platform / gpui-component）必须一致，单一 gpui 版本
+- `gpui-rich-text` 是 manox first-party crate（`crates/rich_text`，workspace 成员）：官方 gpui-component 仓库无此 crate，作者本人代码并入自维护
+- `ropey`、`sum-tree`（`zed-sum-tree`）随 rich_text 引入，版本与 gpui-component main 对齐
+- `psm` patch 到 stacker master 分支（对齐 gpui-component）
 - 所有 gpui 相关依赖在 debug 下 opt-level=3，否则渲染极慢
 
 ## 运行时配置
@@ -140,6 +142,7 @@ crates/
 
 - **技术选型喜新厌旧**：能选择最新稳定版就选最新稳定版。依赖、工具链、API 都优先用最新的 stable release。
 - **禁止 vendor / submodule 依赖**：所有依赖通过包管理器（Cargo）声明，不允许 vendor 目录或 git submodule 引入第三方代码。
+- **crate 依赖只认 crate 索引或 git 仓库地址**：引用外部 crate 时，依赖声明只能是 crates.io 版本（crate 索引）或 `git = "..."` 仓库地址，禁止用 `path = "..."` 指向开发者本机文件系统路径（CI 无法复现、不可移植）。workspace 内部成员间的 `path` 引用除外（属于同一仓库，可移植）。
 - **只允许单二进制、单进程交付**：最终产物是一个二进制文件，运行时只有一个进程。不允许拆分多个独立可执行文件或需要多进程协作。
 - **PR 提交后与 remora 达成一致**：先提交 PR，再运行 `/remora:adversarial-review [prompt]`，与 remora 多轮交锋直到双方达成一致后再合并。
 - **禁止抄袭第三方 crate 代码**：若想引入第三方 crate 的特性，应规范引入该 crate 作为依赖。对于不便规范引入的（过重、未暴露相关接口、archived 等），可以参考其架构思想、设计思路、实现方法，但禁止抄袭代码（复制粘贴后修改）。

@@ -1,6 +1,6 @@
 //! Markdown syntax auto-conversion glue.
 //!
-//! `RichTextState` (gpui-component `crates/rich_text`) has no built-in markdown
+//! `RichTextState` (manox first-party `gpui-rich-text` crate) has no built-in markdown
 //! recognition — typing `# ` inserts a literal `#`. This module watches the
 //! editor state and, when the (single-line) document starts with a complete
 //! markdown prefix, strips the prefix and flips the block kind via
