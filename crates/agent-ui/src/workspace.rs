@@ -14,7 +14,7 @@ use agent::language_model::StopReason;
 use agent::provider::registry;
 use gpui::{AnyElement, Context, Entity, Render, Subscription, Window, prelude::*, px};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     list::ListItem,
@@ -62,12 +62,11 @@ impl Workspace {
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .code_editor("markdown")
                 .line_number(false)
                 .folding(false)
-                .rows(3)
+                .rows(4)
                 .submit_on_enter(true)
-                .placeholder("给 agent 发消息…（Enter 发送，Shift+Enter 换行，Cmd-Shift-E 打开编辑器）")
+                .placeholder("输入消息…")
         });
 
         let editor_state = cx.new(|cx| {
@@ -517,6 +516,81 @@ impl Workspace {
                 .into_any_element(),
         )
     }
+
+    /// Composer row: a rounded container with `+` (reserved, disabled), `Input`, and a circular send/stop button.
+    fn render_composer(&self, running: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .w_full()
+            .items_end()
+            .gap_2()
+            .p_2()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary)
+            .child(
+                Button::new("composer-plus")
+                    .ghost()
+                    .icon(IconName::Plus)
+                    .disabled(true),
+            )
+            .child(gpui::div().flex_1().child(Input::new(&self.input_state)))
+            .child(self.render_send_button(running, cx))
+            .into_any_element()
+    }
+
+    /// Circular icon-only send/stop button.
+    ///
+    /// Reuses `Button` for built-in focus ring, keyboard activation, and disabled handling;
+    /// `.rounded(px(16.))` renders the button as a 32px disc.
+    fn render_send_button(&self, running: bool, cx: &mut Context<Self>) -> AnyElement {
+        Button::new("send-btn")
+            .icon(if running { IconName::Pause } else { IconName::ArrowUp })
+            .when(running, |b| b.danger())
+            .when(!running, |b| b.primary())
+            .rounded(px(16.))
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.thread.read(cx).is_running() {
+                    this.cancel_turn(cx);
+                } else {
+                    this.submit_input(window, cx);
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// Chip row: a plain `cwd` label on the left, model selector on the right.
+    fn render_chip_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .w_full()
+            .items_center()
+            .child(self.render_cwd_chip(theme))
+            .child(gpui::div().flex_1())
+            .child(self.render_model_selector(theme, cx))
+            .into_any_element()
+    }
+
+    /// Static label of the current working directory's basename.
+    ///
+    /// Rendered as a plain `div` (not `Button`) until a directory-switcher popover exists; an
+    /// unclickable `Button` would invite clicks that do nothing.
+    fn render_cwd_chip(&self, theme: &Theme) -> AnyElement {
+        let name = self
+            .cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| *s != ".")
+            .unwrap_or("project");
+        gpui::div()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(name.to_string())
+            .into_any_element()
+    }
 }
 
 impl Render for Workspace {
@@ -524,7 +598,6 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         let model_label = self.model_label(cx);
         let running = self.thread.read(cx).is_running();
-        let model_selector = self.render_model_selector(&theme, cx);
 
         let items: Vec<_> = self
             .conversation
@@ -638,7 +711,7 @@ impl Render for Workspace {
                             .overflow_y_scroll()
                             .children(items.into_iter().map(centered)),
                     )
-                    // Input area: statusline (model selector + running indicator) + editor row
+                    // Input area: composer (rounded container with input + actions) + chip row
                     .child(
                         v_flex()
                             .w_full()
@@ -646,62 +719,8 @@ impl Render for Workspace {
                             .gap_2()
                             .border_t_1()
                             .border_color(theme.border)
-                            // Statusline: model chip on the left, running indicator on the right
-                            .child(centered(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .child(model_selector)
-                                    .child(gpui::div().flex_1())
-                                    .when(running, |this| {
-                                        this.child(
-                                            h_flex()
-                                                .gap_1()
-                                                .items_center()
-                                                .child(
-                                                    Icon::new(IconName::LoaderCircle)
-                                                        .xsmall()
-                                                        .text_color(theme.muted_foreground),
-                                                )
-                                                .child(
-                                                    gpui::div()
-                                                        .text_xs()
-                                                        .text_color(theme.muted_foreground)
-                                                        .child("思考中…"),
-                                                ),
-                                        )
-                                    }),
-                            ))
-                            // Editor row
-                            .child(centered(
-                                h_flex()
-                                    .w_full()
-                                    .gap_2()
-                                    .items_end()
-                                    .child(
-                                        gpui::div().flex_1().child(Input::new(&self.input_state)),
-                                    )
-                                    .child(if running {
-                                        Button::new("stop")
-                                            .ghost()
-                                            .small()
-                                            .label("停止")
-                                            .icon(IconName::Pause)
-                                            .on_click(cx.listener(|this, _, _window, cx| {
-                                                this.cancel_turn(cx);
-                                            }))
-                                            .into_any_element()
-                                    } else {
-                                        Button::new("send")
-                                            .primary()
-                                            .small()
-                                            .label("发送")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.submit_input(window, cx);
-                                            }))
-                                            .into_any_element()
-                                    }),
-                            )),
+                            .child(centered(self.render_composer(running, &theme, cx)))
+                            .child(centered(self.render_chip_row(&theme, cx))),
                     )
                     // Approval overlay (if any)
                     .children(overlay),
