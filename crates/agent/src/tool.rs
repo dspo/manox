@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gpui::{App, Task};
+use tokio_util::sync::CancellationToken;
 
 use crate::language_model::LanguageModelRequestTool;
 
@@ -29,8 +30,16 @@ pub trait AgentTool: Send + Sync + 'static {
     fn requires_approval(&self) -> bool {
         false
     }
-    /// Run the tool. `Ok(output)` is a normal output string; `Err(output)` is an error output string (still fed back to the model).
-    fn run(&self, input: serde_json::Value, cx: &mut App) -> Task<Result<String, String>>;
+    /// Run the tool. `cancel` is the current turn's cancellation token; long-running
+    /// tools (e.g. `bash`) select on it so a user-initiated stop reaps the work
+    /// promptly. `Ok(output)` is a normal output string; `Err(output)` is an error
+    /// output string (still fed back to the model).
+    fn run(
+        &self,
+        input: serde_json::Value,
+        cancel: CancellationToken,
+        cx: &mut App,
+    ) -> Task<Result<String, String>>;
 }
 
 pub type AnyAgentTool = Arc<dyn AgentTool>;
