@@ -6,6 +6,11 @@
 //! - Assistant: a full-width block with a role label + markdown body.
 //! - Reasoning: a collapsible block, indented secondary text with a left border.
 //! - ToolCall: a card with title + status icon + monospace output.
+//!
+//! Streaming assistant / reasoning bodies render as plain `div` (no markdown
+//! re-parse on every token) and only switch to `TextView::markdown` once the
+//! stream ends. The expensive markdown layout + text shaping on every delta
+//! is what produced the visible item overlap and made scrolling feel sticky.
 
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, px};
@@ -72,11 +77,6 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
 
 /// Render an assistant message: role label + copy button + markdown body. `role` is the model display name (dynamic).
 pub fn render_assistant(text: &str, streaming: bool, ix: usize, role: &str, theme: &Theme) -> gpui::AnyElement {
-    let shown = if streaming {
-        format!("{text}▌")
-    } else {
-        text.to_string()
-    };
     v_flex()
         .w_full()
         .gap_2()
@@ -94,12 +94,37 @@ pub fn render_assistant(text: &str, streaming: bool, ix: usize, role: &str, them
                 .child(gpui::div().flex_1())
                 .child(copy_button(ix, "copy-assistant", text.to_string())),
         )
-        .child(
-            gpui::div()
-                .text_sm()
-                .child(TextView::markdown(("assistant", ix), shown).selectable(true)),
-        )
+        .child(render_text_body(text, streaming, ("assistant", ix), theme))
         .into_any_element()
+}
+
+/// Render the assistant / reasoning body. While the stream is live we paint a
+/// plain text run — markdown re-parse and shaped text layout on every token
+/// delta was the source of the visible item overlap and the scroll-jank.
+/// When the stream ends we mount `TextView::markdown` once for selection +
+/// rendering of headings, lists, and code blocks.
+fn render_text_body(
+    text: &str,
+    streaming: bool,
+    id: impl Into<gpui::ElementId> + Clone,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    if streaming {
+        let shown = format!("{text}▌");
+        gpui::div()
+            .id(id.clone())
+            .text_sm()
+            .whitespace_normal()
+            .text_color(theme.foreground)
+            .child(shown)
+            .into_any_element()
+    } else {
+        gpui::div()
+            .id(id.clone())
+            .text_sm()
+            .child(TextView::markdown(id, text.to_string()).selectable(true))
+            .into_any_element()
+    }
 }
 
 /// Render a reasoning (thinking) block: expanded while streaming, collapsed when done, with a copy button.
@@ -123,6 +148,7 @@ pub fn render_reasoning(text: &str, ix: usize, streaming: bool, theme: &Theme) -
             .child(copy_button(ix, "copy-reasoning", text.to_string())),
     );
     if !collapsed {
+        let body = render_text_body(text, streaming, ("reasoning", ix), theme);
         block = block.child(
             gpui::div()
                 .pl_3()
@@ -130,7 +156,7 @@ pub fn render_reasoning(text: &str, ix: usize, streaming: bool, theme: &Theme) -
                 .border_color(theme.border)
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child(TextView::markdown(("reasoning", ix), text.to_string()).selectable(true)),
+                .child(body),
         );
     }
     block.into_any_element()
