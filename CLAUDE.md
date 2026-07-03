@@ -65,16 +65,15 @@ crates/
 
 - `paths.rs` — 统一的配置目录 helper：`cx_config_dir()`（`$HOME/.config/cx`）/ `manox_config_dir()`（`$HOME/.config/cx/manox`）/ `agents_dir()`（`…/manox/agents`）。HOME 缺失时 warn 并回退到 CWD。
 
+- `hashline/` — 行号锚定编辑系统，供 `read_file` / `edit_file` 工具使用。`read_file` 对文件内容计算 4-hex 快照 tag 并编号输出；`edit_file` 解析 `SWAP`/`DEL`/`INS` 指令 patch，验证 tag 仍然匹配实时文件后反向应用（`apply.rs`）。tag 过期时触发 3-way merge 恢复（`recovery.rs`）。全局状态 `OnceLock<Mutex<SnapshotStore>>`（`snapshot.rs`），`init()` 在 `agent::init` 中调用。`block.rs` 处理 bracket-block 操作，`parser.rs` 解析 patch 语法，`hash.rs` 计算内容 hash。
 - `agent_def.rs` — 子 agent 定义加载层。从 `agents_dir()/*.md` 读取 frontmatter（`name`/`description`/`tools`/`disallowed_tools`/`model`/`max_turns`/`allow_nesting`）+ markdown 正文（system prompt），`AgentDefinitionRegistry`（`OnceLock` 全局，`init` 时加载，缺文件/解析失败 warn 跳过）。`tools`/`disallowed_tools` 不影响 `agent` 工具本身（仅 `allow_nesting` + 深度上限控制嵌套）。
 
-- `provider/` — LLM provider 集成：
-  - `config.rs` — 解析 `~/.config/cx/cx.providers.config.yaml`，产出 `ResolvedModel`（provider + endpoint + wire_api + auth 完全解析）。支持 `WireApi::Anthropic` / `Responses` / `Completions`。
+- `provider/` — LLM provider 集成。Provider 配置解析由外部 `cx-providers` crate 完成（单一事实来源，与 `cx` 共享），类型通过 `provider/mod.rs` re-export（`CxConfig`、`ResolvedModel`、`WireApi`、`resolve_apikey` 等）。
   - `registry.rs` — `ProviderRegistry`（`OnceLock` 全局），启动时加载 config，按 wire_api 构造对应 `LanguageModel` 实现。
   - `anthropic.rs` — Anthropic Messages API 流式客户端（SSE 解析 + `AnthropicEventMapper`）。
   - `completions.rs` — OpenAI Chat Completions wire（仅文本流式，不映射工具/thinking）。
   - `responses.rs` — OpenAI Responses wire（仅文本流式）。
   - `sse.rs` — 通用 SSE 行解析（`data:` 前缀剥离）。
-  - `api_key.rs` — 支持 `keychain:SERVICE` / `env:VAR` / `literal:...` / `$(shell ...)` 四种源。
 
 - `tool.rs` + `tool/permission.rs` — `AgentTool` trait + `ToolRegistry` + `PermissionCache`（会话级 always-allow），`PermissionDecision::AllowOnce | AlwaysAllow | Deny`，`ToolAuthorizationResponse`（审批载荷：`Decision(PermissionDecision)` 或 `AskUserQuestion { answers, response }`，后者由 thread 短路为 ToolResult，不经 `run` 执行）。
 
@@ -90,19 +89,31 @@ crates/
 
 ### agent-ui crate（`crates/agent-ui/`）
 
-- `workspace.rs` — `Workspace` 顶层视图，持有 `Entity<Thread>` + `Entity<Sidebar>` + `ConversationState`，`cx.subscribe` 处理 `ThreadEvent`（文本/思考/工具增量交给 `ConversationState`，`ToolCallAuthorization` 弹审批 overlay，`Stop` 终态触发 `save_thread` 落盘）。
+- `workspace.rs` — `Workspace` 顶层视图，持有 `Entity<Thread>` + `Entity<Sidebar>` + `ConversationState`，`cx.subscribe` 处理 `ThreadEvent`（文本/思考/工具增量交给 `ConversationState`，`ToolCallAuthorization` 弹审批 overlay，`Stop` 终态触发 `save_thread` 落盘）。支持 `view_mode` 切换：`Conversation` 主视图 ↔ `Settings` 覆盖层（滑入/滑出动画）。
 
-- `conversation.rs` — `ConversationState`，从 `ThreadEvent` 增量构建扁平 `ConvItem` 列表（`User | Assistant | Reasoning | ToolCall | Error`）。`rebuild_from_messages` 从 Thread 规范消息列表重建视图（加载历史时用）。
+- `conversation.rs` — `ConversationState`，从 `ThreadEvent` 增量构建扁平 `ConvItem` 列表（`User | Assistant | Reasoning | ToolCall | AgentTask | Error`）。`rebuild_from_messages` 从 Thread 规范消息列表重建视图（加载历史时用）。
+
+- `dispatch.rs` — 进程全局句柄（`OnceLock<Entity<Workspace>>` + `OnceLock<WindowHandle<Root>>`），供 macOS 系统菜单项等 App 级 `on_action` handler 从视图树外部触达 Workspace。`main.rs` 在窗口创建后注册。
 
 - `views/sidebar.rs` — `Sidebar` Entity，订阅 `ThreadStore`，列出历史 Threads，发 `SidebarEvent`（NewThread / OpenThread / DeleteThread）。
 
-- `views/message.rs` — 单条消息渲染：User 块内右对齐卡片、Assistant Markdown + 复制按钮、Reasoning 可折叠、ToolCall 卡片（状态图标 + 等宽输出）、Error 卡片。
+- `views/message.rs` — 单条消息渲染：User 块内右对齐卡片、Assistant Markdown + 复制按钮、Reasoning 可折叠、ToolCall 卡片（状态图标 + 等宽输出）、AgentTask 子 agent 卡片（展开/折叠）、Error 卡片。
 
-- `views/mod.rs` — `centered()` 辅助函数（全宽居中限宽 760px）。
+- `views/composer_menu.rs` — 输入框 `+` 和 `⁄` 弹出菜单（对标 Codex.app），含文件附件（`PendingAttachment`，图片→base64 Image block，文本→`<file>` 标签内联）。
+
+- `views/settings.rs` — `SettingsView` Entity + `SettingsEvent`，同窗口覆盖层（左侧分组列表 + 右侧 "Coming soon…" 占位），通过 `Workspace::view_mode` 切换。
+
+- `views/mod.rs` — `centered()` 辅助函数（全宽居中限宽 760px）+ `CONTENT_MAX_W` 常量。
 
 ### manox crate（`crates/manox/`）
 
-- `main.rs` — 薄 bin：初始化 tracing → `gpui_component::init` → `agent::init`（注册 tokio runtime + ProviderRegistry + ThreadStore）→ 创建窗口 1100×760 → `agent_ui::Workspace` + `Root`。绑定 `cmd-q` / `alt-f4` 退出、`cmd-ctrl-f`（mac）/ `f11`（其他）切换全屏。
+- `main.rs` — 薄 bin：初始化 tracing → `gpui_component::init` → `agent::init`（注册 tokio runtime + ProviderRegistry + ThreadStore + hashline snapshot store + AgentDefinitionRegistry）→ 创建窗口 1100×760 → `agent_ui::Workspace` + `Root` + `dispatch` 注册。绑定 `cmd-q` / `alt-f4` 退出、`cmd-ctrl-f`（mac）/ `f11`（其他）切换全屏、`cmd-,`（mac）/ `ctrl-,`（其他）打开 Settings 覆盖层、`ctrl-g` 切换 markdown composer、`cmd-shift-p`（mac）/ `ctrl-shift-p`（其他）切换编辑器预览、`cmd-w`（mac）/ `ctrl-w`（其他）关闭编辑器。macOS 菜单栏含 Settings… 和 Quit 项。
+
+- `resources/` — 应用图标（`app-icon.icns`、`app-icon.png`、`app-icon@2x.png`）+ `manox.entitlements`（codesign 用）。
+
+### 构建脚本
+
+- `script/bundle-mac` — macOS `.app` bundle 打包脚本。从 `crates/manox/Cargo.toml` 的 `[package.metadata.bundle]` 读取元数据，编译 binary → 组装 `.app` → 写入 `Info.plist` → ad-hoc / Apple Developer codesign。支持 `-d`（debug）、`-o`（open）、`-i`（install to /Applications）选项。
 
 ## 关键设计模式
 
@@ -116,12 +127,15 @@ crates/
 - `Thread` emits `ThreadEvent`（UI 订阅增量渲染）
 - `ThreadStore` emits `ThreadStoreEvent::SummariesUpdated`（Sidebar 订阅刷新）
 - `Sidebar` emits `SidebarEvent`（Workspace 订阅响应操作）
+- `SettingsView` emits `SettingsEvent`（Workspace 订阅 Exit 切换回会话视图）
 
 ### 全局单例（OnceLock）
 
 - `runtime::handle()` — tokio Handle
 - `provider::registry::global()` — ProviderRegistry
 - `thread_store::global()` — ThreadStore Entity
+- `hashline::global()` — SnapshotStore（`Mutex<SnapshotStore>`，`read_file`/`edit_file` 工具共用）
+- `agent_def::registry()` — AgentDefinitionRegistry（子 agent 定义）
 
 ### Tool 执行模式
 
@@ -141,26 +155,23 @@ crates/
 - **完成信号**：`setup_child` 订阅只对真终态（`Stop(EndTurn|MaxTokens|Refusal)` + `Error`）发 `done_tx`；`Stop(ToolUse)` 是非终端中间态（子下一轮继续跑工具），忽略之，否则会把子第一轮未跑工具的文本当成最终结果回传父。
 - **快照与持久化**：子结束后，`agent` 工具把 JSON envelope `{"final":..., "messages":[...]}` 作为 ToolResult.content 写入规范 `Thread::messages`——这是子对话的**唯一来源**（不另存内存 map，长会话无泄漏）。UI live 路径从 `ThreadEvent::ToolResult` 的 `output` 用 `agent_sub_messages` 解析喂展开面板；reload 路径从 `rebuild_from_messages` 同样解析 envelope 还原 `sub_messages`。**上下文隔离**：`build_completion_request` 在映射到模型请求时用 `model_facing_content` 把 `agent` 的 ToolResult envelope 剥成只 `final` 文本——规范消息保留完整 envelope（持久化+UI 用），但父 LLM 只看到 `final`，子 agent 的中间工具调用/结果/reasoning 不泄漏进父上下文。
 - **UI**：`ConvItem::AgentTask` 渲染子 agent 卡片（标题=subagent_type+title、状态图标、chevron 展开/折叠）。折叠态显示 `sub_text` live tail；展开态用 `ConversationState::rebuild_from_messages(&sub_messages)` 得临时 state 再递归 `render_item`（递归深度由 `MAX_DEPTH` 数据侧限）。`views/message.rs` 的 `render_agent_task`。
-
 ### tokio ↔ gpui 桥接（子 agent 侧）
 
 子 agent 的 `run_turn` 跑在父 turn 的 gpui task 内（非新 executor）；子内部工具经与主 Thread 相同的 `runtime::handle()` tokio 桥接。`agent` 工具 `run_streaming` 的 `cx.spawn` task `await` `done_rx`（`async_channel`，子终态触发），期间 `sink.try_emit` 把子 `AgentText`/`AgentThinking` 流式喂给父 tool 卡片。
 
 ## GPUI 依赖版本锁定
 
-- GPUI 栈走 git 仓库地址（规则允许，crates.io 无 gpui-component）：`gpui` / `gpui_platform` pin 到 zed rev `1d217ee39d381ac101b7cf49d3d22451ac1093fe`；`gpui-component` / `gpui-component-assets` pin 到 longbridge rev `a9a7341c35b62f27ff512371c62419342264710c`（upstream main HEAD，2026-07-02）
+- GPUI 栈走 git 仓库地址（规则允许，crates.io 无 gpui-component）：`gpui` / `gpui_platform` pin 到 zed rev `1d217ee39d381ac101b7cf49d3d22451ac1093fe`；`gpui-component` / `gpui-component-assets` pin 到 longbridge rev `1505b1487131adbb443f6c69e87847db35bfa2d1`（2026-07-02）
 - gpui-component 锁定 zed rev `1d217ee`，三者（gpui / gpui_platform / gpui-component）必须一致，单一 gpui 版本
-- `gpui-rich-text` 是 manox first-party crate（`crates/rich_text`，workspace 成员）：官方 gpui-component 仓库无此 crate，作者本人代码并入自维护
-- `ropey`、`sum-tree`（`zed-sum-tree`）随 rich_text 引入，版本与 gpui-component main 对齐
 - `psm` patch 到 stacker master 分支（对齐 gpui-component）
 - 所有 gpui 相关依赖在 debug 下 opt-level=3，否则渲染极慢
 
 ## 运行时配置
 
-- LLM 配置：`~/.config/cx/cx.providers.config.yaml`（格式见 `provider/config.rs` 的 `CxConfig`）
+- LLM 配置：`~/.config/cx/cx.providers.config.yaml`（格式由 `cx-providers` crate 定义，`CxConfig` 类型通过 `agent::provider` re-export）
 - SQLite 数据库：`~/.config/cx/manox/threads.db`
 - 子 agent 定义：`~/.config/cx/manox/agents/*.md`（frontmatter + system prompt，见 `agent_def.rs`）
-- API key 源：macOS Keychain（`keychain:SERVICE`）、环境变量（`env:VAR`）、字面量（`literal:...`）、shell 命令（`$(shell ...)`）
+- API key 源：macOS Keychain（`keychain:SERVICE`）、环境变量（`env:VAR`）、字面量（`literal:...`）、shell 命令（`$(shell ...)`）— 由 `cx-providers` crate 的 `resolve_apikey` 统一处理
 
 ## 项目规则
 
