@@ -126,14 +126,15 @@ fn render_text_body(
     theme: &Theme,
 ) -> gpui::AnyElement {
     if streaming {
-        // Stream cursor as a separate div to avoid corrupting Tree-sitter parse.
+        // Plain text div while streaming — no Tree-sitter involved, so cursor
+        // can stay inline without corrupting any parser.
+        let shown = format!("{text}▌");
         gpui::div()
             .id(id.clone())
             .text_sm()
             .whitespace_normal()
             .text_color(theme.foreground)
-            .child(text.to_string())
-            .child(gpui::div().text_color(theme.foreground).child("▌"))
+            .child(shown)
             .into_any_element()
     } else {
         gpui::div()

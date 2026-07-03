@@ -590,7 +590,7 @@ impl Workspace {
                                 .rounded(theme.radius)
                                 .bg(theme.secondary)
                                 .text_xs()
-                                .font_family(cx.theme().mono_font_family.clone())
+                                .font_family(theme.mono_font_family.clone())
                                 .text_color(theme.foreground)
                                 .child(summary),
                         )
