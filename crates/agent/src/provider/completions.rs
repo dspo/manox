@@ -71,8 +71,8 @@ impl LanguageModel for CompletionsModel {
     fn provider_name(&self) -> String {
         self.provider_name.clone()
     }
-    fn wire_api(&self) -> crate::provider::config::WireApi {
-        crate::provider::config::WireApi::Completions
+    fn wire_api(&self) -> crate::provider::WireApi {
+        crate::provider::WireApi::Completions
     }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
@@ -520,7 +520,7 @@ mod tests {
     use crate::language_model::{
         LanguageModelRequestMessage, LanguageModelRequestTool, LanguageModelToolResult,
     };
-    use crate::provider::config::WireApi;
+    use crate::provider::WireApi;
 
     fn req_with_tool() -> LanguageModelRequest {
         LanguageModelRequest {
@@ -678,7 +678,7 @@ mod tests {
         if std::env::var("MANOX_RUN_LIVE").is_err() {
             return;
         }
-        let config = crate::provider::config::CxConfig::load_default().expect("load config");
+        let config = crate::provider::CxConfig::load_default().expect("load config");
         let model = config
             .resolve_all_models()
             .into_iter()

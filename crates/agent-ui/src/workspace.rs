@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use agent::language_model::StopReason;
-use agent::provider::config::WireApi;
+use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{

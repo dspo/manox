@@ -11,9 +11,9 @@ use gpui::App;
 use crate::language_model::AnyLanguageModel;
 use crate::provider::anthropic::AnthropicModel;
 use crate::provider::completions::CompletionsModel;
-use crate::provider::config::{CxConfig, ResolvedModel, WireApi};
 use crate::provider::resolve_apikey;
 use crate::provider::responses::ResponsesModel;
+use crate::provider::{CxConfig, ResolvedModel, WireApi};
 
 /// Global provider registry.
 static REGISTRY: OnceLock<ProviderRegistry> = OnceLock::new();
