@@ -315,22 +315,16 @@ fn resolve_model(
 }
 
 /// The sub-agent's final result text: the last assistant message's first text
-/// block, falling back to the last text block of any role, then to a stated
-/// "no final message" note. Never returns an empty string so the parent model
-/// always receives a meaningful tool result (e.g. when the sub-agent hit the
-/// turn cap mid-tool-call and produced no closing assistant text).
+/// block, then a stated "no final message" note. Never returns an empty string
+/// so the parent model always receives a non-empty tool result. Does NOT fall
+/// back to non-assistant text (e.g. the parent's own prompt or the max-turns
+/// summary instruction): echoing those back as the sub-agent's "result" would
+/// mislead the parent model into thinking the sub-agent produced a reply.
 fn last_assistant_text(msgs: &[Message]) -> String {
     for m in msgs.iter().rev() {
         if m.role != Role::Assistant {
             continue;
         }
-        for c in &m.content {
-            if let MessageContent::Text(t) = c {
-                return t.clone();
-            }
-        }
-    }
-    for m in msgs.iter().rev() {
         for c in &m.content {
             if let MessageContent::Text(t) = c {
                 return t.clone();
@@ -532,12 +526,17 @@ mod tests {
     }
 
     #[test]
-    fn no_assistant_falls_back_to_last_text_then_note() {
-        // With no assistant message, the last text block of any role is used so
-        // the parent model still gets a meaningful result.
+    fn no_assistant_yields_sentinel_not_prompt() {
+        // With no assistant message, the sub-agent produced no reply. Return
+        // the honest sentinel rather than echoing the parent's own prompt (or
+        // the max-turns summary instruction) back as the "result" — that would
+        // mislead the parent model into thinking the sub-agent answered.
         let msgs = vec![Message::user("hi".to_string())];
-        assert_eq!(last_assistant_text(&msgs), "hi");
-        // Truly no text anywhere → a stated note, never an empty string.
+        assert_eq!(
+            last_assistant_text(&msgs),
+            "sub-agent ended without producing a final message"
+        );
+        // Truly no text anywhere → same sentinel, never an empty string.
         let msgs: Vec<Message> = vec![Message::user_with_content(vec![])];
         assert_eq!(
             last_assistant_text(&msgs),
