@@ -9,6 +9,12 @@
 //! callback is unreliable on macOS — it can point at a `WindowId` that the
 //! App's window map has not registered yet, surfacing as `Err(window not
 //! found)`).
+//!
+//! Both slots are populated exactly once for the single main window the
+//! process opens. If a future change ever supports multiple windows, the
+//! `OnceLock` registration will need to be replaced with a slot map keyed
+//! by `WindowId` and the App-level handler will need to pick the target
+//! window (e.g. from `cx.active_window()` after the deferred dispatch).
 
 use std::sync::OnceLock;
 

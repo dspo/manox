@@ -123,6 +123,12 @@ pub struct Workspace {
     /// Keeps `view_mode == Settings` mounted so the exit animation can play
     /// before the unmount; cleared when the slide-out completes.
     exiting_settings: bool,
+    /// Bumped on every transition into or out of Settings. Embedded in the
+    /// slide animation's element id so a fresh tween fires on each direction
+    /// change (an old id would replay from the cached delta and visibly
+    /// jump), and into the exit spawn so a stale unmount can be no-op'd
+    /// when a new enter supersedes it.
+    settings_transition_gen: u64,
     /// Lazily created on the first `enter_settings` call so we don't pay the
     /// cost when the user never opens Settings.
     settings_view: Option<Entity<SettingsView>>,
@@ -230,6 +236,7 @@ impl Workspace {
             stick_to_bottom: true,
             view_mode: ViewMode::default(),
             exiting_settings: false,
+            settings_transition_gen: 0,
             settings_view: None,
             settings_sub: None,
         };
@@ -322,7 +329,13 @@ impl Workspace {
             self.settings_sub = Some(sub);
         }
         self.view_mode = ViewMode::Settings;
+        // Clear any pending exit animation: clicking Settings… while the
+        // panel is still sliding out re-opens the overlay. Bumping the
+        // transition generation also retires the old exit spawn (it carries
+        // the previous gen and no-ops on stale state), and forces the slide
+        // animation to replay from the left edge.
         self.exiting_settings = false;
+        self.settings_transition_gen = self.settings_transition_gen.wrapping_add(1);
         cx.notify();
     }
 
@@ -334,16 +347,23 @@ impl Workspace {
         cx.subscribe(settings, |this, _settings, ev: &SettingsEvent, cx| {
             if matches!(ev, SettingsEvent::Exit) && !this.exiting_settings {
                 // Start the slide-out animation; the actual mode flip and
-                // unmount happen once the animation has finished.
+                // unmount happen once the animation has finished. The
+                // captured transition gen is the watermark for this exit
+                // attempt — if a new enter supersedes it before the timer
+                // fires, the spawn's update is a no-op.
                 this.exiting_settings = true;
+                this.settings_transition_gen = this.settings_transition_gen.wrapping_add(1);
                 cx.notify();
                 let entity = cx.entity().clone();
-                let timer_ms = SLIDE_OUT_MS + 20;
+                let exit_gen = this.settings_transition_gen;
                 cx.spawn(async move |_workspace, cx| {
                     cx.background_executor()
-                        .timer(std::time::Duration::from_millis(timer_ms))
+                        .timer(std::time::Duration::from_millis(SLIDE_OUT_MS + 20))
                         .await;
                     entity.update(cx, |this, cx| {
+                        if this.settings_transition_gen != exit_gen {
+                            return;
+                        }
                         this.view_mode = ViewMode::default();
                         this.exiting_settings = false;
                         cx.notify();
@@ -1422,13 +1442,21 @@ impl Render for Workspace {
                 .clone();
             // Horizontal slide: enter glides the panel in from the left edge
             // (offset -PANEL_W → 0), exit glides it out to the right
-            // (offset 0 → +PANEL_W). The two directions are driven by a
-            // different animation element id so `with_element_state` replays
-            // the tween from delta 0 each time the panel transitions.
+            // (offset 0 → +PANEL_W). The animation id mixes the current
+            // transition generation into the per-direction tag so a fresh
+            // tween fires on every direction change (a stable id would
+            // replay from the cached delta and visibly jump, and a
+            // direction change with the same id would not animate at all).
             let (anim_id, sign) = if self.exiting_settings {
-                ("settings-exit", 1.0)
+                (
+                    format!("settings-exit-{}", self.settings_transition_gen),
+                    1.0,
+                )
             } else {
-                ("settings-enter", -1.0)
+                (
+                    format!("settings-enter-{}", self.settings_transition_gen),
+                    -1.0,
+                )
             };
             let panel_w = px(280.0);
             let anim_el = gpui::div().size_full().child(settings).with_animation(

@@ -1,6 +1,7 @@
-//! Settings window — pixel-aligned to Codex.app's preferences panel.
-//!
-//! Static: no item is wired to behavior yet. The right pane is a `Coming soon…` placeholder.
+//! Settings overlay — a single-window alternative to opening a separate
+//! preferences window. Mounts inline over the Workspace via
+//! `Workspace::view_mode`; clicks on sidebar items update a local
+//! `selected` highlight and emit no further side effects yet.
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, Entity, EventEmitter, Render, SharedString,
