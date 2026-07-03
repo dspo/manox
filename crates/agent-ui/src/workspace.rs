@@ -8,15 +8,16 @@
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{
-    AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity, MouseButton,
-    MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, Subscription, Window, prelude::*,
-    px,
+    Animation, AnimationExt as _, AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent,
+    Entity, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent,
+    Subscription, Window, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -30,10 +31,12 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::OpenSettings;
 use crate::conversation::ConversationState;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
 };
+use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::views::{centered, message::render_item};
 
@@ -113,6 +116,27 @@ pub struct Workspace {
     /// Whether new content should keep the viewport pinned to the bottom.
     /// Reset to `false` by manual user scrolls that move the viewport away.
     stick_to_bottom: bool,
+    /// Top-level view mode. `Settings` replaces the entire window content
+    /// with the SettingsView overlay until the user requests exit.
+    view_mode: ViewMode,
+    /// Set briefly while the Settings overlay is sliding out to the right.
+    /// Keeps `view_mode == Settings` mounted so the exit animation can play
+    /// before the unmount; cleared when the slide-out completes.
+    exiting_settings: bool,
+    /// Lazily created on the first `enter_settings` call so we don't pay the
+    /// cost when the user never opens Settings.
+    settings_view: Option<Entity<SettingsView>>,
+    settings_sub: Option<Subscription>,
+}
+
+/// Top-level rendering mode of the Workspace window. The Settings overlay is
+/// the only non-default mode today; future overlays (e.g. About) can extend
+/// this enum rather than carrying parallel `bool` flags.
+#[derive(Default)]
+enum ViewMode {
+    #[default]
+    Workspace,
+    Settings,
 }
 
 /// Right-side composer width. Wide enough for rendered markdown
@@ -128,6 +152,14 @@ const EDITOR_DIVIDER_WIDTH: f32 = 6.;
 const SIDEBAR_WIDTH: f32 = 260.;
 /// Floor for the main column width when the editor pane is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
+
+/// Settings overlay slide duration. The enter animation glides the panel in
+/// from the left edge, the exit animation glides it out to the right.
+const SLIDE_MS: u64 = 180;
+/// The Exit handler in `subscribe_settings` waits this long before flipping
+/// `view_mode` back to `Workspace`, giving the exit animation time to play.
+/// Set slightly above `SLIDE_MS` so the last frame is not popped mid-tween.
+const SLIDE_OUT_MS: u64 = 200;
 
 /// Drag payload for the editor pane divider. Doubles as the invisible drag
 /// ghost view, mirroring Zed's `DraggedDock` pattern.
@@ -196,6 +228,10 @@ impl Workspace {
             editor_sub: None,
             scroll_handle: ScrollHandle::new(),
             stick_to_bottom: true,
+            view_mode: ViewMode::default(),
+            exiting_settings: false,
+            settings_view: None,
+            settings_sub: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
@@ -272,6 +308,49 @@ impl Workspace {
             SidebarEvent::NewThread => this.start_new_thread(cx),
             SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), cx),
             SidebarEvent::DeleteThread(id) => this.delete_thread(id.clone(), cx),
+        })
+    }
+
+    /// Switch into the Settings overlay. The Settings view is created lazily on
+    /// first entry; from then on the entity + subscription are reused so the
+    /// user's last selection (and any scroll position) survives re-entry.
+    pub fn enter_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_view.is_none() {
+            let settings = cx.new(|cx| SettingsView::new(window, cx));
+            let sub = self.subscribe_settings(&settings, cx);
+            self.settings_view = Some(settings);
+            self.settings_sub = Some(sub);
+        }
+        self.view_mode = ViewMode::Settings;
+        self.exiting_settings = false;
+        cx.notify();
+    }
+
+    fn subscribe_settings(
+        &self,
+        settings: &Entity<SettingsView>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(settings, |this, _settings, ev: &SettingsEvent, cx| {
+            if matches!(ev, SettingsEvent::Exit) && !this.exiting_settings {
+                // Start the slide-out animation; the actual mode flip and
+                // unmount happen once the animation has finished.
+                this.exiting_settings = true;
+                cx.notify();
+                let entity = cx.entity().clone();
+                let timer_ms = SLIDE_OUT_MS + 20;
+                cx.spawn(async move |_workspace, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(timer_ms))
+                        .await;
+                    entity.update(cx, |this, cx| {
+                        this.view_mode = ViewMode::default();
+                        this.exiting_settings = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
         })
     }
 
@@ -1332,6 +1411,36 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Settings overlay replaces the entire window content; the underlying
+        // Workspace state (sidebar, conversation, composer) is preserved and
+        // returns unchanged when the user clicks 返回应用.
+        if matches!(self.view_mode, ViewMode::Settings) {
+            let settings = self
+                .settings_view
+                .as_ref()
+                .expect("enter_settings must have created the SettingsView")
+                .clone();
+            // Horizontal slide: enter glides the panel in from the left edge
+            // (offset -PANEL_W → 0), exit glides it out to the right
+            // (offset 0 → +PANEL_W). The two directions are driven by a
+            // different animation element id so `with_element_state` replays
+            // the tween from delta 0 each time the panel transitions.
+            let (anim_id, sign) = if self.exiting_settings {
+                ("settings-exit", 1.0)
+            } else {
+                ("settings-enter", -1.0)
+            };
+            let panel_w = px(280.0);
+            let anim_el = gpui::div().size_full().child(settings).with_animation(
+                anim_id,
+                Animation::new(Duration::from_millis(SLIDE_MS)).with_easing(ease_out_quint()),
+                move |el, delta| {
+                    let offset = panel_w * sign * (1.0 - delta);
+                    el.relative().ml(offset)
+                },
+            );
+            return h_flex().size_full().child(anim_el);
+        }
         let theme = cx.theme().clone();
         let model_label = self.model_label(cx);
         let running = self.thread.read(cx).is_running();
@@ -1497,6 +1606,9 @@ impl Render for Workspace {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.enter_settings(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &crate::ToggleEditor, window, cx| {
                 this.toggle_editor(window, cx);
             }))
