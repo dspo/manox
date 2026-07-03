@@ -21,10 +21,14 @@ pub struct AgentDefinition {
     pub name: String,
     /// One-line description the parent model reads to decide when to delegate.
     pub description: String,
-    /// Tool whitelist. `None` = inherit all non-`agent` tools.
+    /// Tool whitelist. `None` = inherit all built-in tools. Does not affect the
+    /// `agent` tool — that is governed solely by `allow_nesting` (and the depth
+    /// cap), so listing `agent` here is a no-op and listing it in
+    /// `disallowed_tools` will not block nesting.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
     /// Tool blacklist. Takes precedence over `tools` when both are present.
+    /// Ignored for the `agent` tool (see `tools`).
     #[serde(default)]
     pub disallowed_tools: Option<Vec<String>>,
     /// Model id resolvable via `ProviderRegistry::get_model`. `None` = inherit

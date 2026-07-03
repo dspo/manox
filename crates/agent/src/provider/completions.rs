@@ -250,6 +250,9 @@ fn messages_to_openai(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
         }
 
         match m.role {
+            // Chat Completions wire carries the system prompt as a `system` role
+            // message — the standard slot for this API. (Responses wire lifts it
+            // to the top-level `instructions` field instead; see responses.rs.)
             Role::System => {
                 out.push(json!({"role": "system", "content": text_buf}));
             }

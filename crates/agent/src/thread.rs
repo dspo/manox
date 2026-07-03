@@ -519,6 +519,10 @@ impl Thread {
 
             // Approval-needed tools run one at a time; a cancelled turn or a
             // sibling error skips the rest (they are synthesized below).
+            // Fail-fast on a sibling error mirrors the pre-parallel serial
+            // loop: an infrastructure error aborts the turn rather than
+            // continuing to prompt the user for tools that may be running in
+            // a half-broken state.
             for tu in approval_tus {
                 if cancel.is_cancelled() || first_err.is_some() {
                     break;

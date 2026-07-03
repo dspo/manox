@@ -29,7 +29,9 @@ fn dirs() -> PathBuf {
         return p;
     }
     // No HOME env var: fall back to the process CWD so a missing HOME surfaces
-    // as a benign relative path rather than a hard crash.
+    // as a benign relative path rather than a hard crash. Warn once so the
+    // user notices (db/agents would otherwise silently land under CWD).
+    tracing::warn!("HOME env var unset; manox config will live under the process CWD");
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 

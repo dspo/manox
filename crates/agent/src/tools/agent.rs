@@ -24,7 +24,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_def::{self, AgentDefinition, AgentDefinitionFile};
-use crate::language_model::{AnyLanguageModel, MessageContent, Role};
+use crate::language_model::{AnyLanguageModel, MessageContent, Role, StopReason};
 use crate::message::Message;
 use crate::provider::registry;
 use crate::thread::{Thread, ThreadEvent};
@@ -227,6 +227,9 @@ fn setup_child(
             }
             ThreadEvent::Error(e) => {
                 sink_cb.try_emit(&e.to_string());
+                // A sub-agent error is terminal: unblock the parent so it can
+                // collect whatever partial output was produced.
+                let _ = done_tx.try_send(());
             }
             ThreadEvent::ToolCallAuthorization {
                 id: child_id,
@@ -249,9 +252,16 @@ fn setup_child(
                     });
                 }
             }
-            ThreadEvent::Stop(_) => {
+            // `Stop(ToolUse)` is a non-terminal mid-turn signal: the sub-agent
+            // finished a stream that requested tools and will run them next.
+            // Treating it as done would hand the parent the pre-tool assistant
+            // text as the result. Only true terminal stops complete the sub-agent.
+            ThreadEvent::Stop(StopReason::EndTurn)
+            | ThreadEvent::Stop(StopReason::MaxTokens)
+            | ThreadEvent::Stop(StopReason::Refusal) => {
                 let _ = done_tx.try_send(());
             }
+            ThreadEvent::Stop(StopReason::ToolUse) => {}
             _ => {}
         },
     );
