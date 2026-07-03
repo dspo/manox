@@ -157,8 +157,12 @@ async fn run_bash(
     // spawn_blocking readers drain the read ends.
     let (out_r, out_w) = std::io::pipe()?;
     let (err_r, err_w) = std::io::pipe()?;
-    let out_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(BASH_OUTPUT_MAX_BYTES)));
-    let err_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(BASH_OUTPUT_MAX_BYTES)));
+    let out_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(
+        BASH_OUTPUT_MAX_BYTES,
+    )));
+    let err_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(
+        BASH_OUTPUT_MAX_BYTES,
+    )));
     // Clone the sink and buffers for each reader task; the originals stay here
     // so we can pull the final captured text once the readers finish.
     let out_sink = sink.clone();
@@ -226,14 +230,8 @@ async fn run_bash(
     // Drain readers within the IO deadline, then extract the captured text.
     drain(&mut out_task).await;
     drain(&mut err_task).await;
-    let (out_str, out_trunc) = out_buf
-        .lock()
-        .expect("capture buffer lock poisoned")
-        .take();
-    let (err_str, err_trunc) = err_buf
-        .lock()
-        .expect("capture buffer lock poisoned")
-        .take();
+    let (out_str, out_trunc) = out_buf.lock().expect("capture buffer lock poisoned").take();
+    let (err_str, err_trunc) = err_buf.lock().expect("capture buffer lock poisoned").take();
 
     Ok(format_result(ran, out_str, out_trunc, err_str, err_trunc)?)
 }

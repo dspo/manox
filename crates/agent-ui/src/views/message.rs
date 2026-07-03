@@ -75,12 +75,11 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .border_1()
                 .border_color(theme.border)
                 .shadow_sm()
-                .child(
-                    h_flex()
-                        .w_full()
-                        .justify_end()
-                        .child(copy_button(ix, "copy-user", text.to_string())),
-                )
+                .child(h_flex().w_full().justify_end().child(copy_button(
+                    ix,
+                    "copy-user",
+                    text.to_string(),
+                )))
                 .child(
                     gpui::div()
                         .text_sm()
@@ -196,12 +195,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .w_full()
                 .justify_between()
                 .items_center()
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .text_color(theme.danger)
-                        .child("错误"),
-                )
+                .child(gpui::div().text_sm().text_color(theme.danger).child("错误"))
                 .child(copy_button(ix, "copy-error", msg.to_string())),
         )
         .child(

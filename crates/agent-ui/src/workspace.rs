@@ -9,18 +9,25 @@
 
 use std::path::PathBuf;
 
-use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use agent::language_model::StopReason;
 use agent::provider::config::WireApi;
 use agent::provider::registry;
-use gpui::{AnyElement, Context, DismissEvent, Entity, Render, ScrollHandle, ScrollWheelEvent, Subscription, Window, prelude::*, px};
+use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
+use gpui::{
+    AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity, MouseButton,
+    MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, Subscription, Window,
+    prelude::*, px,
+};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
     button::{Button, ButtonVariants as _},
+    h_flex,
     input::{Input, InputEvent, InputState},
     menu::{PopupMenu, PopupMenuItem},
+    tab::TabBar,
     tag::{Tag, TagVariant},
-    h_flex, v_flex, TitleBar,
+    text::TextView,
+    v_flex,
 };
 
 use crate::conversation::ConversationState;
@@ -38,16 +45,21 @@ struct PendingAuth {
 }
 
 pub struct Workspace {
-    cwd: PathBuf,
-    thread: Entity<Thread>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) thread: Entity<Thread>,
     sidebar: Entity<Sidebar>,
     conversation: ConversationState,
-    input_state: Entity<InputState>,
+    pub(crate) input_state: Entity<InputState>,
     /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
+    /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
+    /// rendered markdown preview (gpui-component `TextView::markdown`).
     editor_state: Entity<InputState>,
     editor_open: bool,
+    editor_preview: bool,
+    /// Editor pane width, driven by dragging the divider. In-memory only.
+    editor_width: Pixels,
     pending_auth: Option<PendingAuth>,
-    model_open: bool,
+    pub(crate) model_open: bool,
     /// PopupMenu entity for the open model selector; created on open, destroyed on close.
     model_menu: Option<Entity<PopupMenu>>,
     model_menu_sub: Option<Subscription>,
@@ -62,6 +74,7 @@ pub struct Workspace {
     thread_sub: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
+    editor_sub: Option<Subscription>,
     /// Tracked scroll position of the message list; used to auto-scroll to the
     /// latest message while the user is parked at the bottom and to leave them
     /// alone when they've scrolled up to read history.
@@ -69,6 +82,30 @@ pub struct Workspace {
     /// Whether new content should keep the viewport pinned to the bottom.
     /// Reset to `false` by manual user scrolls that move the viewport away.
     stick_to_bottom: bool,
+}
+
+/// Right-side composer width. Wide enough for rendered markdown
+/// (headings, lists, code blocks) alongside the 1100px window.
+const EDITOR_PANEL_WIDTH: f32 = 640.;
+const EDITOR_MIN_WIDTH: f32 = 320.;
+const EDITOR_MAX_WIDTH: f32 = 960.;
+/// Width of the drag handle between the main column and the editor pane.
+const EDITOR_DIVIDER_WIDTH: f32 = 6.;
+// Mirrors `views/sidebar.rs` (`Sidebar` renders at `w(px(260.))`). Kept here so
+// the editor pane's resize clamp can reserve space for the sidebar + main
+// column without depending on the sidebar's internals.
+const SIDEBAR_WIDTH: f32 = 260.;
+/// Floor for the main column width when the editor pane is dragged wide.
+const MAIN_MIN_WIDTH: f32 = 160.;
+
+/// Drag payload for the editor pane divider. Doubles as the invisible drag
+/// ghost view, mirroring Zed's `DraggedDock` pattern.
+struct DraggedEditorDivider;
+
+impl Render for DraggedEditorDivider {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
 }
 
 impl Workspace {
@@ -81,6 +118,7 @@ impl Workspace {
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
+                .multi_line(true)
                 .rows(4)
                 .submit_on_enter(true)
                 .placeholder("输入消息…")
@@ -89,11 +127,11 @@ impl Workspace {
         let editor_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("markdown")
-                .line_number(false)
+                .line_number(true)
                 .folding(false)
-                .rows(20)
+                .soft_wrap(true)
                 .submit_on_enter(false)
-                .placeholder("在此撰写较长的 Markdown 消息，点「发送」提交并关闭…")
+                .placeholder("编写 markdown…（Cmd-Enter 发送）")
         });
 
         let sidebar = cx.new(Sidebar::new);
@@ -106,6 +144,8 @@ impl Workspace {
             input_state,
             editor_state,
             editor_open: false,
+            editor_preview: false,
+            editor_width: px(EDITOR_PANEL_WIDTH),
             pending_auth: None,
             model_open: false,
             model_menu: None,
@@ -120,12 +160,14 @@ impl Workspace {
             thread_sub: None,
             sidebar_sub: None,
             input_sub: None,
+            editor_sub: None,
             scroll_handle: ScrollHandle::new(),
             stick_to_bottom: true,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
+        ws.editor_sub = Some(ws.subscribe_editor(window, cx));
         let id = ws.thread.read(cx).id.0.clone();
         ws.sidebar.update(cx, |s, cx| s.set_selected(Some(id), cx));
         ws
@@ -190,22 +232,37 @@ impl Workspace {
 
     fn subscribe_sidebar(&self, cx: &mut Context<Self>) -> Subscription {
         let sidebar = self.sidebar.clone();
-        cx.subscribe(&sidebar, |this, _sidebar, ev: &SidebarEvent, cx| {
-            match ev {
-                SidebarEvent::NewThread => this.start_new_thread(cx),
-                SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), cx),
-                SidebarEvent::DeleteThread(id) => this.delete_thread(id.clone(), cx),
-            }
+        cx.subscribe(&sidebar, |this, _sidebar, ev: &SidebarEvent, cx| match ev {
+            SidebarEvent::NewThread => this.start_new_thread(cx),
+            SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), cx),
+            SidebarEvent::DeleteThread(id) => this.delete_thread(id.clone(), cx),
         })
     }
 
     fn subscribe_input(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
         let input = self.input_state.clone();
-        cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
-            match ev {
+        cx.subscribe_in(
+            &input,
+            window,
+            |this, _, ev: &InputEvent, window, cx| match ev {
                 InputEvent::PressEnter { shift, .. } if !shift => this.submit_input(window, cx),
                 InputEvent::Change => this.sync_slash_menu(window, cx),
                 _ => {}
+            },
+        )
+    }
+
+    /// Submit the right-side editor on Cmd/Ctrl-Enter (`InputEvent::PressEnter`
+    /// with `secondary` set). Plain Enter inserts a newline (submit_on_enter
+    /// is off for the panel editor).
+    fn subscribe_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
+        let editor = self.editor_state.clone();
+        cx.subscribe_in(&editor, window, |this, _, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { secondary, shift } = ev
+                && *secondary
+                && !shift
+            {
+                this.submit_editor(window, cx);
             }
         })
     }
@@ -246,15 +303,12 @@ impl Workspace {
 
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
-        let messages: Vec<agent::Message> = self
-            .thread
-            .read(cx)
-            .messages()
-            .to_vec();
+        let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
         self.conversation = ConversationState::rebuild_from_messages(&messages);
         self.pending_auth = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
-        self.sidebar.update(cx, |s, cx| s.set_selected(Some(id), cx));
+        self.sidebar
+            .update(cx, |s, cx| s.set_selected(Some(id), cx));
         cx.notify();
     }
 
@@ -281,7 +335,7 @@ impl Workspace {
         }
     }
 
-    fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
         if (text.trim().is_empty() && attachments.is_empty()) || self.thread.read(cx).is_running() {
@@ -311,7 +365,8 @@ impl Workspace {
                     (text, extra)
                 })
                 .await;
-            this.update(cx, |this, cx| this.send_user_turn(text, extra, cx)).ok();
+            this.update(cx, |this, cx| this.send_user_turn(text, extra, cx))
+                .ok();
         })
         .detach();
     }
@@ -344,18 +399,74 @@ impl Workspace {
     }
 
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor_open = !self.editor_open;
-        if self.editor_open {
-            self.editor_state
-                .update(cx, |s, cx| s.focus(window, cx));
+        if !self.editor_open {
+            self.open_editor(window, cx);
         } else {
-            self.input_state
-                .update(cx, |s, cx| s.focus(window, cx));
+            self.close_editor(window, cx);
+        }
+    }
+
+    /// Open the markdown editor: hide the inline composer and transfer its draft
+    /// text into the editor so writing continues there. Submit from the editor
+    /// with Cmd-Enter; close with Ctrl-G / Cmd-W to move the draft back.
+    fn open_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_open {
+            return;
+        }
+        // Close any open inline menus so they don't linger behind the hidden footer.
+        self.close_slash_menu();
+        self.close_plus_menu();
+        let draft = self.input_state.read(cx).value().to_string();
+        self.editor_open = true;
+        self.editor_preview = false;
+        self.editor_state.update(cx, |s, cx| {
+            s.set_value(draft, window, cx);
+            s.focus(window, cx);
+        });
+        self.input_state
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Close the markdown editor without submitting: move the draft back into the
+    /// inline composer and reveal it again.
+    fn close_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor_open {
+            return;
+        }
+        let draft = self.editor_state.read(cx).value().to_string();
+        self.editor_open = false;
+        self.editor_preview = false;
+        self.input_state.update(cx, |s, cx| {
+            s.set_value(draft, window, cx);
+            s.focus(window, cx);
+        });
+        self.editor_state
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Toggle the right-side composer between plain-text edit and rendered
+    /// markdown preview. No-op when the panel is closed.
+    fn toggle_editor_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_editor_preview(!self.editor_preview, window, cx);
+    }
+
+    /// Switch the editor panel to preview (`Write` tab) or rendered markdown
+    /// (`Preview` tab). No-op when the panel is closed or already in that mode.
+    /// Returning to `Write` focuses the editor so typing works immediately.
+    fn set_editor_preview(&mut self, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor_open || self.editor_preview == preview {
+            return;
+        }
+        self.editor_preview = preview;
+        if !preview {
+            self.editor_state.update(cx, |s, cx| s.focus(window, cx));
         }
         cx.notify();
     }
 
-    /// Submit the composer text to the thread, then close the panel and return
+    /// Submit the editor text to the thread, then close the panel and return
     /// focus to the inline input.
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
@@ -368,15 +479,16 @@ impl Workspace {
             thread.run_turn(cx);
         });
         save_thread(self.thread.clone(), cx);
-        self.editor_state
-            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.editor_state.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
         self.editor_open = false;
-        self.input_state
-            .update(cx, |s, cx| s.focus(window, cx));
+        self.editor_preview = false;
+        self.input_state.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
     }
 
-    fn model_label(&self, cx: &mut Context<Self>) -> String {
+    pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {
         self.thread
             .read(cx)
             .model()
@@ -394,152 +506,11 @@ impl Workspace {
     }
 
     /// Abort the current turn.
-    fn cancel_turn(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn cancel_turn(&mut self, cx: &mut Context<Self>) {
         self.thread.update(cx, |thread, cx| {
             thread.cancel(cx);
         });
         cx.notify();
-    }
-
-    /// Cascading model selector using PopupMenu with Provider → Model submenus.
-    ///
-    /// Closed: a ghost button showing the current model with a chevron.
-    /// Open: an absolute-positioned PopupMenu; hovering a Provider row expands
-    /// a flyout submenu listing its Models. PopupMenu handles all hover,
-    /// click-outside, and keyboard-dismiss behavior internally.
-    fn render_model_selector(&mut self, _theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let label = self.model_label(cx);
-        let open = self.model_open;
-
-        let trigger = Button::new("model-trigger")
-            .ghost()
-            .small()
-            .label(label)
-            .icon(if open { IconName::ChevronUp } else { IconName::ChevronDown })
-            .on_click(cx.listener(|this, _, window, cx| {
-                if this.model_open {
-                    this.model_open = false;
-                    this.model_menu = None;
-                    this.model_menu_sub = None;
-                } else {
-                    this.model_open = true;
-                    let workspace = cx.entity();
-                    let menu = PopupMenu::build(window, cx, |menu, window, cx| {
-                        Self::build_model_popup_menu(menu, workspace, window, cx)
-                    });
-                    let sub = cx.subscribe(&menu, |this: &mut Workspace, _menu: Entity<PopupMenu>, _: &DismissEvent, cx: &mut Context<Workspace>| {
-                        this.model_open = false;
-                        this.model_menu = None;
-                        this.model_menu_sub = None;
-                        cx.notify();
-                    });
-                    this.model_menu = Some(menu);
-                    this.model_menu_sub = Some(sub);
-                }
-                cx.notify();
-            }));
-
-        if !open {
-            return trigger.into_any_element();
-        }
-
-        let menu = self
-            .model_menu
-            .clone()
-            .expect("model_menu exists when open");
-
-        gpui::div()
-            .relative()
-            .child(trigger)
-            .child(
-                // PopupMenu has its own bg/border/shadow and on_mouse_down_out.
-                // `.occlude()` renders the dropdown above all non-occluded elements
-                // (footer borders, message list, etc.).
-                gpui::div()
-                    .id("model-dropdown")
-                    .absolute()
-                    .bottom_full()
-                    .right_0()
-                    .occlude()
-                    .child(menu),
-            )
-            .into_any_element()
-    }
-
-    /// WireApi → Tag variant + label mapping for the model menu.
-    fn wire_tag_variant(wire: WireApi) -> (TagVariant, &'static str) {
-        match wire {
-            WireApi::Anthropic => (TagVariant::Primary, "Anthropic"),
-            WireApi::Responses => (TagVariant::Info, "Responses"),
-            WireApi::Completions => (TagVariant::Warning, "Completions"),
-            WireApi::Unavailable => (TagVariant::Secondary, "N/A"),
-        }
-    }
-
-    /// Cascading model menu grouped by provider; each model row shows a wire-api Tag.
-    fn build_model_popup_menu(
-        menu: PopupMenu,
-        workspace: Entity<Workspace>,
-        window: &mut Window,
-        cx: &mut Context<PopupMenu>,
-    ) -> PopupMenu {
-        let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> =
-            Vec::new();
-        for m in registry::global().models() {
-            let prov = m.provider_name();
-            if let Some(last) = providers.last_mut()
-                && last.0 == prov
-            {
-                last.1.push(m.clone());
-            } else {
-                providers.push((prov, vec![m.clone()]));
-            }
-        }
-
-        let mut menu = menu;
-        if providers.is_empty() {
-            menu = menu.item(PopupMenuItem::Label("No models configured".into()));
-        }
-        for (prov_name, models) in providers {
-            let ws = workspace.clone();
-            menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
-                let mut submenu = submenu;
-                for m in &models {
-                    let model_id = m.id();
-                    let model_name = m.name().to_string();
-                    let wire = m.wire_api();
-                    let (variant, label) = Self::wire_tag_variant(wire);
-                    let ws = ws.clone();
-                    submenu = submenu.item(
-                        PopupMenuItem::element(move |_window, _cx| {
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    Tag::new()
-                                        .with_variant(variant)
-                                        .outline()
-                                        .small()
-                                        .child(label),
-                                )
-                                .child(model_name.clone())
-                        })
-                        .on_click(move |_, _, cx: &mut gpui::App| {
-                            ws.update(cx, |this, cx| {
-                                if let Some(m) =
-                                    registry::global().get_model(model_id.as_ref())
-                                {
-                                    this.thread
-                                        .update(cx, |t, cx| t.set_model(m, cx));
-                                }
-                            });
-                        }),
-                    );
-                }
-                submenu
-            });
-        }
-        menu
     }
 
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -643,8 +614,160 @@ impl Workspace {
         )
     }
 
+    /// Cascading model selector using PopupMenu with Provider → Model submenus.
+    ///
+    /// Closed: a ghost button showing the current model with a chevron.
+    /// Open: an absolute-positioned PopupMenu; hovering a Provider row expands
+    /// a flyout submenu listing its Models. PopupMenu handles all hover,
+    /// click-outside, and keyboard-dismiss behavior internally.
+    fn render_model_selector(&mut self, _theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let label = self.model_label(cx);
+        let open = self.model_open;
+
+        let trigger = Button::new("model-trigger")
+            .ghost()
+            .small()
+            .label(label)
+            .icon(if open {
+                IconName::ChevronUp
+            } else {
+                IconName::ChevronDown
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.model_open {
+                    this.model_open = false;
+                    this.model_menu = None;
+                    this.model_menu_sub = None;
+                } else {
+                    this.model_open = true;
+                    let workspace = cx.entity();
+                    let menu = PopupMenu::build(window, cx, |menu, window, cx| {
+                        Self::build_model_popup_menu(menu, workspace, window, cx)
+                    });
+                    let sub = cx.subscribe(
+                        &menu,
+                        |this: &mut Workspace,
+                         _menu: Entity<PopupMenu>,
+                         _: &DismissEvent,
+                         cx: &mut Context<Workspace>| {
+                            this.model_open = false;
+                            this.model_menu = None;
+                            this.model_menu_sub = None;
+                            cx.notify();
+                        },
+                    );
+                    this.model_menu = Some(menu);
+                    this.model_menu_sub = Some(sub);
+                }
+                cx.notify();
+            }));
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        let menu = self
+            .model_menu
+            .clone()
+            .expect("model_menu exists when open");
+
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                // PopupMenu has its own bg/border/shadow and on_mouse_down_out.
+                // `.occlude()` renders the dropdown above all non-occluded elements
+                // (footer borders, message list, etc.).
+                gpui::div()
+                    .id("model-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .right_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
+    /// WireApi → Tag variant + label mapping for the model menu.
+    fn wire_tag_variant(wire: WireApi) -> (TagVariant, &'static str) {
+        match wire {
+            WireApi::Anthropic => (TagVariant::Primary, "Anthropic"),
+            WireApi::Responses => (TagVariant::Info, "Responses"),
+            WireApi::Completions => (TagVariant::Warning, "Completions"),
+            WireApi::Unavailable => (TagVariant::Secondary, "N/A"),
+        }
+    }
+
+    /// Cascading model menu grouped by provider; each model row shows a wire-api Tag.
+    fn build_model_popup_menu(
+        menu: PopupMenu,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> = Vec::new();
+        for m in registry::global().models() {
+            let prov = m.provider_name();
+            if let Some(last) = providers.last_mut()
+                && last.0 == prov
+            {
+                last.1.push(m.clone());
+            } else {
+                providers.push((prov, vec![m.clone()]));
+            }
+        }
+
+        let mut menu = menu;
+        if providers.is_empty() {
+            menu = menu.item(PopupMenuItem::Label("No models configured".into()));
+        }
+        for (prov_name, models) in providers {
+            let ws = workspace.clone();
+            menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
+                let mut submenu = submenu;
+                for m in &models {
+                    let model_id = m.id();
+                    let model_name = m.name().to_string();
+                    let wire = m.wire_api();
+                    let (variant, label) = Self::wire_tag_variant(wire);
+                    let ws = ws.clone();
+                    submenu = submenu.item(
+                        PopupMenuItem::element(move |_window, _cx| {
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Tag::new()
+                                        .with_variant(variant)
+                                        .outline()
+                                        .small()
+                                        .child(label),
+                                )
+                                .child(model_name.clone())
+                        })
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            ws.update(cx, |this, cx| {
+                                if let Some(m) = registry::global().get_model(model_id.as_ref()) {
+                                    this.thread.update(cx, |t, cx| t.set_model(m, cx));
+                                }
+                            });
+                        }),
+                    );
+                }
+                submenu
+            });
+        }
+        menu
+    }
+
     /// Composer row: a rounded container with the `+` menu button, `Input`, and a circular send/stop button.
-    fn render_composer(&mut self, running: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_composer(
+        &mut self,
+        running: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         h_flex()
             .w_full()
             .items_end()
@@ -751,7 +874,11 @@ impl Workspace {
     /// `.rounded(px(16.))` renders the button as a 32px disc.
     fn render_send_button(&self, running: bool, cx: &mut Context<Self>) -> AnyElement {
         Button::new("send-btn")
-            .icon(if running { IconName::Pause } else { IconName::ArrowUp })
+            .icon(if running {
+                IconName::Pause
+            } else {
+                IconName::ArrowUp
+            })
             .when(running, |b| b.danger())
             .when(!running, |b| b.primary())
             .rounded(px(16.))
@@ -793,11 +920,14 @@ impl Workspace {
                 cx.notify();
             }
         });
-        Some(centered(render_attachment_chips(
-            &self.pending_attachments,
-            theme,
-            move |ix, window, cx| on_remove(&ix, window, cx),
-        )).into_any_element())
+        Some(
+            centered(render_attachment_chips(
+                &self.pending_attachments,
+                theme,
+                move |ix, window, cx| on_remove(&ix, window, cx),
+            ))
+            .into_any_element(),
+        )
     }
 
     /// Chip row: a plain `cwd` label on the left, model selector on the right.
@@ -863,62 +993,109 @@ impl Render for Workspace {
         let overlay = self.render_auth_overlay(&theme, cx);
 
         let editor_open = self.editor_open;
-        let editor_panel = v_flex()
-            .w(px(440.))
+        let editor_preview = self.editor_preview;
+        let editor_width = self.editor_width;
+        // The inline composer and the markdown editor are mutually exclusive: while
+        // the editor pane is open the footer is hidden and the draft lives in the
+        // editor (moved there on open, moved back on close).
+        let footer = if !editor_open {
+            Some(
+                v_flex()
+                    .w_full()
+                    .py_2()
+                    .gap_2()
+                    .relative()
+                    .children(self.render_slash_overlay())
+                    .children(self.render_attachments(&theme, cx))
+                    .child(centered(self.render_composer(running, &theme, cx)))
+                    .child(self.render_chip_row(&theme, cx)),
+            )
+        } else {
+            None
+        };
+        // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
+        // toggles preview — all keyboard-driven per the no-button constraint.
+        // The divider is the visual separator and the drag handle for resizing.
+        let editor_divider = gpui::div()
+            .id("editor-divider")
+            .w(px(EDITOR_DIVIDER_WIDTH))
             .h_full()
             .flex_shrink_0()
-            .border_l_1()
-            .border_color(theme.border)
-            .bg(theme.background)
-            .p_3()
-            .gap_2()
+            .relative()
+            .cursor(CursorStyle::ResizeLeftRight)
             .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("编辑器"),
-                    )
-                    .child(
-                        Button::new("editor-close")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_editor(window, cx);
-                            })),
-                    ),
+                gpui::div()
+                    .absolute()
+                    .left(px(2.5))
+                    .w(px(1.))
+                    .h_full()
+                    .bg(theme.border),
+            )
+            .on_drag(DraggedEditorDivider, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| DraggedEditorDivider)
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    // Double-click resets the pane to its default width.
+                    if e.click_count >= 2 {
+                        this.editor_width = px(EDITOR_PANEL_WIDTH);
+                        cx.notify();
+                    }
+                }),
+            );
+        let editor_pane = v_flex()
+            .w(editor_width)
+            .h_full()
+            .flex_shrink_0()
+            .bg(theme.background)
+            .child(
+                h_flex().w_full().px_2().pt_1().child(
+                    TabBar::new("editor-tabs")
+                        .underline()
+                        .small()
+                        .selected_index(if editor_preview { 1 } else { 0 })
+                        .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                            this.set_editor_preview(*ix == 1, window, cx);
+                        }))
+                        .child("Write")
+                        .child("Preview"),
+                ),
             )
             .child(
                 gpui::div()
+                    .id("editor-content")
+                    .w_full()
                     .flex_1()
                     .min_h_0()
-                    .child(Input::new(&self.editor_state)),
-            )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(if running {
-                        Button::new("editor-stop")
-                            .ghost()
-                            .small()
-                            .label("停止")
-                            .icon(IconName::Pause)
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.cancel_turn(cx);
-                            }))
+                    .overflow_hidden()
+                    .child(if editor_preview {
+                        // The TextView caches its parsed document per element id and early-returns
+                        // in set_text when the source is unchanged, so resizing the pane would leave
+                        // the laid-out tree stale. Derive the id from the quantized pane width so a
+                        // width change mounts a fresh state and re-parses at the new wrap width.
+                        let preview_id =
+                            format!("editor-preview-{}", (f32::from(editor_width) as i32) / 8);
+                        v_flex()
+                            .h_full()
+                            .p_4()
+                            .text_sm()
+                            .child(
+                                TextView::markdown(
+                                    preview_id,
+                                    self.editor_state.read(cx).value().to_string(),
+                                )
+                                .selectable(true)
+                                .scrollable(true)
+                                .h_full(),
+                            )
                             .into_any_element()
                     } else {
-                        Button::new("editor-send")
-                            .primary()
-                            .small()
-                            .label("发送")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.submit_editor(window, cx);
-                            }))
+                        Input::new(&self.editor_state)
+                            .size_full()
+                            .appearance(false)
                             .into_any_element()
                     }),
             );
@@ -929,6 +1106,14 @@ impl Render for Workspace {
             .text_color(theme.foreground)
             .on_action(cx.listener(|this, _: &crate::ToggleEditor, window, cx| {
                 this.toggle_editor(window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &crate::ToggleEditorPreview, window, cx| {
+                    this.toggle_editor_preview(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &crate::CloseEditor, window, cx| {
+                this.close_editor(window, cx);
             }))
             // Left sidebar
             .child(self.sidebar.clone())
@@ -997,28 +1182,37 @@ impl Render for Workspace {
                     )
                     // Separator line (standalone div so the PopupMenu inside
                     // the footer can render on top of it without z-order issues).
-                    .child(
-                        gpui::div()
-                            .w_full()
-                            .h(px(1.))
-                            .bg(theme.border),
-                    )
+                    .child(gpui::div().w_full().h(px(1.)).bg(theme.border))
                     // Input area: pending attachments + composer + chip row, with the slash
-                    // menu overlaid above the composer.
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .py_2()
-                            .gap_2()
-                            .relative()
-                            .children(self.render_slash_overlay())
-                            .children(self.render_attachments(&theme, cx))
-                            .child(centered(self.render_composer(running, &theme, cx)))
-                            .child(self.render_chip_row(&theme, cx)),
-                    )
+                    // menu overlaid above the composer. Hidden while the markdown editor pane
+                    // is open — the draft is moved into the editor on open and back on close.
+                    .children(footer)
                     // Approval overlay (if any)
                     .children(overlay),
             )
-            .when(editor_open, |this| this.child(editor_panel))
+            .when(editor_open, |this| {
+                this.child(editor_divider).child(editor_pane)
+            })
+            .on_drag_move(cx.listener(
+                |this, e: &DragMoveEvent<DraggedEditorDivider>, _window, cx| {
+                    // The root fills the window, so its right edge is the
+                    // window's right edge and the editor pane's width is the
+                    // distance from the cursor to that edge. Clamp both to a
+                    // minimum and to leave the main column at least
+                    // `MAIN_MIN_WIDTH` (sidebar + main + divider sit left of
+                    // the editor), so dragging wide never overflows the window
+                    // or collapses the conversation column.
+                    let new_w = e.bounds.right() - e.event.position.x;
+                    let dynamic_max = e.bounds.size.width
+                        - px(SIDEBAR_WIDTH)
+                        - px(EDITOR_DIVIDER_WIDTH)
+                        - px(MAIN_MIN_WIDTH);
+                    let max_w = dynamic_max
+                        .min(px(EDITOR_MAX_WIDTH))
+                        .max(px(EDITOR_MIN_WIDTH));
+                    this.editor_width = new_w.clamp(px(EDITOR_MIN_WIDTH), max_w);
+                    cx.notify();
+                },
+            ))
     }
 }

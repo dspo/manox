@@ -45,7 +45,7 @@ xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
 base64 = "0.22"
 
-# GPUI 栈 —— rev 必须与 gpui-component 锁定值一致（1d217ee...）
+# GPUI 栈 —— git 仓库地址（规则允许）。gpui-component 锁定 zed rev 1d217ee，三者必须一致。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 
@@ -53,7 +53,7 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee3
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1", features = ["tree-sitter-languages"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
 
-# psm 用 stacker 的版本（对齐 gpui-component，WASM 支持更好；桌面构建同样无害）
+# psm 用 stacker 的版本（对齐 gpui-component）
 [patch.crates-io]
 psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
 

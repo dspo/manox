@@ -51,7 +51,9 @@ impl MessageContent {
 
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::Text(text) | Self::Thinking { text, .. } => text.chars().all(|c| c.is_whitespace()),
+            Self::Text(text) | Self::Thinking { text, .. } => {
+                text.chars().all(|c| c.is_whitespace())
+            }
             Self::ToolResult(result) => result.content.chars().all(|c| c.is_whitespace()),
             Self::Image { data, .. } => data.is_empty(),
             Self::ToolUse(_) => false,

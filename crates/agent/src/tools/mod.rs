@@ -11,8 +11,6 @@
 
 pub mod bash;
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use globset::{Glob, GlobSetBuilder};
 use gpui::{App, AppContext as _, Task};
 use grep_regex::RegexMatcherBuilder;
@@ -20,6 +18,8 @@ use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::{AgentTool, AnyAgentTool, ToolRegistry};

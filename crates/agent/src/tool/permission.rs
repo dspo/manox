@@ -38,6 +38,9 @@ impl PermissionCache {
     }
 
     pub fn clear(&self) {
-        self.always_allow.lock().expect("always_allow poisoned").clear();
+        self.always_allow
+            .lock()
+            .expect("always_allow poisoned")
+            .clear();
     }
 }

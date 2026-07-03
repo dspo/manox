@@ -5,21 +5,15 @@
 //! thinking and body text split into separate items, and tool calls are tracked
 //! by id for status/output.
 
-use agent::{Message, ThreadEvent, ToolCallStatus};
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
+use agent::{Message, ThreadEvent, ToolCallStatus};
 
 /// A single renderable conversation item.
 #[derive(Debug, Clone)]
 pub enum ConvItem {
     User(String),
-    Assistant {
-        text: String,
-        streaming: bool,
-    },
-    Reasoning {
-        text: String,
-        streaming: bool,
-    },
+    Assistant { text: String, streaming: bool },
+    Reasoning { text: String, streaming: bool },
     ToolCall(ToolCallItem),
     Error(String),
 }
@@ -200,16 +194,16 @@ impl ConversationState {
                     // Text becomes a user bubble; ToolResult blocks pair back to the
                     // ToolCall item emitted from the preceding assistant ToolUse.
                     // ToolResults live in user messages per the Anthropic wire contract.
-                    let text: String = m
-                        .content
-                        .iter()
-                        .filter_map(|c| match c {
-                            MessageContent::Text(t)
-                            | MessageContent::Thinking { text: t, .. } => Some(t.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
+                    let text: String =
+                        m.content
+                            .iter()
+                            .filter_map(|c| match c {
+                                MessageContent::Text(t)
+                                | MessageContent::Thinking { text: t, .. } => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
                     if !text.is_empty() {
                         state.push_user(text);
                     }
@@ -294,8 +288,8 @@ fn pair_tool_result(state: &mut ConversationState, tr: &LanguageModelToolResult)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
     use agent::Message;
+    use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
     use std::sync::Arc;
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the
@@ -338,7 +332,12 @@ mod tests {
         assert_eq!(tool.status, ToolCallStatus::Success);
         assert!(!tool.is_error);
         // The pure-toolresult user message must not render an empty user bubble.
-        assert!(!state.items().iter().any(|i| matches!(i, ConvItem::User(t) if t.is_empty())));
+        assert!(
+            !state
+                .items()
+                .iter()
+                .any(|i| matches!(i, ConvItem::User(t) if t.is_empty()))
+        );
     }
 
     #[test]

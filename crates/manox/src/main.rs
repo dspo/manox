@@ -32,10 +32,18 @@ fn main() {
             gpui::KeyBinding::new("cmd-ctrl-f", ToggleFullscreen, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("f11", ToggleFullscreen, None),
+            // Ctrl-G opens the right-side markdown composer.
+            gpui::KeyBinding::new("ctrl-g", agent_ui::ToggleEditor, None),
+            // Cmd/Ctrl-W closes the markdown composer and returns the draft to the inline input.
             #[cfg(target_os = "macos")]
-            gpui::KeyBinding::new("cmd-shift-e", agent_ui::ToggleEditor, None),
+            gpui::KeyBinding::new("cmd-w", agent_ui::CloseEditor, None),
             #[cfg(not(target_os = "macos"))]
-            gpui::KeyBinding::new("ctrl-shift-e", agent_ui::ToggleEditor, None),
+            gpui::KeyBinding::new("ctrl-w", agent_ui::CloseEditor, None),
+            // Cmd/Ctrl-Shift-P toggles between plain-text edit and markdown preview.
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-shift-p", agent_ui::ToggleEditorPreview, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-shift-p", agent_ui::ToggleEditorPreview, None),
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &ToggleFullscreen, cx: &mut App| {

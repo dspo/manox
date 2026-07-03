@@ -15,10 +15,8 @@ pub const CONTENT_MAX_W: f32 = 760.0;
 /// Used by message entries and the input area so lines don't run too long on wide screens.
 pub fn centered(child: impl gpui::IntoElement) -> Div {
     use gpui_component::{h_flex, v_flex};
-    h_flex().w_full().justify_center().child(
-        v_flex()
-            .w_full()
-            .max_w(px(CONTENT_MAX_W))
-            .child(child),
-    )
+    h_flex()
+        .w_full()
+        .justify_center()
+        .child(v_flex().w_full().max_w(px(CONTENT_MAX_W)).child(child))
 }

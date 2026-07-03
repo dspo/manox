@@ -19,14 +19,15 @@ use futures::StreamExt as _;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task};
 use tokio_util::sync::CancellationToken;
 
+use crate::db::ThreadRecord;
 use crate::language_model::{
-    AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role, StopReason,
+    AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
+    Role, StopReason,
 };
 use crate::message::Message;
 use crate::tool::{PermissionCache, PermissionDecision, ToolRegistry};
 use crate::tools;
-use crate::db::ThreadRecord;
 
 /// Stable `Thread` id used for persistence.
 #[derive(Debug, Clone)]
@@ -65,10 +66,7 @@ pub enum ThreadEvent {
     /// Live output chunk from a streaming tool (e.g. `bash` stdout/stderr).
     /// Accumulated into the matching tool-call item's `output` until the
     /// final `ToolResult` overwrites it with the canonical (truncated) text.
-    ToolOutput {
-        id: String,
-        chunk: String,
-    },
+    ToolOutput { id: String, chunk: String },
     /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with the decision.
     ToolCallAuthorization {
         id: String,
@@ -109,7 +107,10 @@ impl Thread {
         cx.new(|_cx| Self {
             id,
             messages: Vec::new(),
-            model: crate::provider::registry::global().models().first().cloned(),
+            model: crate::provider::registry::global()
+                .models()
+                .first()
+                .cloned(),
             tools: Arc::new(tools::default_registry(cwd.clone())),
             permission: Arc::new(PermissionCache::default()),
             cwd,
@@ -185,8 +186,7 @@ impl Thread {
         if let Some((pending_id, tx)) = self.pending_authorization.take()
             && pending_id == id
             && tx.send(decision).is_ok()
-        {
-        }
+        {}
         let _ = cx;
     }
 
@@ -311,9 +311,8 @@ impl Thread {
                 break;
             }
 
-            let mut tool_uses = this.update(cx, |this, _cx| {
-                std::mem::take(&mut this.pending_tool_uses)
-            })?;
+            let mut tool_uses =
+                this.update(cx, |this, _cx| std::mem::take(&mut this.pending_tool_uses))?;
             if tool_uses.is_empty() {
                 break;
             }
@@ -420,8 +419,9 @@ impl Thread {
         let input = tu.input.clone();
         let (sink, rx) = crate::tool::ToolOutputSink::channel(id.clone().into());
         let id_for_drain = id.clone();
-        let result_task: Task<Result<String, String>> =
-            this.update(cx, |_this, cx| tool.run_streaming(input, cancel.clone(), sink, cx))?;
+        let result_task: Task<Result<String, String>> = this.update(cx, |_this, cx| {
+            tool.run_streaming(input, cancel.clone(), sink, cx)
+        })?;
         // Drain live output chunks to the UI while the tool runs. A foreground
         // spawn is used (not background_spawn) because emitting requires an
         // `AsyncApp`, which is `!Send` (`Rc`-backed). The receiver closes once
