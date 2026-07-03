@@ -515,18 +515,25 @@ impl Render for Workspace {
                 ),
             )
             .child(
-                v_flex()
+                gpui::div()
                     .id("editor-content")
+                    .w_full()
                     .flex_1()
                     .min_h_0()
-                    .h_full()
+                    .overflow_hidden()
                     .child(if editor_preview {
+                        // The TextView caches its parsed document per element id and early-returns
+                        // in set_text when the source is unchanged, so resizing the pane would leave
+                        // the laid-out tree stale. Derive the id from the quantized pane width so a
+                        // width change mounts a fresh state and re-parses at the new wrap width.
+                        let preview_id =
+                            format!("editor-preview-{}", (f32::from(editor_width) as i32) / 8);
                         v_flex()
                             .h_full()
                             .p_4()
                             .child(
                                 TextView::markdown(
-                                    "editor-preview",
+                                    preview_id,
                                     self.editor_state.read(cx).value().to_string(),
                                 )
                                 .selectable(true)
@@ -536,7 +543,7 @@ impl Render for Workspace {
                             .into_any_element()
                     } else {
                         Input::new(&self.editor_state)
-                            .h_full()
+                            .size_full()
                             .appearance(false)
                             .into_any_element()
                     }),
