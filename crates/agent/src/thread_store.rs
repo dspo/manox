@@ -64,13 +64,26 @@ impl ThreadStore {
         &self.summaries
     }
 
-    /// Re-read the db, refresh the summary list, and emit.
+    /// Re-read the db, refresh the summary list, and emit. The `db.list()`
+    /// query runs off the UI thread so a large history (or a busy SQLite lock)
+    /// can't stall the main thread on turn end / submit / delete.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if let Ok(list) = self.db.list() {
-            self.summaries = list;
-        }
-        cx.emit(ThreadStoreEvent::SummariesUpdated);
-        cx.notify();
+        let db = self.db.clone();
+        cx.spawn(async move |this, cx| {
+            let list = cx
+                .background_executor()
+                .spawn(async move { db.list() })
+                .await;
+            this.update(cx, |s, cx| {
+                if let Ok(list) = list {
+                    s.summaries = list;
+                }
+                cx.emit(ThreadStoreEvent::SummariesUpdated);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Load and restore a `Thread` by id (model resolved from the registry by id; `None` if not found).

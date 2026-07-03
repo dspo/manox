@@ -9,25 +9,32 @@
 //!
 //! Streaming assistant / reasoning bodies render as plain `div` (no markdown
 //! re-parse on every token) and only switch to `TextView::markdown` once the
-//! stream ends. The expensive markdown layout + text shaping on every delta
-//! is what produced the visible item overlap and made scrolling feel sticky.
+//! stream ends. The same rule applies to streaming tool output: while lines
+//! are still arriving we paint a plain monospace run and only mount the
+//! syntax-highlighted `TextView::markdown` once the final `ToolResult` lands.
 
 use std::collections::HashSet;
 
+use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
+use agent::tools::agent::{agent_final_text, agent_sub_messages};
+use agent::{Message, ToolCallStatus};
 use gpui::prelude::*;
-use gpui::{App, ClipboardItem, WeakEntity, px};
+use gpui::{App, ClipboardItem, Render, WeakEntity, px};
 use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::{
-    Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
 
 use crate::Workspace;
 use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem};
+use crate::views::centered;
 
 /// Render-time context for sub-agent task cards: which task ids are currently
 /// expanded, and a weak handle to toggle expansion on the owning `Workspace`.
+/// `None` when the owning `Workspace` is already dropped (renders collapsed,
+/// clicks no-op).
 #[derive(Clone)]
 pub struct AgentTaskCtx {
     pub expanded: HashSet<String>,
@@ -60,14 +67,87 @@ fn markdown_tv(
     if scrollable { tv.scrollable(true) } else { tv }
 }
 
+/// One renderable conversation item, owned by its own gpui `Entity` so a
+/// streaming delta notifies (and re-renders) only this item rather than the
+/// whole workspace. `id` is the item's stable list index (the conversation
+/// only ever appends, so the index never shifts); it keys element ids within
+/// the entity's own namespace. `role` is the model display name captured at
+/// creation time so a finished bubble keeps its model label after the user
+/// switches models.
+pub struct MessageItem {
+    kind: ConvItem,
+    role: String,
+    id: usize,
+    /// Weak handle to the owning `Workspace`, used to read/toggle the shared
+    /// `expanded_tasks` set from `AgentTask` cards.
+    weak_workspace: WeakEntity<Workspace>,
+}
+
+impl MessageItem {
+    pub fn new(kind: ConvItem, role: String, id: usize, weak: WeakEntity<Workspace>) -> Self {
+        Self {
+            kind,
+            role,
+            id,
+            weak_workspace: weak,
+        }
+    }
+
+    pub fn kind(&self) -> &ConvItem {
+        &self.kind
+    }
+
+    pub fn kind_mut(&mut self) -> &mut ConvItem {
+        &mut self.kind
+    }
+
+    /// Flip every streaming flag off (terminal `Stop`). Called once per turn,
+    /// so the O(items) walk is harmless.
+    pub fn finalize_streaming(&mut self) {
+        match &mut self.kind {
+            ConvItem::Assistant { streaming, .. } | ConvItem::Reasoning { streaming, .. } => {
+                *streaming = false
+            }
+            ConvItem::ToolCall(t) => t.streaming = false,
+            ConvItem::AgentTask(t) => t.streaming = false,
+            _ => {}
+        }
+    }
+}
+
+impl Render for MessageItem {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let agent_ctx = self.weak_workspace.upgrade().map(|ws| {
+            let expanded = ws.read(cx).expanded_tasks.clone();
+            AgentTaskCtx {
+                expanded,
+                weak: ws.downgrade(),
+            }
+        });
+        centered(render_item(
+            &self.kind,
+            self.id,
+            &self.role,
+            &theme,
+            agent_ctx.as_ref(),
+        ))
+    }
+}
+
 /// Render a `ConvItem` as an element. `ix` is the entry index (stable key for collapsibles/TextView).
-/// `agent_ctx` supplies expansion state for `AgentTask` cards.
+/// `agent_ctx` supplies expansion state for `AgentTask` cards; `None` renders
+/// them collapsed with no-op clicks (used when the owning Workspace is gone).
 pub fn render_item(
     item: &ConvItem,
     ix: usize,
     role: &str,
     theme: &Theme,
-    agent_ctx: &AgentTaskCtx,
+    agent_ctx: Option<&AgentTaskCtx>,
 ) -> gpui::AnyElement {
     match item {
         ConvItem::User(text) => render_user(text, ix, theme),
@@ -329,35 +409,63 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
     };
 
     if !display_output.is_empty() {
-        // Language-annotated code block for syntax highlighting, plain block otherwise.
-        let lang = lang_hint_for_tool(&item.name);
-        let code = if let Some(l) = lang {
-            format!("```{l}\n{display_output}\n```")
-        } else {
-            format!("```\n{display_output}\n```")
-        };
-        // Fixed-height container with internal scroll: the TextView scrolls
-        // inside its own box, so the parent v_flex (the card) reports a
-        // deterministic height regardless of how long the output is. The
-        // previous `max_h + overflow_y_scroll` only clipped the visible area
-        // — the next item was still placed at the clipped boundary, but the
-        // non-scrollable TextView rendered at its natural height, so long
-        // outputs visually overflowed into the next item's y-range.
-        card = card.child(
-            gpui::div()
-                .id(("tool-output", ix))
-                .h(px(220.))
-                .overflow_hidden()
-                .px_3()
-                .py_2()
-                .border_t_1()
-                .border_color(theme.border)
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(markdown_tv(("tool-output-text", ix), code, theme, true)),
-        );
+        card = card.child(render_tool_output(
+            &display_output,
+            &item.name,
+            item.streaming,
+            ix,
+            theme,
+        ));
     }
     card.into_any_element()
+}
+
+/// Fixed-height container with the tool's output. While streaming we paint a
+/// plain monospace run (no markdown re-parse per chunk); once the final
+/// `ToolResult` lands we mount the syntax-highlighted, scrollable
+/// `TextView::markdown`. The container keeps a deterministic height either way
+/// so the parent card (and the list) reports a stable layout.
+fn render_tool_output(
+    output: &str,
+    tool_name: &str,
+    streaming: bool,
+    ix: usize,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    let container = gpui::div()
+        .id(("tool-output", ix))
+        .h(px(220.))
+        .overflow_hidden()
+        .px_3()
+        .py_2()
+        .border_t_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.muted_foreground);
+    if streaming {
+        // Plain monospace run, one div per line, while lines are still
+        // arriving — no Tree-sitter, no shaped-text layout per chunk. Matches
+        // the assistant body's streaming rule. gpui has no `WhiteSpace::Pre`,
+        // so we split on newlines to preserve line structure.
+        container
+            .font_family(theme.mono_font_family.clone())
+            .children(
+                output
+                    .split('\n')
+                    .map(|line| gpui::div().child(line.to_string())),
+            )
+            .into_any_element()
+    } else {
+        let lang = lang_hint_for_tool(tool_name);
+        let code = if let Some(l) = lang {
+            format!("```{l}\n{output}\n```")
+        } else {
+            format!("```\n{output}\n```")
+        };
+        container
+            .child(markdown_tv(("tool-output-text", ix), code, theme, true))
+            .into_any_element()
+    }
 }
 
 /// Render a sub-agent task card: title + status icon + chevron to expand the
@@ -368,7 +476,7 @@ pub fn render_agent_task(
     item: &AgentTaskItem,
     ix: usize,
     theme: &Theme,
-    agent_ctx: &AgentTaskCtx,
+    agent_ctx: Option<&AgentTaskCtx>,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
     let (status_icon, status_color, status_label) = match item.status {
@@ -381,14 +489,14 @@ pub fn render_agent_task(
         ToolCallStatus::Denied => (IconName::CircleX, theme.danger, "已拒绝"),
     };
 
-    let expanded = agent_ctx.expanded.contains(&item.id);
+    let expanded = agent_ctx.is_some_and(|c| c.expanded.contains(&item.id));
     let chevron = if expanded {
         IconName::ChevronDown
     } else {
         IconName::ChevronRight
     };
     let id_for_toggle = item.id.clone();
-    let weak = agent_ctx.weak.clone();
+    let weak = agent_ctx.map(|c| c.weak.clone());
     let copy_text = if item.final_text.is_empty() {
         item.sub_text.clone()
     } else {
@@ -412,12 +520,19 @@ pub fn render_agent_task(
                 .items_center()
                 .cursor_pointer()
                 .on_click(move |_, _window, cx: &mut App| {
+                    // Toggle membership in the owning Workspace's
+                    // `expanded_tasks`, then remeasure the whole list: an
+                    // expand/collapse changes this card's height, and the
+                    // list caches a per-item measured height that must be
+                    // invalidated for the new layout to take hold.
+                    let Some(weak) = weak.clone() else {
+                        return;
+                    };
                     let _ = weak.update(cx, |w, cx| {
-                        // Toggle membership in `expanded_tasks`; notify so the
-                        // chevron/body re-render immediately.
                         if !w.expanded_tasks.insert(id_for_toggle.clone()) {
                             w.expanded_tasks.remove(&id_for_toggle);
                         }
+                        w.list_state().remeasure();
                         cx.notify();
                     });
                 })
@@ -465,27 +580,24 @@ pub fn render_agent_task(
         // Expanded: rebuild the child conversation from its snapshot and render
         // each item recursively. Nested agent tasks share the same expansion
         // set (keyed by id), so they expand/collapse in place too.
-        let sub = crate::conversation::ConversationState::rebuild_from_messages(&item.sub_messages);
-        let sub_items: Vec<_> = sub
-            .items()
-            .iter()
-            .enumerate()
-            .map(|(six, sitem)| render_item(sitem, six, "agent", theme, agent_ctx))
-            .collect();
+        let sub_items = build_items(&item.sub_messages);
         if sub_items.is_empty() {
             if !collapsed_body.is_empty() {
                 card = card.child(render_agent_body(&collapsed_body, ix, theme));
             }
         } else {
-            card = card.child(
-                v_flex()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .px_3()
-                    .py_2()
-                    .gap_1()
-                    .children(sub_items),
-            );
+            card =
+                card.child(
+                    v_flex()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .px_3()
+                        .py_2()
+                        .gap_1()
+                        .children(sub_items.iter().enumerate().map(|(six, sitem)| {
+                            render_item(sitem, six, "agent", theme, agent_ctx)
+                        })),
+                );
         }
     } else if !collapsed_body.is_empty() {
         card = card.child(render_agent_body(&collapsed_body, ix, theme));
@@ -537,5 +649,142 @@ fn truncate(s: &str, max_chars: usize) -> String {
         format!("{t}…")
     } else {
         one_line
+    }
+}
+
+/// Build a flat `ConvItem` list from a `Thread`'s canonical message list.
+/// Shared by `ConversationState::rebuild_from_messages` (top-level, wraps each
+/// item in its own `Entity`) and the nested sub-agent panel (renders plain
+/// items inline, since the snapshot is static once expanded).
+///
+/// Tool calls pair ToolUse with ToolResult by `tool_use_id`; an unpaired side
+/// becomes its own item.
+pub fn build_items(messages: &[Message]) -> Vec<ConvItem> {
+    let mut items: Vec<ConvItem> = Vec::new();
+    for m in messages {
+        match m.role {
+            Role::User => {
+                // Text becomes a user bubble; ToolResult blocks pair back to the
+                // ToolCall item emitted from the preceding assistant ToolUse.
+                // ToolResults live in user messages per the Anthropic wire contract.
+                let text: String = m
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
+                            Some(t.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !text.is_empty() {
+                    items.push(ConvItem::User(text));
+                }
+                for c in &m.content {
+                    if let MessageContent::ToolResult(tr) = c {
+                        pair_tool_result(&mut items, tr);
+                    }
+                }
+            }
+            Role::Assistant => {
+                for c in &m.content {
+                    match c {
+                        MessageContent::Text(t) => {
+                            items.push(ConvItem::Assistant {
+                                text: t.clone(),
+                                streaming: false,
+                            });
+                        }
+                        MessageContent::Thinking { text, .. } => {
+                            items.push(ConvItem::Reasoning {
+                                text: text.clone(),
+                                streaming: false,
+                            });
+                        }
+                        MessageContent::ToolUse(tu) => {
+                            if tu.name.as_ref() == "agent" {
+                                let title = agent::thread::tool_title(tu.name.as_ref(), &tu.input);
+                                items.push(ConvItem::AgentTask(AgentTaskItem {
+                                    id: tu.id.clone(),
+                                    title,
+                                    status: ToolCallStatus::Success,
+                                    streaming: false,
+                                    sub_text: String::new(),
+                                    sub_messages: Vec::new(),
+                                    final_text: String::new(),
+                                    is_error: false,
+                                }));
+                            } else {
+                                items.push(ConvItem::ToolCall(ToolCallItem {
+                                    id: tu.id.clone(),
+                                    name: tu.name.to_string(),
+                                    title: tu.name.to_string(),
+                                    status: ToolCallStatus::Success,
+                                    output: String::new(),
+                                    is_error: false,
+                                    streaming: false,
+                                }));
+                            }
+                        }
+                        MessageContent::ToolResult(tr) => {
+                            // Defensive: tool results normally live in user messages,
+                            // but pair them here too if they ever appear in an assistant turn.
+                            pair_tool_result(&mut items, tr);
+                        }
+                        MessageContent::Image { .. } => {}
+                    }
+                }
+            }
+            Role::System => {}
+        }
+    }
+    items
+}
+
+/// Attach a tool_result to its matching item by id. Sub-agent results land in
+/// `AgentTaskItem::final_text`; ordinary tool results land in `ToolCallItem::output`.
+/// If no match exists, emit a standalone ToolCall result item.
+fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
+    let status = if tr.is_error {
+        ToolCallStatus::Error
+    } else {
+        ToolCallStatus::Success
+    };
+    let ix = items.iter().position(|i| match i {
+        ConvItem::AgentTask(t) => t.id == tr.tool_use_id,
+        ConvItem::ToolCall(t) => t.id == tr.tool_use_id,
+        _ => false,
+    });
+    let Some(ix) = ix else {
+        items.push(ConvItem::ToolCall(ToolCallItem {
+            id: tr.tool_use_id.clone(),
+            name: tr.tool_name.to_string(),
+            title: String::new(),
+            status,
+            output: tr.content.clone(),
+            is_error: tr.is_error,
+            streaming: false,
+        }));
+        return;
+    };
+    match &mut items[ix] {
+        ConvItem::AgentTask(t) => {
+            // On reload the in-memory snapshot map is empty, so restore the
+            // sub-conversation from the persisted JSON envelope.
+            t.final_text = agent_final_text(&tr.content);
+            t.sub_messages = agent_sub_messages(&tr.content).unwrap_or_default();
+            t.is_error = tr.is_error;
+            t.status = status;
+        }
+        ConvItem::ToolCall(t) => {
+            t.output = tr.content.clone();
+            t.is_error = tr.is_error;
+            t.status = status;
+            if t.name.is_empty() {
+                t.name = tr.tool_name.to_string();
+            }
+        }
+        _ => {}
     }
 }

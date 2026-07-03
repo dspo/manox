@@ -1,13 +1,17 @@
 //! Conversation view state.
 //!
-//! Builds a flat `ConvItem` list from `ThreadEvent` deltas for UI rendering. The
-//! `Thread` holds the canonical messages; this maintains a render-oriented view:
-//! thinking and body text split into separate items, and tool calls are tracked
-//! by id for status/output.
+//! A gpui `Entity` holding one `Entity<MessageItem>` per conversation item.
+//! `Thread` holds the canonical messages; this maintains a render-oriented
+//! view: thinking and body text split into separate items, and tool calls are
+//! tracked by id for status/output. Each item lives in its own `Entity` so a
+//! streaming delta notifies (and re-renders) only that item, leaving already-
+//! finished items' markdown untouched.
 
-use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
-use agent::tools::agent::{agent_final_text, agent_sub_messages};
 use agent::{Message, ThreadEvent, ToolCallStatus};
+use gpui::{App, AppContext as _, Entity, WeakEntity};
+
+use crate::Workspace;
+use crate::views::message::{MessageItem, build_items};
 
 /// A single renderable conversation item.
 #[derive(Debug, Clone)]
@@ -51,9 +55,22 @@ pub struct AgentTaskItem {
     pub is_error: bool,
 }
 
+/// What `apply` did to the item list, so the caller can keep the `ListState`
+/// in sync (splice on append, remeasure on in-place mutation).
+pub enum ApplyOutcome {
+    /// No item touched (e.g. `ToolCallAuthorization`).
+    None,
+    /// An existing item's content changed at `index`; remeasure that item.
+    Remeasure(usize),
+    /// A new item was appended at the end; splice the list count up.
+    Appended,
+    /// Every item may have changed (terminal `Stop`); remeasure all.
+    All,
+}
+
 #[derive(Debug, Default)]
 pub struct ConversationState {
-    items: Vec<ConvItem>,
+    items: Vec<Entity<MessageItem>>,
 }
 
 impl ConversationState {
@@ -61,7 +78,7 @@ impl ConversationState {
         Self::default()
     }
 
-    pub fn items(&self) -> &[ConvItem] {
+    pub fn items(&self) -> &[Entity<MessageItem>] {
         &self.items
     }
 
@@ -70,66 +87,128 @@ impl ConversationState {
     }
 
     /// Append a user message.
-    pub fn push_user(&mut self, text: String) {
-        self.items.push(ConvItem::User(text));
+    pub fn push_user(
+        &mut self,
+        text: String,
+        role: &str,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) {
+        let id = self.items.len();
+        self.items
+            .push(cx.new(|_| MessageItem::new(ConvItem::User(text), role.to_string(), id, weak)));
     }
 
-    fn find_tool(&self, id: &str) -> Option<usize> {
-        self.items.iter().position(|item| match item {
-            ConvItem::ToolCall(t) => t.id == id,
-            _ => false,
-        })
+    fn find_tool(&self, id: &str, cx: &App) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|e| matches!(e.read(cx).kind(), ConvItem::ToolCall(t) if t.id == id))
     }
 
-    fn find_agent_task(&self, id: &str) -> Option<usize> {
-        self.items.iter().position(|item| match item {
-            ConvItem::AgentTask(t) => t.id == id,
-            _ => false,
-        })
+    fn find_agent_task(&self, id: &str, cx: &App) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|e| matches!(e.read(cx).kind(), ConvItem::AgentTask(t) if t.id == id))
     }
 
     /// Feed the child `Thread`'s full message list into the matching agent task,
-    /// populating the expandable sub-conversation panel. Called by `Workspace`
-    /// after the parent's `subagent_snapshots` is updated.
-    pub fn set_agent_sub_messages(&mut self, id: &str, messages: Vec<Message>) {
-        if let Some(ix) = self.find_agent_task(id)
-            && let Some(ConvItem::AgentTask(t)) = self.items.get_mut(ix)
-        {
-            t.sub_messages = messages;
-        }
+    /// populating the expandable sub-conversation panel. Returns the item index
+    /// so the caller can remeasure it; `None` if no matching task was found.
+    pub fn set_agent_sub_messages(
+        &mut self,
+        id: &str,
+        messages: Vec<Message>,
+        cx: &mut App,
+    ) -> Option<usize> {
+        let ix = self.find_agent_task(id, cx)?;
+        self.items[ix].update(cx, |item, cx| {
+            if let ConvItem::AgentTask(t) = item.kind_mut() {
+                t.sub_messages = messages;
+            }
+            cx.notify();
+        });
+        Some(ix)
     }
 
     /// Apply a `ThreadEvent` delta (excludes `ToolCallAuthorization`, which `Workspace` handles).
-    pub fn apply(&mut self, event: &ThreadEvent) {
+    pub fn apply(
+        &mut self,
+        event: &ThreadEvent,
+        role: &str,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) -> ApplyOutcome {
         match event {
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
-                    Some(ConvItem::Assistant { streaming, .. }) => !*streaming,
-                    _ => true,
+                    Some(e) => !matches!(
+                        e.read(cx).kind(),
+                        ConvItem::Assistant {
+                            streaming: true,
+                            ..
+                        }
+                    ),
+                    None => true,
                 };
                 if needs_new {
-                    self.items.push(ConvItem::Assistant {
-                        text: String::new(),
-                        streaming: true,
+                    let id = self.items.len();
+                    self.items.push(cx.new(|_| {
+                        MessageItem::new(
+                            ConvItem::Assistant {
+                                text: delta.clone(),
+                                streaming: true,
+                            },
+                            role.to_string(),
+                            id,
+                            weak,
+                        )
+                    }));
+                    ApplyOutcome::Appended
+                } else {
+                    let ix = self.items.len() - 1;
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::Assistant { text, .. } = item.kind_mut() {
+                            text.push_str(delta);
+                        }
+                        cx.notify();
                     });
-                }
-                if let Some(ConvItem::Assistant { text, .. }) = self.items.last_mut() {
-                    text.push_str(delta);
+                    ApplyOutcome::Remeasure(ix)
                 }
             }
             ThreadEvent::AgentThinking(delta) => {
                 let needs_new = match self.items.last() {
-                    Some(ConvItem::Reasoning { streaming, .. }) => !*streaming,
-                    _ => true,
+                    Some(e) => !matches!(
+                        e.read(cx).kind(),
+                        ConvItem::Reasoning {
+                            streaming: true,
+                            ..
+                        }
+                    ),
+                    None => true,
                 };
                 if needs_new {
-                    self.items.push(ConvItem::Reasoning {
-                        text: String::new(),
-                        streaming: true,
+                    let id = self.items.len();
+                    self.items.push(cx.new(|_| {
+                        MessageItem::new(
+                            ConvItem::Reasoning {
+                                text: delta.clone(),
+                                streaming: true,
+                            },
+                            role.to_string(),
+                            id,
+                            weak,
+                        )
+                    }));
+                    ApplyOutcome::Appended
+                } else {
+                    let ix = self.items.len() - 1;
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::Reasoning { text, .. } = item.kind_mut() {
+                            text.push_str(delta);
+                        }
+                        cx.notify();
                     });
-                }
-                if let Some(ConvItem::Reasoning { text, .. }) = self.items.last_mut() {
-                    text.push_str(delta);
+                    ApplyOutcome::Remeasure(ix)
                 }
             }
             ThreadEvent::ToolCall {
@@ -141,52 +220,88 @@ impl ConversationState {
                 if name == "agent" {
                     // Sub-agent invocations render as AgentTask cards, not plain
                     // tool calls, so they get the expandable sub-conversation panel.
-                    if let Some(ix) = self.find_agent_task(id) {
-                        if let Some(ConvItem::AgentTask(t)) = self.items.get_mut(ix) {
+                    if let Some(ix) = self.find_agent_task(id, cx) {
+                        self.items[ix].update(cx, |item, cx| {
+                            if let ConvItem::AgentTask(t) = item.kind_mut() {
+                                t.title = title.clone();
+                                t.status = *status;
+                            }
+                            cx.notify();
+                        });
+                        ApplyOutcome::Remeasure(ix)
+                    } else {
+                        let ix = self.items.len();
+                        self.items.push(cx.new(|_| {
+                            MessageItem::new(
+                                ConvItem::AgentTask(AgentTaskItem {
+                                    id: id.clone(),
+                                    title: title.clone(),
+                                    status: *status,
+                                    streaming: matches!(*status, ToolCallStatus::Running),
+                                    sub_text: String::new(),
+                                    sub_messages: Vec::new(),
+                                    final_text: String::new(),
+                                    is_error: false,
+                                }),
+                                role.to_string(),
+                                ix,
+                                weak,
+                            )
+                        }));
+                        ApplyOutcome::Appended
+                    }
+                } else if let Some(ix) = self.find_tool(id, cx) {
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::ToolCall(t) = item.kind_mut() {
                             t.title = title.clone();
                             t.status = *status;
+                            t.name = name.clone();
                         }
-                    } else {
-                        self.items.push(ConvItem::AgentTask(AgentTaskItem {
-                            id: id.clone(),
-                            title: title.clone(),
-                            status: *status,
-                            streaming: matches!(*status, ToolCallStatus::Running),
-                            sub_text: String::new(),
-                            sub_messages: Vec::new(),
-                            final_text: String::new(),
-                            is_error: false,
-                        }));
-                    }
-                } else if let Some(ix) = self.find_tool(id) {
-                    if let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix) {
-                        t.title = title.clone();
-                        t.status = *status;
-                        t.name = name.clone();
-                    }
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(ix)
                 } else {
-                    self.items.push(ConvItem::ToolCall(ToolCallItem {
-                        id: id.clone(),
-                        name: name.clone(),
-                        title: title.clone(),
-                        status: *status,
-                        output: String::new(),
-                        is_error: false,
-                        streaming: matches!(*status, ToolCallStatus::Running),
+                    let ix = self.items.len();
+                    self.items.push(cx.new(|_| {
+                        MessageItem::new(
+                            ConvItem::ToolCall(ToolCallItem {
+                                id: id.clone(),
+                                name: name.clone(),
+                                title: title.clone(),
+                                status: *status,
+                                output: String::new(),
+                                is_error: false,
+                                streaming: matches!(*status, ToolCallStatus::Running),
+                            }),
+                            role.to_string(),
+                            ix,
+                            weak,
+                        )
                     }));
+                    ApplyOutcome::Appended
                 }
             }
             ThreadEvent::ToolOutput { id, chunk } => {
-                if let Some(ix) = self.find_agent_task(id) {
-                    if let Some(ConvItem::AgentTask(t)) = self.items.get_mut(ix) {
-                        t.sub_text.push_str(chunk);
-                        t.streaming = true;
-                    }
-                } else if let Some(ix) = self.find_tool(id)
-                    && let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix)
-                {
-                    t.output.push_str(chunk);
-                    t.streaming = true;
+                if let Some(ix) = self.find_agent_task(id, cx) {
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::AgentTask(t) = item.kind_mut() {
+                            t.sub_text.push_str(chunk);
+                            t.streaming = true;
+                        }
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(ix)
+                } else if let Some(ix) = self.find_tool(id, cx) {
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::ToolCall(t) = item.kind_mut() {
+                            t.output.push_str(chunk);
+                            t.streaming = true;
+                        }
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(ix)
+                } else {
+                    ApplyOutcome::None
                 }
             }
             ThreadEvent::ToolResult {
@@ -199,55 +314,73 @@ impl ConversationState {
                 } else {
                     ToolCallStatus::Success
                 };
-                if let Some(ix) = self.find_agent_task(id) {
-                    if let Some(ConvItem::AgentTask(t)) = self.items.get_mut(ix) {
-                        // The live event carries the JSON envelope; extract the
-                        // final text for the collapsed view. `sub_messages` is
-                        // filled separately from the in-memory snapshot by the
-                        // workspace, so don't touch it here.
-                        t.final_text = agent_final_text(output);
-                        t.is_error = *is_error;
-                        t.streaming = false;
-                        t.status = status;
-                    }
-                } else if let Some(ix) = self.find_tool(id) {
-                    if let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix) {
-                        t.output = output.clone();
-                        t.is_error = *is_error;
-                        t.streaming = false;
-                        t.status = status;
-                    }
+                if let Some(ix) = self.find_agent_task(id, cx) {
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::AgentTask(t) = item.kind_mut() {
+                            // The live event carries the JSON envelope; extract the
+                            // final text for the collapsed view. `sub_messages` is
+                            // filled separately from the in-memory snapshot by the
+                            // workspace, so don't touch it here.
+                            t.final_text = agent::tools::agent::agent_final_text(output);
+                            t.is_error = *is_error;
+                            t.streaming = false;
+                            t.status = status;
+                        }
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(ix)
+                } else if let Some(ix) = self.find_tool(id, cx) {
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::ToolCall(t) = item.kind_mut() {
+                            t.output = output.clone();
+                            t.is_error = *is_error;
+                            t.streaming = false;
+                            t.status = status;
+                        }
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(ix)
                 } else {
                     // No matching ToolCall item; insert directly as a result item.
-                    self.items.push(ConvItem::ToolCall(ToolCallItem {
-                        id: id.clone(),
-                        name: String::new(),
-                        title: String::new(),
-                        status,
-                        output: output.clone(),
-                        is_error: *is_error,
-                        streaming: false,
+                    let ix = self.items.len();
+                    self.items.push(cx.new(|_| {
+                        MessageItem::new(
+                            ConvItem::ToolCall(ToolCallItem {
+                                id: id.clone(),
+                                name: String::new(),
+                                title: String::new(),
+                                status,
+                                output: output.clone(),
+                                is_error: *is_error,
+                                streaming: false,
+                            }),
+                            role.to_string(),
+                            ix,
+                            weak,
+                        )
                     }));
+                    ApplyOutcome::Appended
                 }
             }
             ThreadEvent::ToolCallAuthorization { .. } => {
                 // Handled by `Workspace` as a prompt overlay; not part of the conversation flow.
+                ApplyOutcome::None
             }
             ThreadEvent::Stop(_) => {
-                for item in &mut self.items {
-                    match item {
-                        ConvItem::Assistant { streaming, .. }
-                        | ConvItem::Reasoning { streaming, .. } => {
-                            *streaming = false;
-                        }
-                        ConvItem::ToolCall(t) => t.streaming = false,
-                        ConvItem::AgentTask(t) => t.streaming = false,
-                        _ => {}
-                    }
+                for e in &self.items {
+                    e.update(cx, |item, cx| {
+                        item.finalize_streaming();
+                        cx.notify();
+                    });
                 }
+                ApplyOutcome::All
             }
             ThreadEvent::Error(e) => {
-                self.items.push(ConvItem::Error(e.to_string()));
+                let ix = self.items.len();
+                self.items.push(cx.new(|_| {
+                    MessageItem::new(ConvItem::Error(e.to_string()), role.to_string(), ix, weak)
+                }));
+                ApplyOutcome::Appended
             }
         }
     }
@@ -257,130 +390,21 @@ impl ConversationState {
     }
 
     /// Rebuild view state from a `Thread`'s canonical message list (used when loading a historical thread).
-    /// Tool calls pair ToolUse with ToolResult by `tool_use_id`; an unpaired side becomes its own item.
-    pub fn rebuild_from_messages(messages: &[Message]) -> Self {
-        let mut state = Self::new();
-        for m in messages {
-            match m.role {
-                Role::User => {
-                    // Text becomes a user bubble; ToolResult blocks pair back to the
-                    // ToolCall item emitted from the preceding assistant ToolUse.
-                    // ToolResults live in user messages per the Anthropic wire contract.
-                    let text: String =
-                        m.content
-                            .iter()
-                            .filter_map(|c| match c {
-                                MessageContent::Text(t)
-                                | MessageContent::Thinking { text: t, .. } => Some(t.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("");
-                    if !text.is_empty() {
-                        state.push_user(text);
-                    }
-                    for c in &m.content {
-                        if let MessageContent::ToolResult(tr) = c {
-                            pair_tool_result(&mut state, tr);
-                        }
-                    }
-                }
-                Role::Assistant => {
-                    for c in &m.content {
-                        match c {
-                            MessageContent::Text(t) => {
-                                state.items.push(ConvItem::Assistant {
-                                    text: t.clone(),
-                                    streaming: false,
-                                });
-                            }
-                            MessageContent::Thinking { text, .. } => {
-                                state.items.push(ConvItem::Reasoning {
-                                    text: text.clone(),
-                                    streaming: false,
-                                });
-                            }
-                            MessageContent::ToolUse(tu) => {
-                                if tu.name.as_ref() == "agent" {
-                                    let title =
-                                        agent::thread::tool_title(tu.name.as_ref(), &tu.input);
-                                    state.items.push(ConvItem::AgentTask(AgentTaskItem {
-                                        id: tu.id.clone(),
-                                        title,
-                                        status: ToolCallStatus::Success,
-                                        streaming: false,
-                                        sub_text: String::new(),
-                                        sub_messages: Vec::new(),
-                                        final_text: String::new(),
-                                        is_error: false,
-                                    }));
-                                } else {
-                                    state.items.push(ConvItem::ToolCall(ToolCallItem {
-                                        id: tu.id.clone(),
-                                        name: tu.name.to_string(),
-                                        title: tu.name.to_string(),
-                                        status: ToolCallStatus::Success,
-                                        output: String::new(),
-                                        is_error: false,
-                                        streaming: false,
-                                    }));
-                                }
-                            }
-                            MessageContent::ToolResult(tr) => {
-                                // Defensive: tool results normally live in user messages,
-                                // but pair them here too if they ever appear in an assistant turn.
-                                pair_tool_result(&mut state, tr);
-                            }
-                            MessageContent::Image { .. } => {}
-                        }
-                    }
-                }
-                Role::System => {}
-            }
-        }
-        state
-    }
-}
-
-/// Attach a tool_result to its matching item by id. Sub-agent results land in
-/// `AgentTaskItem::final_text`; ordinary tool results land in `ToolCallItem::output`.
-/// If no match exists, emit a standalone ToolCall result item.
-fn pair_tool_result(state: &mut ConversationState, tr: &LanguageModelToolResult) {
-    let status = if tr.is_error {
-        ToolCallStatus::Error
-    } else {
-        ToolCallStatus::Success
-    };
-    if let Some(ix) = state.find_agent_task(&tr.tool_use_id) {
-        if let Some(ConvItem::AgentTask(t)) = state.items.get_mut(ix) {
-            // On reload the in-memory snapshot map is empty, so restore the
-            // sub-conversation from the persisted JSON envelope.
-            t.final_text = agent_final_text(&tr.content);
-            t.sub_messages = agent_sub_messages(&tr.content).unwrap_or_default();
-            t.is_error = tr.is_error;
-            t.status = status;
-        }
-        return;
-    }
-    if let Some(ix) = state.find_tool(&tr.tool_use_id) {
-        if let Some(ConvItem::ToolCall(t)) = state.items.get_mut(ix) {
-            t.output = tr.content.clone();
-            t.is_error = tr.is_error;
-            t.status = status;
-            if t.name.is_empty() {
-                t.name = tr.tool_name.to_string();
-            }
-        }
-    } else {
-        state.items.push(ConvItem::ToolCall(ToolCallItem {
-            id: tr.tool_use_id.clone(),
-            name: tr.tool_name.to_string(),
-            title: String::new(),
-            status,
-            output: tr.content.clone(),
-            is_error: tr.is_error,
-            streaming: false,
-        }));
+    pub fn rebuild_from_messages(
+        messages: &[Message],
+        role: &str,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) -> Self {
+        let plain = build_items(messages);
+        let items = plain
+            .into_iter()
+            .enumerate()
+            .map(|(id, kind)| {
+                cx.new(|_| MessageItem::new(kind, role.to_string(), id, weak.clone()))
+            })
+            .collect();
+        Self { items }
     }
 }
 
@@ -388,7 +412,9 @@ fn pair_tool_result(state: &mut ConversationState, tr: &LanguageModelToolResult)
 mod tests {
     use super::*;
     use agent::Message;
-    use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
+    use agent::language_model::{
+        LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role,
+    };
     use std::sync::Arc;
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the
@@ -418,9 +444,8 @@ mod tests {
                 })],
             },
         ];
-        let state = ConversationState::rebuild_from_messages(&messages);
-        let tool = state
-            .items()
+        let items = build_items(&messages);
+        let tool = items
             .iter()
             .find_map(|i| match i {
                 ConvItem::ToolCall(t) if t.id == "tu_1" => Some(t),
@@ -430,10 +455,8 @@ mod tests {
         assert_eq!(tool.output, "file contents here");
         assert_eq!(tool.status, ToolCallStatus::Success);
         assert!(!tool.is_error);
-        // The pure-toolresult user message must not render an empty user bubble.
         assert!(
-            !state
-                .items()
+            !items
                 .iter()
                 .any(|i| matches!(i, ConvItem::User(t) if t.is_empty()))
         );
@@ -450,9 +473,8 @@ mod tests {
                 content: "boom".to_string(),
             })],
         }];
-        let state = ConversationState::rebuild_from_messages(&messages);
-        let tool = state
-            .items()
+        let items = build_items(&messages);
+        let tool = items
             .iter()
             .find_map(|i| match i {
                 ConvItem::ToolCall(t) if t.id == "tu_x" => Some(t),
@@ -498,9 +520,8 @@ mod tests {
                 })],
             },
         ];
-        let state = ConversationState::rebuild_from_messages(&messages);
-        let task = state
-            .items()
+        let items = build_items(&messages);
+        let task = items
             .iter()
             .find_map(|i| match i {
                 ConvItem::AgentTask(t) if t.id == "tu_agent" => Some(t),
@@ -517,10 +538,13 @@ mod tests {
     #[test]
     fn agent_final_text_falls_back_for_legacy_content() {
         assert_eq!(
-            agent_final_text("just a plain summary"),
+            agent::tools::agent::agent_final_text("just a plain summary"),
             "just a plain summary"
         );
-        assert_eq!(agent_final_text("not json { at all"), "not json { at all");
-        assert!(agent_sub_messages("plain text").is_none());
+        assert_eq!(
+            agent::tools::agent::agent_final_text("not json { at all"),
+            "not json { at all"
+        );
+        assert!(agent::tools::agent::agent_sub_messages("plain text").is_none());
     }
 }
