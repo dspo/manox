@@ -12,7 +12,6 @@ use dirs::home_dir;
 use rand::RngCore;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -28,14 +27,19 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
+use cx_providers::{
+    AgentConfig, ApiKeySourceKind, CopilotAuth, CxConfig, EndpointConfig, ModelConfig,
+    PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec, ProviderModelConfig,
+    ResolvedModel, WireApi, active_provider_config_path, cx_state_dir, read_config_file,
+    resolve_apikey,
+};
+
 mod codex_app;
 mod probe;
 mod stats;
 mod warp;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
-const LEGACY_PROVIDER_CONFIG_FILE_NAME: &str = "config.yaml";
 const LAUNCH_HOME_DIR_NAME: &str = "cx-launch-homes";
 const LAUNCH_HOME_TTL_SECS: u64 = 60 * 60 * 24;
 const ADD_PROVIDER_SENTINEL: &str = "+ 添加 Provider";
@@ -43,158 +47,6 @@ const ADD_NEW_PROVIDER_SENTINEL: &str = "+ 新建 Provider";
 const ADD_WIRE_API_ACTION: &str = "添加 wire_api";
 const ADD_MODEL_ACTION: &str = "添加 model";
 const DEFAULT_PROVIDER_CONFIG_YAML: &str = include_str!("../config/providers.default.yaml");
-
-// ══════════════════════════════════════════════════
-// 配置结构体（从 YAML 反序列化）
-// ══════════════════════════════════════════════════
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-struct CxConfig {
-    #[serde(default)]
-    providers: Vec<ProviderConfig>,
-    #[serde(default)]
-    agents: Vec<AgentConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ProviderConfig {
-    name: String,
-    #[serde(default)]
-    apikey_source: Option<String>,
-    #[serde(default)]
-    models: BTreeMap<String, ProviderModelConfig>,
-    #[serde(default)]
-    endpoints: BTreeMap<String, ProviderEndpointSpec>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-enum ProviderEndpointSpec {
-    Url(String),
-    Detailed(ProviderEndpointDetail),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ProviderEndpointDetail {
-    url: String,
-    #[serde(default)]
-    agents: Vec<String>,
-    #[serde(default)]
-    copilot_auth: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct EndpointConfig {
-    wire_api: String,
-    url: String,
-    agents: Vec<String>,
-    copilot_auth: Option<String>,
-    models: Vec<ModelConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ModelConfig {
-    id: String,
-    #[serde(default)]
-    swe_pro: Option<String>,
-    #[serde(default)]
-    hle: Option<String>,
-    #[serde(default)]
-    desc: Option<String>,
-    #[serde(default)]
-    context: Option<String>,
-    #[serde(default)]
-    wire_apis: Vec<String>,
-    #[serde(default)]
-    agents: Vec<String>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-struct ProviderModelConfig {
-    #[serde(default)]
-    swe_pro: Option<String>,
-    #[serde(default)]
-    hle: Option<String>,
-    #[serde(default)]
-    desc: Option<String>,
-    #[serde(default)]
-    context: Option<String>,
-    #[serde(default)]
-    wire_apis: Vec<String>,
-    #[serde(default)]
-    agents: Vec<String>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct AgentConfig {
-    id: String,
-    #[serde(alias = "bin")]
-    binary: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    wire_apis: Vec<String>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ApiKeySourceKind {
-    None,
-    Env,
-    Keychain,
-    Literal,
-    Shell,
-}
-
-impl ApiKeySourceKind {
-    fn all() -> [Self; 5] {
-        [
-            Self::None,
-            Self::Env,
-            Self::Keychain,
-            Self::Literal,
-            Self::Shell,
-        ]
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::None => "不设置",
-            Self::Env => "env:VAR",
-            Self::Keychain => "keychain:SERVICE",
-            Self::Literal => "literal:value",
-            Self::Shell => "$(shell command)",
-        }
-    }
-
-    fn prompt(self) -> &'static str {
-        match self {
-            Self::None => "不设置 apikey_source，保留为空",
-            Self::Env => "输入环境变量名，例如 DASHSCOPE_API_KEY",
-            Self::Keychain => "输入 Keychain service 名称，例如 DASHSCOPE_API_KEY",
-            Self::Literal => "输入固定值，仅建议本地调试使用",
-            Self::Shell => "输入 shell 命令内容，不要带 $( )，例如 op read ...",
-        }
-    }
-
-    fn build(self, value: &str) -> Option<String> {
-        let value = value.trim();
-        match self {
-            Self::None => None,
-            Self::Env => Some(format!("env:{value}")),
-            Self::Keychain => Some(format!("keychain:{value}")),
-            Self::Literal => Some(format!("literal:{value}")),
-            Self::Shell => Some(format!("$({value})")),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 enum AddOperation {
@@ -246,122 +98,56 @@ enum TextInputAction {
     Cancel,
 }
 
-impl ProviderConfig {
-    fn normalized_endpoints(&self) -> Vec<EndpointConfig> {
-        let mut endpoints = self
-            .endpoints
+// ResolvedModel lives in cx-providers; cx builds it with TUI-specific semantics
+// (agent compatibility, provider+model env merge, "—" placeholders) that the shared
+// crate's manox-style `from_config` does not assume.
+
+/// Build a `ResolvedModel` with cx semantics: `visible_agents` filters by cross-model
+/// compatibility, `env` merges provider base + model overrides, missing scores show "—".
+fn resolved_model_from_config(
+    config: &CxConfig,
+    provider: &ProviderConfig,
+    endpoint: &EndpointConfig,
+    model: &ModelConfig,
+) -> ResolvedModel {
+    let model_wire_apis: Vec<WireApi> = if model.wire_apis.is_empty() {
+        vec![WireApi::from_str(&endpoint.wire_api)]
+    } else {
+        model
+            .wire_apis
             .iter()
-            .map(|(wire_api, spec)| {
-                let (url, agents, copilot_auth) = match spec {
-                    ProviderEndpointSpec::Url(url) => (url.clone(), Vec::new(), None),
-                    ProviderEndpointSpec::Detailed(detail) => (
-                        detail.url.clone(),
-                        detail.agents.clone(),
-                        detail.copilot_auth.clone(),
-                    ),
-                };
-                let models = self
-                    .models
-                    .iter()
-                    .filter(|(_, model)| {
-                        model.wire_apis.is_empty()
-                            || model.wire_apis.iter().any(|candidate| {
-                                WireApi::from_str(candidate) == WireApi::from_str(wire_api)
-                            })
-                    })
-                    .map(|(id, model)| ModelConfig {
-                        id: id.clone(),
-                        swe_pro: model.swe_pro.clone(),
-                        hle: model.hle.clone(),
-                        desc: model.desc.clone(),
-                        context: model.context.clone(),
-                        wire_apis: model.wire_apis.clone(),
-                        agents: model.agents.clone(),
-                        env: model.env.clone(),
-                    })
-                    .collect();
+            .map(|s| WireApi::from_str(s))
+            .filter(|w| *w != WireApi::Unavailable)
+            .collect()
+    };
+    // Merged env: provider is the base, model entries override.
+    let mut merged_env = provider.env.clone();
+    merged_env.extend(model.env.clone());
 
-                EndpointConfig {
-                    wire_api: wire_api.clone(),
-                    url,
-                    agents,
-                    copilot_auth,
-                    models,
-                }
-            })
-            .collect::<Vec<_>>();
-        endpoints.sort_by_key(|endpoint| WireApi::from_str(&endpoint.wire_api).priority());
-        endpoints
-    }
-
-    fn has_endpoints(&self) -> bool {
-        !self.normalized_endpoints().is_empty()
+    ResolvedModel {
+        id: model.id.clone(),
+        swe_pro: model.swe_pro.clone().unwrap_or_else(|| "—".to_string()),
+        hle: model.hle.clone().unwrap_or_else(|| "—".to_string()),
+        desc: model.desc.clone().unwrap_or_default(),
+        context: model.context.clone().unwrap_or_else(|| "—".to_string()),
+        wire_api: WireApi::from_str(&endpoint.wire_api),
+        model_wire_apis,
+        provider_name: provider.name.clone(),
+        endpoint_url: endpoint.url.clone(),
+        visible_agents: effective_agents_for_model(config, provider, endpoint, model),
+        copilot_auth: CopilotAuth::from_endpoint(endpoint),
+        env: merged_env,
+        apikey_source: provider.apikey_source.clone(),
     }
 }
 
-// ══════════════════════════════════════════════════
-// 运行时数据结构（从 config 构建，TUI 使用）
-// ══════════════════════════════════════════════════
-
-#[derive(Debug, Clone)]
-struct ResolvedModel {
-    id: String,
-    swe_pro: String,
-    hle: String,
-    desc: String,
-    context: String,
-    wire_api: WireApi,
-    model_wire_apis: Vec<WireApi>,
-    provider_name: String,
-    endpoint_url: String,
-    visible_agents: Vec<String>,
-    copilot_auth: CopilotAuth,
-    env: BTreeMap<String, String>,
-}
-
-impl ResolvedModel {
-    fn from_config(
-        config: &CxConfig,
-        provider: &ProviderConfig,
-        endpoint: &EndpointConfig,
-        model: &ModelConfig,
-    ) -> Self {
-        let model_wire_apis: Vec<WireApi> = if model.wire_apis.is_empty() {
-            vec![WireApi::from_str(&endpoint.wire_api)]
-        } else {
-            model
-                .wire_apis
-                .iter()
-                .map(|s| WireApi::from_str(s))
-                .filter(|w| *w != WireApi::Unavailable)
-                .collect()
-        };
-        // 合并 provider 级和 model 级环境变量：provider 为底，model 覆盖同名变量。
-        let mut merged_env = provider.env.clone();
-        merged_env.extend(model.env.clone());
-
-        Self {
-            id: model.id.clone(),
-            swe_pro: model.swe_pro.clone().unwrap_or_else(|| "—".to_string()),
-            hle: model.hle.clone().unwrap_or_else(|| "—".to_string()),
-            desc: model.desc.clone().unwrap_or_default(),
-            context: model.context.clone().unwrap_or_else(|| "—".to_string()),
-            wire_api: WireApi::from_str(&endpoint.wire_api),
-            model_wire_apis,
-            provider_name: provider.name.clone(),
-            endpoint_url: endpoint.url.clone(),
-            visible_agents: effective_agents_for_model(config, provider, endpoint, model),
-            copilot_auth: CopilotAuth::from_endpoint(endpoint),
-            env: merged_env,
-        }
-    }
-
-    fn supports_agent(&self, agent_id: &str) -> bool {
-        let agent_id = canonical_agent_id(agent_id);
-        self.visible_agents
-            .iter()
-            .any(|a| canonical_agent_id(a) == agent_id)
-    }
+/// True if `model` lists `agent_id` (modulo `canonical_agent_id` normalization).
+fn resolved_model_supports_agent(model: &ResolvedModel, agent_id: &str) -> bool {
+    let agent_id = canonical_agent_id(agent_id);
+    model
+        .visible_agents
+        .iter()
+        .any(|a| canonical_agent_id(a) == agent_id)
 }
 
 #[derive(Debug, Clone)]
@@ -524,65 +310,16 @@ fn effective_agents_for_model(
     resolved
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum WireApi {
-    Responses,
-    Completions,
-    Anthropic,
-    Unavailable,
-}
-
-impl WireApi {
-    fn from_str(s: &str) -> Self {
-        match s {
-            "responses" => Self::Responses,
-            "completions" => Self::Completions,
-            "anthropic" => Self::Anthropic,
-            _ => Self::Unavailable,
-        }
-    }
-
-    fn display(self) -> &'static str {
-        match self {
-            Self::Responses => "responses",
-            Self::Completions => "completions",
-            Self::Anthropic => "anthropic",
-            Self::Unavailable => "unavailable",
-        }
-    }
-
-    fn priority(self) -> u8 {
-        match self {
-            Self::Anthropic => 0,
-            Self::Responses => 1,
-            Self::Completions => 2,
-            Self::Unavailable => 3,
-        }
-    }
-
-    fn launch_value(self) -> Result<&'static str> {
-        match self {
-            Self::Responses => Ok("responses"),
-            Self::Completions => Ok("completions"),
-            Self::Anthropic => Ok("anthropic"),
-            Self::Unavailable => {
-                bail!("该模型当前被标记为 unavailable，请先运行 `cx probe` 更新探测结果")
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CopilotAuth {
-    ApiKey,
-    BearerToken,
-}
-
-impl CopilotAuth {
-    pub(crate) fn from_endpoint(endpoint: &EndpointConfig) -> Self {
-        match endpoint.copilot_auth.as_deref() {
-            Some("bearer_token") => Self::BearerToken,
-            _ => Self::ApiKey,
+/// Map a `WireApi` to the launch vocabulary used by copilot's `COPILOT_PROVIDER_WIRE_API`.
+/// `Unavailable` is an error here (cx probe must refresh) — unlike `WireApi::display`,
+/// which is a lossless label.
+fn wire_api_launch_value(wire_api: WireApi) -> Result<&'static str> {
+    match wire_api {
+        WireApi::Responses => Ok("responses"),
+        WireApi::Completions => Ok("completions"),
+        WireApi::Anthropic => Ok("anthropic"),
+        WireApi::Unavailable => {
+            bail!("该模型当前被标记为 unavailable，请先运行 `cx probe` 更新探测结果")
         }
     }
 }
@@ -780,52 +517,6 @@ fn find_agent(config: &CxConfig, agent_id: &str) -> Option<ResolvedAgent> {
 
 fn unsupported_codex_app_message() -> &'static str {
     "`cx` 不再代理 `codex app` 桌面版。请直接运行原生 `codex app ...`；终端版仍可继续使用 `cx codex ...`。"
-}
-
-// ══════════════════════════════════════════════════
-// 配置加载
-// ══════════════════════════════════════════════════
-
-fn provider_config_path() -> Result<PathBuf> {
-    Ok(cx_state_dir()?.join(PROVIDER_CONFIG_FILE_NAME))
-}
-
-fn legacy_provider_config_path() -> Result<PathBuf> {
-    Ok(cx_state_dir()?.join(LEGACY_PROVIDER_CONFIG_FILE_NAME))
-}
-
-fn migrate_legacy_provider_config(current_path: &Path, legacy_path: &Path) -> Result<bool> {
-    if current_path.exists() || !legacy_path.exists() {
-        return Ok(false);
-    }
-
-    if let Some(parent) = current_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
-    }
-
-    fs::rename(legacy_path, current_path).with_context(|| {
-        format!(
-            "迁移旧配置失败: {} -> {}",
-            legacy_path.display(),
-            current_path.display()
-        )
-    })?;
-    eprintln!("已将旧 Provider 配置迁移到 {}", current_path.display());
-    Ok(true)
-}
-
-fn active_provider_config_path() -> Result<PathBuf> {
-    let current_path = provider_config_path()?;
-    let legacy_path = legacy_provider_config_path()?;
-    migrate_legacy_provider_config(&current_path, &legacy_path)?;
-    Ok(current_path)
-}
-
-fn read_config_file(path: &Path) -> Result<CxConfig> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
-    serde_yaml::from_str(&content).with_context(|| format!("解析配置文件失败: {}", path.display()))
 }
 
 fn create_default_provider_config(path: &Path) -> Result<()> {
@@ -1351,34 +1042,6 @@ fn save_config(path: &Path, config: &CxConfig) -> Result<()> {
     write_string_atomic(path, &yaml)
 }
 
-fn resolve_apikey(source: &str) -> Result<String> {
-    if let Some(rest) = source.strip_prefix("keychain:") {
-        keychain_secret(rest)
-    } else if let Some(rest) = source.strip_prefix("env:") {
-        env::var(rest).with_context(|| format!("环境变量 `{rest}` 未设置"))
-    } else if let Some(rest) = source.strip_prefix("literal:") {
-        Ok(rest.to_string())
-    } else if source.starts_with("$(") {
-        // Shell command: $(command)
-        let cmd = source.trim_start_matches("$(").trim_end_matches(')');
-        let output = Command::new("sh")
-            .args(["-c", cmd])
-            .output()
-            .with_context(|| format!("执行 shell 命令失败: {cmd}"))?;
-        if !output.status.success() {
-            bail!("shell 命令 `{cmd}` 执行失败");
-        }
-        Ok(String::from_utf8(output.stdout)?.trim().to_string())
-    } else {
-        bail!("不支持的 apikey_source 格式: `{source}`")
-    }
-}
-
-fn cx_state_dir() -> Result<PathBuf> {
-    let home = home_dir().context("无法解析用户主目录")?;
-    Ok(home.join(".config/cx"))
-}
-
 fn current_unix_secs() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1397,7 +1060,7 @@ fn build_all_models(config: &CxConfig) -> Vec<ResolvedModel> {
     for provider in &config.providers {
         for endpoint in provider.normalized_endpoints() {
             for model in &endpoint.models {
-                models.push(ResolvedModel::from_config(
+                models.push(resolved_model_from_config(
                     config, provider, &endpoint, model,
                 ));
             }
@@ -1477,7 +1140,7 @@ fn model_options_for_provider(
 
     for model in all_models
         .iter()
-        .filter(|m| m.provider_name == provider_name && m.supports_agent(agent_id))
+        .filter(|m| m.provider_name == provider_name && resolved_model_supports_agent(m, agent_id))
     {
         if let Some(index) = indexes_by_id.get(&model.id).copied() {
             grouped[index].push(model.clone());
@@ -1511,7 +1174,7 @@ fn injected_models_for_codex_app(
         .iter()
         .filter(|m| {
             m.provider_name == provider_name
-                && m.supports_agent("Codex.app")
+                && resolved_model_supports_agent(m, "Codex.app")
                 // 显式确认模型支持 Responses wire api。supports_agent 已隐含这点
                 // （Codex.app agent 仅兼容 Responses endpoint），但这里再过滤一次，
                 // 防止配置层不变量将来变动时把非 Responses 模型注入、生成错误的 wire_api。
@@ -2516,7 +2179,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                         env.insert("COPILOT_PROVIDER_TYPE".into(), "openai".into());
                         env.insert(
                             "COPILOT_PROVIDER_WIRE_API".into(),
-                            model.wire_api.launch_value()?.to_string(),
+                            wire_api_launch_value(model.wire_api)?.to_string(),
                         );
                     }
                     WireApi::Unavailable => {
@@ -2632,41 +2295,6 @@ fn resolve_binary(name: &str) -> Result<PathBuf> {
         .into_iter()
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| anyhow!("找不到原生可执行文件 `{name}`"))
-}
-
-fn keychain_secret(service: &str) -> Result<String> {
-    if !cfg!(target_os = "macos") {
-        bail!("`keychain:` 仅支持 macOS Keychain，请改用 `env:` 配置 `{service}`。");
-    }
-
-    let user = env::var("USER").unwrap_or_default();
-    let output = Command::new("security")
-        .args(["find-generic-password", "-a", &user, "-s", service, "-w"])
-        .output()
-        .with_context(|| format!("调用 macOS Keychain 失败，service={service}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        bail!(
-            "无法从 Keychain 读取 `{service}`: {}",
-            if stderr.is_empty() {
-                "未知错误".to_string()
-            } else {
-                stderr
-            }
-        );
-    }
-
-    let secret = String::from_utf8(output.stdout)
-        .with_context(|| format!("Keychain 返回的 `{service}` 不是合法 UTF-8"))?
-        .trim()
-        .to_string();
-
-    if secret.is_empty() {
-        bail!("Keychain 中的 `{service}` 为空");
-    }
-
-    Ok(secret)
 }
 
 fn run_probe(provider: Option<String>, auto_probe: bool, config: &CxConfig) -> Result<()> {
@@ -4308,6 +3936,7 @@ mod tests {
             visible_agents: vec!["codex".into(), "claude".into()],
             copilot_auth: CopilotAuth::ApiKey,
             env: BTreeMap::new(),
+            apikey_source: None,
         }
     }
 
@@ -4562,6 +4191,7 @@ mod tests {
                 visible_agents: vec!["claude".into()],
                 copilot_auth: CopilotAuth::ApiKey,
                 env: BTreeMap::new(),
+                apikey_source: None,
             }),
             injected_models: Vec::new(),
         };
@@ -4624,6 +4254,7 @@ mod tests {
                 visible_agents: vec!["claude".into()],
                 copilot_auth: CopilotAuth::ApiKey,
                 env: BTreeMap::new(),
+                apikey_source: None,
             }),
             injected_models: Vec::new(),
         };
@@ -4663,6 +4294,7 @@ mod tests {
                 visible_agents: vec!["copilot".into()],
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
+                apikey_source: None,
             }),
             injected_models: Vec::new(),
         };
@@ -4714,6 +4346,7 @@ mod tests {
                 visible_agents: vec!["copilot".into()],
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
+                apikey_source: None,
             }),
             injected_models: Vec::new(),
         };
@@ -4757,6 +4390,7 @@ mod tests {
                 visible_agents: vec!["copilot".into()],
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
+                apikey_source: None,
             }),
             injected_models: Vec::new(),
         };
@@ -4855,6 +4489,7 @@ mod tests {
                 visible_agents: vec!["claude".into()],
                 copilot_auth: CopilotAuth::ApiKey,
                 env: model_env,
+                apikey_source: None,
             }),
             injected_models: Vec::new(),
         };
@@ -4902,6 +4537,7 @@ mod tests {
                 visible_agents: vec!["claude".into()],
                 copilot_auth: CopilotAuth::ApiKey,
                 env: model_env,
+                apikey_source: None,
             }),
             injected_models: Vec::new(),
         };
@@ -4986,6 +4622,7 @@ mod tests {
                 visible_agents: vec!["claude".into()],
                 copilot_auth: CopilotAuth::ApiKey,
                 env: merged_env,
+                apikey_source: None,
             }),
             injected_models: Vec::new(),
         };
@@ -5034,7 +4671,7 @@ mod tests {
         };
         let endpoints = provider.normalized_endpoints();
         let model = &endpoints[0].models[0];
-        let resolved = ResolvedModel::from_config(&config, &provider, &endpoints[0], model);
+        let resolved = resolved_model_from_config(&config, &provider, &endpoints[0], model);
 
         // Model env overrides provider env for shared key
         assert_eq!(resolved.env.get("SHARED"), Some(&"from-model".into()));
@@ -5718,7 +5355,7 @@ trust_level = "trusted"
         // codex+ 支持 anthropic / responses / completions，该 provider 下所有模型都应可见。
         for model in &models {
             assert!(
-                model.supports_agent("codex+"),
+                resolved_model_supports_agent(model, "codex+"),
                 "codex+ 应能看到模型 {} (wire_api={:?})",
                 model.id,
                 model.wire_api
@@ -5902,24 +5539,6 @@ trust_level = "trusted"
         assert!(fake.join("sessions").join("local.json").exists());
 
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn migrate_legacy_provider_config_moves_file() {
-        let dir = temp_test_dir("provider-config-migration");
-        fs::create_dir_all(&dir).unwrap();
-
-        let current_path = dir.join(PROVIDER_CONFIG_FILE_NAME);
-        let legacy_path = dir.join(LEGACY_PROVIDER_CONFIG_FILE_NAME);
-        let content = "providers: []\nagents: []\n";
-        fs::write(&legacy_path, content).unwrap();
-
-        let migrated = migrate_legacy_provider_config(&current_path, &legacy_path).unwrap();
-        assert!(migrated);
-        assert!(!legacy_path.exists());
-        assert_eq!(fs::read_to_string(&current_path).unwrap(), content);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6213,7 +5832,7 @@ agents:
         // ResolvedModel merges provider + model env
         let endpoints = provider.normalized_endpoints();
         let resolved =
-            ResolvedModel::from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
+            resolved_model_from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
         assert_eq!(resolved.env.len(), 3);
         assert_eq!(
             resolved.env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
@@ -6250,7 +5869,7 @@ agents:
         let provider = &config.providers[0];
         let endpoints = provider.normalized_endpoints();
         let resolved =
-            ResolvedModel::from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
+            resolved_model_from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
 
         assert_eq!(
             resolved.env.get("SHARED_VAR"),

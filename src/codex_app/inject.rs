@@ -323,6 +323,7 @@ mod tests {
             visible_agents: vec!["Codex.app".into()],
             copilot_auth: CopilotAuth::ApiKey,
             env: BTreeMap::new(),
+            apikey_source: None,
         }
     }
 

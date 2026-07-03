@@ -507,6 +507,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "cx-providers",
  "dirs",
  "futures-util",
  "glob",
@@ -525,6 +526,17 @@ dependencies = [
  "tokio-tungstenite",
  "url",
  "which",
+]
+
+[[package]]
+name = "cx-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "serde",
+ "serde_yaml",
+ "tempfile",
 ]
 
 [[package]]
