@@ -220,8 +220,6 @@ impl Render for Sidebar {
                             })),
                     ),
             )
-            // Fixed bottom footer: settings + account (static).
-            .child(render_footer(&theme))
     }
 }
 
@@ -353,51 +351,6 @@ fn render_thread_item(
                         .on_click(cx.listener(move |_this, _ev, _window, cx| {
                             cx.emit(SidebarEvent::DeleteThread(id_del.clone()));
                         })),
-                ),
-        )
-        .into_any_element()
-}
-
-/// Static bottom footer: settings row + account row.
-fn render_footer(theme: &Theme) -> AnyElement {
-    v_flex()
-        .w_full()
-        .flex_shrink_0()
-        .px_2()
-        .py_2()
-        .gap_0p5()
-        .border_t_1()
-        .border_color(theme.border)
-        .child(static_menu_item(IconName::Settings, "设置", theme))
-        .child(
-            h_flex()
-                .w_full()
-                .px_2()
-                .py_1p5()
-                .gap_2()
-                .items_center()
-                .rounded(theme.radius)
-                .hover(|s| s.bg(theme.accent.opacity(0.08)))
-                .child(
-                    gpui::div()
-                        .size(px(24.))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(theme.accent)
-                        .text_color(theme.accent_foreground)
-                        .text_xs()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child("账"),
-                )
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child("账户"),
                 ),
         )
         .into_any_element()
