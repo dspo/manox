@@ -137,6 +137,7 @@ dependencies = [
  "brush-builtins",
  "brush-core",
  "chrono",
+ "cx-providers",
  "futures",
  "globset",
  "gpui",
@@ -149,7 +150,6 @@ dependencies = [
  "schemars 0.8.22",
  "serde",
  "serde_json",
- "serde_yaml",
  "similar",
  "tokio",
  "tokio-util",
@@ -1759,6 +1759,17 @@ checksum = "01334b89b69ff726750c5ce5073fc8bd860e99aa9a8fc5ca11b04730e3aee97a"
 dependencies = [
  "link-section",
  "linktime-proc-macro",
+]
+
+[[package]]
+name = "cx-providers"
+version = "0.1.0"
+source = "git+https://github.com/dspo/cx.git?rev=e210e4a1ab68f014f6535100c8652c05fa56639c#e210e4a1ab68f014f6535100c8652c05fa56639c"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]
