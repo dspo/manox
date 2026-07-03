@@ -44,14 +44,20 @@ fn text_view_style(theme: &Theme) -> TextViewStyle {
 }
 
 /// Markdown `TextView` with theme-aware syntax highlighting.
+///
+/// `scrollable = true` mounts an internal vertical scrollbar. In that mode the
+/// TextView sizes to its parent's box, so the parent must have a defined
+/// height (use `h(...)` rather than `max_h(...)`).
 fn markdown_tv(
     id: impl Into<gpui::ElementId>,
     text: impl Into<gpui::SharedString>,
     theme: &Theme,
+    scrollable: bool,
 ) -> TextView {
-    TextView::markdown(id, text)
+    let tv = TextView::markdown(id, text)
         .selectable(true)
-        .style(text_view_style(theme))
+        .style(text_view_style(theme));
+    if scrollable { tv.scrollable(true) } else { tv }
 }
 
 /// Render a `ConvItem` as an element. `ix` is the entry index (stable key for collapsibles/TextView).
@@ -111,7 +117,12 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                     gpui::div()
                         .text_sm()
                         .text_color(theme.secondary_foreground)
-                        .child(markdown_tv(("user-text", ix), text.to_string(), theme)),
+                        .child(markdown_tv(
+                            ("user-text", ix),
+                            text.to_string(),
+                            theme,
+                            false,
+                        )),
                 ),
         )
         .into_any_element()
@@ -172,7 +183,7 @@ fn render_text_body(
         gpui::div()
             .id(id.clone())
             .text_sm()
-            .child(markdown_tv(id, text.to_string(), theme))
+            .child(markdown_tv(id, text.to_string(), theme, false))
             .into_any_element()
     }
 }
@@ -235,7 +246,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
             gpui::div()
                 .text_sm()
                 .text_color(theme.danger)
-                .child(markdown_tv(("error", ix), msg.to_string(), theme)),
+                .child(markdown_tv(("error", ix), msg.to_string(), theme, false)),
         )
         .into_any_element()
 }
@@ -325,18 +336,25 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
         } else {
             format!("```\n{display_output}\n```")
         };
+        // Fixed-height container with internal scroll: the TextView scrolls
+        // inside its own box, so the parent v_flex (the card) reports a
+        // deterministic height regardless of how long the output is. The
+        // previous `max_h + overflow_y_scroll` only clipped the visible area
+        // — the next item was still placed at the clipped boundary, but the
+        // non-scrollable TextView rendered at its natural height, so long
+        // outputs visually overflowed into the next item's y-range.
         card = card.child(
             gpui::div()
                 .id(("tool-output", ix))
-                .max_h(px(220.))
-                .overflow_y_scroll()
+                .h(px(220.))
+                .overflow_hidden()
                 .px_3()
                 .py_2()
                 .border_t_1()
                 .border_color(theme.border)
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(markdown_tv(("tool-output-text", ix), code, theme)),
+                .child(markdown_tv(("tool-output-text", ix), code, theme, true)),
         );
     }
     card.into_any_element()
@@ -492,7 +510,7 @@ fn render_agent_body(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
         .border_color(theme.border)
         .text_xs()
         .text_color(theme.muted_foreground)
-        .child(markdown_tv(("agent-body-text", ix), code, theme))
+        .child(markdown_tv(("agent-body-text", ix), code, theme, false))
         .into_any_element()
 }
 

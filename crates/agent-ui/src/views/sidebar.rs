@@ -4,41 +4,22 @@
 //! conversation entry emits `OpenThread(id)`; the "new conversation" menu item emits `NewThread`;
 //! each entry's "×" emits `DeleteThread(id)`. Workspace subscribes to these events.
 //!
-//! The top menu, "projects" group, and bottom account footer are static decoration that mirrors
-//! Codex.app's sidebar layout; only the "new conversation" item and the real conversation list
-//! carry behavior.
+//! Threads bound to a project (chosen on the first screen) are grouped under a collapsible folder
+//! in the "项目" section, keyed by project path; the rest fall under "对话". The top menu and bottom
+//! account footer are static decoration mirroring Codex.app's layout.
+
+use std::collections::HashSet;
 
 use agent::{ThreadStore, ThreadStoreEvent};
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, Render, Subscription, Window, prelude::*, px,
+    AnyElement, Context, Entity, EventEmitter, Render, SharedString, Subscription, Window,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
-
-/// Static placeholder projects shown under the "projects" group. These carry no behavior and exist
-/// only to mirror Codex.app's layout.
-const PLACEHOLDER_PROJECTS: &[(&str, &[(&str, &str)])] = &[
-    ("cvat", &[]),
-    (
-        "floraldet-training",
-        &[
-            ("本周 main 更新到默认，然后复现…", "4天"),
-            ("city 只 claude 和 codex 等 age…", "4天"),
-        ],
-    ),
-    (
-        "cx",
-        &[
-            ("介绍一下本项目？", "1周"),
-            ("what model now？", "1周"),
-            ("what model now？", "1周"),
-        ],
-    ),
-    ("huaji-skm", &[("本项目全文 health 语义有可…", "2周")]),
-];
 
 /// Events the sidebar emits to the Workspace.
 #[derive(Debug, Clone)]
@@ -51,6 +32,8 @@ pub enum SidebarEvent {
 pub struct Sidebar {
     store: Entity<ThreadStore>,
     selected: Option<String>,
+    /// Project paths whose folder group is collapsed; absent means expanded.
+    collapsed: HashSet<String>,
     _sub: Subscription,
 }
 
@@ -67,6 +50,7 @@ impl Sidebar {
         Self {
             store,
             selected: None,
+            collapsed: HashSet::new(),
             _sub: sub,
         }
     }
@@ -80,6 +64,81 @@ impl Sidebar {
         self.selected = id;
         cx.notify();
     }
+
+    /// A collapsible project folder: a clickable header (chevron + folder icon +
+    /// basename) over its indented conversation rows when expanded.
+    fn render_project_group(
+        &self,
+        path: &str,
+        group: &[agent::ThreadSummary],
+        selected: Option<&str>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let expanded = !self.collapsed.contains(path);
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path)
+            .to_string();
+        let key: SharedString = path.to_string().into();
+
+        let header = h_flex()
+            .id(key.clone())
+            .w_full()
+            .px_2()
+            .py_1p5()
+            .gap_1()
+            .items_center()
+            .rounded(theme.radius)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+            .child(
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .xsmall()
+                .text_color(theme.muted_foreground),
+            )
+            .child(
+                Icon::new(IconName::Folder)
+                    .small()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_sm()
+                    .text_color(theme.foreground)
+                    .child(name),
+            )
+            .on_click(cx.listener({
+                let path = path.to_string();
+                move |this, _ev, _window, cx| {
+                    if !this.collapsed.remove(&path) {
+                        this.collapsed.insert(path.clone());
+                    }
+                    cx.notify();
+                }
+            }));
+
+        let rows = expanded.then(|| {
+            v_flex()
+                .gap_0p5()
+                .children(group.iter().enumerate().map(|(ix, s)| {
+                    render_thread_item(ix, s, selected == Some(s.id.as_str()), px(16.), theme, cx)
+                }))
+        });
+
+        v_flex()
+            .gap_0p5()
+            .child(header)
+            .children(rows)
+            .into_any_element()
+    }
 }
 
 impl Render for Sidebar {
@@ -87,6 +146,21 @@ impl Render for Sidebar {
         let theme = cx.theme().clone();
         let summaries = self.store.read(cx).summaries().to_vec();
         let selected = self.selected.clone();
+
+        // Partition into project-bound groups (keyed by project path, first-seen
+        // order preserved) and the projectless remainder. `summaries` is already
+        // newest-first, so both keep that ordering.
+        let mut projects: Vec<(String, Vec<agent::ThreadSummary>)> = Vec::new();
+        let mut loose: Vec<agent::ThreadSummary> = Vec::new();
+        for s in &summaries {
+            if s.project.is_empty() {
+                loose.push(s.clone());
+            } else if let Some(entry) = projects.iter_mut().find(|(p, _)| *p == s.project) {
+                entry.1.push(s.clone());
+            } else {
+                projects.push((s.project.clone(), vec![s.clone()]));
+            }
+        }
 
         // Leave room for the macOS traffic-light buttons that float over the transparent titlebar.
         let top_inset = if cfg!(target_os = "macos") {
@@ -98,7 +172,7 @@ impl Render for Sidebar {
         v_flex()
             .h_full()
             .w(px(260.))
-            .bg(theme.secondary)
+            .bg(theme.background)
             .border_r_1()
             .border_color(theme.border)
             // Scrollable body: top menu + projects + conversations.
@@ -126,25 +200,26 @@ impl Render for Sidebar {
                             .child(static_menu_item(IconName::Calendar, "已安排", &theme))
                             .child(static_menu_item(IconName::Frame, "插件", &theme)),
                     )
-                    .child(section_header("项目", &theme))
-                    .child(render_projects(&theme))
-                    .child(section_header("对话", &theme))
+                    .children((!projects.is_empty()).then(|| section_header("项目", &theme)))
+                    .children(projects.into_iter().map(|(path, group)| {
+                        self.render_project_group(&path, &group, selected.as_deref(), &theme, cx)
+                    }))
+                    .children((!loose.is_empty()).then(|| section_header("对话", &theme)))
                     .child(
                         v_flex()
                             .gap_0p5()
-                            .children(summaries.iter().enumerate().map(|(ix, s)| {
+                            .children(loose.iter().enumerate().map(|(ix, s)| {
                                 render_thread_item(
                                     ix,
                                     s,
                                     selected.as_deref() == Some(s.id.as_str()),
+                                    px(0.),
                                     &theme,
                                     cx,
                                 )
                             })),
                     ),
             )
-            // Fixed bottom footer: settings + account (static).
-            .child(render_footer(&theme))
     }
 }
 
@@ -202,74 +277,13 @@ fn section_header(label: &'static str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// Static projects list with their nested placeholder conversations.
-fn render_projects(theme: &Theme) -> AnyElement {
-    let mut col = v_flex().gap_0p5();
-    for (name, convs) in PLACEHOLDER_PROJECTS {
-        col = col.child(
-            h_flex()
-                .w_full()
-                .px_2()
-                .py_1p5()
-                .gap_2()
-                .items_center()
-                .rounded(theme.radius)
-                .hover(|s| s.bg(theme.accent.opacity(0.08)))
-                .child(
-                    Icon::new(IconName::Folder)
-                        .small()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(*name),
-                ),
-        );
-        for (title, when) in *convs {
-            col = col.child(nested_conversation(title, when, theme));
-        }
-    }
-    col.into_any_element()
-}
-
-/// An indented placeholder conversation under a project: title on the left, relative time on the right.
-fn nested_conversation(title: &'static str, when: &'static str, theme: &Theme) -> AnyElement {
-    h_flex()
-        .w_full()
-        .pl_8()
-        .pr_2()
-        .py_1()
-        .gap_2()
-        .items_center()
-        .rounded(theme.radius)
-        .hover(|s| s.bg(theme.accent.opacity(0.08)))
-        .child(
-            gpui::div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(title),
-        )
-        .child(
-            gpui::div()
-                .flex_shrink_0()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(when),
-        )
-        .into_any_element()
-}
-
+/// Render one conversation row. `indent` adds left padding so rows nested under
+/// a project folder align below its label.
 fn render_thread_item(
     ix: usize,
     summary: &agent::ThreadSummary,
     selected: bool,
+    indent: gpui::Pixels,
     theme: &Theme,
     cx: &mut Context<Sidebar>,
 ) -> AnyElement {
@@ -293,7 +307,8 @@ fn render_thread_item(
         .id(("thread-item", ix))
         .group(group.clone())
         .w_full()
-        .px_2()
+        .pl(px(8.) + indent)
+        .pr_2()
         .py_1p5()
         .gap_2()
         .items_center()
@@ -336,51 +351,6 @@ fn render_thread_item(
                         .on_click(cx.listener(move |_this, _ev, _window, cx| {
                             cx.emit(SidebarEvent::DeleteThread(id_del.clone()));
                         })),
-                ),
-        )
-        .into_any_element()
-}
-
-/// Static bottom footer: settings row + account row.
-fn render_footer(theme: &Theme) -> AnyElement {
-    v_flex()
-        .w_full()
-        .flex_shrink_0()
-        .px_2()
-        .py_2()
-        .gap_0p5()
-        .border_t_1()
-        .border_color(theme.border)
-        .child(static_menu_item(IconName::Settings, "设置", theme))
-        .child(
-            h_flex()
-                .w_full()
-                .px_2()
-                .py_1p5()
-                .gap_2()
-                .items_center()
-                .rounded(theme.radius)
-                .hover(|s| s.bg(theme.accent.opacity(0.08)))
-                .child(
-                    gpui::div()
-                        .size(px(24.))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(theme.accent)
-                        .text_color(theme.accent_foreground)
-                        .text_xs()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child("账"),
-                )
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child("账户"),
                 ),
         )
         .into_any_element()

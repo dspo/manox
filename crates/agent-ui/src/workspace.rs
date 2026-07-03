@@ -9,15 +9,16 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use agent::language_model::StopReason;
-use agent::provider::config::WireApi;
+use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{
-    AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity, MouseButton,
-    MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, Subscription, Window, prelude::*,
-    px,
+    Animation, AnimationExt as _, AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent,
+    Entity, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent,
+    Subscription, Window, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -31,10 +32,12 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::OpenSettings;
 use crate::conversation::ConversationState;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
 };
+use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::views::{centered, message::render_item};
 
@@ -103,6 +106,10 @@ pub struct Workspace {
     slash_menu_sub: Option<Subscription>,
     /// Files picked via the `+` menu, not yet sent. Cleared on submit.
     pending_attachments: Vec<PendingAttachment>,
+    /// True while a native directory picker is open from the "Choose project" row.
+    /// Guards against the user submitting a message before the picker resolves
+    /// (which would make `set_project` a silent no-op once `messages` is non-empty).
+    project_picker_pending: bool,
     thread_sub: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
@@ -117,6 +124,33 @@ pub struct Workspace {
     /// Sub-agent task ids whose cards are expanded to show the child
     /// conversation. Toggled by clicking the card header.
     pub(crate) expanded_tasks: HashSet<String>,
+    /// Top-level view mode. `Settings` replaces the entire window content
+    /// with the SettingsView overlay until the user requests exit.
+    view_mode: ViewMode,
+    /// Set briefly while the Settings overlay is sliding out to the right.
+    /// Keeps `view_mode == Settings` mounted so the exit animation can play
+    /// before the unmount; cleared when the slide-out completes.
+    exiting_settings: bool,
+    /// Bumped on every transition into or out of Settings. Embedded in the
+    /// slide animation's element id so a fresh tween fires on each direction
+    /// change (an old id would replay from the cached delta and visibly
+    /// jump), and into the exit spawn so a stale unmount can be no-op'd
+    /// when a new enter supersedes it.
+    settings_transition_gen: u64,
+    /// Lazily created on the first `enter_settings` call so we don't pay the
+    /// cost when the user never opens Settings.
+    settings_view: Option<Entity<SettingsView>>,
+    settings_sub: Option<Subscription>,
+}
+
+/// Top-level rendering mode of the Workspace window. The Settings overlay is
+/// the only non-default mode today; future overlays (e.g. About) can extend
+/// this enum rather than carrying parallel `bool` flags.
+#[derive(Default)]
+enum ViewMode {
+    #[default]
+    Workspace,
+    Settings,
 }
 
 /// Right-side composer width. Wide enough for rendered markdown
@@ -132,6 +166,14 @@ const EDITOR_DIVIDER_WIDTH: f32 = 6.;
 const SIDEBAR_WIDTH: f32 = 260.;
 /// Floor for the main column width when the editor pane is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
+
+/// Settings overlay slide duration. The enter animation glides the panel in
+/// from the left edge, the exit animation glides it out to the right.
+const SLIDE_MS: u64 = 180;
+/// The Exit handler in `subscribe_settings` waits this long before flipping
+/// `view_mode` back to `Workspace`, giving the exit animation time to play.
+/// Set slightly above `SLIDE_MS` so the last frame is not popped mid-tween.
+const SLIDE_OUT_MS: u64 = 200;
 
 /// Drag payload for the editor pane divider. Doubles as the invisible drag
 /// ghost view, mirroring Zed's `DraggedDock` pattern.
@@ -154,9 +196,9 @@ impl Workspace {
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
-                .rows(4)
+                .auto_grow(5, 12)
                 .submit_on_enter(true)
-                .placeholder("输入消息…")
+                .placeholder("输入消息，点击发送以开始使用")
         });
 
         let editor_state = cx.new(|cx| {
@@ -193,6 +235,7 @@ impl Workspace {
             slash_menu: None,
             slash_menu_sub: None,
             pending_attachments: Vec::new(),
+            project_picker_pending: false,
             thread_sub: None,
             sidebar_sub: None,
             input_sub: None,
@@ -200,6 +243,11 @@ impl Workspace {
             scroll_handle: ScrollHandle::new(),
             stick_to_bottom: true,
             expanded_tasks: HashSet::new(),
+            view_mode: ViewMode::default(),
+            exiting_settings: false,
+            settings_transition_gen: 0,
+            settings_view: None,
+            settings_sub: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
@@ -287,6 +335,62 @@ impl Workspace {
             SidebarEvent::NewThread => this.start_new_thread(cx),
             SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), cx),
             SidebarEvent::DeleteThread(id) => this.delete_thread(id.clone(), cx),
+        })
+    }
+
+    /// Switch into the Settings overlay. The Settings view is created lazily on
+    /// first entry; from then on the entity + subscription are reused so the
+    /// user's last selection (and any scroll position) survives re-entry.
+    pub fn enter_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings_view.is_none() {
+            let settings = cx.new(|cx| SettingsView::new(window, cx));
+            let sub = self.subscribe_settings(&settings, cx);
+            self.settings_view = Some(settings);
+            self.settings_sub = Some(sub);
+        }
+        self.view_mode = ViewMode::Settings;
+        // Clear any pending exit animation: clicking Settings… while the
+        // panel is still sliding out re-opens the overlay. Bumping the
+        // transition generation also retires the old exit spawn (it carries
+        // the previous gen and no-ops on stale state), and forces the slide
+        // animation to replay from the left edge.
+        self.exiting_settings = false;
+        self.settings_transition_gen = self.settings_transition_gen.wrapping_add(1);
+        cx.notify();
+    }
+
+    fn subscribe_settings(
+        &self,
+        settings: &Entity<SettingsView>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(settings, |this, _settings, ev: &SettingsEvent, cx| {
+            if matches!(ev, SettingsEvent::Exit) && !this.exiting_settings {
+                // Start the slide-out animation; the actual mode flip and
+                // unmount happen once the animation has finished. The
+                // captured transition gen is the watermark for this exit
+                // attempt — if a new enter supersedes it before the timer
+                // fires, the spawn's update is a no-op.
+                this.exiting_settings = true;
+                this.settings_transition_gen = this.settings_transition_gen.wrapping_add(1);
+                cx.notify();
+                let entity = cx.entity().clone();
+                let exit_gen = this.settings_transition_gen;
+                cx.spawn(async move |_workspace, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(SLIDE_OUT_MS + 20))
+                        .await;
+                    entity.update(cx, |this, cx| {
+                        if this.settings_transition_gen != exit_gen {
+                            return;
+                        }
+                        this.view_mode = ViewMode::default();
+                        this.exiting_settings = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
         })
     }
 
@@ -390,7 +494,13 @@ impl Workspace {
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
-        if (text.trim().is_empty() && attachments.is_empty()) || self.thread.read(cx).is_running() {
+        if (text.trim().is_empty() && attachments.is_empty())
+            || self.thread.read(cx).is_running()
+            // Block submit while the project picker is open: setting the
+            // project after a message lands is a no-op (set_project guards on
+            // !messages.is_empty()), so the project would be silently dropped.
+            || self.project_picker_pending
+        {
             self.pending_attachments = attachments;
             return;
         }
@@ -1063,25 +1173,76 @@ impl Workspace {
         menu
     }
 
-    /// Composer row: a rounded container with the `+` menu button, `Input`, and a circular send/stop button.
+    /// Composer card: an auto-growing text area above a single toolbar row.
+    /// The card's fill matches the page background (`theme.background`) so only
+    /// the 1px border outlines it — the user-perceived "底纹" disappears.
+    /// The `Input` renders bare (no appearance/border of its own) so there is
+    /// no double-layered fill.
     fn render_composer(
         &mut self,
         running: bool,
+        first_screen: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        h_flex()
+        let plus = self.render_plus_button(cx);
+        let cwd = self.render_cwd_chip(theme, cx);
+        let access = self.render_access_placeholder(theme);
+        let model = self.render_model_selector(theme, cx);
+        let send = self.render_send_button(running, cx);
+        // "Choose project" binds the thread's project; only offered before the
+        // conversation starts (the empty first screen), matching the reference.
+        let choose_project = first_screen.then(|| self.render_choose_project_row(theme, cx));
+
+        v_flex()
             .w_full()
-            .items_end()
             .gap_2()
             .p_2()
             .rounded(theme.radius)
             .border_1()
             .border_color(theme.border)
-            .bg(theme.secondary)
-            .child(self.render_plus_button(cx))
-            .child(gpui::div().flex_1().child(Input::new(&self.input_state)))
-            .child(self.render_send_button(running, cx))
+            .bg(theme.background)
+            .child(
+                Input::new(&self.input_state)
+                    .appearance(false)
+                    .bordered(false)
+                    .focus_bordered(false),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(plus)
+                            .child(cwd)
+                            .child(access),
+                    )
+                    .child(h_flex().items_center().gap_1().child(model).child(send)),
+            )
+            .children(choose_project)
+            .into_any_element()
+    }
+
+    /// Visual-only "full access" affordance mirroring Codex's permission chip.
+    /// Not wired to any approval mode; manox still gates tools via the runtime
+    /// authorization prompt.
+    fn render_access_placeholder(&self, theme: &Theme) -> AnyElement {
+        h_flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(gpui::div().size(px(6.)).rounded_full().bg(theme.success))
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("完全访问"),
+            )
             .into_any_element()
     }
 
@@ -1170,6 +1331,69 @@ impl Workspace {
         .detach();
     }
 
+    /// Open the native directory picker and bind the chosen folder to the thread
+    /// as its project. Tools then resolve paths against it. Offered only on the
+    /// empty first screen; `set_project` no-ops once the conversation has started.
+    fn choose_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_picker_pending {
+            return;
+        }
+        self.project_picker_pending = true;
+        let dir = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = dir.await;
+            this.update(cx, |this, cx| {
+                this.project_picker_pending = false;
+                if let Ok(Ok(Some(paths))) = result
+                    && let Some(path) = paths.into_iter().next()
+                {
+                    this.thread.update(cx, |t, cx| t.set_project(path, cx));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The "Choose project" row inside the composer card, shown only on the empty
+    /// first screen. Displays the bound project's basename once one is chosen.
+    fn render_choose_project_row(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let project = self.thread.read(cx).project().cloned();
+        let (icon, label, color) = match &project {
+            Some(dir) => {
+                let name = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("project")
+                    .to_string();
+                (IconName::FolderOpen, name, theme.foreground)
+            }
+            None => (
+                IconName::Folder,
+                "Choose project".to_string(),
+                theme.muted_foreground,
+            ),
+        };
+        h_flex()
+            .id("choose-project")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+            .child(Icon::new(icon).small().text_color(color))
+            .child(gpui::div().text_xs().text_color(color).child(label))
+            .on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))
+            .into_any_element()
+    }
+
     /// Circular icon-only send/stop button.
     ///
     /// Reuses `Button` for built-in focus ring, keyboard activation, and disabled handling;
@@ -1232,36 +1456,15 @@ impl Workspace {
         )
     }
 
-    /// Chip row: a plain `cwd` label on the left, model selector on the right.
-    fn render_chip_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        // Self-contained centering (not `centered()` helper) so the absolute-positioned
-        // model dropdown is not clipped by any `max_w` ancestor.
-        h_flex()
-            .w_full()
-            .justify_center()
-            .child(
-                h_flex()
-                    .w_full()
-                    .max_w(px(crate::views::CONTENT_MAX_W))
-                    .items_center()
-                    .child(self.render_cwd_chip(theme))
-                    .child(gpui::div().flex_1())
-                    .child(
-                        gpui::div()
-                            .flex_shrink_0()
-                            .child(self.render_model_selector(theme, cx)),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// Static label of the current working directory's basename.
+    /// Static label of the thread's working directory basename. Reflects the
+    /// chosen project once one is bound (the thread's `cwd` follows the project).
     ///
-    /// Rendered as a plain `div` (not `Button`) until a directory-switcher popover exists; an
-    /// unclickable `Button` would invite clicks that do nothing.
-    fn render_cwd_chip(&self, theme: &Theme) -> AnyElement {
-        let name = self
-            .cwd
+    /// Rendered as a plain `div` (not `Button`): the project is picked on the
+    /// empty first screen via the "Choose project" row and fixed thereafter, so
+    /// a clickable chip would invite clicks that do nothing.
+    fn render_cwd_chip(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let cwd = self.thread.read(cx).cwd().to_path_buf();
+        let name = cwd
             .file_name()
             .and_then(|s| s.to_str())
             .filter(|s| *s != ".")
@@ -1269,8 +1472,6 @@ impl Workspace {
         gpui::div()
             .px_2()
             .py_1()
-            .rounded(theme.radius)
-            .bg(theme.secondary)
             .text_xs()
             .text_color(theme.muted_foreground)
             .child(name.to_string())
@@ -1280,6 +1481,44 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Settings overlay replaces the entire window content; the underlying
+        // Workspace state (sidebar, conversation, composer) is preserved and
+        // returns unchanged when the user clicks 返回应用.
+        if matches!(self.view_mode, ViewMode::Settings) {
+            let settings = self
+                .settings_view
+                .as_ref()
+                .expect("enter_settings must have created the SettingsView")
+                .clone();
+            // Horizontal slide: enter glides the panel in from the left edge
+            // (offset -PANEL_W → 0), exit glides it out to the right
+            // (offset 0 → +PANEL_W). The animation id mixes the current
+            // transition generation into the per-direction tag so a fresh
+            // tween fires on every direction change (a stable id would
+            // replay from the cached delta and visibly jump, and a
+            // direction change with the same id would not animate at all).
+            let (anim_id, sign) = if self.exiting_settings {
+                (
+                    format!("settings-exit-{}", self.settings_transition_gen),
+                    1.0,
+                )
+            } else {
+                (
+                    format!("settings-enter-{}", self.settings_transition_gen),
+                    -1.0,
+                )
+            };
+            let panel_w = px(280.0);
+            let anim_el = gpui::div().size_full().child(settings).with_animation(
+                anim_id,
+                Animation::new(Duration::from_millis(SLIDE_MS)).with_easing(ease_out_quint()),
+                move |el, delta| {
+                    let offset = panel_w * sign * (1.0 - delta);
+                    el.relative().ml(offset)
+                },
+            );
+            return h_flex().size_full().child(anim_el);
+        }
         let theme = cx.theme().clone();
         let model_label = self.model_label(cx);
         let running = self.thread.read(cx).is_running();
@@ -1305,10 +1544,16 @@ impl Render for Workspace {
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
         let editor_width = self.editor_width;
+        // Empty first screen: no messages and nothing streaming. The composer is
+        // hoisted into a vertically-centered hero (heading + composer + "Choose
+        // project"); once the conversation starts it drops to the bottom footer.
+        let first_screen = self.conversation.is_empty() && !running;
         // The inline composer and the markdown editor are mutually exclusive: while
         // the editor pane is open the footer is hidden and the draft lives in the
         // editor (moved there on open, moved back on close).
-        let footer = if !editor_open {
+        let footer = if editor_open || first_screen {
+            None
+        } else {
             Some(
                 v_flex()
                     .w_full()
@@ -1317,11 +1562,40 @@ impl Render for Workspace {
                     .relative()
                     .children(self.render_slash_overlay())
                     .children(self.render_attachments(&theme, cx))
-                    .child(centered(self.render_composer(running, &theme, cx)))
-                    .child(self.render_chip_row(&theme, cx)),
+                    .child(centered(self.render_composer(running, false, &theme, cx))),
             )
-        } else {
+        };
+        // Hero occupies the message-list region on the first screen.
+        let hero = if editor_open || !first_screen {
             None
+        } else {
+            Some(
+                v_flex()
+                    .flex_1()
+                    .w_full()
+                    .justify_center()
+                    .items_center()
+                    .relative()
+                    .child(
+                        centered(
+                            v_flex()
+                                .w_full()
+                                .gap_5()
+                                .items_center()
+                                .child(
+                                    gpui::div()
+                                        .text_2xl()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.foreground)
+                                        .child("我们该做什么？"),
+                                )
+                                .children(self.render_attachments(&theme, cx))
+                                .child(self.render_composer(running, true, &theme, cx)),
+                        )
+                        .relative()
+                        .children(self.render_slash_overlay()),
+                    ),
+            )
         };
         // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
         // toggles preview — all keyboard-driven per the no-button constraint.
@@ -1414,6 +1688,9 @@ impl Render for Workspace {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.enter_settings(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &crate::ToggleEditor, window, cx| {
                 this.toggle_editor(window, cx);
             }))
@@ -1449,12 +1726,15 @@ impl Render for Workspace {
                             )
                             .child(h_flex()),
                     )
+                    // Empty first screen shows the centered hero in place of the
+                    // (empty) message list; otherwise the scrollable conversation.
+                    .children(hero)
                     // Message list (centered, width-capped, scrollable).
                     // `track_scroll` lets us read offset/max and call `scroll_to_bottom`
                     // from event handlers. `on_scroll_wheel` reacts to manual scrolls:
                     // if the user drags the viewport away from the bottom, disengage
                     // auto-follow until they scroll back down.
-                    .child(
+                    .children((!first_screen).then(|| {
                         v_flex()
                             .id("messages")
                             .flex_1()
@@ -1488,14 +1768,8 @@ impl Render for Workspace {
                                     // moment they reach the bottom.
                                 },
                             ))
-                            .children(items.into_iter().map(centered)),
-                    )
-                    // Separator line (standalone div so the PopupMenu inside
-                    // the footer can render on top of it without z-order issues).
-                    .child(gpui::div().w_full().h(px(1.)).bg(theme.border))
-                    // Input area: pending attachments + composer + chip row, with the slash
-                    // menu overlaid above the composer. Hidden while the markdown editor pane
-                    // is open — the draft is moved into the editor on open and back on close.
+                            .children(items.into_iter().map(centered))
+                    }))
                     .children(footer)
                     // Approval overlay (if any)
                     .children(overlay),

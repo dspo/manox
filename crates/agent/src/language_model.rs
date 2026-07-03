@@ -207,7 +207,7 @@ impl std::ops::Add for TokenUsage {
     }
 }
 
-use crate::provider::config::WireApi;
+use crate::provider::WireApi;
 
 /// Language model abstraction.
 pub trait LanguageModel: Send + Sync {

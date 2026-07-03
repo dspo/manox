@@ -8,11 +8,13 @@ set -euo pipefail
 # Options:
 #   -d    Compile in debug mode
 #   -o    Open the resulting .app after bundling
+#   -i    Install the .app to /Applications
 #   -h    Display this help and exit
 
 build_flag="--release"
 target_dir="release"
 open_result=false
+install_result=false
 
 help_info() {
     echo "
@@ -22,14 +24,16 @@ Bundle manox as a macOS .app.
 Options:
   -d    Compile in debug mode
   -o    Open the resulting .app after bundling
+  -i    Install the .app to /Applications
   -h    Display this help and exit
 "
 }
 
-while getopts 'doh' flag; do
+while getopts 'doih' flag; do
     case "${flag}" in
         o) open_result=true;;
         d) build_flag=""; target_dir="debug";;
+        i) install_result=true;;
         h) help_info; exit 0;;
     esac
 done
@@ -181,6 +185,15 @@ echo ""
 echo "Bundle complete: ${app_path}"
 echo "Binary:  ${macos_dir}/manox"
 echo ""
+
+if [[ "$install_result" = true ]]; then
+    install_dest="/Applications/${app_name}.app"
+    echo "Installing to ${install_dest}"
+    rm -rf "${install_dest}"
+    cp -R "${app_path}" "${install_dest}"
+    echo "Installed: ${install_dest}"
+    app_path="${install_dest}"
+fi
 
 if [[ "$open_result" = true ]]; then
     echo "Opening ${app_path}"

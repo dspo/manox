@@ -1,6 +1,6 @@
 //! SQLite persistence.
 //!
-//! Single `threads` table: id / summary / model_id / cwd / messages(JSON) / updated_at.
+//! Single `threads` table: id / summary / model_id / cwd / project / messages(JSON) / updated_at.
 //! `ThreadsDatabase` holds a `Mutex<Connection>`; all methods are synchronous and
 //! blocking (callers may wrap them in `background_spawn`). `ThreadRecord` is the
 //! serializable snapshot of a `Thread`.
@@ -27,6 +27,8 @@ pub struct ThreadSummary {
     pub id: String,
     pub summary: String,
     pub model_id: String,
+    /// Absolute project directory the thread is bound to; empty when none was chosen.
+    pub project: String,
     pub updated_at: i64,
 }
 
@@ -37,6 +39,8 @@ pub struct ThreadRecord {
     pub summary: String,
     pub model_id: String,
     pub cwd: String,
+    /// Absolute project directory the thread is bound to; empty when none was chosen.
+    pub project: String,
     pub messages: Vec<Message>,
 }
 
@@ -53,6 +57,7 @@ CREATE TABLE IF NOT EXISTS threads (
     summary TEXT NOT NULL DEFAULT '',
     model_id TEXT NOT NULL DEFAULT '',
     cwd TEXT NOT NULL DEFAULT '',
+    project TEXT NOT NULL DEFAULT '',
     messages TEXT NOT NULL DEFAULT '[]',
     updated_at INTEGER NOT NULL
 );
@@ -68,6 +73,12 @@ impl ThreadsDatabase {
         let conn = Connection::open(path)
             .with_context(|| format!("打开 threads db 失败: {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("建 threads 表失败")?;
+        // Migrate pre-`project` databases. SQLite has no `ADD COLUMN IF NOT EXISTS`;
+        // a duplicate-column error on already-migrated databases is expected and ignored.
+        let _ = conn.execute(
+            "ALTER TABLE threads ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -88,12 +99,13 @@ impl ThreadsDatabase {
 
         let conn = self.conn.lock().expect("db mutex 中毒");
         conn.execute(
-            "INSERT INTO threads (id, summary, model_id, cwd, messages, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO threads (id, summary, model_id, cwd, project, messages, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                 summary = excluded.summary,
                 model_id = excluded.model_id,
                 cwd = excluded.cwd,
+                project = excluded.project,
                 messages = excluded.messages,
                 updated_at = excluded.updated_at",
             params![
@@ -101,6 +113,7 @@ impl ThreadsDatabase {
                 rec.summary,
                 rec.model_id,
                 rec.cwd,
+                rec.project,
                 messages_json,
                 now
             ],
@@ -112,8 +125,9 @@ impl ThreadsDatabase {
     /// Load a full record by id. Returns `None` if absent.
     pub fn load(&self, id: &str) -> Result<Option<ThreadRecord>> {
         let conn = self.conn.lock().expect("db mutex 中毒");
-        let mut stmt =
-            conn.prepare("SELECT id, summary, model_id, cwd, messages FROM threads WHERE id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, summary, model_id, cwd, project, messages FROM threads WHERE id = ?1",
+        )?;
         let mut rows = stmt.query(params![id])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
@@ -122,7 +136,8 @@ impl ThreadsDatabase {
         let summary: String = row.get(1)?;
         let model_id: String = row.get(2)?;
         let cwd: String = row.get(3)?;
-        let messages_json: String = row.get(4)?;
+        let project: String = row.get(4)?;
+        let messages_json: String = row.get(5)?;
         let stored: Vec<StoredMessage> = serde_json::from_str(&messages_json)
             .with_context(|| format!("反序列化 messages 失败 (thread {id})"))?;
         let messages = stored
@@ -137,6 +152,7 @@ impl ThreadsDatabase {
             summary,
             model_id,
             cwd,
+            project,
             messages,
         }))
     }
@@ -145,14 +161,15 @@ impl ThreadsDatabase {
     pub fn list(&self) -> Result<Vec<ThreadSummary>> {
         let conn = self.conn.lock().expect("db mutex 中毒");
         let mut stmt = conn.prepare(
-            "SELECT id, summary, model_id, updated_at FROM threads ORDER BY updated_at DESC",
+            "SELECT id, summary, model_id, project, updated_at FROM threads ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ThreadSummary {
                 id: row.get(0)?,
                 summary: row.get(1)?,
                 model_id: row.get(2)?,
-                updated_at: row.get(3)?,
+                project: row.get(3)?,
+                updated_at: row.get(4)?,
             })
         })?;
         let mut out = Vec::new();
@@ -194,6 +211,7 @@ mod tests {
             summary: "你好".into(),
             model_id: "百炼/glm-5.2[1m]/anthropic".into(),
             cwd: "/tmp".into(),
+            project: "/tmp".into(),
             messages: vec![
                 Message::user("你好".into()),
                 Message::assistant(vec![MessageContent::Text("hi".into())]),
@@ -204,12 +222,14 @@ mod tests {
         let loaded = db.load("t1").expect("load").expect("present");
         assert_eq!(loaded.id, "t1");
         assert_eq!(loaded.summary, "你好");
+        assert_eq!(loaded.project, "/tmp");
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].role, Role::User);
 
         let list = db.list().expect("list");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "t1");
+        assert_eq!(list[0].project, "/tmp");
 
         db.delete("t1").expect("delete");
         assert!(db.load("t1").expect("load").is_none());
