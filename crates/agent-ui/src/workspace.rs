@@ -69,6 +69,14 @@ pub struct Workspace {
 const EDITOR_PANEL_WIDTH: f32 = 640.;
 const EDITOR_MIN_WIDTH: f32 = 320.;
 const EDITOR_MAX_WIDTH: f32 = 960.;
+/// Width of the drag handle between the main column and the editor pane.
+const EDITOR_DIVIDER_WIDTH: f32 = 6.;
+// Mirrors `views/sidebar.rs` (`Sidebar` renders at `w(px(260.))`). Kept here so
+// the editor pane's resize clamp can reserve space for the sidebar + main
+// column without depending on the sidebar's internals.
+const SIDEBAR_WIDTH: f32 = 260.;
+/// Floor for the main column width when the editor pane is dragged wide.
+const MAIN_MIN_WIDTH: f32 = 160.;
 
 /// Drag payload for the editor pane divider. Doubles as the invisible drag
 /// ghost view, mirroring Zed's `DraggedDock` pattern.
@@ -693,7 +701,7 @@ impl Render for Workspace {
         // The divider is the visual separator and the drag handle for resizing.
         let editor_divider = gpui::div()
             .id("editor-divider")
-            .w(px(6.))
+            .w(px(EDITOR_DIVIDER_WIDTH))
             .h_full()
             .flex_shrink_0()
             .relative()
@@ -805,10 +813,22 @@ impl Render for Workspace {
             })
             .on_drag_move(cx.listener(
                 |this, e: &DragMoveEvent<DraggedEditorDivider>, _window, cx| {
-                    // The editor pane hugs the window's right edge, so its width
-                    // is the distance from the cursor to the root's right edge.
+                    // The root fills the window, so its right edge is the
+                    // window's right edge and the editor pane's width is the
+                    // distance from the cursor to that edge. Clamp both to a
+                    // minimum and to leave the main column at least
+                    // `MAIN_MIN_WIDTH` (sidebar + main + divider sit left of
+                    // the editor), so dragging wide never overflows the window
+                    // or collapses the conversation column.
                     let new_w = e.bounds.right() - e.event.position.x;
-                    this.editor_width = new_w.clamp(px(EDITOR_MIN_WIDTH), px(EDITOR_MAX_WIDTH));
+                    let dynamic_max = e.bounds.size.width
+                        - px(SIDEBAR_WIDTH)
+                        - px(EDITOR_DIVIDER_WIDTH)
+                        - px(MAIN_MIN_WIDTH);
+                    let max_w = dynamic_max
+                        .min(px(EDITOR_MAX_WIDTH))
+                        .max(px(EDITOR_MIN_WIDTH));
+                    this.editor_width = new_w.clamp(px(EDITOR_MIN_WIDTH), max_w);
                     cx.notify();
                 },
             ))
