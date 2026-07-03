@@ -15,7 +15,7 @@ use agent::provider::config::WireApi;
 use agent::provider::registry;
 use gpui::{AnyElement, Context, DismissEvent, Entity, Render, Subscription, Window, prelude::*, px};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     menu::{PopupMenu, PopupMenuItem},
@@ -24,6 +24,9 @@ use gpui_component::{
 };
 
 use crate::conversation::ConversationState;
+use crate::views::composer_menu::{
+    PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
+};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::views::{centered, message::render_item};
 
@@ -48,6 +51,14 @@ pub struct Workspace {
     /// PopupMenu entity for the open model selector; created on open, destroyed on close.
     model_menu: Option<Entity<PopupMenu>>,
     model_menu_sub: Option<Subscription>,
+    plus_open: bool,
+    plus_menu: Option<Entity<PopupMenu>>,
+    plus_menu_sub: Option<Subscription>,
+    slash_open: bool,
+    slash_menu: Option<Entity<PopupMenu>>,
+    slash_menu_sub: Option<Subscription>,
+    /// Files picked via the `+` menu, not yet sent. Cleared on submit.
+    pending_attachments: Vec<PendingAttachment>,
     thread_sub: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
@@ -92,6 +103,13 @@ impl Workspace {
             model_open: false,
             model_menu: None,
             model_menu_sub: None,
+            plus_open: false,
+            plus_menu: None,
+            plus_menu_sub: None,
+            slash_open: false,
+            slash_menu: None,
+            slash_menu_sub: None,
+            pending_attachments: Vec::new(),
             thread_sub: None,
             sidebar_sub: None,
             input_sub: None,
@@ -151,12 +169,42 @@ impl Workspace {
     fn subscribe_input(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
         let input = self.input_state.clone();
         cx.subscribe_in(&input, window, |this, _, ev: &InputEvent, window, cx| {
-            if let InputEvent::PressEnter { shift, .. } = ev
-                && !shift
-            {
-                this.submit_input(window, cx);
+            match ev {
+                InputEvent::PressEnter { shift, .. } if !shift => this.submit_input(window, cx),
+                InputEvent::Change => this.sync_slash_menu(window, cx),
+                _ => {}
             }
         })
+    }
+
+    /// Open the `⁄` command menu when the input is exactly `/`, close it otherwise. The menu is
+    /// static decoration; selecting a row does nothing but dismiss.
+    fn sync_slash_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.input_state.read(cx).value().to_string();
+        let should_open = value == "/";
+        if should_open && !self.slash_open {
+            let theme = cx.theme().clone();
+            let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+                build_slash_menu(menu, &theme)
+            });
+            let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
+                this.close_slash_menu();
+                cx.notify();
+            });
+            self.slash_open = true;
+            self.slash_menu = Some(menu);
+            self.slash_menu_sub = Some(sub);
+            cx.notify();
+        } else if !should_open && self.slash_open {
+            self.close_slash_menu();
+            cx.notify();
+        }
+    }
+
+    fn close_slash_menu(&mut self) {
+        self.slash_open = false;
+        self.slash_menu = None;
+        self.slash_menu_sub = None;
     }
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
@@ -202,18 +250,63 @@ impl Workspace {
 
     fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
-        if text.trim().is_empty() || self.thread.read(cx).is_running() {
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        if (text.trim().is_empty() && attachments.is_empty()) || self.thread.read(cx).is_running() {
+            self.pending_attachments = attachments;
             return;
         }
+        self.input_state
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.close_slash_menu();
+
+        if attachments.is_empty() {
+            self.send_user_turn(text, Vec::new(), cx);
+            return;
+        }
+
+        // Reading attachment bytes is blocking IO; do it off the UI thread, then start the turn.
+        cx.spawn(async move |this, cx| {
+            let (text, extra) = cx
+                .background_spawn(async move {
+                    let mut text = text;
+                    let mut extra = Vec::new();
+                    for att in &attachments {
+                        if let Some(content) = load_attachment(att, &mut text) {
+                            extra.push(content);
+                        }
+                    }
+                    (text, extra)
+                })
+                .await;
+            this.update(cx, |this, cx| this.send_user_turn(text, extra, cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Append the user turn (text plus any image content) to the thread and start the run.
+    fn send_user_turn(
+        &mut self,
+        text: String,
+        images: Vec<agent::language_model::MessageContent>,
+        cx: &mut Context<Self>,
+    ) {
+        use agent::language_model::MessageContent;
         self.conversation.push_user(text.clone());
         self.thread.update(cx, |thread, cx| {
-            thread.insert_user_message(text, cx);
+            if images.is_empty() {
+                thread.insert_user_message(text, cx);
+            } else {
+                let mut content = Vec::with_capacity(images.len() + 1);
+                if !text.trim().is_empty() {
+                    content.push(MessageContent::Text(text));
+                }
+                content.extend(images);
+                thread.insert_user_message_with_content(content, cx);
+            }
             thread.run_turn(cx);
         });
         // Persist on submit so the sidebar shows the new entry immediately.
         save_thread(self.thread.clone(), cx);
-        self.input_state
-            .update(cx, |state, cx| state.set_value("", window, cx));
         cx.notify();
     }
 
@@ -517,8 +610,8 @@ impl Workspace {
         )
     }
 
-    /// Composer row: a rounded container with `+` (reserved, disabled), `Input`, and a circular send/stop button.
-    fn render_composer(&self, running: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// Composer row: a rounded container with the `+` menu button, `Input`, and a circular send/stop button.
+    fn render_composer(&mut self, running: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         h_flex()
             .w_full()
             .items_end()
@@ -528,15 +621,95 @@ impl Workspace {
             .border_1()
             .border_color(theme.border)
             .bg(theme.secondary)
-            .child(
-                Button::new("composer-plus")
-                    .ghost()
-                    .icon(IconName::Plus)
-                    .disabled(true),
-            )
+            .child(self.render_plus_button(cx))
             .child(gpui::div().flex_1().child(Input::new(&self.input_state)))
             .child(self.render_send_button(running, cx))
             .into_any_element()
+    }
+
+    /// The composer `+` button and its popup menu (Codex-style "add / plugins").
+    fn render_plus_button(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let trigger = Button::new("composer-plus")
+            .ghost()
+            .icon(IconName::Plus)
+            .on_click(cx.listener(|this, _, window, cx| {
+                if this.plus_open {
+                    this.close_plus_menu();
+                } else {
+                    this.open_plus_menu(window, cx);
+                }
+                cx.notify();
+            }));
+
+        if !self.plus_open {
+            return trigger.into_any_element();
+        }
+        let Some(menu) = self.plus_menu.clone() else {
+            return trigger.into_any_element();
+        };
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::div()
+                    .id("plus-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .left_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
+    fn open_plus_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let theme = cx.theme().clone();
+        let ws = cx.entity();
+        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+            let ws = ws.clone();
+            build_plus_menu(menu, &theme, move |window, cx| {
+                ws.update(cx, |this, cx| {
+                    this.close_plus_menu();
+                    this.pick_files(window, cx);
+                    cx.notify();
+                });
+            })
+        });
+        let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
+            this.close_plus_menu();
+            cx.notify();
+        });
+        self.plus_open = true;
+        self.plus_menu = Some(menu);
+        self.plus_menu_sub = Some(sub);
+    }
+
+    fn close_plus_menu(&mut self) {
+        self.plus_open = false;
+        self.plus_menu = None;
+        self.plus_menu_sub = None;
+    }
+
+    /// Open the native file picker and add chosen paths as pending attachments.
+    fn pick_files(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = paths.await {
+                this.update(cx, |this, cx| {
+                    for p in paths {
+                        this.pending_attachments.push(PendingAttachment::new(p));
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Circular icon-only send/stop button.
@@ -557,6 +730,41 @@ impl Workspace {
                 }
             }))
             .into_any_element()
+    }
+
+    /// The `⁄` command menu overlaid above the composer while `slash_open`.
+    fn render_slash_overlay(&self) -> Option<AnyElement> {
+        let menu = self.slash_menu.clone()?;
+        Some(
+            centered(
+                gpui::div()
+                    .id("slash-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .left_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Pending-attachment chips shown above the composer, each removable.
+    fn render_attachments(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.pending_attachments.is_empty() {
+            return None;
+        }
+        let on_remove = cx.listener(|this, ix: &usize, _window, cx| {
+            if *ix < this.pending_attachments.len() {
+                this.pending_attachments.remove(*ix);
+                cx.notify();
+            }
+        });
+        Some(centered(render_attachment_chips(
+            &self.pending_attachments,
+            theme,
+            move |ix, window, cx| on_remove(&ix, window, cx),
+        )).into_any_element())
     }
 
     /// Chip row: a plain `cwd` label on the left, model selector on the right.
@@ -731,12 +939,16 @@ impl Render for Workspace {
                             .h(px(1.))
                             .bg(theme.border),
                     )
-                    // Input area: composer (rounded container with input + actions) + chip row
+                    // Input area: pending attachments + composer + chip row, with the slash
+                    // menu overlaid above the composer.
                     .child(
                         v_flex()
                             .w_full()
                             .py_2()
                             .gap_2()
+                            .relative()
+                            .children(self.render_slash_overlay())
+                            .children(self.render_attachments(&theme, cx))
                             .child(centered(self.render_composer(running, &theme, cx)))
                             .child(self.render_chip_row(&theme, cx)),
                     )

@@ -21,6 +21,13 @@ impl Message {
         }
     }
 
+    pub fn user_with_content(content: Vec<MessageContent>) -> Self {
+        Self {
+            role: Role::User,
+            content,
+        }
+    }
+
     pub fn assistant(content: Vec<MessageContent>) -> Self {
         Self {
             role: Role::Assistant,
