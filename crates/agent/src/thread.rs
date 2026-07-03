@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use futures::FutureExt as _;
 use futures::StreamExt as _;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
 use tokio_util::sync::CancellationToken;
@@ -457,7 +458,12 @@ impl Thread {
             };
             let mut cancelled = false;
             loop {
-                let event = tokio::select! {
+                // Take one event (yielding until ready) so the loop always makes
+                // progress, then drain every further already-ready event in the
+                // same tick via `now_or_never`. Applying a batch inside a single
+                // `update` amortizes the gpui executor crossing and lets sibling
+                // deltas coalesce into one layout pass.
+                let first = tokio::select! {
                     ev = stream.next() => match ev {
                         Some(e) => e,
                         None => break,
@@ -467,11 +473,23 @@ impl Thread {
                         break;
                     }
                 };
-                let is_stop = matches!(event, Ok(LanguageModelCompletionEvent::Stop(_)));
+                let mut batch = vec![first];
+                while let Some(Some(ev)) = stream.next().now_or_never() {
+                    batch.push(ev);
+                }
+                let has_stop = batch
+                    .iter()
+                    .any(|e| matches!(e, Ok(LanguageModelCompletionEvent::Stop(_))));
                 this.update(cx, |this, cx| {
-                    this.handle_completion_event(event, cx);
+                    for ev in batch {
+                        this.handle_completion_event(ev, cx);
+                    }
                 })?;
-                if is_stop {
+                if has_stop {
+                    break;
+                }
+                if cancel.is_cancelled() {
+                    cancelled = true;
                     break;
                 }
             }

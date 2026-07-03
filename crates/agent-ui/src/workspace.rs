@@ -17,8 +17,8 @@ use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent,
-    Entity, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent,
-    Subscription, Window, ease_out_quint, prelude::*, px,
+    Entity, FollowMode, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseUpEvent,
+    Pixels, Render, Subscription, Window, ease_out_quint, list, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -33,13 +33,13 @@ use gpui_component::{
 };
 
 use crate::OpenSettings;
-use crate::conversation::ConversationState;
+use crate::conversation::{ApplyOutcome, ConversationState};
+use crate::views::centered;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
 };
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
-use crate::views::{centered, message::render_item};
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
 struct PendingAuth {
@@ -75,7 +75,7 @@ pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<Thread>,
     sidebar: Entity<Sidebar>,
-    conversation: ConversationState,
+    conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
     /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
     /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
@@ -114,15 +114,14 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
-    /// Tracked scroll position of the message list; used to auto-scroll to the
-    /// latest message while the user is parked at the bottom and to leave them
-    /// alone when they've scrolled up to read history.
-    scroll_handle: ScrollHandle,
-    /// Whether new content should keep the viewport pinned to the bottom.
-    /// Reset to `false` by manual user scrolls that move the viewport away.
-    stick_to_bottom: bool,
+    /// Virtualized, follow-the-tail scroll state for the message list. Replaces
+    /// the old `ScrollHandle` + `stick_to_bottom` hand-rolled auto-follow:
+    /// `FollowMode::Tail` keeps the viewport pinned to the latest item while the
+    /// user is at the bottom and disengages the moment they scroll up.
+    list_state: ListState,
     /// Sub-agent task ids whose cards are expanded to show the child
-    /// conversation. Toggled by clicking the card header.
+    /// conversation. Toggled by clicking the card header; shared across all
+    /// nesting levels so nested agent tasks expand in place.
     pub(crate) expanded_tasks: HashSet<String>,
     /// Top-level view mode. `Settings` replaces the entire window content
     /// with the SettingsView overlay until the user requests exit.
@@ -213,11 +212,14 @@ impl Workspace {
 
         let sidebar = cx.new(Sidebar::new);
 
+        let list_state = ListState::new(0, ListAlignment::Top, px(2048.));
+        list_state.set_follow_mode(FollowMode::Tail);
+
         let mut ws = Self {
             cwd,
             thread,
             sidebar,
-            conversation: ConversationState::new(),
+            conversation: cx.new(|_| ConversationState::new()),
             input_state,
             editor_state,
             editor_open: false,
@@ -240,8 +242,7 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
-            scroll_handle: ScrollHandle::new(),
-            stick_to_bottom: true,
+            list_state,
             expanded_tasks: HashSet::new(),
             view_mode: ViewMode::default(),
             exiting_settings: false,
@@ -279,9 +280,17 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::Stop(reason) => {
-                    this.conversation.apply(ev);
-                    if this.stick_to_bottom {
-                        this.scroll_handle.scroll_to_bottom();
+                    let weak = cx.weak_entity();
+                    let role = this.model_label(cx);
+                    let outcome = this
+                        .conversation
+                        .update(cx, |c, cx| c.apply(ev, &role, weak, cx));
+                    // Stop flips every streaming flag off, so finalized bodies
+                    // switch to `TextView::markdown` and need their real height
+                    // measured across the whole list.
+                    if matches!(outcome, ApplyOutcome::All) {
+                        let count = this.conversation.read(cx).items().len();
+                        this.list_state.remeasure_items(0..count);
                     }
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
@@ -290,26 +299,42 @@ impl Workspace {
                     cx.notify();
                 }
                 _ => {
-                    // Capture stick state before mutating the list: a user at the
-                    // bottom should stay glued there as new tokens stream in. If
-                    // they've scrolled up, we leave their viewport alone.
-                    let was_at_bottom =
-                        this.stick_to_bottom || Self::is_at_bottom(&this.scroll_handle);
-                    this.conversation.apply(ev);
-                    // After a sub-agent's tool result lands, parse its JSON
-                    // envelope to feed the child conversation into the matching
-                    // AgentTask card's expandable panel. The envelope in the
-                    // ToolResult is the single source of truth (also used on
-                    // reload via rebuild_from_messages), so no separate in-memory
-                    // snapshot map is consulted.
-                    if let ThreadEvent::ToolResult { id, output, .. } = ev
+                    let weak = cx.weak_entity();
+                    let role = this.model_label(cx);
+                    let outcome = this
+                        .conversation
+                        .update(cx, |c, cx| c.apply(ev, &role, weak, cx));
+                    // Sub-agent tool results carry the child conversation in
+                    // their JSON envelope; feed it into the matching AgentTask
+                    // card's expandable panel. The envelope is the single
+                    // source of truth (also used on reload).
+                    let remeasure_sub = if let ThreadEvent::ToolResult { id, output, .. } = ev
                         && let Some(msgs) = agent::tools::agent::agent_sub_messages(output)
                     {
-                        this.conversation.set_agent_sub_messages(id, msgs);
+                        this.conversation
+                            .update(cx, |c, cx| c.set_agent_sub_messages(id, msgs, cx))
+                    } else {
+                        None
+                    };
+                    let count = this.conversation.read(cx).items().len();
+                    match outcome {
+                        ApplyOutcome::None => {}
+                        ApplyOutcome::Remeasure(ix) => {
+                            this.list_state.remeasure_items(ix..ix + 1);
+                        }
+                        // A new item appended at the end; grow the list count.
+                        // FollowMode::Tail keeps the viewport pinned to the new
+                        // tail automatically when the user is at the bottom.
+                        ApplyOutcome::Appended if count > 0 => {
+                            this.list_state.splice(count - 1..count - 1, 1);
+                        }
+                        ApplyOutcome::All => {
+                            this.list_state.remeasure_items(0..count);
+                        }
+                        ApplyOutcome::Appended => {}
                     }
-                    this.stick_to_bottom = was_at_bottom;
-                    if was_at_bottom {
-                        this.scroll_handle.scroll_to_bottom();
+                    if let Some(ix) = remeasure_sub {
+                        this.list_state.remeasure_items(ix..ix + 1);
                     }
                     cx.notify();
                 }
@@ -317,16 +342,10 @@ impl Workspace {
         })
     }
 
-    /// True if the message list is parked at the bottom within `STICK_THRESHOLD`
-    /// pixels. Uses the cached `stick_to_bottom` flag as a fast path: if we
-    /// already know the user wanted to follow along, don't second-guess them.
-    fn is_at_bottom(handle: &ScrollHandle) -> bool {
-        const STICK_THRESHOLD: f32 = 32.;
-        let max = handle.max_offset();
-        if max.y <= px(0.) {
-            return true;
-        }
-        handle.offset().y >= max.y - px(STICK_THRESHOLD)
+    /// `ListState` handle, shared with `AgentTask` cards so an expand/collapse
+    /// toggle can invalidate the cached per-item height.
+    pub(crate) fn list_state(&self) -> &ListState {
+        &self.list_state
     }
 
     fn subscribe_sidebar(&self, cx: &mut Context<Self>) -> Subscription {
@@ -459,7 +478,16 @@ impl Workspace {
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
-        self.conversation = ConversationState::rebuild_from_messages(&messages);
+        let role = self.model_label(cx);
+        let weak = cx.weak_entity();
+        let new_conv =
+            cx.new(|cx| ConversationState::rebuild_from_messages(&messages, &role, weak, cx));
+        let count = new_conv.read(cx).items().len();
+        self.conversation = new_conv;
+        // The list state held a measured tree for the previous thread's items;
+        // reset to the new count so it re-measures from scratch instead of
+        // carrying stale heights.
+        self.list_state.reset(count);
         self.pending_auths.clear();
         self.pending_ask = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
@@ -541,7 +569,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         use agent::language_model::MessageContent;
-        self.conversation.push_user(text.clone());
+        let role = self.model_label(cx);
+        let weak = cx.weak_entity();
+        self.conversation
+            .update(cx, |c, cx| c.push_user(text.clone(), &role, weak, cx));
+        // Splice the new user bubble into the list count; FollowMode::Tail
+        // scrolls it into view when the user is parked at the bottom.
+        let count = self.conversation.read(cx).items().len();
+        if count > 0 {
+            self.list_state.splice(count - 1..count - 1, 1);
+        }
         self.thread.update(cx, |thread, cx| {
             if images.is_empty() {
                 thread.insert_user_message(text, cx);
@@ -635,7 +672,14 @@ impl Workspace {
         if text.trim().is_empty() || self.thread.read(cx).is_running() {
             return;
         }
-        self.conversation.push_user(text.clone());
+        let role = self.model_label(cx);
+        let weak = cx.weak_entity();
+        self.conversation
+            .update(cx, |c, cx| c.push_user(text.clone(), &role, weak, cx));
+        let count = self.conversation.read(cx).items().len();
+        if count > 0 {
+            self.list_state.splice(count - 1..count - 1, 1);
+        }
         self.thread.update(cx, |thread, cx| {
             thread.insert_user_message(text, cx);
             thread.run_turn(cx);
@@ -1520,22 +1564,9 @@ impl Render for Workspace {
             return h_flex().size_full().child(anim_el);
         }
         let theme = cx.theme().clone();
-        let model_label = self.model_label(cx);
         let running = self.thread.read(cx).is_running();
 
-        let agent_ctx = crate::views::message::AgentTaskCtx {
-            expanded: self.expanded_tasks.clone(),
-            weak: cx.weak_entity(),
-        };
         self.ensure_ask_inputs(_window, cx);
-
-        let items: Vec<_> = self
-            .conversation
-            .items()
-            .iter()
-            .enumerate()
-            .map(|(ix, item)| render_item(item, ix, &model_label, &theme, &agent_ctx))
-            .collect();
 
         let overlay = self
             .render_ask_overlay(&theme, cx)
@@ -1547,7 +1578,7 @@ impl Render for Workspace {
         // Empty first screen: no messages and nothing streaming. The composer is
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
-        let first_screen = self.conversation.is_empty() && !running;
+        let first_screen = self.conversation.read(cx).is_empty() && !running;
         // The inline composer and the markdown editor are mutually exclusive: while
         // the editor pane is open the footer is hidden and the draft lives in the
         // editor (moved there on open, moved back on close).
@@ -1727,48 +1758,25 @@ impl Render for Workspace {
                             .child(h_flex()),
                     )
                     // Empty first screen shows the centered hero in place of the
-                    // (empty) message list; otherwise the scrollable conversation.
+                    // (empty) message list; otherwise the virtualized, tail-
+                    // following conversation list. Each item is its own
+                    // `Entity<MessageItem>`, so a streaming delta re-renders only
+                    // that item; the list only re-invokes the closure for visible
+                    // items and reuses cached element subtrees for the rest.
                     .children(hero)
-                    // Message list (centered, width-capped, scrollable).
-                    // `track_scroll` lets us read offset/max and call `scroll_to_bottom`
-                    // from event handlers. `on_scroll_wheel` reacts to manual scrolls:
-                    // if the user drags the viewport away from the bottom, disengage
-                    // auto-follow until they scroll back down.
                     .children((!first_screen).then(|| {
-                        v_flex()
-                            .id("messages")
-                            .flex_1()
-                            .py_5()
-                            .gap_5()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll_handle)
-                            .on_scroll_wheel(cx.listener(
-                                |this, ev: &ScrollWheelEvent, _window, _cx| {
-                                    let line_height = px(20.);
-                                    let dy = ev.delta.pixel_delta(line_height).y;
-                                    if dy < px(0.) {
-                                        // User wheeled up (away from bottom):
-                                        // stop following. The check runs before
-                                        // gpui's internal scroll handler applies
-                                        // the offset, so the offset we read here
-                                        // is still the pre-scroll value; treating
-                                        // upward intent as "leave" keeps the user
-                                        // from being yanked back by the next
-                                        // content delta.
-                                        this.stick_to_bottom = false;
-                                    } else if Self::is_at_bottom(&this.scroll_handle) {
-                                        // Wheeled down or stationary; re-engage
-                                        // only when the viewport is parked at the
-                                        // bottom within `STICK_THRESHOLD`.
-                                        this.stick_to_bottom = true;
-                                    }
-                                    // Wheel-down while not at bottom is just the
-                                    // user scrolling through history; leave the
-                                    // flag alone so re-engagement happens the
-                                    // moment they reach the bottom.
-                                },
-                            ))
-                            .children(items.into_iter().map(centered))
+                        let conv = self.conversation.clone();
+                        list(self.list_state.clone(), move |ix, _window, cx| {
+                            conv.read(cx)
+                                .items()
+                                .get(ix)
+                                .cloned()
+                                .map(|item| v_flex().py_2().child(item).into_any_element())
+                                .unwrap_or_else(|| gpui::Empty.into_any_element())
+                        })
+                        .with_sizing_behavior(ListSizingBehavior::Auto)
+                        .flex_1()
+                        .into_any_element()
                     }))
                     .children(footer)
                     // Approval overlay (if any)
