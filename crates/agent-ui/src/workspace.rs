@@ -15,8 +15,8 @@ use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{
     AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity, MouseButton,
-    MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, Subscription, Window,
-    prelude::*, px,
+    MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, Subscription, Window, prelude::*,
+    px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -44,6 +44,29 @@ struct PendingAuth {
     summary: String,
 }
 
+/// A parsed `AskUserQuestion` prompt awaiting the user's selections.
+struct PendingAsk {
+    id: String,
+    questions: Vec<AskQuestion>,
+    /// Per-question toggled option flags, aligned with `questions[i].options`.
+    selections: Vec<Vec<bool>>,
+    /// Per-question free-form "Other" input; non-empty text overrides the
+    /// option selection for that question.
+    others: Vec<Entity<InputState>>,
+}
+
+struct AskQuestion {
+    question: String,
+    header: String,
+    multi_select: bool,
+    options: Vec<AskOption>,
+}
+
+struct AskOption {
+    label: String,
+    description: String,
+}
+
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<Thread>,
@@ -59,6 +82,10 @@ pub struct Workspace {
     /// Editor pane width, driven by dragging the divider. In-memory only.
     editor_width: Pixels,
     pending_auth: Option<PendingAuth>,
+    /// A pending `AskUserQuestion` card; takes precedence over `pending_auth`
+    /// in the overlay slot. `None` unless the latest authorization is an
+    /// `AskUserQuestion` call.
+    pending_ask: Option<PendingAsk>,
     pub(crate) model_open: bool,
     /// PopupMenu entity for the open model selector; created on open, destroyed on close.
     model_menu: Option<Entity<PopupMenu>>,
@@ -147,6 +174,7 @@ impl Workspace {
             editor_preview: false,
             editor_width: px(EDITOR_PANEL_WIDTH),
             pending_auth: None,
+            pending_ask: None,
             model_open: false,
             model_menu: None,
             model_menu_sub: None,
@@ -181,8 +209,11 @@ impl Workspace {
                     id,
                     tool_name,
                     summary,
-                    ..
+                    input,
                 } => {
+                    if tool_name == "AskUserQuestion" {
+                        this.pending_ask = parse_pending_ask(id.clone(), input.clone());
+                    }
                     this.pending_auth = Some(PendingAuth {
                         id: id.clone(),
                         tool_name: tool_name.clone(),
@@ -497,12 +528,103 @@ impl Workspace {
     }
 
     fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
+        self.pending_ask = None;
         if let Some(auth) = self.pending_auth.take() {
             self.thread.update(cx, |thread, cx| {
-                thread.respond_authorization(&auth.id, decision, cx);
+                thread.respond_authorization(
+                    &auth.id,
+                    agent::ToolAuthorizationResponse::Decision(decision),
+                    cx,
+                );
             });
             cx.notify();
         }
+    }
+
+    /// Allocate the per-question `InputState` entities for the pending ask card
+    /// on first render. `InputState::new` needs a `Window`, which the event
+    /// handler lacks, so creation is deferred to here.
+    fn ensure_ask_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ask) = self.pending_ask.as_mut() else {
+            return;
+        };
+        if ask.others.len() == ask.questions.len() {
+            return;
+        }
+        ask.others = (0..ask.questions.len())
+            .map(|_| cx.new(|cx| InputState::new(window, cx)))
+            .collect();
+    }
+
+    /// Toggle an option in the pending ask card. Single-select questions reset
+    /// siblings; multi-select toggles in place.
+    fn toggle_ask_option(&mut self, qi: usize, oi: usize, cx: &mut Context<Self>) {
+        if let Some(ask) = self.pending_ask.as_mut()
+            && let Some(sel) = ask.selections.get_mut(qi)
+        {
+            let multi = ask
+                .questions
+                .get(qi)
+                .map(|q| q.multi_select)
+                .unwrap_or(false);
+            let prev = sel.get(oi).copied().unwrap_or(false);
+            if multi {
+                if let Some(slot) = sel.get_mut(oi) {
+                    *slot = !*slot;
+                }
+            } else {
+                for s in sel.iter_mut() {
+                    *s = false;
+                }
+                if let Some(slot) = sel.get_mut(oi) {
+                    *slot = !prev;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Submit the pending ask card: gather answers (per-question "Other" text
+    /// overrides option selections) and forward them to the thread.
+    fn resolve_ask(&mut self, cx: &mut Context<Self>) {
+        let ask = match self.pending_ask.take() {
+            Some(a) => a,
+            None => return,
+        };
+        let mut answers: Vec<(String, String)> = Vec::with_capacity(ask.questions.len());
+        for (i, q) in ask.questions.iter().enumerate() {
+            let other = ask
+                .others
+                .get(i)
+                .map(|s| s.read(cx).value().trim().to_string())
+                .unwrap_or_default();
+            let answer = if !other.is_empty() {
+                other
+            } else {
+                let sel = ask.selections.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
+                let selected: Vec<&str> = q
+                    .options
+                    .iter()
+                    .zip(sel.iter())
+                    .filter_map(|(o, &s)| s.then_some(o.label.as_str()))
+                    .collect();
+                selected.join(", ")
+            };
+            answers.push((q.question.clone(), answer));
+        }
+        let id = ask.id.clone();
+        self.pending_auth = None;
+        self.thread.update(cx, |thread, cx| {
+            thread.respond_authorization(
+                &id,
+                agent::ToolAuthorizationResponse::AskUserQuestion {
+                    answers,
+                    response: None,
+                },
+                cx,
+            );
+        });
+        cx.notify();
     }
 
     /// Abort the current turn.
@@ -514,6 +636,11 @@ impl Workspace {
     }
 
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // AskUserQuestion renders its own card; suppress the generic approval
+        // modal while a question card is open (both share the same id).
+        if self.pending_ask.is_some() {
+            return None;
+        }
         let auth = self.pending_auth.as_ref()?;
         let summary = auth.summary.clone();
         let tool_name = auth.tool_name.clone();
@@ -610,6 +737,131 @@ impl Workspace {
                                 ),
                         ),
                 )
+                .into_any_element(),
+        )
+    }
+
+    /// Question card for `AskUserQuestion`. Mirrors the approval overlay's
+    /// container; the body renders each question with toggleable option
+    /// buttons and a free-form "Other" input.
+    fn render_ask_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ask = self.pending_ask.as_ref()?;
+
+        let mut card = v_flex()
+            .w(px(520.))
+            .max_h(px(560.))
+            .p_4()
+            .gap_3()
+            .rounded(theme.radius)
+            .bg(theme.background)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_lg()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Icon::new(IconName::Info).small().text_color(theme.primary))
+                    .child(
+                        gpui::div()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("澄清问题"),
+                    ),
+            );
+
+        for (qi, q) in ask.questions.iter().enumerate() {
+            let sel = ask.selections.get(qi);
+            let other = ask.others.get(qi).cloned();
+            let mut qblock = v_flex().gap_2().child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Tag::new()
+                            .with_variant(TagVariant::Secondary)
+                            .small()
+                            .child(q.header.clone()),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_sm()
+                            .text_color(theme.foreground)
+                            .child(q.question.clone()),
+                    ),
+            );
+            for (oi, opt) in q.options.iter().enumerate() {
+                let selected = sel.and_then(|s| s.get(oi).copied()).unwrap_or(false);
+                let mut btn = Button::new(gpui::SharedString::from(format!("ask-{qi}-{oi}")));
+                if selected {
+                    btn = btn.primary();
+                } else {
+                    btn = btn.ghost();
+                }
+                btn = btn.small().label(opt.label.clone()).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.toggle_ask_option(qi, oi, cx);
+                    },
+                ));
+                qblock = qblock.child(
+                    h_flex().gap_2().items_start().child(btn).child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(opt.description.clone()),
+                    ),
+                );
+            }
+            if let Some(state) = other {
+                qblock = qblock.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            gpui::div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("其他（自由输入）"),
+                        )
+                        .child(Input::new(&state)),
+                );
+            }
+            card = card.child(qblock);
+        }
+
+        card = card.child(
+            h_flex()
+                .gap_2()
+                .justify_end()
+                .child(
+                    Button::new("ask-cancel")
+                        .ghost()
+                        .small()
+                        .label("取消")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.resolve_auth(PermissionDecision::Deny, cx);
+                        })),
+                )
+                .child(
+                    Button::new("ask-submit")
+                        .primary()
+                        .small()
+                        .label("提交")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.resolve_ask(cx);
+                        })),
+                ),
+        );
+
+        Some(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.background.opacity(0.6))
+                .child(card.into_any_element())
                 .into_any_element(),
         )
     }
@@ -982,6 +1234,8 @@ impl Render for Workspace {
         let model_label = self.model_label(cx);
         let running = self.thread.read(cx).is_running();
 
+        self.ensure_ask_inputs(_window, cx);
+
         let items: Vec<_> = self
             .conversation
             .items()
@@ -990,7 +1244,9 @@ impl Render for Workspace {
             .map(|(ix, item)| render_item(item, ix, &model_label, &theme))
             .collect();
 
-        let overlay = self.render_auth_overlay(&theme, cx);
+        let overlay = self
+            .render_ask_overlay(&theme, cx)
+            .or_else(|| self.render_auth_overlay(&theme, cx));
 
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
@@ -1215,4 +1471,60 @@ impl Render for Workspace {
                 },
             ))
     }
+}
+
+/// Parse an `AskUserQuestion` tool input into a `PendingAsk`. The per-question
+/// `InputState` entities are allocated lazily on first render (they need a
+/// `Window`, which the event handler lacks). Returns `None` when the input is
+/// malformed (the generic approval overlay then takes over as a fallback).
+fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk> {
+    let questions = input.get("questions")?.as_array()?;
+    // An empty questions array renders a button-only card with no way to
+    // answer; fall back to the generic approval overlay instead.
+    if questions.is_empty() {
+        return None;
+    }
+    let mut parsed: Vec<AskQuestion> = Vec::with_capacity(questions.len());
+    let mut selections: Vec<Vec<bool>> = Vec::with_capacity(questions.len());
+    for q in questions {
+        let question = q.get("question")?.as_str()?.to_string();
+        let header = q
+            .get("header")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let multi_select = q
+            .get("multiSelect")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut opts: Vec<AskOption> = Vec::new();
+        if let Some(arr) = q.get("options").and_then(|v| v.as_array()) {
+            for o in arr {
+                let label = o
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let description = o
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                opts.push(AskOption { label, description });
+            }
+        }
+        selections.push(vec![false; opts.len()]);
+        parsed.push(AskQuestion {
+            question,
+            header,
+            multi_select,
+            options: opts,
+        });
+    }
+    Some(PendingAsk {
+        id,
+        questions: parsed,
+        selections,
+        others: Vec::new(),
+    })
 }

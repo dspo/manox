@@ -15,7 +15,11 @@
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, px};
 use gpui_component::text::{TextView, TextViewStyle};
-use gpui_component::{Icon, IconName, Sizable as _, Theme, button::{Button, ButtonVariants as _}, h_flex, v_flex};
+use gpui_component::{
+    Icon, IconName, Sizable as _, Theme,
+    button::{Button, ButtonVariants as _},
+    h_flex, v_flex,
+};
 
 use crate::conversation::{ConvItem, ToolCallItem};
 
@@ -29,7 +33,11 @@ fn text_view_style(theme: &Theme) -> TextViewStyle {
 }
 
 /// Markdown `TextView` with theme-aware syntax highlighting.
-fn markdown_tv(id: impl Into<gpui::ElementId>, text: impl Into<gpui::SharedString>, theme: &Theme) -> TextView {
+fn markdown_tv(
+    id: impl Into<gpui::ElementId>,
+    text: impl Into<gpui::SharedString>,
+    theme: &Theme,
+) -> TextView {
     TextView::markdown(id, text)
         .selectable(true)
         .style(text_view_style(theme))
@@ -91,7 +99,13 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
 }
 
 /// Render an assistant message: role label + copy button + markdown body. `role` is the model display name (dynamic).
-pub fn render_assistant(text: &str, streaming: bool, ix: usize, role: &str, theme: &Theme) -> gpui::AnyElement {
+pub fn render_assistant(
+    text: &str,
+    streaming: bool,
+    ix: usize,
+    role: &str,
+    theme: &Theme,
+) -> gpui::AnyElement {
     v_flex()
         .w_full()
         .gap_2()

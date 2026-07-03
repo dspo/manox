@@ -9,7 +9,8 @@
 //!
 //! Authorization uses a `tokio::sync::oneshot`: `Thread` emits `ToolCallAuthorization`
 //! carrying a `Sender`; the UI resolves the prompt and sends back a
-//! `PermissionDecision`, which the task `await`s on the gpui executor.
+//! `ToolAuthorizationResponse` (a permission decision or, for `AskUserQuestion`,
+//! the user's answers), which the task `await`s on the gpui executor.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ use crate::language_model::{
     Role, StopReason,
 };
 use crate::message::Message;
-use crate::tool::{PermissionCache, PermissionDecision, ToolRegistry};
+use crate::tool::{PermissionCache, PermissionDecision, ToolAuthorizationResponse, ToolRegistry};
 use crate::tools;
 
 /// Stable `Thread` id used for persistence.
@@ -67,7 +68,7 @@ pub enum ThreadEvent {
     /// Accumulated into the matching tool-call item's `output` until the
     /// final `ToolResult` overwrites it with the canonical (truncated) text.
     ToolOutput { id: String, chunk: String },
-    /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with the decision.
+    /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with a `ToolAuthorizationResponse` (a decision, or — for `AskUserQuestion` — the user's answers).
     ToolCallAuthorization {
         id: String,
         tool_name: String,
@@ -89,8 +90,11 @@ pub struct Thread {
     cwd: PathBuf,
     /// tool_uses collected during the current turn, processed after the stream ends.
     pending_tool_uses: Vec<LanguageModelToolUse>,
-    /// The pending authorization awaiting a UI decision (id + responder).
-    pending_authorization: Option<(String, tokio::sync::oneshot::Sender<PermissionDecision>)>,
+    /// The pending authorization awaiting a UI response (id + responder).
+    pending_authorization: Option<(
+        String,
+        tokio::sync::oneshot::Sender<ToolAuthorizationResponse>,
+    )>,
     /// The running turn task; dropping it aborts the turn.
     running_turn: Option<Task<()>>,
     /// Cancellation token for the running turn. Cancelled by `cancel()` so the
@@ -102,7 +106,7 @@ pub struct Thread {
 impl EventEmitter<ThreadEvent> for Thread {}
 
 impl Thread {
-    /// Construct a new `Thread`, defaulting to the registry's first model and registering the 7 built-in tools.
+    /// Construct a new `Thread`, defaulting to the registry's first model and registering the built-in tools.
     pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
         cx.new(|_cx| Self {
             id,
@@ -175,17 +179,18 @@ impl Thread {
         "(新对话)".to_string()
     }
 
-    /// Called after the UI resolves authorization: forward the decision to the matching pending responder by id.
-    /// Silently ignored when no id matches (the responder may have timed out or belonged to a cancelled turn).
+    /// Called after the UI resolves authorization: forward the response to the
+    /// matching pending responder by id. Silently ignored when no id matches
+    /// (the responder may have timed out or belonged to a cancelled turn).
     pub fn respond_authorization(
         &mut self,
         id: &str,
-        decision: PermissionDecision,
+        response: ToolAuthorizationResponse,
         cx: &mut Context<Self>,
     ) {
         if let Some((pending_id, tx)) = self.pending_authorization.take()
             && pending_id == id
-            && tx.send(decision).is_ok()
+            && tx.send(response).is_ok()
         {}
         let _ = cx;
     }
@@ -383,9 +388,9 @@ impl Thread {
                 });
             })?;
 
-            let decision = tokio::select! {
-                d = rx => d.unwrap_or(PermissionDecision::Deny),
-                _ = cancel.cancelled() => PermissionDecision::Deny,
+            let response = tokio::select! {
+                r = rx => r.unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
+                _ = cancel.cancelled() => ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
             };
             // The pending responder is spent whether the UI answered or cancel
             // fired; drop any stale sender so a late `respond_authorization`
@@ -393,17 +398,36 @@ impl Thread {
             this.update(cx, |this, _cx| {
                 this.pending_authorization = None;
             })?;
-            match decision {
-                PermissionDecision::Deny => {
+            match response {
+                ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {
                     let msg = "用户拒绝执行".to_string();
                     Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
                     Self::append_tool_result(this, tu, msg, true, cx)?;
                     return Ok(());
                 }
-                PermissionDecision::AlwaysAllow => {
+                ToolAuthorizationResponse::Decision(PermissionDecision::AlwaysAllow) => {
                     this.read_with(cx, |this, _| this.permission.set_always_allowed(&name))?;
                 }
-                PermissionDecision::AllowOnce => {}
+                ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {}
+                ToolAuthorizationResponse::AskUserQuestion { answers, response } => {
+                    let output = match response {
+                        Some(text) => format!("User responded: {text}"),
+                        None => {
+                            let mut buf = String::new();
+                            for (q, a) in &answers {
+                                buf.push_str("Question: ");
+                                buf.push_str(q);
+                                buf.push_str("\nAnswer: ");
+                                buf.push_str(a);
+                                buf.push_str("\n\n");
+                            }
+                            buf.trim_end().to_string()
+                        }
+                    };
+                    Self::emit_tool_result(this, &id, &name, &title, &output, false, cx)?;
+                    Self::append_tool_result(this, tu, output, false, cx)?;
+                    return Ok(());
+                }
             }
         }
 
@@ -813,6 +837,27 @@ fn tool_title(name: &str, input: &serde_json::Value) -> String {
             let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             format!("glob {p}")
         }
+        "AskUserQuestion" => {
+            let q = input
+                .get("questions")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|q| q.get("question"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let single = q.lines().next().unwrap_or("").trim();
+            let trimmed = if single.chars().count() > 80 {
+                let t: String = single.chars().take(80).collect();
+                format!("{t}…")
+            } else {
+                single.to_string()
+            };
+            if trimmed.is_empty() {
+                "AskUserQuestion".to_string()
+            } else {
+                format!("AskUserQuestion: {trimmed}")
+            }
+        }
         _ => name.to_string(),
     }
 }
@@ -840,5 +885,24 @@ mod tests {
     fn edit_file_title_missing_header_is_empty() {
         let input = json!({ "patch": "SWAP 5.=5:\n+X" });
         assert_eq!(tool_title("edit_file", &input), "edit_file ");
+    }
+
+    #[test]
+    fn ask_user_question_title_uses_first_question() {
+        let input = json!({
+            "questions": [
+                { "question": "Which framework?", "header": "Framework",
+                  "options": [{"label":"A","description":"a"}], "multiSelect": false }
+            ]
+        });
+        assert_eq!(
+            tool_title("AskUserQuestion", &input),
+            "AskUserQuestion: Which framework?"
+        );
+    }
+
+    #[test]
+    fn ask_user_question_title_falls_back_without_questions() {
+        assert_eq!(tool_title("AskUserQuestion", &json!({})), "AskUserQuestion");
     }
 }
