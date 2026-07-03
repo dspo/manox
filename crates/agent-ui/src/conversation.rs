@@ -6,34 +6,8 @@
 //! by id for status/output.
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
+use agent::tools::agent::{agent_final_text, agent_sub_messages};
 use agent::{Message, ThreadEvent, ToolCallStatus};
-use serde::Deserialize;
-
-/// Persisted `agent` tool-result envelope: the model-facing final text plus the
-/// full sub-agent conversation, so the expandable panel survives a reload.
-#[derive(Deserialize)]
-struct AgentToolResultPayload {
-    #[serde(rename = "final")]
-    final_text: String,
-    #[serde(default)]
-    messages: Vec<Message>,
-}
-
-/// The model-facing final text from an `agent` tool result. Parses the JSON
-/// envelope when present; falls back to the raw content for legacy or non-json
-/// results so a plain string result still renders.
-fn agent_final_text(content: &str) -> String {
-    serde_json::from_str::<AgentToolResultPayload>(content)
-        .map(|p| p.final_text)
-        .unwrap_or_else(|_| content.to_string())
-}
-
-/// The persisted sub-agent conversation, when the content is the JSON envelope.
-fn agent_sub_messages(content: &str) -> Option<Vec<Message>> {
-    serde_json::from_str::<AgentToolResultPayload>(content)
-        .ok()
-        .map(|p| p.messages)
-}
 
 /// A single renderable conversation item.
 #[derive(Debug, Clone)]

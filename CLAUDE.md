@@ -139,7 +139,7 @@ crates/
 - **深度/嵌套限制**：`Thread.depth` 主=0 子=父+1，`MAX_DEPTH=5`。`build_child_registry` 仅在 `allow_nesting && child_depth<MAX_DEPTH` 时注册 `agent` 工具，`run_streaming` 开头 `depth+1>MAX_DEPTH` 直接 Err。双重保险。
 - **max_turns 截断**：达 `max_turns` 时注入一轮总结 user 消息（`cap_summary_injected` 防二次循环），让子 agent 产出连贯最终回复而非硬停；第二轮再触顶才 `Stop(EndTurn)`。
 - **完成信号**：`setup_child` 订阅只对真终态（`Stop(EndTurn|MaxTokens|Refusal)` + `Error`）发 `done_tx`；`Stop(ToolUse)` 是非终端中间态（子下一轮继续跑工具），忽略之，否则会把子第一轮未跑工具的文本当成最终结果回传父。
-- **快照与持久化**：子结束后，`agent` 工具把子完整对话存入父 `subagent_snapshots[ptu]`（UI 展开）+ 把 JSON envelope `{"final":..., "messages":[...]}` 作为 ToolResult.content 回传（reload 后 `rebuild_from_messages` 反序列化还原 `sub_messages`，重建展开面板——内存快照在重启后丢失，envelope 是唯一来源）。`final` 字段是父 LLM 读到的最终文本。
+- **快照与持久化**：子结束后，`agent` 工具把子完整对话存入父 `subagent_snapshots[ptu]`（UI 展开）+ 把 JSON envelope `{"final":..., "messages":[...]}` 作为 ToolResult.content 写入规范 `Thread::messages`（reload 后 `rebuild_from_messages` 反序列化还原 `sub_messages`，重建展开面板——内存快照在重启后丢失，envelope 是唯一来源）。**上下文隔离**：`build_completion_request` 在映射到模型请求时用 `model_facing_content` 把 `agent` 的 ToolResult envelope 剥成只 `final` 文本——规范消息保留完整 envelope（持久化+UI 用），但父 LLM 只看到 `final`，子 agent 的中间工具调用/结果/reasoning 不泄漏进父上下文。
 - **UI**：`ConvItem::AgentTask` 渲染子 agent 卡片（标题=subagent_type+title、状态图标、chevron 展开/折叠）。折叠态显示 `sub_text` live tail；展开态用 `ConversationState::rebuild_from_messages(&sub_messages)` 得临时 state 再递归 `render_item`（递归深度由 `MAX_DEPTH` 数据侧限）。`views/message.rs` 的 `render_agent_task`。
 
 ### tokio ↔ gpui 桥接（子 agent 侧）

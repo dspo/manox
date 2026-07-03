@@ -340,6 +340,39 @@ fn last_assistant_text(msgs: &[Message]) -> String {
     "sub-agent ended without producing a final message".to_string()
 }
 
+/// Persisted `agent` tool-result envelope: the model-facing final text plus the
+/// full sub-agent conversation, so the expandable panel survives a reload. The
+/// envelope is the canonical ToolResult content (persisted to DB, used by the UI
+/// to rebuild `sub_messages`); `build_completion_request` strips it to `final`
+/// before the request reaches the model, so the sub-conversation never leaks
+/// into the parent's context.
+#[derive(Deserialize)]
+pub(crate) struct AgentToolResultPayload {
+    #[serde(rename = "final")]
+    final_text: String,
+    #[serde(default)]
+    messages: Vec<Message>,
+}
+
+/// The model-facing final text from an `agent` tool result. Parses the JSON
+/// envelope when present; falls back to the raw content for legacy or non-json
+/// results. Used by `Thread::build_completion_request` to strip the envelope so
+/// only the final text reaches the parent model.
+pub fn agent_final_text(content: &str) -> String {
+    serde_json::from_str::<AgentToolResultPayload>(content)
+        .map(|p| p.final_text)
+        .unwrap_or_else(|_| content.to_string())
+}
+
+/// The persisted sub-agent conversation, when the content is the JSON envelope.
+/// Used by the UI to rebuild the expandable panel after a reload (the in-memory
+/// snapshot map is empty on restart, so the envelope is the only source).
+pub fn agent_sub_messages(content: &str) -> Option<Vec<Message>> {
+    serde_json::from_str::<AgentToolResultPayload>(content)
+        .ok()
+        .map(|p| p.messages)
+}
+
 /// Whether `name` passes the definition's `tools`/`disallowed_tools` filters.
 /// `disallowed_tools` takes precedence; an absent `tools` whitelist inherits all.
 fn is_tool_allowed(name: &str, def: &AgentDefinition) -> bool {

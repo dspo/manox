@@ -1044,9 +1044,15 @@ impl Thread {
                 cache: false,
             });
         }
+        // Map canonical messages to the request, stripping the `agent` tool's
+        // JSON envelope to just its `final` text. The full sub-conversation
+        // stays in `self.messages` for persistence and UI rebuild, but the
+        // parent model must only see the final reply — otherwise every sub-agent
+        // tool call, tool result, and reasoning block leaks into the parent's
+        // context, defeating the point of spawning an isolated sub-agent.
         messages.extend(self.messages.iter().map(|m| LanguageModelRequestMessage {
             role: m.role,
-            content: m.content.clone(),
+            content: m.content.iter().map(model_facing_content).collect(),
             cache: false,
         }));
         LanguageModelRequest {
@@ -1054,6 +1060,25 @@ impl Thread {
             tools: self.tools.to_request_tools(),
             ..Default::default()
         }
+    }
+}
+
+/// Strip the `agent` tool's JSON envelope from a ToolResult so only its `final`
+/// text reaches the model. The canonical `Thread::messages` keep the full
+/// envelope (for persistence and UI rebuild); this mapping is applied only when
+/// building a request, so the sub-conversation never leaks into the parent's
+/// context. Non-`agent` content passes through unchanged.
+fn model_facing_content(c: &MessageContent) -> MessageContent {
+    match c {
+        MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == "agent" => {
+            MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: tr.tool_use_id.clone(),
+                tool_name: tr.tool_name.clone(),
+                is_error: tr.is_error,
+                content: crate::tools::agent::agent_final_text(&tr.content),
+            })
+        }
+        other => other.clone(),
     }
 }
 
@@ -1150,8 +1175,11 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_title;
+    use super::{model_facing_content, tool_title};
+    use crate::language_model::{LanguageModelToolResult, MessageContent};
+    use crate::message::Message;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn edit_file_title_extracts_path_not_tag() {
@@ -1190,5 +1218,66 @@ mod tests {
     #[test]
     fn ask_user_question_title_falls_back_without_questions() {
         assert_eq!(tool_title("AskUserQuestion", &json!({})), "AskUserQuestion");
+    }
+
+    /// The `agent` tool's persisted ToolResult carries a JSON envelope
+    /// `{"final":..., "messages":[...]}`. The model must only see the `final`
+    /// text — otherwise the sub-agent's whole conversation (tool calls, results,
+    /// reasoning) leaks into the parent's context. `model_facing_content`
+    /// strips the envelope; the canonical `Thread::messages` keep it.
+    #[test]
+    fn model_facing_content_strips_agent_envelope_to_final() {
+        let sub = vec![Message::user("research foo".to_string())];
+        let envelope = json!({ "final": "found 3 files", "messages": sub }).to_string();
+        let tr = MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: "tu_1".to_string(),
+            tool_name: Arc::from("agent"),
+            is_error: false,
+            content: envelope,
+        });
+        let stripped = model_facing_content(&tr);
+        let MessageContent::ToolResult(out) = stripped else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(out.content, "found 3 files");
+        assert_eq!(out.tool_name.as_ref(), "agent");
+        // Original canonical content is untouched (still the envelope).
+        let MessageContent::ToolResult(orig) = tr else {
+            unreachable!()
+        };
+        assert!(orig.content.contains("\"messages\""));
+    }
+
+    /// A non-`agent` tool result passes through unchanged — no envelope
+    /// stripping, no content mutation.
+    #[test]
+    fn model_facing_content_passes_non_agent_through() {
+        let tr = MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: "tu_2".to_string(),
+            tool_name: Arc::from("bash"),
+            is_error: false,
+            content: "command output".to_string(),
+        });
+        let MessageContent::ToolResult(out) = model_facing_content(&tr) else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(out.content, "command output");
+        assert_eq!(out.tool_name.as_ref(), "bash");
+    }
+
+    /// A legacy `agent` result (plain text, no envelope) falls back to the raw
+    /// content rather than emptying it.
+    #[test]
+    fn model_facing_content_agent_legacy_falls_back() {
+        let tr = MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: "tu_3".to_string(),
+            tool_name: Arc::from("agent"),
+            is_error: false,
+            content: "plain summary".to_string(),
+        });
+        let MessageContent::ToolResult(out) = model_facing_content(&tr) else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(out.content, "plain summary");
     }
 }
