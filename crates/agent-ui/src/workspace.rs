@@ -21,6 +21,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::PopupMenu,
+    tab::TabBar,
     text::TextView,
     v_flex,
 };
@@ -103,10 +104,10 @@ impl Workspace {
         let editor_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("markdown")
-                .line_number(false)
+                .line_number(true)
                 .folding(true)
                 .submit_on_enter(false)
-                .placeholder("编写 markdown…（Cmd-Shift-P 切换预览，Cmd-Enter 发送）")
+                .placeholder("编写 markdown…（Cmd-Enter 发送）")
         });
 
         let sidebar = cx.new(Sidebar::new);
@@ -276,12 +277,18 @@ impl Workspace {
     /// Toggle the right-side composer between plain-text edit and rendered
     /// markdown preview. No-op when the panel is closed.
     fn toggle_editor_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.editor_open {
+        self.set_editor_preview(!self.editor_preview, window, cx);
+    }
+
+    /// Switch the editor panel to preview (`Write` tab) or rendered markdown
+    /// (`Preview` tab). No-op when the panel is closed or already in that mode.
+    /// Returning to `Write` focuses the editor so typing works immediately.
+    fn set_editor_preview(&mut self, preview: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor_open || self.editor_preview == preview {
             return;
         }
-        self.editor_preview = !self.editor_preview;
-        if !self.editor_preview {
-            // Returning to edit mode: focus the editor so typing works immediately.
+        self.editor_preview = preview;
+        if !preview {
             self.editor_state.update(cx, |s, cx| s.focus(window, cx));
         }
         cx.notify();
@@ -493,18 +500,41 @@ impl Render for Workspace {
             .h_full()
             .flex_shrink_0()
             .bg(theme.background)
-            .child(if editor_preview {
-                TextView::markdown(
-                    "editor-preview",
-                    self.editor_state.read(cx).value().to_string(),
-                )
-                .selectable(true)
-                .scrollable(true)
-                .h_full()
-                .into_any_element()
-            } else {
-                Input::new(&self.editor_state).h_full().into_any_element()
-            });
+            .child(
+                h_flex().w_full().px_2().pt_1().child(
+                    TabBar::new("editor-tabs")
+                        .underline()
+                        .small()
+                        .selected_index(if editor_preview { 1 } else { 0 })
+                        .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                            this.set_editor_preview(*ix == 1, window, cx);
+                        }))
+                        .child("Write")
+                        .child("Preview"),
+                ),
+            )
+            .child(
+                v_flex()
+                    .id("editor-content")
+                    .flex_1()
+                    .min_h_0()
+                    .h_full()
+                    .child(if editor_preview {
+                        TextView::markdown(
+                            "editor-preview",
+                            self.editor_state.read(cx).value().to_string(),
+                        )
+                        .selectable(true)
+                        .scrollable(true)
+                        .h_full()
+                        .into_any_element()
+                    } else {
+                        Input::new(&self.editor_state)
+                            .h_full()
+                            .appearance(false)
+                            .into_any_element()
+                    }),
+            );
 
         h_flex()
             .size_full()
