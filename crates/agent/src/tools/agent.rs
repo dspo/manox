@@ -139,22 +139,19 @@ impl AgentToolTrait for SpawnAgentTool {
                 });
             }
 
-            // Capture the sub-agent's full conversation for the expandable UI
-            // panel and extract its final assistant text as the tool result.
+            // Capture the sub-agent's full conversation and extract its final
+            // assistant text as the tool result.
             let msgs = child.read_with(cx, |c, _| c.messages().to_vec());
             let final_text = last_assistant_text(&msgs);
-
-            if let Some(p) = parent.upgrade() {
-                p.update(cx, |t, cx| {
-                    t.insert_subagent_snapshot(ptu.clone(), msgs.clone(), cx);
-                });
-            }
             drop(sub);
 
-            // Persist the sub-agent conversation inside the tool result so the
-            // expandable panel survives a reload (the in-memory snapshot map is
-            // lost on restart). The `final` field is what the parent model reads;
-            // `messages` is the full child conversation for UI reconstruction.
+            // The tool result is a JSON envelope {"final":..., "messages":[...]}.
+            // The envelope in the parent's ToolResult is the single source of
+            // truth: build_completion_request strips it to `final` for the model
+            // (context isolation), and the UI parses `messages` from it for the
+            // expandable panel — both live and after reload. No separate in-memory
+            // snapshot map is kept, so there is nothing to leak across a long
+            // session with many sub-agent calls.
             let payload = serde_json::json!({ "final": final_text, "messages": msgs });
             Ok(payload.to_string())
         })

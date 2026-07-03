@@ -57,7 +57,7 @@ crates/
 
 **核心模块：**
 
-- `thread.rs` — `Thread` 状态机（gpui `Entity<Thread>` + `EventEmitter<ThreadEvent>`）。`run_turn` 在 gpui executor 上 spawn 一个 task，task 内循环：`build_completion_request` → `model.stream_completion` → 逐事件 `handle_completion_event` → 收集 `pending_tool_uses` → 流结束后按「免审批并行 / 需审批串行」分区执行（gpui `Task` 非 Send，故并发 spawn + 顺序 await）→ 逐 tool 审批→执行→追加 ToolResult 消息→回到循环。无 tool_use 时 `EndTurn` 退出。子 agent 字段：`system`（子 system prompt，主 Thread=None）、`depth`（主=0，子=父+1）、`max_turns`/`turn_count`/`cap_summary_injected`（截断时注入一轮总结而非硬停）、`pending_authorizations`（id→oneshot，多槽）、`pending_child_auth`（复合 id→`ChildAuthRoute`，授权冒泡路由）、`subagent_snapshots`（父 tool_use_id→子对话 `Vec<Message>`，UI 展开用）。`new_subagent` 构造子 Thread，`tools_fn` 闭包解决「AgentTool 需子 WeakEntity 但子 Thread 还没建」的先有鸡先有蛋问题。
+- `thread.rs` — `Thread` 状态机（gpui `Entity<Thread>` + `EventEmitter<ThreadEvent>`）。`run_turn` 在 gpui executor 上 spawn 一个 task，task 内循环：`build_completion_request` → `model.stream_completion` → 逐事件 `handle_completion_event` → 收集 `pending_tool_uses` → 流结束后按「免审批并行 / 需审批串行」分区执行（gpui `Task` 非 Send，故并发 spawn + 顺序 await）→ 逐 tool 审批→执行→追加 ToolResult 消息→回到循环。无 tool_use 时 `EndTurn` 退出。子 agent 字段：`system`（子 system prompt，主 Thread=None）、`depth`（主=0，子=父+1）、`max_turns`/`turn_count`/`cap_summary_injected`（截断时注入一轮总结而非硬停）、`pending_authorizations`（id→oneshot，多槽）、`pending_child_auth`（复合 id→`ChildAuthRoute`，授权冒泡路由）。子 agent 对话不单独存内存 map——直接作为 JSON envelope 写进父 ToolResult.content（见「快照与持久化」）。`new_subagent` 构造子 Thread，`tools_fn` 闭包解决「AgentTool 需子 WeakEntity 但子 Thread 还没建」的先有鸡先有蛋问题。
 
 - `language_model.rs` — `LanguageModel` trait（`stream_completion` 返回 `BoxFuture` 产出 `BoxStream<Result<LanguageModelCompletionEvent>>`）。通用类型：`Role`、`MessageContent`、`LanguageModelRequest`、`LanguageModelToolUse`、`LanguageModelToolResult` 等。
 
@@ -139,7 +139,7 @@ crates/
 - **深度/嵌套限制**：`Thread.depth` 主=0 子=父+1，`MAX_DEPTH=5`。`build_child_registry` 仅在 `allow_nesting && child_depth<MAX_DEPTH` 时注册 `agent` 工具，`run_streaming` 开头 `depth+1>MAX_DEPTH` 直接 Err。双重保险。
 - **max_turns 截断**：达 `max_turns` 时注入一轮总结 user 消息（`cap_summary_injected` 防二次循环），让子 agent 产出连贯最终回复而非硬停；第二轮再触顶才 `Stop(EndTurn)`。
 - **完成信号**：`setup_child` 订阅只对真终态（`Stop(EndTurn|MaxTokens|Refusal)` + `Error`）发 `done_tx`；`Stop(ToolUse)` 是非终端中间态（子下一轮继续跑工具），忽略之，否则会把子第一轮未跑工具的文本当成最终结果回传父。
-- **快照与持久化**：子结束后，`agent` 工具把子完整对话存入父 `subagent_snapshots[ptu]`（UI 展开）+ 把 JSON envelope `{"final":..., "messages":[...]}` 作为 ToolResult.content 写入规范 `Thread::messages`（reload 后 `rebuild_from_messages` 反序列化还原 `sub_messages`，重建展开面板——内存快照在重启后丢失，envelope 是唯一来源）。**上下文隔离**：`build_completion_request` 在映射到模型请求时用 `model_facing_content` 把 `agent` 的 ToolResult envelope 剥成只 `final` 文本——规范消息保留完整 envelope（持久化+UI 用），但父 LLM 只看到 `final`，子 agent 的中间工具调用/结果/reasoning 不泄漏进父上下文。
+- **快照与持久化**：子结束后，`agent` 工具把 JSON envelope `{"final":..., "messages":[...]}` 作为 ToolResult.content 写入规范 `Thread::messages`——这是子对话的**唯一来源**（不另存内存 map，长会话无泄漏）。UI live 路径从 `ThreadEvent::ToolResult` 的 `output` 用 `agent_sub_messages` 解析喂展开面板；reload 路径从 `rebuild_from_messages` 同样解析 envelope 还原 `sub_messages`。**上下文隔离**：`build_completion_request` 在映射到模型请求时用 `model_facing_content` 把 `agent` 的 ToolResult envelope 剥成只 `final` 文本——规范消息保留完整 envelope（持久化+UI 用），但父 LLM 只看到 `final`，子 agent 的中间工具调用/结果/reasoning 不泄漏进父上下文。
 - **UI**：`ConvItem::AgentTask` 渲染子 agent 卡片（标题=subagent_type+title、状态图标、chevron 展开/折叠）。折叠态显示 `sub_text` live tail；展开态用 `ConversationState::rebuild_from_messages(&sub_messages)` 得临时 state 再递归 `render_item`（递归深度由 `MAX_DEPTH` 数据侧限）。`views/message.rs` 的 `render_agent_task`。
 
 ### tokio ↔ gpui 桥接（子 agent 侧）

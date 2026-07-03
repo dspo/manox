@@ -100,10 +100,6 @@ pub struct Thread {
     /// id `<parent_tool_use_id>::<child_auth_id>`. Routing a response back
     /// forwards it to the owning child thread.
     pending_child_auth: HashMap<String, ChildAuthRoute>,
-    /// Sub-agent conversation snapshots keyed by the parent-side tool_use id.
-    /// Filled when a sub-agent finishes; the UI reads them to render the
-    /// expandable sub-conversation panel.
-    subagent_snapshots: HashMap<String, Vec<Message>>,
     /// Sub-agent system prompt; `None` for the main thread (no system prompt injected).
     system: Option<String>,
     /// Nesting depth. Main thread = 0; a sub-agent = parent depth + 1.
@@ -151,7 +147,6 @@ impl Thread {
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_child_auth: HashMap::new(),
-                subagent_snapshots: HashMap::new(),
                 system: None,
                 depth: 0,
                 max_turns: None,
@@ -183,7 +178,6 @@ impl Thread {
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_child_auth: HashMap::new(),
-                subagent_snapshots: HashMap::new(),
                 system: None,
                 depth: 0,
                 max_turns: None,
@@ -222,7 +216,6 @@ impl Thread {
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_child_auth: HashMap::new(),
-                subagent_snapshots: HashMap::new(),
                 system: Some(system),
                 depth,
                 max_turns: Some(max_turns),
@@ -322,23 +315,6 @@ impl Thread {
             summary,
             input,
         });
-    }
-
-    /// Store a finished sub-agent's full message list keyed by the parent-side
-    /// tool_use id, so the UI can render the expandable sub-conversation panel.
-    pub fn insert_subagent_snapshot(
-        &mut self,
-        tool_use_id: String,
-        messages: Vec<Message>,
-        cx: &mut Context<Self>,
-    ) {
-        self.subagent_snapshots.insert(tool_use_id, messages);
-        cx.notify();
-    }
-
-    /// Read-only access to sub-agent snapshots (for UI rendering).
-    pub fn subagent_snapshots(&self) -> &HashMap<String, Vec<Message>> {
-        &self.subagent_snapshots
     }
 
     pub fn depth(&self) -> u32 {

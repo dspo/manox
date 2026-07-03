@@ -248,12 +248,14 @@ impl Workspace {
                     let was_at_bottom =
                         this.stick_to_bottom || Self::is_at_bottom(&this.scroll_handle);
                     this.conversation.apply(ev);
-                    // After a sub-agent's tool result lands, feed its child-
-                    // conversation snapshot into the matching AgentTask card so
-                    // the expandable panel has the full sub-conversation.
-                    if let ThreadEvent::ToolResult { id, .. } = ev
-                        && let Some(msgs) =
-                            this.thread.read(cx).subagent_snapshots().get(id).cloned()
+                    // After a sub-agent's tool result lands, parse its JSON
+                    // envelope to feed the child conversation into the matching
+                    // AgentTask card's expandable panel. The envelope in the
+                    // ToolResult is the single source of truth (also used on
+                    // reload via rebuild_from_messages), so no separate in-memory
+                    // snapshot map is consulted.
+                    if let ThreadEvent::ToolResult { id, output, .. } = ev
+                        && let Some(msgs) = agent::tools::agent::agent_sub_messages(output)
                     {
                         this.conversation.set_agent_sub_messages(id, msgs);
                     }
