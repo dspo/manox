@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::language_model::{MessageContent, Role};
 use crate::message::Message;
+use crate::paths;
 
 /// Thread database handle.
 pub struct ThreadsDatabase {
@@ -170,13 +171,9 @@ impl ThreadsDatabase {
     }
 }
 
-/// Default db path: `$HOME/.config/manox/threads.db`.
+/// Default db path: `$HOME/.config/cx/manox/threads.db`.
 pub fn default_db_path() -> Result<std::path::PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME 环境变量未设置"))?;
-    Ok(std::path::PathBuf::from(home)
-        .join(".config")
-        .join("manox")
-        .join("threads.db"))
+    Ok(paths::manox_config_dir()?.join("threads.db"))
 }
 
 #[cfg(test)]

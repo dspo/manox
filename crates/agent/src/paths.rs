@@ -1,9 +1,8 @@
 //! Filesystem paths for manox configuration.
 //!
 //! All manox-specific config lives under `~/.config/cx/manox/` (the `cx` config
-//! root is shared with `cx.providers.config.yaml`). The SQLite database still
-//! lives under the legacy `~/.config/manox/` until the path-migration PR lands;
-//! agent definitions — a new concern — go straight to the new root.
+//! root is shared with `cx.providers.config.yaml`): the SQLite database, agent
+//! definitions, and any future state.
 
 use std::path::PathBuf;
 
