@@ -8,6 +8,7 @@
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use agent::language_model::StopReason;
 use agent::provider::config::WireApi;
@@ -18,6 +19,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, TitleBar,
+    animation::{Transition, ease_in_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -671,9 +673,11 @@ impl Render for Workspace {
 
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
-        // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
-        // toggles preview — all keyboard-driven per the no-button constraint.
-        let editor_panel = v_flex()
+        // Inner panel keeps a fixed width so content never reflows mid-slide;
+        // the wrapper clips it while animating toward 0. No chrome on the
+        // panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P toggles preview —
+        // all keyboard-driven per the no-button constraint.
+        let editor_inner = v_flex()
             .w(px(EDITOR_PANEL_WIDTH))
             .h_full()
             .flex_shrink_0()
@@ -692,6 +696,28 @@ impl Render for Workspace {
             } else {
                 Input::new(&self.editor_state).h_full().into_any_element()
             });
+
+        // Slide the wrapper width between 0 and the panel width. Encoding the
+        // open state into the animation id makes each toggle start a fresh
+        // animation whose from-value matches the previous to-value, so there
+        // is no jump on reversal.
+        let (from_w, to_w) = if editor_open {
+            (px(0.), px(EDITOR_PANEL_WIDTH))
+        } else {
+            (px(EDITOR_PANEL_WIDTH), px(0.))
+        };
+        let editor_panel = Transition::new(Duration::from_millis(200))
+            .ease(ease_in_out_cubic)
+            .width(from_w, to_w)
+            .apply(
+                h_flex()
+                    .h_full()
+                    .flex_shrink_0()
+                    .overflow_hidden()
+                    .child(editor_inner),
+                ("editor-panel", editor_open as usize),
+            )
+            .into_any_element();
 
         h_flex()
             .size_full()
@@ -754,6 +780,6 @@ impl Render for Workspace {
                     // Approval overlay (if any)
                     .children(overlay),
             )
-            .when(editor_open, |this| this.child(editor_panel))
+            .child(editor_panel)
     }
 }
