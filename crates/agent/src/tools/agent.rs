@@ -146,12 +146,17 @@ impl AgentToolTrait for SpawnAgentTool {
 
             if let Some(p) = parent.upgrade() {
                 p.update(cx, |t, cx| {
-                    t.insert_subagent_snapshot(ptu.clone(), msgs, cx);
+                    t.insert_subagent_snapshot(ptu.clone(), msgs.clone(), cx);
                 });
             }
             drop(sub);
 
-            Ok(final_text)
+            // Persist the sub-agent conversation inside the tool result so the
+            // expandable panel survives a reload (the in-memory snapshot map is
+            // lost on restart). The `final` field is what the parent model reads;
+            // `messages` is the full child conversation for UI reconstruction.
+            let payload = serde_json::json!({ "final": final_text, "messages": msgs });
+            Ok(payload.to_string())
         })
     }
 }
@@ -192,7 +197,16 @@ fn setup_child(
     }
 
     let model = resolve_model(&def.model, parent, cx)?;
-    let permission = Arc::new(PermissionCache::default());
+    // Seed the sub-agent's permission cache with the parent's always-allow
+    // grants: a tool the user already "always allows" for the parent should not
+    // re-prompt inside the sub-agent. The child cache is still independent, so
+    // new grants the user gives inside the sub-agent do not leak back to the
+    // parent (they route to the child via the bubbled composite id).
+    let parent_snapshot = parent
+        .upgrade()
+        .map(|p| p.read_with(cx, |t, _| t.permission_snapshot()))
+        .unwrap_or_default();
+    let permission = Arc::new(PermissionCache::from_snapshot(parent_snapshot));
     let max_turns = def.max_turns.unwrap_or(10);
     let system_prompt = def_file.system_prompt.clone();
     let cwd_path = cwd.as_ref().clone();

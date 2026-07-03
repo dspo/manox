@@ -82,8 +82,12 @@ pub struct Workspace {
     editor_preview: bool,
     /// Editor pane width, driven by dragging the divider. In-memory only.
     editor_width: Pixels,
-    pending_auth: Option<PendingAuth>,
-    /// A pending `AskUserQuestion` card; takes precedence over `pending_auth`
+    /// Pending tool-call authorizations, keyed by their (possibly composite)
+    /// id. Multiple can be open at once when parallel sub-agents each bubble an
+    /// approval request — the overlay shows the most recent and queues the rest,
+    /// resolving them one at a time so no `oneshot` is stranded by overwrite.
+    pending_auths: Vec<PendingAuth>,
+    /// A pending `AskUserQuestion` card; takes precedence over `pending_auths`
     /// in the overlay slot. `None` unless the latest authorization is an
     /// `AskUserQuestion` call.
     pending_ask: Option<PendingAsk>,
@@ -177,7 +181,7 @@ impl Workspace {
             editor_open: false,
             editor_preview: false,
             editor_width: px(EDITOR_PANEL_WIDTH),
-            pending_auth: None,
+            pending_auths: Vec::new(),
             pending_ask: None,
             model_open: false,
             model_menu: None,
@@ -219,7 +223,7 @@ impl Workspace {
                     if tool_name == "AskUserQuestion" {
                         this.pending_ask = parse_pending_ask(id.clone(), input.clone());
                     }
-                    this.pending_auth = Some(PendingAuth {
+                    this.pending_auths.push(PendingAuth {
                         id: id.clone(),
                         tool_name: tool_name.clone(),
                         summary: summary.clone(),
@@ -350,7 +354,8 @@ impl Workspace {
         let id = self.thread.read(cx).id.0.clone();
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
         self.conversation = ConversationState::rebuild_from_messages(&messages);
-        self.pending_auth = None;
+        self.pending_auths.clear();
+        self.pending_ask = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id), cx));
@@ -542,17 +547,30 @@ impl Workspace {
     }
 
     fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
-        self.pending_ask = None;
-        if let Some(auth) = self.pending_auth.take() {
-            self.thread.update(cx, |thread, cx| {
-                thread.respond_authorization(
-                    &auth.id,
-                    agent::ToolAuthorizationResponse::Decision(decision),
-                    cx,
-                );
-            });
-            cx.notify();
+        // When an AskUserQuestion card is open its "取消" button calls this; the
+        // generic approval overlay is suppressed while a card is open, so the
+        // card is the only caller in that state. Resolve the card's specific id
+        // rather than the queue tail, so a non-ask auth queued behind the card
+        // is not accidentally dismissed.
+        let id = match self.pending_ask.as_ref() {
+            Some(ask) => ask.id.clone(),
+            None => match self.pending_auths.last() {
+                Some(a) => a.id.clone(),
+                None => return,
+            },
+        };
+        self.pending_auths.retain(|a| a.id != id);
+        if self.pending_ask.as_ref().is_some_and(|a| a.id == id) {
+            self.pending_ask = None;
         }
+        self.thread.update(cx, |thread, cx| {
+            thread.respond_authorization(
+                &id,
+                agent::ToolAuthorizationResponse::Decision(decision),
+                cx,
+            );
+        });
+        cx.notify();
     }
 
     /// Allocate the per-question `InputState` entities for the pending ask card
@@ -627,7 +645,10 @@ impl Workspace {
             answers.push((q.question.clone(), answer));
         }
         let id = ask.id.clone();
-        self.pending_auth = None;
+        // Remove the matching entry from the pending-auth queue (it was pushed
+        // alongside the ask card) so it doesn't resurface after the ask resolves.
+        self.pending_auths.retain(|a| a.id != id);
+        self.pending_ask = None;
         self.thread.update(cx, |thread, cx| {
             thread.respond_authorization(
                 &id,
@@ -655,9 +676,12 @@ impl Workspace {
         if self.pending_ask.is_some() {
             return None;
         }
-        let auth = self.pending_auth.as_ref()?;
+        let auth = self.pending_auths.last()?;
         let summary = auth.summary.clone();
         let tool_name = auth.tool_name.clone();
+        // When several auths are queued behind the visible one, signal that
+        // dismissing this card will surface the next.
+        let queued = self.pending_auths.len().saturating_sub(1);
 
         Some(
             gpui::div()
@@ -696,6 +720,16 @@ impl Workspace {
                                 .text_color(theme.muted_foreground)
                                 .child(format!("工具：{tool_name}")),
                         )
+                        .children(if queued > 0 {
+                            Some(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("（队列中还有 {queued} 个待审批）")),
+                            )
+                        } else {
+                            None
+                        })
                         .child(
                             gpui::div()
                                 .p_2()

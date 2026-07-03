@@ -59,4 +59,20 @@ impl PermissionCache {
             .expect("always_allow poisoned")
             .clear();
     }
+
+    /// Snapshot of the always-allow set, for seeding a sub-agent's cache.
+    pub fn allowed_tools(&self) -> HashSet<String> {
+        self.always_allow
+            .lock()
+            .expect("always_allow poisoned")
+            .clone()
+    }
+
+    /// Construct a cache pre-seeded with an always-allow snapshot (e.g. a
+    /// sub-agent inheriting its parent's grants).
+    pub fn from_snapshot(tools: HashSet<String>) -> Self {
+        Self {
+            always_allow: Mutex::new(tools),
+        }
+    }
 }

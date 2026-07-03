@@ -112,6 +112,10 @@ pub struct Thread {
     max_turns: Option<u32>,
     /// Completed round-trips in the current turn, for `max_turns` enforcement.
     turn_count: u32,
+    /// Whether the max-turns summary turn has already been injected. The cap is
+    /// allowed one extra round-trip so the sub-agent can produce a coherent
+    /// final message instead of ending mid-work; a second cap hit hard-stops.
+    cap_summary_injected: bool,
     /// The running turn task; dropping it aborts the turn.
     running_turn: Option<Task<()>>,
     /// Cancellation token for the running turn. Cancelled by `cancel()` so the
@@ -152,6 +156,7 @@ impl Thread {
                 depth: 0,
                 max_turns: None,
                 turn_count: 0,
+                cap_summary_injected: false,
                 running_turn: None,
                 turn_cancel: None,
             }
@@ -183,6 +188,7 @@ impl Thread {
                 depth: 0,
                 max_turns: None,
                 turn_count: 0,
+                cap_summary_injected: false,
                 running_turn: None,
                 turn_cancel: None,
             }
@@ -221,6 +227,7 @@ impl Thread {
                 depth,
                 max_turns: Some(max_turns),
                 turn_count: 0,
+                cap_summary_injected: false,
                 running_turn: None,
                 turn_cancel: None,
             }
@@ -336,6 +343,13 @@ impl Thread {
 
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// Snapshot of this Thread's always-allow set, for seeding a sub-agent's
+    /// permission cache so the child does not re-prompt grants the user already
+    /// gave the parent for the same tool.
+    pub fn permission_snapshot(&self) -> std::collections::HashSet<String> {
+        self.permission.allowed_tools()
     }
 
     pub fn model(&self) -> Option<&AnyLanguageModel> {
@@ -562,12 +576,25 @@ impl Thread {
             }
 
             // Sub-agent turn cap: stop runaway sub-agents after `max_turns` round-trips.
+            // The first hit injects one summary turn so the sub-agent can wrap up
+            // with a coherent final message instead of ending mid-work; a second
+            // hit (the summary turn itself overflowed) hard-stops.
             let hit_cap = this.update(cx, |this, cx| {
                 this.turn_count += 1;
-                let capped = this
-                    .max_turns
-                    .map(|m| this.turn_count >= m)
-                    .unwrap_or(false);
+                let Some(max) = this.max_turns else {
+                    return false;
+                };
+                let capped = this.turn_count >= max;
+                if capped && !this.cap_summary_injected {
+                    this.cap_summary_injected = true;
+                    this.insert_user_message(
+                        format!(
+                            "你已达到最大轮次 {max}。请基于上述已完成的工作，给出一个简洁的最终总结，不要再调用任何工具。"
+                        ),
+                        cx,
+                    );
+                    return false;
+                }
                 if capped {
                     cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
                 }

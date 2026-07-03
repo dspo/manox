@@ -5,9 +5,10 @@
 //! thinking, and tool content (reusing `MessageContent`).
 
 use crate::language_model::{MessageContent, Role};
+use serde::{Deserialize, Serialize};
 
 /// A single conversation message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<MessageContent>,

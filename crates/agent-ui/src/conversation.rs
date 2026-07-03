@@ -7,6 +7,33 @@
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::{Message, ThreadEvent, ToolCallStatus};
+use serde::Deserialize;
+
+/// Persisted `agent` tool-result envelope: the model-facing final text plus the
+/// full sub-agent conversation, so the expandable panel survives a reload.
+#[derive(Deserialize)]
+struct AgentToolResultPayload {
+    #[serde(rename = "final")]
+    final_text: String,
+    #[serde(default)]
+    messages: Vec<Message>,
+}
+
+/// The model-facing final text from an `agent` tool result. Parses the JSON
+/// envelope when present; falls back to the raw content for legacy or non-json
+/// results so a plain string result still renders.
+fn agent_final_text(content: &str) -> String {
+    serde_json::from_str::<AgentToolResultPayload>(content)
+        .map(|p| p.final_text)
+        .unwrap_or_else(|_| content.to_string())
+}
+
+/// The persisted sub-agent conversation, when the content is the JSON envelope.
+fn agent_sub_messages(content: &str) -> Option<Vec<Message>> {
+    serde_json::from_str::<AgentToolResultPayload>(content)
+        .ok()
+        .map(|p| p.messages)
+}
 
 /// A single renderable conversation item.
 #[derive(Debug, Clone)]
@@ -200,7 +227,11 @@ impl ConversationState {
                 };
                 if let Some(ix) = self.find_agent_task(id) {
                     if let Some(ConvItem::AgentTask(t)) = self.items.get_mut(ix) {
-                        t.final_text = output.clone();
+                        // The live event carries the JSON envelope; extract the
+                        // final text for the collapsed view. `sub_messages` is
+                        // filled separately from the in-memory snapshot by the
+                        // workspace, so don't touch it here.
+                        t.final_text = agent_final_text(output);
                         t.is_error = *is_error;
                         t.streaming = false;
                         t.status = status;
@@ -348,7 +379,10 @@ fn pair_tool_result(state: &mut ConversationState, tr: &LanguageModelToolResult)
     };
     if let Some(ix) = state.find_agent_task(&tr.tool_use_id) {
         if let Some(ConvItem::AgentTask(t)) = state.items.get_mut(ix) {
-            t.final_text = tr.content.clone();
+            // On reload the in-memory snapshot map is empty, so restore the
+            // sub-conversation from the persisted JSON envelope.
+            t.final_text = agent_final_text(&tr.content);
+            t.sub_messages = agent_sub_messages(&tr.content).unwrap_or_default();
             t.is_error = tr.is_error;
             t.status = status;
         }
@@ -455,5 +489,64 @@ mod tests {
         assert_eq!(tool.status, ToolCallStatus::Error);
         assert!(tool.is_error);
         assert_eq!(tool.name, "bash");
+    }
+
+    /// A reloaded `agent` tool call must restore both its final text and the
+    /// sub-conversation from the persisted JSON envelope (the in-memory snapshot
+    /// map is empty after restart, so the envelope is the only source).
+    #[test]
+    fn rebuild_restores_agent_sub_messages_from_envelope() {
+        let sub_messages = vec![
+            Message::user("research the foo module".to_string()),
+            Message::assistant(vec![MessageContent::Text("found 3 files".to_string())]),
+        ];
+        let envelope = serde_json::json!({
+            "final": "found 3 files",
+            "messages": sub_messages,
+        })
+        .to_string();
+        let messages = vec![
+            Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
+                id: "tu_agent".to_string(),
+                name: Arc::from("agent"),
+                raw_input: String::new(),
+                input: serde_json::json!({"subagent_type": "researcher", "prompt": "research foo"}),
+                is_input_complete: true,
+                thought_signature: None,
+            })]),
+            Message {
+                role: Role::User,
+                content: vec![MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "tu_agent".to_string(),
+                    tool_name: Arc::from("agent"),
+                    is_error: false,
+                    content: envelope,
+                })],
+            },
+        ];
+        let state = ConversationState::rebuild_from_messages(&messages);
+        let task = state
+            .items()
+            .iter()
+            .find_map(|i| match i {
+                ConvItem::AgentTask(t) if t.id == "tu_agent" => Some(t),
+                _ => None,
+            })
+            .expect("agent task item present");
+        assert_eq!(task.final_text, "found 3 files");
+        assert_eq!(task.sub_messages.len(), 2);
+        assert_eq!(task.sub_messages[1].content.len(), 1);
+    }
+
+    /// A legacy `agent` tool result (plain text, no JSON envelope) must still
+    /// render its final text without panicking.
+    #[test]
+    fn agent_final_text_falls_back_for_legacy_content() {
+        assert_eq!(
+            agent_final_text("just a plain summary"),
+            "just a plain summary"
+        );
+        assert_eq!(agent_final_text("not json { at all"), "not json { at all");
+        assert!(agent_sub_messages("plain text").is_none());
     }
 }
