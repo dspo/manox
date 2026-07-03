@@ -229,6 +229,10 @@ fn setup_child(
     let sink_cb = sink.clone();
     let parent_cb = parent.clone();
     let ptu_cb = ptu.to_string();
+    // Capture the sub-agent type so bubbled authorization prompts can be
+    // prefixed with it — otherwise two parallel sub-agents each running bash
+    // produce identical "工具：bash" overlays the user can't tell apart.
+    let subagent_type_cb = def.name.clone();
     let child_weak = child.downgrade();
     let sub = cx.subscribe(
         &child,
@@ -249,6 +253,11 @@ fn setup_child(
                 input,
             } => {
                 let composite = format!("{ptu_cb}::{child_id}");
+                // Prefix the displayed summary with the sub-agent type so the
+                // user can tell which sub-agent a bubbled approval is for.
+                // `tool_name` is left untouched: the workspace keys
+                // AskUserQuestion rendering off it.
+                let prefixed = format!("[{}] {}", subagent_type_cb, summary);
                 if let Some(p) = parent_cb.upgrade() {
                     p.update(cx, |t, cx| {
                         t.register_child_auth(
@@ -256,7 +265,7 @@ fn setup_child(
                             child_weak.clone(),
                             child_id.clone(),
                             tool_name.clone(),
-                            summary.clone(),
+                            prefixed,
                             input.clone(),
                             cx,
                         );
