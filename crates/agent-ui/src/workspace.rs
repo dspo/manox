@@ -98,6 +98,10 @@ pub struct Workspace {
     slash_menu_sub: Option<Subscription>,
     /// Files picked via the `+` menu, not yet sent. Cleared on submit.
     pending_attachments: Vec<PendingAttachment>,
+    /// True while a native directory picker is open from the "Choose project" row.
+    /// Guards against the user submitting a message before the picker resolves
+    /// (which would make `set_project` a silent no-op once `messages` is non-empty).
+    project_picker_pending: bool,
     thread_sub: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
@@ -185,6 +189,7 @@ impl Workspace {
             slash_menu: None,
             slash_menu_sub: None,
             pending_attachments: Vec::new(),
+            project_picker_pending: false,
             thread_sub: None,
             sidebar_sub: None,
             input_sub: None,
@@ -369,7 +374,13 @@ impl Workspace {
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
-        if (text.trim().is_empty() && attachments.is_empty()) || self.thread.read(cx).is_running() {
+        if (text.trim().is_empty() && attachments.is_empty())
+            || self.thread.read(cx).is_running()
+            // Block submit while the project picker is open: setting the
+            // project after a message lands is a no-op (set_project guards on
+            // !messages.is_empty()), so the project would be silently dropped.
+            || self.project_picker_pending
+        {
             self.pending_attachments = attachments;
             return;
         }
@@ -1076,12 +1087,7 @@ impl Workspace {
             .gap_1()
             .px_2()
             .py_1()
-            .child(
-                gpui::div()
-                    .size(px(6.))
-                    .rounded_full()
-                    .bg(gpui::rgb(0x22c55e)),
-            )
+            .child(gpui::div().size(px(6.)).rounded_full().bg(theme.success))
             .child(
                 gpui::div()
                     .text_xs()
@@ -1180,6 +1186,10 @@ impl Workspace {
     /// as its project. Tools then resolve paths against it. Offered only on the
     /// empty first screen; `set_project` no-ops once the conversation has started.
     fn choose_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_picker_pending {
+            return;
+        }
+        self.project_picker_pending = true;
         let dir = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
             directories: true,
@@ -1187,15 +1197,17 @@ impl Workspace {
             prompt: None,
         });
         cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = dir.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                this.update(cx, |this, cx| {
+            let result = dir.await;
+            this.update(cx, |this, cx| {
+                this.project_picker_pending = false;
+                if let Ok(Ok(Some(paths))) = result
+                    && let Some(path) = paths.into_iter().next()
+                {
                     this.thread.update(cx, |t, cx| t.set_project(path, cx));
-                    cx.notify();
-                })
-                .ok();
-            }
+                }
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
