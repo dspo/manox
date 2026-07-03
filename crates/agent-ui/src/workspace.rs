@@ -8,18 +8,17 @@
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use agent::language_model::StopReason;
 use agent::provider::config::WireApi;
 use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{
-    AnyElement, Context, DismissEvent, Entity, Render, Subscription, Window, prelude::*, px,
+    AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity, MouseButton,
+    MouseUpEvent, Pixels, Render, Subscription, Window, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, TitleBar,
-    animation::{Transition, ease_in_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -52,6 +51,8 @@ pub struct Workspace {
     editor_state: Entity<InputState>,
     editor_open: bool,
     editor_preview: bool,
+    /// Editor pane width, driven by dragging the divider. In-memory only.
+    editor_width: Pixels,
     pending_auth: Option<PendingAuth>,
     model_open: bool,
     /// PopupMenu entity for the open model selector; created on open, destroyed on close.
@@ -66,6 +67,18 @@ pub struct Workspace {
 /// Right-side composer width. Wide enough for rendered markdown
 /// (headings, lists, code blocks) alongside the 1100px window.
 const EDITOR_PANEL_WIDTH: f32 = 640.;
+const EDITOR_MIN_WIDTH: f32 = 320.;
+const EDITOR_MAX_WIDTH: f32 = 960.;
+
+/// Drag payload for the editor pane divider. Doubles as the invisible drag
+/// ghost view, mirroring Zed's `DraggedDock` pattern.
+struct DraggedEditorDivider;
+
+impl Render for DraggedEditorDivider {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -102,6 +115,7 @@ impl Workspace {
             editor_state,
             editor_open: false,
             editor_preview: false,
+            editor_width: px(EDITOR_PANEL_WIDTH),
             pending_auth: None,
             model_open: false,
             model_menu: None,
@@ -673,16 +687,44 @@ impl Render for Workspace {
 
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
-        // Inner panel keeps a fixed width so content never reflows mid-slide;
-        // the wrapper clips it while animating toward 0. No chrome on the
-        // panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P toggles preview —
-        // all keyboard-driven per the no-button constraint.
-        let editor_inner = v_flex()
-            .w(px(EDITOR_PANEL_WIDTH))
+        let editor_width = self.editor_width;
+        // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
+        // toggles preview — all keyboard-driven per the no-button constraint.
+        // The divider is the visual separator and the drag handle for resizing.
+        let editor_divider = gpui::div()
+            .id("editor-divider")
+            .w(px(6.))
             .h_full()
             .flex_shrink_0()
-            .border_l_1()
-            .border_color(theme.border)
+            .relative()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .child(
+                gpui::div()
+                    .absolute()
+                    .left(px(2.5))
+                    .w(px(1.))
+                    .h_full()
+                    .bg(theme.border),
+            )
+            .on_drag(DraggedEditorDivider, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| DraggedEditorDivider)
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    // Double-click resets the pane to its default width.
+                    if e.click_count >= 2 {
+                        this.editor_width = px(EDITOR_PANEL_WIDTH);
+                        cx.notify();
+                    }
+                }),
+            );
+        let editor_pane = v_flex()
+            .w(editor_width)
+            .h_full()
+            .flex_shrink_0()
             .bg(theme.background)
             .child(if editor_preview {
                 TextView::markdown(
@@ -696,28 +738,6 @@ impl Render for Workspace {
             } else {
                 Input::new(&self.editor_state).h_full().into_any_element()
             });
-
-        // Slide the wrapper width between 0 and the panel width. Encoding the
-        // open state into the animation id makes each toggle start a fresh
-        // animation whose from-value matches the previous to-value, so there
-        // is no jump on reversal.
-        let (from_w, to_w) = if editor_open {
-            (px(0.), px(EDITOR_PANEL_WIDTH))
-        } else {
-            (px(EDITOR_PANEL_WIDTH), px(0.))
-        };
-        let editor_panel = Transition::new(Duration::from_millis(200))
-            .ease(ease_in_out_cubic)
-            .width(from_w, to_w)
-            .apply(
-                h_flex()
-                    .h_full()
-                    .flex_shrink_0()
-                    .overflow_hidden()
-                    .child(editor_inner),
-                ("editor-panel", editor_open as usize),
-            )
-            .into_any_element();
 
         h_flex()
             .size_full()
@@ -780,6 +800,17 @@ impl Render for Workspace {
                     // Approval overlay (if any)
                     .children(overlay),
             )
-            .child(editor_panel)
+            .when(editor_open, |this| {
+                this.child(editor_divider).child(editor_pane)
+            })
+            .on_drag_move(cx.listener(
+                |this, e: &DragMoveEvent<DraggedEditorDivider>, _window, cx| {
+                    // The editor pane hugs the window's right edge, so its width
+                    // is the distance from the cursor to the root's right edge.
+                    let new_w = e.bounds.right() - e.event.position.x;
+                    this.editor_width = new_w.clamp(px(EDITOR_MIN_WIDTH), px(EDITOR_MAX_WIDTH));
+                    cx.notify();
+                },
+            ))
     }
 }
