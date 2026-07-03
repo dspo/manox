@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::language_model::LanguageModelRequestTool;
 
-pub use permission::{PermissionCache, PermissionDecision};
+pub use permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
 
 /// Cloneable handle for live tool output. Tools that stream (e.g. `bash`)
 /// call [`ToolOutputSink::try_emit`] per output chunk; the owning `Thread`

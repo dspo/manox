@@ -9,6 +9,7 @@
 //! requiring approval (write_file / edit_file / bash) override `requires_approval`
 //! to return true.
 
+pub mod ask_user;
 pub mod bash;
 
 use globset::{Glob, GlobSetBuilder};
@@ -557,7 +558,7 @@ impl AgentTool for GlobTool {
 
 // ─── Default registry ─────────────────────────────────────────────────────
 
-/// Build a `ToolRegistry` with the 7 built-in tools; `cwd` is the relative root for each tool.
+/// Build a `ToolRegistry` with the built-in tools; `cwd` is the relative root for each tool.
 pub fn default_registry(cwd: PathBuf) -> ToolRegistry {
     let cwd = Arc::new(cwd);
     let mut reg = ToolRegistry::new();
@@ -568,6 +569,7 @@ pub fn default_registry(cwd: PathBuf) -> ToolRegistry {
     reg.register(std::sync::Arc::new(bash::BashTool::new(cwd.as_ref().clone())) as AnyAgentTool);
     reg.register(std::sync::Arc::new(GrepTool { cwd: cwd.clone() }) as AnyAgentTool);
     reg.register(std::sync::Arc::new(GlobTool { cwd }) as AnyAgentTool);
+    reg.register(std::sync::Arc::new(ask_user::AskUserQuestionTool) as AnyAgentTool);
     reg
 }
 
@@ -576,10 +578,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_registry_has_seven_tools() {
+    fn default_registry_has_eight_tools() {
         let reg = default_registry(PathBuf::from("."));
         let tools = reg.to_request_tools();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
@@ -588,6 +590,7 @@ mod tests {
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"glob"));
+        assert!(names.contains(&"AskUserQuestion"));
     }
 
     #[test]

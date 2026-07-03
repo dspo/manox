@@ -72,9 +72,9 @@ crates/
   - `sse.rs` — 通用 SSE 行解析（`data:` 前缀剥离）。
   - `api_key.rs` — 支持 `keychain:SERVICE` / `env:VAR` / `literal:...` / `$(shell ...)` 四种源。
 
-- `tool.rs` + `tool/permission.rs` — `AgentTool` trait + `ToolRegistry` + `PermissionCache`（会话级 always-allow），`PermissionDecision::AllowOnce | AlwaysAllow | Deny`。
+- `tool.rs` + `tool/permission.rs` — `AgentTool` trait + `ToolRegistry` + `PermissionCache`（会话级 always-allow），`PermissionDecision::AllowOnce | AlwaysAllow | Deny`，`ToolAuthorizationResponse`（审批载荷：`Decision(PermissionDecision)` 或 `AskUserQuestion { answers, response }`，后者由 thread 短路为 ToolResult，不经 `run` 执行）。
 
-- `tools/` — 7 个内置工具：`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`。写操作（write_file/edit_file）和 bash 需审批。bash/grep 经 tokio 子进程 + `async_channel` 桥回 gpui Task。
+- `tools/` — 8 个内置工具：`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`、`ask_user`（`AskUserQuestion`，向用户提多选澄清问题）。写操作（write_file/edit_file）、bash 与 `AskUserQuestion` 需审批。bash/grep 经 tokio 子进程 + `async_channel` 桥回 gpui Task。
 
 - `runtime.rs` — 全局 tokio runtime（`OnceLock<Handle>`），`init` 时 build 并 forget，`handle()` 取全局 Handle。供 provider 在 gpui executor 上 spawn tokio 任务跑 HTTP 流。
 
@@ -82,7 +82,7 @@ crates/
 
 - `thread_store.rs` — `ThreadStore` 进程全局 Entity（`OnceLock`），管理 Thread 摘要列表，提供 `save_thread` 异步落盘 + refresh。
 
-**Thread 审批流：** 工具需审批时，`run_tool` 发 `ThreadEvent::ToolCallAuthorization` 携带 `oneshot::Sender`，UI 弹窗后调用 `Thread::respond_authorization` 回传 `PermissionDecision`，task 在 gpui executor 上 `await` oneshot receiver。
+**Thread 审批流：** 工具需审批时，`run_tool` 发 `ThreadEvent::ToolCallAuthorization` 携带 `oneshot::Sender`，UI 弹窗后调用 `Thread::respond_authorization` 回传 `ToolAuthorizationResponse`（普通工具为 `Decision(PermissionDecision)`，`AskUserQuestion` 为 `AskUserQuestion { answers, response }`，thread 据此短路生成 ToolResult 而不执行 `run`），task 在 gpui executor 上 `await` oneshot receiver。
 
 ### agent-ui crate（`crates/agent-ui/`）
 

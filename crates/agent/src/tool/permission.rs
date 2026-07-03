@@ -16,6 +16,22 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// Payload the UI sends back through the authorization oneshot. Either a
+/// traditional allow/deny decision, or — for `AskUserQuestion` — the answers
+/// collected from the user, which the thread short-circuits into a `ToolResult`
+/// without ever executing the tool.
+#[derive(Debug)]
+pub enum ToolAuthorizationResponse {
+    Decision(PermissionDecision),
+    AskUserQuestion {
+        /// (question text, selected labels joined by ", " or free-form "Other" text).
+        answers: Vec<(String, String)>,
+        /// Free-form reply that dismisses the whole question card; when set,
+        /// `answers` is ignored.
+        response: Option<String>,
+    },
+}
+
 /// Session-scoped permission cache (thread-safe).
 #[derive(Default)]
 pub struct PermissionCache {
