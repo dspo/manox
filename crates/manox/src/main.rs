@@ -3,7 +3,7 @@
 //! Only handles window, theme, and tracing init, and mounts `agent_ui::Workspace` in the window.
 //! Agent logic lives in the `agent` crate; UI lives in the `agent-ui` crate.
 
-use gpui::{App, AppContext as _, actions, px, size};
+use gpui::{App, AppContext as _, Menu, MenuItem, actions, px, size};
 use gpui::{WindowBounds, WindowOptions};
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 
@@ -52,6 +52,8 @@ fn main() {
             }
         });
 
+        cx.set_menus(build_app_menus());
+
         let window_options = WindowOptions {
             titlebar: Some(TitleBar::title_bar_options()),
             window_bounds: Some(WindowBounds::centered(size(px(1100.), px(760.)), cx)),
@@ -71,4 +73,15 @@ fn main() {
         })
         .detach();
     });
+}
+
+fn build_app_menus() -> Vec<Menu> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![Menu::new("manox").items([MenuItem::action("Quit", Quit)])]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![Menu::new("File").items([MenuItem::action("Quit", Quit)])]
+    }
 }
