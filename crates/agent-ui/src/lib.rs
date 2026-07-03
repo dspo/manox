@@ -10,4 +10,4 @@ pub mod workspace;
 pub use workspace::Workspace;
 
 // Open/close the right-side markdown composer.
-gpui::actions!(agent_ui, [ToggleEditor, ToggleEditorPreview]);
+gpui::actions!(agent_ui, [ToggleEditor, ToggleEditorPreview, CloseEditor]);

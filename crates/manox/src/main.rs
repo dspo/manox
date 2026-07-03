@@ -34,6 +34,11 @@ fn main() {
             gpui::KeyBinding::new("f11", ToggleFullscreen, None),
             // Ctrl-G opens the right-side markdown composer.
             gpui::KeyBinding::new("ctrl-g", agent_ui::ToggleEditor, None),
+            // Cmd/Ctrl-W closes the markdown composer and returns the draft to the inline input.
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-w", agent_ui::CloseEditor, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-w", agent_ui::CloseEditor, None),
             // Cmd/Ctrl-Shift-P toggles between plain-text edit and markdown preview.
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-shift-p", agent_ui::ToggleEditorPreview, None),

@@ -364,13 +364,50 @@ impl Workspace {
     }
 
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor_open = !self.editor_open;
-        if self.editor_open {
-            self.editor_preview = false;
-            self.editor_state.update(cx, |s, cx| s.focus(window, cx));
+        if !self.editor_open {
+            self.open_editor(window, cx);
         } else {
-            self.input_state.update(cx, |s, cx| s.focus(window, cx));
+            self.close_editor(window, cx);
         }
+    }
+
+    /// Open the markdown editor: hide the inline composer and transfer its draft
+    /// text into the editor so writing continues there. Submit from the editor
+    /// with Cmd-Enter; close with Ctrl-G / Cmd-W to move the draft back.
+    fn open_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_open {
+            return;
+        }
+        // Close any open inline menus so they don't linger behind the hidden footer.
+        self.close_slash_menu();
+        self.close_plus_menu();
+        let draft = self.input_state.read(cx).value().to_string();
+        self.editor_open = true;
+        self.editor_preview = false;
+        self.editor_state.update(cx, |s, cx| {
+            s.set_value(draft, window, cx);
+            s.focus(window, cx);
+        });
+        self.input_state
+            .update(cx, |s, cx| s.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Close the markdown editor without submitting: move the draft back into the
+    /// inline composer and reveal it again.
+    fn close_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editor_open {
+            return;
+        }
+        let draft = self.editor_state.read(cx).value().to_string();
+        self.editor_open = false;
+        self.editor_preview = false;
+        self.input_state.update(cx, |s, cx| {
+            s.set_value(draft, window, cx);
+            s.focus(window, cx);
+        });
+        self.editor_state
+            .update(cx, |s, cx| s.set_value("", window, cx));
         cx.notify();
     }
 
@@ -923,6 +960,24 @@ impl Render for Workspace {
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
         let editor_width = self.editor_width;
+        // The inline composer and the markdown editor are mutually exclusive: while
+        // the editor pane is open the footer is hidden and the draft lives in the
+        // editor (moved there on open, moved back on close).
+        let footer = if !editor_open {
+            Some(
+                v_flex()
+                    .w_full()
+                    .py_2()
+                    .gap_2()
+                    .relative()
+                    .children(self.render_slash_overlay())
+                    .children(self.render_attachments(&theme, cx))
+                    .child(centered(self.render_composer(running, &theme, cx)))
+                    .child(self.render_chip_row(&theme, cx)),
+            )
+        } else {
+            None
+        };
         // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
         // toggles preview — all keyboard-driven per the no-button constraint.
         // The divider is the visual separator and the drag handle for resizing.
@@ -1021,6 +1076,9 @@ impl Render for Workspace {
                     this.toggle_editor_preview(window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &crate::CloseEditor, window, cx| {
+                this.close_editor(window, cx);
+            }))
             // Left sidebar
             .child(self.sidebar.clone())
             // Main column
@@ -1059,18 +1117,9 @@ impl Render for Workspace {
                     // the footer can render on top of it without z-order issues).
                     .child(gpui::div().w_full().h(px(1.)).bg(theme.border))
                     // Input area: pending attachments + composer + chip row, with the slash
-                    // menu overlaid above the composer.
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .py_2()
-                            .gap_2()
-                            .relative()
-                            .children(self.render_slash_overlay())
-                            .children(self.render_attachments(&theme, cx))
-                            .child(centered(self.render_composer(running, &theme, cx)))
-                            .child(self.render_chip_row(&theme, cx)),
-                    )
+                    // menu overlaid above the composer. Hidden while the markdown editor pane
+                    // is open — the draft is moved into the editor on open and back on close.
+                    .children(footer)
                     // Approval overlay (if any)
                     .children(overlay),
             )
