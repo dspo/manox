@@ -217,6 +217,16 @@ impl Thread {
         cx.notify();
     }
 
+    /// Append a user message carrying multiple content blocks (e.g. text plus attached images).
+    pub fn insert_user_message_with_content(
+        &mut self,
+        content: Vec<MessageContent>,
+        cx: &mut Context<Self>,
+    ) {
+        self.messages.push(Message::user_with_content(content));
+        cx.notify();
+    }
+
     /// Start a completion turn. No-ops when a turn is already running or there is no model.
     pub fn run_turn(&mut self, cx: &mut Context<Self>) {
         if self.running_turn.is_some() {

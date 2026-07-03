@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+base64.workspace = true
 chrono.workspace = true
 futures.workspace = true
 serde.workspace = true

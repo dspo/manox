@@ -1,5 +1,6 @@
 //! View rendering layer for the conversation.
 
+pub mod composer_menu;
 pub mod message;
 pub mod sidebar;
 

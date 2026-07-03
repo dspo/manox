@@ -228,6 +228,7 @@ fn messages_to_openai(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
         let mut text_buf = String::new();
         let mut tool_uses: Vec<&crate::language_model::LanguageModelToolUse> = Vec::new();
         let mut tool_results: Vec<&crate::language_model::LanguageModelToolResult> = Vec::new();
+        let mut images: Vec<(&str, &str)> = Vec::new();
 
         for c in &m.content {
             match c {
@@ -235,14 +236,16 @@ fn messages_to_openai(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
                 MessageContent::Thinking { text, .. } => text_buf.push_str(text),
                 MessageContent::ToolUse(tu) => tool_uses.push(tu),
                 MessageContent::ToolResult(tr) => tool_results.push(tr),
+                MessageContent::Image { data, mime_type } => images.push((data, mime_type)),
             }
         }
 
         let has_text = !text_buf.trim().is_empty();
         let has_tool_uses = !tool_uses.is_empty();
         let has_tool_results = !tool_results.is_empty();
+        let has_images = !images.is_empty();
 
-        if !has_text && !has_tool_uses && !has_tool_results {
+        if !has_text && !has_tool_uses && !has_tool_results && !has_images {
             continue;
         }
 
@@ -251,7 +254,21 @@ fn messages_to_openai(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
                 out.push(json!({"role": "system", "content": text_buf}));
             }
             Role::User => {
-                if has_text {
+                if has_images {
+                    // Multimodal user turn: `content` becomes a parts array mixing
+                    // one text part (if any) with `image_url` parts as data URLs.
+                    let mut parts: Vec<Value> = Vec::new();
+                    if has_text {
+                        parts.push(json!({"type": "text", "text": text_buf}));
+                    }
+                    for (data, mime) in &images {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{mime};base64,{data}")},
+                        }));
+                    }
+                    out.push(json!({"role": "user", "content": parts}));
+                } else if has_text {
                     out.push(json!({"role": "user", "content": text_buf}));
                 }
                 for tr in tool_results {

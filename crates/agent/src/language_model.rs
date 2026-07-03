@@ -21,13 +21,19 @@ pub enum Role {
     System,
 }
 
-/// A single message content block. The first version carries only Text / Thinking / ToolUse / ToolResult.
+/// A single message content block: text, thinking, an image, or a tool call/result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MessageContent {
     Text(String),
     Thinking {
         text: String,
         signature: Option<String>,
+    },
+    /// An inline image carried as base64-encoded bytes plus its MIME type, sent to
+    /// providers that accept multimodal content blocks.
+    Image {
+        data: String,
+        mime_type: String,
     },
     ToolUse(LanguageModelToolUse),
     ToolResult(LanguageModelToolResult),
@@ -39,7 +45,7 @@ impl MessageContent {
             Self::Text(text) => Some(text.as_str()),
             Self::Thinking { text, .. } => Some(text.as_str()),
             Self::ToolResult(result) => Some(result.content.as_str()),
-            Self::ToolUse(_) => None,
+            Self::Image { .. } | Self::ToolUse(_) => None,
         }
     }
 
@@ -47,6 +53,7 @@ impl MessageContent {
         match self {
             Self::Text(text) | Self::Thinking { text, .. } => text.chars().all(|c| c.is_whitespace()),
             Self::ToolResult(result) => result.content.chars().all(|c| c.is_whitespace()),
+            Self::Image { data, .. } => data.is_empty(),
             Self::ToolUse(_) => false,
         }
     }

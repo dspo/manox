@@ -250,6 +250,7 @@ impl ConversationState {
                                 // but pair them here too if they ever appear in an assistant turn.
                                 pair_tool_result(&mut state, tr);
                             }
+                            MessageContent::Image { .. } => {}
                         }
                     }
                 }
