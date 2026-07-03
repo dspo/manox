@@ -517,10 +517,10 @@ impl Thread {
                 }
             }
 
-            // Approval-needed tools run one at a time; a cancelled turn skips
-            // the rest (they are synthesized below).
+            // Approval-needed tools run one at a time; a cancelled turn or a
+            // sibling error skips the rest (they are synthesized below).
             for tu in approval_tus {
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() || first_err.is_some() {
                     break;
                 }
                 let tu_id = tu.id.clone();
