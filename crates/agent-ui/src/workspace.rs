@@ -105,7 +105,8 @@ impl Workspace {
             InputState::new(window, cx)
                 .code_editor("markdown")
                 .line_number(true)
-                .folding(true)
+                .folding(false)
+                .soft_wrap(false)
                 .submit_on_enter(false)
                 .placeholder("编写 markdown…（Cmd-Enter 发送）")
         });
@@ -520,14 +521,19 @@ impl Render for Workspace {
                     .min_h_0()
                     .h_full()
                     .child(if editor_preview {
-                        TextView::markdown(
-                            "editor-preview",
-                            self.editor_state.read(cx).value().to_string(),
-                        )
-                        .selectable(true)
-                        .scrollable(true)
-                        .h_full()
-                        .into_any_element()
+                        v_flex()
+                            .h_full()
+                            .p_4()
+                            .child(
+                                TextView::markdown(
+                                    "editor-preview",
+                                    self.editor_state.read(cx).value().to_string(),
+                                )
+                                .selectable(true)
+                                .scrollable(true)
+                                .h_full(),
+                            )
+                            .into_any_element()
                     } else {
                         Input::new(&self.editor_state)
                             .h_full()
