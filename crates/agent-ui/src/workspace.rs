@@ -15,7 +15,8 @@ use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{
     AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity, MouseButton,
-    MouseUpEvent, Pixels, Render, Subscription, Window, prelude::*, px,
+    MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, Subscription, Window,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -74,6 +75,13 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
+    /// Tracked scroll position of the message list; used to auto-scroll to the
+    /// latest message while the user is parked at the bottom and to leave them
+    /// alone when they've scrolled up to read history.
+    scroll_handle: ScrollHandle,
+    /// Whether new content should keep the viewport pinned to the bottom.
+    /// Reset to `false` by manual user scrolls that move the viewport away.
+    stick_to_bottom: bool,
 }
 
 /// Right-side composer width. Wide enough for rendered markdown
@@ -153,6 +161,8 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
+            scroll_handle: ScrollHandle::new(),
+            stick_to_bottom: true,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
@@ -182,6 +192,9 @@ impl Workspace {
                 }
                 ThreadEvent::Stop(reason) => {
                     this.conversation.apply(ev);
+                    if this.stick_to_bottom {
+                        this.scroll_handle.scroll_to_bottom();
+                    }
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
                         save_thread(this.thread.clone(), cx);
@@ -189,11 +202,32 @@ impl Workspace {
                     cx.notify();
                 }
                 _ => {
+                    // Capture stick state before mutating the list: a user at the
+                    // bottom should stay glued there as new tokens stream in. If
+                    // they've scrolled up, we leave their viewport alone.
+                    let was_at_bottom =
+                        this.stick_to_bottom || Self::is_at_bottom(&this.scroll_handle);
                     this.conversation.apply(ev);
+                    this.stick_to_bottom = was_at_bottom;
+                    if was_at_bottom {
+                        this.scroll_handle.scroll_to_bottom();
+                    }
                     cx.notify();
                 }
             }
         })
+    }
+
+    /// True if the message list is parked at the bottom within `STICK_THRESHOLD`
+    /// pixels. Uses the cached `stick_to_bottom` flag as a fast path: if we
+    /// already know the user wanted to follow along, don't second-guess them.
+    fn is_at_bottom(handle: &ScrollHandle) -> bool {
+        const STICK_THRESHOLD: f32 = 32.;
+        let max = handle.max_offset();
+        if max.y <= px(0.) {
+            return true;
+        }
+        handle.offset().y >= max.y - px(STICK_THRESHOLD)
     }
 
     fn subscribe_sidebar(&self, cx: &mut Context<Self>) -> Subscription {
@@ -1105,7 +1139,11 @@ impl Render for Workspace {
                             )
                             .child(h_flex()),
                     )
-                    // Message list (centered, width-capped, scrollable)
+                    // Message list (centered, width-capped, scrollable).
+                    // `track_scroll` lets us read offset/max and call `scroll_to_bottom`
+                    // from event handlers. `on_scroll_wheel` reacts to manual scrolls:
+                    // if the user drags the viewport away from the bottom, disengage
+                    // auto-follow until they scroll back down.
                     .child(
                         v_flex()
                             .id("messages")
@@ -1113,6 +1151,33 @@ impl Render for Workspace {
                             .py_5()
                             .gap_5()
                             .overflow_y_scroll()
+                            .track_scroll(&self.scroll_handle)
+                            .on_scroll_wheel(cx.listener(
+                                |this, ev: &ScrollWheelEvent, _window, _cx| {
+                                    let line_height = px(20.);
+                                    let dy = ev.delta.pixel_delta(line_height).y;
+                                    if dy < px(0.) {
+                                        // User wheeled up (away from bottom):
+                                        // stop following. The check runs before
+                                        // gpui's internal scroll handler applies
+                                        // the offset, so the offset we read here
+                                        // is still the pre-scroll value; treating
+                                        // upward intent as "leave" keeps the user
+                                        // from being yanked back by the next
+                                        // content delta.
+                                        this.stick_to_bottom = false;
+                                    } else if Self::is_at_bottom(&this.scroll_handle) {
+                                        // Wheeled down or stationary; re-engage
+                                        // only when the viewport is parked at the
+                                        // bottom within `STICK_THRESHOLD`.
+                                        this.stick_to_bottom = true;
+                                    }
+                                    // Wheel-down while not at bottom is just the
+                                    // user scrolling through history; leave the
+                                    // flag alone so re-engagement happens the
+                                    // moment they reach the bottom.
+                                },
+                            ))
                             .children(items.into_iter().map(centered)),
                     )
                     // Separator line (standalone div so the PopupMenu inside
