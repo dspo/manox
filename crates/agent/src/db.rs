@@ -170,11 +170,12 @@ impl ThreadsDatabase {
     }
 }
 
-/// Default db path: `$HOME/.config/manox/threads.db`.
+/// Default db path: `$HOME/.config/cx/manox/threads.db`.
 pub fn default_db_path() -> Result<std::path::PathBuf> {
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME 环境变量未设置"))?;
     Ok(std::path::PathBuf::from(home)
         .join(".config")
+        .join("cx")
         .join("manox")
         .join("threads.db"))
 }

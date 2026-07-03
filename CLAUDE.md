@@ -78,7 +78,7 @@ crates/
 
 - `runtime.rs` — 全局 tokio runtime（`OnceLock<Handle>`），`init` 时 build 并 forget，`handle()` 取全局 Handle。供 provider 在 gpui executor 上 spawn tokio 任务跑 HTTP 流。
 
-- `db.rs` — `ThreadsDatabase`（SQLite `threads` 表，路径 `$HOME/.config/manox/threads.db`），`Mutex<Connection>` 同步操作。
+- `db.rs` — `ThreadsDatabase`（SQLite `threads` 表，路径 `$HOME/.config/cx/manox/threads.db`），`Mutex<Connection>` 同步操作。
 
 - `thread_store.rs` — `ThreadStore` 进程全局 Entity（`OnceLock`），管理 Thread 摘要列表，提供 `save_thread` 异步落盘 + refresh。
 
@@ -135,7 +135,7 @@ crates/
 ## 运行时配置
 
 - LLM 配置：`~/.config/cx/cx.providers.config.yaml`（格式见 `provider/config.rs` 的 `CxConfig`）
-- SQLite 数据库：`~/.config/manox/threads.db`
+- SQLite 数据库：`~/.config/cx/manox/threads.db`
 - API key 源：macOS Keychain（`keychain:SERVICE`）、环境变量（`env:VAR`）、字面量（`literal:...`）、shell 命令（`$(shell ...)`）
 
 ## 项目规则
