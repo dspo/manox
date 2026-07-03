@@ -4,10 +4,12 @@
 //! gpui-native. The LLM connects directly to providers declared in
 //! `~/.config/cx/cx.providers.config.yaml`.
 
+pub mod agent_def;
 pub mod db;
 pub mod hashline;
 pub mod language_model;
 pub mod message;
+pub mod paths;
 pub mod provider;
 pub mod runtime;
 pub mod thread;
@@ -25,10 +27,11 @@ pub use tool::permission::{PermissionCache, PermissionDecision};
 pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};
 
 /// Register the tokio runtime + `ProviderRegistry` + `ThreadStore` + the
-/// hashline snapshot store. Call at App startup.
+/// hashline snapshot store + the subagent definition registry. Call at App startup.
 pub fn init(cx: &mut App) {
     runtime::init(cx);
     provider::registry::init(cx);
     thread_store::init(cx);
     hashline::init();
+    agent_def::init();
 }

@@ -7,6 +7,7 @@
 //!
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use agent::language_model::StopReason;
@@ -15,8 +16,8 @@ use agent::provider::registry;
 use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{
     AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent, Entity, MouseButton,
-    MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, Subscription, Window,
-    prelude::*, px,
+    MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, Subscription, Window, prelude::*,
+    px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -82,6 +83,9 @@ pub struct Workspace {
     /// Whether new content should keep the viewport pinned to the bottom.
     /// Reset to `false` by manual user scrolls that move the viewport away.
     stick_to_bottom: bool,
+    /// Sub-agent task ids whose cards are expanded to show the child
+    /// conversation. Toggled by clicking the card header.
+    pub(crate) expanded_tasks: HashSet<String>,
 }
 
 /// Right-side composer width. Wide enough for rendered markdown
@@ -163,6 +167,7 @@ impl Workspace {
             editor_sub: None,
             scroll_handle: ScrollHandle::new(),
             stick_to_bottom: true,
+            expanded_tasks: HashSet::new(),
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
@@ -208,6 +213,15 @@ impl Workspace {
                     let was_at_bottom =
                         this.stick_to_bottom || Self::is_at_bottom(&this.scroll_handle);
                     this.conversation.apply(ev);
+                    // After a sub-agent's tool result lands, feed its child-
+                    // conversation snapshot into the matching AgentTask card so
+                    // the expandable panel has the full sub-conversation.
+                    if let ThreadEvent::ToolResult { id, .. } = ev
+                        && let Some(msgs) =
+                            this.thread.read(cx).subagent_snapshots().get(id).cloned()
+                    {
+                        this.conversation.set_agent_sub_messages(id, msgs);
+                    }
                     this.stick_to_bottom = was_at_bottom;
                     if was_at_bottom {
                         this.scroll_handle.scroll_to_bottom();
@@ -982,12 +996,16 @@ impl Render for Workspace {
         let model_label = self.model_label(cx);
         let running = self.thread.read(cx).is_running();
 
+        let agent_ctx = crate::views::message::AgentTaskCtx {
+            expanded: self.expanded_tasks.clone(),
+            weak: cx.weak_entity(),
+        };
         let items: Vec<_> = self
             .conversation
             .items()
             .iter()
             .enumerate()
-            .map(|(ix, item)| render_item(item, ix, &model_label, &theme))
+            .map(|(ix, item)| render_item(item, ix, &model_label, &theme, &agent_ctx))
             .collect();
 
         let overlay = self.render_auth_overlay(&theme, cx);

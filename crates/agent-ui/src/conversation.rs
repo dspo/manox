@@ -15,6 +15,7 @@ pub enum ConvItem {
     Assistant { text: String, streaming: bool },
     Reasoning { text: String, streaming: bool },
     ToolCall(ToolCallItem),
+    AgentTask(AgentTaskItem),
     Error(String),
 }
 
@@ -30,6 +31,23 @@ pub struct ToolCallItem {
     /// True while live `ToolOutput` chunks are still streaming in; flipped to
     /// false once the final `ToolResult` lands the canonical output.
     pub streaming: bool,
+}
+
+/// A sub-agent (`agent` tool) invocation. The child `Thread`'s streamed text
+/// accumulates in `sub_text` for the collapsed live tail; the full child
+/// conversation lands in `sub_messages` (via the parent's snapshot) for the
+/// expandable panel. `final_text` is what the parent model received as the
+/// tool result.
+#[derive(Debug, Clone)]
+pub struct AgentTaskItem {
+    pub id: String,
+    pub title: String,
+    pub status: ToolCallStatus,
+    pub streaming: bool,
+    pub sub_text: String,
+    pub sub_messages: Vec<Message>,
+    pub final_text: String,
+    pub is_error: bool,
 }
 
 #[derive(Debug, Default)]
@@ -60,6 +78,24 @@ impl ConversationState {
             ConvItem::ToolCall(t) => t.id == id,
             _ => false,
         })
+    }
+
+    fn find_agent_task(&self, id: &str) -> Option<usize> {
+        self.items.iter().position(|item| match item {
+            ConvItem::AgentTask(t) => t.id == id,
+            _ => false,
+        })
+    }
+
+    /// Feed the child `Thread`'s full message list into the matching agent task,
+    /// populating the expandable sub-conversation panel. Called by `Workspace`
+    /// after the parent's `subagent_snapshots` is updated.
+    pub fn set_agent_sub_messages(&mut self, id: &str, messages: Vec<Message>) {
+        if let Some(ix) = self.find_agent_task(id)
+            && let Some(ConvItem::AgentTask(t)) = self.items.get_mut(ix)
+        {
+            t.sub_messages = messages;
+        }
     }
 
     /// Apply a `ThreadEvent` delta (excludes `ToolCallAuthorization`, which `Workspace` handles).
@@ -101,7 +137,27 @@ impl ConversationState {
                 title,
                 status,
             } => {
-                if let Some(ix) = self.find_tool(id) {
+                if name == "agent" {
+                    // Sub-agent invocations render as AgentTask cards, not plain
+                    // tool calls, so they get the expandable sub-conversation panel.
+                    if let Some(ix) = self.find_agent_task(id) {
+                        if let Some(ConvItem::AgentTask(t)) = self.items.get_mut(ix) {
+                            t.title = title.clone();
+                            t.status = *status;
+                        }
+                    } else {
+                        self.items.push(ConvItem::AgentTask(AgentTaskItem {
+                            id: id.clone(),
+                            title: title.clone(),
+                            status: *status,
+                            streaming: matches!(*status, ToolCallStatus::Running),
+                            sub_text: String::new(),
+                            sub_messages: Vec::new(),
+                            final_text: String::new(),
+                            is_error: false,
+                        }));
+                    }
+                } else if let Some(ix) = self.find_tool(id) {
                     if let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix) {
                         t.title = title.clone();
                         t.status = *status;
@@ -120,11 +176,16 @@ impl ConversationState {
                 }
             }
             ThreadEvent::ToolOutput { id, chunk } => {
-                if let Some(ix) = self.find_tool(id) {
-                    if let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix) {
-                        t.output.push_str(chunk);
+                if let Some(ix) = self.find_agent_task(id) {
+                    if let Some(ConvItem::AgentTask(t)) = self.items.get_mut(ix) {
+                        t.sub_text.push_str(chunk);
                         t.streaming = true;
                     }
+                } else if let Some(ix) = self.find_tool(id)
+                    && let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix)
+                {
+                    t.output.push_str(chunk);
+                    t.streaming = true;
                 }
             }
             ThreadEvent::ToolResult {
@@ -132,16 +193,24 @@ impl ConversationState {
                 output,
                 is_error,
             } => {
-                if let Some(ix) = self.find_tool(id) {
+                let status = if *is_error {
+                    ToolCallStatus::Error
+                } else {
+                    ToolCallStatus::Success
+                };
+                if let Some(ix) = self.find_agent_task(id) {
+                    if let Some(ConvItem::AgentTask(t)) = self.items.get_mut(ix) {
+                        t.final_text = output.clone();
+                        t.is_error = *is_error;
+                        t.streaming = false;
+                        t.status = status;
+                    }
+                } else if let Some(ix) = self.find_tool(id) {
                     if let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix) {
                         t.output = output.clone();
                         t.is_error = *is_error;
                         t.streaming = false;
-                        t.status = if *is_error {
-                            ToolCallStatus::Error
-                        } else {
-                            ToolCallStatus::Success
-                        };
+                        t.status = status;
                     }
                 } else {
                     // No matching ToolCall item; insert directly as a result item.
@@ -149,11 +218,7 @@ impl ConversationState {
                         id: id.clone(),
                         name: String::new(),
                         title: String::new(),
-                        status: if *is_error {
-                            ToolCallStatus::Error
-                        } else {
-                            ToolCallStatus::Success
-                        },
+                        status,
                         output: output.clone(),
                         is_error: *is_error,
                         streaming: false,
@@ -170,6 +235,8 @@ impl ConversationState {
                         | ConvItem::Reasoning { streaming, .. } => {
                             *streaming = false;
                         }
+                        ConvItem::ToolCall(t) => t.streaming = false,
+                        ConvItem::AgentTask(t) => t.streaming = false,
                         _ => {}
                     }
                 }
@@ -229,15 +296,30 @@ impl ConversationState {
                                 });
                             }
                             MessageContent::ToolUse(tu) => {
-                                state.items.push(ConvItem::ToolCall(ToolCallItem {
-                                    id: tu.id.clone(),
-                                    name: tu.name.to_string(),
-                                    title: tu.name.to_string(),
-                                    status: ToolCallStatus::Success,
-                                    output: String::new(),
-                                    is_error: false,
-                                    streaming: false,
-                                }));
+                                if tu.name.as_ref() == "agent" {
+                                    let title =
+                                        agent::thread::tool_title(tu.name.as_ref(), &tu.input);
+                                    state.items.push(ConvItem::AgentTask(AgentTaskItem {
+                                        id: tu.id.clone(),
+                                        title,
+                                        status: ToolCallStatus::Success,
+                                        streaming: false,
+                                        sub_text: String::new(),
+                                        sub_messages: Vec::new(),
+                                        final_text: String::new(),
+                                        is_error: false,
+                                    }));
+                                } else {
+                                    state.items.push(ConvItem::ToolCall(ToolCallItem {
+                                        id: tu.id.clone(),
+                                        name: tu.name.to_string(),
+                                        title: tu.name.to_string(),
+                                        status: ToolCallStatus::Success,
+                                        output: String::new(),
+                                        is_error: false,
+                                        streaming: false,
+                                    }));
+                                }
                             }
                             MessageContent::ToolResult(tr) => {
                                 // Defensive: tool results normally live in user messages,
@@ -255,14 +337,23 @@ impl ConversationState {
     }
 }
 
-/// Attach a tool_result to its matching ToolCall item by id; if none exists yet,
-/// emit a standalone result item. Mirrors the live `ToolResult` event handling.
+/// Attach a tool_result to its matching item by id. Sub-agent results land in
+/// `AgentTaskItem::final_text`; ordinary tool results land in `ToolCallItem::output`.
+/// If no match exists, emit a standalone ToolCall result item.
 fn pair_tool_result(state: &mut ConversationState, tr: &LanguageModelToolResult) {
     let status = if tr.is_error {
         ToolCallStatus::Error
     } else {
         ToolCallStatus::Success
     };
+    if let Some(ix) = state.find_agent_task(&tr.tool_use_id) {
+        if let Some(ConvItem::AgentTask(t)) = state.items.get_mut(ix) {
+            t.final_text = tr.content.clone();
+            t.is_error = tr.is_error;
+            t.status = status;
+        }
+        return;
+    }
     if let Some(ix) = state.find_tool(&tr.tool_use_id) {
         if let Some(ConvItem::ToolCall(t)) = state.items.get_mut(ix) {
             t.output = tr.content.clone();
