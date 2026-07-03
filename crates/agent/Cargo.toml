@@ -15,6 +15,7 @@ brush-core = { workspace = true }
 brush-builtins = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 schemars.workspace = true
 cx-providers.workspace = true
 reqwest.workspace = true

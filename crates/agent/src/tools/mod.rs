@@ -9,11 +9,12 @@
 //! requiring approval (write_file / edit_file / bash) override `requires_approval`
 //! to return true.
 
+pub mod agent;
 pub mod ask_user;
 pub mod bash;
 
 use globset::{Glob, GlobSetBuilder};
-use gpui::{App, AppContext as _, Task};
+use gpui::{App, AppContext as _, Task, WeakEntity};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
@@ -23,6 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::thread::Thread;
 use crate::tool::{AgentTool, AnyAgentTool, ToolRegistry};
 
 /// Convert a schemars schema to a `serde_json::Value`.
@@ -558,18 +560,31 @@ impl AgentTool for GlobTool {
 
 // ─── Default registry ─────────────────────────────────────────────────────
 
-/// Build a `ToolRegistry` with the built-in tools; `cwd` is the relative root for each tool.
-pub fn default_registry(cwd: PathBuf) -> ToolRegistry {
+/// The built-in tools as `AnyAgentTool` (no `agent` tool). Shared by the main
+/// registry and sub-agent registries (which filter by name).
+pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
+    vec![
+        Arc::new(ReadFileTool) as AnyAgentTool,
+        Arc::new(WriteFileTool),
+        Arc::new(EditFileTool),
+        Arc::new(ListDirectoryTool { cwd: cwd.clone() }),
+        Arc::new(bash::BashTool::new(cwd.as_ref().clone())),
+        Arc::new(GrepTool { cwd: cwd.clone() }),
+        Arc::new(GlobTool { cwd: cwd.clone() }),
+        Arc::new(ask_user::AskUserQuestionTool),
+    ]
+}
+
+/// Build a `ToolRegistry` with the built-in tools plus the `agent` sub-agent
+/// tool. `parent` is the owning `Thread` so the `agent` tool can route
+/// bubbled-up authorizations and read the parent's model.
+pub fn default_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistry {
     let cwd = Arc::new(cwd);
     let mut reg = ToolRegistry::new();
-    reg.register(std::sync::Arc::new(ReadFileTool) as AnyAgentTool);
-    reg.register(std::sync::Arc::new(WriteFileTool) as AnyAgentTool);
-    reg.register(std::sync::Arc::new(EditFileTool) as AnyAgentTool);
-    reg.register(std::sync::Arc::new(ListDirectoryTool { cwd: cwd.clone() }) as AnyAgentTool);
-    reg.register(std::sync::Arc::new(bash::BashTool::new(cwd.as_ref().clone())) as AnyAgentTool);
-    reg.register(std::sync::Arc::new(GrepTool { cwd: cwd.clone() }) as AnyAgentTool);
-    reg.register(std::sync::Arc::new(GlobTool { cwd }) as AnyAgentTool);
-    reg.register(std::sync::Arc::new(ask_user::AskUserQuestionTool) as AnyAgentTool);
+    for tool in base_tools(cwd.clone()) {
+        reg.register(tool);
+    }
+    reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent)) as AnyAgentTool);
     reg
 }
 
@@ -578,11 +593,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_registry_has_eight_tools() {
-        let reg = default_registry(PathBuf::from("."));
-        let tools = reg.to_request_tools();
+    fn base_tools_has_eight_tools() {
+        let tools = base_tools(Arc::new(PathBuf::from(".")));
         assert_eq!(tools.len(), 8);
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"edit_file"));
@@ -591,6 +605,8 @@ mod tests {
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"AskUserQuestion"));
+        // The sub-agent tool is registered by `default_registry`, not `base_tools`.
+        assert!(!names.contains(&"agent"));
     }
 
     #[test]

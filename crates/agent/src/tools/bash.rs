@@ -233,7 +233,7 @@ async fn run_bash(
     let (out_str, out_trunc) = out_buf.lock().expect("capture buffer lock poisoned").take();
     let (err_str, err_trunc) = err_buf.lock().expect("capture buffer lock poisoned").take();
 
-    Ok(format_result(ran, out_str, out_trunc, err_str, err_trunc)?)
+    format_result(ran, out_str, out_trunc, err_str, err_trunc)
 }
 
 /// Format the outcome: success returns stdout (or stderr when stdout is empty);

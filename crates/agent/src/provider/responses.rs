@@ -190,13 +190,19 @@ pub async fn stream_responses(
 }
 
 fn build_request_body(model: &str, max_tokens: u64, request: &LanguageModelRequest) -> Value {
-    let input = build_input(&request.messages);
+    let (input, instructions) = build_input(&request.messages);
     let mut body = json!({
         "model": model,
         "input": input,
         "max_output_tokens": max_tokens,
         "stream": true,
     });
+    // System prompt (e.g. a sub-agent's) goes to the top-level `instructions`
+    // field — the OpenAI Responses-recommended slot — rather than a `system`
+    // role message item. Anthropic wire lifts it to `system` the same way.
+    if !instructions.is_empty() {
+        body["instructions"] = Value::String(instructions);
+    }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
@@ -218,8 +224,11 @@ fn build_request_body(model: &str, max_tokens: u64, request: &LanguageModelReque
 
 /// Responses-wire input is a flat list of `message` / `function_call` / `function_call_output` items.
 /// Tool calls and their results are emitted as separate top-level items per the wire spec.
-fn build_input(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
+/// Returns the input items plus any accumulated system-prompt text, which the caller
+/// lifts to the top-level `instructions` field instead of a `system` role message item.
+fn build_input(messages: &[LanguageModelRequestMessage]) -> (Vec<Value>, String) {
     let mut out: Vec<Value> = Vec::new();
+    let mut system_instructions = String::new();
     for m in messages {
         let mut text_buf = String::new();
         let mut tool_uses: Vec<&LanguageModelToolUse> = Vec::new();
@@ -242,11 +251,24 @@ fn build_input(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
         // Images only attach to user turns; the Responses wire has no assistant image part.
         let has_images = !images.is_empty() && m.role == Role::User;
 
+        // System messages carry the (sub-)agent's system prompt; lift their text to
+        // the top-level `instructions` field rather than emitting a `system` role
+        // message item. A system message is pure text by construction.
+        if m.role == Role::System {
+            if has_text {
+                if !system_instructions.is_empty() {
+                    system_instructions.push_str("\n\n");
+                }
+                system_instructions.push_str(&text_buf);
+            }
+            continue;
+        }
+
         if has_text || has_images {
             let (role, text_kind) = match m.role {
                 Role::User => ("user", "input_text"),
                 Role::Assistant => ("assistant", "output_text"),
-                Role::System => ("system", "input_text"),
+                Role::System => unreachable!("system messages are lifted to `instructions` above"),
             };
             let mut content: Vec<Value> = Vec::new();
             if has_text {
@@ -301,7 +323,7 @@ fn build_input(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
             continue;
         }
     }
-    out
+    (out, system_instructions)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -640,7 +662,8 @@ mod tests {
                 cache: false,
             },
         ];
-        let input = build_input(&messages);
+        let (input, instructions) = build_input(&messages);
+        assert!(instructions.is_empty());
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[0]["call_id"], "call_1");
@@ -658,12 +681,34 @@ mod tests {
             content: vec![MessageContent::Text("hello".to_string())],
             cache: false,
         }];
-        let input = build_input(&messages);
+        let (input, instructions) = build_input(&messages);
+        assert!(instructions.is_empty());
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn build_input_lifts_system_to_instructions() {
+        let messages = vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text("you are a sub-agent".to_string())],
+                cache: false,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text("hi".to_string())],
+                cache: false,
+            },
+        ];
+        let (input, instructions) = build_input(&messages);
+        // System text is lifted out of the input items entirely.
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(instructions, "you are a sub-agent");
     }
 
     fn make_added(index: usize, call_id: &str, name: &str) -> Value {

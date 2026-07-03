@@ -12,12 +12,13 @@
 //! `ToolAuthorizationResponse` (a permission decision or, for `AskUserQuestion`,
 //! the user's answers), which the task `await`s on the gpui executor.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt as _;
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::ThreadRecord;
@@ -94,11 +95,27 @@ pub struct Thread {
     project: Option<PathBuf>,
     /// tool_uses collected during the current turn, processed after the stream ends.
     pending_tool_uses: Vec<LanguageModelToolUse>,
-    /// The pending authorization awaiting a UI response (id + responder).
-    pending_authorization: Option<(
-        String,
-        tokio::sync::oneshot::Sender<ToolAuthorizationResponse>,
-    )>,
+    /// Pending authorizations for THIS thread's own tool calls, keyed by
+    /// tool_use id. A map (not a single slot) so parallel tool calls can each
+    /// await their own decision without overwriting one another.
+    pending_authorizations:
+        HashMap<String, tokio::sync::oneshot::Sender<ToolAuthorizationResponse>>,
+    /// Authorization requests bubbled up from a sub-agent, keyed by a composite
+    /// id `<parent_tool_use_id>::<child_auth_id>`. Routing a response back
+    /// forwards it to the owning child thread.
+    pending_child_auth: HashMap<String, ChildAuthRoute>,
+    /// Sub-agent system prompt; `None` for the main thread (no system prompt injected).
+    system: Option<String>,
+    /// Nesting depth. Main thread = 0; a sub-agent = parent depth + 1.
+    depth: u32,
+    /// Max agentic turns before a sub-agent is force-stopped. `None` = unlimited.
+    max_turns: Option<u32>,
+    /// Completed round-trips in the current turn, for `max_turns` enforcement.
+    turn_count: u32,
+    /// Whether the max-turns summary turn has already been injected. The cap is
+    /// allowed one extra round-trip so the sub-agent can produce a coherent
+    /// final message instead of ending mid-work; a second cap hit hard-stops.
+    cap_summary_injected: bool,
     /// The running turn task; dropping it aborts the turn.
     running_turn: Option<Task<()>>,
     /// Cancellation token for the running turn. Cancelled by `cancel()` so the
@@ -107,26 +124,42 @@ pub struct Thread {
     turn_cancel: Option<CancellationToken>,
 }
 
+/// A forwarded authorization request from a sub-agent: which child thread holds
+/// the pending decision and what id the child knows it by.
+struct ChildAuthRoute {
+    child: WeakEntity<Thread>,
+    child_auth_id: String,
+}
+
 impl EventEmitter<ThreadEvent> for Thread {}
 
 impl Thread {
-    /// Construct a new `Thread`, defaulting to the registry's first model and registering the built-in tools.
+    /// Construct a new `Thread`, defaulting to the registry's first model and registering the built-in tools plus the `agent` tool.
     pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
-        cx.new(|_cx| Self {
-            id,
-            messages: Vec::new(),
-            model: crate::provider::registry::global()
-                .models()
-                .first()
-                .cloned(),
-            tools: Arc::new(tools::default_registry(cwd.clone())),
-            permission: Arc::new(PermissionCache::default()),
-            cwd,
-            project: None,
-            pending_tool_uses: Vec::new(),
-            pending_authorization: None,
-            running_turn: None,
-            turn_cancel: None,
+        cx.new(|cx| {
+            let weak = cx.weak_entity();
+            Self {
+                id,
+                messages: Vec::new(),
+                model: crate::provider::registry::global()
+                    .models()
+                    .first()
+                    .cloned(),
+                tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
+                permission: Arc::new(PermissionCache::default()),
+                cwd,
+                project: None,
+                pending_tool_uses: Vec::new(),
+                pending_authorizations: HashMap::new(),
+                pending_child_auth: HashMap::new(),
+                system: None,
+                depth: 0,
+                max_turns: None,
+                turn_count: 0,
+                cap_summary_injected: false,
+                running_turn: None,
+                turn_cancel: None,
+            }
         })
     }
 
@@ -139,18 +172,66 @@ impl Thread {
         model: Option<AnyLanguageModel>,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|_cx| Self {
-            id,
-            messages,
-            model,
-            tools: Arc::new(tools::default_registry(cwd.clone())),
-            permission: Arc::new(PermissionCache::default()),
-            cwd,
-            project,
-            pending_tool_uses: Vec::new(),
-            pending_authorization: None,
-            running_turn: None,
-            turn_cancel: None,
+        cx.new(|cx| {
+            let weak = cx.weak_entity();
+            Self {
+                id,
+                messages,
+                model,
+                tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
+                permission: Arc::new(PermissionCache::default()),
+                cwd,
+                project,
+                pending_tool_uses: Vec::new(),
+                pending_authorizations: HashMap::new(),
+                pending_child_auth: HashMap::new(),
+                system: None,
+                depth: 0,
+                max_turns: None,
+                turn_count: 0,
+                cap_summary_injected: false,
+                running_turn: None,
+                turn_cancel: None,
+            }
+        })
+    }
+
+    /// Construct a sub-agent `Thread` with a restricted tool registry, an
+    /// independent permission cache, a system prompt, and a turn cap. The
+    /// `tools_fn` closure receives the new thread's own `WeakEntity` so the
+    /// `agent` tool (when nesting is allowed) can route back to it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_subagent(
+        cwd: PathBuf,
+        model: AnyLanguageModel,
+        permission: Arc<PermissionCache>,
+        system: String,
+        max_turns: u32,
+        depth: u32,
+        tools_fn: impl FnOnce(WeakEntity<Self>) -> ToolRegistry,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            let weak = cx.weak_entity();
+            Self {
+                id: ThreadId(uuid::Uuid::new_v4().to_string()),
+                messages: Vec::new(),
+                model: Some(model),
+                tools: Arc::new(tools_fn(weak)),
+                permission,
+                cwd,
+                project: None,
+                pending_tool_uses: Vec::new(),
+                pending_authorizations: HashMap::new(),
+                pending_child_auth: HashMap::new(),
+                system: Some(system),
+                depth,
+                max_turns: Some(max_turns),
+                turn_count: 0,
+                cap_summary_injected: false,
+                running_turn: None,
+                turn_cancel: None,
+            }
         })
     }
 
@@ -191,20 +272,73 @@ impl Thread {
         "(新对话)".to_string()
     }
 
-    /// Called after the UI resolves authorization: forward the response to the
-    /// matching pending responder by id. Silently ignored when no id matches
-    /// (the responder may have timed out or belonged to a cancelled turn).
+    /// Called after the UI resolves authorization: route the response to the
+    /// matching pending responder by id. Handles three cases:
+    /// 1. an id matching this thread's own `pending_authorizations` → send to the tool;
+    /// 2. a composite id `<parent_tool_use_id>::<child_auth_id>` registered via
+    ///    `register_child_auth` → forward to the child thread;
+    /// 3. no match → silently drop (stale, cancelled, or already resolved).
     pub fn respond_authorization(
         &mut self,
         id: &str,
         response: ToolAuthorizationResponse,
         cx: &mut Context<Self>,
     ) {
-        if let Some((pending_id, tx)) = self.pending_authorization.take()
-            && pending_id == id
-            && tx.send(response).is_ok()
-        {}
+        if let Some(tx) = self.pending_authorizations.remove(id) {
+            let _ = tx.send(response);
+            return;
+        }
+        if let Some(route) = self.pending_child_auth.remove(id) {
+            if let Some(child) = route.child.upgrade() {
+                let child_id = route.child_auth_id.clone();
+                child.update(cx, |c, cx| {
+                    c.respond_authorization(&child_id, response, cx);
+                });
+            }
+            return;
+        }
         let _ = cx;
+    }
+
+    /// Register a sub-agent's authorization request under a composite id and
+    /// re-emit it on this (parent) thread so the UI overlay can prompt the user.
+    /// The decision later arrives via `respond_authorization` and is forwarded
+    /// to the child. Called by the `agent` tool's event subscription.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_child_auth(
+        &mut self,
+        composite_id: String,
+        child: WeakEntity<Thread>,
+        child_auth_id: String,
+        tool_name: String,
+        summary: String,
+        input: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_child_auth.insert(
+            composite_id.clone(),
+            ChildAuthRoute {
+                child,
+                child_auth_id,
+            },
+        );
+        cx.emit(ThreadEvent::ToolCallAuthorization {
+            id: composite_id,
+            tool_name,
+            summary,
+            input,
+        });
+    }
+
+    pub fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    /// Snapshot of this Thread's always-allow set, for seeding a sub-agent's
+    /// permission cache so the child does not re-prompt grants the user already
+    /// gave the parent for the same tool.
+    pub fn permission_snapshot(&self) -> std::collections::HashSet<String> {
+        self.permission.allowed_tools()
     }
 
     pub fn model(&self) -> Option<&AnyLanguageModel> {
@@ -236,7 +370,7 @@ impl Thread {
             return;
         }
         self.cwd = dir.clone();
-        self.tools = Arc::new(tools::default_registry(dir.clone()));
+        self.tools = Arc::new(tools::default_registry(dir.clone(), cx.weak_entity()));
         self.project = Some(dir);
         cx.notify();
     }
@@ -345,27 +479,134 @@ impl Thread {
                 break;
             }
 
-            let mut tool_uses =
-                this.update(cx, |this, _cx| std::mem::take(&mut this.pending_tool_uses))?;
+            let (tool_uses, free_tus, approval_tus) = this.update(cx, |this, _cx| {
+                let tool_uses = std::mem::take(&mut this.pending_tool_uses);
+                let mut free = Vec::new();
+                let mut appr = Vec::new();
+                for tu in &tool_uses {
+                    let needs_approval = this
+                        .tools
+                        .get(tu.name.as_ref())
+                        .map(|t| t.requires_approval())
+                        .unwrap_or(false)
+                        && !this.permission.is_always_allowed(tu.name.as_ref());
+                    if needs_approval {
+                        appr.push(tu.clone());
+                    } else {
+                        free.push(tu.clone());
+                    }
+                }
+                (tool_uses, free, appr)
+            })?;
             if tool_uses.is_empty() {
                 break;
             }
 
-            while !tool_uses.is_empty() {
-                let tu = tool_uses.remove(0);
-                Self::run_tool(this, tu, cancel, cx).await?;
+            // Approval-free tools run in parallel; approval-needed tools run
+            // serially so the single-slot UI auth overlay never holds two
+            // pending prompts at once (the second would overwrite the first and
+            // strand the first tool's `oneshot` forever). gpui `Task`s are
+            // `!Send`, so concurrency is "spawn all, then await in order".
+            let free_tasks: Vec<Task<Result<()>>> = this.update(cx, |_this, cx| {
+                free_tus
+                    .iter()
+                    .cloned()
+                    .map(|tu| {
+                        let cancel = cancel.clone();
+                        cx.spawn(async move |this, cx: &mut AsyncApp| {
+                            Self::run_tool_inner(this, tu, cancel, cx).await
+                        })
+                    })
+                    .collect()
+            })?;
+
+            let mut fulfilled: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut first_err: Option<anyhow::Error> = None;
+            for (i, task) in free_tasks.into_iter().enumerate() {
+                match task.await {
+                    Ok(()) => {
+                        fulfilled.insert(free_tus[i].id.clone());
+                    }
+                    Err(e) if first_err.is_none() => {
+                        first_err = Some(e);
+                    }
+                    Err(_) => {}
+                }
                 if cancel.is_cancelled() {
                     break;
                 }
             }
-            // Pair tool_uses that never started: a dangling tool_use in the
-            // next request makes Anthropic reject with HTTP 400. The one
-            // mid-flight when cancel fired already got a "cancelled" result
-            // from the tool itself.
-            for tu in tool_uses {
-                Self::synthesize_unrun_tool_result(this, tu, cx)?;
+
+            // Approval-needed tools run one at a time; a cancelled turn or a
+            // sibling error skips the rest (they are synthesized below).
+            // Fail-fast on a sibling error mirrors the pre-parallel serial
+            // loop: an infrastructure error aborts the turn rather than
+            // continuing to prompt the user for tools that may be running in
+            // a half-broken state.
+            for tu in approval_tus {
+                if cancel.is_cancelled() || first_err.is_some() {
+                    break;
+                }
+                let tu_id = tu.id.clone();
+                let task: Task<Result<()>> = this.update(cx, |_this, cx| {
+                    let cancel = cancel.clone();
+                    cx.spawn(async move |this, cx: &mut AsyncApp| {
+                        Self::run_tool_inner(this, tu, cancel, cx).await
+                    })
+                })?;
+                match task.await {
+                    Ok(()) => {
+                        fulfilled.insert(tu_id);
+                    }
+                    Err(e) if first_err.is_none() => {
+                        first_err = Some(e);
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            // Cancel or error may have left tool_uses without a paired
+            // tool_result. Anthropic requires every tool_use to have one or the
+            // next request 400s, so synthesize an error result for any unrun id.
+            for tu in &tool_uses {
+                if !fulfilled.contains(&tu.id) {
+                    Self::synthesize_unrun_tool_result(this, tu.clone(), cx)?;
+                }
+            }
+
+            if let Some(e) = first_err {
+                return Err(e);
             }
             if cancel.is_cancelled() {
+                break;
+            }
+
+            // Sub-agent turn cap: stop runaway sub-agents after `max_turns` round-trips.
+            // The first hit injects one summary turn so the sub-agent can wrap up
+            // with a coherent final message instead of ending mid-work; a second
+            // hit (the summary turn itself overflowed) hard-stops.
+            let hit_cap = this.update(cx, |this, cx| {
+                this.turn_count += 1;
+                let Some(max) = this.max_turns else {
+                    return false;
+                };
+                let capped = this.turn_count >= max;
+                if capped && !this.cap_summary_injected {
+                    this.cap_summary_injected = true;
+                    this.insert_user_message(
+                        format!(
+                            "你已达到最大轮次 {max}。请基于上述已完成的工作，给出一个简洁的最终总结，不要再调用任何工具。"
+                        ),
+                        cx,
+                    );
+                    return false;
+                }
+                if capped {
+                    cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
+                }
+                capped
+            })?;
+            if hit_cap {
                 break;
             }
         }
@@ -373,10 +614,11 @@ impl Thread {
     }
 
     /// Run a single tool call: authorize (if needed) → run → append a ToolResult message → emit.
-    async fn run_tool(
-        this: &gpui::WeakEntity<Self>,
+    /// Owned `WeakEntity`/`CancellationToken` so each parallel tool runs in its own spawned task.
+    async fn run_tool_inner(
+        this: gpui::WeakEntity<Self>,
         tu: LanguageModelToolUse,
-        cancel: &CancellationToken,
+        cancel: CancellationToken,
         cx: &mut AsyncApp,
     ) -> Result<()> {
         let id = tu.id.clone();
@@ -387,8 +629,8 @@ impl Thread {
 
         let Some(tool) = tool else {
             let msg = format!("未知工具: {name}");
-            Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
-            Self::append_tool_result(this, tu, msg.clone(), true, cx)?;
+            Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
+            Self::append_tool_result(&this, tu, msg.clone(), true, cx)?;
             return Ok(());
         };
 
@@ -406,7 +648,7 @@ impl Thread {
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             this.update(cx, |this, _cx| {
-                this.pending_authorization = Some((id.clone(), tx));
+                this.pending_authorizations.insert(id.clone(), tx);
             })?;
             this.update(cx, |_, cx| {
                 cx.emit(ThreadEvent::ToolCallAuthorization {
@@ -422,16 +664,16 @@ impl Thread {
                 _ = cancel.cancelled() => ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
             };
             // The pending responder is spent whether the UI answered or cancel
-            // fired; drop any stale sender so a late `respond_authorization`
-            // cannot revive a cancelled turn.
+            // fired; remove it so a late `respond_authorization` cannot revive a
+            // cancelled turn.
             this.update(cx, |this, _cx| {
-                this.pending_authorization = None;
+                this.pending_authorizations.remove(&id);
             })?;
             match response {
                 ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {
                     let msg = "用户拒绝执行".to_string();
-                    Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
-                    Self::append_tool_result(this, tu, msg, true, cx)?;
+                    Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
+                    Self::append_tool_result(&this, tu, msg, true, cx)?;
                     return Ok(());
                 }
                 ToolAuthorizationResponse::Decision(PermissionDecision::AlwaysAllow) => {
@@ -453,8 +695,8 @@ impl Thread {
                             buf.trim_end().to_string()
                         }
                     };
-                    Self::emit_tool_result(this, &id, &name, &title, &output, false, cx)?;
-                    Self::append_tool_result(this, tu, output, false, cx)?;
+                    Self::emit_tool_result(&this, &id, &name, &title, &output, false, cx)?;
+                    Self::append_tool_result(&this, tu, output, false, cx)?;
                     return Ok(());
                 }
             }
@@ -512,15 +754,15 @@ impl Thread {
             });
         })?;
 
-        Self::emit_tool_result(this, &id, &name, &title, &output_str, is_error, cx)?;
-        Self::append_tool_result(this, tu, output_str, is_error, cx)?;
+        Self::emit_tool_result(&this, &id, &name, &title, &output_str, is_error, cx)?;
+        Self::append_tool_result(&this, tu, output_str, is_error, cx)?;
         Ok(())
     }
 
-    /// Synthesize an error `ToolResult` for a tool_use that never executed
-    /// (because the turn was cancelled before it started). Every tool_use in
-    /// the preceding assistant message must be paired with a tool_result, or
-    /// Anthropic rejects the next request with HTTP 400.
+    /// Append an error `ToolResult` for a tool_use that never ran (the turn was
+    /// cancelled or a sibling tool errored before it started). Anthropic rejects
+    /// a request whose tool_uses lack matching tool_results, so this keeps the
+    /// message list well-formed when a turn aborts mid-batch.
     fn synthesize_unrun_tool_result(
         this: &gpui::WeakEntity<Self>,
         tu: LanguageModelToolUse,
@@ -796,21 +1038,53 @@ impl Thread {
     }
 
     /// Map `messages` into a `LanguageModelRequest` (including tool definitions).
+    /// A sub-agent's system prompt, when set, is prepended as a `System` message;
+    /// the Anthropic wire mapper lifts `System` messages into the top-level
+    /// `system` field, and other wires treat it as a leading message.
     fn build_completion_request(&self) -> LanguageModelRequest {
-        let messages: Vec<LanguageModelRequestMessage> = self
-            .messages
-            .iter()
-            .map(|m| LanguageModelRequestMessage {
-                role: m.role,
-                content: m.content.clone(),
+        let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
+        if let Some(sys) = &self.system {
+            messages.push(LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text(sys.clone())],
                 cache: false,
-            })
-            .collect();
+            });
+        }
+        // Map canonical messages to the request, stripping the `agent` tool's
+        // JSON envelope to just its `final` text. The full sub-conversation
+        // stays in `self.messages` for persistence and UI rebuild, but the
+        // parent model must only see the final reply — otherwise every sub-agent
+        // tool call, tool result, and reasoning block leaks into the parent's
+        // context, defeating the point of spawning an isolated sub-agent.
+        messages.extend(self.messages.iter().map(|m| LanguageModelRequestMessage {
+            role: m.role,
+            content: m.content.iter().map(model_facing_content).collect(),
+            cache: false,
+        }));
         LanguageModelRequest {
             messages,
             tools: self.tools.to_request_tools(),
             ..Default::default()
         }
+    }
+}
+
+/// Strip the `agent` tool's JSON envelope from a ToolResult so only its `final`
+/// text reaches the model. The canonical `Thread::messages` keep the full
+/// envelope (for persistence and UI rebuild); this mapping is applied only when
+/// building a request, so the sub-conversation never leaks into the parent's
+/// context. Non-`agent` content passes through unchanged.
+fn model_facing_content(c: &MessageContent) -> MessageContent {
+    match c {
+        MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == "agent" => {
+            MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: tr.tool_use_id.clone(),
+                tool_name: tr.tool_name.clone(),
+                is_error: tr.is_error,
+                content: crate::tools::agent::agent_final_text(&tr.content),
+            })
+        }
+        other => other.clone(),
     }
 }
 
@@ -826,7 +1100,7 @@ fn truncate_summary(s: &str, max_chars: usize) -> String {
 }
 
 /// Build a human-readable title for a tool call.
-fn tool_title(name: &str, input: &serde_json::Value) -> String {
+pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
     match name {
         "read_file" | "write_file" | "list_directory" => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -866,6 +1140,20 @@ fn tool_title(name: &str, input: &serde_json::Value) -> String {
             let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             format!("glob {p}")
         }
+        "agent" => {
+            let st = input
+                .get("subagent_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+            let trimmed = if prompt.chars().count() > 60 {
+                let t: String = prompt.chars().take(60).collect();
+                format!("{t}…")
+            } else {
+                prompt.to_string()
+            };
+            format!("agent: {st} — {trimmed}")
+        }
         "AskUserQuestion" => {
             let q = input
                 .get("questions")
@@ -893,8 +1181,11 @@ fn tool_title(name: &str, input: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_title;
+    use super::{model_facing_content, tool_title};
+    use crate::language_model::{LanguageModelToolResult, MessageContent};
+    use crate::message::Message;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn edit_file_title_extracts_path_not_tag() {
@@ -933,5 +1224,66 @@ mod tests {
     #[test]
     fn ask_user_question_title_falls_back_without_questions() {
         assert_eq!(tool_title("AskUserQuestion", &json!({})), "AskUserQuestion");
+    }
+
+    /// The `agent` tool's persisted ToolResult carries a JSON envelope
+    /// `{"final":..., "messages":[...]}`. The model must only see the `final`
+    /// text — otherwise the sub-agent's whole conversation (tool calls, results,
+    /// reasoning) leaks into the parent's context. `model_facing_content`
+    /// strips the envelope; the canonical `Thread::messages` keep it.
+    #[test]
+    fn model_facing_content_strips_agent_envelope_to_final() {
+        let sub = vec![Message::user("research foo".to_string())];
+        let envelope = json!({ "final": "found 3 files", "messages": sub }).to_string();
+        let tr = MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: "tu_1".to_string(),
+            tool_name: Arc::from("agent"),
+            is_error: false,
+            content: envelope,
+        });
+        let stripped = model_facing_content(&tr);
+        let MessageContent::ToolResult(out) = stripped else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(out.content, "found 3 files");
+        assert_eq!(out.tool_name.as_ref(), "agent");
+        // Original canonical content is untouched (still the envelope).
+        let MessageContent::ToolResult(orig) = tr else {
+            unreachable!()
+        };
+        assert!(orig.content.contains("\"messages\""));
+    }
+
+    /// A non-`agent` tool result passes through unchanged — no envelope
+    /// stripping, no content mutation.
+    #[test]
+    fn model_facing_content_passes_non_agent_through() {
+        let tr = MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: "tu_2".to_string(),
+            tool_name: Arc::from("bash"),
+            is_error: false,
+            content: "command output".to_string(),
+        });
+        let MessageContent::ToolResult(out) = model_facing_content(&tr) else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(out.content, "command output");
+        assert_eq!(out.tool_name.as_ref(), "bash");
+    }
+
+    /// A legacy `agent` result (plain text, no envelope) falls back to the raw
+    /// content rather than emptying it.
+    #[test]
+    fn model_facing_content_agent_legacy_falls_back() {
+        let tr = MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: "tu_3".to_string(),
+            tool_name: Arc::from("agent"),
+            is_error: false,
+            content: "plain summary".to_string(),
+        });
+        let MessageContent::ToolResult(out) = model_facing_content(&tr) else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(out.content, "plain summary");
     }
 }

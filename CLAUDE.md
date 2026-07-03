@@ -57,11 +57,15 @@ crates/
 
 **核心模块：**
 
-- `thread.rs` — `Thread` 状态机（gpui `Entity<Thread>` + `EventEmitter<ThreadEvent>`）。`run_turn` 在 gpui executor 上 spawn 一个 task，task 内循环：`build_completion_request` → `model.stream_completion` → 逐事件 `handle_completion_event` → 收集 `pending_tool_uses` → 流结束后逐 tool 审批→执行→追加 ToolResult 消息→回到循环。无 tool_use 时 `EndTurn` 退出。
+- `thread.rs` — `Thread` 状态机（gpui `Entity<Thread>` + `EventEmitter<ThreadEvent>`）。`run_turn` 在 gpui executor 上 spawn 一个 task，task 内循环：`build_completion_request` → `model.stream_completion` → 逐事件 `handle_completion_event` → 收集 `pending_tool_uses` → 流结束后按「免审批并行 / 需审批串行」分区执行（gpui `Task` 非 Send，故并发 spawn + 顺序 await）→ 逐 tool 审批→执行→追加 ToolResult 消息→回到循环。无 tool_use 时 `EndTurn` 退出。子 agent 字段：`system`（子 system prompt，主 Thread=None）、`depth`（主=0，子=父+1）、`max_turns`/`turn_count`/`cap_summary_injected`（截断时注入一轮总结而非硬停）、`pending_authorizations`（id→oneshot，多槽）、`pending_child_auth`（复合 id→`ChildAuthRoute`，授权冒泡路由）。子 agent 对话不单独存内存 map——直接作为 JSON envelope 写进父 ToolResult.content（见「快照与持久化」）。`new_subagent` 构造子 Thread，`tools_fn` 闭包解决「AgentTool 需子 WeakEntity 但子 Thread 还没建」的先有鸡先有蛋问题。
 
 - `language_model.rs` — `LanguageModel` trait（`stream_completion` 返回 `BoxFuture` 产出 `BoxStream<Result<LanguageModelCompletionEvent>>`）。通用类型：`Role`、`MessageContent`、`LanguageModelRequest`、`LanguageModelToolUse`、`LanguageModelToolResult` 等。
 
-- `message.rs` — `Message`（role + `Vec<MessageContent>`），Thread 持有 `Vec<Message>` 作为规范状态。
+- `message.rs` — `Message`（role + `Vec<MessageContent>`，`Serialize/Deserialize`），Thread 持有 `Vec<Message>` 作为规范状态。
+
+- `paths.rs` — 统一的配置目录 helper：`cx_config_dir()`（`$HOME/.config/cx`）/ `manox_config_dir()`（`$HOME/.config/cx/manox`）/ `agents_dir()`（`…/manox/agents`）。HOME 缺失时 warn 并回退到 CWD。
+
+- `agent_def.rs` — 子 agent 定义加载层。从 `agents_dir()/*.md` 读取 frontmatter（`name`/`description`/`tools`/`disallowed_tools`/`model`/`max_turns`/`allow_nesting`）+ markdown 正文（system prompt），`AgentDefinitionRegistry`（`OnceLock` 全局，`init` 时加载，缺文件/解析失败 warn 跳过）。`tools`/`disallowed_tools` 不影响 `agent` 工具本身（仅 `allow_nesting` + 深度上限控制嵌套）。
 
 - `provider/` — LLM provider 集成：
   - `config.rs` — 解析 `~/.config/cx/cx.providers.config.yaml`，产出 `ResolvedModel`（provider + endpoint + wire_api + auth 完全解析）。支持 `WireApi::Anthropic` / `Responses` / `Completions`。
@@ -74,7 +78,7 @@ crates/
 
 - `tool.rs` + `tool/permission.rs` — `AgentTool` trait + `ToolRegistry` + `PermissionCache`（会话级 always-allow），`PermissionDecision::AllowOnce | AlwaysAllow | Deny`，`ToolAuthorizationResponse`（审批载荷：`Decision(PermissionDecision)` 或 `AskUserQuestion { answers, response }`，后者由 thread 短路为 ToolResult，不经 `run` 执行）。
 
-- `tools/` — 8 个内置工具：`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`、`ask_user`（`AskUserQuestion`，向用户提多选澄清问题）。写操作（write_file/edit_file）、bash 与 `AskUserQuestion` 需审批。bash/grep 经 tokio 子进程 + `async_channel` 桥回 gpui Task。
+- `tools/` — 9 个内置工具：`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`、`ask_user`（`AskUserQuestion`，向用户提多选澄清问题）、`agent`（spawn 子 agent，见「多 agent 系统」）。写操作（write_file/edit_file）、bash 与 `AskUserQuestion` 需审批；`agent` 本身不审批（spawn 是只读的，子 agent 内部工具各自审批）。bash/grep 经 tokio 子进程 + `async_channel` 桥回 gpui Task。
 
 - `runtime.rs` — 全局 tokio runtime（`OnceLock<Handle>`），`init` 时 build 并 forget，`handle()` 取全局 Handle。供 provider 在 gpui executor 上 spawn tokio 任务跑 HTTP 流。
 
@@ -123,6 +127,25 @@ crates/
 
 每个工具实现 `AgentTool` trait，`run` 返回 `Task<Result<String, String>>`（`Ok` 为正常输出，`Err` 仍回传模型）。FS 工具经 `cx.background_spawn`，子进程工具（bash/grep）经 `bridge_tokio`（`async_channel` 桥接 tokio → gpui）。
 
+### 多 agent（subagents）系统
+
+主 agent 通过 `agent` 工具（`tools/agent.rs`）spawn 独立 context、受限工具集、独立 system prompt 的子 agent，把其最终回复作为 tool result 回传。对标 Claude Code 的 `Agent` 工具 / Codex 的 `spawn_agent`。
+
+- **定义文件**：`~/.config/cx/manox/agents/*.md`，frontmatter（`name`/`description`/`tools`/`disallowed_tools`/`model`/`max_turns`/`allow_nesting`）+ 正文（system prompt）。`AgentDefinitionRegistry` 启动时加载（`OnceLock` 全局），缺文件/解析失败 warn 跳过。
+- **子 Thread 构造**：`Thread::new_subagent` 建独立 `Entity<Thread>`，持 `system`/`depth`/`max_turns`/独立 `PermissionCache`/受限 `ToolRegistry`。`tools_fn` 闭包在 `cx.entity().downgrade()` 可用后构造 registry，解决 AgentTool 需子 WeakEntity 的循环依赖。
+- **并行执行**：`run_turn_loop` 把 `pending_tool_uses` 按 `requires_approval()` 分区——免审批工具并行 spawn（gpui `Task` 非 Send，故「并发 spawn + 顺序 await」等价 join_all），需审批工具串行（避免单槽 overlay 覆盖）。cancel 共享同一 `CancellationToken`（clone 广播）。
+- **授权冒泡**：子 agent 内部工具需审批时，子 Thread emit `ToolCallAuthorization`，`agent` 工具的订阅把它以**复合 id** `<parent_tool_use_id>::<child_auth_id>` 重新 emit 到父 Thread。`Thread::respond_authorization` 三分支：命中本 Thread `pending_authorizations`→oneshot send；命中 `pending_child_auth`（复合 id）→upgrade child 转发；都不命中→静默（可能已 cancel）。UI overlay 透明处理复合 id，`pending_auths: Vec` 多槽避免两个并行子 agent 同时冒泡时互相覆盖。
+- **权限继承**：子 `PermissionCache` 用 `PermissionCache::from_snapshot(parent.permission_snapshot())` 预填父的 always-allow 快照，子不再因父已授权的工具重复弹窗；子新授权不回写父（路由回子 Thread）。
+- **深度/嵌套限制**：`Thread.depth` 主=0 子=父+1，`MAX_DEPTH=5`。`build_child_registry` 仅在 `allow_nesting && child_depth<MAX_DEPTH` 时注册 `agent` 工具，`run_streaming` 开头 `depth+1>MAX_DEPTH` 直接 Err。双重保险。
+- **max_turns 截断**：达 `max_turns` 时注入一轮总结 user 消息（`cap_summary_injected` 防二次循环），让子 agent 产出连贯最终回复而非硬停；第二轮再触顶才 `Stop(EndTurn)`。
+- **完成信号**：`setup_child` 订阅只对真终态（`Stop(EndTurn|MaxTokens|Refusal)` + `Error`）发 `done_tx`；`Stop(ToolUse)` 是非终端中间态（子下一轮继续跑工具），忽略之，否则会把子第一轮未跑工具的文本当成最终结果回传父。
+- **快照与持久化**：子结束后，`agent` 工具把 JSON envelope `{"final":..., "messages":[...]}` 作为 ToolResult.content 写入规范 `Thread::messages`——这是子对话的**唯一来源**（不另存内存 map，长会话无泄漏）。UI live 路径从 `ThreadEvent::ToolResult` 的 `output` 用 `agent_sub_messages` 解析喂展开面板；reload 路径从 `rebuild_from_messages` 同样解析 envelope 还原 `sub_messages`。**上下文隔离**：`build_completion_request` 在映射到模型请求时用 `model_facing_content` 把 `agent` 的 ToolResult envelope 剥成只 `final` 文本——规范消息保留完整 envelope（持久化+UI 用），但父 LLM 只看到 `final`，子 agent 的中间工具调用/结果/reasoning 不泄漏进父上下文。
+- **UI**：`ConvItem::AgentTask` 渲染子 agent 卡片（标题=subagent_type+title、状态图标、chevron 展开/折叠）。折叠态显示 `sub_text` live tail；展开态用 `ConversationState::rebuild_from_messages(&sub_messages)` 得临时 state 再递归 `render_item`（递归深度由 `MAX_DEPTH` 数据侧限）。`views/message.rs` 的 `render_agent_task`。
+
+### tokio ↔ gpui 桥接（子 agent 侧）
+
+子 agent 的 `run_turn` 跑在父 turn 的 gpui task 内（非新 executor）；子内部工具经与主 Thread 相同的 `runtime::handle()` tokio 桥接。`agent` 工具 `run_streaming` 的 `cx.spawn` task `await` `done_rx`（`async_channel`，子终态触发），期间 `sink.try_emit` 把子 `AgentText`/`AgentThinking` 流式喂给父 tool 卡片。
+
 ## GPUI 依赖版本锁定
 
 - GPUI 栈走 git 仓库地址（规则允许，crates.io 无 gpui-component）：`gpui` / `gpui_platform` pin 到 zed rev `1d217ee39d381ac101b7cf49d3d22451ac1093fe`；`gpui-component` / `gpui-component-assets` pin 到 longbridge rev `a9a7341c35b62f27ff512371c62419342264710c`（upstream main HEAD，2026-07-02）
@@ -136,6 +159,7 @@ crates/
 
 - LLM 配置：`~/.config/cx/cx.providers.config.yaml`（格式见 `provider/config.rs` 的 `CxConfig`）
 - SQLite 数据库：`~/.config/cx/manox/threads.db`
+- 子 agent 定义：`~/.config/cx/manox/agents/*.md`（frontmatter + system prompt，见 `agent_def.rs`）
 - API key 源：macOS Keychain（`keychain:SERVICE`）、环境变量（`env:VAR`）、字面量（`literal:...`）、shell 命令（`$(shell ...)`）
 
 ## 项目规则
