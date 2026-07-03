@@ -14,14 +14,26 @@
 
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, px};
-use gpui_component::text::TextView;
-use gpui_component::{
-    Icon, IconName, Sizable as _, Theme,
-    button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
-};
+use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::{Icon, IconName, Sizable as _, Theme, button::{Button, ButtonVariants as _}, h_flex, v_flex};
 
 use crate::conversation::{ConvItem, ToolCallItem};
+
+/// Build a `TextViewStyle` that matches the current theme's highlight palette.
+fn text_view_style(theme: &Theme) -> TextViewStyle {
+    TextViewStyle {
+        highlight_theme: theme.highlight_theme.clone(),
+        is_dark: theme.is_dark(),
+        ..TextViewStyle::default()
+    }
+}
+
+/// Markdown `TextView` with theme-aware syntax highlighting.
+fn markdown_tv(id: impl Into<gpui::ElementId>, text: impl Into<gpui::SharedString>, theme: &Theme) -> TextView {
+    TextView::markdown(id, text)
+        .selectable(true)
+        .style(text_view_style(theme))
+}
 
 /// Render a `ConvItem` as an element. `ix` is the entry index (stable key for collapsibles/TextView).
 pub fn render_item(item: &ConvItem, ix: usize, role: &str, theme: &Theme) -> gpui::AnyElement {
@@ -72,10 +84,7 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                     gpui::div()
                         .text_sm()
                         .text_color(theme.secondary_foreground)
-                        .child(
-                            TextView::markdown(("user-text", ix), text.to_string())
-                                .selectable(true),
-                        ),
+                        .child(markdown_tv(("user-text", ix), text.to_string(), theme)),
                 ),
         )
         .into_any_element()
@@ -108,7 +117,7 @@ pub fn render_assistant(text: &str, streaming: bool, ix: usize, role: &str, them
 /// plain text run — markdown re-parse and shaped text layout on every token
 /// delta was the source of the visible item overlap and the scroll-jank.
 /// When the stream ends we mount `TextView::markdown` once for selection +
-/// rendering of headings, lists, and code blocks.
+/// rendering of headings, lists, and code blocks with syntax highlighting.
 fn render_text_body(
     text: &str,
     streaming: bool,
@@ -116,6 +125,8 @@ fn render_text_body(
     theme: &Theme,
 ) -> gpui::AnyElement {
     if streaming {
+        // Plain text div while streaming — no Tree-sitter involved, so cursor
+        // can stay inline without corrupting any parser.
         let shown = format!("{text}▌");
         gpui::div()
             .id(id.clone())
@@ -128,7 +139,7 @@ fn render_text_body(
         gpui::div()
             .id(id.clone())
             .text_sm()
-            .child(TextView::markdown(id, text.to_string()).selectable(true))
+            .child(markdown_tv(id, text.to_string(), theme))
             .into_any_element()
     }
 }
@@ -191,9 +202,19 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
             gpui::div()
                 .text_sm()
                 .text_color(theme.danger)
-                .child(TextView::markdown(("error", ix), msg.to_string()).selectable(true)),
+                .child(markdown_tv(("error", ix), msg.to_string(), theme)),
         )
         .into_any_element()
+}
+
+/// Heuristic: map a tool name to a markdown code-block language tag so that
+/// syntax highlighting can colour the output.
+fn lang_hint_for_tool(name: &str) -> Option<&'static str> {
+    match name {
+        "bash" => Some("bash"),
+        "python" => Some("python"),
+        _ => None,
+    }
 }
 
 /// Render a tool-call card: title + status icon + copy button + monospace output.
@@ -238,7 +259,7 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
                     gpui::div()
                         .flex_1()
                         .text_xs()
-                        .font_family("monospace")
+                        .font_family(theme.mono_font_family.clone())
                         .text_color(theme.foreground)
                         .child(truncate(&title, 80)),
                 )
@@ -264,8 +285,13 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
     };
 
     if !display_output.is_empty() {
-        // Wrap as a markdown code block: monospace, uninterpreted, selectable.
-        let code = format!("```\n{}\n```", display_output);
+        // Language-annotated code block for syntax highlighting, plain block otherwise.
+        let lang = lang_hint_for_tool(&item.name);
+        let code = if let Some(l) = lang {
+            format!("```{l}\n{display_output}\n```")
+        } else {
+            format!("```\n{display_output}\n```")
+        };
         card = card.child(
             gpui::div()
                 .id(("tool-output", ix))
@@ -277,7 +303,7 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
                 .border_color(theme.border)
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(TextView::markdown(("tool-output-text", ix), code).selectable(true)),
+                .child(markdown_tv(("tool-output-text", ix), code, theme)),
         );
     }
     card.into_any_element()
