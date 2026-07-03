@@ -110,6 +110,7 @@ impl Workspace {
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
+                .multi_line(true)
                 .rows(4)
                 .submit_on_enter(true)
                 .placeholder("输入消息…")
@@ -120,7 +121,7 @@ impl Workspace {
                 .code_editor("markdown")
                 .line_number(true)
                 .folding(false)
-                .soft_wrap(false)
+                .soft_wrap(true)
                 .submit_on_enter(false)
                 .placeholder("编写 markdown…（Cmd-Enter 发送）")
         });
@@ -1046,6 +1047,7 @@ impl Render for Workspace {
                         v_flex()
                             .h_full()
                             .p_4()
+                            .text_sm()
                             .child(
                                 TextView::markdown(
                                     preview_id,
