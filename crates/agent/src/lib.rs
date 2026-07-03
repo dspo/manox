@@ -23,7 +23,7 @@ pub use db::ThreadSummary;
 pub use message::Message;
 pub use thread::{Thread, ThreadEvent, ThreadId, ToolCallStatus};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
-pub use tool::permission::{PermissionCache, PermissionDecision};
+pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
 pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};
 
 /// Register the tokio runtime + `ProviderRegistry` + `ThreadStore` + the

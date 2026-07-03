@@ -9,7 +9,8 @@
 //!
 //! Authorization uses a `tokio::sync::oneshot`: `Thread` emits `ToolCallAuthorization`
 //! carrying a `Sender`; the UI resolves the prompt and sends back a
-//! `PermissionDecision`, which the task `await`s on the gpui executor.
+//! `ToolAuthorizationResponse` (a permission decision or, for `AskUserQuestion`,
+//! the user's answers), which the task `await`s on the gpui executor.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ use crate::language_model::{
     Role, StopReason,
 };
 use crate::message::Message;
-use crate::tool::{PermissionCache, PermissionDecision, ToolRegistry};
+use crate::tool::{PermissionCache, PermissionDecision, ToolAuthorizationResponse, ToolRegistry};
 use crate::tools;
 
 /// Stable `Thread` id used for persistence.
@@ -68,7 +69,7 @@ pub enum ThreadEvent {
     /// Accumulated into the matching tool-call item's `output` until the
     /// final `ToolResult` overwrites it with the canonical (truncated) text.
     ToolOutput { id: String, chunk: String },
-    /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with the decision.
+    /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with a `ToolAuthorizationResponse` (a decision, or — for `AskUserQuestion` — the user's answers).
     ToolCallAuthorization {
         id: String,
         tool_name: String,
@@ -93,9 +94,10 @@ pub struct Thread {
     /// Pending authorizations for THIS thread's own tool calls, keyed by
     /// tool_use id. A map (not a single slot) so parallel tool calls can each
     /// await their own decision without overwriting one another.
-    pending_authorizations: HashMap<String, tokio::sync::oneshot::Sender<PermissionDecision>>,
+    pending_authorizations:
+        HashMap<String, tokio::sync::oneshot::Sender<ToolAuthorizationResponse>>,
     /// Authorization requests bubbled up from a sub-agent, keyed by a composite
-    /// id `<parent_tool_use_id>::<child_auth_id>`. Routing a decision back
+    /// id `<parent_tool_use_id>::<child_auth_id>`. Routing a response back
     /// forwards it to the owning child thread.
     pending_child_auth: HashMap<String, ChildAuthRoute>,
     /// Sub-agent conversation snapshots keyed by the parent-side tool_use id.
@@ -128,7 +130,7 @@ struct ChildAuthRoute {
 impl EventEmitter<ThreadEvent> for Thread {}
 
 impl Thread {
-    /// Construct a new `Thread`, defaulting to the registry's first model and registering the 7 built-in tools plus the `agent` tool.
+    /// Construct a new `Thread`, defaulting to the registry's first model and registering the built-in tools plus the `agent` tool.
     pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let weak = cx.weak_entity();
@@ -257,7 +259,7 @@ impl Thread {
         "(新对话)".to_string()
     }
 
-    /// Called after the UI resolves authorization: route the decision to the
+    /// Called after the UI resolves authorization: route the response to the
     /// matching pending responder by id. Handles three cases:
     /// 1. an id matching this thread's own `pending_authorizations` → send to the tool;
     /// 2. a composite id `<parent_tool_use_id>::<child_auth_id>` registered via
@@ -266,18 +268,18 @@ impl Thread {
     pub fn respond_authorization(
         &mut self,
         id: &str,
-        decision: PermissionDecision,
+        response: ToolAuthorizationResponse,
         cx: &mut Context<Self>,
     ) {
         if let Some(tx) = self.pending_authorizations.remove(id) {
-            let _ = tx.send(decision);
+            let _ = tx.send(response);
             return;
         }
         if let Some(route) = self.pending_child_auth.remove(id) {
             if let Some(child) = route.child.upgrade() {
                 let child_id = route.child_auth_id.clone();
                 child.update(cx, |c, cx| {
-                    c.respond_authorization(&child_id, decision, cx);
+                    c.respond_authorization(&child_id, response, cx);
                 });
             }
             return;
@@ -457,20 +459,36 @@ impl Thread {
                 break;
             }
 
-            let tool_uses =
-                this.update(cx, |this, _cx| std::mem::take(&mut this.pending_tool_uses))?;
+            let (tool_uses, free_tus, approval_tus) = this.update(cx, |this, _cx| {
+                let tool_uses = std::mem::take(&mut this.pending_tool_uses);
+                let mut free = Vec::new();
+                let mut appr = Vec::new();
+                for tu in &tool_uses {
+                    let needs_approval = this
+                        .tools
+                        .get(tu.name.as_ref())
+                        .map(|t| t.requires_approval())
+                        .unwrap_or(false)
+                        && !this.permission.is_always_allowed(tu.name.as_ref());
+                    if needs_approval {
+                        appr.push(tu.clone());
+                    } else {
+                        free.push(tu.clone());
+                    }
+                }
+                (tool_uses, free, appr)
+            })?;
             if tool_uses.is_empty() {
                 break;
             }
 
-            // Spawn every collected tool_use concurrently on its own gpui task,
-            // then await them in order. gpui `Task`s are `!Send` so `tokio::join!`
-            // is unavailable, but spawning first lets the tools run in parallel
-            // while the ordered `await`s only serialize completion collection.
-            // Tool results carry their own `tool_use_id`, so append order is
-            // irrelevant to the wire contract.
-            let tasks: Vec<Task<Result<()>>> = this.update(cx, |_this, cx| {
-                tool_uses
+            // Approval-free tools run in parallel; approval-needed tools run
+            // serially so the single-slot UI auth overlay never holds two
+            // pending prompts at once (the second would overwrite the first and
+            // strand the first tool's `oneshot` forever). gpui `Task`s are
+            // `!Send`, so concurrency is "spawn all, then await in order".
+            let free_tasks: Vec<Task<Result<()>>> = this.update(cx, |_this, cx| {
+                free_tus
                     .iter()
                     .cloned()
                     .map(|tu| {
@@ -481,20 +499,57 @@ impl Thread {
                     })
                     .collect()
             })?;
-            // Drop the owned copy; tasks own their `tu` clones now.
-            drop(tool_uses);
 
+            let mut fulfilled: std::collections::HashSet<String> = std::collections::HashSet::new();
             let mut first_err: Option<anyhow::Error> = None;
-            for task in tasks {
-                if let Err(e) = task.await
-                    && first_err.is_none()
-                {
-                    first_err = Some(e);
+            for (i, task) in free_tasks.into_iter().enumerate() {
+                match task.await {
+                    Ok(()) => {
+                        fulfilled.insert(free_tus[i].id.clone());
+                    }
+                    Err(e) if first_err.is_none() => {
+                        first_err = Some(e);
+                    }
+                    Err(_) => {}
                 }
                 if cancel.is_cancelled() {
                     break;
                 }
             }
+
+            // Approval-needed tools run one at a time; a cancelled turn skips
+            // the rest (they are synthesized below).
+            for tu in approval_tus {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let tu_id = tu.id.clone();
+                let task: Task<Result<()>> = this.update(cx, |_this, cx| {
+                    let cancel = cancel.clone();
+                    cx.spawn(async move |this, cx: &mut AsyncApp| {
+                        Self::run_tool_inner(this, tu, cancel, cx).await
+                    })
+                })?;
+                match task.await {
+                    Ok(()) => {
+                        fulfilled.insert(tu_id);
+                    }
+                    Err(e) if first_err.is_none() => {
+                        first_err = Some(e);
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            // Cancel or error may have left tool_uses without a paired
+            // tool_result. Anthropic requires every tool_use to have one or the
+            // next request 400s, so synthesize an error result for any unrun id.
+            for tu in &tool_uses {
+                if !fulfilled.contains(&tu.id) {
+                    Self::synthesize_unrun_tool_result(this, tu.clone(), cx)?;
+                }
+            }
+
             if let Some(e) = first_err {
                 return Err(e);
             }
@@ -567,9 +622,9 @@ impl Thread {
                 });
             })?;
 
-            let decision = tokio::select! {
-                d = rx => d.unwrap_or(PermissionDecision::Deny),
-                _ = cancel.cancelled() => PermissionDecision::Deny,
+            let response = tokio::select! {
+                r = rx => r.unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
+                _ = cancel.cancelled() => ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
             };
             // The pending responder is spent whether the UI answered or cancel
             // fired; remove it so a late `respond_authorization` cannot revive a
@@ -577,17 +632,36 @@ impl Thread {
             this.update(cx, |this, _cx| {
                 this.pending_authorizations.remove(&id);
             })?;
-            match decision {
-                PermissionDecision::Deny => {
+            match response {
+                ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {
                     let msg = "用户拒绝执行".to_string();
                     Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
                     Self::append_tool_result(&this, tu, msg, true, cx)?;
                     return Ok(());
                 }
-                PermissionDecision::AlwaysAllow => {
+                ToolAuthorizationResponse::Decision(PermissionDecision::AlwaysAllow) => {
                     this.read_with(cx, |this, _| this.permission.set_always_allowed(&name))?;
                 }
-                PermissionDecision::AllowOnce => {}
+                ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {}
+                ToolAuthorizationResponse::AskUserQuestion { answers, response } => {
+                    let output = match response {
+                        Some(text) => format!("User responded: {text}"),
+                        None => {
+                            let mut buf = String::new();
+                            for (q, a) in &answers {
+                                buf.push_str("Question: ");
+                                buf.push_str(q);
+                                buf.push_str("\nAnswer: ");
+                                buf.push_str(a);
+                                buf.push_str("\n\n");
+                            }
+                            buf.trim_end().to_string()
+                        }
+                    };
+                    Self::emit_tool_result(&this, &id, &name, &title, &output, false, cx)?;
+                    Self::append_tool_result(&this, tu, output, false, cx)?;
+                    return Ok(());
+                }
             }
         }
 
@@ -645,6 +719,32 @@ impl Thread {
 
         Self::emit_tool_result(&this, &id, &name, &title, &output_str, is_error, cx)?;
         Self::append_tool_result(&this, tu, output_str, is_error, cx)?;
+        Ok(())
+    }
+
+    /// Append an error `ToolResult` for a tool_use that never ran (the turn was
+    /// cancelled or a sibling tool errored before it started). Anthropic rejects
+    /// a request whose tool_uses lack matching tool_results, so this keeps the
+    /// message list well-formed when a turn aborts mid-batch.
+    fn synthesize_unrun_tool_result(
+        this: &gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let name = tu.name.to_string();
+        let title = tool_title(&name, &tu.input);
+        let msg = "工具未执行（会话被取消）".to_string();
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: ToolCallStatus::Denied,
+            });
+        })?;
+        Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
+        Self::append_tool_result(this, tu, msg, true, cx)?;
         Ok(())
     }
 
@@ -992,6 +1092,27 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
             };
             format!("agent: {st} — {trimmed}")
         }
+        "AskUserQuestion" => {
+            let q = input
+                .get("questions")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|q| q.get("question"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let single = q.lines().next().unwrap_or("").trim();
+            let trimmed = if single.chars().count() > 80 {
+                let t: String = single.chars().take(80).collect();
+                format!("{t}…")
+            } else {
+                single.to_string()
+            };
+            if trimmed.is_empty() {
+                "AskUserQuestion".to_string()
+            } else {
+                format!("AskUserQuestion: {trimmed}")
+            }
+        }
         _ => name.to_string(),
     }
 }
@@ -1019,5 +1140,24 @@ mod tests {
     fn edit_file_title_missing_header_is_empty() {
         let input = json!({ "patch": "SWAP 5.=5:\n+X" });
         assert_eq!(tool_title("edit_file", &input), "edit_file ");
+    }
+
+    #[test]
+    fn ask_user_question_title_uses_first_question() {
+        let input = json!({
+            "questions": [
+                { "question": "Which framework?", "header": "Framework",
+                  "options": [{"label":"A","description":"a"}], "multiSelect": false }
+            ]
+        });
+        assert_eq!(
+            tool_title("AskUserQuestion", &input),
+            "AskUserQuestion: Which framework?"
+        );
+    }
+
+    #[test]
+    fn ask_user_question_title_falls_back_without_questions() {
+        assert_eq!(tool_title("AskUserQuestion", &json!({})), "AskUserQuestion");
     }
 }

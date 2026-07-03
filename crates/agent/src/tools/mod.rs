@@ -10,6 +10,7 @@
 //! to return true.
 
 pub mod agent;
+pub mod ask_user;
 pub mod bash;
 
 use globset::{Glob, GlobSetBuilder};
@@ -559,8 +560,8 @@ impl AgentTool for GlobTool {
 
 // ─── Default registry ─────────────────────────────────────────────────────
 
-/// The seven built-in tools as `AnyAgentTool` (no `agent` tool). Shared by
-/// the main registry and sub-agent registries (which filter by name).
+/// The built-in tools as `AnyAgentTool` (no `agent` tool). Shared by the main
+/// registry and sub-agent registries (which filter by name).
 pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
     vec![
         Arc::new(ReadFileTool) as AnyAgentTool,
@@ -569,11 +570,12 @@ pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
         Arc::new(ListDirectoryTool { cwd: cwd.clone() }),
         Arc::new(bash::BashTool::new(cwd.as_ref().clone())),
         Arc::new(GrepTool { cwd: cwd.clone() }),
-        Arc::new(GlobTool { cwd }),
+        Arc::new(GlobTool { cwd: cwd.clone() }),
+        Arc::new(ask_user::AskUserQuestionTool),
     ]
 }
 
-/// Build a `ToolRegistry` with the 7 built-in tools plus the `agent` sub-agent
+/// Build a `ToolRegistry` with the built-in tools plus the `agent` sub-agent
 /// tool. `parent` is the owning `Thread` so the `agent` tool can route
 /// bubbled-up authorizations and read the parent's model.
 pub fn default_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistry {
@@ -591,9 +593,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_tools_has_seven_tools() {
+    fn base_tools_has_eight_tools() {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
@@ -602,6 +604,7 @@ mod tests {
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"glob"));
+        assert!(names.contains(&"AskUserQuestion"));
         // The sub-agent tool is registered by `default_registry`, not `base_tools`.
         assert!(!names.contains(&"agent"));
     }

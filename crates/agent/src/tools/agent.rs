@@ -290,8 +290,11 @@ fn resolve_model(
         .ok_or_else(|| "无可用模型".to_string())
 }
 
-/// The last assistant message's text content, or empty if the sub-agent
-/// produced none (e.g. cancelled before any text).
+/// The sub-agent's final result text: the last assistant message's first text
+/// block, falling back to the last text block of any role, then to a stated
+/// "no final message" note. Never returns an empty string so the parent model
+/// always receives a meaningful tool result (e.g. when the sub-agent hit the
+/// turn cap mid-tool-call and produced no closing assistant text).
 fn last_assistant_text(msgs: &[Message]) -> String {
     for m in msgs.iter().rev() {
         if m.role != Role::Assistant {
@@ -303,7 +306,14 @@ fn last_assistant_text(msgs: &[Message]) -> String {
             }
         }
     }
-    String::new()
+    for m in msgs.iter().rev() {
+        for c in &m.content {
+            if let MessageContent::Text(t) = c {
+                return t.clone();
+            }
+        }
+    }
+    "sub-agent ended without producing a final message".to_string()
 }
 
 /// Whether `name` passes the definition's `tools`/`disallowed_tools` filters.
@@ -465,8 +475,16 @@ mod tests {
     }
 
     #[test]
-    fn no_assistant_yields_empty() {
+    fn no_assistant_falls_back_to_last_text_then_note() {
+        // With no assistant message, the last text block of any role is used so
+        // the parent model still gets a meaningful result.
         let msgs = vec![Message::user("hi".to_string())];
-        assert_eq!(last_assistant_text(&msgs), "");
+        assert_eq!(last_assistant_text(&msgs), "hi");
+        // Truly no text anywhere → a stated note, never an empty string.
+        let msgs: Vec<Message> = vec![Message::user_with_content(vec![])];
+        assert_eq!(
+            last_assistant_text(&msgs),
+            "sub-agent ended without producing a final message"
+        );
     }
 }
