@@ -98,6 +98,10 @@ pub struct Workspace {
     slash_menu_sub: Option<Subscription>,
     /// Files picked via the `+` menu, not yet sent. Cleared on submit.
     pending_attachments: Vec<PendingAttachment>,
+    /// True while a native directory picker is open from the "Choose project" row.
+    /// Guards against the user submitting a message before the picker resolves
+    /// (which would make `set_project` a silent no-op once `messages` is non-empty).
+    project_picker_pending: bool,
     thread_sub: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
@@ -146,9 +150,9 @@ impl Workspace {
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
-                .rows(4)
+                .auto_grow(5, 12)
                 .submit_on_enter(true)
-                .placeholder("输入消息…")
+                .placeholder("输入消息，点击发送以开始使用")
         });
 
         let editor_state = cx.new(|cx| {
@@ -185,6 +189,7 @@ impl Workspace {
             slash_menu: None,
             slash_menu_sub: None,
             pending_attachments: Vec::new(),
+            project_picker_pending: false,
             thread_sub: None,
             sidebar_sub: None,
             input_sub: None,
@@ -369,7 +374,13 @@ impl Workspace {
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
-        if (text.trim().is_empty() && attachments.is_empty()) || self.thread.read(cx).is_running() {
+        if (text.trim().is_empty() && attachments.is_empty())
+            || self.thread.read(cx).is_running()
+            // Block submit while the project picker is open: setting the
+            // project after a message lands is a no-op (set_project guards on
+            // !messages.is_empty()), so the project would be silently dropped.
+            || self.project_picker_pending
+        {
             self.pending_attachments = attachments;
             return;
         }
@@ -1013,25 +1024,76 @@ impl Workspace {
         menu
     }
 
-    /// Composer row: a rounded container with the `+` menu button, `Input`, and a circular send/stop button.
+    /// Composer card: an auto-growing text area above a single toolbar row.
+    /// The card's fill matches the page background (`theme.background`) so only
+    /// the 1px border outlines it — the user-perceived "底纹" disappears.
+    /// The `Input` renders bare (no appearance/border of its own) so there is
+    /// no double-layered fill.
     fn render_composer(
         &mut self,
         running: bool,
+        first_screen: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        h_flex()
+        let plus = self.render_plus_button(cx);
+        let cwd = self.render_cwd_chip(theme, cx);
+        let access = self.render_access_placeholder(theme);
+        let model = self.render_model_selector(theme, cx);
+        let send = self.render_send_button(running, cx);
+        // "Choose project" binds the thread's project; only offered before the
+        // conversation starts (the empty first screen), matching the reference.
+        let choose_project = first_screen.then(|| self.render_choose_project_row(theme, cx));
+
+        v_flex()
             .w_full()
-            .items_end()
             .gap_2()
             .p_2()
             .rounded(theme.radius)
             .border_1()
             .border_color(theme.border)
-            .bg(theme.secondary)
-            .child(self.render_plus_button(cx))
-            .child(gpui::div().flex_1().child(Input::new(&self.input_state)))
-            .child(self.render_send_button(running, cx))
+            .bg(theme.background)
+            .child(
+                Input::new(&self.input_state)
+                    .appearance(false)
+                    .bordered(false)
+                    .focus_bordered(false),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(plus)
+                            .child(cwd)
+                            .child(access),
+                    )
+                    .child(h_flex().items_center().gap_1().child(model).child(send)),
+            )
+            .children(choose_project)
+            .into_any_element()
+    }
+
+    /// Visual-only "full access" affordance mirroring Codex's permission chip.
+    /// Not wired to any approval mode; manox still gates tools via the runtime
+    /// authorization prompt.
+    fn render_access_placeholder(&self, theme: &Theme) -> AnyElement {
+        h_flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(gpui::div().size(px(6.)).rounded_full().bg(theme.success))
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("完全访问"),
+            )
             .into_any_element()
     }
 
@@ -1120,6 +1182,69 @@ impl Workspace {
         .detach();
     }
 
+    /// Open the native directory picker and bind the chosen folder to the thread
+    /// as its project. Tools then resolve paths against it. Offered only on the
+    /// empty first screen; `set_project` no-ops once the conversation has started.
+    fn choose_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_picker_pending {
+            return;
+        }
+        self.project_picker_pending = true;
+        let dir = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = dir.await;
+            this.update(cx, |this, cx| {
+                this.project_picker_pending = false;
+                if let Ok(Ok(Some(paths))) = result
+                    && let Some(path) = paths.into_iter().next()
+                {
+                    this.thread.update(cx, |t, cx| t.set_project(path, cx));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The "Choose project" row inside the composer card, shown only on the empty
+    /// first screen. Displays the bound project's basename once one is chosen.
+    fn render_choose_project_row(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let project = self.thread.read(cx).project().cloned();
+        let (icon, label, color) = match &project {
+            Some(dir) => {
+                let name = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("project")
+                    .to_string();
+                (IconName::FolderOpen, name, theme.foreground)
+            }
+            None => (
+                IconName::Folder,
+                "Choose project".to_string(),
+                theme.muted_foreground,
+            ),
+        };
+        h_flex()
+            .id("choose-project")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+            .child(Icon::new(icon).small().text_color(color))
+            .child(gpui::div().text_xs().text_color(color).child(label))
+            .on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))
+            .into_any_element()
+    }
+
     /// Circular icon-only send/stop button.
     ///
     /// Reuses `Button` for built-in focus ring, keyboard activation, and disabled handling;
@@ -1182,36 +1307,15 @@ impl Workspace {
         )
     }
 
-    /// Chip row: a plain `cwd` label on the left, model selector on the right.
-    fn render_chip_row(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        // Self-contained centering (not `centered()` helper) so the absolute-positioned
-        // model dropdown is not clipped by any `max_w` ancestor.
-        h_flex()
-            .w_full()
-            .justify_center()
-            .child(
-                h_flex()
-                    .w_full()
-                    .max_w(px(crate::views::CONTENT_MAX_W))
-                    .items_center()
-                    .child(self.render_cwd_chip(theme))
-                    .child(gpui::div().flex_1())
-                    .child(
-                        gpui::div()
-                            .flex_shrink_0()
-                            .child(self.render_model_selector(theme, cx)),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// Static label of the current working directory's basename.
+    /// Static label of the thread's working directory basename. Reflects the
+    /// chosen project once one is bound (the thread's `cwd` follows the project).
     ///
-    /// Rendered as a plain `div` (not `Button`) until a directory-switcher popover exists; an
-    /// unclickable `Button` would invite clicks that do nothing.
-    fn render_cwd_chip(&self, theme: &Theme) -> AnyElement {
-        let name = self
-            .cwd
+    /// Rendered as a plain `div` (not `Button`): the project is picked on the
+    /// empty first screen via the "Choose project" row and fixed thereafter, so
+    /// a clickable chip would invite clicks that do nothing.
+    fn render_cwd_chip(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+        let cwd = self.thread.read(cx).cwd().to_path_buf();
+        let name = cwd
             .file_name()
             .and_then(|s| s.to_str())
             .filter(|s| *s != ".")
@@ -1219,8 +1323,6 @@ impl Workspace {
         gpui::div()
             .px_2()
             .py_1()
-            .rounded(theme.radius)
-            .bg(theme.secondary)
             .text_xs()
             .text_color(theme.muted_foreground)
             .child(name.to_string())
@@ -1251,10 +1353,16 @@ impl Render for Workspace {
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
         let editor_width = self.editor_width;
+        // Empty first screen: no messages and nothing streaming. The composer is
+        // hoisted into a vertically-centered hero (heading + composer + "Choose
+        // project"); once the conversation starts it drops to the bottom footer.
+        let first_screen = self.conversation.is_empty() && !running;
         // The inline composer and the markdown editor are mutually exclusive: while
         // the editor pane is open the footer is hidden and the draft lives in the
         // editor (moved there on open, moved back on close).
-        let footer = if !editor_open {
+        let footer = if editor_open || first_screen {
+            None
+        } else {
             Some(
                 v_flex()
                     .w_full()
@@ -1263,11 +1371,40 @@ impl Render for Workspace {
                     .relative()
                     .children(self.render_slash_overlay())
                     .children(self.render_attachments(&theme, cx))
-                    .child(centered(self.render_composer(running, &theme, cx)))
-                    .child(self.render_chip_row(&theme, cx)),
+                    .child(centered(self.render_composer(running, false, &theme, cx))),
             )
-        } else {
+        };
+        // Hero occupies the message-list region on the first screen.
+        let hero = if editor_open || !first_screen {
             None
+        } else {
+            Some(
+                v_flex()
+                    .flex_1()
+                    .w_full()
+                    .justify_center()
+                    .items_center()
+                    .relative()
+                    .child(
+                        centered(
+                            v_flex()
+                                .w_full()
+                                .gap_5()
+                                .items_center()
+                                .child(
+                                    gpui::div()
+                                        .text_2xl()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.foreground)
+                                        .child("我们该做什么？"),
+                                )
+                                .children(self.render_attachments(&theme, cx))
+                                .child(self.render_composer(running, true, &theme, cx)),
+                        )
+                        .relative()
+                        .children(self.render_slash_overlay()),
+                    ),
+            )
         };
         // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
         // toggles preview — all keyboard-driven per the no-button constraint.
@@ -1395,12 +1532,15 @@ impl Render for Workspace {
                             )
                             .child(h_flex()),
                     )
+                    // Empty first screen shows the centered hero in place of the
+                    // (empty) message list; otherwise the scrollable conversation.
+                    .children(hero)
                     // Message list (centered, width-capped, scrollable).
                     // `track_scroll` lets us read offset/max and call `scroll_to_bottom`
                     // from event handlers. `on_scroll_wheel` reacts to manual scrolls:
                     // if the user drags the viewport away from the bottom, disengage
                     // auto-follow until they scroll back down.
-                    .child(
+                    .children((!first_screen).then(|| {
                         v_flex()
                             .id("messages")
                             .flex_1()
@@ -1434,14 +1574,8 @@ impl Render for Workspace {
                                     // moment they reach the bottom.
                                 },
                             ))
-                            .children(items.into_iter().map(centered)),
-                    )
-                    // Separator line (standalone div so the PopupMenu inside
-                    // the footer can render on top of it without z-order issues).
-                    .child(gpui::div().w_full().h(px(1.)).bg(theme.border))
-                    // Input area: pending attachments + composer + chip row, with the slash
-                    // menu overlaid above the composer. Hidden while the markdown editor pane
-                    // is open — the draft is moved into the editor on open and back on close.
+                            .children(items.into_iter().map(centered))
+                    }))
                     .children(footer)
                     // Approval overlay (if any)
                     .children(overlay),

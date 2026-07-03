@@ -88,6 +88,10 @@ pub struct Thread {
     tools: Arc<ToolRegistry>,
     permission: Arc<PermissionCache>,
     cwd: PathBuf,
+    /// The project directory the thread is bound to, chosen on the first screen.
+    /// `None` means no project was chosen; tools then resolve paths against the
+    /// app launch directory (`cwd`). Once set, it is fixed for the thread's life.
+    project: Option<PathBuf>,
     /// tool_uses collected during the current turn, processed after the stream ends.
     pending_tool_uses: Vec<LanguageModelToolUse>,
     /// The pending authorization awaiting a UI response (id + responder).
@@ -118,6 +122,7 @@ impl Thread {
             tools: Arc::new(tools::default_registry(cwd.clone())),
             permission: Arc::new(PermissionCache::default()),
             cwd,
+            project: None,
             pending_tool_uses: Vec::new(),
             pending_authorization: None,
             running_turn: None,
@@ -129,6 +134,7 @@ impl Thread {
     pub fn restore(
         id: ThreadId,
         cwd: PathBuf,
+        project: Option<PathBuf>,
         messages: Vec<Message>,
         model: Option<AnyLanguageModel>,
         cx: &mut App,
@@ -140,6 +146,7 @@ impl Thread {
             tools: Arc::new(tools::default_registry(cwd.clone())),
             permission: Arc::new(PermissionCache::default()),
             cwd,
+            project,
             pending_tool_uses: Vec::new(),
             pending_authorization: None,
             running_turn: None,
@@ -155,6 +162,11 @@ impl Thread {
             summary: self.summary(),
             model_id,
             cwd: self.cwd.display().to_string(),
+            project: self
+                .project
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             messages: self.messages.clone(),
         })
     }
@@ -210,6 +222,23 @@ impl Thread {
 
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
+    }
+
+    pub fn project(&self) -> Option<&PathBuf> {
+        self.project.as_ref()
+    }
+
+    /// Bind the thread to a project directory, rebuilding the tool registry so
+    /// tools resolve paths against it. A no-op once the conversation has started
+    /// (project is chosen on the empty first screen and fixed thereafter).
+    pub fn set_project(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if !self.messages.is_empty() {
+            return;
+        }
+        self.cwd = dir.clone();
+        self.tools = Arc::new(tools::default_registry(dir.clone()));
+        self.project = Some(dir);
+        cx.notify();
     }
 
     pub fn is_running(&self) -> bool {

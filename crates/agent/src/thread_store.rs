@@ -77,9 +77,11 @@ impl ThreadStore {
     pub fn load_thread(&self, id: &str, cx: &mut App) -> Option<Entity<Thread>> {
         let rec: ThreadRecord = self.db.load(id).ok()??;
         let model: Option<AnyLanguageModel> = registry::global().get_model(&rec.model_id);
+        let project = (!rec.project.is_empty()).then(|| PathBuf::from(&rec.project));
         Some(Thread::restore(
             ThreadId(rec.id),
             PathBuf::from(&rec.cwd),
+            project,
             rec.messages,
             model,
             cx,
