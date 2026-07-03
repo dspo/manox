@@ -95,7 +95,14 @@ impl ThreadsDatabase {
                 cwd = excluded.cwd,
                 messages = excluded.messages,
                 updated_at = excluded.updated_at",
-            params![rec.id, rec.summary, rec.model_id, rec.cwd, messages_json, now],
+            params![
+                rec.id,
+                rec.summary,
+                rec.model_id,
+                rec.cwd,
+                messages_json,
+                now
+            ],
         )
         .context("upsert thread 失败")?;
         Ok(())
@@ -104,9 +111,8 @@ impl ThreadsDatabase {
     /// Load a full record by id. Returns `None` if absent.
     pub fn load(&self, id: &str) -> Result<Option<ThreadRecord>> {
         let conn = self.conn.lock().expect("db mutex 中毒");
-        let mut stmt = conn.prepare(
-            "SELECT id, summary, model_id, cwd, messages FROM threads WHERE id = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, summary, model_id, cwd, messages FROM threads WHERE id = ?1")?;
         let mut rows = stmt.query(params![id])?;
         let Some(row) = rows.next()? else {
             return Ok(None);

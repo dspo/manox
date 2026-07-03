@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter};
 
-use crate::db::{ThreadsDatabase, ThreadRecord, ThreadSummary, default_db_path};
+use crate::db::{ThreadRecord, ThreadSummary, ThreadsDatabase, default_db_path};
 use crate::language_model::AnyLanguageModel;
 use crate::provider::registry;
 use crate::thread::{Thread, ThreadId};
@@ -34,14 +34,16 @@ static GLOBAL: OnceLock<Entity<ThreadStore>> = OnceLock::new();
 /// Open the db, load the summary list, and register the global `Entity`. Call at App startup.
 pub fn init(cx: &mut App) {
     let path = default_db_path().expect("解析 threads.db 路径失败");
-    let db = ThreadsDatabase::open(&path).unwrap_or_else(|e| {
-        panic!("打开 threads db 失败 ({}): {e}", path.display())
-    });
+    let db = ThreadsDatabase::open(&path)
+        .unwrap_or_else(|e| panic!("打开 threads db 失败 ({}): {e}", path.display()));
     let summaries = db.list().unwrap_or_else(|e| {
         tracing::warn!(error = %e, "加载历史 threads 列表失败，以空列表启动");
         Vec::new()
     });
-    tracing::info!(count = summaries.len(), "ThreadStore 初始化，加载历史 threads");
+    tracing::info!(
+        count = summaries.len(),
+        "ThreadStore 初始化，加载历史 threads"
+    );
     let entity = cx.new(|_cx| ThreadStore {
         db: Arc::new(db),
         summaries,

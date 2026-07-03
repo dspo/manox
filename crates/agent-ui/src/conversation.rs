@@ -5,21 +5,15 @@
 //! thinking and body text split into separate items, and tool calls are tracked
 //! by id for status/output.
 
-use agent::{Message, ThreadEvent, ToolCallStatus};
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
+use agent::{Message, ThreadEvent, ToolCallStatus};
 
 /// A single renderable conversation item.
 #[derive(Debug, Clone)]
 pub enum ConvItem {
     User(String),
-    Assistant {
-        text: String,
-        streaming: bool,
-    },
-    Reasoning {
-        text: String,
-        streaming: bool,
-    },
+    Assistant { text: String, streaming: bool },
+    Reasoning { text: String, streaming: bool },
     ToolCall(ToolCallItem),
     Error(String),
 }
@@ -33,6 +27,9 @@ pub struct ToolCallItem {
     pub status: ToolCallStatus,
     pub output: String,
     pub is_error: bool,
+    /// True while live `ToolOutput` chunks are still streaming in; flipped to
+    /// false once the final `ToolResult` lands the canonical output.
+    pub streaming: bool,
 }
 
 #[derive(Debug, Default)]
@@ -118,7 +115,16 @@ impl ConversationState {
                         status: *status,
                         output: String::new(),
                         is_error: false,
+                        streaming: matches!(*status, ToolCallStatus::Running),
                     }));
+                }
+            }
+            ThreadEvent::ToolOutput { id, chunk } => {
+                if let Some(ix) = self.find_tool(id) {
+                    if let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix) {
+                        t.output.push_str(chunk);
+                        t.streaming = true;
+                    }
                 }
             }
             ThreadEvent::ToolResult {
@@ -130,6 +136,7 @@ impl ConversationState {
                     if let Some(ConvItem::ToolCall(t)) = self.items.get_mut(ix) {
                         t.output = output.clone();
                         t.is_error = *is_error;
+                        t.streaming = false;
                         t.status = if *is_error {
                             ToolCallStatus::Error
                         } else {
@@ -149,6 +156,7 @@ impl ConversationState {
                         },
                         output: output.clone(),
                         is_error: *is_error,
+                        streaming: false,
                     }));
                 }
             }
@@ -186,16 +194,16 @@ impl ConversationState {
                     // Text becomes a user bubble; ToolResult blocks pair back to the
                     // ToolCall item emitted from the preceding assistant ToolUse.
                     // ToolResults live in user messages per the Anthropic wire contract.
-                    let text: String = m
-                        .content
-                        .iter()
-                        .filter_map(|c| match c {
-                            MessageContent::Text(t)
-                            | MessageContent::Thinking { text: t, .. } => Some(t.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("");
+                    let text: String =
+                        m.content
+                            .iter()
+                            .filter_map(|c| match c {
+                                MessageContent::Text(t)
+                                | MessageContent::Thinking { text: t, .. } => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
                     if !text.is_empty() {
                         state.push_user(text);
                     }
@@ -228,6 +236,7 @@ impl ConversationState {
                                     status: ToolCallStatus::Success,
                                     output: String::new(),
                                     is_error: false,
+                                    streaming: false,
                                 }));
                             }
                             MessageContent::ToolResult(tr) => {
@@ -235,6 +244,7 @@ impl ConversationState {
                                 // but pair them here too if they ever appear in an assistant turn.
                                 pair_tool_result(&mut state, tr);
                             }
+                            MessageContent::Image { .. } => {}
                         }
                     }
                 }
@@ -270,6 +280,7 @@ fn pair_tool_result(state: &mut ConversationState, tr: &LanguageModelToolResult)
             status,
             output: tr.content.clone(),
             is_error: tr.is_error,
+            streaming: false,
         }));
     }
 }
@@ -277,8 +288,8 @@ fn pair_tool_result(state: &mut ConversationState, tr: &LanguageModelToolResult)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
     use agent::Message;
+    use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
     use std::sync::Arc;
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the
@@ -321,7 +332,12 @@ mod tests {
         assert_eq!(tool.status, ToolCallStatus::Success);
         assert!(!tool.is_error);
         // The pure-toolresult user message must not render an empty user bubble.
-        assert!(!state.items().iter().any(|i| matches!(i, ConvItem::User(t) if t.is_empty())));
+        assert!(
+            !state
+                .items()
+                .iter()
+                .any(|i| matches!(i, ConvItem::User(t) if t.is_empty()))
+        );
     }
 
     #[test]

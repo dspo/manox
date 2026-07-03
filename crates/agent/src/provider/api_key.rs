@@ -38,9 +38,7 @@ pub fn resolve_apikey(source: &str) -> Result<String> {
 /// Read a generic password from the macOS Keychain.
 fn keychain_secret(service: &str) -> Result<String> {
     if !cfg!(target_os = "macos") {
-        bail!(
-            "`keychain:` 仅支持 macOS Keychain，请改用 `env:` 配置 `{service}`。"
-        );
+        bail!("`keychain:` 仅支持 macOS Keychain，请改用 `env:` 配置 `{service}`。");
     }
 
     let user = std::env::var("USER").unwrap_or_default();
@@ -61,7 +59,9 @@ fn keychain_secret(service: &str) -> Result<String> {
         );
     }
 
-    Ok(String::from_utf8(output.stdout)?.trim_end_matches(['\n', '\r']).to_string())
+    Ok(String::from_utf8(output.stdout)?
+        .trim_end_matches(['\n', '\r'])
+        .to_string())
 }
 
 #[cfg(test)]

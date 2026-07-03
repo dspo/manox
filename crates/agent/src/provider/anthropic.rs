@@ -267,6 +267,10 @@ fn content_to_anthropic(c: &MessageContent) -> Option<serde_json::Value> {
             }
             Some(v)
         }
+        MessageContent::Image { data, mime_type } => Some(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": mime_type, "data": data},
+        })),
     }
 }
 

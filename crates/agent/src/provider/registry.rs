@@ -47,21 +47,15 @@ impl ProviderRegistry {
 
     /// Look up a model by its stable manox id (`provider/model/wire`).
     pub fn get_model(&self, id: &str) -> Option<AnyLanguageModel> {
-        self.models
-            .iter()
-            .find(|m| m.id() == id)
-            .cloned()
+        self.models.iter().find(|m| m.id() == id).cloned()
     }
 }
 
 /// Build a concrete `LanguageModel` from a `ResolvedModel` by `wire_api`. Requires resolving the api_key.
 fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
-    let api_key = resolve_apikey(
-        resolved
-            .apikey_source
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("provider {} 未配置 apikey_source", resolved.provider_name))?,
-    )?;
+    let api_key = resolve_apikey(resolved.apikey_source.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("provider {} 未配置 apikey_source", resolved.provider_name)
+    })?)?;
     let max_tokens = parse_max_tokens(&resolved.context);
 
     let model: AnyLanguageModel = match resolved.wire_api {
@@ -124,9 +118,8 @@ fn parse_max_tokens(context: &str) -> u64 {
 /// Read the cx config, build the registry, and register it globally. Call at App startup.
 /// Panics on failure — manox is unusable without an LLM.
 pub fn init(_cx: &mut App) {
-    let config = CxConfig::load_default().unwrap_or_else(|e| {
-        panic!("加载 cx providers 配置失败: {e}")
-    });
+    let config =
+        CxConfig::load_default().unwrap_or_else(|e| panic!("加载 cx providers 配置失败: {e}"));
     let registry = ProviderRegistry::from_config(config);
     if registry.models().is_empty() {
         tracing::error!("ProviderRegistry 初始化后无可用模型");

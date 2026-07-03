@@ -19,14 +19,15 @@ use futures::StreamExt as _;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task};
 use tokio_util::sync::CancellationToken;
 
+use crate::db::ThreadRecord;
 use crate::language_model::{
-    AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
-    LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role, StopReason,
+    AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
+    Role, StopReason,
 };
 use crate::message::Message;
 use crate::tool::{PermissionCache, PermissionDecision, ToolRegistry};
 use crate::tools;
-use crate::db::ThreadRecord;
 
 /// Stable `Thread` id used for persistence.
 #[derive(Debug, Clone)]
@@ -62,6 +63,10 @@ pub enum ThreadEvent {
         output: String,
         is_error: bool,
     },
+    /// Live output chunk from a streaming tool (e.g. `bash` stdout/stderr).
+    /// Accumulated into the matching tool-call item's `output` until the
+    /// final `ToolResult` overwrites it with the canonical (truncated) text.
+    ToolOutput { id: String, chunk: String },
     /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with the decision.
     ToolCallAuthorization {
         id: String,
@@ -102,7 +107,10 @@ impl Thread {
         cx.new(|_cx| Self {
             id,
             messages: Vec::new(),
-            model: crate::provider::registry::global().models().first().cloned(),
+            model: crate::provider::registry::global()
+                .models()
+                .first()
+                .cloned(),
             tools: Arc::new(tools::default_registry(cwd.clone())),
             permission: Arc::new(PermissionCache::default()),
             cwd,
@@ -178,8 +186,7 @@ impl Thread {
         if let Some((pending_id, tx)) = self.pending_authorization.take()
             && pending_id == id
             && tx.send(decision).is_ok()
-        {
-        }
+        {}
         let _ = cx;
     }
 
@@ -207,6 +214,16 @@ impl Thread {
     /// Append a user message.
     pub fn insert_user_message(&mut self, text: String, cx: &mut Context<Self>) {
         self.messages.push(Message::user(text));
+        cx.notify();
+    }
+
+    /// Append a user message carrying multiple content blocks (e.g. text plus attached images).
+    pub fn insert_user_message_with_content(
+        &mut self,
+        content: Vec<MessageContent>,
+        cx: &mut Context<Self>,
+    ) {
+        self.messages.push(Message::user_with_content(content));
         cx.notify();
     }
 
@@ -294,9 +311,8 @@ impl Thread {
                 break;
             }
 
-            let mut tool_uses = this.update(cx, |this, _cx| {
-                std::mem::take(&mut this.pending_tool_uses)
-            })?;
+            let mut tool_uses =
+                this.update(cx, |this, _cx| std::mem::take(&mut this.pending_tool_uses))?;
             if tool_uses.is_empty() {
                 break;
             }
@@ -401,8 +417,29 @@ impl Thread {
         })?;
 
         let input = tu.input.clone();
-        let result_task: Task<Result<String, String>> =
-            this.update(cx, |_this, cx| tool.run(input, cancel.clone(), cx))?;
+        let (sink, rx) = crate::tool::ToolOutputSink::channel(id.clone().into());
+        let id_for_drain = id.clone();
+        let result_task: Task<Result<String, String>> = this.update(cx, |_this, cx| {
+            tool.run_streaming(input, cancel.clone(), sink, cx)
+        })?;
+        // Drain live output chunks to the UI while the tool runs. A foreground
+        // spawn is used (not background_spawn) because emitting requires an
+        // `AsyncApp`, which is `!Send` (`Rc`-backed). The receiver closes once
+        // the tool task drops the sink, so this detaches cleanly when
+        // `result_task` completes.
+        this.update(cx, |_, cx| {
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                while let Ok(chunk) = rx.recv().await {
+                    let _ = this.update(cx, |_, cx| {
+                        cx.emit(ThreadEvent::ToolOutput {
+                            id: id_for_drain.clone(),
+                            chunk,
+                        });
+                    });
+                }
+            })
+            .detach();
+        })?;
         let output = result_task.await;
         let (output_str, is_error) = match output {
             Ok(o) => (o, false),

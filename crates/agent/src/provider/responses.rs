@@ -224,6 +224,7 @@ fn build_input(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
         let mut text_buf = String::new();
         let mut tool_uses: Vec<&LanguageModelToolUse> = Vec::new();
         let mut tool_results: Vec<&crate::language_model::LanguageModelToolResult> = Vec::new();
+        let mut images: Vec<(&str, &str)> = Vec::new();
 
         for c in &m.content {
             match c {
@@ -231,23 +232,36 @@ fn build_input(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
                 MessageContent::Thinking { text, .. } => text_buf.push_str(text),
                 MessageContent::ToolUse(tu) => tool_uses.push(tu),
                 MessageContent::ToolResult(tr) => tool_results.push(tr),
+                MessageContent::Image { data, mime_type } => images.push((data, mime_type)),
             }
         }
 
         let has_text = !text_buf.trim().is_empty();
         let has_tool_uses = !tool_uses.is_empty();
         let has_tool_results = !tool_results.is_empty();
+        // Images only attach to user turns; the Responses wire has no assistant image part.
+        let has_images = !images.is_empty() && m.role == Role::User;
 
-        if has_text {
+        if has_text || has_images {
             let (role, text_kind) = match m.role {
                 Role::User => ("user", "input_text"),
                 Role::Assistant => ("assistant", "output_text"),
                 Role::System => ("system", "input_text"),
             };
+            let mut content: Vec<Value> = Vec::new();
+            if has_text {
+                content.push(json!({"type": text_kind, "text": text_buf}));
+            }
+            for (data, mime) in &images {
+                content.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{mime};base64,{data}"),
+                }));
+            }
             out.push(json!({
                 "type": "message",
                 "role": role,
-                "content": [{"type": text_kind, "text": text_buf}],
+                "content": content,
             }));
         }
 

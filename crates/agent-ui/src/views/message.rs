@@ -10,7 +10,11 @@
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, px};
 use gpui_component::text::TextView;
-use gpui_component::{Icon, IconName, Sizable as _, Theme, button::{Button, ButtonVariants as _}, h_flex, v_flex};
+use gpui_component::{
+    Icon, IconName, Sizable as _, Theme,
+    button::{Button, ButtonVariants as _},
+    h_flex, v_flex,
+};
 
 use crate::conversation::{ConvItem, ToolCallItem};
 
@@ -54,24 +58,32 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .border_1()
                 .border_color(theme.border)
                 .shadow_sm()
-                .child(
-                    h_flex()
-                        .w_full()
-                        .justify_end()
-                        .child(copy_button(ix, "copy-user", text.to_string())),
-                )
+                .child(h_flex().w_full().justify_end().child(copy_button(
+                    ix,
+                    "copy-user",
+                    text.to_string(),
+                )))
                 .child(
                     gpui::div()
                         .text_sm()
                         .text_color(theme.secondary_foreground)
-                        .child(TextView::markdown(("user-text", ix), text.to_string()).selectable(true)),
+                        .child(
+                            TextView::markdown(("user-text", ix), text.to_string())
+                                .selectable(true),
+                        ),
                 ),
         )
         .into_any_element()
 }
 
 /// Render an assistant message: role label + copy button + markdown body. `role` is the model display name (dynamic).
-pub fn render_assistant(text: &str, streaming: bool, ix: usize, role: &str, theme: &Theme) -> gpui::AnyElement {
+pub fn render_assistant(
+    text: &str,
+    streaming: bool,
+    ix: usize,
+    role: &str,
+    theme: &Theme,
+) -> gpui::AnyElement {
     let shown = if streaming {
         format!("{text}▌")
     } else {
@@ -152,12 +164,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .w_full()
                 .justify_between()
                 .items_center()
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .text_color(theme.danger)
-                        .child("错误"),
-                )
+                .child(gpui::div().text_sm().text_color(theme.danger).child("错误"))
                 .child(copy_button(ix, "copy-error", msg.to_string())),
         )
         .child(
@@ -227,9 +234,18 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
                 ),
         );
 
-    if !item.output.is_empty() {
+    // While streaming, show the live tail so newly-emitted lines stay visible
+    // without a scroll handle (the full, truncated output replaces it once the
+    // final `ToolResult` lands and `streaming` flips false).
+    let display_output = if item.streaming {
+        live_tail(&item.output)
+    } else {
+        item.output.clone()
+    };
+
+    if !display_output.is_empty() {
         // Wrap as a markdown code block: monospace, uninterpreted, selectable.
-        let code = format!("```\n{}\n```", item.output);
+        let code = format!("```\n{}\n```", display_output);
         card = card.child(
             gpui::div()
                 .id(("tool-output", ix))
@@ -245,6 +261,22 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
         );
     }
     card.into_any_element()
+}
+
+/// Trailing slice of live output: keep the last ~12 KiB so the most recent
+/// lines are in view as they stream in. Whole-buffer lines are preserved once
+/// the final result arrives.
+fn live_tail(output: &str) -> String {
+    const TAIL_BYTES: usize = 12 * 1024;
+    if output.len() <= TAIL_BYTES {
+        return output.to_string();
+    }
+    let cut = output.len() - TAIL_BYTES;
+    // Start at the next line boundary so we don't slice mid-line.
+    let start = output[cut..].find('\n').map(|i| cut + i + 1).unwrap_or(cut);
+    let mut s = String::from("…（已省略前面部分）\n");
+    s.push_str(&output[start..]);
+    s
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {

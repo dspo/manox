@@ -260,7 +260,12 @@ impl ResolvedModel {
 
     /// Stable id used for display and unique identification (provider/model/wire).
     pub fn key(&self) -> String {
-        format!("{}/{}/{}", self.provider_name, self.id, self.wire_api.display())
+        format!(
+            "{}/{}/{}",
+            self.provider_name,
+            self.id,
+            self.wire_api.display()
+        )
     }
 
     /// model id sent to the API: the trailing `[<digits>m]` context suffix is stripped (e.g. `glm-5.2[1m]` → `glm-5.2`).
@@ -382,7 +387,9 @@ providers:
         assert!(!resolved.is_empty(), "至少应有一个 resolved model");
         // The Bailian provider should exist and contain glm-5.2[1m] (anthropic wire).
         let has_bailian_glm = resolved.iter().any(|m| {
-            m.provider_name == "百炼" && m.id.contains("glm-5.2") && m.wire_api == WireApi::Anthropic
+            m.provider_name == "百炼"
+                && m.id.contains("glm-5.2")
+                && m.wire_api == WireApi::Anthropic
         });
         assert!(has_bailian_glm, "应含百炼 glm-5.2[1m] anthropic");
         let _ = path;

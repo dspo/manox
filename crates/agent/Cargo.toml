@@ -11,6 +11,8 @@ futures.workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 libc = { workspace = true }
+brush-core = { workspace = true }
+brush-builtins = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
