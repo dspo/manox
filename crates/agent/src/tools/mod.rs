@@ -59,8 +59,12 @@ where
 /// The result feeds both FS ops and hashline snapshot keys, so `read_file` and
 /// `edit_file` stay consistent regardless of how the model spelled the path.
 /// `cwd` is absolute (set by `Thread::set_project`), so a relative input always
-/// yields an absolute path — never the process cwd.
+/// yields an absolute path — never the process cwd. `~` is NOT expanded (callers
+/// spell absolute home paths or `set_project` to a resolved dir); the path is
+/// also not canonicalized, so `.`/`..` segments stay literal to keep snapshot
+/// keys a stable string.
 fn resolve_path<P: AsRef<Path>>(input: P, cwd: &Path) -> PathBuf {
+    debug_assert!(cwd.is_absolute(), "resolve_path cwd must be absolute");
     let p = input.as_ref();
     if p.is_absolute() {
         p.to_path_buf()
