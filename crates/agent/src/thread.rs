@@ -1058,16 +1058,24 @@ impl Thread {
     /// Map `messages` into a `LanguageModelRequest` (including tool definitions).
     /// A sub-agent's system prompt, when set, is prepended as a `System` message;
     /// the Anthropic wire mapper lifts `System` messages into the top-level
-    /// `system` field, and other wires treat it as a leading message.
+    /// `system` field, and other wires treat it as a leading message. The main
+    /// thread has no `system` field, so a runtime-identity prompt (thread id,
+    /// cwd, project, os, shell, date) is minted here instead — see
+    /// `system_prompt::build_main_system_prompt`.
     fn build_completion_request(&self) -> LanguageModelRequest {
         let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
-        if let Some(sys) = &self.system {
-            messages.push(LanguageModelRequestMessage {
-                role: Role::System,
-                content: vec![MessageContent::Text(sys.clone())],
-                cache: false,
-            });
-        }
+        let system = self.system.clone().unwrap_or_else(|| {
+            crate::system_prompt::build_main_system_prompt(
+                &self.cwd,
+                self.project.as_deref(),
+                &self.id.0,
+            )
+        });
+        messages.push(LanguageModelRequestMessage {
+            role: Role::System,
+            content: vec![MessageContent::Text(system)],
+            cache: true,
+        });
         // Map canonical messages to the request, stripping the `agent` tool's
         // JSON envelope to just its `final` text. The full sub-conversation
         // stays in `self.messages` for persistence and UI rebuild, but the

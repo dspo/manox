@@ -296,7 +296,14 @@ fn parse_op_header(line: &str) -> Result<ParsedOp, String> {
         }
         return Err("未知 INS 位置（应为 PRE/POST/HEAD/TAIL）".to_string());
     }
-    Err(format!("无法识别的操作头: {line:?}"))
+    Err(format!(
+        "无法识别的操作头: {line:?}。\
+         提示：body 行（要插入/替换的正文）必须以 `+` 开头（如 `+new content`），\
+         `+` 单独一行表示空行，`+-x`/`++x` 转义字面 `-`/`+`；\
+         `-` 开头的 markdown 列表项不是 body 行，请改写成 `+` 前缀。\
+         若你确实在写操作头，可用指令：`SWAP N.=M:` / `DEL N.=M` / `INS.PRE N:` / \
+         `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` / `SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:`。"
+    ))
 }
 
 /// Parse `[PATH#TAG]` → `FilePatch` with empty ops. Returns `None` if not a
@@ -525,5 +532,25 @@ mod tests {
     fn error_on_unrecognized_header() {
         let e = parse_patch("[a.rs#1A2B]\nFROB 1").unwrap_err();
         assert!(e.message.contains("无法识别"));
+    }
+
+    #[test]
+    fn unrecognized_header_suggests_plus_body_prefix() {
+        // Reproduces thread c5aefe4d msg 17: the model wrote a `- `-prefixed
+        // markdown list item where a `+`-prefixed body row was expected, and
+        // the parser saw it as an operation header. The error must steer the
+        // model toward the `+` body-row prefix.
+        let e = parse_patch("[a.rs#1A2B]\n- `hashline/` — 行锚定补丁系统").unwrap_err();
+        assert!(e.message.contains("无法识别"), "got: {}", e.message);
+        assert!(
+            e.message.contains("`+`"),
+            "must mention `+` prefix: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("markdown"),
+            "must mention markdown: {}",
+            e.message
+        );
     }
 }

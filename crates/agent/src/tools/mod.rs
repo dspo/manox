@@ -90,8 +90,10 @@ impl AgentTool for ReadFileTool {
         "read_file"
     }
     fn description(&self) -> &str {
-        "读取指定文件的完整内容。输出格式：首行 `[PATH#TAG]`（TAG 是 4-hex 快照标签），\
-         随后是 `N:TEXT` 行号格式（1-indexed）。后续 edit_file 必须复用此 TAG 与行号。"
+        "读取指定文件的完整内容。输出格式：首行 `[<绝对路径>#<TAG>]`，\
+         例如 `[/Users/me/proj/src/lib.rs#A557]`，其中 TAG 是 4-hex 快照标签。\
+         随后是 `N:TEXT` 行号格式（1-indexed）。后续 edit_file 必须复用此 TAG 与行号，\
+         且 patch 头部要写 read_file 返回的同一个绝对路径——不要用字面 `PATH` 占位符。"
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<ReadFileInput>()
@@ -179,17 +181,21 @@ pub struct EditFileTool {
 
 #[derive(Deserialize, JsonSchema)]
 struct EditFileInput {
-    /// Hashline patch text. Each file section starts with `[PATH#TAG]` where TAG
-    /// is the 4-hex snapshot tag from your latest `read_file`. Operations:
-    /// `SWAP N.=M:` replace lines N..=M (inclusive) with the `+TEXT` body rows;
-    /// `DEL N.=M` delete lines N..=M (no body); `INS.PRE N:` / `INS.POST N:` /
-    /// `INS.HEAD:` / `INS.TAIL:` insert body rows; `SWAP.BLK N:` / `DEL.BLK N` /
-    /// `INS.BLK.POST N:` operate on the bracket-block beginning at line N. Body
-    /// rows are `+TEXT` (`+` alone = blank line; `+-x`/`++x` escapes a literal
-    /// leading `-`/`+`). Line numbers reference the ORIGINAL file from read_file
-    /// and do not shift across hunks. Ranges cover only changed lines; pure
-    /// additions use `INS`, never a widened `SWAP`. On a stale-TAG rejection,
-    /// re-`read_file` before retrying.
+    /// Hashline patch text. Each file section starts with a header
+    /// `[<abs-path>#<tag>]` — paste the exact absolute path and 4-hex tag
+    /// returned by your latest `read_file` for that file; do NOT write the
+    /// literal word `PATH`. Example: `[/Users/me/proj/CLAUDE.md#A557]`.
+    /// Operations: `SWAP N.=M:` replace lines N..=M (inclusive) with the
+    /// `+TEXT` body rows; `DEL N.=M` delete lines N..=M (no body);
+    /// `INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` insert body
+    /// rows; `SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:` operate on the
+    /// bracket-block beginning at line N. Body rows are `+TEXT` (`+` alone =
+    /// blank line; `+-x`/`++x` escapes a literal leading `-`/`+`); a `-`-prefixed
+    /// markdown list item is NOT a body row — rewrite it with a `+` prefix.
+    /// Line numbers reference the ORIGINAL file from read_file and do not shift
+    /// across hunks. Ranges cover only changed lines; pure additions use
+    /// `INS`, never a widened `SWAP`. On a stale-TAG rejection, re-`read_file`
+    /// before retrying.
     patch: String,
 }
 

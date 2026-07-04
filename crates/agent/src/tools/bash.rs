@@ -40,8 +40,13 @@ use crate::tools::{bridge_tokio, schema};
 
 /// Wall-clock limit before a hung command is killed.
 const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
-/// Hard cap on retained stdout/stderr so a runaway command cannot OOM the app.
-const BASH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
+/// Hard cap on retained stdout/stderr so a runaway command cannot OOM the app
+/// and does not flood the model's context. Above this the capture keeps a
+/// running byte total (for the truncation notice) but drops the overflowing
+/// text. 64 KiB mirrors the order of magnitude used by other native agents
+/// (zed 16 KiB, pi/oh-my-pi 50 KiB) — enough for typical `git`/`cargo` output,
+/// small enough that the model can act on it.
+const BASH_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// Grace window given to a SIGTERM'd process group before escalating to SIGKILL.
 const CANCELLATION_GRACE_MS: u64 = 50;
 /// Upper bound on draining the stdout/stderr pipes after the group is killed:
@@ -230,10 +235,20 @@ async fn run_bash(
     // Drain readers within the IO deadline, then extract the captured text.
     drain(&mut out_task).await;
     drain(&mut err_task).await;
-    let (out_str, out_trunc) = out_buf.lock().expect("capture buffer lock poisoned").take();
-    let (err_str, err_trunc) = err_buf.lock().expect("capture buffer lock poisoned").take();
+    let (out_str, out_trunc, out_dropped) =
+        out_buf.lock().expect("capture buffer lock poisoned").take();
+    let (err_str, err_trunc, err_dropped) =
+        err_buf.lock().expect("capture buffer lock poisoned").take();
 
-    format_result(ran, out_str, out_trunc, err_str, err_trunc)
+    format_result(
+        ran,
+        out_str,
+        out_trunc,
+        out_dropped,
+        err_str,
+        err_trunc,
+        err_dropped,
+    )
 }
 
 /// Format the outcome: success returns stdout (or stderr when stdout is empty);
@@ -243,11 +258,13 @@ fn format_result(
     ran: Outcome,
     stdout: String,
     stdout_trunc: bool,
+    stdout_dropped: usize,
     stderr: String,
     stderr_trunc: bool,
+    stderr_dropped: usize,
 ) -> Result<String, anyhow::Error> {
-    let stdout = with_truncation_note(&stdout, stdout_trunc);
-    let stderr = with_truncation_note(&stderr, stderr_trunc);
+    let stdout = with_truncation_note(&stdout, stdout_trunc, stdout_dropped);
+    let stderr = with_truncation_note(&stderr, stderr_trunc, stderr_dropped);
     match ran {
         Outcome::Ran(Ok(er)) => {
             if er.exit_code.is_success() {
@@ -334,12 +351,17 @@ fn read_pipe(
     }
 }
 
-/// Byte-capped buffer: appends until `max`, then drops the rest and marks
-/// truncated. Matches the prior harness's cap-at-max policy.
+/// Byte-capped buffer: appends until `max`, then drops the overflowing text
+/// while still tallying the total bytes seen. The total lets the truncation
+/// notice tell the model how much it is missing, so it knows to narrow the
+/// command rather than guess at the truncated tail.
 struct CaptureBuffer {
     buf: Vec<u8>,
     max: usize,
     truncated: bool,
+    /// Bytes seen after the cap was hit; reported in the truncation notice.
+    /// Only accrued once `truncated` is set, so this is the dropped tail size.
+    dropped: usize,
 }
 
 impl CaptureBuffer {
@@ -348,11 +370,13 @@ impl CaptureBuffer {
             buf: Vec::with_capacity(8 * 1024),
             max,
             truncated: false,
+            dropped: 0,
         }
     }
 
     fn push(&mut self, data: &[u8]) {
         if self.truncated {
+            self.dropped = self.dropped.saturating_add(data.len());
             return;
         }
         let remaining = self.max.saturating_sub(self.buf.len());
@@ -360,22 +384,36 @@ impl CaptureBuffer {
             self.buf.extend_from_slice(data);
         } else {
             self.buf.extend_from_slice(&data[..remaining]);
+            self.dropped = self.dropped.saturating_add(data.len() - remaining);
             self.truncated = true;
         }
     }
 
-    fn take(&mut self) -> (String, bool) {
+    /// Returns `(text, truncated, dropped_bytes)`.
+    fn take(&mut self) -> (String, bool, usize) {
         let data = std::mem::take(&mut self.buf);
-        (String::from_utf8_lossy(&data).into_owned(), self.truncated)
+        let dropped = std::mem::take(&mut self.dropped);
+        (
+            String::from_utf8_lossy(&data).into_owned(),
+            self.truncated,
+            dropped,
+        )
     }
 }
 
-/// Append a truncation notice when the captured stream exceeded the byte cap.
-fn with_truncation_note(s: &str, truncated: bool) -> String {
+/// Prepend a truncation notice when the captured stream exceeded the byte cap.
+/// Prefixed (not suffixed) so the model sees the warning before the truncated
+/// text and is told the dropped size plus how to narrow the command — mirrors
+/// zed's `Command output too long. The first N bytes:` and codex's
+/// `Warning: truncated output (original token count: N)`.
+fn with_truncation_note(s: &str, truncated: bool, dropped: usize) -> String {
     if truncated {
+        let cap = BASH_OUTPUT_MAX_BYTES;
+        let total = cap + dropped;
         format!(
-            "{s}\n... [output truncated: cap {} bytes]",
-            BASH_OUTPUT_MAX_BYTES
+            "⚠ Command output too long ({total} bytes total, showing first {cap}).\n\
+             Narrow the command (select specific columns, add `| head`, `LIMIT`, etc.) and retry —\n\
+             do not guess the truncated content.\n\n{s}"
         )
     } else {
         s.to_string()
@@ -553,5 +591,57 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.trim_end(), "/tmp");
+    }
+
+    #[test]
+    fn capture_buffer_caps_and_tracks_dropped_total() {
+        let mut buf = CaptureBuffer::new(64 * 1024);
+        // First 64 KiB fills the cap exactly without truncation.
+        buf.push(&vec![b'x'; 64 * 1024]);
+        let (_, truncated, dropped) = buf.take();
+        assert!(!truncated, "exactly at cap is not truncated");
+        assert_eq!(dropped, 0);
+
+        // Now overflow: cap + 10 KiB more. The tail is dropped but tallied.
+        let mut buf = CaptureBuffer::new(64 * 1024);
+        buf.push(&vec![b'x'; 64 * 1024]);
+        buf.push(&vec![b'y'; 10 * 1024]);
+        let (text, truncated, dropped) = buf.take();
+        assert!(truncated);
+        assert_eq!(dropped, 10 * 1024);
+        assert!(!text.contains('y'), "dropped tail must not appear in text");
+    }
+
+    #[test]
+    fn truncation_notice_is_prefixed_advisory_and_reports_total() {
+        // 64 KiB cap + 12 KiB dropped → 76 KiB total reported.
+        let note = with_truncation_note("leftover line", true, 12 * 1024);
+        let cap = BASH_OUTPUT_MAX_BYTES;
+        assert!(
+            note.starts_with('⚠'),
+            "notice must be prefixed so the model sees it first: {note}"
+        );
+        assert!(
+            note.contains("Narrow the command"),
+            "must advise narrowing: {note}"
+        );
+        assert!(
+            note.contains(&format!("{} bytes total", cap + 12 * 1024)),
+            "must report total bytes: {note}"
+        );
+        assert!(
+            note.contains("leftover line"),
+            "truncated text must still be present: {note}"
+        );
+        // The notice is prefixed, so the truncated text comes after the warning.
+        let warning_idx = note.find("⚠").unwrap();
+        let text_idx = note.find("leftover line").unwrap();
+        assert!(warning_idx < text_idx);
+    }
+
+    #[test]
+    fn truncation_notice_absent_when_not_truncated() {
+        let s = with_truncation_note("plain output", false, 0);
+        assert_eq!(s, "plain output");
     }
 }
