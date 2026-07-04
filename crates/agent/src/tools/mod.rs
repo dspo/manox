@@ -20,7 +20,7 @@ use grep_searcher::{SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -51,9 +51,33 @@ where
     })
 }
 
+// ─── path resolution ──────────────────────────────────────────────────────
+
+/// Resolve a tool input path against the thread cwd.
+///
+/// Absolute paths are returned as-is; relative paths are joined onto `cwd`.
+/// The result feeds both FS ops and hashline snapshot keys, so `read_file` and
+/// `edit_file` stay consistent regardless of how the model spelled the path.
+/// `cwd` is absolute (set by `Thread::set_project`), so a relative input always
+/// yields an absolute path — never the process cwd. `~` is NOT expanded (callers
+/// spell absolute home paths or `set_project` to a resolved dir); the path is
+/// also not canonicalized, so `.`/`..` segments stay literal to keep snapshot
+/// keys a stable string.
+fn resolve_path<P: AsRef<Path>>(input: P, cwd: &Path) -> PathBuf {
+    debug_assert!(cwd.is_absolute(), "resolve_path cwd must be absolute");
+    let p = input.as_ref();
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
 // ─── read_file ────────────────────────────────────────────────────────────
 
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    cwd: Arc<PathBuf>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct ReadFileInput {
@@ -81,16 +105,16 @@ impl AgentTool for ReadFileTool {
         let Ok(parsed) = serde_json::from_value::<ReadFileInput>(input) else {
             return cx.background_spawn(async { Err("input 解析失败".to_string()) });
         };
+        let path = resolve_path(&parsed.path, &self.cwd);
         cx.background_spawn(async move {
-            let raw = std::fs::read_to_string(&parsed.path)
-                .map_err(|e| format!("read_file 失败: {e}"))?;
+            let raw = std::fs::read_to_string(&path).map_err(|e| format!("read_file 失败: {e}"))?;
             let text = crate::hashline::normalize_to_lf(&raw);
             let snap = crate::hashline::global()
                 .lock()
                 .expect("hashline store poisoned")
-                .record(std::path::Path::new(&parsed.path), &text);
+                .record(&path, &text);
             Ok(crate::hashline::format_numbered(
-                &parsed.path,
+                &path.display().to_string(),
                 &text,
                 &snap.tag,
             ))
@@ -100,7 +124,9 @@ impl AgentTool for ReadFileTool {
 
 // ─── write_file ───────────────────────────────────────────────────────────
 
-pub struct WriteFileTool;
+pub struct WriteFileTool {
+    cwd: Arc<PathBuf>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct WriteFileInput {
@@ -132,12 +158,14 @@ impl AgentTool for WriteFileTool {
         let Ok(parsed) = serde_json::from_value::<WriteFileInput>(input) else {
             return cx.background_spawn(async { Err("input 解析失败".to_string()) });
         };
+        let path = resolve_path(&parsed.path, &self.cwd);
+        let content_len = parsed.content.len();
         cx.background_spawn(async move {
-            if let Some(parent) = std::path::Path::new(&parsed.path).parent() {
+            if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            std::fs::write(&parsed.path, &parsed.content)
-                .map(|_| format!("已写入 {}（{} 字节）", parsed.path, parsed.content.len()))
+            std::fs::write(&path, &parsed.content)
+                .map(|_| format!("已写入 {}（{content_len} 字节）", path.display()))
                 .map_err(|e| format!("write_file 失败: {e}"))
         })
     }
@@ -145,7 +173,9 @@ impl AgentTool for WriteFileTool {
 
 // ─── edit_file ────────────────────────────────────────────────────────────
 
-pub struct EditFileTool;
+pub struct EditFileTool {
+    cwd: Arc<PathBuf>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct EditFileInput {
@@ -185,11 +215,12 @@ impl AgentTool for EditFileTool {
         let Ok(parsed) = serde_json::from_value::<EditFileInput>(input) else {
             return cx.background_spawn(async { Err("input 解析失败".to_string()) });
         };
+        let cwd = self.cwd.clone();
         cx.background_spawn(async move {
             let patches = crate::hashline::parse_patch(&parsed.patch).map_err(|e| e.to_string())?;
             let mut results: Vec<String> = Vec::new();
             for fp in patches {
-                let path = fp.path.clone();
+                let path = resolve_path(&fp.path, &cwd);
                 let path_display = path.display().to_string();
                 let raw = std::fs::read_to_string(&path)
                     .map_err(|e| format!("edit_file 读取失败 {path_display}: {e}"))?;
@@ -221,7 +252,7 @@ impl AgentTool for EditFileTool {
                 let new_snap = crate::hashline::global()
                     .lock()
                     .expect("hashline store poisoned")
-                    .record(std::path::Path::new(&path), &new_text);
+                    .record(&path, &new_text);
                 let diff = unified_diff(&current, &new_text);
                 results.push(format!("[{}#{}]\n{}", path_display, new_snap.tag, diff));
             }
@@ -308,7 +339,7 @@ impl AgentTool for ListDirectoryTool {
         };
         let base = parsed
             .path
-            .map(PathBuf::from)
+            .map(|p| resolve_path(&p, &self.cwd))
             .unwrap_or_else(|| self.cwd.as_ref().clone());
         cx.background_spawn(async move {
             let entries =
@@ -368,7 +399,7 @@ impl AgentTool for GrepTool {
         };
         let base = parsed
             .path
-            .map(PathBuf::from)
+            .map(|p| resolve_path(&p, &self.cwd))
             .unwrap_or_else(|| self.cwd.as_ref().clone());
         cx.background_spawn(async move { run_grep(&parsed.pattern, &base, parsed.glob.as_deref()) })
     }
@@ -504,7 +535,10 @@ impl AgentTool for GlobTool {
         };
         let cwd = self.cwd.as_ref().clone();
         cx.background_spawn(async move {
-            let root = parsed.path.map(PathBuf::from).unwrap_or_else(|| cwd.clone());
+            let root = parsed
+                .path
+                .map(|p| resolve_path(&p, &cwd))
+                .unwrap_or_else(|| cwd.clone());
             let matcher = GlobSetBuilder::new()
                 .add(Glob::new(&parsed.pattern).map_err(|e| format!("glob 模式无效: {e}"))?)
                 .build()
@@ -564,9 +598,9 @@ impl AgentTool for GlobTool {
 /// registry and sub-agent registries (which filter by name).
 pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
     vec![
-        Arc::new(ReadFileTool) as AnyAgentTool,
-        Arc::new(WriteFileTool),
-        Arc::new(EditFileTool),
+        Arc::new(ReadFileTool { cwd: cwd.clone() }) as AnyAgentTool,
+        Arc::new(WriteFileTool { cwd: cwd.clone() }),
+        Arc::new(EditFileTool { cwd: cwd.clone() }),
         Arc::new(ListDirectoryTool { cwd: cwd.clone() }),
         Arc::new(bash::BashTool::new(cwd.as_ref().clone())),
         Arc::new(GrepTool { cwd: cwd.clone() }),
@@ -632,5 +666,49 @@ mod tests {
         assert_eq!(persist("", false, false, true), "");
         // BOM is re-prepended.
         assert_eq!(persist("x", false, true, false), "\u{feff}x");
+    }
+
+    #[test]
+    fn resolve_path_passes_absolute_through() {
+        let cwd = Path::new("/Users/someone/proj");
+        // Unix absolute, with trailing file name.
+        assert_eq!(
+            resolve_path("/Users/someone/proj/CLAUDE.md", cwd),
+            PathBuf::from("/Users/someone/proj/CLAUDE.md")
+        );
+        // Absolute path is not rewritten to live under cwd even if it overlaps.
+        assert_eq!(
+            resolve_path("/tmp/elsewhere.txt", cwd),
+            PathBuf::from("/tmp/elsewhere.txt")
+        );
+    }
+
+    #[test]
+    fn resolve_path_joins_relative_onto_cwd() {
+        let cwd = Path::new("/Users/someone/proj");
+        assert_eq!(
+            resolve_path("CLAUDE.md", cwd),
+            PathBuf::from("/Users/someone/proj/CLAUDE.md")
+        );
+        // `.` and nested relative paths resolve under cwd, never the process cwd.
+        assert_eq!(
+            resolve_path("./src/lib.rs", cwd),
+            PathBuf::from("/Users/someone/proj/src/lib.rs")
+        );
+        assert_eq!(
+            resolve_path("src/lib.rs", cwd),
+            PathBuf::from("/Users/someone/proj/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_path_handles_dot_dot() {
+        let cwd = Path::new("/Users/someone/proj");
+        // `..` stays literal (no canonicalization) so hashline snapshot keys
+        // remain a stable string across calls — the cwd is already absolute.
+        assert_eq!(
+            resolve_path("../sibling/file.txt", cwd),
+            PathBuf::from("/Users/someone/proj/../sibling/file.txt")
+        );
     }
 }

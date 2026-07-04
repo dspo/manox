@@ -365,7 +365,9 @@ fn expect_colon(s: &str) -> Result<(), String> {
     if s == ":" {
         Ok(())
     } else {
-        Err(format!("期望 `:` 结尾，遇到 {:?}", s))
+        Err(format!(
+            "期望 `:` 结尾，遇到 {s:?}。带 body 的指令以 `:` 收尾：`SWAP N.=M:` / `SWAP.BLK N:` / `INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` / `INS.BLK.POST N:`；不带 body 的 `DEL`/`DEL.BLK` 无冒号（如 `DEL N.=M` / `DEL.BLK N`）。若行号写成了 `N:M` 多半是误把 `N.=M:` 拼成了 `N:M`。"
+        ))
     }
 }
 
