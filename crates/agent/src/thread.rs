@@ -1074,7 +1074,11 @@ impl Thread {
         messages.push(LanguageModelRequestMessage {
             role: Role::System,
             content: vec![MessageContent::Text(system)],
-            cache: true,
+            // The `cache` flag is currently advisory only — the Anthropic wire
+            // mapper (`provider/anthropic.rs::content_to_anthropic`) does not yet
+            // emit `cache_control` breakpoints. Kept `false` to avoid implying
+            // caching that isn't actually wired up.
+            cache: false,
         });
         // Map canonical messages to the request, stripping the `agent` tool's
         // JSON envelope to just its `final` text. The full sub-conversation
