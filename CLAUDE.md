@@ -85,6 +85,15 @@ crates/
 - `db.rs` — `ThreadsDatabase`（SQLite `threads` 表，路径 `$HOME/.config/cx/manox/threads.db`），`Mutex<Connection>` 同步操作。
 
 - `thread_store.rs` — `ThreadStore` 进程全局 Entity（`OnceLock`），管理 Thread 摘要列表，提供 `save_thread` 异步落盘 + refresh。
+- `hashline/` — 行锚定补丁系统 + 快照恢复：
+  - `mod.rs` — 全局 `SnapshotStore`（`OnceLock<Mutex<>>`），`init()` 在 `agent::init` 时调用。
+  - `hash.rs` — `compute_tag` 计算 4-hex 内容哈希（规范化文本的 CRC32）。
+  - `snapshot.rs` — `SnapshotStore` 管理 path → `Snapshot`（raw bytes + tag + line_count），`read_file` 记录前调用 `store_snapshot`，`edit_file` 用 `get_snapshot` 验证 tag。
+  - `parser.rs` — 补丁解析：支持 `SWAP N.=M`、`DEL N.=M`、`INS.PRE/POST/HEAD/TAIL N`、`SWAP.BLK N` 等操作，产出 `FilePatch` → `Vec<Op>`。
+  - `apply.rs` — 补丁应用：`apply` 对 ORIGINAL 行号逐 op 后向应用；tag 过期时 `try_recover` 做 3-way merge（基于内容范围定位快照片段到当前文本）。
+  - `block.rs` — 行范围块结构（`BlockError`）。
+  - `recovery.rs` — `try_recover` / `try_recover_with_snapshot` 恢复逻辑。
+  - 工具链：`read_file` 输出 `[PATH#TAG]` 头部 + `N:TEXT` 带行号内容；`edit_file` 输入 hashline patch 格式，复用 TAG 验证后应用。
 
 **Thread 审批流：** 工具需审批时，`run_tool` 发 `ThreadEvent::ToolCallAuthorization` 携带 `oneshot::Sender`，UI 弹窗后调用 `Thread::respond_authorization` 回传 `ToolAuthorizationResponse`（普通工具为 `Decision(PermissionDecision)`，`AskUserQuestion` 为 `AskUserQuestion { answers, response }`，thread 据此短路生成 ToolResult 而不执行 `run`），task 在 gpui executor 上 `await` oneshot receiver。
 
