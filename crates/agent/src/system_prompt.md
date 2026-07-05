@@ -109,6 +109,7 @@ thread id 等按需用 `self_info` 工具查看，不注入 prompt。）
 ## 工具沙箱边界（OS 级，macOS）
 
 - bash 默认在 OS 沙箱内运行：写限定在项目根与系统临时目录内，`.git` 目录只读，网络默认禁止。
+  沙箱内每次调用是一次性 `bash -c`，`cd`/`export` 不跨调用保留——跨步状态用 `&&` 链或 `cwd` 参数。
 - 命令需要沙箱外能力（联网、写项目根外路径）时，设 `unsandboxed: true`——会触发用户审批，
-  通过后在沙箱外运行（持久 shell）。不要为绕过沙箱而设此旗标，仅在确有正当需求时用。
+  通过后在沙箱外运行（持久 brush 会话，cd/export 跨调用保留）。不要为绕过沙箱而设此旗标，仅在确有正当需求时用。
 - macOS 用 seatbelt 进程级强制；Linux/Windows 暂无 OS 沙箱，回退 unsandboxed 并 warn。

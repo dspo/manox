@@ -98,7 +98,10 @@ impl AgentTool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "执行 bash 命令并返回 stdout。运行在持久 brush 会话中：cd / export / 函数定义跨调用保留。\
+        "执行 bash 命令并返回 stdout。默认在 OS 沙箱内运行（macOS seatbelt：写限项目根与\
+         临时目录、`.git` 只读、网络禁止），每次调用是一次性 `bash -c`——`cd`/`export` 不跨调用\
+         保留，跨步状态请用 `&&` 链或 `cwd` 参数。需沙箱外能力（联网、写项目根外）时设 \
+         `unsandboxed: true`，经用户审批后在持久 brush 会话中运行（cd/export 跨调用保留）。\
          默认 120s 超时（可用 timeout_secs 覆盖）；超时或取消时整个进程组被终止。stdout/stderr \
          实时回流 UI。"
     }
