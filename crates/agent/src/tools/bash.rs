@@ -506,27 +506,29 @@ fn format_sandboxed_result(
     }
 }
 
-/// Async line reader: appends bytes into a [`CaptureBuffer`] and forwards
+/// Async chunk reader: appends bytes into a [`CaptureBuffer`] and forwards
 /// complete lines to the live `sink`, mirroring the sync [`read_pipe`] but for
-/// a tokio pipe. EOFs when the child's stdout/stderr close.
+/// a tokio pipe. Reads in fixed 8 KiB chunks (not `read_until`) so a
+/// newline-less binary stream can't grow an unbounded line buffer or emit a
+/// single huge chunk to the sink. EOFs when the child's stdout/stderr close.
 #[cfg(target_os = "macos")]
-async fn read_pipe_async<R: tokio::io::AsyncBufRead + Unpin>(
+async fn read_pipe_async<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     buf: Arc<std::sync::Mutex<CaptureBuffer>>,
     sink: ToolOutputSink,
 ) {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
     let mut carry: Vec<u8> = Vec::new();
-    let mut chunk = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
     loop {
-        chunk.clear();
-        match reader.read_until(b'\n', &mut chunk).await {
+        match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(_) => {
+            Ok(n) => {
+                let data = &chunk[..n];
                 if let Ok(mut b) = buf.lock() {
-                    b.push(&chunk);
+                    b.push(data);
                 }
-                carry.extend_from_slice(&chunk);
+                carry.extend_from_slice(data);
                 while let Some(i) = carry.iter().position(|&b| b == b'\n') {
                     let rest = carry.split_off(i + 1);
                     let line = std::mem::take(&mut carry);
@@ -555,7 +557,6 @@ async fn run_sandboxed_bash(
     sink: ToolOutputSink,
 ) -> Result<String, anyhow::Error> {
     use std::process::Stdio;
-    use tokio::io::BufReader;
     use tokio::process::Child;
 
     let cwd = cwd_override
@@ -594,12 +595,12 @@ async fn run_sandboxed_bash(
     let err_buf_task = err_buf.clone();
 
     let mut out_task = tokio::task::spawn(read_pipe_async(
-        BufReader::new(stdout),
+        stdout,
         out_buf_task,
         out_sink,
     ));
     let mut err_task = tokio::task::spawn(read_pipe_async(
-        BufReader::new(stderr),
+        stderr,
         err_buf_task,
         err_sink,
     ));
