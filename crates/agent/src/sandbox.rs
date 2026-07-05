@@ -41,6 +41,10 @@ use std::path::{Path, PathBuf};
 pub struct SandboxPolicy {
     writable_roots: Vec<PathBuf>,
     protected_paths: Vec<PathBuf>,
+    /// Read only by the seatbelt renderer (macOS). Kept cross-platform as a
+    /// policy knob for future Linux bwrap / Windows backends; on non-macOS it
+    /// is written but not yet read.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     allow_network: bool,
 }
 
@@ -85,6 +89,7 @@ impl SandboxPolicy {
     /// re-allow to writable roots, deny to protected paths, deny all network
     /// when `allow_network` is false. More-specific rules win, so the
     /// `.git` deny overrides the project-root allow for that subtree.
+    #[cfg(target_os = "macos")]
     fn render_seatbelt(&self) -> String {
         let mut s = String::new();
         s.push_str("(version 1)\n");
@@ -147,6 +152,7 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 
 /// Escape a path for a seatbelt `(subpath "...")` string literal. Seatbelt
 /// string literals are C-escaped; only `\` and `"` need escaping in real paths.
+#[cfg(target_os = "macos")]
 fn escape_seatbelt_path(path: &Path) -> String {
     path.display()
         .to_string()
@@ -184,6 +190,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_allows_project_root_and_tmp() {
         let s = policy().render_seatbelt();
@@ -198,6 +205,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_denies_dot_git() {
         let s = policy().render_seatbelt();
@@ -208,6 +216,7 @@ mod tests {
         assert!(s.contains(".git"), "policy: {s}");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_denies_network() {
         let s = policy().render_seatbelt();
