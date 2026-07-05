@@ -55,8 +55,11 @@ pub trait AgentTool: Send + Sync + 'static {
     fn description(&self) -> &str;
     /// JSON Schema sent to the model.
     fn input_schema(&self) -> serde_json::Value;
-    /// Whether the tool requires user approval before running (writes and command execution default to true; read-only tools false).
-    fn requires_approval(&self) -> bool {
+    /// Whether the tool requires user approval before running. Takes the
+    /// parsed-call `input` so tools like `bash` can gate approval on a knob
+    /// (e.g. `unsandboxed: true`): the sandboxed default is safe to run
+    /// without approval, only the unsandboxed escalation needs a human.
+    fn requires_approval(&self, _input: &serde_json::Value) -> bool {
         false
     }
     /// Run the tool. `cancel` is the current turn's cancellation token; long-running

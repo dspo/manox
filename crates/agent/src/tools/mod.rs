@@ -12,6 +12,7 @@
 pub mod agent;
 pub mod ask_user;
 pub mod bash;
+pub mod self_info;
 
 use globset::{Glob, GlobSetBuilder};
 use gpui::{App, AppContext as _, Task, WeakEntity};
@@ -63,7 +64,7 @@ where
 /// spell absolute home paths or `set_project` to a resolved dir); the path is
 /// also not canonicalized, so `.`/`..` segments stay literal to keep snapshot
 /// keys a stable string.
-fn resolve_path<P: AsRef<Path>>(input: P, cwd: &Path) -> PathBuf {
+pub(crate) fn resolve_path<P: AsRef<Path>>(input: P, cwd: &Path) -> PathBuf {
     debug_assert!(cwd.is_absolute(), "resolve_path cwd must be absolute");
     let p = input.as_ref();
     if p.is_absolute() {
@@ -71,6 +72,100 @@ fn resolve_path<P: AsRef<Path>>(input: P, cwd: &Path) -> PathBuf {
     } else {
         cwd.join(p)
     }
+}
+
+/// Resolve a write target and enforce the sandbox write confinement: the path
+/// must fall under the project root or temp dir, and must not be under a
+/// protected path (`.git`). Cross-platform pure-Rust check, independent of
+/// whether the seatbelt backend itself is available — FS tools don't go
+/// through bash, so seatbelt never covers them, and this is the hard layer.
+///
+/// The model escalates a write outside the writable set by routing through
+/// `bash` with `unsandboxed: true` (which triggers user approval); the error
+/// message says so.
+fn resolve_path_for_write<P: AsRef<Path>>(input: P, cwd: &Path) -> Result<PathBuf, String> {
+    let path = resolve_path(input, cwd);
+    let policy = crate::sandbox::SandboxPolicy::for_project(cwd);
+    if policy.is_protected(&path) {
+        return Err(format!(
+            "写被沙箱保护（`.git`）：{}。如需写入受保护路径，请在 bash 工具中显式设 `unsandboxed: true` 并经用户审批。",
+            path.display()
+        ));
+    }
+    if !policy.is_writable(&path) {
+        return Err(format!(
+            "写超出项目根与临时目录：{}。如需写入项目根外路径，请在 bash 工具中显式设 `unsandboxed: true` 并经用户审批。",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+// ─── truncation ───────────────────────────────────────────────────────────
+
+/// Tool output that may have exceeded a byte cap, plus enough metadata to
+/// render a uniform `⚠`-prefixed advisory.
+///
+/// Bash reaches this state via `CaptureBuffer::take` (streaming capture that
+/// already knows the dropped tail size); other tools reach it via
+/// [`truncate_output`], which cuts on a UTF-8 boundary. Both produce a
+/// `TruncatedText` so the rendered notice — `⚠ 输出过长（共 N 字节，显示前 M）`
+/// plus a per-tool narrow hint plus `不要臆测被截断的内容` — is identical
+/// across tools, mirroring zed's `Command output too long. The first N bytes:`
+/// and codex's `Warning: truncated output (original token count: N)`.
+pub(crate) struct TruncatedText<'a> {
+    text: &'a str,
+    truncated: bool,
+    cap: usize,
+    dropped: usize,
+}
+
+impl<'a> TruncatedText<'a> {
+    /// Wrap already-truncated text where the caller knows the byte cap and the
+    /// dropped tail size. `dropped == 0` means no truncation occurred.
+    pub(crate) fn new(text: &'a str, cap: usize, dropped: usize) -> Self {
+        Self {
+            text,
+            truncated: dropped > 0,
+            cap,
+            dropped,
+        }
+    }
+
+    /// Render with the uniform advisory. `hint` is folded into one line before
+    /// the "do not guess" directive, e.g. "用更窄的命令重试（`| head`、`LIMIT`）".
+    pub(crate) fn render(&self, hint: &str) -> String {
+        if !self.truncated {
+            return self.text.to_string();
+        }
+        let total = self.cap + self.dropped;
+        format!(
+            "⚠ 输出过长（共 {total} 字节，显示前 {cap}）。{hint}——不要臆测被截断的内容。\n\n{text}",
+            cap = self.cap,
+            text = self.text,
+        )
+    }
+}
+
+/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary, returning a
+/// `TruncatedText` that knows how many bytes were dropped. For tools without a
+/// streaming capture buffer. Currently exercised by its own tests; kept for the
+/// next non-streaming tool that needs it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn truncate_output(s: &str, max: usize) -> TruncatedText<'_> {
+    if s.len() <= max {
+        return TruncatedText::new(s, max, 0);
+    }
+    // Walk char boundaries; include each char whose end offset fits in `max`.
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        let next = i + c.len_utf8();
+        if next > max {
+            break;
+        }
+        end = next;
+    }
+    TruncatedText::new(&s[..end], max, s.len() - end)
 }
 
 // ─── read_file ────────────────────────────────────────────────────────────
@@ -91,9 +186,8 @@ impl AgentTool for ReadFileTool {
     }
     fn description(&self) -> &str {
         "读取指定文件的完整内容。输出格式：首行 `[<绝对路径>#<TAG>]`，\
-         例如 `[/Users/me/proj/src/lib.rs#A557]`，其中 TAG 是 4-hex 快照标签。\
-         随后是 `N:TEXT` 行号格式（1-indexed）。后续 edit_file 必须复用此 TAG 与行号，\
-         且 patch 头部要写 read_file 返回的同一个绝对路径——不要用字面 `PATH` 占位符。"
+         例如 `[/Users/me/proj/src/lib.rs#A557]`，其中 TAG 是 4-hex 快照标签；\
+         随后是 `N:TEXT` 行号格式（1-indexed）。"
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<ReadFileInput>()
@@ -145,7 +239,7 @@ impl AgentTool for WriteFileTool {
     fn description(&self) -> &str {
         "把内容写入指定文件（覆盖）。用于创建或重写文件。"
     }
-    fn requires_approval(&self) -> bool {
+    fn requires_approval(&self, _input: &serde_json::Value) -> bool {
         true
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -160,7 +254,10 @@ impl AgentTool for WriteFileTool {
         let Ok(parsed) = serde_json::from_value::<WriteFileInput>(input) else {
             return cx.background_spawn(async { Err("input 解析失败".to_string()) });
         };
-        let path = resolve_path(&parsed.path, &self.cwd);
+        let path = match resolve_path_for_write(&parsed.path, &self.cwd) {
+            Ok(p) => p,
+            Err(e) => return cx.background_spawn(async move { Err(e) }),
+        };
         let content_len = parsed.content.len();
         cx.background_spawn(async move {
             if let Some(parent) = path.parent() {
@@ -206,7 +303,7 @@ impl AgentTool for EditFileTool {
     fn description(&self) -> &str {
         "用 hashline patch 编辑已存在文件（行号锚定 + TAG 校验）。见 input.patch 字段说明。"
     }
-    fn requires_approval(&self) -> bool {
+    fn requires_approval(&self, _input: &serde_json::Value) -> bool {
         true
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -226,7 +323,7 @@ impl AgentTool for EditFileTool {
             let patches = crate::hashline::parse_patch(&parsed.patch).map_err(|e| e.to_string())?;
             let mut results: Vec<String> = Vec::new();
             for fp in patches {
-                let path = resolve_path(&fp.path, &cwd);
+                let path = resolve_path_for_write(&fp.path, &cwd)?;
                 let path_display = path.display().to_string();
                 let raw = std::fs::read_to_string(&path)
                     .map_err(|e| format!("edit_file 读取失败 {path_display}: {e}"))?;
@@ -586,10 +683,11 @@ impl AgentTool for GlobTool {
             if out.is_empty() {
                 Ok("无匹配文件".to_string())
             } else if truncated {
+                // Count-based truncation (not byte), so it does not go through
+                // `TruncatedText`; the wording is unified to the `⚠` advisory style.
                 Ok(format!(
-                    "{}\n... (truncated to {}, more matches exist — raise `limit` or narrow `pattern`)",
-                    out.join("\n"),
-                    limit
+                    "⚠ 匹配过多（已显示前 {limit} 条，更多未列出）。收窄 `pattern` 或调高 `limit` 后重试——不要臆测未列出的匹配。\n\n{}",
+                    out.join("\n")
                 ))
             } else {
                 Ok(out.join("\n"))
@@ -624,7 +722,8 @@ pub fn default_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistr
     for tool in base_tools(cwd.clone()) {
         reg.register(tool);
     }
-    reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent)) as AnyAgentTool);
+    reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone())) as AnyAgentTool);
+    reg.register(self_info::new(parent));
     reg
 }
 
@@ -716,5 +815,71 @@ mod tests {
             resolve_path("../sibling/file.txt", cwd),
             PathBuf::from("/Users/someone/proj/../sibling/file.txt")
         );
+    }
+
+    #[test]
+    fn truncate_output_caps_at_char_boundary() {
+        // 6-byte ASCII + 3-byte '世' (U+4E16). Cap at 7 bytes must keep the
+        // ASCII prefix and drop '世' whole (no mid-codepoint split).
+        let s = "abcdef世";
+        let t = truncate_output(s, 7);
+        assert!(t.truncated);
+        assert_eq!(t.text, "abcdef");
+        assert_eq!(t.dropped, "世".len()); // 3 bytes dropped
+    }
+
+    #[test]
+    fn truncate_output_no_truncation_under_cap() {
+        let t = truncate_output("short", 100);
+        assert!(!t.truncated);
+        assert_eq!(t.render("hint"), "short");
+    }
+
+    #[test]
+    fn render_prefixed_advisory_reports_total() {
+        let t = TruncatedText::new("body", 100, 50);
+        let r = t.render("收窄 pattern");
+        assert!(r.starts_with('⚠'), "prefixed: {r}");
+        assert!(r.contains("共 150 字节"), "total reported: {r}");
+        assert!(r.contains("显示前 100"), "cap reported: {r}");
+        assert!(r.contains("收窄 pattern"), "hint folded in: {r}");
+        assert!(r.contains("不要臆测"), "no-guess directive: {r}");
+        assert!(r.contains("body"), "text preserved: {r}");
+    }
+
+    #[test]
+    fn write_confinement_rejects_outside_project() {
+        let cwd = Path::new("/tmp/manox-write-confinement");
+        // /etc is outside the project root + temp dir.
+        let r = resolve_path_for_write("/etc/manox-probe", cwd);
+        assert!(r.is_err(), "must reject write outside project: {r:?}");
+        let e = r.unwrap_err();
+        assert!(e.contains("超出项目根"), "error: {e}");
+    }
+
+    #[test]
+    fn write_confinement_rejects_dot_git() {
+        let cwd = Path::new("/tmp/manox-write-confinement");
+        let r = resolve_path_for_write(".git/config", cwd);
+        assert!(r.is_err(), "must reject write to .git: {r:?}");
+        let e = r.unwrap_err();
+        assert!(e.contains("沙箱保护"), "error: {e}");
+    }
+
+    #[test]
+    fn write_confinement_allows_project_and_tmp() {
+        let cwd = Path::new("/tmp/manox-write-confinement");
+        assert!(resolve_path_for_write("src/lib.rs", cwd).is_ok());
+        let tmp = std::env::temp_dir().join("manox-write-confinement-probe");
+        assert!(resolve_path_for_write(&tmp, cwd).is_ok());
+    }
+
+    #[test]
+    fn read_not_confined() {
+        // Reads use resolve_path, not resolve_path_for_write, so they are not
+        // confined — matching zed/codex which allow reading anywhere.
+        let cwd = Path::new("/tmp/manox-write-confinement");
+        let p = resolve_path("/etc/passwd", cwd);
+        assert_eq!(p, PathBuf::from("/etc/passwd"));
     }
 }
