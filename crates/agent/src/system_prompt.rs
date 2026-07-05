@@ -9,15 +9,20 @@
 //! [`system_prompt.md`] next to this file, embedded via `include_str!` so the
 //! prose reads as plain markdown and edits don't touch Rust — mirroring codex's
 //! split (static `base_instructions/default.md` + dynamic `<cwd>`/
-//! `<current_date>` environment XML). Only the runtime identity block (cwd,
-//! project, os, shell, date) is formatted here, since those are
-//! machine-assembled key/value rows, not prose. Thread id is deliberately NOT
-//! injected — the model fetches it on demand via the `self_info` tool (codex
-//! and zed likewise do not inject session/thread id into the prompt).
+//! `<current_date>` environment XML). The markdown carries a
+//! `{{runtime_identity}}` placeholder where the live block belongs; this
+//! builder renders the cwd/project/os/shell/date key-value rows into it. No
+//! template engine crate — `str::replace` is enough for one tag. Thread id is
+//! deliberately NOT injected — the model fetches it on demand via the
+//! `self_info` tool (codex and zed likewise do not inject session/thread id
+//! into the prompt).
 
 use std::path::Path;
 
 const STATIC_PROMPT: &str = include_str!("system_prompt.md");
+
+/// Tag in `system_prompt.md` replaced with the live runtime identity block.
+const RUNTIME_IDENTITY_TAG: &str = "{{runtime_identity}}";
 
 /// Build the main-thread system prompt from live thread state.
 ///
@@ -29,19 +34,16 @@ pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>) -> String {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
     let os = std::env::consts::OS;
 
-    let mut s = STATIC_PROMPT.to_string();
-    if !s.ends_with('\n') {
-        s.push('\n');
-    }
-    s.push_str("\n## 运行时身份\n");
-    s.push_str(&format!("- 当前工作目录：`{}`\n", cwd.display()));
+    let mut identity = String::from("## 运行时身份\n");
+    identity.push_str(&format!("- 当前工作目录：`{}`\n", cwd.display()));
     if let Some(p) = project {
-        s.push_str(&format!("- 项目根：`{}`\n", p.display()));
+        identity.push_str(&format!("- 项目根：`{}`\n", p.display()));
     }
-    s.push_str(&format!("- 操作系统：{os}\n"));
-    s.push_str(&format!("- 默认 shell：{shell}\n"));
-    s.push_str(&format!("- 今天：{today}\n"));
-    s
+    identity.push_str(&format!("- 操作系统：{os}\n"));
+    identity.push_str(&format!("- 默认 shell：{shell}\n"));
+    identity.push_str(&format!("- 今天：{today}\n"));
+
+    STATIC_PROMPT.replace(RUNTIME_IDENTITY_TAG, &identity)
 }
 
 /// The user message injected when a sub-agent hits its `max_turns` cap.
@@ -73,11 +75,22 @@ mod tests {
     #[test]
     fn prompt_does_not_leak_tech_stack() {
         // The identity names the product, not the implementation: the model has
-        // no use for "GPUI" or other framework names, and exposing them only
-        // invites tangents.
+        // no use for "GPUI"/"brush" or other framework names, and exposing
+        // them only invites tangents.
         let p = build_main_system_prompt(Path::new("/tmp"), None);
         assert!(!p.contains("GPUI"), "must not leak tech stack: {p}");
         assert!(!p.contains("gpui"), "must not leak tech stack: {p}");
+        assert!(!p.contains("brush"), "must not leak tech stack: {p}");
+    }
+
+    #[test]
+    fn runtime_identity_placeholder_is_rendered() {
+        // The {{runtime_identity}} tag must be substituted with live values,
+        // never reach the model as a literal placeholder.
+        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        assert!(!p.contains("{{"), "placeholder leaked: {p}");
+        assert!(!p.contains("runtime_identity}}"), "placeholder leaked: {p}");
+        assert!(p.contains("## 运行时身份"), "identity block missing: {p}");
     }
 
     #[test]

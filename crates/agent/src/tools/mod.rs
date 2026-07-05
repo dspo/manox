@@ -487,7 +487,7 @@ impl AgentTool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "用 ripgrep 搜索文件内容，返回匹配行（带行号）。"
+        "按正则搜索文件内容，返回匹配行（带行号）。"
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<GrepInput>()
