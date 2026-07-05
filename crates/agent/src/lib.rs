@@ -12,6 +12,8 @@ pub mod message;
 pub mod paths;
 pub mod provider;
 pub mod runtime;
+pub mod sandbox;
+pub mod system_prompt;
 pub mod thread;
 pub mod thread_store;
 pub mod tool;

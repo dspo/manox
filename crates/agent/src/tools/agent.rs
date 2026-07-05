@@ -82,7 +82,7 @@ impl AgentToolTrait for SpawnAgentTool {
         super::schema::<AgentToolInput>()
     }
 
-    fn requires_approval(&self) -> bool {
+    fn requires_approval(&self, _input: &serde_json::Value) -> bool {
         false
     }
 
@@ -407,6 +407,11 @@ fn build_child_registry(
         if is_tool_allowed(tool.name(), def) {
             reg.register(tool);
         }
+    }
+    // self_info is per-thread (needs the child's WeakEntity), so it can't live
+    // in base_tools; register it here, subject to the same allow/disallow filter.
+    if is_tool_allowed("self_info", def) {
+        reg.register(super::self_info::new(child_weak.clone()));
     }
     if can_nest(def, child_depth) {
         reg.register(

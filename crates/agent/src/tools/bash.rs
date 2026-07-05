@@ -40,8 +40,16 @@ use crate::tools::{bridge_tokio, schema};
 
 /// Wall-clock limit before a hung command is killed.
 const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
-/// Hard cap on retained stdout/stderr so a runaway command cannot OOM the app.
-const BASH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
+/// Hard cap on retained stdout/stderr so a runaway command cannot OOM the app
+/// and does not flood the model's context. Above this the capture keeps a
+/// running byte total (for the truncation notice) but drops the overflowing
+/// text. 64 KiB mirrors the order of magnitude used by other native agents
+/// (zed 16 KiB, pi/oh-my-pi 50 KiB) — enough for typical `git`/`cargo` output,
+/// small enough that the model can act on it.
+const BASH_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+/// Narrow-the-command hint folded into the truncation advisory. Lives here
+/// (not in `system_prompt.md`) because it is tool-specific guidance.
+const BASH_TRUNCATION_HINT: &str = "用更窄的命令重试（指定列、`| head`、`LIMIT`、收窄 pattern）";
 /// Grace window given to a SIGTERM'd process group before escalating to SIGKILL.
 const CANCELLATION_GRACE_MS: u64 = 50;
 /// Upper bound on draining the stdout/stderr pipes after the group is killed:
@@ -75,6 +83,14 @@ struct BashInput {
     /// Kill the command after this many seconds (defaults to 120).
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// Run outside the OS sandbox (macOS seatbelt). Default false: the command
+    /// is confined to project root + temp dir writes, `.git` read-only, network
+    /// denied, and runs without approval. Set true only when the command
+    /// genuinely needs the outside (network, writes outside the project) — it
+    /// then runs in a persistent shell with no confinement, gated by user
+    /// approval.
+    #[serde(default)]
+    unsandboxed: Option<bool>,
 }
 
 impl AgentTool for BashTool {
@@ -82,12 +98,26 @@ impl AgentTool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "执行 bash 命令并返回 stdout。运行在持久 brush 会话中：cd / export / 函数定义跨调用保留。\
+        "执行 bash 命令并返回 stdout。默认在 OS 沙箱内运行（macOS seatbelt：写限项目根与\
+         临时目录、`.git` 只读、网络禁止），每次调用是一次性 `bash -c`——`cd`/`export` 不跨调用\
+         保留，跨步状态请用 `&&` 链或 `cwd` 参数。需沙箱外能力（联网、写项目根外）时设 \
+         `unsandboxed: true`，经用户审批后在持久 shell 会话中运行（cd/export 跨调用保留）。\
          默认 120s 超时（可用 timeout_secs 覆盖）；超时或取消时整个进程组被终止。stdout/stderr \
          实时回流 UI。"
     }
-    fn requires_approval(&self) -> bool {
-        true
+    fn requires_approval(&self, input: &serde_json::Value) -> bool {
+        let unsandboxed = input
+            .get("unsandboxed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if unsandboxed {
+            return true;
+        }
+        // Sandboxed bash skips approval only where an OS sandbox actually
+        // enforces confinement. On platforms without a backend, the default
+        // path falls back to an unconstrained brush shell — gate it on
+        // approval until a real backend (Linux bwrap / Windows) lands.
+        !crate::sandbox::is_available()
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<BashInput>()
@@ -117,17 +147,54 @@ impl AgentTool for BashTool {
         let cwd_override = parsed.cwd.clone();
         let timeout = Duration::from_secs(parsed.timeout_secs.unwrap_or(BASH_DEFAULT_TIMEOUT_SECS));
         let command = parsed.command.clone();
+        let unsandboxed = parsed.unsandboxed.unwrap_or(false);
         bridge_tokio(cx, async move {
-            run_bash(
-                shell,
-                &command,
-                &base_cwd,
-                cwd_override.as_deref(),
-                timeout,
-                cancel,
-                sink,
-            )
-            .await
+            if unsandboxed {
+                // Approved escalation: brush's persistent shell, no confinement.
+                run_bash(
+                    shell,
+                    &command,
+                    &base_cwd,
+                    cwd_override.as_deref(),
+                    timeout,
+                    cancel,
+                    sink,
+                )
+                .await
+            } else if crate::sandbox::is_available() {
+                // Sandboxed default: seatbelt-wrapped subprocess, no approval.
+                #[cfg(target_os = "macos")]
+                {
+                    run_sandboxed_bash(
+                        &command,
+                        &base_cwd,
+                        cwd_override.as_deref(),
+                        timeout,
+                        cancel,
+                        sink,
+                    )
+                    .await
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    unreachable!("is_available() true only on macos")
+                }
+            } else {
+                // No OS sandbox on this platform: fall back to brush + warn.
+                tracing::warn!(
+                    "sandbox unavailable on this platform, running unsandboxed via brush"
+                );
+                run_bash(
+                    shell,
+                    &command,
+                    &base_cwd,
+                    cwd_override.as_deref(),
+                    timeout,
+                    cancel,
+                    sink,
+                )
+                .await
+            }
         })
     }
 }
@@ -189,10 +256,15 @@ async fn run_bash(
             *guard = Some(s);
         }
         if let Some(cwd) = cwd_override {
+            // Resolve relative overrides against the thread cwd explicitly,
+            // rather than relying on brush's internal resolution — the model
+            // may pass a relative path meaning "relative to thread cwd", and
+            // `resolve_path` makes that absolute before brush sees it.
+            let resolved = super::resolve_path(cwd, base_cwd);
             guard
                 .as_mut()
                 .expect("shell initialized")
-                .set_working_dir(cwd)
+                .set_working_dir(&resolved)
                 .map_err(brush_err)?;
         }
         let sh = guard.as_mut().expect("shell initialized");
@@ -230,10 +302,12 @@ async fn run_bash(
     // Drain readers within the IO deadline, then extract the captured text.
     drain(&mut out_task).await;
     drain(&mut err_task).await;
-    let (out_str, out_trunc) = out_buf.lock().expect("capture buffer lock poisoned").take();
-    let (err_str, err_trunc) = err_buf.lock().expect("capture buffer lock poisoned").take();
+    let (out_str, _out_trunc, out_dropped) =
+        out_buf.lock().expect("capture buffer lock poisoned").take();
+    let (err_str, _err_trunc, err_dropped) =
+        err_buf.lock().expect("capture buffer lock poisoned").take();
 
-    format_result(ran, out_str, out_trunc, err_str, err_trunc)
+    format_result(ran, out_str, out_dropped, err_str, err_dropped)
 }
 
 /// Format the outcome: success returns stdout (or stderr when stdout is empty);
@@ -242,12 +316,16 @@ async fn run_bash(
 fn format_result(
     ran: Outcome,
     stdout: String,
-    stdout_trunc: bool,
+    stdout_dropped: usize,
     stderr: String,
-    stderr_trunc: bool,
+    stderr_dropped: usize,
 ) -> Result<String, anyhow::Error> {
-    let stdout = with_truncation_note(&stdout, stdout_trunc);
-    let stderr = with_truncation_note(&stderr, stderr_trunc);
+    // `truncated == dropped > 0` is the `CaptureBuffer` invariant, so the bool
+    // is derivable and not passed separately.
+    let stdout = crate::tools::TruncatedText::new(&stdout, BASH_OUTPUT_MAX_BYTES, stdout_dropped)
+        .render(BASH_TRUNCATION_HINT);
+    let stderr = crate::tools::TruncatedText::new(&stderr, BASH_OUTPUT_MAX_BYTES, stderr_dropped)
+        .render(BASH_TRUNCATION_HINT);
     match ran {
         Outcome::Ran(Ok(er)) => {
             if er.exit_code.is_success() {
@@ -334,12 +412,17 @@ fn read_pipe(
     }
 }
 
-/// Byte-capped buffer: appends until `max`, then drops the rest and marks
-/// truncated. Matches the prior harness's cap-at-max policy.
+/// Byte-capped buffer: appends until `max`, then drops the overflowing text
+/// while still tallying the total bytes seen. The total lets the truncation
+/// notice tell the model how much it is missing, so it knows to narrow the
+/// command rather than guess at the truncated tail.
 struct CaptureBuffer {
     buf: Vec<u8>,
     max: usize,
     truncated: bool,
+    /// Bytes seen after the cap was hit; reported in the truncation notice.
+    /// Only accrued once `truncated` is set, so this is the dropped tail size.
+    dropped: usize,
 }
 
 impl CaptureBuffer {
@@ -348,11 +431,13 @@ impl CaptureBuffer {
             buf: Vec::with_capacity(8 * 1024),
             max,
             truncated: false,
+            dropped: 0,
         }
     }
 
     fn push(&mut self, data: &[u8]) {
         if self.truncated {
+            self.dropped = self.dropped.saturating_add(data.len());
             return;
         }
         let remaining = self.max.saturating_sub(self.buf.len());
@@ -360,26 +445,201 @@ impl CaptureBuffer {
             self.buf.extend_from_slice(data);
         } else {
             self.buf.extend_from_slice(&data[..remaining]);
+            self.dropped = self.dropped.saturating_add(data.len() - remaining);
             self.truncated = true;
         }
     }
 
-    fn take(&mut self) -> (String, bool) {
+    /// Returns `(text, truncated, dropped_bytes)`.
+    fn take(&mut self) -> (String, bool, usize) {
         let data = std::mem::take(&mut self.buf);
-        (String::from_utf8_lossy(&data).into_owned(), self.truncated)
+        let dropped = std::mem::take(&mut self.dropped);
+        (
+            String::from_utf8_lossy(&data).into_owned(),
+            self.truncated,
+            dropped,
+        )
     }
 }
 
-/// Append a truncation notice when the captured stream exceeded the byte cap.
-fn with_truncation_note(s: &str, truncated: bool) -> String {
-    if truncated {
-        format!(
-            "{s}\n... [output truncated: cap {} bytes]",
-            BASH_OUTPUT_MAX_BYTES
-        )
-    } else {
-        s.to_string()
+/// Why a sandboxed wait ended: child exited, spawn failed, wall-clock
+/// timeout, or user cancellation.
+#[cfg(target_os = "macos")]
+enum SandboxOutcome {
+    Exited(std::process::ExitStatus),
+    SpawnFailed(std::io::Error),
+    TimedOut,
+    Cancelled,
+}
+
+/// Format a sandboxed run. Mirrors [`format_result`] but over `ExitStatus`
+/// instead of brush's `ExecutionResult`; the truncation rendering is shared
+/// via [`crate::tools::TruncatedText`].
+#[cfg(target_os = "macos")]
+fn format_sandboxed_result(
+    ran: SandboxOutcome,
+    stdout: String,
+    stdout_dropped: usize,
+    stderr: String,
+    stderr_dropped: usize,
+) -> Result<String, anyhow::Error> {
+    let stdout = crate::tools::TruncatedText::new(&stdout, BASH_OUTPUT_MAX_BYTES, stdout_dropped)
+        .render(BASH_TRUNCATION_HINT);
+    let stderr = crate::tools::TruncatedText::new(&stderr, BASH_OUTPUT_MAX_BYTES, stderr_dropped)
+        .render(BASH_TRUNCATION_HINT);
+    match ran {
+        SandboxOutcome::Exited(status) => {
+            if status.success() {
+                let combined = if stdout.is_empty() { stderr } else { stdout };
+                Ok(combined)
+            } else {
+                let code = status.code().unwrap_or(-1);
+                Err(anyhow::anyhow!(
+                    "bash 退出码 {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                ))
+            }
+        }
+        SandboxOutcome::SpawnFailed(e) => Err(anyhow::anyhow!(
+            "bash 启动失败: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )),
+        SandboxOutcome::TimedOut => Err(anyhow::anyhow!(
+            "bash 超时（已终止进程组）\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )),
+        SandboxOutcome::Cancelled => Err(anyhow::anyhow!(
+            "bash 已取消\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )),
     }
+}
+
+/// Async chunk reader: appends bytes into a [`CaptureBuffer`] and forwards
+/// complete lines to the live `sink`, mirroring the sync [`read_pipe`] but for
+/// a tokio pipe. Reads in fixed 8 KiB chunks (not `read_until`) so a
+/// newline-less binary stream can't grow an unbounded line buffer or emit a
+/// single huge chunk to the sink. EOFs when the child's stdout/stderr close.
+#[cfg(target_os = "macos")]
+async fn read_pipe_async<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    buf: Arc<std::sync::Mutex<CaptureBuffer>>,
+    sink: ToolOutputSink,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let data = &chunk[..n];
+                if let Ok(mut b) = buf.lock() {
+                    b.push(data);
+                }
+                carry.extend_from_slice(data);
+                while let Some(i) = carry.iter().position(|&b| b == b'\n') {
+                    let rest = carry.split_off(i + 1);
+                    let line = std::mem::take(&mut carry);
+                    sink.try_emit(&String::from_utf8_lossy(&line));
+                    carry = rest;
+                }
+            }
+        }
+    }
+    if !carry.is_empty() {
+        sink.try_emit(&String::from_utf8_lossy(&carry));
+    }
+}
+
+/// Execute `command` in a seatbelt-sandboxed `sandbox-exec` subprocess: write
+/// to project root + temp dir only, `.git` read-only, network denied. Mirrors
+/// [`run_bash`]'s capture/timeout/cancel structure but over a one-shot
+/// `tokio::process::Command` rather than brush's persistent shell.
+#[cfg(target_os = "macos")]
+async fn run_sandboxed_bash(
+    command: &str,
+    base_cwd: &Path,
+    cwd_override: Option<&str>,
+    timeout: Duration,
+    cancel: CancellationToken,
+    sink: ToolOutputSink,
+) -> Result<String, anyhow::Error> {
+    use std::process::Stdio;
+    use tokio::process::Child;
+
+    let cwd = cwd_override
+        .map(|c| super::resolve_path(c, base_cwd))
+        .unwrap_or_else(|| base_cwd.to_path_buf());
+    let policy = crate::sandbox::SandboxPolicy::for_project(base_cwd);
+    let mut cmd = policy.wrap_command(command, &cwd);
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    let mut child: Child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return format_sandboxed_result(
+                SandboxOutcome::SpawnFailed(e),
+                String::new(),
+                0,
+                String::new(),
+                0,
+            );
+        }
+    };
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let out_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(
+        BASH_OUTPUT_MAX_BYTES,
+    )));
+    let err_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(
+        BASH_OUTPUT_MAX_BYTES,
+    )));
+    let out_sink = sink.clone();
+    let err_sink = sink;
+    let out_buf_task = out_buf.clone();
+    let err_buf_task = err_buf.clone();
+
+    let mut out_task = tokio::task::spawn(read_pipe_async(stdout, out_buf_task, out_sink));
+    let mut err_task = tokio::task::spawn(read_pipe_async(stderr, err_buf_task, err_sink));
+
+    // Race the wait against the wall-clock timeout and user cancellation. The
+    // `child.wait()` future is inline in the select! (not pinned outside), so
+    // when cancel/timeout wins it is dropped — releasing the `&mut child`
+    // borrow so we can `start_kill` + reap on the next line.
+    let ran = tokio::select! {
+        status = child.wait() => match status {
+            Ok(s) => SandboxOutcome::Exited(s),
+            Err(e) => SandboxOutcome::SpawnFailed(e),
+        },
+        _ = cancel.cancelled() => SandboxOutcome::Cancelled,
+        _ = tokio::time::sleep(timeout) => SandboxOutcome::TimedOut,
+    };
+    if matches!(ran, SandboxOutcome::Cancelled | SandboxOutcome::TimedOut) {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    // Drain readers within the IO deadline; grandchildren holding the pipes
+    // open would otherwise stall the join.
+    let _ = tokio::time::timeout(Duration::from_millis(IO_DRAIN_TIMEOUT_MS), async {
+        let _ = tokio::join!(&mut out_task, &mut err_task);
+    })
+    .await;
+    drain(&mut out_task).await;
+    drain(&mut err_task).await;
+
+    let (out_str, out_dropped) = {
+        let mut b = out_buf.lock().expect("capture buffer lock poisoned");
+        let (t, _, d) = b.take();
+        (t, d)
+    };
+    let (err_str, err_dropped) = {
+        let mut b = err_buf.lock().expect("capture buffer lock poisoned");
+        let (t, _, d) = b.take();
+        (t, d)
+    };
+
+    format_sandboxed_result(ran, out_str, out_dropped, err_str, err_dropped)
 }
 
 /// Signal every tracked job's process group. With `NewProcessGroup` each
@@ -553,5 +813,59 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.trim_end(), "/tmp");
+    }
+
+    #[test]
+    fn capture_buffer_caps_and_tracks_dropped_total() {
+        let mut buf = CaptureBuffer::new(64 * 1024);
+        // First 64 KiB fills the cap exactly without truncation.
+        buf.push(&vec![b'x'; 64 * 1024]);
+        let (_, truncated, dropped) = buf.take();
+        assert!(!truncated, "exactly at cap is not truncated");
+        assert_eq!(dropped, 0);
+
+        // Now overflow: cap + 10 KiB more. The tail is dropped but tallied.
+        let mut buf = CaptureBuffer::new(64 * 1024);
+        buf.push(&vec![b'x'; 64 * 1024]);
+        buf.push(&vec![b'y'; 10 * 1024]);
+        let (text, truncated, dropped) = buf.take();
+        assert!(truncated);
+        assert_eq!(dropped, 10 * 1024);
+        assert!(!text.contains('y'), "dropped tail must not appear in text");
+    }
+
+    #[test]
+    fn truncation_notice_is_prefixed_advisory_and_reports_total() {
+        // 64 KiB cap + 12 KiB dropped → 76 KiB total reported.
+        let note =
+            crate::tools::TruncatedText::new("leftover line", BASH_OUTPUT_MAX_BYTES, 12 * 1024)
+                .render(BASH_TRUNCATION_HINT);
+        assert!(
+            note.starts_with('⚠'),
+            "notice must be prefixed so the model sees it first: {note}"
+        );
+        assert!(
+            note.contains("用更窄的命令"),
+            "must advise narrowing: {note}"
+        );
+        assert!(
+            note.contains(&format!("共 {} 字节", BASH_OUTPUT_MAX_BYTES + 12 * 1024)),
+            "must report total bytes: {note}"
+        );
+        assert!(
+            note.contains("leftover line"),
+            "truncated text must still be present: {note}"
+        );
+        // The notice is prefixed, so the truncated text comes after the warning.
+        let warning_idx = note.find('⚠').unwrap();
+        let text_idx = note.find("leftover line").unwrap();
+        assert!(warning_idx < text_idx);
+    }
+
+    #[test]
+    fn truncation_notice_absent_when_not_truncated() {
+        let s = crate::tools::TruncatedText::new("plain output", BASH_OUTPUT_MAX_BYTES, 0)
+            .render(BASH_TRUNCATION_HINT);
+        assert_eq!(s, "plain output");
     }
 }

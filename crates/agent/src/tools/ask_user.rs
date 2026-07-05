@@ -70,7 +70,7 @@ impl AgentTool for AskUserQuestionTool {
         super::schema::<AskUserQuestionInput>()
     }
 
-    fn requires_approval(&self) -> bool {
+    fn requires_approval(&self, _input: &serde_json::Value) -> bool {
         true
     }
 

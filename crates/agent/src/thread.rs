@@ -363,6 +363,14 @@ impl Thread {
         self.project.as_ref()
     }
 
+    pub fn turn_count(&self) -> u32 {
+        self.turn_count
+    }
+
+    pub fn max_turns(&self) -> Option<u32> {
+        self.max_turns
+    }
+
     /// Bind the thread to a project directory, rebuilding the tool registry so
     /// tools resolve paths against it. A no-op once the conversation has started
     /// (project is chosen on the empty first screen and fixed thereafter).
@@ -505,7 +513,7 @@ impl Thread {
                     let needs_approval = this
                         .tools
                         .get(tu.name.as_ref())
-                        .map(|t| t.requires_approval())
+                        .map(|t| t.requires_approval(&tu.input))
                         .unwrap_or(false)
                         && !this.permission.is_always_allowed(tu.name.as_ref());
                     if needs_approval {
@@ -612,9 +620,7 @@ impl Thread {
                 if capped && !this.cap_summary_injected {
                     this.cap_summary_injected = true;
                     this.insert_user_message(
-                        format!(
-                            "你已达到最大轮次 {max}。请基于上述已完成的工作，给出一个简洁的最终总结，不要再调用任何工具。"
-                        ),
+                        crate::system_prompt::max_turns_summary_prompt(max),
                         cx,
                     );
                     return false;
@@ -652,7 +658,7 @@ impl Thread {
             return Ok(());
         };
 
-        let needs_approval = tool.requires_approval()
+        let needs_approval = tool.requires_approval(&tu.input)
             && !this.read_with(cx, |this, _| this.permission.is_always_allowed(&name))?;
         if needs_approval {
             this.update(cx, |_, cx| {
@@ -1058,16 +1064,25 @@ impl Thread {
     /// Map `messages` into a `LanguageModelRequest` (including tool definitions).
     /// A sub-agent's system prompt, when set, is prepended as a `System` message;
     /// the Anthropic wire mapper lifts `System` messages into the top-level
-    /// `system` field, and other wires treat it as a leading message.
+    /// `system` field, and other wires treat it as a leading message. The main
+    /// thread has no `system` field, so a runtime-identity prompt (cwd,
+    /// project, os, shell, date) is minted here instead — see
+    /// `system_prompt::build_main_system_prompt`. Thread id is deliberately
+    /// absent; the model fetches it via the `self_info` tool.
     fn build_completion_request(&self) -> LanguageModelRequest {
         let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
-        if let Some(sys) = &self.system {
-            messages.push(LanguageModelRequestMessage {
-                role: Role::System,
-                content: vec![MessageContent::Text(sys.clone())],
-                cache: false,
-            });
-        }
+        let system = self.system.clone().unwrap_or_else(|| {
+            crate::system_prompt::build_main_system_prompt(&self.cwd, self.project.as_deref())
+        });
+        messages.push(LanguageModelRequestMessage {
+            role: Role::System,
+            content: vec![MessageContent::Text(system)],
+            // The `cache` flag is currently advisory only — the Anthropic wire
+            // mapper (`provider/anthropic.rs::content_to_anthropic`) does not yet
+            // emit `cache_control` breakpoints. Kept `false` to avoid implying
+            // caching that isn't actually wired up.
+            cache: false,
+        });
         // Map canonical messages to the request, stripping the `agent` tool's
         // JSON envelope to just its `final` text. The full sub-conversation
         // stays in `self.messages` for persistence and UI rebuild, but the
