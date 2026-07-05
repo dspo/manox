@@ -620,13 +620,19 @@ async fn run_sandboxed_bash(
     }
 
     // Drain readers within the IO deadline; grandchildren holding the pipes
-    // open would otherwise stall the join.
-    let _ = tokio::time::timeout(Duration::from_millis(IO_DRAIN_TIMEOUT_MS), async {
+    // open would otherwise stall the join. The `join!` inside the timeout polls
+    // each handle at most once; on a missed deadline we abort instead of polling
+    // again — a `JoinHandle` polled after `Complete` panics, which was the
+    // sandboxed-bash crash when the readers finished before the deadline.
+    if tokio::time::timeout(Duration::from_millis(IO_DRAIN_TIMEOUT_MS), async {
         let _ = tokio::join!(&mut out_task, &mut err_task);
     })
-    .await;
-    drain(&mut out_task).await;
-    drain(&mut err_task).await;
+    .await
+    .is_err()
+    {
+        out_task.abort();
+        err_task.abort();
+    }
 
     let (out_str, out_dropped) = {
         let mut b = out_buf.lock().expect("capture buffer lock poisoned");
@@ -696,6 +702,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out, "hello");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sandboxed_bash_fast_exit_does_not_panic() {
+        // Regression: `run_sandboxed_bash` used to `join!` the reader handles
+        // inside the drain timeout and then `drain()` them again — polling a
+        // completed JoinHandle panics ("JoinHandle polled after completion").
+        // A command that exits immediately makes the readers finish before the
+        // drain deadline, which was the exact crash repro. The fixed path
+        // aborts on a missed deadline instead of re-polling, so a fast exit
+        // must complete without panicking.
+        let out = run_sandboxed_bash(
+            "true",
+            &PathBuf::from("."),
+            None,
+            Duration::from_secs(10),
+            CancellationToken::new(),
+            null_sink(),
+        )
+        .await
+        .expect("fast exit must not panic and must report Ok");
+        assert!(out.is_empty(), "expected empty output, got: {out}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
