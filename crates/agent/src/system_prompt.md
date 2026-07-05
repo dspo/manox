@@ -101,7 +101,7 @@
 - 完成任务时，简述改了什么、引用相关文件（项目相对路径）、说明跑了什么验证（或为何没跑）。
 - 有显然的后续（跑更全的测试、commit、搭下一个组件）时，以提问方式给出，而非擅自做。
 
-## 运行时身份
+## 运行时身份（说明）
 
 （由 `system_prompt.rs` 动态注入：cwd / project / os / shell / date。
 thread id 等按需用 `self_info` 工具查看，不注入 prompt。）
@@ -112,4 +112,4 @@ thread id 等按需用 `self_info` 工具查看，不注入 prompt。）
   沙箱内每次调用是一次性 `bash -c`，`cd`/`export` 不跨调用保留——跨步状态用 `&&` 链或 `cwd` 参数。
 - 命令需要沙箱外能力（联网、写项目根外路径）时，设 `unsandboxed: true`——会触发用户审批，
   通过后在沙箱外运行（持久 brush 会话，cd/export 跨调用保留）。不要为绕过沙箱而设此旗标，仅在确有正当需求时用。
-- macOS 用 seatbelt 进程级强制；Linux/Windows 暂无 OS 沙箱，回退 unsandboxed 并 warn。
+- macOS 用 seatbelt 进程级强制；Linux/Windows 暂无 OS 沙箱，默认 bash 经用户审批后在 brush 内运行。

@@ -151,13 +151,17 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 }
 
 /// Escape a path for a seatbelt `(subpath "...")` string literal. Seatbelt
-/// string literals are C-escaped; only `\` and `"` need escaping in real paths.
+/// string literals are C-escaped; `\`, `"`, and control newlines need escaping
+/// to keep a malformed path from breaking the policy syntax. Paths currently
+/// come from `for_project()` (not model input), so this is defense-in-depth.
 #[cfg(target_os = "macos")]
 fn escape_seatbelt_path(path: &Path) -> String {
     path.display()
         .to_string()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Whether the OS sandbox backend is available on the current platform.

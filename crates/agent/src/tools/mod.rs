@@ -5,9 +5,10 @@
 //! - grep: ripgrep library (grep-searcher + grep-regex + ignore), in-process via `background_spawn`.
 //! - glob: the `ignore` crate (gitignore-aware walk) + `globset` (pattern match).
 //!
-//! Each tool generates its `input_schema` from a typed Input via `schemars`. Tools
-//! requiring approval (write_file / edit_file / bash) override `requires_approval`
-//! to return true.
+//! Each tool generates its `input_schema` from a typed Input via `schemars`.
+//! `requires_approval` gates the approval overlay: write_file / edit_file /
+//! ask_user always require it; `bash` requires it on `unsandboxed: true`
+//! escalation or when no OS sandbox backend is available (see [`bash`]).
 
 pub mod agent;
 pub mod ask_user;

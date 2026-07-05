@@ -106,13 +106,18 @@ impl AgentTool for BashTool {
          实时回流 UI。"
     }
     fn requires_approval(&self, input: &serde_json::Value) -> bool {
-        // Sandboxed bash (the default) runs without approval — the seatbelt
-        // confines writes and network, so a human need not gate every command.
-        // Only an explicit `unsandboxed: true` escalation requests approval.
-        input
+        let unsandboxed = input
             .get("unsandboxed")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if unsandboxed {
+            return true;
+        }
+        // Sandboxed bash skips approval only where an OS sandbox actually
+        // enforces confinement. On platforms without a backend, the default
+        // path falls back to an unconstrained brush shell — gate it on
+        // approval until a real backend (Linux bwrap / Windows) lands.
+        !crate::sandbox::is_available()
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<BashInput>()
@@ -594,16 +599,8 @@ async fn run_sandboxed_bash(
     let out_buf_task = out_buf.clone();
     let err_buf_task = err_buf.clone();
 
-    let mut out_task = tokio::task::spawn(read_pipe_async(
-        stdout,
-        out_buf_task,
-        out_sink,
-    ));
-    let mut err_task = tokio::task::spawn(read_pipe_async(
-        stderr,
-        err_buf_task,
-        err_sink,
-    ));
+    let mut out_task = tokio::task::spawn(read_pipe_async(stdout, out_buf_task, out_sink));
+    let mut err_task = tokio::task::spawn(read_pipe_async(stderr, err_buf_task, err_sink));
 
     // Race the wait against the wall-clock timeout and user cancellation. The
     // `child.wait()` future is inline in the select! (not pinned outside), so
