@@ -45,6 +45,10 @@ xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
 base64 = "0.22"
 
+rmcp = { version = "1.8", default-features = false }
+toml = "0.8"
+http = "1"
+
 # cx-providers —— provider 配置解析的单一事实来源（与 cx 共享）。锁 cx 仓库已合并的确定 rev。
 cx-providers = { git = "https://github.com/dspo/cx.git", rev = "e210e4a1ab68f014f6535100c8652c05fa56639c" }
 

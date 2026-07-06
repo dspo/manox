@@ -8,6 +8,7 @@ pub mod agent_def;
 pub mod db;
 pub mod hashline;
 pub mod language_model;
+pub mod mcp;
 pub mod message;
 pub mod paths;
 pub mod provider;
@@ -22,17 +23,19 @@ pub mod tools;
 use gpui::App;
 
 pub use db::ThreadSummary;
+pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};
 pub use message::Message;
 pub use thread::{Thread, ThreadEvent, ThreadId, ToolCallStatus};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
 pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
 pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};
 
-/// Register the tokio runtime + `ProviderRegistry` + `ThreadStore` + the
-/// hashline snapshot store + the subagent definition registry. Call at App startup.
+/// Register the tokio runtime + `ProviderRegistry` + `McpRegistry` + `ThreadStore`
+/// + the hashline snapshot store + the subagent definition registry. Call at App startup.
 pub fn init(cx: &mut App) {
     runtime::init(cx);
     provider::registry::init(cx);
+    mcp::registry::init(cx);
     thread_store::init(cx);
     hashline::init();
     agent_def::init();

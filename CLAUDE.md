@@ -147,6 +147,7 @@ crates/
 - **授权冒泡**：子 agent 内部工具需审批时，子 Thread emit `ToolCallAuthorization`，`agent` 工具的订阅把它以**复合 id** `<parent_tool_use_id>::<child_auth_id>` 重新 emit 到父 Thread。`Thread::respond_authorization` 三分支：命中本 Thread `pending_authorizations`→oneshot send；命中 `pending_child_auth`（复合 id）→upgrade child 转发；都不命中→静默（可能已 cancel）。UI overlay 透明处理复合 id，`pending_auths: Vec` 多槽避免两个并行子 agent 同时冒泡时互相覆盖。
 - **权限继承**：子 `PermissionCache` 用 `PermissionCache::from_snapshot(parent.permission_snapshot())` 预填父的 always-allow 快照，子不再因父已授权的工具重复弹窗；子新授权不回写父（路由回子 Thread）。
 - **深度/嵌套限制**：`Thread.depth` 主=0 子=父+1，`MAX_DEPTH=5`。`build_child_registry` 仅在 `allow_nesting && child_depth<MAX_DEPTH` 时注册 `agent` 工具，`run_streaming` 开头 `depth+1>MAX_DEPTH` 直接 Err。双重保险。
+- **工具集范围（MCP 不进子 agent）**：`build_child_registry` 基于 `base_tools` 构造（按 frontmatter `tools`/`disallowed_tools` 过滤），`default_registry` 才在 `base_tools` 之外追加 MCP 工具。故 MCP 工具仅主 agent 可用——子 agent 是受限 context，首版不继承全局 MCP 能力；若 frontmatter `tools` 列了 `mcp_*` 名也会因不在 `base_tools` 而被 `is_tool_allowed` 拒绝。
 - **max_turns 截断**：达 `max_turns` 时注入一轮总结 user 消息（`cap_summary_injected` 防二次循环），让子 agent 产出连贯最终回复而非硬停；第二轮再触顶才 `Stop(EndTurn)`。
 - **完成信号**：`setup_child` 订阅只对真终态（`Stop(EndTurn|MaxTokens|Refusal)` + `Error`）发 `done_tx`；`Stop(ToolUse)` 是非终端中间态（子下一轮继续跑工具），忽略之，否则会把子第一轮未跑工具的文本当成最终结果回传父。
 - **快照与持久化**：子结束后，`agent` 工具把 JSON envelope `{"final":..., "messages":[...]}` 作为 ToolResult.content 写入规范 `Thread::messages`——这是子对话的**唯一来源**（不另存内存 map，长会话无泄漏）。UI live 路径从 `ThreadEvent::ToolResult` 的 `output` 用 `agent_sub_messages` 解析喂展开面板；reload 路径从 `rebuild_from_messages` 同样解析 envelope 还原 `sub_messages`。**上下文隔离**：`build_completion_request` 在映射到模型请求时用 `model_facing_content` 把 `agent` 的 ToolResult envelope 剥成只 `final` 文本——规范消息保留完整 envelope（持久化+UI 用），但父 LLM 只看到 `final`，子 agent 的中间工具调用/结果/reasoning 不泄漏进父上下文。
@@ -170,6 +171,7 @@ crates/
 - LLM 配置：`~/.config/cx/cx.providers.config.yaml`（格式见 `provider/config.rs` 的 `CxConfig`）
 - SQLite 数据库：`~/.config/cx/manox/threads.db`
 - 子 agent 定义：`~/.config/cx/manox/agents/*.md`（frontmatter + system prompt，见 `agent_def.rs`）
+- MCP 配置：`~/.config/cx/manox/mcp.toml`（`[mcp_servers.<name>]` 表，stdio `command`/`args`/`env`/`cwd` 或 streamable HTTP `url`/`headers`，见 `mcp/config.rs`。纯文件配置，不接入 UI）
 - API key 源：macOS Keychain（`keychain:SERVICE`）、环境变量（`env:VAR`）、字面量（`literal:...`）、shell 命令（`$(shell ...)`）
 
 ## 项目规则
