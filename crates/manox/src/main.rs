@@ -22,6 +22,7 @@ fn main() {
     app.run(move |cx| {
         gpui_component::init(cx);
         agent::init(cx);
+        agent_ui::slash_command::init(cx);
 
         cx.bind_keys([
             #[cfg(target_os = "macos")]

@@ -448,8 +448,20 @@ impl Workspace {
         let should_open = value == "/";
         if should_open && !self.slash_open {
             let theme = cx.theme().clone();
+            let on_select = cx.listener(|this, name: &str, window, cx| {
+                // Insert `/name ` into the composer so the user can add args
+                // and submit. Replacing the whole value keeps the leading `/`
+                // consistent (the popover only opens for input == "/").
+                let text = format!("/{name} ");
+                this.input_state
+                    .update(cx, |state, cx| state.set_value(text, window, cx));
+                this.close_slash_menu();
+                cx.notify();
+            });
             let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-                build_slash_menu(menu, &theme)
+                build_slash_menu(menu, &theme, move |name, window, cx| {
+                    on_select(name, window, cx);
+                })
             });
             let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
                 this.close_slash_menu();
@@ -535,6 +547,25 @@ impl Workspace {
         self.input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.close_slash_menu();
+
+        // Slash commands (line-initial `/name [args]`) are intercepted before
+        // sending a normal user turn. A recognized command fully handles the
+        // input (Handled), asks to inject text as a user turn (InjectUserTurn),
+        // or declines (NoOp → fall through to the normal path). Slash parsing
+        // only applies to text-only input; attachments force the normal path.
+        if attachments.is_empty()
+            && let Some(parsed) = crate::slash_command::parse(&text)
+        {
+            let result = crate::slash_command::dispatch(&parsed, self, window, cx);
+            match result {
+                crate::slash_command::SlashResult::Handled => return,
+                crate::slash_command::SlashResult::InjectUserTurn(msg) => {
+                    self.send_user_turn(msg, Vec::new(), cx);
+                    return;
+                }
+                crate::slash_command::SlashResult::NoOp => {}
+            }
+        }
 
         if attachments.is_empty() {
             self.send_user_turn(text, Vec::new(), cx);
@@ -700,6 +731,22 @@ impl Workspace {
             .model()
             .map(|m| m.name().to_string())
             .unwrap_or_else(|| "未配置模型".to_string())
+    }
+
+    /// Push a system-styled notice into the conversation (no thread message,
+    /// no model turn). Used by slash commands to report outcomes — e.g. the
+    /// mock `/yolo` acknowledging recognition. Renders as an error-styled
+    /// card (the only built-in notice-style `ConvItem`).
+    pub fn add_info_message(&mut self, text: String, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        let count = self.conversation.read(cx).items().len();
+        self.conversation.update(cx, |c, cx| {
+            c.push_notice(text, weak, cx);
+        });
+        if count > 0 {
+            self.list_state.splice(count..count, 1);
+        }
+        cx.notify();
     }
 
     fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
