@@ -65,7 +65,9 @@ pub fn apply(text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
         for (os, oe) in &consumed {
             if *os <= *end && *start <= *oe {
                 return Err(ApplyError {
-                    message: format!("op range {start}..={end} overlaps existing range {os}..={oe}"),
+                    message: format!(
+                        "op range {start}..={end} overlaps existing range {os}..={oe}"
+                    ),
                 });
             }
         }
@@ -178,7 +180,10 @@ fn resolve_op(op: &Op, lines: &[String]) -> Result<ResolvedOp, ApplyError> {
                 && (*a == 0 || *a > lines.len())
             {
                 return Err(ApplyError {
-                    message: format!("INS anchor line {a} out of bounds (file has {} lines)", lines.len()),
+                    message: format!(
+                        "INS anchor line {a} out of bounds (file has {} lines)",
+                        lines.len()
+                    ),
                 });
             }
             Ok(ResolvedOp::Ins {

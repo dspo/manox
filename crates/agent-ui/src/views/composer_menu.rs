@@ -15,8 +15,8 @@ use std::rc::Rc;
 
 use std::path::{Path, PathBuf};
 
-use agent::language_model::MessageContent;
 use agent::i18n;
+use agent::language_model::MessageContent;
 use base64::Engine as _;
 use gpui::{SharedString, prelude::*};
 use gpui_component::{
@@ -152,8 +152,7 @@ fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
             .child(Icon::new(icon.clone()).small().text_color(muted))
             .child(gpui::div().text_sm().text_color(fg).child(name.clone()));
         if !desc.is_empty() {
-            line = line
-                .child(gpui::div().text_xs().text_color(muted).child(desc.clone()));
+            line = line.child(gpui::div().text_xs().text_color(muted).child(desc.clone()));
         }
         line
     })
@@ -217,7 +216,8 @@ pub fn build_plus_menu(
             1 => {
                 if let Some(on_project) = on_project.clone() {
                     menu = menu.item(
-                        menu_row_item(row, theme).on_click(move |_, window, cx| on_project(window, cx)),
+                        menu_row_item(row, theme)
+                            .on_click(move |_, window, cx| on_project(window, cx)),
                     );
                 }
                 // When on_project is None, skip the "Choose project" row entirely.
