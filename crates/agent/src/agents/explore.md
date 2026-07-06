@@ -14,7 +14,7 @@ disallowed_tools:
   - agent
   - skill
   - monitor
-  - ask_user
+  - AskUserQuestion
 max_turns: 8
 allow_nesting: false
 ---

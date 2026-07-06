@@ -6,7 +6,7 @@ tools:
   - list_directory
   - grep
   - glob
-  - ask_user
+  - AskUserQuestion
   - self_info
 disallowed_tools:
   - write_file
