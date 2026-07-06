@@ -320,9 +320,7 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::PlanProposed { id, .. } => {
-                    this.pending_plan = Some(PendingPlan {
-                        id: id.clone(),
-                    });
+                    this.pending_plan = Some(PendingPlan { id: id.clone() });
                     // Delegate to ConversationState to backfill the plan text
                     // into the matching ToolCall item for markdown rendering.
                     let weak = cx.weak_entity();
@@ -1172,7 +1170,11 @@ impl Workspace {
     /// Plan approval overlay (model called `exit_plan_mode`). The plan text
     /// is rendered in the chat view; this overlay only asks the approval
     /// question. Auth/ask overlays take precedence so they never compete.
-    fn render_plan_approval_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_plan_approval_overlay(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if self.pending_ask.is_some() || !self.pending_auths.is_empty() {
             return None;
         }
