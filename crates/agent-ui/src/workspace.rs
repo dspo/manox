@@ -841,8 +841,8 @@ impl Workspace {
 
     /// Push a system-styled notice into the conversation (no thread message,
     /// no model turn). Used by slash commands to report outcomes — e.g. the
-    /// mock `/yolo` acknowledging recognition. Renders as an error-styled
-    /// card (the only built-in notice-style `ConvItem`).
+    /// `/yolo` toggle acknowledging the mode change. Renders as a neutral-toned
+    /// `ConvItem::Notice` card (distinct from the red `ConvItem::Error`).
     pub fn add_info_message(&mut self, text: String, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
         let count = self.conversation.read(cx).items().len();
