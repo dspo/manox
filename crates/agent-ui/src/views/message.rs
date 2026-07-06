@@ -185,6 +185,7 @@ pub fn render_item(
         ConvItem::ToolCall(t) => render_tool_call(t, ix, theme, tool_ctx),
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx),
         ConvItem::Error(msg) => render_error(msg, ix, theme),
+        ConvItem::Notice(msg) => render_notice(msg, ix, theme),
     }
 }
 
@@ -354,6 +355,41 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .text_sm()
                 .text_color(theme.danger)
                 .child(markdown_tv(("error", ix), msg.to_string(), theme, false)),
+        )
+        .into_any_element()
+}
+
+/// Render an ephemeral system notice — status toggles, slash-command acks.
+/// Neutral tones so positive state changes (e.g. "YOLO 模式已开启") do not
+/// read as a runtime error.
+pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
+    v_flex()
+        .w_full()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary.opacity(0.3))
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child("通知"),
+                )
+                .child(copy_button(ix, "copy-notice", msg.to_string())),
+        )
+        .child(
+            gpui::div()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(markdown_tv(("notice", ix), msg.to_string(), theme, false)),
         )
         .into_any_element()
 }
