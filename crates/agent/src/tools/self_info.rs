@@ -168,4 +168,40 @@ mod tests {
             "expected thread id in output, got: {out}"
         );
     }
+
+    /// Documents the gpui invariant the `run_tool_inner` fix relies on:
+    /// holding a write lease on the owning `Thread` (via `Entity::update`)
+    /// while `self_info`'s `run` does `read_with` on the same entity
+    /// re-leases it and trips `double_lease_panic`. This is the SIGABRT from
+    /// thread `4543a630`, reproduced synchronously here without going through
+    /// `run_tool_inner` (which would need a full turn). It does not guard the
+    /// fix directly — it pins the invariant so a future re-introduction of
+    /// `this.update` wrapping in `run_tool_inner` has a concrete, failing
+    /// reference for why it breaks.
+    #[test]
+    #[should_panic(expected = "already being updated")]
+    #[allow(clippy::let_underscore_future)]
+    fn read_with_inside_owning_thread_write_lease_panics() {
+        crate::agent_def::init();
+
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            crate::thread::Thread::restore(
+                crate::thread::ThreadId("double-lease-doc".to_string()),
+                std::path::PathBuf::from("/tmp"),
+                None,
+                Vec::new(),
+                None,
+                cx,
+            )
+        });
+        let tool = SelfInfoTool::new(thread.downgrade());
+        let thread_handle = thread.clone();
+
+        cx.update(|cx| {
+            thread_handle.update(cx, |_t, cx| {
+                let _ = tool.run(serde_json::json!({}), CancellationToken::new(), cx);
+            });
+        });
+    }
 }
