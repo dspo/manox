@@ -1,0 +1,22 @@
+[package]
+name = "terminal-ui"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "terminal_ui"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+serde.workspace = true
+tracing.workspace = true
+terminal = { path = "../terminal" }
+agent = { path = "../agent" }
+
+[lints.clippy]
+dbg_macro = "deny"
