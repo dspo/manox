@@ -17,6 +17,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use gpui::{App, AppContext, AsyncApp, Task, WeakEntity};
 use schemars::JsonSchema;
@@ -135,6 +136,7 @@ impl AgentToolTrait for SpawnAgentTool {
 
         let child = setup.child;
         let done_rx = setup.done_rx;
+        let child_errored = setup.child_errored;
         let sub = setup.sub;
 
         cx.spawn(async move |cx: &mut AsyncApp| {
@@ -155,6 +157,8 @@ impl AgentToolTrait for SpawnAgentTool {
             // assistant text as the tool result.
             let msgs = child.read_with(cx, |c, _| c.messages().to_vec());
             let final_text = last_assistant_text(&msgs);
+            let errored = child_errored.load(std::sync::atomic::Ordering::Relaxed)
+                || final_text == NO_FINAL_SENTINEL;
             drop(sub);
 
             // The tool result is a JSON envelope {"final":..., "messages":[...]}.
@@ -164,18 +168,32 @@ impl AgentToolTrait for SpawnAgentTool {
             // expandable panel — both live and after reload. No separate in-memory
             // snapshot map is kept, so there is nothing to leak across a long
             // session with many sub-agent calls.
+            //
+            // Returning the envelope as `Err` (rather than `Ok`) when the
+            // sub-agent errored or produced no final message routes through
+            // `Thread::run_tool_inner`'s `Err(e) => (e, true)` arm — the ToolResult
+            // keeps the envelope as its content (so the UI panel and the
+            // `agent_final_text`/`agent_sub_messages` parsers still work) but is
+            // flagged `is_error: true`, so the parent model sees the failure
+            // instead of mistaking a non-reply for success (thread 6cd3d096).
             let payload = serde_json::json!({ "final": final_text, "messages": msgs });
-            Ok(payload.to_string())
+            if errored {
+                Err(payload.to_string())
+            } else {
+                Ok(payload.to_string())
+            }
         })
     }
 }
 
 /// Everything `run_streaming` builds synchronously before spawning the await
 /// task. `child` and `sub` are moved into that task; `done_rx` resolves when
-/// the sub-agent emits `Stop`.
+/// the sub-agent emits `Stop`; `child_errored` is set by the subscription when
+/// the sub-agent emits `ThreadEvent::Error`.
 struct SubagentSetup {
     child: gpui::Entity<Thread>,
     done_rx: async_channel::Receiver<()>,
+    child_errored: Arc<AtomicBool>,
     sub: gpui::Subscription,
 }
 
@@ -244,7 +262,11 @@ fn setup_child(
 
     // Stream the sub-agent's progress to the parent's tool card and bubble
     // authorizations. `Stop` signals completion via the bounded channel.
+    // `child_errored` is flipped by the `Error` arm so `run_streaming` can
+    // route the result through `Err` → `is_error: true` (a sub-agent that
+    // crashed is a failure, not a silent success).
     let (done_tx, done_rx) = async_channel::bounded(1);
+    let child_errored = Arc::new(AtomicBool::new(false));
     let sink_cb = sink.clone();
     let parent_cb = parent.clone();
     let ptu_cb = ptu.to_string();
@@ -253,6 +275,7 @@ fn setup_child(
     // produce identical "工具：bash" overlays the user can't tell apart.
     let subagent_type_cb = def.name.clone();
     let child_weak = child.downgrade();
+    let errored_cb = child_errored.clone();
     let sub = cx.subscribe(
         &child,
         move |_child, ev: &ThreadEvent, cx: &mut App| match ev {
@@ -260,6 +283,7 @@ fn setup_child(
                 sink_cb.try_emit(t);
             }
             ThreadEvent::Error(e) => {
+                errored_cb.store(true, std::sync::atomic::Ordering::Relaxed);
                 sink_cb.try_emit(&e.to_string());
                 // A sub-agent error is terminal: unblock the parent so it can
                 // collect whatever partial output was produced.
@@ -313,6 +337,7 @@ fn setup_child(
     Ok(SubagentSetup {
         child,
         done_rx,
+        child_errored,
         sub,
     })
 }
@@ -342,6 +367,11 @@ fn resolve_model(
         .ok_or_else(|| "no model available".to_string())
 }
 
+/// Sentinel returned by `last_assistant_text` when the sub-agent produced no
+/// assistant text. `run_streaming` treats it as a failure (returns `Err`) so the
+/// parent model sees `is_error: true` rather than a silent non-reply.
+const NO_FINAL_SENTINEL: &str = "sub-agent ended without producing a final message";
+
 /// The sub-agent's final result text: the last assistant message's first text
 /// block, then a stated "no final message" note. Never returns an empty string
 /// so the parent model always receives a non-empty tool result. Does NOT fall
@@ -359,7 +389,7 @@ fn last_assistant_text(msgs: &[Message]) -> String {
             }
         }
     }
-    "sub-agent ended without producing a final message".to_string()
+    NO_FINAL_SENTINEL.to_string()
 }
 
 /// Persisted `agent` tool-result envelope: the model-facing final text plus the
@@ -443,8 +473,27 @@ fn build_child_registry(
     reg
 }
 
+/// A short capability tag for a sub-agent definition, derived from its
+/// `tools`/`disallowed_tools`: `read-only` when it can neither write files nor
+/// run bash, otherwise the union of `write`/`bash`. Advertised in the tool
+/// description so the parent model does not delegate write/exec work to a
+/// read-only sub-agent — the failure mode behind thread 6cd3d096, where three
+/// `plan` sub-agents were asked to write files they could not touch and each
+/// replied "I'm in read-only mode".
+fn capability_tag(def: &AgentDefinition) -> &'static str {
+    let can_write = is_tool_allowed("write_file", def) || is_tool_allowed("edit_file", def);
+    let can_bash = is_tool_allowed("bash", def);
+    match (can_write, can_bash) {
+        (true, true) => "write+bash",
+        (true, false) => "write",
+        (false, true) => "bash",
+        (false, false) => "read-only",
+    }
+}
+
 /// Compose the tool description advertised to the parent model, listing the
-/// available sub-agent types and their one-line descriptions.
+/// available sub-agent types with a capability tag and their one-line
+/// descriptions.
 fn build_description() -> Arc<str> {
     let mut s = String::from(
         "Spawn a sub-agent to handle a focused subtask. The sub-agent runs in \
@@ -457,8 +506,21 @@ fn build_description() -> Arc<str> {
     if !defs.is_empty() {
         s.push_str("\n\nAvailable subagent_type values:");
         for d in defs {
-            s.push_str(&format!("\n- {}: {}", d.def.name, d.def.description));
+            s.push_str(&format!(
+                "\n- {} ({}): {}",
+                d.def.name,
+                capability_tag(&d.def),
+                d.def.description
+            ));
         }
+        s.push_str(
+            "\n\nThe capability tag in parentheses shows what each sub-agent can \
+             do: `read-only` sub-agents cannot write files or run bash — do not \
+             delegate write/exec work to them (they will refuse and waste a \
+             round). Each sub-agent starts from a blank context with no parent \
+             history, so pin any interface contract the sub-agent must honor \
+             (exact function names, signatures, types) directly in the prompt.",
+        );
     } else {
         s.push_str(
             "\n\nNo sub-agent definitions are loaded. Add Markdown files under \
@@ -544,6 +606,37 @@ mod tests {
         assert!(can_nest(&on, MAX_DEPTH - 1));
         assert!(!can_nest(&on, MAX_DEPTH));
         assert!(!can_nest(&off, 1));
+    }
+
+    #[test]
+    fn capability_tag_read_only_when_write_and_bash_disallowed() {
+        // The bundled `plan`/`explore` profile: explicit read-only allowlist,
+        // write/exec tools disallowed. Must advertise `read-only` so the parent
+        // model does not delegate write work here (thread 6cd3d096).
+        let d = def(
+            Some(vec!["read_file".to_string(), "grep".to_string()]),
+            Some(vec![
+                "write_file".to_string(),
+                "edit_file".to_string(),
+                "bash".to_string(),
+            ]),
+            false,
+        );
+        assert_eq!(capability_tag(&d), "read-only");
+    }
+
+    #[test]
+    fn capability_tag_reflects_write_and_bash_availability() {
+        let write_only = def(Some(vec!["write_file".to_string()]), None, false);
+        assert_eq!(capability_tag(&write_only), "write");
+        let bash_only = def(Some(vec!["bash".to_string()]), None, false);
+        assert_eq!(capability_tag(&bash_only), "bash");
+        let both = def(
+            Some(vec!["write_file".to_string(), "bash".to_string()]),
+            None,
+            false,
+        );
+        assert_eq!(capability_tag(&both), "write+bash");
     }
 
     #[test]

@@ -83,6 +83,11 @@ pub enum ThreadEvent {
     },
     /// YOLO mode toggled on/off. The UI refreshes its badge and access chip.
     YoloToggled { on: bool },
+    /// A completion turn started. Signals the UI (via `ThreadStore`) that this
+    /// thread is now running — covers the gap before the first `AgentText`/
+    /// `AgentThinking` delta arrives (model warming up, network latency) so
+    /// the running indicator is immediate. Terminal `Stop`/`Error` clear it.
+    TurnStarted,
     /// A completion turn ended.
     Stop(StopReason),
     /// An error during streaming.
@@ -862,6 +867,12 @@ impl Thread {
             cx.emit(ThreadEvent::Error(anyhow::anyhow!("No model configured")));
             return;
         };
+
+        // Signal the UI immediately that a turn is in flight — before the
+        // first streaming delta arrives — so the sidebar running indicator
+        // lights up during the warm-up gap. `ThreadStore::set_running` (called
+        // by the workspace on this event) is the bridge to the sidebar.
+        cx.emit(ThreadEvent::TurnStarted);
 
         let cancel = CancellationToken::new();
         self.turn_cancel = Some(cancel.clone());
@@ -2592,9 +2603,7 @@ mod tests {
         let model = registry
             .models()
             .iter()
-            .find(|m| {
-                m.provider_name() == "百炼" && m.name().contains("glm-5.2")
-            })
+            .find(|m| m.provider_name() == "百炼" && m.name().contains("glm-5.2"))
             .cloned()
             .expect("百炼 glm-5.2[1m] anthropic");
 
@@ -2635,8 +2644,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
 
-        let msgs = cx
-            .update(|cx| thread.read_with(cx, |t, _| t.messages.clone()));
+        let msgs = cx.update(|cx| thread.read_with(cx, |t, _| t.messages.clone()));
         // The assistant turn must have produced real text content, not just an
         // empty `ContentBlockStart` thinking block (the pre-fix symptom).
         let assistant_text: String = msgs
@@ -2654,6 +2662,9 @@ mod tests {
             !assistant_text.is_empty(),
             "assistant produced no text — stream was not fully drained (got messages: {msgs:?})"
         );
-        eprintln!("assistant text: {}", assistant_text.chars().take(200).collect::<String>());
+        eprintln!(
+            "assistant text: {}",
+            assistant_text.chars().take(200).collect::<String>()
+        );
     }
 }

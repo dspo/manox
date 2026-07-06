@@ -27,6 +27,7 @@
 //! [`build_main_system_prompt`] and [`language_directive`].
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 const STATIC_PROMPT: &str = include_str!("system_prompt.md");
 
@@ -74,6 +75,9 @@ pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>, yolo: bool) 
     }
     prompt.push_str(&format!("- Operating system: {os}\n"));
     prompt.push_str(&format!("- Default shell: {shell}\n"));
+    let (python3, node) = runtime_versions();
+    prompt.push_str(&format!("- python3: {python3}\n"));
+    prompt.push_str(&format!("- node: {node}\n"));
     prompt.push_str(&format!("- Today: {today}\n"));
     if yolo {
         prompt.push_str(
@@ -82,6 +86,34 @@ pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>, yolo: bool) 
     }
 
     prompt
+}
+
+/// Session-stable runtime versions for the identity block: `python3` and
+/// `node` as reported by `<bin> --version` (first line), or `(absent)` when the
+/// binary is missing. Probed once per process via a `OnceLock` so the prompt
+/// stays byte-identical across requests (prefix-cache stable) and the spawn
+/// cost is paid only on the first `build_main_system_prompt` call.
+///
+/// Motivated by thread 6cd3d096, where the model assumed Python 3.10+ and
+/// emitted `match/case`, which `SyntaxError`'d on the actual 3.9.6 — the model
+/// had no runtime facts to ground its version assumption.
+fn runtime_versions() -> (&'static str, &'static str) {
+    static VERSIONS: OnceLock<(String, String)> = OnceLock::new();
+    let (py, node) = VERSIONS.get_or_init(|| (probe_version("python3"), probe_version("node")));
+    (py.as_str(), node.as_str())
+}
+
+/// Capture the first line of `<bin> --version`'s stdout, or `(absent)` on any
+/// failure (binary not on PATH, non-zero exit, non-UTF8). The model only needs
+/// a best-effort label, not a strict parser.
+fn probe_version(bin: &str) -> String {
+    match std::process::Command::new(bin).arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            let full = String::from_utf8_lossy(&out.stdout);
+            full.lines().next().unwrap_or("(absent)").trim().to_string()
+        }
+        _ => "(absent)".to_string(),
+    }
 }
 
 /// The language directive injected into the system prompt so the model addresses
@@ -139,6 +171,11 @@ mod tests {
         assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
         assert!(p.contains("manox agent"), "identity must appear: {p}");
         assert!(p.contains("Today:"), "date row must appear: {p}");
+        // Runtime versions are injected so the model does not guess (thread
+        // 6cd3d096). The row is present regardless of whether the binary is
+        // installed — absent binaries render as `(absent)`.
+        assert!(p.contains("- python3:"), "python3 row must appear: {p}");
+        assert!(p.contains("- node:"), "node row must appear: {p}");
     }
 
     #[test]

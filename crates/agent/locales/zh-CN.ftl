@@ -11,6 +11,7 @@ sidebar-plugins = 插件
 sidebar-section-projects = 项目
 sidebar-section-conversations = 对话
 sidebar-empty-summary = (新对话)
+sidebar-copy-thread-id = 复制 thread id
 sidebar-time-just-now = 刚刚
 sidebar-time-minutes = {$count} 分钟前
 sidebar-time-hours = {$count} 小时前
