@@ -101,8 +101,14 @@ impl ThreadStore {
         ))
     }
 
-    /// Delete by id, then refresh.
+    /// Delete by id, then refresh. Fires `SessionEnd` (fail-open) so plugins
+    /// can tear down per-session state — a deleted thread's session is over.
     pub fn delete_thread(&mut self, id: &str, cx: &mut Context<Self>) {
+        crate::hook::fire(
+            crate::hook::HookEvent::SessionEnd,
+            None,
+            serde_json::json!({"thread_id": id}),
+        );
         if let Err(e) = self.db.delete(id) {
             tracing::warn!(error = %e, "删除 thread 失败");
         }

@@ -55,12 +55,14 @@ pub fn marketplace_cache_dir() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("marketplaces"))
 }
 
-/// Stable filesystem-safe slug for a marketplace git URL: the last path segment
-/// with a trailing `.git` stripped. Two URLs that resolve to the same slug share
-/// a cache entry — mirroring Claude Code, which keys marketplaces by name rather
-/// than by full URL.
+/// Stable filesystem-safe slug for a marketplace git URL: the last non-empty
+/// path segment with a trailing `.git` stripped. Two URLs that resolve to the
+/// same slug share a cache entry — mirroring Claude Code, which keys
+/// marketplaces by name rather than by full URL. A trailing slash is tolerated
+/// (the segment before it is used) so `…/x/` and `…/x` collide, as intended.
 pub fn marketplace_slug(git_url: &str) -> String {
-    let tail = git_url.rsplit('/').next().unwrap_or(git_url);
+    let trimmed = git_url.trim_end_matches('/');
+    let tail = trimmed.rsplit('/').next().unwrap_or(trimmed);
     tail.trim_end_matches(".git").to_string()
 }
 

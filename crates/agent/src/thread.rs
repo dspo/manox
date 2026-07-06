@@ -501,6 +501,7 @@ impl Thread {
                 let cwd = this.cwd.display().to_string();
                 crate::hook::fire(
                     crate::hook::HookEvent::SessionStart,
+                    Some(&cwd),
                     serde_json::json!({"thread_id": thread_id, "cwd": cwd}),
                 );
             }
@@ -790,8 +791,12 @@ impl Thread {
         // PreToolUse hooks fire after approval but before execution — the
         // handler sees the resolved input and can observe/log the call.
         // Notification-only: a non-zero exit cannot block the tool (fail-open).
+        let hook_cwd = this
+            .read_with(cx, |t, _| t.cwd.display().to_string())
+            .unwrap_or_default();
         crate::hook::fire(
             crate::hook::HookEvent::PreToolUse,
+            Some(&hook_cwd),
             serde_json::json!({
                 "thread_id": this.read_with(cx, |t, _| t.id.0.clone()).unwrap_or_default(),
                 "tool_name": name,
@@ -849,8 +854,12 @@ impl Thread {
         // PostToolUse hooks fire after the result is recorded. The handler sees
         // the output and error flag; fail-open means a hook failure cannot
         // retroactively fail the tool.
+        let post_cwd = this
+            .read_with(cx, |t, _| t.cwd.display().to_string())
+            .unwrap_or_default();
         crate::hook::fire(
             crate::hook::HookEvent::PostToolUse,
+            Some(&post_cwd),
             serde_json::json!({
                 "thread_id": this.read_with(cx, |t, _| t.id.0.clone()).unwrap_or_default(),
                 "tool_name": name,
@@ -927,8 +936,10 @@ impl Thread {
                 self.finalize_assistant_message(cx);
                 // Fire Stop hooks (e.g. a stop-gate reviewer) fail-open; the
                 // turn has already ended, so the handler runs detached.
+                let stop_cwd = self.cwd.display().to_string();
                 crate::hook::fire(
                     crate::hook::HookEvent::Stop,
+                    Some(&stop_cwd),
                     serde_json::json!({
                         "thread_id": self.id.0,
                         "stop_reason": format!("{reason:?}"),

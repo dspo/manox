@@ -14,8 +14,8 @@
 //! errors fed back to the model — never as panics.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
@@ -23,10 +23,17 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::plugin::PluginManager;
 use crate::tool::{AgentTool, AnyAgentTool, ToolOutputSink};
 use crate::tools::bridge_tokio;
+
+/// Wall-clock cap on a single JSON-RPC round-trip. A hung server that never
+/// responds would otherwise block the turn indefinitely — the model sees a
+/// timeout error instead and can recover. Generous (most calls return in
+/// milliseconds) to absorb slow tool execution without false timeouts.
+const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One MCP server declared in a plugin's `.mcp.json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -53,11 +60,14 @@ pub struct McpToolDef {
     pub input_schema: Value,
 }
 
-/// A live MCP server connection. stdin/stdout are mutex-guarded so concurrent
-/// tool calls serialize on a single JSON-RPC channel (MCP stdio is
-/// request/response — the server answers one `id` at a time).
+/// A live MCP server connection. The whole JSON-RPC round-trip (write request
+/// → read matching response) is guarded by `call_lock`, so concurrent tool
+/// calls on the same server serialize: without it, call B's response could be
+/// read and dropped by call A's reader loop, hanging B forever. MCP stdio is
+/// inherently request/response on one channel — there is no safe interleaving.
 pub struct McpClient {
     server_name: String,
+    call_lock: Mutex<()>,
     stdin: Arc<Mutex<ChildStdin>>,
     stdout: Arc<Mutex<BufReader<ChildStdout>>>,
     next_id: Mutex<i64>,
@@ -83,8 +93,29 @@ impl McpClient {
             .with_context(|| format!("spawning MCP server `{server_name}` ({})", cfg.command))?;
         let stdin = child.stdin.take().context("MCP server stdin missing")?;
         let stdout = child.stdout.take().context("MCP server stdout missing")?;
+        // Drain stderr to tracing so a chatty server does not fill its stderr
+        // pipe and block. Each line is logged at WARN (servers rarely write
+        // stderr unless something is wrong) prefixed with the server name.
+        if let Some(stderr) = child.stderr.take() {
+            let server_name_for_drain = server_name.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        tracing::warn!(server = %server_name_for_drain, "mcp stderr: {trimmed}");
+                    }
+                }
+            });
+        }
         let client = Arc::new(Self {
             server_name: server_name.clone(),
+            call_lock: Mutex::new(()),
             stdin: Arc::new(Mutex::new(stdin)),
             stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
             next_id: Mutex::new(0),
@@ -174,10 +205,19 @@ impl McpClient {
         Ok(out)
     }
 
-    /// Send a JSON-RPC request and await the matching response. Notifications
-    /// emitted by the server in the meantime are logged and skipped — the loop
-    /// reads until a response with our `id` arrives.
+    /// Send a JSON-RPC request and await the matching response. The full
+    /// round-trip is serialized by `call_lock` and capped by
+    /// [`MCP_CALL_TIMEOUT`]: a concurrent call cannot interleave its response
+    /// onto this reader, and a hung server surfaces as an error rather than a
+    /// permanent block. Notifications emitted by the server in the meantime
+    /// are logged and skipped — the loop reads until a response with our `id`
+    /// arrives (or the deadline passes).
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        // Hold `call_lock` across write+read so a second concurrent call cannot
+        // write its own request between our write and our read and have us
+        // consume its response (the shared stdout reader has no per-call
+        // demultiplexer).
+        let _guard = self.call_lock.lock().await;
         let id = {
             let mut g = self.next_id.lock().await;
             *g += 1;
@@ -190,40 +230,52 @@ impl McpClient {
             "params": params,
         });
         let line = serde_json::to_string(&request)? + "\n";
-        {
-            let mut stdin = self.stdin.lock().await;
-            stdin.write_all(line.as_bytes()).await?;
-            stdin.flush().await?;
-        }
-        let mut stdout = self.stdout.lock().await;
-        loop {
-            let mut buf = String::new();
-            let n = stdout.read_line(&mut buf).await?;
-            if n == 0 {
-                anyhow::bail!("MCP server `{}` closed stdout", self.server_name);
+        let round_trip = async {
+            {
+                let mut stdin = self.stdin.lock().await;
+                stdin.write_all(line.as_bytes()).await?;
+                stdin.flush().await?;
             }
-            let trimmed = buf.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let msg: Value = match serde_json::from_str(trimmed) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        server = self.server_name,
-                        "ignoring non-JSON MCP line: {e}: {trimmed:?}"
-                    );
+            let mut stdout = self.stdout.lock().await;
+            loop {
+                let mut buf = String::new();
+                let n = stdout.read_line(&mut buf).await?;
+                if n == 0 {
+                    anyhow::bail!("MCP server `{}` closed stdout", self.server_name);
+                }
+                let trimmed = buf.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
-            };
-            if msg.get("id").and_then(|i| i.as_i64()) == Some(id) {
-                if let Some(err) = msg.get("error") {
-                    anyhow::bail!("MCP error from `{}`: {}", self.server_name, err);
+                let msg: Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            server = self.server_name,
+                            "ignoring non-JSON MCP line: {e}: {trimmed:?}"
+                        );
+                        continue;
+                    }
+                };
+                if msg.get("id").and_then(|i| i.as_i64()) == Some(id) {
+                    if let Some(err) = msg.get("error") {
+                        anyhow::bail!("MCP error from `{}`: {}", self.server_name, err);
+                    }
+                    return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
                 }
-                return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+                // A notification or a late response to a timed-out prior call
+                // — drop it. `call_lock` makes this safe: no live concurrent
+                // call's response is in flight, only stale ones from timeouts.
             }
-            // A notification or a response to a different (stale) id — drop it.
-        }
+        };
+        tokio::time::timeout(MCP_CALL_TIMEOUT, round_trip)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "MCP server `{}` timed out after {MCP_CALL_TIMEOUT:?} ({method})",
+                    self.server_name
+                )
+            })?
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
@@ -240,8 +292,11 @@ impl McpClient {
     }
 }
 
-/// One server's live client + the tools it exposed at handshake.
+/// One server's live client + the tools it exposed at handshake. The owning
+/// plugin name namespaces the tool ids so two plugins that both declare a
+/// server named `fs` do not collide in the registry.
 struct ReadyServer {
+    plugin_name: String,
     client: Arc<McpClient>,
     tools: Vec<McpToolDef>,
 }
@@ -270,7 +325,7 @@ impl McpRegistry {
         }
         let handle = crate::runtime::handle().clone();
         handle.spawn(async move {
-            for (server_name, cfg, _plugin_root) in configs {
+            for (plugin_name, server_name, cfg) in configs {
                 let server_name_clone = server_name.clone();
                 let client = match McpClient::connect(server_name.clone(), &cfg).await {
                     Ok(c) => c,
@@ -295,15 +350,19 @@ impl McpRegistry {
                     reg.ready
                         .lock()
                         .expect("MCP registry poisoned")
-                        .push(ReadyServer { client, tools });
+                        .push(ReadyServer {
+                            plugin_name,
+                            client,
+                            tools,
+                        });
                 }
             }
         });
     }
 
-    /// Collect `(server_name, config, plugin_root)` from every installed
+    /// Collect `(plugin_name, server_name, config)` from every installed
     /// plugin's `.mcp.json`. Plugins without one contribute nothing.
-    fn collect_configs() -> Vec<(String, McpServerConfig, PathBuf)> {
+    fn collect_configs() -> Vec<(String, String, McpServerConfig)> {
         let mut out = Vec::new();
         for plugin in PluginManager::installed() {
             let mcp_file = plugin.root.join(".mcp.json");
@@ -323,7 +382,7 @@ impl McpRegistry {
                 }
             };
             for (name, cfg) in parsed.mcp_servers {
-                out.push((name, cfg, plugin.root.clone()));
+                out.push((plugin.name.clone(), name, cfg));
             }
         }
         out
@@ -337,12 +396,13 @@ impl McpRegistry {
         let ready = self.ready.lock().expect("MCP registry poisoned");
         let mut out = Vec::new();
         for server in ready.iter() {
-            let server_name = server.client.server_name.clone();
             for tool in &server.tools {
-                out.push(
-                    Arc::new(McpTool::new(server.client.clone(), &server_name, tool))
-                        as AnyAgentTool,
-                );
+                out.push(Arc::new(McpTool::new(
+                    server.client.clone(),
+                    &server.plugin_name,
+                    &server.client.server_name,
+                    tool,
+                )) as AnyAgentTool);
             }
         }
         out
@@ -371,8 +431,9 @@ pub fn ready_tools() -> Vec<AnyAgentTool> {
 }
 
 /// An `AgentTool` backed by an MCP server tool. The model sees a namespaced
-/// name (`mcp__<server>__<tool>`) so MCP tools never collide with built-ins or
-/// other servers; the original tool name is forwarded to the server on call.
+/// name (`mcp__<plugin>__<server>__<tool>`) so MCP tools never collide with
+/// built-ins or other servers/plugins; the original tool name is forwarded to
+/// the server on call.
 pub struct McpTool {
     client: Arc<McpClient>,
     /// Original MCP tool name — what the server expects in `tools/call`.
@@ -384,8 +445,13 @@ pub struct McpTool {
 }
 
 impl McpTool {
-    pub fn new(client: Arc<McpClient>, server_name: &str, def: &McpToolDef) -> Self {
-        let name: Arc<str> = format!("mcp__{server_name}__{}", def.name).into();
+    pub fn new(
+        client: Arc<McpClient>,
+        plugin_name: &str,
+        server_name: &str,
+        def: &McpToolDef,
+    ) -> Self {
+        let name: Arc<str> = format!("mcp__{plugin_name}__{server_name}__{}", def.name).into();
         Self {
             client,
             tool_name: def.name.clone(),
@@ -409,22 +475,27 @@ impl AgentTool for McpTool {
     fn run(
         &self,
         input: serde_json::Value,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
         cx: &mut gpui::App,
     ) -> gpui::Task<Result<String, String>> {
         let client = self.client.clone();
         let tool_name = self.tool_name.clone();
         bridge_tokio(cx, async move {
-            if cancel.is_cancelled() {
-                return Err(anyhow::anyhow!("MCP tool cancelled"));
+            // Race the call against cancellation so a user-initiated stop
+            // returns promptly. The call's inner `call_lock` is released when
+            // `select!` drops the losing future; a late server response to the
+            // cancelled call is dropped by the next call's reader (stale id).
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(anyhow::anyhow!("MCP tool cancelled")),
+                r = client.call_tool(&tool_name, input) => r,
             }
-            client.call_tool(&tool_name, input).await
         })
     }
     fn run_streaming(
         &self,
         input: serde_json::Value,
-        cancel: tokio_util::sync::CancellationToken,
+        cancel: CancellationToken,
         _sink: ToolOutputSink,
         cx: &mut gpui::App,
     ) -> gpui::Task<Result<String, String>> {

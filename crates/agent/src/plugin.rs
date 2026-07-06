@@ -76,19 +76,34 @@ impl PluginManager {
         let dir = paths::marketplace_dir(git_url)?;
         paths::ensure_manox_config_dir()?;
         if dir.join(".git").exists() {
-            // Refresh in place: fetch + reset to remote HEAD so the index stays
-            // current without clobbering local clones a user may have patched.
-            let status = Command::new("git")
+            // Refresh in place: fetch, then hard-reset the working tree to the
+            // fetched tip. `git fetch` alone updates remote refs but leaves the
+            // on-disk files (which `load_marketplace_index` reads) stale; the
+            // reset is what actually surfaces the latest marketplace index.
+            let fetch = Command::new("git")
                 .arg("-C")
                 .arg(&dir)
                 .args(["fetch", "--all"])
                 .status()
                 .with_context(|| format!("git fetch in {}", dir.display()))?;
-            if !status.success() {
+            if !fetch.success() {
                 tracing::warn!(
                     "git fetch failed for marketplace {} — using existing clone",
                     git_url
                 );
+            } else {
+                let reset = Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(["reset", "--hard", "FETCH_HEAD"])
+                    .status()
+                    .with_context(|| format!("git reset in {}", dir.display()))?;
+                if !reset.success() {
+                    tracing::warn!(
+                        "git reset failed for marketplace {} — index may be stale",
+                        git_url
+                    );
+                }
             }
         } else {
             std::fs::create_dir_all(dir.parent().unwrap_or(Path::new(".")))
@@ -223,18 +238,7 @@ impl PluginManager {
             std::fs::create_dir_all(parent).ok();
         }
         let existing = std::fs::read_to_string(&file).unwrap_or_default();
-        let filtered: Vec<&str> = existing
-            .lines()
-            .filter(|l| !l.trim().is_empty() && !l.starts_with(name))
-            .collect();
-        let mut body = filtered.join("\n");
-        if !body.is_empty() {
-            body.push('\n');
-        }
-        body.push_str(name);
-        body.push('\t');
-        body.push_str(marketplace);
-        body.push('\n');
+        let body = compose_enabled_body(&existing, name, marketplace);
         std::fs::write(&file, body).context("writing enabled_plugins")?;
         Ok(())
     }
@@ -284,6 +288,30 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Compose the enabled-plugins file body from `existing` plus a fresh entry.
+/// Any prior line whose tab-split key equals `name` is dropped — by key, not
+/// by prefix, so re-installing `foo` leaves `foobar` intact. Pure so it can be
+/// tested without touching the real config path (HOME is process-global, so a
+/// parallel test cannot safely redirect `paths::enabled_plugins_file`).
+fn compose_enabled_body(existing: &str, name: &str, marketplace: &str) -> String {
+    let filtered: Vec<&str> = existing
+        .lines()
+        .filter(|l| {
+            let key = l.split('\t').next().unwrap_or("");
+            !l.trim().is_empty() && key != name
+        })
+        .collect();
+    let mut body = filtered.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.push_str(name);
+    body.push('\t');
+    body.push_str(marketplace);
+    body.push('\n');
+    body
 }
 
 #[cfg(test)]
@@ -342,14 +370,20 @@ mod tests {
     }
 
     #[test]
-    fn enabled_roundtrip() {
-        // set/remove operate on the real config path; isolate by pointing the
-        // test at a throwaway via direct file writes through the manager.
-        let tmp = std::env::temp_dir().join("manox_enabled_test.txt");
-        std::fs::write(&tmp, "").unwrap();
-        // The manager reads paths::enabled_plugins_file(); we cannot redirect it
-        // here, so this test only exercises copy_tree + slug parsing. The
-        // enabled-file path is covered by the integration scenario in the plan.
-        let _ = std::fs::remove_file(&tmp);
+    fn compose_enabled_body_replaces_in_place_without_prefix_collision() {
+        // Re-installing `foo` must drop only the prior `foo` line, leaving
+        // `foobar` untouched. A naive `starts_with` filter would erase both.
+        let existing = "foo\told-market\nfoobar\tmarket-a\n";
+        let body = compose_enabled_body(existing, "foo", "new-market");
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(lines.contains(&"foobar\tmarket-a"));
+        assert!(lines.contains(&"foo\tnew-market"));
+        assert!(!lines.contains(&"foo\told-market"));
+    }
+
+    #[test]
+    fn compose_enabled_body_inserts_when_absent() {
+        let body = compose_enabled_body("", "gitwork", "agent-marketplace");
+        assert_eq!(body, "gitwork\tagent-marketplace\n");
     }
 }

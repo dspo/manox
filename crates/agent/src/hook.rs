@@ -1,12 +1,13 @@
-//! Hook engine — lifecycle event shell commands declared by plugins.
-//!
 //! A plugin's `hooks/hooks.json` maps lifecycle events (`SessionStart`,
 //! `SessionEnd`, `Stop`, `PreToolUse`, `PostToolUse`) to shell commands. The
-//! command runs with `CLAUDE_PLUGIN_ROOT` set to the plugin's installed root
-//! and the event payload fed on stdin as JSON — the same contract Claude Code
-//! exposes, so a plugin's `scripts/*.mjs` handlers run unchanged under manox.
+//! command runs with `CLAUDE_PLUGIN_ROOT` set to the plugin's installed root,
+//! `CLAUDE_PROJECT_DIR` set to the owning thread's cwd, and the event payload
+//! fed on stdin as JSON — the same contract Claude Code exposes, so a plugin's
+//! `scripts/*.mjs` handlers run unchanged under manox.
 //!
-//! Hooks are fire-and-forget and fail-open: a handler error or timeout is
+//! `SessionStart` fires before a main thread's first turn; `SessionEnd` fires
+//! when a thread is deleted (its session is over). `Stop` fires on each turn's
+//! end. Hooks are fire-and-forget and fail-open: a handler error or timeout is
 //! logged and never blocks the turn. This matches the fail-open discipline
 //! Claude Code applies to its Stop-gate hooks (a broken reviewer must not hang
 //! the session). `PreToolUse` / `PostToolUse` therefore cannot block a tool
@@ -24,6 +25,13 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 
 use crate::plugin::PluginManager;
+
+/// Default cap on a hook's wall-clock runtime when the entry declares no
+/// `timeout`. Without a default, a buggy handler that loops forever would run
+/// forever (its tokio task is detached); the cap turns that into a logged
+/// timeout. Generous so legitimate slow handlers (e.g. `npm install` in a
+/// SessionStart) are not false-killed.
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 300;
 
 /// Lifecycle events a plugin hook can subscribe to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +151,9 @@ impl HookRegistry {
     /// Fire `event` for every plugin that subscribes to it. Each command runs
     /// detached on the global tokio runtime; failures and timeouts are logged
     /// and never propagated — the turn proceeds regardless (fail-open).
-    pub fn fire(&self, event: HookEvent, payload: Value) {
+    /// `project_cwd` becomes `CLAUDE_PROJECT_DIR` for the handler, matching the
+    /// Claude Code contract (the user's project, not the plugin install dir).
+    pub fn fire(&self, event: HookEvent, project_cwd: Option<&str>, payload: Value) {
         let handle = crate::runtime::handle().clone();
         let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
         for plugin in &self.plugins {
@@ -151,10 +161,19 @@ impl HookRegistry {
                 let plugin_name = plugin.plugin_name.clone();
                 let root = plugin.root.clone();
                 let command = entry.command.clone();
-                let timeout = entry.timeout;
+                let timeout = entry.timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS);
                 let payload = payload_bytes.clone();
+                let project_cwd = project_cwd.map(|s| s.to_string());
                 handle.spawn(async move {
-                    run_hook(&plugin_name, &root, &command, &payload, timeout).await;
+                    run_hook(
+                        &plugin_name,
+                        &root,
+                        &command,
+                        &payload,
+                        project_cwd.as_deref(),
+                        timeout,
+                    )
+                    .await;
                 });
             }
         }
@@ -166,17 +185,27 @@ async fn run_hook(
     plugin_root: &Path,
     command: &str,
     payload: &[u8],
-    timeout_secs: Option<u64>,
+    project_cwd: Option<&str>,
+    timeout_secs: u64,
 ) {
     let mut cmd = tokio::process::Command::new("/bin/sh");
     cmd.arg("-c").arg(command);
     cmd.env("CLAUDE_PLUGIN_ROOT", plugin_root);
-    if let Some(cwd) = plugin_root.parent() {
-        cmd.env("CLAUDE_PROJECT_DIR", cwd);
-    }
+    // `CLAUDE_PROJECT_DIR` is the user's project, not the plugin install dir.
+    // Fall back to the plugin root's parent only when the caller has no thread
+    // cwd (early boot paths) — better a rough guess than an unset var.
+    let fallback = plugin_root.parent().map(|p| p.to_path_buf());
+    let project_dir = project_cwd
+        .map(PathBuf::from)
+        .or(fallback)
+        .unwrap_or_else(|| plugin_root.to_path_buf());
+    cmd.env("CLAUDE_PROJECT_DIR", project_dir);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // Kill the sh + its children when the task is dropped (e.g. on timeout) so
+    // a hung handler cannot orphan a process beyond the deadline.
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -193,15 +222,16 @@ async fn run_hook(
     }
 
     let fut = child.wait_with_output();
-    let result = match timeout_secs {
-        Some(secs) => match tokio::time::timeout(Duration::from_secs(secs), fut).await {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::warn!(plugin = plugin_name, secs, "hook timeout ({command})");
-                return;
-            }
-        },
-        None => fut.await,
+    let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(
+                plugin = plugin_name,
+                secs = timeout_secs,
+                "hook timeout ({command})"
+            );
+            return;
+        }
     };
 
     match result {
@@ -234,10 +264,12 @@ fn registry() -> Option<&'static HookRegistry> {
     REGISTRY.get()
 }
 
-/// Fire an event across all plugins. No-op when no hooks are registered.
-pub fn fire(event: HookEvent, payload: Value) {
+/// Fire an event across all plugins. `project_cwd` is exposed to handlers as
+/// `CLAUDE_PROJECT_DIR`; pass the owning thread's cwd so a handler sees the
+/// user's project, not the plugin install dir. No-op when no hooks registered.
+pub fn fire(event: HookEvent, project_cwd: Option<&str>, payload: Value) {
     if let Some(reg) = registry() {
-        reg.fire(event, payload);
+        reg.fire(event, project_cwd, payload);
     }
 }
 
