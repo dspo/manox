@@ -67,14 +67,26 @@ pub struct BashTool {
     /// Owning thread, read to check YOLO mode (forces the unsandboxed branch
     /// so bash runs outside seatbelt when YOLO is on). `None` in tests.
     thread: Option<WeakEntity<Thread>>,
+    /// Write-confinement policy shared with FS write tools (one derivation per
+    /// registry rebuild). The sandboxed path feeds it to `wrap_command`'s
+    /// seatbelt; the unsandboxed path uses `is_write_allowed` to reject a `cwd`
+    /// override outside the writable set or inside a protected subtree — the
+    /// c5aefe4d escape was `cd` into a sibling worktree then git ops against
+    /// its `.git`.
+    sandbox: crate::sandbox::SandboxPolicy,
 }
 
 impl BashTool {
-    pub fn new(cwd: PathBuf, thread: WeakEntity<Thread>) -> Self {
+    pub fn new(
+        cwd: PathBuf,
+        thread: WeakEntity<Thread>,
+        sandbox: crate::sandbox::SandboxPolicy,
+    ) -> Self {
         Self {
             cwd,
             shell: Arc::new(tokio::sync::Mutex::new(None)),
             thread: Some(thread),
+            sandbox,
         }
     }
 }
@@ -151,6 +163,7 @@ impl AgentTool for BashTool {
         };
         let shell = self.shell.clone();
         let base_cwd = self.cwd.clone();
+        let sandbox = self.sandbox.clone();
         let cwd_override = parsed.cwd.clone();
         let timeout = Duration::from_secs(parsed.timeout_secs.unwrap_or(BASH_DEFAULT_TIMEOUT_SECS));
         let command = parsed.command.clone();
@@ -172,6 +185,7 @@ impl AgentTool for BashTool {
                     &command,
                     &base_cwd,
                     cwd_override.as_deref(),
+                    &sandbox,
                     timeout,
                     cancel,
                     sink,
@@ -185,6 +199,7 @@ impl AgentTool for BashTool {
                         &command,
                         &base_cwd,
                         cwd_override.as_deref(),
+                        &sandbox,
                         timeout,
                         cancel,
                         sink,
@@ -205,6 +220,7 @@ impl AgentTool for BashTool {
                     &command,
                     &base_cwd,
                     cwd_override.as_deref(),
+                    &sandbox,
                     timeout,
                     cancel,
                     sink,
@@ -226,16 +242,38 @@ enum Outcome {
 /// and cancellation, stream live output to `sink`, and return capped
 /// stdout/stderr. On timeout/cancellation the spawned process groups are reaped
 /// (SIGTERM → SIGKILL) so orphaned grandchildren cannot keep the pipes open.
+///
+/// `policy` confines the `cwd_override`: an override outside the writable set
+/// or inside a protected subtree (`.git`) is rejected before brush runs. This
+/// is the c5aefe4d escape — `cd` into a sibling worktree then git ops against
+/// its `.git`. Direct writes outside the project root are NOT blocked here:
+/// the unsandboxed path is the user-approved / YOLO escape route, and
+/// constraining writes (not cwd) would defeat its purpose.
 #[allow(clippy::too_many_arguments)]
 async fn run_bash(
     shell: Arc<tokio::sync::Mutex<Option<Shell>>>,
     command: &str,
     base_cwd: &Path,
     cwd_override: Option<&str>,
+    policy: &crate::sandbox::SandboxPolicy,
     timeout: Duration,
     cancel: CancellationToken,
     sink: ToolOutputSink,
 ) -> Result<String, anyhow::Error> {
+    // Reject a cwd override outside the writable set or inside a protected
+    // subtree before brush executes it. `cd <sibling-worktree>` is the exact
+    // c5aefe4d escape; blocking the cwd change blocks the subsequent git ops
+    // against the foreign `.git`.
+    if let Some(cwd) = cwd_override {
+        let resolved = super::resolve_path(cwd, base_cwd);
+        if !policy.is_write_allowed(&resolved) {
+            return Err(anyhow::anyhow!(
+                "工作目录越出沙箱可写范围或落入受保护路径（`.git`）：{}。\
+                 如需在项目根外或受保护路径运行命令，请在 bash 工具中显式设 `unsandboxed: true` 并经用户审批。",
+                resolved.display()
+            ));
+        }
+    }
     // Two pipe pairs: external children and builtins both write here, the
     // spawn_blocking readers drain the read ends.
     let (out_r, out_w) = std::io::pipe()?;
@@ -269,6 +307,15 @@ async fn run_bash(
                 .await
                 .map_err(brush_err)?;
             s.set_working_dir(base_cwd).map_err(brush_err)?;
+            // Inject the login shell's PATH so brush-spawned children find
+            // Homebrew / toolchain binaries the GUI process env lacks (thread
+            // `e5047fd2`: `gh` not found). brush propagates shell env vars to
+            // external children, so a single set on init covers every call.
+            s.set_env_global(
+                "PATH",
+                brush_core::ShellVariable::new(crate::path_env::resolved_login_path().to_string()),
+            )
+            .map_err(brush_err)?;
             *guard = Some(s);
         }
         if let Some(cwd) = cwd_override {
@@ -573,6 +620,7 @@ async fn run_sandboxed_bash(
     command: &str,
     base_cwd: &Path,
     cwd_override: Option<&str>,
+    policy: &crate::sandbox::SandboxPolicy,
     timeout: Duration,
     cancel: CancellationToken,
     sink: ToolOutputSink,
@@ -583,7 +631,6 @@ async fn run_sandboxed_bash(
     let cwd = cwd_override
         .map(|c| super::resolve_path(c, base_cwd))
         .unwrap_or_else(|| base_cwd.to_path_buf());
-    let policy = crate::sandbox::SandboxPolicy::for_project(base_cwd);
     let mut cmd = policy.wrap_command(command, &cwd);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -701,6 +748,10 @@ mod tests {
         sink
     }
 
+    fn policy() -> crate::sandbox::SandboxPolicy {
+        crate::sandbox::SandboxPolicy::for_project(&PathBuf::from("."))
+    }
+
     // These exercise `run_bash` directly (no gpui App) so the brush execution,
     // timeout escalation, and cancellation paths are covered.
 
@@ -711,6 +762,7 @@ mod tests {
             "printf hello",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
@@ -734,6 +786,7 @@ mod tests {
             "true",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
@@ -750,6 +803,7 @@ mod tests {
             "exit 7",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
@@ -768,6 +822,7 @@ mod tests {
             "sleep 30",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(1),
             CancellationToken::new(),
             null_sink(),
@@ -797,6 +852,7 @@ mod tests {
             "sleep 30",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(60),
             cancel,
             null_sink(),
@@ -818,6 +874,7 @@ mod tests {
             "sleep 30 & wait",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(1),
             CancellationToken::new(),
             null_sink(),
@@ -840,6 +897,7 @@ mod tests {
             "cd /tmp",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
@@ -851,6 +909,7 @@ mod tests {
             "pwd",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),

@@ -238,4 +238,52 @@ mod tests {
             "no-tools directive: {s}"
         );
     }
+
+    #[test]
+    fn prompt_distinguishes_discussion_from_implementation() {
+        // "How do I X" is a discussion request, not an implementation request —
+        // the agent must answer first and ask before touching code (thread
+        // bfb39601: agent started implementing on a "how do I add a
+        // marketplace" question).
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        assert!(
+            p.contains("Discussion vs implementation"),
+            "discussion section: {p}"
+        );
+        assert!(p.contains("discussion or Q&A"), "discussion framing: {p}");
+        assert!(
+            p.contains("shall I implement this now?"),
+            "ask-before-implementing: {p}"
+        );
+        assert!(
+            p.contains("Don't modify code without an explicit request"),
+            "no-unsolicited-code-changes: {p}"
+        );
+        assert!(
+            p.contains("the user's actual request"),
+            "task-execution scoped to actual request: {p}"
+        );
+    }
+
+    #[test]
+    fn prompt_contains_git_verification_discipline() {
+        // Every git write op must be verified with git itself before reporting
+        // success — the branch-tracking false-success regression (thread
+        // e5047fd2) came from reporting push success without checking
+        // `git log origin/<branch>`.
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        assert!(p.contains("Git operations"), "git section: {p}");
+        assert!(
+            p.contains("git log origin/<branch>"),
+            "remote verification: {p}"
+        );
+        assert!(
+            p.contains("Don't report success without verifying"),
+            "no-success-without-verify: {p}"
+        );
+        assert!(
+            p.contains("git branch --show-current"),
+            "branch name from measurement: {p}"
+        );
+    }
 }

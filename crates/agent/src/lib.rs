@@ -15,6 +15,7 @@ pub mod language_model;
 pub mod mcp;
 pub mod message;
 pub mod model_alias;
+pub mod path_env;
 pub mod paths;
 pub mod plugin;
 pub mod prefix_stability;

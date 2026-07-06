@@ -768,7 +768,20 @@ impl Thread {
         // end of the batch loop. Without this, the next turn's first tool batch
         // would be cut short by a stale flag.
         this.update(cx, |this, _| this.end_turn_after_tool = false)?;
+        // `turn_count` tracks the round-trip index within this `run_turn` only,
+        // not a session-wide total — reset on entry so `self_info` reports the
+        // current turn's progress (issue 5: it used to accumulate across user
+        // messages, reading "14/unlimited" mid-session). `cap_summary_injected`
+        // resets in lockstep so a prior turn's cap does not suppress this one's.
+        this.update(cx, |this, _| {
+            this.turn_count = 0;
+            this.cap_summary_injected = false;
+        })?;
         loop {
+            // Increment at the top so `turn_count` is 1-indexed for the
+            // round-trip about to run — `self_info` mid-batch reads the current
+            // index, not the previous batch's count.
+            this.update(cx, |this, _| this.turn_count += 1)?;
             let request = this.update(cx, |this, cx| {
                 this.pending_tool_uses.clear();
                 this.reconcile_tool_uses(cx);
@@ -950,12 +963,15 @@ impl Thread {
                 break;
             }
 
-            // Sub-agent turn cap: stop runaway sub-agents after `max_turns` round-trips.
-            // The first hit injects one summary turn so the sub-agent can wrap up
-            // with a coherent final message instead of ending mid-work; a second
-            // hit (the summary turn itself overflowed) hard-stops.
+            // Sub-agent turn cap: stop runaway sub-agents after `max_turns`
+            // round-trips. `turn_count` is 1-indexed and incremented at the top
+            // of each round-trip, so `>= max` fires at the end of the Nth
+            // round-trip — after exactly `max` tool round-trips have run. The
+            // first hit injects one summary turn so the sub-agent can wrap up
+            // with a coherent final message instead of ending mid-work; a
+            // second hit (the summary turn itself overflowed with tools)
+            // hard-stops.
             let hit_cap = this.update(cx, |this, cx| {
-                this.turn_count += 1;
                 let Some(max) = this.max_turns else {
                     return false;
                 };
