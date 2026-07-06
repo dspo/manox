@@ -80,7 +80,7 @@ impl AgentTool for McpTool {
     fn run(
         &self,
         input: serde_json::Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let client = self.client.clone();
@@ -88,7 +88,10 @@ impl AgentTool for McpTool {
         // bridge_tokio: F: Future<Output = Result<R, anyhow::Error>>, R: Display.
         // On success we return Ok(ToolOutput) whose Display is the text; when
         // the server flags is_error we return Err(anyhow) so bridge maps it to
-        // Err(String) and the model sees a tool failure.
+        // Err(String) and the model sees a tool failure. The cancel token races
+        // the rmcp call so a user-initiated stop reaps the turn promptly; the
+        // server-side call is left to complete on its own (MCP has no in-flight
+        // cancellation notification in the base spec).
         crate::tools::bridge_tokio(cx, async move {
             let mut params = CallToolRequestParams::new(name);
             if let serde_json::Value::Object(map) = input
@@ -96,11 +99,12 @@ impl AgentTool for McpTool {
             {
                 params = params.with_arguments(map);
             }
-            let result: CallToolResult = client
-                .peer()
-                .call_tool(params)
-                .await
-                .map_err(|e| anyhow::anyhow!("MCP tools/call failed: {e}"))?;
+            let result: CallToolResult = tokio::select! {
+                r = client.peer().call_tool(params) => {
+                    r.map_err(|e| anyhow::anyhow!("MCP tools/call failed: {e}"))?
+                }
+                _ = cancel.cancelled() => return Err(anyhow::anyhow!("cancelled")),
+            };
             let out = flatten_call_tool_result(&result);
             if out.is_error {
                 Err(anyhow::anyhow!("{}", out.text))

@@ -55,7 +55,12 @@ pub fn init(_cx: &mut App) {
     } else {
         tracing::info!("MCP registry empty (no servers connected)");
     }
-    let _ = REGISTRY.set(registry);
+    if let Err(rejected) = REGISTRY.set(registry) {
+        tracing::warn!(
+            "MCP registry already initialized; new registry ({} tools) rejected",
+            rejected.tools.len()
+        );
+    }
 }
 
 fn build_registry(config: McpConfig) -> McpRegistry {
@@ -65,18 +70,21 @@ fn build_registry(config: McpConfig) -> McpRegistry {
     let handle = crate::runtime::handle();
     // Block on connecting all servers. The tokio runtime is multi-threaded and
     // lives for the process; init runs on the gpui main thread before any UI.
-    let tools = handle.block_on(async { connect_all(config.mcp_servers).await });
+    // `handle.spawn` (not bare `tokio::spawn`) makes the runtime handle
+    // explicit — we are on the gpui main thread, not inside a tokio worker.
+    let tools = handle.block_on(async { connect_all(handle.clone(), config.mcp_servers).await });
     McpRegistry { tools }
 }
 
 /// Connect every server concurrently, collect the resulting tool adapters.
 /// Per-server failures are isolated.
 async fn connect_all(
+    handle: tokio::runtime::Handle,
     servers: BTreeMap<String, crate::mcp::config::McpServerConfig>,
 ) -> Vec<AnyAgentTool> {
     let mut tasks = Vec::new();
     for (name, cfg) in servers {
-        tasks.push(tokio::spawn(async move { connect_one(&name, cfg).await }));
+        tasks.push(handle.spawn(async move { connect_one(&name, cfg).await }));
     }
     let mut all_tools = Vec::new();
     for task in tasks {
