@@ -213,7 +213,8 @@ impl AgentTool for ReadFileTool {
         };
         let path = resolve_path(&parsed.path, &self.cwd);
         cx.background_spawn(async move {
-            let raw = std::fs::read_to_string(&path).map_err(|e| format!("read_file failed: {e}"))?;
+            let raw =
+                std::fs::read_to_string(&path).map_err(|e| format!("read_file failed: {e}"))?;
             let text = crate::hashline::normalize_to_lf(&raw);
             let snap = crate::hashline::global()
                 .lock()
@@ -896,10 +897,7 @@ mod tests {
         assert!(r.contains("150 bytes total"), "total reported: {r}");
         assert!(r.contains("showing first 100"), "cap reported: {r}");
         assert!(r.contains("narrow the pattern"), "hint folded in: {r}");
-        assert!(
-            r.contains("do not speculate"),
-            "no-guess directive: {r}"
-        );
+        assert!(r.contains("do not speculate"), "no-guess directive: {r}");
         assert!(r.contains("body"), "text preserved: {r}");
     }
 

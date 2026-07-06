@@ -17,8 +17,16 @@ use crate::views::message::{MessageItem, build_items};
 #[derive(Debug, Clone)]
 pub enum ConvItem {
     User(String),
-    Assistant { text: String, streaming: bool },
-    Reasoning { text: String, streaming: bool, collapsed: bool, user_toggled: bool },
+    Assistant {
+        text: String,
+        streaming: bool,
+    },
+    Reasoning {
+        text: String,
+        streaming: bool,
+        collapsed: bool,
+        user_toggled: bool,
+    },
     ToolCall(ToolCallItem),
     AgentTask(AgentTaskItem),
     /// A runtime error from the agent (red danger styling).
@@ -452,6 +460,10 @@ impl ConversationState {
             }
             ThreadEvent::YoloToggled { .. } => {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
+                ApplyOutcome::None
+            }
+            ThreadEvent::PrefixStability { .. } => {
+                // UI state (cache chip) handled by `Workspace`; not a conversation item.
                 ApplyOutcome::None
             }
         }

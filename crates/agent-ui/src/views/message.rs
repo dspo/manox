@@ -117,10 +117,13 @@ impl MessageItem {
     /// single-line card so it stops competing with the assistant's final reply.
     pub fn finalize_streaming(&mut self) {
         match &mut self.kind {
-            ConvItem::Assistant { streaming, .. } => {
-                *streaming = false
-            }
-            ConvItem::Reasoning { streaming, collapsed, user_toggled, .. } => {
+            ConvItem::Assistant { streaming, .. } => *streaming = false,
+            ConvItem::Reasoning {
+                streaming,
+                collapsed,
+                user_toggled,
+                ..
+            } => {
                 *streaming = false;
                 *collapsed = !*user_toggled;
             }
@@ -185,7 +188,20 @@ pub fn render_item(
         ConvItem::Assistant { text, streaming } => {
             render_assistant(text, *streaming, ix, role, theme)
         }
-        ConvItem::Reasoning { text, streaming, collapsed, user_toggled } => render_reasoning(text, ix, *streaming, *collapsed, *user_toggled, theme, tool_ctx),
+        ConvItem::Reasoning {
+            text,
+            streaming,
+            collapsed,
+            user_toggled,
+        } => render_reasoning(
+            text,
+            ix,
+            *streaming,
+            *collapsed,
+            *user_toggled,
+            theme,
+            tool_ctx,
+        ),
         ConvItem::ToolCall(t) => {
             if t.name == "exit_plan_mode" {
                 render_plan_card(t, ix, theme, tool_ctx)
@@ -341,10 +357,14 @@ pub fn render_reasoning(
                 let _ = weak.update(cx, |w, cx| {
                     let conv = w.conversation.clone();
                     conv.update(cx, |c, cx| {
-                        if let Some(item) = c.items().get(ix_click)
-                        {
+                        if let Some(item) = c.items().get(ix_click) {
                             item.update(cx, |item, cx| {
-                                if let ConvItem::Reasoning { collapsed, user_toggled, .. } = item.kind_mut() {
+                                if let ConvItem::Reasoning {
+                                    collapsed,
+                                    user_toggled,
+                                    ..
+                                } = item.kind_mut()
+                                {
                                     *collapsed = !*collapsed;
                                     *user_toggled = true;
                                 }
@@ -392,7 +412,12 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .w_full()
                 .justify_between()
                 .items_center()
-                .child(gpui::div().text_sm().text_color(theme.danger).child(i18n::t("message-error")))
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .text_color(theme.danger)
+                        .child(i18n::t("message-error")),
+                )
                 .child(copy_button(ix, "copy-error", msg.to_string())),
         )
         .child(
@@ -460,15 +485,26 @@ pub fn render_tool_call(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
-    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) = match item.status {
-        ToolCallStatus::PendingApproval => {
-            (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-pending"))
-        }
-        ToolCallStatus::Running => (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-running")),
-        ToolCallStatus::Success => (IconName::CircleCheck, theme.success, i18n::t("status-success")),
-        ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
-        ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
-    };
+    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) =
+        match item.status {
+            ToolCallStatus::PendingApproval => (
+                IconName::LoaderCircle,
+                theme.muted_foreground,
+                i18n::t("status-pending"),
+            ),
+            ToolCallStatus::Running => (
+                IconName::LoaderCircle,
+                theme.muted_foreground,
+                i18n::t("status-running"),
+            ),
+            ToolCallStatus::Success => (
+                IconName::CircleCheck,
+                theme.success,
+                i18n::t("status-success"),
+            ),
+            ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
+            ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
+        };
 
     let title = if item.title.is_empty() {
         item.name.clone()
@@ -774,15 +810,26 @@ pub fn render_agent_task(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
-    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) = match item.status {
-        ToolCallStatus::PendingApproval => {
-            (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-pending"))
-        }
-        ToolCallStatus::Running => (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-running")),
-        ToolCallStatus::Success => (IconName::CircleCheck, theme.success, i18n::t("status-success")),
-        ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
-        ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
-    };
+    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) =
+        match item.status {
+            ToolCallStatus::PendingApproval => (
+                IconName::LoaderCircle,
+                theme.muted_foreground,
+                i18n::t("status-pending"),
+            ),
+            ToolCallStatus::Running => (
+                IconName::LoaderCircle,
+                theme.muted_foreground,
+                i18n::t("status-running"),
+            ),
+            ToolCallStatus::Success => (
+                IconName::CircleCheck,
+                theme.success,
+                i18n::t("status-success"),
+            ),
+            ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
+            ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
+        };
 
     let expanded = agent_ctx.is_some_and(|c| c.expanded.contains(&item.id));
     let chevron = if expanded {

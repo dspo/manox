@@ -179,8 +179,8 @@ fn setup_child(
     ptu: &str,
     cx: &mut App,
 ) -> Result<SubagentSetup, String> {
-    let parsed: AgentToolInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("agent input parse failed: {e}"))?;
+    let parsed: AgentToolInput = serde_json::from_value(input.clone())
+        .map_err(|e| format!("agent input parse failed: {e}"))?;
 
     let def_file: Arc<AgentDefinitionFile> = agent_def::global()
         .get(&parsed.subagent_type)

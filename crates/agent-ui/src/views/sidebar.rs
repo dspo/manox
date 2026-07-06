@@ -18,8 +18,9 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
     tag::{Tag, TagVariant},
+    v_flex,
 };
 
 /// Events the sidebar emits to the Workspace.
@@ -227,13 +228,18 @@ impl Render for Sidebar {
                                 &theme,
                             )),
                     )
-                    .children((!projects.is_empty())
-                        .then(|| section_header(i18n::t("sidebar-section-projects"), &theme)))
+                    .children(
+                        (!projects.is_empty())
+                            .then(|| section_header(i18n::t("sidebar-section-projects"), &theme)),
+                    )
                     .children(projects.into_iter().map(|(path, group)| {
                         self.render_project_group(&path, &group, selected.as_deref(), &theme, cx)
                     }))
-                    .children((!loose.is_empty())
-                        .then(|| section_header(i18n::t("sidebar-section-conversations"), &theme)))
+                    .children(
+                        (!loose.is_empty()).then(|| {
+                            section_header(i18n::t("sidebar-section-conversations"), &theme)
+                        }),
+                    )
                     .child(
                         v_flex()
                             .gap_0p5()
@@ -312,9 +318,9 @@ fn section_header(label: SharedString, theme: &Theme) -> AnyElement {
 }
 
 /// Render one conversation row. `indent` adds left padding so rows nested under
-/// a project folder align below its label. A short thread-id tag (first 8 chars)
-/// is shown; the currently-viewed thread uses a colored tag variant, others use
-/// the secondary variant.
+/// a project folder align below its label. Two-row layout: title on top, tag +
+/// relative time + delete button on bottom. The thread-id tag uses outline style
+/// matching the model-menu wire-api tags.
 fn render_thread_item(
     ix: usize,
     summary: &agent::ThreadSummary,
@@ -338,7 +344,6 @@ fn render_thread_item(
         theme.transparent
     };
     let group = gpui::SharedString::from(format!("thread-row-{ix}"));
-    // Short thread ID: first 8 hex chars of the UUID.
     let short_id = &summary.id[..summary.id.len().min(8)];
     let tag_variant = if selected {
         TagVariant::Primary
@@ -352,9 +357,7 @@ fn render_thread_item(
         .w_full()
         .pl(px(8.) + indent)
         .pr_2()
-        .py_1p5()
-        .gap_2()
-        .items_center()
+        .py_1()
         .rounded(theme.radius)
         .bg(bg)
         .hover(|s| s.bg(theme.accent.opacity(0.08)))
@@ -362,45 +365,57 @@ fn render_thread_item(
         .on_click(cx.listener(move |_this, _ev, _window, cx| {
             cx.emit(SidebarEvent::OpenThread(id_open.clone()));
         }))
+        // Two-row layout: title on top, metadata on bottom.
         .child(
-            Tag::new()
-                .with_variant(tag_variant)
-                .xsmall()
-                .child(short_id.to_string()),
-        )
-        .child(
-            gpui::div()
+            v_flex()
+                .gap_0p5()
                 .flex_1()
                 .min_w_0()
-                .overflow_hidden()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(title),
-        )
-        // Relative time, hidden while the row is hovered so the delete button can take its place.
-        .child(
-            gpui::div()
-                .flex_shrink_0()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .group_hover(group.clone(), |s| s.invisible())
-                .child(updated),
-        )
-        // Delete button, revealed only on row hover.
-        .child(
-            gpui::div()
-                .absolute()
-                .right_2()
-                .invisible()
-                .group_hover(group, |s| s.visible())
+                // Row 1: title (full width, no inline tag clutter).
                 .child(
-                    Button::new(("del-thread", ix))
-                        .ghost()
-                        .small()
-                        .icon(IconName::Close)
-                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
-                            cx.emit(SidebarEvent::DeleteThread(id_del.clone()));
-                        })),
+                    gpui::div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(title),
+                )
+                // Row 2: tag + relative time + delete button.
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Tag::new()
+                                .with_variant(tag_variant)
+                                .outline()
+                                .small()
+                                .child(short_id.to_string()),
+                        )
+                        // Relative time, hidden while the row is hovered so the delete button can take its place.
+                        .child(
+                            gpui::div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .group_hover(group.clone(), |s| s.invisible())
+                                .child(updated),
+                        )
+                        // Delete button, revealed only on row hover.
+                        .child(
+                            gpui::div()
+                                .invisible()
+                                .group_hover(group, |s| s.visible())
+                                .child(
+                                    Button::new(("del-thread", ix))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Close)
+                                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
+                                            cx.emit(SidebarEvent::DeleteThread(id_del.clone()));
+                                        })),
+                                ),
+                        ),
                 ),
         )
         .into_any_element()

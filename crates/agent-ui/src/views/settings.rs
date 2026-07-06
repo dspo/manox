@@ -116,8 +116,9 @@ impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search =
-            cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t("settings-search-placeholder")));
+        let search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::t("settings-search-placeholder"))
+        });
         Self {
             search,
             selected: None,
@@ -293,7 +294,10 @@ impl Render for SettingsView {
                 let coming_label: SharedString = match selected.as_ref() {
                     Some(key) => {
                         let displayed = i18n::t(key);
-                        i18n::t_str("settings-coming-soon-label", &[("label", displayed.as_ref())])
+                        i18n::t_str(
+                            "settings-coming-soon-label",
+                            &[("label", displayed.as_ref())],
+                        )
                     }
                     None => i18n::t("settings-coming-soon"),
                 };
