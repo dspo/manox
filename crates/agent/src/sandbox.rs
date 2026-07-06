@@ -89,6 +89,11 @@ impl SandboxPolicy {
     /// re-allow to writable roots, deny to protected paths, deny all network
     /// when `allow_network` is false. More-specific rules win, so the
     /// `.git` deny overrides the project-root allow for that subtree.
+    ///
+    /// Character-device redirection targets (`/dev/null`, `/dev/zero`,
+    /// `/dev/stdout`, `/dev/stderr`) are allowlisted as literals: they are not
+    /// under any writable root, so `(deny file-write*)` would otherwise reject
+    /// `cmd > /dev/null`. They are write-only sinks with no persistent state.
     #[cfg(target_os = "macos")]
     fn render_seatbelt(&self) -> String {
         let mut s = String::new();
@@ -100,6 +105,9 @@ impl SandboxPolicy {
                 "(allow file-write* (subpath \"{}\"))\n",
                 escape_seatbelt_path(root)
             ));
+        }
+        for dev in ["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr"] {
+            s.push_str(&format!("(allow file-write* (literal \"{dev}\"))\n"));
         }
         for p in &self.protected_paths {
             s.push_str(&format!(
@@ -230,6 +238,24 @@ mod tests {
     fn seatbelt_denies_network() {
         let s = policy().render_seatbelt();
         assert!(s.contains("(deny network*)"), "network denied: {s}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_allows_dev_null_and_redirect_targets() {
+        // `/dev/null` is a character device outside any writable root; without
+        // an explicit literal allow, `cmd > /dev/null` is rejected. The same
+        // applies to the other common redirection sinks.
+        let s = policy().render_seatbelt();
+        for dev in ["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr"] {
+            assert!(
+                s.contains(&format!("(allow file-write* (literal \"{dev}\"))")),
+                "{dev} must be allowlisted: {s}"
+            );
+        }
+        // The Rust-side check is unchanged: /dev/null is not "writable" in the
+        // FS-tool sense — only seatbelt redirection is relaxed for it.
+        assert!(!policy().is_writable(Path::new("/dev/null")));
     }
 
     #[cfg(target_os = "macos")]
