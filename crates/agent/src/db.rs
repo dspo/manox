@@ -41,6 +41,8 @@ pub struct ThreadRecord {
     pub cwd: String,
     /// Absolute project directory the thread is bound to; empty when none was chosen.
     pub project: String,
+    /// Whether YOLO mode was active when the thread was saved.
+    pub yolo: bool,
     pub messages: Vec<Message>,
 }
 
@@ -58,6 +60,7 @@ CREATE TABLE IF NOT EXISTS threads (
     model_id TEXT NOT NULL DEFAULT '',
     cwd TEXT NOT NULL DEFAULT '',
     project TEXT NOT NULL DEFAULT '',
+    yolo INTEGER NOT NULL DEFAULT 0,
     messages TEXT NOT NULL DEFAULT '[]',
     updated_at INTEGER NOT NULL
 );
@@ -77,6 +80,11 @@ impl ThreadsDatabase {
         // a duplicate-column error on already-migrated databases is expected and ignored.
         let _ = conn.execute(
             "ALTER TABLE threads ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        // Migrate pre-`yolo` databases (same idempotent-ignore pattern).
+        let _ = conn.execute(
+            "ALTER TABLE threads ADD COLUMN yolo INTEGER NOT NULL DEFAULT 0",
             [],
         );
         Ok(Self {
@@ -99,13 +107,14 @@ impl ThreadsDatabase {
 
         let conn = self.conn.lock().expect("db mutex 中毒");
         conn.execute(
-            "INSERT INTO threads (id, summary, model_id, cwd, project, messages, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO threads (id, summary, model_id, cwd, project, yolo, messages, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET
                 summary = excluded.summary,
                 model_id = excluded.model_id,
                 cwd = excluded.cwd,
                 project = excluded.project,
+                yolo = excluded.yolo,
                 messages = excluded.messages,
                 updated_at = excluded.updated_at",
             params![
@@ -114,6 +123,7 @@ impl ThreadsDatabase {
                 rec.model_id,
                 rec.cwd,
                 rec.project,
+                rec.yolo,
                 messages_json,
                 now
             ],
@@ -126,7 +136,7 @@ impl ThreadsDatabase {
     pub fn load(&self, id: &str) -> Result<Option<ThreadRecord>> {
         let conn = self.conn.lock().expect("db mutex 中毒");
         let mut stmt = conn.prepare(
-            "SELECT id, summary, model_id, cwd, project, messages FROM threads WHERE id = ?1",
+            "SELECT id, summary, model_id, cwd, project, yolo, messages FROM threads WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
         let Some(row) = rows.next()? else {
@@ -137,7 +147,8 @@ impl ThreadsDatabase {
         let model_id: String = row.get(2)?;
         let cwd: String = row.get(3)?;
         let project: String = row.get(4)?;
-        let messages_json: String = row.get(5)?;
+        let yolo: bool = row.get::<_, i64>(5)? != 0;
+        let messages_json: String = row.get(6)?;
         let stored: Vec<StoredMessage> = serde_json::from_str(&messages_json)
             .with_context(|| format!("反序列化 messages 失败 (thread {id})"))?;
         let messages = stored
@@ -153,6 +164,7 @@ impl ThreadsDatabase {
             model_id,
             cwd,
             project,
+            yolo,
             messages,
         }))
     }
@@ -212,6 +224,7 @@ mod tests {
             model_id: "百炼/glm-5.2[1m]/anthropic".into(),
             cwd: "/tmp".into(),
             project: "/tmp".into(),
+            yolo: true,
             messages: vec![
                 Message::user("你好".into()),
                 Message::assistant(vec![MessageContent::Text("hi".into())]),
@@ -223,6 +236,7 @@ mod tests {
         assert_eq!(loaded.id, "t1");
         assert_eq!(loaded.summary, "你好");
         assert_eq!(loaded.project, "/tmp");
+        assert!(loaded.yolo, "yolo flag must round-trip");
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].role, Role::User);
 

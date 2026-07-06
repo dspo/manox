@@ -80,6 +80,8 @@ pub enum ThreadEvent {
         summary: String,
         input: serde_json::Value,
     },
+    /// YOLO mode toggled on/off. The UI refreshes its badge and access chip.
+    YoloToggled { on: bool },
     /// A completion turn ended.
     Stop(StopReason),
     /// An error during streaming.
@@ -95,6 +97,11 @@ pub struct Thread {
     model: Option<AnyLanguageModel>,
     tools: Arc<ToolRegistry>,
     permission: Arc<PermissionCache>,
+    /// YOLO mode: when true, all tool approvals are bypassed and `bash` runs
+    /// unsandboxed (DangerFullAccess equivalent). Session-scoped; inherited by
+    /// sub-agents. Distinct from the always-allow cache so disabling YOLO
+    /// returns to normal approval without leaving stale always-allow grants.
+    yolo: bool,
     cwd: PathBuf,
     /// The project directory the thread is bound to, chosen on the first screen.
     /// `None` means no project was chosen; tools then resolve paths against the
@@ -176,6 +183,7 @@ impl Thread {
                     .cloned(),
                 tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
+                yolo: false,
                 cwd,
                 project: None,
                 pending_tool_uses: Vec::new(),
@@ -202,6 +210,7 @@ impl Thread {
         id: ThreadId,
         cwd: PathBuf,
         project: Option<PathBuf>,
+        yolo: bool,
         messages: Vec<Message>,
         model: Option<AnyLanguageModel>,
         cx: &mut App,
@@ -214,6 +223,7 @@ impl Thread {
                 model,
                 tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
+                yolo,
                 cwd,
                 project,
                 pending_tool_uses: Vec::new(),
@@ -244,6 +254,7 @@ impl Thread {
         cwd: PathBuf,
         model: AnyLanguageModel,
         permission: Arc<PermissionCache>,
+        yolo: bool,
         system: String,
         max_turns: u32,
         depth: u32,
@@ -258,6 +269,7 @@ impl Thread {
                 model: Some(model),
                 tools: Arc::new(tools_fn(weak)),
                 permission,
+                yolo,
                 cwd,
                 project: None,
                 pending_tool_uses: Vec::new(),
@@ -292,6 +304,7 @@ impl Thread {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            yolo: self.yolo,
             messages: self.messages.clone(),
         })
     }
@@ -410,6 +423,23 @@ impl Thread {
     /// gave the parent for the same tool.
     pub fn permission_snapshot(&self) -> std::collections::HashSet<String> {
         self.permission.allowed_tools()
+    }
+
+    /// Whether YOLO mode is active (approvals bypassed, bash unsandboxed).
+    pub fn yolo(&self) -> bool {
+        self.yolo
+    }
+
+    /// Toggle YOLO mode. Emits [`ThreadEvent::YoloToggled`] so the UI refreshes
+    /// its badge and access chip. Bypasses approvals for all subsequent tool
+    /// calls in this thread (and any sub-agents spawned after the toggle).
+    pub fn set_yolo(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.yolo == on {
+            return;
+        }
+        self.yolo = on;
+        cx.emit(ThreadEvent::YoloToggled { on });
+        cx.notify();
     }
 
     pub fn model(&self) -> Option<&AnyLanguageModel> {
@@ -631,17 +661,21 @@ impl Thread {
                 for tu in &tool_uses {
                     // `exit_plan_mode` is synthesized (not in `this.tools`), so
                     // the registry lookup below would default it to the free
-                    // (parallel) path. Force it serial: the plan overlay is
-                    // single-slot like the auth overlay, so two parallel
-                    // `exit_plan_mode` calls would have the second overwrite the
-                    // first's `pending_plan` and strand its oneshot forever.
+                    // (parallel) path; it has its own plan-overlay routing.
                     let is_plan_exit = tu.name.as_ref() == "exit_plan_mode";
+                    // YOLO bypasses permission gates, but not tools whose
+                    // authorization flow IS their execution (AskUserQuestion):
+                    // bypassing those would drop the user's input and hit an
+                    // unreachable `run`.
+                    let tool = this.tools.get(tu.name.as_ref());
+                    let requires_approval = tool
+                        .map(|t| t.requires_approval(&tu.input))
+                        .unwrap_or(false);
+                    let requires_user_input =
+                        tool.map(|t| t.requires_user_input()).unwrap_or(false);
                     let needs_approval = !is_plan_exit
-                        && this
-                            .tools
-                            .get(tu.name.as_ref())
-                            .map(|t| t.requires_approval(&tu.input))
-                            .unwrap_or(false)
+                        && (!this.yolo || requires_user_input)
+                        && requires_approval
                         && !this.permission.is_always_allowed(tu.name.as_ref());
                     if needs_approval || is_plan_exit {
                         appr.push(tu.clone());
@@ -820,8 +854,17 @@ impl Thread {
             return Ok(());
         }
 
+        // YOLO mode bypasses permission approvals: skip the authorization
+        // prompt entirely so the tool runs immediately. This is the
+        // session-level equivalent of codex's `approval_policy = Never`. Tools
+        // whose authorization flow IS their execution (`AskUserQuestion`) are
+        // exempt: bypassing them would drop the user's input and hit an
+        // unreachable `run`.
+        let requires_user_input = tool.requires_user_input();
         let needs_approval = tool.requires_approval(&tu.input)
-            && !this.read_with(cx, |this, _| this.permission.is_always_allowed(&name))?;
+            && !this.read_with(cx, |this, _| {
+                (this.yolo && !requires_user_input) || this.permission.is_always_allowed(&name)
+            })?;
         if needs_approval {
             this.update(cx, |_, cx| {
                 cx.emit(ThreadEvent::ToolCall {
@@ -1381,7 +1424,11 @@ impl Thread {
     fn build_completion_request(&self) -> LanguageModelRequest {
         let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
         let mut system = self.system.clone().unwrap_or_else(|| {
-            crate::system_prompt::build_main_system_prompt(&self.cwd, self.project.as_deref())
+            crate::system_prompt::build_main_system_prompt(
+                &self.cwd,
+                self.project.as_deref(),
+                self.yolo,
+            )
         });
         // In plan mode, append the read-only-constraint addendum so the model
         // knows it must submit a plan via `exit_plan_mode` rather than act.
@@ -1696,6 +1743,7 @@ mod tests {
                 super::ThreadId("reg-run-tool-inner".to_string()),
                 std::path::PathBuf::from("/tmp"),
                 None,
+                false,
                 Vec::new(),
                 None,
                 cx,
@@ -1758,6 +1806,7 @@ mod tests {
                 super::ThreadId("reg-cancel-plan".to_string()),
                 std::path::PathBuf::from("/tmp"),
                 None,
+                false,
                 Vec::new(),
                 None,
                 cx,
@@ -1815,6 +1864,7 @@ mod tests {
                 super::ThreadId("reg-plan-approve-order".to_string()),
                 std::path::PathBuf::from("/tmp"),
                 None,
+                false,
                 Vec::new(),
                 None,
                 cx,
@@ -1905,5 +1955,81 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// Regression guard for the YOLO + `AskUserQuestion` interaction.
+    /// `AskUserQuestion`'s `run` body is unreachable — its result is built
+    /// from the `ToolAuthorizationResponse` at the authorization gate. YOLO
+    /// bypasses *permission* gates, but must not bypass this tool, or the
+    /// model would hit the unreachable `run` and get an error string instead
+    /// of the user's answers. Under the fix, YOLO + `AskUserQuestion` still
+    /// enters the gate; a cancelled turn resolves the gate to `Deny`, so the
+    /// tool result is the user-refusal message — not the `run`-body error.
+    #[test]
+    fn run_tool_inner_yolo_ask_user_question_hits_gate_not_run() {
+        use crate::language_model::{LanguageModelToolResult, LanguageModelToolUse};
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                super::ThreadId("reg-yolo-ask-user".to_string()),
+                std::path::PathBuf::from("/tmp"),
+                None,
+                true, // YOLO on
+                Vec::new(),
+                None,
+                cx,
+            )
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_aq".to_string(),
+            name: Arc::from("AskUserQuestion"),
+            raw_input: "{}".to_string(),
+            input: serde_json::json!({}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let weak = thread.downgrade();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let r = result.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *r.lock().unwrap() =
+                    Some(super::Thread::run_tool_inner(weak, tu, cancel, &mut cx).await);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+
+        let res = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("run_tool_inner did not complete");
+        assert!(res.is_ok(), "run_tool_inner failed: {:?}", res.err());
+
+        let messages = cx.update(|cx| thread.read_with(cx, |t, _| t.messages.clone()));
+        let last = messages.last().expect("no message appended");
+        let MessageContent::ToolResult(LanguageModelToolResult { content, .. }) =
+            last.content.last().expect("no content")
+        else {
+            panic!("expected ToolResult, got {:?}", last.content);
+        };
+        assert!(
+            content.contains("用户拒绝执行"),
+            "YOLO + AskUserQuestion should hit the authorization gate (Deny on cancel), \
+             got: {content}"
+        );
+        assert!(
+            !content.contains("resolved by the UI"),
+            "YOLO must not bypass AskUserQuestion into its unreachable run body, got: {content}"
+        );
     }
 }

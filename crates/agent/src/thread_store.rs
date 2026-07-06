@@ -95,6 +95,7 @@ impl ThreadStore {
             ThreadId(rec.id),
             PathBuf::from(&rec.cwd),
             project,
+            rec.yolo,
             rec.messages,
             model,
             cx,

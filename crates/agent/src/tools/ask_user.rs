@@ -78,6 +78,13 @@ impl AgentTool for AskUserQuestionTool {
         true
     }
 
+    /// The authorization gate IS this tool's execution: the thread intercepts
+    /// the `ToolAuthorizationResponse` and builds the result from the user's
+    /// answers, never reaching `run`. YOLO must not bypass it.
+    fn requires_user_input(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         _input: serde_json::Value,

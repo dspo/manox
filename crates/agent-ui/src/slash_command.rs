@@ -10,9 +10,11 @@
 //! ([`init`]). Each command is an erased `&'static dyn SlashCommand`. The
 //! `⁄` popover in the composer lists registered commands dynamically.
 //!
-//! Two commands ship today: the mock `/yolo` (placeholder, real YOLO lands in
-//! a follow-up PR) and the live `/plan` (enter/exit plan mode, see
-//! [`PlanCommand`]).
+//! Two built-in commands ship today: the live `/yolo` (toggle YOLO mode —
+//! bypass approvals + unsandboxed bash, see [`YoloCommand`]) and `/plan`
+//! (enter/exit plan mode, see [`PlanCommand`]). Markdown prompt-macros
+//! (`/gitwork:deliver`, etc.) are mirrored in at runtime via the
+//! [`MarkdownSlashCommand`] adapter.
 
 use std::sync::{Arc, OnceLock};
 
@@ -103,10 +105,10 @@ impl SlashCommandRegistry {
 /// `OnceLock::set`.
 pub fn init(_cx: &mut App) {
     let mut commands: Vec<Box<dyn SlashCommand>> = vec![
-        // Mock /yolo: pushes a placeholder notice. The real YOLO
-        // implementation replaces this command with a live toggle + execution
-        // in a follow-up PR.
-        Box::new(MockYoloCommand),
+        // /yolo: toggle YOLO mode (no args), or enable YOLO and immediately run
+        // the prompt as a user turn (with args). Bypasses approvals and runs
+        // bash unsandboxed for the session.
+        Box::new(YoloCommand),
         Box::new(PlanCommand),
     ];
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
@@ -176,31 +178,36 @@ pub fn dispatch(
     cmd.execute(&parsed.args, workspace, window, cx)
 }
 
-// ─── built-in commands (mock) ─────────────────────────────────────────────
+// ─── built-in commands ─────────────────────────────────────────────────────
 
-/// Placeholder `/yolo` command. Pushes an info notice; no real effect.
-/// Replaced by the live YOLO toggle in the follow-up PR.
-struct MockYoloCommand;
+/// `/yolo` — toggle YOLO mode on the current thread.
+///
+/// `/yolo` (no args) toggles YOLO on/off and pushes a notice.
+/// `/yolo [prompt]` enables YOLO (if not already on) and immediately sends
+/// `prompt` as a user turn so the agent starts working with full autonomy.
+struct YoloCommand;
 
-impl SlashCommand for MockYoloCommand {
+impl SlashCommand for YoloCommand {
     fn name(&self) -> &str {
         "yolo"
     }
     fn description(&self) -> &str {
-        "切换 YOLO 模式（mock：暂无实际效果）"
+        "切换 YOLO 模式（免审批 + bash 沙箱外）；带提示词则开启后直接开工"
     }
     fn execute(
         &self,
-        _args: &str,
+        args: &str,
         workspace: &mut Workspace,
         _window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> SlashResult {
-        workspace.add_info_message(
-            "/yolo 命令已识别（mock）。真实 YOLO 模式将在后续 PR 实现。".to_string(),
-            cx,
-        );
-        SlashResult::Handled
+        if args.is_empty() {
+            workspace.toggle_yolo(cx);
+            SlashResult::Handled
+        } else {
+            workspace.start_yolo_turn(args.to_string(), cx);
+            SlashResult::Handled
+        }
     }
 }
 
@@ -356,7 +363,7 @@ mod tests {
             return;
         }
         let _ = REGISTRY.set(SlashCommandRegistry::new(vec![
-            Box::new(MockYoloCommand),
+            Box::new(YoloCommand),
             Box::new(PlanCommand),
         ]));
     }
