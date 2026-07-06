@@ -128,3 +128,4 @@ manox 区分**模型面向**与**用户面向**两条字符串边界，二者不
 - **PR 提交后与 remora 达成一致**：先提交 PR，再运行 `/remora:adversarial-review [prompt]`，多轮交锋达成一致后再合并。
 - **禁止抄袭第三方 crate 代码**：不便规范引入的可参考架构思想，但禁止复制粘贴后修改。`git2` 即因此被禁（plugin marketplace shell out 系统 `git`）。
 - **注释一律英文，面向终态（描述不变量/意图）而非过程流水账，非必要不注释**。详见 `~/.claude/rules/code-comments.md`。
+- **迭代时不得破坏前缀缓存**：provider 侧前缀缓存是透明优化——命中时零成本，击穿时静默回退为全量重算，无 warning、无 error。任何对 `build_completion_request` 或消息组装管线的改动，必须保持跨 turn 的请求前缀字节一致；若确实需要重写历史（截断、剥离图片等），须先接入 `AppendOnlyContextManager`（`prefix_stability.rs`）或显式禁用该路径的缓存。缓存正确性完全依赖调用方维护前缀稳定——没有运行时护栏。
