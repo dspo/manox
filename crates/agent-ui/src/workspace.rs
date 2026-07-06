@@ -2048,7 +2048,7 @@ impl Render for Workspace {
                 .iter()
                 .rev()
                 .filter_map(|e| {
-                    if let ConvItem::Error(msg) = e.read(cx).kind() {
+                    if let ConvItem::Error(msg) | ConvItem::Notice(msg) = e.read(cx).kind() {
                         Some(msg.clone())
                     } else {
                         None

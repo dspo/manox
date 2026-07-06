@@ -103,7 +103,7 @@ impl ConversationState {
     /// the hero layout.
     pub fn is_empty(&self, cx: &App) -> bool {
         self.items.iter().all(|e| {
-            matches!(e.read(cx).kind(), ConvItem::Error(_))
+            matches!(e.read(cx).kind(), ConvItem::Error(_) | ConvItem::Notice(_))
         })
     }
 
