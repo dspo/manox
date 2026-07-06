@@ -36,6 +36,16 @@ pub struct ToolCallItem {
     /// True while live `ToolOutput` chunks are still streaming in; flipped to
     /// false once the final `ToolResult` lands the canonical output.
     pub streaming: bool,
+    /// True ⇒ body hidden. Auto-flipped to true on terminal status (Success /
+    /// Error / Denied) unless `user_toggled` is set, so a completed tool call
+    /// collapses back to a single-line card. While `streaming` is true the
+    /// body is always shown regardless of this flag.
+    pub collapsed: bool,
+    /// Becomes true the first time the user clicks the card header. Once
+    /// set, the auto-collapse logic stops touching `collapsed` so the user's
+    /// manual choice survives subsequent status transitions within the same
+    /// tool call.
+    pub user_toggled: bool,
 }
 
 /// A sub-agent (`agent` tool) invocation. The child `Thread`'s streamed text
@@ -99,7 +109,7 @@ impl ConversationState {
             .push(cx.new(|_| MessageItem::new(ConvItem::User(text), role.to_string(), id, weak)));
     }
 
-    fn find_tool(&self, id: &str, cx: &App) -> Option<usize> {
+    pub fn find_tool(&self, id: &str, cx: &App) -> Option<usize> {
         self.items
             .iter()
             .position(|e| matches!(e.read(cx).kind(), ConvItem::ToolCall(t) if t.id == id))
@@ -218,8 +228,6 @@ impl ConversationState {
                 status,
             } => {
                 if name == "agent" {
-                    // Sub-agent invocations render as AgentTask cards, not plain
-                    // tool calls, so they get the expandable sub-conversation panel.
                     if let Some(ix) = self.find_agent_task(id, cx) {
                         self.items[ix].update(cx, |item, cx| {
                             if let ConvItem::AgentTask(t) = item.kind_mut() {
@@ -256,6 +264,18 @@ impl ConversationState {
                             t.title = title.clone();
                             t.status = *status;
                             t.name = name.clone();
+                            // Reaching a terminal status flips collapse on —
+                            // matches the same flip in the ToolResult branch
+                            // for tools whose result event lands first.
+                            if matches!(
+                                *status,
+                                ToolCallStatus::Success
+                                    | ToolCallStatus::Error
+                                    | ToolCallStatus::Denied
+                            ) && !t.streaming
+                            {
+                                t.collapsed = !t.user_toggled;
+                            }
                         }
                         cx.notify();
                     });
@@ -272,6 +292,8 @@ impl ConversationState {
                                 output: String::new(),
                                 is_error: false,
                                 streaming: matches!(*status, ToolCallStatus::Running),
+                                collapsed: false,
+                                user_toggled: false,
                             }),
                             role.to_string(),
                             ix,
@@ -336,6 +358,9 @@ impl ConversationState {
                             t.is_error = *is_error;
                             t.streaming = false;
                             t.status = status;
+                            // Auto-collapse once the tool call reaches a terminal
+                            // status. Preserves the user's manual choice if any.
+                            t.collapsed = !t.user_toggled;
                         }
                         cx.notify();
                     });
@@ -353,6 +378,11 @@ impl ConversationState {
                                 output: output.clone(),
                                 is_error: *is_error,
                                 streaming: false,
+                                collapsed: !matches!(
+                                    status,
+                                    ToolCallStatus::Running | ToolCallStatus::PendingApproval
+                                ),
+                                user_toggled: false,
                             }),
                             role.to_string(),
                             ix,
