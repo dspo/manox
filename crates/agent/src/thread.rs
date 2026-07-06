@@ -571,6 +571,17 @@ impl Thread {
             // stays parked until the entity is dropped, and a late
             // `respond_plan_approval` from the UI silently no-ops.
             self.pending_plan_approval.clear();
+            // Symmetric cleanup of pending tool-authorization oneshots. A
+            // cancelled turn resolves in-flight approvals via the cancellation
+            // token's `select!` arms, but the senders must also be dropped so a
+            // late `respond_authorization` from the UI silently no-ops instead
+            // of panicking on a closed channel.
+            self.pending_authorizations.clear();
+            // Drop bubbled sub-agent auth routes too: a parent cancel must
+            // unwind child-authorization routing so a late composite-id
+            // response no-ops at the parent instead of traversing to a child
+            // whose own pending map is already empty.
+            self.pending_child_auth.clear();
             cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
             cx.notify();
         }
@@ -1841,6 +1852,69 @@ mod tests {
                 // plan_mode is NOT cleared by cancel — it stays true so the
                 // next turn still builds a plan-mode request.
                 assert!(t.plan_mode, "cancel should not clear plan_mode");
+            });
+        });
+    }
+
+    /// Regression: `cancel()` must clear `pending_authorizations` symmetrically
+    /// with `pending_plan_approval`. The cancellation token resolves in-flight
+    /// `select!` arms, but the oneshot senders must also be dropped so a late
+    /// `respond_authorization` from the UI silently no-ops instead of landing
+    /// on a closed channel.
+    #[test]
+    fn cancel_clears_pending_authorizations() {
+        use crate::tool::ToolAuthorizationResponse;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                super::ThreadId("reg-cancel-auth".to_string()),
+                std::path::PathBuf::from("/tmp"),
+                None,
+                false,
+                Vec::new(),
+                None,
+                cx,
+            )
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                t.turn_cancel = Some(cancel);
+                let (tx, _rx) = tokio::sync::oneshot::channel::<ToolAuthorizationResponse>();
+                t.pending_authorizations.insert("auth-1".to_string(), tx);
+                // Simulate a bubbled child authorization pending on the parent.
+                t.pending_child_auth.insert(
+                    "parent::child".to_string(),
+                    super::ChildAuthRoute {
+                        child: gpui::WeakEntity::<super::Thread>::new_invalid(),
+                        child_auth_id: "child".to_string(),
+                    },
+                );
+            });
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.cancel(cx));
+        });
+
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                assert!(t.turn_cancel.is_none(), "cancel should take turn_cancel");
+                assert!(
+                    t.pending_authorizations.is_empty(),
+                    "cancel should clear pending_authorizations (oneshot sender \
+                     still lingering — late respond_authorization would hit a \
+                     closed channel)"
+                );
+                assert!(
+                    t.pending_child_auth.is_empty(),
+                    "cancel should clear pending_child_auth (orphaned route \
+                     still lingering — late composite-id response would \
+                     traverse to child before no-oping)"
+                );
             });
         });
     }

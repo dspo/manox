@@ -36,6 +36,10 @@ impl AgentTool for SkillTool {
     fn input_schema(&self) -> serde_json::Value {
         schema::<SkillInput>()
     }
+    /// Read-only: delivers a skill's reference body, never mutates the world.
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn run(
         &self,
         input: serde_json::Value,

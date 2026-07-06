@@ -928,6 +928,7 @@ mod tests {
             "grep",
             "glob",
             "AskUserQuestion",
+            "skill",
         ] {
             assert!(by_name(n).is_read_only(), "{n} should be read-only");
         }
