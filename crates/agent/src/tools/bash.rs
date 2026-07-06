@@ -92,7 +92,40 @@ impl BashTool {
     }
 }
 
-#[derive(Deserialize, JsonSchema)]
+/// Parse `unsandboxed` from a JSON bool or a string ("true"/"false"/"1"/"0",
+/// case-insensitive). Models occasionally emit `"unsandboxed": "true"` (string);
+/// strict serde would reject the whole input as "parse failed", dropping the
+/// tool call. Returns `None` for null, absent, or unrecognized values.
+fn lenient_bool_value(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Deserialize `Option<bool>` accepting both a JSON bool and a lenient string
+/// form (see [`lenient_bool_value`]). Null yields `None`; any other shape is a
+/// hard error so a malformed value is surfaced rather than silently coerced.
+fn lenient_bool_opt<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: serde_json::Value = serde::Deserialize::deserialize(d)?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    match lenient_bool_value(&v) {
+        Some(b) => Ok(Some(b)),
+        None => Err(serde::de::Error::custom(format!("expected bool, got {v}"))),
+    }
+}
+
+#[derive(Deserialize, JsonSchema, Debug)]
 struct BashInput {
     /// Bash command to run in the persistent session (`cd` / `export` persist).
     command: String,
@@ -108,7 +141,7 @@ struct BashInput {
     /// genuinely needs the outside (network, writes outside the project) — it
     /// then runs in a persistent shell with no confinement, gated by user
     /// approval.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_bool_opt")]
     unsandboxed: Option<bool>,
 }
 
@@ -128,7 +161,7 @@ impl AgentTool for BashTool {
     fn requires_approval(&self, input: &serde_json::Value) -> bool {
         let unsandboxed = input
             .get("unsandboxed")
-            .and_then(|v| v.as_bool())
+            .and_then(lenient_bool_value)
             .unwrap_or(false);
         if unsandboxed {
             return true;
@@ -975,5 +1008,54 @@ mod tests {
         let s = crate::tools::TruncatedText::new("plain output", BASH_OUTPUT_MAX_BYTES, 0)
             .render(BASH_TRUNCATION_HINT);
         assert_eq!(s, "plain output");
+    }
+
+    #[test]
+    fn lenient_bool_value_accepts_bool_and_string_forms() {
+        assert_eq!(lenient_bool_value(&serde_json::json!(true)), Some(true));
+        assert_eq!(lenient_bool_value(&serde_json::json!(false)), Some(false));
+        assert_eq!(lenient_bool_value(&serde_json::json!("true")), Some(true));
+        assert_eq!(lenient_bool_value(&serde_json::json!("FALSE")), Some(false));
+        assert_eq!(lenient_bool_value(&serde_json::json!("1")), Some(true));
+        assert_eq!(lenient_bool_value(&serde_json::json!("0")), Some(false));
+        assert_eq!(lenient_bool_value(&serde_json::json!(null)), None);
+        assert_eq!(lenient_bool_value(&serde_json::json!("maybe")), None);
+        assert_eq!(lenient_bool_value(&serde_json::json!(42)), None);
+    }
+
+    #[test]
+    fn bash_input_parses_string_unsandboxed() {
+        // Models sometimes emit `"unsandboxed": "true"` (string). Strict serde
+        // would reject the whole input; the lenient deserializer accepts it.
+        let parsed: BashInput =
+            serde_json::from_value(serde_json::json!({"command":"ls","unsandboxed":"true"}))
+                .expect("string \"true\" must parse");
+        assert_eq!(parsed.unsandboxed, Some(true));
+
+        let parsed: BashInput =
+            serde_json::from_value(serde_json::json!({"command":"ls","unsandboxed":"false"}))
+                .expect("string \"false\" must parse");
+        assert_eq!(parsed.unsandboxed, Some(false));
+
+        let parsed: BashInput =
+            serde_json::from_value(serde_json::json!({"command":"ls","unsandboxed":true}))
+                .expect("bool true must parse");
+        assert_eq!(parsed.unsandboxed, Some(true));
+
+        let parsed: BashInput = serde_json::from_value(serde_json::json!({"command":"ls"}))
+            .expect("absent unsandboxed must parse");
+        assert_eq!(parsed.unsandboxed, None);
+    }
+
+    #[test]
+    fn bash_input_rejects_malformed_unsandboxed() {
+        let err = serde_json::from_value::<BashInput>(serde_json::json!({
+            "command":"ls","unsandboxed":"maybe"
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expected bool"),
+            "malformed value must surface a clear error: {err}"
+        );
     }
 }

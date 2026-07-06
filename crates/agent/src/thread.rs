@@ -163,11 +163,6 @@ pub struct Thread {
     /// Pending plan-approval oneshots, keyed by the `exit_plan_mode` tool_use
     /// id. Mirrors `pending_authorizations` exactly.
     pending_plan_approval: HashMap<String, tokio::sync::oneshot::Sender<PlanApprovalResponse>>,
-    /// Set by `run_plan_approval` on approval so `run_turn_loop` ends the turn
-    /// after the current tool batch — preventing the model from barreling into
-    /// write tools (now visible since `plan_mode` was cleared) before the user
-    /// has signaled to proceed.
-    end_turn_after_tool: bool,
     /// LLM-generated conversation title; `None` until the first title stream
     /// lands. Main-thread only (sub-agents don't title). Displayed by the
     /// sidebar in place of the mechanical first-message summary.
@@ -233,7 +228,6 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                end_turn_after_tool: false,
                 title: None,
                 title_in_flight: false,
                 title_last_eval_user_count: None,
@@ -294,7 +288,6 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                end_turn_after_tool: false,
                 title,
                 title_in_flight: false,
                 title_last_eval_user_count,
@@ -353,7 +346,6 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                end_turn_after_tool: false,
                 title: None,
                 title_in_flight: false,
                 title_last_eval_user_count: None,
@@ -800,11 +792,6 @@ impl Thread {
                 );
             }
         })?;
-        // Defensive: clear any `end_turn_after_tool` left over from a prior turn
-        // that exited via cancel or a sibling infra-error before the check at the
-        // end of the batch loop. Without this, the next turn's first tool batch
-        // would be cut short by a stale flag.
-        this.update(cx, |this, _| this.end_turn_after_tool = false)?;
         // `turn_count` tracks the round-trip index within this `run_turn` only,
         // not a session-wide total — reset on entry so `self_info` reports the
         // current turn's progress (issue 5: it used to accumulate across user
@@ -872,6 +859,17 @@ impl Thread {
                         this.handle_completion_event(ev, cx);
                     }
                 })?;
+                // Yield to the gpui foreground executor between batches so the
+                // macOS run loop can drain queued runnables (input events,
+                // frame callbacks). A fast-streaming provider keeps the
+                // async_channel non-empty, so `poll_next` returns Ready without
+                // registering a waker; without this yield the turn task starves
+                // the run loop and the UI freezes mid-turn.
+                std::future::poll_fn(|cx| {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::<()>::Pending
+                })
+                .await;
                 if has_stop {
                     break;
                 }
@@ -995,22 +993,6 @@ impl Thread {
                 return Err(e);
             }
             if cancel.is_cancelled() {
-                break;
-            }
-
-            // A plan was approved this batch: end the turn so the model does not
-            // continue into write tools (newly visible since `plan_mode` was
-            // cleared) before the user has signaled to proceed.
-            let stop_after_plan = this.update(cx, |this, cx| {
-                if this.end_turn_after_tool {
-                    this.end_turn_after_tool = false;
-                    cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
-                    true
-                } else {
-                    false
-                }
-            })?;
-            if stop_after_plan {
                 break;
             }
 
@@ -1332,11 +1314,12 @@ impl Thread {
                 // the message list. Clearing `plan_mode` before `append` would
                 // leave the messages inconsistent (plan mode off but no
                 // approval result recorded) if `append_tool_result` failed.
-                // `end_turn_after_tool` is checked by `run_turn_loop` after
-                // this returns.
+                // The turn loop continues naturally: the next
+                // `build_completion_request` sees `plan_mode == false` so the
+                // write tools become visible, and the approval ToolResult
+                // ("You may now begin execution.") prompts the model to act.
                 this.update(cx, |this, cx| {
                     this.plan_mode = false;
-                    this.end_turn_after_tool = true;
                     cx.notify();
                 })?;
             }
@@ -2279,10 +2262,6 @@ mod tests {
         cx.update(|cx| {
             thread.read_with(cx, |t, _| {
                 assert!(!t.plan_mode, "plan_mode should be false after approval");
-                assert!(
-                    t.end_turn_after_tool,
-                    "end_turn_after_tool should be set after approval"
-                );
                 let last = t.messages.last().expect("no message after approval");
                 let tr = last
                     .content
