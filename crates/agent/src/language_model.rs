@@ -155,6 +155,14 @@ impl ReasoningEffort {
             Self::Max => "max",
         }
     }
+
+    pub fn openai_wire_value(self, official_openai: bool) -> &'static str {
+        if official_openai && matches!(self, Self::XHigh | Self::Max) {
+            "high"
+        } else {
+            self.wire_value()
+        }
+    }
 }
 
 /// A single completion request.

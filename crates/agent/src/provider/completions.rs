@@ -243,7 +243,7 @@ fn build_request_body(
         body["prompt_cache_retention"] = Value::String("24h".to_string());
     }
     if let Some(effort) = request.reasoning_effort {
-        body["reasoning_effort"] = Value::String(effort.wire_value().to_string());
+        body["reasoning_effort"] = Value::String(effort.openai_wire_value(long_ttl).to_string());
     }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
@@ -658,6 +658,14 @@ mod tests {
         req.reasoning_effort = Some(ReasoningEffort::Max);
         let body = build_request_body("m", 64, &req, "test-key", false);
         assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn build_request_body_clamps_reasoning_effort_for_official_openai() {
+        let mut req = req_with_tool();
+        req.reasoning_effort = Some(ReasoningEffort::Max);
+        let body = build_request_body("m", 64, &req, "test-key", true);
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]

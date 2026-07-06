@@ -238,7 +238,7 @@ fn build_request_body(
     }
     if let Some(effort) = request.reasoning_effort {
         body["reasoning"] = json!({
-            "effort": effort.wire_value(),
+            "effort": effort.openai_wire_value(long_ttl),
         });
     }
     // System prompt (e.g. a sub-agent's) goes to the top-level `instructions`
@@ -688,6 +688,14 @@ mod tests {
         req.reasoning_effort = Some(ReasoningEffort::XHigh);
         let body = build_request_body("m", 64, &req, "test-key", false);
         assert_eq!(body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn build_request_body_clamps_reasoning_effort_for_official_openai() {
+        let mut req = req_with_tool();
+        req.reasoning_effort = Some(ReasoningEffort::XHigh);
+        let body = build_request_body("m", 64, &req, "test-key", true);
+        assert_eq!(body["reasoning"]["effort"], "high");
     }
 
     #[test]
