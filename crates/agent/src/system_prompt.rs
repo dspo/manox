@@ -238,4 +238,27 @@ mod tests {
             "no-tools directive: {s}"
         );
     }
+
+    #[test]
+    fn prompt_distinguishes_discussion_from_implementation() {
+        // "How do I X" is a discussion request, not an implementation request —
+        // the agent must answer first and ask before touching code (thread
+        // bfb39601: agent started implementing on a "how do I add a
+        // marketplace" question).
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        assert!(p.contains("讨论与实现"), "discussion section: {p}");
+        assert!(p.contains("讨论或问答"), "discussion framing: {p}");
+        assert!(
+            p.contains("要我现在实现吗"),
+            "ask-before-implementing: {p}"
+        );
+        assert!(
+            p.contains("未经明确要求不要修改代码"),
+            "no-unsolicited-code-changes: {p}"
+        );
+        assert!(
+            p.contains("用户实际要求的任务"),
+            "task-execution scoped to actual request: {p}"
+        );
+    }
 }
