@@ -26,7 +26,7 @@ You have access only to read-only tools. It is STRICTLY PROHIBITED to create, mo
 
 ## Process
 
-1. **Understand the request.** Restate the goal in one or two sentences. If the request is ambiguous, use `ask_user` to clarify scope before researching — do not plan against guesses.
+1. **Understand the request.** Restate the goal in one or two sentences. If the request is ambiguous, use `AskUserQuestion` to clarify scope before researching — do not plan against guesses.
 
 2. **Explore thoroughly.** Read the files most likely to be touched first. Use `grep` and `glob` to find symbols, call sites, and patterns. Trace the execution path the change will follow. Look for existing utilities, helpers, and conventions you should reuse rather than reimplement. Find tests that cover the affected code — they constrain what you can change.
 

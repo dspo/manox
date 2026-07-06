@@ -145,6 +145,11 @@ async fn run_monitor(
         // Reap grandchildren that inherited the pipes if we drop the handle
         // without a clean exit.
         .kill_on_drop(true);
+    // Put the child in its own process group so a cancel/timeout can kill the
+    // whole group (grandchildren like `sleep` spawned by `sh -c` would otherwise
+    // be orphaned and survive — `child.kill()` only signals the `sh` parent).
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -171,15 +176,21 @@ async fn run_monitor(
     let mut captured = String::new();
     let mut truncated = false;
     let mut reader = BufReader::new(stdout).lines();
+    // Absolute wall-clock deadline. A fresh `tokio::time::sleep(timeout)` in the
+    // select! loop would reset on every stdout line, giving idle/quiet semantics
+    // (a slow emitter would never time out); `sleep_until(deadline)` shares one
+    // absolute deadline across iterations so the wall-clock cap holds regardless
+    // of how often lines arrive.
+    let deadline = tokio::time::Instant::now() + timeout;
     let exit_reason = loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                let _ = child.kill().await;
+                kill_process_group(&child);
                 sink.try_emit("⚠ monitor cancelled\n");
                 break "cancelled";
             }
-            _ = tokio::time::sleep(timeout) => {
-                let _ = child.kill().await;
+            _ = tokio::time::sleep_until(deadline) => {
+                kill_process_group(&child);
                 sink.try_emit(&format!(
                     "⚠ monitor timed out after {}ms\n",
                     timeout.as_millis()
@@ -190,7 +201,11 @@ async fn run_monitor(
                 match line {
                     Ok(Some(l)) => {
                         sink.try_emit(&format!("{l}\n"));
-                        if captured.len() < MONITOR_OUTPUT_MAX_BYTES {
+                        // Bound the capture strictly: the line plus its
+                        // trailing newline must fit under the cap, otherwise
+                        // mark truncated and stop appending (the live stream
+                        // still gets every line via the sink).
+                        if captured.len() + l.len() < MONITOR_OUTPUT_MAX_BYTES {
                             captured.push_str(&l);
                             captured.push('\n');
                         } else {
@@ -225,6 +240,24 @@ async fn run_monitor(
         Err(e) => Err(format!("wait failed: {e}\n{captured}")),
     }
 }
+
+/// Kill the child's whole process group. On Unix the child runs in its own
+/// group (set via `process_group(0)`), so `killpg` reaps grandchildren too —
+/// `child.kill()` alone only signals the `sh` parent and orphans descendants
+/// that do not write to the piped stdout/stderr.
+#[cfg(unix)]
+fn kill_process_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: `killpg` is a libc call with no Rust invariants to uphold;
+        // the pid is the child's own group id (set by `process_group(0)`).
+        unsafe {
+            libc::killpg(pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &tokio::process::Child) {}
 
 #[cfg(test)]
 mod tests {

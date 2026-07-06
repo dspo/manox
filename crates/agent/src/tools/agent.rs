@@ -86,6 +86,18 @@ impl AgentToolTrait for SpawnAgentTool {
         false
     }
 
+    /// The `agent` tool itself does not mutate the world — spawning a sub-agent
+    /// is not a file write. The sub-agent's own write capability is governed by
+    /// its definition's tool set, so plan mode treats `agent` as read-only and
+    /// advertises it (via `to_request_tools_read_only`) so the main thread can
+    /// delegate research to the bundled read-only `plan`/`explore` sub-agents.
+    /// A write-capable user-authored sub-agent could still be spawned in plan
+    /// mode — that escape is bounded by the sub-agent's own definition and is
+    /// the same prompt-level trust Claude Code relies on, not a hard wall.
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         input: serde_json::Value,

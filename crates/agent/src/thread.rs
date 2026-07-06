@@ -1710,20 +1710,16 @@ impl Thread {
             messages.push(m);
         }
         let tools = if self.plan_mode {
-            // In plan mode, advertise read-only tools plus the `agent` tool
-            // (so the model can delegate research to the read-only `plan` /
-            // `explore` sub-agents with isolated context) plus the synthesized
-            // `exit_plan_mode` tool (not in the registry). Write tools and
-            // `bash` stay hidden: a sub-agent spawned via `agent` is governed
-            // by its own definition's tool set, and the bundled `plan`/
-            // `explore` are read-only by construction, so delegation does not
-            // open a write path. `run_tool_inner` backstops any stray write
-            // call. Plan mode takes precedence over `turn_tool_filter` — it is
-            // the stricter, user-visible safety contract.
+            // In plan mode, advertise read-only tools plus the synthesized
+            // `exit_plan_mode` tool (not in the registry). The `agent` tool is
+            // read-only (see `SpawnAgentTool::is_read_only`), so it is included
+            // automatically — letting the main thread delegate research to the
+            // bundled `plan`/`explore` sub-agents with isolated context. Write
+            // tools and `bash` stay hidden; `run_tool_inner` backstops any
+            // stray write call. Plan mode takes precedence over
+            // `turn_tool_filter` — it is the stricter, user-visible safety
+            // contract.
             let mut list = self.tools.to_request_tools_read_only();
-            if let Some(agent_tool) = self.tools.to_request_tool("agent") {
-                list.push(agent_tool);
-            }
             list.push(exit_plan_mode_request_tool());
             list
         } else {
