@@ -202,7 +202,13 @@ pub fn render_item(
             theme,
             tool_ctx,
         ),
-        ConvItem::ToolCall(t) => render_tool_call(t, ix, theme, tool_ctx),
+        ConvItem::ToolCall(t) => {
+            if t.name == "exit_plan_mode" {
+                render_plan_card(t, ix, theme, tool_ctx)
+            } else {
+                render_tool_call(t, ix, theme, tool_ctx)
+            }
+        }
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx),
         ConvItem::Error(msg) => render_error(msg, ix, theme),
         ConvItem::Notice(msg) => render_notice(msg, ix, theme),
@@ -613,6 +619,132 @@ pub fn render_tool_call(
             theme,
         ));
     }
+    card.into_any_element()
+}
+
+/// Render an `exit_plan_mode` tool-call as a plan card. The body uses
+/// `TextView::markdown` (assistant-style, no code-block wrapping, no height
+/// cap) instead of the monospace scrollable container. PendingApproval forces
+/// the body open; terminal status auto-collapses like a regular ToolCall.
+fn render_plan_card(
+    item: &ToolCallItem,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
+    use agent::ToolCallStatus;
+    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) = match item.status {
+        ToolCallStatus::PendingApproval => {
+            (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-pending"))
+        }
+        ToolCallStatus::Running => (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-running")),
+        ToolCallStatus::Success => (IconName::CircleCheck, theme.success, i18n::t("status-success")),
+        ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
+        ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
+    };
+
+    let title = if item.title.is_empty() {
+        item.name.clone()
+    } else {
+        item.title.clone()
+    };
+
+    // PendingApproval always shows the body; terminal status auto-collapses.
+    let show_body = item.status == ToolCallStatus::PendingApproval
+        || item.streaming
+        || !item.collapsed;
+    let chevron = if item.collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    };
+
+    let id_for_toggle = item.id.clone();
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+
+    let mut card = v_flex()
+        .w_full()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .id(("plan-header", ix))
+                .w_full()
+                .px_3()
+                .py_1p5()
+                .gap_2()
+                .items_center()
+                .cursor_pointer()
+                .on_click(move |_, _window, cx: &mut App| {
+                    let Some(weak) = weak_workspace.clone() else {
+                        return;
+                    };
+                    let _ = weak.update(cx, |w, cx| {
+                        let id = id_for_toggle.clone();
+                        let conv = w.conversation.clone();
+                        conv.update(cx, |c, cx| {
+                            if let Some(ix) = c.find_tool(&id, &*cx)
+                                && let Some(item) = c.items().get(ix)
+                            {
+                                item.update(cx, |item, cx| {
+                                    if let ConvItem::ToolCall(t) = item.kind_mut() {
+                                        t.collapsed = !t.collapsed;
+                                        t.user_toggled = true;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        w.list_state().remeasure();
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(chevron)
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    Icon::new(IconName::LayoutDashboard)
+                        .small()
+                        .text_color(theme.accent),
+                )
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(title),
+                )
+                .child(copy_button(ix, "copy-plan", item.output.clone()))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .text_xs()
+                        .text_color(status_color)
+                        .child(Icon::new(status_icon).xsmall())
+                        .child(status_label),
+                ),
+        );
+
+    if show_body && !item.output.is_empty() {
+        card = card.child(
+            gpui::div()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(markdown_tv(("plan-text", ix), item.output.clone(), theme, false)),
+        );
+    }
+
     card.into_any_element()
 }
 
