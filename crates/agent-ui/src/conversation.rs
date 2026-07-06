@@ -109,6 +109,15 @@ impl ConversationState {
             .push(cx.new(|_| MessageItem::new(ConvItem::User(text), role.to_string(), id, weak)));
     }
 
+    /// Append a system-styled notice (rendered as an error card). Does not
+    /// touch the canonical `Thread` messages — UI-only, for slash-command
+    /// acknowledgements and similar ephemeral notices.
+    pub fn push_notice(&mut self, text: String, weak: WeakEntity<Workspace>, cx: &mut App) {
+        let id = self.items.len();
+        self.items
+            .push(cx.new(|_| MessageItem::new(ConvItem::Error(text), String::new(), id, weak)));
+    }
+
     pub fn find_tool(&self, id: &str, cx: &App) -> Option<usize> {
         self.items
             .iter()

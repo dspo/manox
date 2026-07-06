@@ -5,6 +5,7 @@
 
 pub mod conversation;
 pub mod dispatch;
+pub mod slash_command;
 pub mod views;
 pub mod workspace;
 
