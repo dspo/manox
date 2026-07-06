@@ -150,6 +150,9 @@ fn muted_text(label: SharedString, muted: Hsla) -> AnyElement {
 
 type BoolApply = Arc<dyn Fn(&mut SettingsView, bool) + Send + Sync + 'static>;
 type StringApply = Arc<dyn Fn(&mut SettingsView, SharedString) + Send + Sync + 'static>;
+type PostApply = Arc<
+    dyn Fn(&mut SettingsView, &SharedString, &mut Context<SettingsView>) + Send + Sync + 'static,
+>;
 
 /// Build a Switch bound to a field via the view entity. The `apply` closure
 /// runs inside `Entity::update`, so it can mutate view state freely.
@@ -191,6 +194,42 @@ fn mock_dropdown(
                     PopupMenuItem::new(opt.clone()).on_click(move |_ev, _window, cx| {
                         view.update(cx, |this, cx| {
                             apply(this, opt.clone());
+                            cx.notify();
+                        });
+                    }),
+                )
+            })
+        })
+        .into_any_element()
+}
+
+/// Same as [`mock_dropdown`] but invokes `post` inside the entity update after
+/// `apply` has mutated state. Used by the language picker to persist
+/// `Settings::language` to disk alongside the in-memory field update.
+fn mock_dropdown_with_post(
+    id: impl Into<gpui::ElementId>,
+    label: SharedString,
+    options: Vec<(SharedString, SharedString)>,
+    view: Entity<SettingsView>,
+    apply: StringApply,
+    post: PostApply,
+) -> AnyElement {
+    Button::new(id)
+        .label(label)
+        .dropdown_caret(true)
+        .outline()
+        .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _window, _cx| {
+            options.iter().fold(menu, |menu, (display, token)| {
+                let display = display.clone();
+                let token = token.clone();
+                let view = view.clone();
+                let apply = apply.clone();
+                let post = post.clone();
+                menu.item(
+                    PopupMenuItem::new(display.clone()).on_click(move |_ev, _window, cx| {
+                        view.update(cx, |this, cx| {
+                            apply(this, display.clone());
+                            post(this, &token, cx);
                             cx.notify();
                         });
                     }),
@@ -423,7 +462,6 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
     // --- General (misc) section ---
     let general_section = {
         let entity = entity.clone();
-        let lang_options = vec![i18n::t("settings-value-auto-detect")];
         let term_bottom_label = i18n::t("settings-value-bottom");
         let term_right_label = i18n::t("settings-value-right");
         let cr_inline_label = i18n::t("settings-value-inline");
@@ -448,12 +486,20 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
             row_with_control(
                 i18n::t("settings-row-language"),
                 Some(muted_text(i18n::t("settings-desc-language"), muted)),
-                mock_dropdown(
+                mock_dropdown_with_post(
                     "language",
-                    view.file_target.clone(),
-                    lang_options,
+                    view.language.clone(),
+                    vec![
+                        (
+                            i18n::t("settings-value-auto-detect"),
+                            SharedString::from(""),
+                        ),
+                        (i18n::t("settings-value-en"), SharedString::from("en")),
+                        (i18n::t("settings-value-zh-CN"), SharedString::from("zh-CN")),
+                    ],
                     entity.clone(),
-                    Arc::new(|this, v| this.file_target = v),
+                    Arc::new(|this, v| this.language = v),
+                    Arc::new(|this, value, cx| this.persist_language(value.clone(), cx)),
                 ),
             ),
             hairline(theme.border.opacity(0.6)),
@@ -859,6 +905,8 @@ pub fn render_config(view: &mut SettingsView, cx: &mut Context<SettingsView>) ->
             row_with_control(
                 i18n::t("settings-row-config-version"),
                 None,
+                // The version is a build identifier (e.g. "26.630.12135"), not
+                // user-facing copy. Not routed through i18n.
                 muted_text("26.630.12135".into(), muted),
             ),
             hairline(theme.border.opacity(0.6)),
@@ -1108,7 +1156,7 @@ pub fn render_mcp(view: &mut SettingsView, cx: &mut Context<SettingsView>) -> An
             v_flex()
                 .px_3()
                 .py_3()
-                .child(muted_text(i18n::t("settings-desc-mcp"), muted))
+                .child(muted_text(i18n::t("settings-empty-mcp"), muted))
                 .into_any_element(),
         );
     } else {
@@ -1155,7 +1203,11 @@ pub fn render_mcp(view: &mut SettingsView, cx: &mut Context<SettingsView>) -> An
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().text_sm().child("codex_apps"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .child(i18n::t("settings-row-mcp-plugin-name")),
+                    )
                     .child(mock_switch(
                         "mcp-plugin-codex-apps",
                         false,
@@ -1180,8 +1232,10 @@ pub fn render_mcp(view: &mut SettingsView, cx: &mut Context<SettingsView>) -> An
 
 // --- Environment panel ----------------------------------------------------
 
-pub fn render_environment(_view: &mut SettingsView, _cx: &mut Context<SettingsView>) -> AnyElement {
-    let theme = cx_theme_clone(_cx);
+pub fn render_environment(_view: &mut SettingsView, cx: &mut Context<SettingsView>) -> AnyElement {
+    // Mock panel: no SettingsView state is read or mutated. The constant
+    // project list is rendered as a static two-column grid.
+    let theme = cx.theme().clone();
     let muted = theme.muted_foreground;
 
     let top_header = v_flex()
@@ -1293,12 +1347,4 @@ fn section_header_with_tag(label: &'static str, tag: &'static str) -> AnyElement
                 .child(i18n::t(tag)),
         )
         .into_any_element()
-}
-
-// `cx.theme()` requires a context, so for the environment panel that doesn't
-// take a SettingsView reference we use this shim — the panel doesn't mutate
-// any view state, so cloning the default theme from the active theme registry
-// is sufficient.
-fn cx_theme_clone(_cx: &mut Context<SettingsView>) -> Theme {
-    _cx.theme().clone()
 }

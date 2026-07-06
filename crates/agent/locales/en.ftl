@@ -109,6 +109,8 @@ settings-btn-import = Import
 settings-btn-view = View
 settings-value-vscode = VS Code
 settings-value-auto-detect = Auto-detect
+settings-value-en = English
+settings-value-zh-CN = Simplified Chinese
 settings-value-bottom = Bottom
 settings-value-right = Right
 settings-value-inline = Inline view
@@ -209,6 +211,7 @@ settings-desc-memory-reset = Delete all Codex memories
 ### views/settings.rs — MCP panel
 settings-panel-mcp = MCP servers
 settings-desc-mcp = Connect external tools and data sources
+settings-empty-mcp = No MCP servers configured. Click "Add server" to register one.
 settings-section-mcp-servers = Servers
 settings-btn-add-server = + Add server
 settings-section-mcp-plugins = From plugins

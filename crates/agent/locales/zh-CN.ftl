@@ -96,6 +96,8 @@ settings-btn-import = 导入
 settings-btn-view = 查看
 settings-value-vscode = VS Code
 settings-value-auto-detect = 自动检测
+settings-value-en = English
+settings-value-zh-CN = 简体中文
 settings-value-bottom = 底部
 settings-value-right = 右侧
 settings-value-inline = 行内视图
@@ -196,6 +198,7 @@ settings-desc-memory-reset = 删除所有 Codex 记忆
 ### views/settings.rs — MCP 面板
 settings-panel-mcp = MCP 服务器
 settings-desc-mcp = 连接外部工具和数据源
+settings-empty-mcp = 尚未配置任何 MCP 服务器。点击"添加服务器"注册一个。
 settings-section-mcp-servers = 服务器
 settings-btn-add-server = + 添加服务器
 settings-section-mcp-plugins = 来自插件

@@ -152,6 +152,7 @@ pub struct SettingsView {
     permission_auto_review: bool,
     permission_full_access: bool,
     file_target: SharedString,
+    language: SharedString,
     show_in_menu_bar: bool,
     bottom_panel: bool,
     terminal_location: SharedString,
@@ -230,9 +231,20 @@ impl SettingsView {
             custom_instructions_input,
             work_mode: WorkMode::default(),
             permission_default: true,
-            permission_auto_review: true,
-            permission_full_access: true,
+            permission_auto_review: false,
+            permission_full_access: false,
             file_target: i18n::t("settings-value-vscode"),
+            language: {
+                // Display the saved token in a human-readable form; the
+                // underlying `Settings::language` holds the locale tag.
+                let saved = user_settings::load().language.unwrap_or_default();
+                match saved.as_str() {
+                    "" => i18n::t("settings-value-auto-detect"),
+                    "en" => i18n::t("settings-value-en"),
+                    "zh-CN" => i18n::t("settings-value-zh-CN"),
+                    _ => saved.into(),
+                }
+            },
             show_in_menu_bar: true,
             bottom_panel: true,
             terminal_location: i18n::t("settings-value-bottom"),
@@ -295,6 +307,23 @@ impl SettingsView {
                 tracing::warn!(error = %e, "failed to save custom_instructions");
             }
         }
+    }
+
+    fn persist_language(&mut self, value: SharedString, cx: &mut Context<Self>) {
+        // The dropdown option is a (display_label, persist_token) pair; only
+        // the token is written to settings.toml. An empty string means the user
+        // chose the "auto-detect" placeholder, which should leave the existing
+        // setting alone rather than clear it.
+        let token = value.to_string();
+        if token.is_empty() {
+            return;
+        }
+        let mut settings = user_settings::load();
+        settings.language = Some(token);
+        if let Err(e) = user_settings::save(&settings) {
+            tracing::warn!(error = %e, "failed to save language");
+        }
+        cx.notify();
     }
 }
 
