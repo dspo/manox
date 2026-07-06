@@ -24,6 +24,7 @@ gpui::actions!(
         CloseEditor,
         OpenSettings,
         AskPrev,
-        AskNext
+        AskNext,
+        AskCancel
     ]
 );

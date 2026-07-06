@@ -42,7 +42,7 @@ use crate::views::composer_menu::{
 };
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
-use crate::{AskNext, AskPrev, OpenSettings};
+use crate::{AskCancel, AskNext, AskPrev, OpenSettings};
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
 struct PendingAuth {
@@ -934,7 +934,12 @@ impl Workspace {
             return;
         }
         ask.others = (0..ask.questions.len())
-            .map(|_| cx.new(|cx| InputState::new(window, cx)))
+            .map(|_| cx.new(|cx| {
+                InputState::new(window, cx)
+                    .multi_line(true)
+                    .auto_grow(2, 6)
+                    .placeholder(i18n::t("workspace-clarify-other"))
+            }))
             .collect();
         ask.response_input = Some(cx.new(|cx| {
             InputState::new(window, cx)
@@ -1532,12 +1537,15 @@ impl Workspace {
                 },
             );
 
-        // Keyboard context for AskPrev/AskNext actions.
+        // Keyboard context for AskPrev/AskNext/Cancel actions.
         v_flex()
             .id("ask-drawer")
             .key_context("AskDrawer")
             .on_action(cx.listener(Workspace::on_ask_prev))
             .on_action(cx.listener(Workspace::on_ask_next))
+            .on_action(cx.listener(|this, _: &AskCancel, _, cx| {
+                this.resolve_auth(PermissionDecision::Deny, cx);
+            }))
             .child(card)
             .into_any_element()
     }
