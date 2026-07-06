@@ -127,7 +127,10 @@ impl ThreadStore {
 
 /// Persist a `Thread` snapshot (upsert) asynchronously, then refresh the global list.
 /// Called by `Workspace` on user message submit / turn end. No-ops when there is no snapshot (no model).
-pub fn save_thread(thread: Entity<Thread>, cx: &mut App) {
+/// `touch`: when true, `updated_at` is bumped to now (real user activity); when false,
+/// the existing timestamp is preserved (e.g. saving state on thread switch without
+/// implying the user interacted with it).
+pub fn save_thread(thread: Entity<Thread>, touch: bool, cx: &mut App) {
     let store = global();
     let db = store.read(cx).db.clone();
     let Some(rec) = thread.read(cx).snapshot() else {
@@ -137,14 +140,16 @@ pub fn save_thread(thread: Entity<Thread>, cx: &mut App) {
         let db = db;
         let res = cx
             .background_executor()
-            .spawn(async move { db.upsert(&rec) })
+            .spawn(async move { db.upsert(&rec, touch) })
             .await;
         if let Err(e) = res {
             tracing::warn!(error = %e, "保存 thread 失败");
         }
-        store.update(cx, |s, cx| {
-            s.refresh(cx);
-        });
+        if touch {
+            store.update(cx, |s, cx| {
+                s.refresh(cx);
+            });
+        }
     })
     .detach();
 }

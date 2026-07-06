@@ -117,8 +117,12 @@ impl MessageItem {
     /// single-line card so it stops competing with the assistant's final reply.
     pub fn finalize_streaming(&mut self) {
         match &mut self.kind {
-            ConvItem::Assistant { streaming, .. } | ConvItem::Reasoning { streaming, .. } => {
+            ConvItem::Assistant { streaming, .. } => {
                 *streaming = false
+            }
+            ConvItem::Reasoning { streaming, collapsed, user_toggled, .. } => {
+                *streaming = false;
+                *collapsed = !*user_toggled;
             }
             ConvItem::ToolCall(t) => {
                 t.streaming = false;
@@ -181,7 +185,7 @@ pub fn render_item(
         ConvItem::Assistant { text, streaming } => {
             render_assistant(text, *streaming, ix, role, theme)
         }
-        ConvItem::Reasoning { text, streaming } => render_reasoning(text, ix, *streaming, theme),
+        ConvItem::Reasoning { text, streaming, collapsed, user_toggled } => render_reasoning(text, ix, *streaming, *collapsed, *user_toggled, theme, tool_ctx),
         ConvItem::ToolCall(t) => render_tool_call(t, ix, theme, tool_ctx),
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx),
         ConvItem::Error(msg) => render_error(msg, ix, theme),
@@ -296,20 +300,55 @@ fn render_text_body(
 }
 
 /// Render a reasoning (thinking) block: expanded while streaming, collapsed when done, with a copy button.
-pub fn render_reasoning(text: &str, ix: usize, streaming: bool, theme: &Theme) -> gpui::AnyElement {
-    let collapsed = !streaming;
+/// Clicking the header toggles collapsed state (like tool-call cards), tracked by `user_toggled` so the user's
+/// manual choice survives subsequent status transitions.
+pub fn render_reasoning(
+    text: &str,
+    ix: usize,
+    streaming: bool,
+    collapsed: bool,
+    _user_toggled: bool,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
     let chevron = if collapsed {
         IconName::ChevronRight
     } else {
         IconName::ChevronDown
     };
+    let _id_for_toggle = format!("reasoning-toggle-{ix}");
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
     let mut block = v_flex().w_full().gap_1().child(
         h_flex()
             .id(("reasoning-header", ix))
             .gap_1p5()
             .items_center()
+            .cursor_pointer()
             .text_xs()
             .text_color(theme.muted_foreground)
+            .on_click(move |_, _window, cx: &mut App| {
+                let Some(weak) = weak_workspace.clone() else {
+                    return;
+                };
+                let ix_click = ix;
+                let _ = weak.update(cx, |w, cx| {
+                    let conv = w.conversation.clone();
+                    conv.update(cx, |c, cx| {
+                        if let Some(item) = c.items().get(ix_click)
+                        {
+                            item.update(cx, |item, cx| {
+                                if let ConvItem::Reasoning { collapsed, user_toggled, .. } = item.kind_mut() {
+                                    *collapsed = !*collapsed;
+                                    *user_toggled = true;
+                                }
+                                cx.notify();
+                            });
+                        }
+                    });
+                    w.list_state().remeasure();
+                    cx.notify();
+                });
+            })
             .child(Icon::new(chevron).xsmall())
             .child("思考")
             .child(gpui::div().flex_1())
@@ -787,6 +826,8 @@ pub fn build_items(messages: &[Message]) -> Vec<ConvItem> {
                             items.push(ConvItem::Reasoning {
                                 text: text.clone(),
                                 streaming: false,
+                                collapsed: true,
+                                user_toggled: false,
                             });
                         }
                         MessageContent::ToolUse(tu) => {
