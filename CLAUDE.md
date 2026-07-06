@@ -78,13 +78,19 @@ crates/
 
 - `tool.rs` + `tool/permission.rs` — `AgentTool` trait + `ToolRegistry` + `PermissionCache`（会话级 always-allow），`PermissionDecision::AllowOnce | AlwaysAllow | Deny`，`ToolAuthorizationResponse`（审批载荷：`Decision(PermissionDecision)` 或 `AskUserQuestion { answers, response }`，后者由 thread 短路为 ToolResult，不经 `run` 执行）。
 
-- `tools/` — 9 个内置工具：`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`、`ask_user`（`AskUserQuestion`，向用户提多选澄清问题）、`agent`（spawn 子 agent，见「多 agent 系统」）。写操作（write_file/edit_file）、bash 与 `AskUserQuestion` 需审批；`agent` 本身不审批（spawn 是只读的，子 agent 内部工具各自审批）。bash/grep 经 tokio 子进程 + `async_channel` 桥回 gpui Task。
+- `tools/` — 10 个内置工具：8 个 base tools（`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`、`ask_user`）+ `agent`（spawn 子 agent）+ `self_info`（查看运行时身份）。FS 工具（read/write/edit/list/grep/glob）实现于 `tools/mod.rs`；`bash`/`ask_user`/`agent`/`self_info` 各占独立文件。写操作（write_file/edit_file）、bash 与 `AskUserQuestion` 需审批；`agent` 本身不审批（spawn 是只读的，子 agent 内部工具各自审批）。bash/grep 经 tokio 子进程 + `async_channel` 桥回 gpui Task。
 
 - `runtime.rs` — 全局 tokio runtime（`OnceLock<Handle>`），`init` 时 build 并 forget，`handle()` 取全局 Handle。供 provider 在 gpui executor 上 spawn tokio 任务跑 HTTP 流。
 
 - `db.rs` — `ThreadsDatabase`（SQLite `threads` 表，路径 `$HOME/.config/cx/manox/threads.db`），`Mutex<Connection>` 同步操作。
 
 - `thread_store.rs` — `ThreadStore` 进程全局 Entity（`OnceLock`），管理 Thread 摘要列表，提供 `save_thread` 异步落盘 + refresh。
+
+- `sandbox.rs` — OS 级沙箱：macOS seatbelt（`sandbox-exec`）默认对 bash 工具强制写限制 + 网络禁止；Linux/Windows 回退到 brush 无沙箱。FS 工具（write_file/edit_file）有独立的纯 Rust 路径写限制层（项目根 + temp dir 可写，`.git` 保护）。`SandboxPolicy` 计算可写根 + 保护路径，`is_writable`/`is_protected` 门控所有写操作。
+
+- `system_prompt.rs` + `system_prompt.md` — 系统提示词管理。`SystemPrompt` 组合 agent 标识 + 可用工具描述 + 工具使用规范，注入到每次 LLM 请求的 `system` 消息。
+
+- `hashline/` — 行号 + TAG 快照模块。`format_numbered` 输出 `[path#TAG]\nN:TEXT` 格式；`normalize_to_lf` 统一 CRLF；`compute_tag` 计算 4-hex 快照标签；`apply`/`recover` 执行 hashline patch 并支持 TAG 校验失败时的智能恢复。
 
 **Thread 审批流：** 工具需审批时，`run_tool` 发 `ThreadEvent::ToolCallAuthorization` 携带 `oneshot::Sender`，UI 弹窗后调用 `Thread::respond_authorization` 回传 `ToolAuthorizationResponse`（普通工具为 `Decision(PermissionDecision)`，`AskUserQuestion` 为 `AskUserQuestion { answers, response }`，thread 据此短路生成 ToolResult 而不执行 `run`），task 在 gpui executor 上 `await` oneshot receiver。
 
@@ -93,6 +99,8 @@ crates/
 - `workspace.rs` — `Workspace` 顶层视图，持有 `Entity<Thread>` + `Entity<Sidebar>` + `ConversationState`，`cx.subscribe` 处理 `ThreadEvent`（文本/思考/工具增量交给 `ConversationState`，`ToolCallAuthorization` 弹审批 overlay，`Stop` 终态触发 `save_thread` 落盘）。
 
 - `conversation.rs` — `ConversationState`，从 `ThreadEvent` 增量构建扁平 `ConvItem` 列表（`User | Assistant | Reasoning | ToolCall | Error`）。`rebuild_from_messages` 从 Thread 规范消息列表重建视图（加载历史时用）。
+
+- `dispatch.rs` — 事件分发器，解耦 `Workspace` 与 `Thread`/`Sidebar` 的事件订阅。
 
 - `views/sidebar.rs` — `Sidebar` Entity，订阅 `ThreadStore`，列出历史 Threads，发 `SidebarEvent`（NewThread / OpenThread / DeleteThread）。
 
@@ -148,10 +156,8 @@ crates/
 
 ## GPUI 依赖版本锁定
 
-- GPUI 栈走 git 仓库地址（规则允许，crates.io 无 gpui-component）：`gpui` / `gpui_platform` pin 到 zed rev `1d217ee39d381ac101b7cf49d3d22451ac1093fe`；`gpui-component` / `gpui-component-assets` pin 到 longbridge rev `a9a7341c35b62f27ff512371c62419342264710c`（upstream main HEAD，2026-07-02）
+- GPUI 栈走 git 仓库地址（规则允许，crates.io 无 gpui-component）：`gpui` / `gpui_platform` pin 到 zed rev `1d217ee39d381ac101b7cf49d3d22451ac1093fe`；`gpui-component` / `gpui-component-assets` pin 到 longbridge rev `1505b1487131adbb443f6c69e87847db35bfa2d1`
 - gpui-component 锁定 zed rev `1d217ee`，三者（gpui / gpui_platform / gpui-component）必须一致，单一 gpui 版本
-- `gpui-rich-text` 是 manox first-party crate（`crates/rich_text`，workspace 成员）：官方 gpui-component 仓库无此 crate，作者本人代码并入自维护
-- `ropey`、`sum-tree`（`zed-sum-tree`）随 rich_text 引入，版本与 gpui-component main 对齐
 - `psm` patch 到 stacker master 分支（对齐 gpui-component）
 - 所有 gpui 相关依赖在 debug 下 opt-level=3，否则渲染极慢
 
