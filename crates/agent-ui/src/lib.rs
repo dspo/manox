@@ -13,8 +13,17 @@ pub use views::settings::SettingsView;
 pub use workspace::Workspace;
 
 // Open/close the right-side markdown composer, plus the global OpenSettings
-// action that flips the Workspace into the Settings overlay.
+// action that flips the Workspace into the Settings overlay. AskPrev/AskNext
+// navigate between questions in the ask drawer (bound to arrow keys within the
+// drawer's focus context).
 gpui::actions!(
     agent_ui,
-    [ToggleEditor, ToggleEditorPreview, CloseEditor, OpenSettings]
+    [
+        ToggleEditor,
+        ToggleEditorPreview,
+        CloseEditor,
+        OpenSettings,
+        AskPrev,
+        AskNext
+    ]
 );
