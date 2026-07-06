@@ -18,8 +18,9 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
     tag::{Tag, TagVariant},
+    v_flex,
 };
 
 /// Events the sidebar emits to the Workspace.
@@ -227,13 +228,18 @@ impl Render for Sidebar {
                                 &theme,
                             )),
                     )
-                    .children((!projects.is_empty())
-                        .then(|| section_header(i18n::t("sidebar-section-projects"), &theme)))
+                    .children(
+                        (!projects.is_empty())
+                            .then(|| section_header(i18n::t("sidebar-section-projects"), &theme)),
+                    )
                     .children(projects.into_iter().map(|(path, group)| {
                         self.render_project_group(&path, &group, selected.as_deref(), &theme, cx)
                     }))
-                    .children((!loose.is_empty())
-                        .then(|| section_header(i18n::t("sidebar-section-conversations"), &theme)))
+                    .children(
+                        (!loose.is_empty()).then(|| {
+                            section_header(i18n::t("sidebar-section-conversations"), &theme)
+                        }),
+                    )
                     .child(
                         v_flex()
                             .gap_0p5()

@@ -358,12 +358,16 @@ fn parse_lid(s: &str) -> Result<(usize, &str), String> {
     let mut end = 0;
     let bytes = s.as_bytes();
     if bytes.is_empty() || !bytes[0].is_ascii_digit() || bytes[0] == b'0' {
-        return Err(format!("expected a line number (non-zero digit prefix): {s:?}"));
+        return Err(format!(
+            "expected a line number (non-zero digit prefix): {s:?}"
+        ));
     }
     while end < bytes.len() && bytes[end].is_ascii_digit() {
         end += 1;
     }
-    let n: usize = s[..end].parse().map_err(|_| format!("line number overflow: {s:?}"))?;
+    let n: usize = s[..end]
+        .parse()
+        .map_err(|_| format!("line number overflow: {s:?}"))?;
     Ok((n, &s[end..]))
 }
 

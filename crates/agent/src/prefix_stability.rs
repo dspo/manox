@@ -1,11 +1,16 @@
-//! Prefix-stability scaffolding for provider-side prompt caching.
+//! Prefix-stability diagnostics for provider-side prompt caching.
 //!
 //! manox's `Thread::messages` is append-only today, so the byte prefix sent to
 //! the LLM (system prompt + tool specs + message history) is naturally stable
-//! across turns — only the new tail is a cache miss each turn. This module is
-//! a **scaffold, not yet wired into `build_completion_request`**: it exists so
-//! that when per-turn tool-result truncation, image stripping, or history
-//! rewriting lands, the request can be routed through
+//! across turns — only the new tail is a cache miss each turn. `StablePrefix`
+//! fingerprints the system prompt + tool specs each turn and reports drift
+//! (system-prompt change, tool-set change) so the UI can surface a cache-hit
+//! chip and accidental drift (a future feature that rewrites messages or
+//! hot-reloads tools) is visible.
+//!
+//! The `AppendOnlyLog` / `AppendOnlyContextManager` below remain scaffolding
+//! for the day per-turn tool-result truncation, image stripping, or history
+//! rewriting lands — at that point the request can be routed through
 //! [`AppendOnlyContextManager`] to preserve the byte-stable prefix up to the
 //! divergence point instead of re-sending the entire conversation (which would
 //! silently break the provider's prefix cache).
@@ -25,13 +30,16 @@ use xxhash_rust::xxh32::xxh32;
 
 use crate::language_model::{LanguageModelRequest, LanguageModelRequestMessage, MessageContent};
 
-/// A frozen prefix (system prompt + tool specs snapshot) keyed by a content
-/// fingerprint. Reused across turns so the byte prefix stays identical until
-/// the live state's fingerprint changes.
+/// A fingerprinted prefix (system prompt + tool specs) tracked across turns
+/// so drift is detectable. Also tallies check/change counts for a stability
+/// ratio the UI renders as a cache-hit chip.
 #[derive(Default)]
 pub struct StablePrefix {
     snapshot: Option<StablePrefixSnapshot>,
     version: u32,
+    check_count: u64,
+    change_count: u64,
+    last_change: Option<PrefixChange>,
 }
 
 /// A captured prefix snapshot: the frozen system-prompt text plus a tool-spec
@@ -42,35 +50,92 @@ struct StablePrefixSnapshot {
     tools_fingerprint: u32,
 }
 
+/// What drifted between two `StablePrefix` snapshots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefixChange {
+    pub system_changed: bool,
+    pub tools_changed: bool,
+}
+
 impl StablePrefix {
-    /// Build or rebuild from a live request. Returns `true` if the prefix
-    /// actually changed (cache miss imminent).
-    pub fn build(&mut self, request: &LanguageModelRequest) -> bool {
+    /// Fingerprint the live request against the pinned snapshot. Returns
+    /// `Some(change)` when the prefix drifted (system prompt and/or tool set),
+    /// `None` when stable or on the first (baseline-establishing) call. The
+    /// first call pins the baseline without counting as drift.
+    pub fn build(&mut self, request: &LanguageModelRequest) -> Option<PrefixChange> {
         let system = collect_system_text(&request.messages);
         let tools_fingerprint = tools_fingerprint(&request.tools);
-        if let Some(snap) = &self.snapshot
-            && snap.system == system
-            && snap.tools_fingerprint == tools_fingerprint
-        {
-            return false;
+        self.check_count += 1;
+
+        let prev = match &self.snapshot {
+            Some(snap) => snap,
+            None => {
+                // First check: pin the baseline, no drift to report.
+                self.snapshot = Some(StablePrefixSnapshot {
+                    system,
+                    tools_fingerprint,
+                });
+                self.version += 1;
+                self.last_change = None;
+                return None;
+            }
+        };
+
+        let system_changed = prev.system != system;
+        let tools_changed = prev.tools_fingerprint != tools_fingerprint;
+        if !system_changed && !tools_changed {
+            return None;
         }
+
         self.snapshot = Some(StablePrefixSnapshot {
             system,
             tools_fingerprint,
         });
         self.version += 1;
-        true
+        self.change_count += 1;
+        let change = PrefixChange {
+            system_changed,
+            tools_changed,
+        };
+        self.last_change = Some(change);
+        Some(change)
     }
 
     /// Force rebuild on the next `build()` call (e.g. after an MCP reconnect
     /// changed the tool set).
     pub fn invalidate(&mut self) {
         self.snapshot = None;
+        self.last_change = None;
     }
 
     /// Monotonic version counter; bumps each time the prefix bytes change.
     pub fn version(&self) -> u32 {
         self.version
+    }
+
+    /// Total stability checks performed (one per `build` call).
+    pub fn check_count(&self) -> u64 {
+        self.check_count
+    }
+
+    /// Checks that detected drift.
+    pub fn change_count(&self) -> u64 {
+        self.change_count
+    }
+
+    /// Stability ratio as a whole-percent `u16` (0–100). 100 means the prefix
+    /// has never drifted. 100 before any check (no division by zero).
+    pub fn stability_pct(&self) -> u16 {
+        if self.check_count == 0 {
+            return 100;
+        }
+        let stable = self.check_count - self.change_count;
+        ((stable * 100) / self.check_count).min(100) as u16
+    }
+
+    /// The most recent drift, if any.
+    pub fn last_change(&self) -> Option<PrefixChange> {
+        self.last_change
     }
 
     /// The frozen system-prompt text, or `None` if `build()` was never called
@@ -365,8 +430,21 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(sp.build(&req)); // first build → changed
-        assert!(!sp.build(&req)); // same → unchanged
+        assert!(sp.build(&req).is_none()); // first build → baseline, no drift
+        assert!(sp.build(&req).is_none()); // same → stable
+        assert_eq!(sp.check_count(), 2);
+        assert_eq!(sp.change_count(), 0);
+        assert_eq!(sp.stability_pct(), 100);
+
+        // Change the system prompt → drift reported, system_changed only.
+        let mut req2 = req.clone();
+        req2.messages[0].content[0] = MessageContent::Text("sys-v2".into());
+        let change = sp.build(&req2).expect("drift detected");
+        assert!(change.system_changed);
+        assert!(!change.tools_changed);
+        assert_eq!(sp.change_count(), 1);
+        // 2 stable / 3 checks = 66%
+        assert_eq!(sp.stability_pct(), 66);
     }
 
     #[test]

@@ -41,3 +41,18 @@ pub fn openai_long_ttl(endpoint_url: &str) -> bool {
         }
     }
 }
+
+/// Whether an endpoint + model id pair looks like DeepSeek. Used only for
+/// observability (a `tracing::debug` confirming the DeepSeek-aware completions
+/// parsing path is active); no behavior is gated on it, because the fields
+/// DeepSeek returns (`reasoning_content`, `prompt_cache_hit_tokens`) are parsed
+/// unconditionally as optional serde fields — present-when-relevant, harmless
+/// when absent, and shared with other OpenAI-compatible reasoning models.
+pub fn is_deepseek(endpoint_url: &str, model_id: &str) -> bool {
+    let host = reqwest::Url::parse(endpoint_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    let host_match = host.as_deref().is_some_and(|h| h.contains("deepseek.com"));
+    let id_match = model_id.to_ascii_lowercase().contains("deepseek");
+    host_match || id_match
+}

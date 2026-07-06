@@ -37,9 +37,7 @@ impl Language {
     fn langid(self) -> LanguageIdentifier {
         match self {
             Language::En => "en".parse().expect("en is a valid BCP47 langid"),
-            Language::ZhCn => "zh-CN"
-                .parse()
-                .expect("zh-CN is a valid BCP47 langid"),
+            Language::ZhCn => "zh-CN".parse().expect("zh-CN is a valid BCP47 langid"),
         }
     }
 
@@ -243,10 +241,7 @@ mod tests {
     fn en_plural_minutes() {
         set_lang(Language::En);
         assert_eq!(t_count("sidebar-time-minutes", 1).as_ref(), "1 minute ago");
-        assert_eq!(
-            t_count("sidebar-time-minutes", 5).as_ref(),
-            "5 minutes ago"
-        );
+        assert_eq!(t_count("sidebar-time-minutes", 5).as_ref(), "5 minutes ago");
     }
 
     #[test]

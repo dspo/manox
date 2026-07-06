@@ -199,6 +199,79 @@ mod tests {
         r
     }
 
+    /// Stub tool with a configurable name so tests can probe ordering without
+    /// depending on the built-in tool set.
+    struct StubTool {
+        name: &'static str,
+    }
+
+    impl AgentTool for StubTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn run(
+            &self,
+            _input: serde_json::Value,
+            _cancel: CancellationToken,
+            _cx: &mut App,
+        ) -> Task<Result<String, String>> {
+            Task::ready(Ok("stub".to_string()))
+        }
+    }
+
+    fn stub(name: &'static str) -> AnyAgentTool {
+        Arc::new(StubTool { name }) as AnyAgentTool
+    }
+
+    /// The request-tool list must be lexicographically sorted by name. The
+    /// `BTreeMap` backing `ToolRegistry` gives this for free; this test pins
+    /// the invariant so a future switch to `HashMap` (which would silently
+    /// bust the provider's prefix cache by reordering tool specs turn-over-turn)
+    /// is caught.
+    #[test]
+    fn to_request_tools_is_lexicographically_sorted() {
+        let r = registry();
+        let names: Vec<String> = r
+            .to_request_tools()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "tool list must be sorted by name: {names:?}");
+    }
+
+    /// Registering a name that sorts before every built-in keeps the list
+    /// sorted — the cache-stable ordering is preserved regardless of
+    /// registration order.
+    #[test]
+    fn registering_out_of_order_name_stays_sorted() {
+        let mut r = registry();
+        // "000_stub" sorts before all built-in tool names; registered last but
+        // must appear first in the output.
+        r.register(stub("000_stub"));
+        r.register(stub("zzz_stub"));
+        let names: Vec<String> = r
+            .to_request_tools()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "sorted after out-of-order register: {names:?}"
+        );
+        assert_eq!(names.first(), Some(&"000_stub".to_string()));
+        assert_eq!(names.last(), Some(&"zzz_stub".to_string()));
+    }
+
     #[test]
     fn filtered_excludes_write_tools_in_plan_mode() {
         let r = registry();

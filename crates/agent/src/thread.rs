@@ -26,9 +26,10 @@ use crate::db::ThreadRecord;
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
-    Role, StopReason,
+    Role, StopReason, TokenUsage,
 };
 use crate::message::Message;
+use crate::prefix_stability::StablePrefix;
 use crate::tool::{
     PermissionCache, PermissionDecision, PlanApprovalResponse, ToolAuthorizationResponse,
     ToolRegistry, exit_plan_mode_request_tool,
@@ -89,6 +90,15 @@ pub enum ThreadEvent {
     /// The model called `exit_plan_mode` and submitted a plan. The UI shows an
     /// approval overlay; resolution arrives via `respond_plan_approval`.
     PlanProposed { id: String, plan_text: String },
+    /// The prefix-stability fingerprint for this turn vs. the previous one.
+    /// Emitted on every turn with the current stability ratio plus the drift
+    /// flags so the UI can render a `cache: NN%` chip; `system_changed` /
+    /// `tools_changed` are `true` only when that component drifted this turn.
+    PrefixStability {
+        stability_pct: u16,
+        system_changed: bool,
+        tools_changed: bool,
+    },
 }
 
 pub struct Thread {
@@ -172,6 +182,15 @@ pub struct Thread {
     /// landing without a new user message). Seeded from `restore` so a reloaded
     /// thread continues the cadence without re-evaluating immediately.
     title_last_eval_user_count: Option<usize>,
+    /// Fingerprint of the system prompt + tool specs, tracked turn-over-turn
+    /// so prefix drift (a history rewrite, tool hot-reload, plan-mode toggle)
+    /// is observable rather than silently busting the provider's prefix cache.
+    /// See [`crate::prefix_stability`].
+    prefix_stability: StablePrefix,
+    /// The most recent `TokenUsage` reported by the provider (cache read /
+    /// creation counts), surfaced alongside the stability chip so the user can
+    /// confirm cache hits by token count, not just by ratio.
+    last_usage: Option<TokenUsage>,
 }
 
 /// A forwarded authorization request from a sub-agent: which child thread holds
@@ -218,6 +237,8 @@ impl Thread {
                 title: None,
                 title_in_flight: false,
                 title_last_eval_user_count: None,
+                prefix_stability: StablePrefix::default(),
+                last_usage: None,
             }
         })
     }
@@ -277,6 +298,8 @@ impl Thread {
                 title,
                 title_in_flight: false,
                 title_last_eval_user_count,
+                prefix_stability: StablePrefix::default(),
+                last_usage: None,
             }
         })
     }
@@ -334,6 +357,8 @@ impl Thread {
                 title: None,
                 title_in_flight: false,
                 title_last_eval_user_count: None,
+                prefix_stability: StablePrefix::default(),
+                last_usage: None,
             }
         })
     }
@@ -612,6 +637,18 @@ impl Thread {
         self.project.as_ref()
     }
 
+    /// Prefix-stability ratio as a whole-percent `u16` (0–100). 100 means the
+    /// system prompt + tool-spec prefix has never drifted across turns.
+    pub fn prefix_stability_pct(&self) -> u16 {
+        self.prefix_stability.stability_pct()
+    }
+
+    /// The most recent provider-reported token usage (cache read/creation
+    /// counts), or `None` if the provider has not reported any yet.
+    pub fn last_cache_usage(&self) -> Option<TokenUsage> {
+        self.last_usage
+    }
+
     pub fn turn_count(&self) -> u32 {
         self.turn_count
     }
@@ -786,6 +823,20 @@ impl Thread {
                 this.pending_tool_uses.clear();
                 this.reconcile_tool_uses(cx);
                 this.build_completion_request()
+            })?;
+
+            // Fingerprint the request's system prompt + tool specs against the
+            // previous turn so prefix drift (history rewrite, tool hot-reload,
+            // plan-mode toggle) is observable. Emitted every turn with the
+            // current stability ratio; drift flags are `true` only when that
+            // component changed this turn.
+            this.update(cx, |this, cx| {
+                let change = this.prefix_stability.build(&request);
+                cx.emit(ThreadEvent::PrefixStability {
+                    stability_pct: this.prefix_stability.stability_pct(),
+                    system_changed: change.is_some_and(|c| c.system_changed),
+                    tools_changed: change.is_some_and(|c| c.tools_changed),
+                });
             })?;
 
             let mut stream = tokio::select! {
@@ -1264,8 +1315,9 @@ impl Thread {
 
         match response {
             PlanApprovalResponse::Approve => {
-                let msg =
-                    format!("User approved the plan. Plan contents:\n\n{plan_text}\n\nYou may now begin execution.");
+                let msg = format!(
+                    "User approved the plan. Plan contents:\n\n{plan_text}\n\nYou may now begin execution."
+                );
                 this.update(cx, |_, cx| {
                     cx.emit(ThreadEvent::ToolCall {
                         id: id.clone(),
@@ -1366,7 +1418,10 @@ impl Thread {
                 self.append_assistant_thinking(text.clone(), signature, cx);
                 cx.emit(ThreadEvent::AgentThinking(text));
             }
-            Ok(LanguageModelCompletionEvent::UsageUpdate(_)) => {}
+            Ok(LanguageModelCompletionEvent::UsageUpdate(u)) => {
+                self.last_usage = Some(u);
+                cx.notify();
+            }
             Ok(LanguageModelCompletionEvent::Stop(reason)) => {
                 self.finalize_assistant_message(cx);
                 // Fire Stop hooks (e.g. a stop-gate reviewer) fail-open; the

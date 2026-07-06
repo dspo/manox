@@ -14,7 +14,9 @@ use std::time::Duration;
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::provider::registry;
-use agent::{PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, i18n, save_thread};
+use agent::{
+    PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, i18n, save_thread,
+};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
     DragMoveEvent, Entity, FollowMode, ListAlignment, ListSizingBehavior, ListState, MouseButton,
@@ -349,6 +351,10 @@ impl Workspace {
                     if !matches!(reason, StopReason::ToolUse) {
                         save_thread(this.thread.clone(), true, cx);
                     }
+                    cx.notify();
+                }
+                ThreadEvent::PrefixStability { .. } => {
+                    // Refresh the `cache: NN%` chip in the composer status row.
                     cx.notify();
                 }
                 _ => {
@@ -1071,7 +1077,10 @@ impl Workspace {
                             gpui::div()
                                 .text_sm()
                                 .text_color(theme.muted_foreground)
-                                .child(i18n::t_str("workspace-approval-tool", &[("name", tool_name.as_str())])),
+                                .child(i18n::t_str(
+                                    "workspace-approval-tool",
+                                    &[("name", tool_name.as_str())],
+                                )),
                         )
                         .children(if queued > 0 {
                             Some(
@@ -1518,6 +1527,7 @@ impl Workspace {
     ) -> AnyElement {
         let plus = self.render_plus_button(cx);
         let cwd = self.render_cwd_chip(theme, cx);
+        let cache = self.render_cache_chip(cx);
         let access = self.render_access_placeholder(theme, cx);
         let yolo = self.thread.read(cx).yolo();
         let model = self.render_model_selector(theme, cx);
@@ -1548,6 +1558,7 @@ impl Workspace {
                             .gap_1()
                             .child(plus)
                             .child(cwd)
+                            .child(cache)
                             .child(access),
                     )
                     .child(
@@ -1646,32 +1657,36 @@ impl Workspace {
                 let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
                     menu.max_w(gpui::px(180.))
                         .label(i18n::t("workspace-mode-section"))
-                        .item(PopupMenuItem::new(i18n::t("workspace-mode-normal")).checked(!yolo_now).on_click(
-                            move |_, _window, cx| {
-                                ws_normal.update(cx, |this, cx| {
-                                    this.thread.update(cx, |t, cx| t.set_yolo(false, cx));
-                                    this.add_info_message(
-                                        i18n::t("workspace-yolo-off-notice").to_string(),
-                                        cx,
-                                    );
-                                    this.close_access_menu();
-                                    cx.notify();
-                                });
-                            },
-                        ))
-                        .item(PopupMenuItem::new(i18n::t("workspace-mode-yolo")).checked(yolo_now).on_click(
-                            move |_, _window, cx| {
-                                ws_yolo.update(cx, |this, cx| {
-                                    this.thread.update(cx, |t, cx| t.set_yolo(true, cx));
-                                    this.add_info_message(
-                                        i18n::t("workspace-yolo-on-notice").to_string(),
-                                        cx,
-                                    );
-                                    this.close_access_menu();
-                                    cx.notify();
-                                });
-                            },
-                        ))
+                        .item(
+                            PopupMenuItem::new(i18n::t("workspace-mode-normal"))
+                                .checked(!yolo_now)
+                                .on_click(move |_, _window, cx| {
+                                    ws_normal.update(cx, |this, cx| {
+                                        this.thread.update(cx, |t, cx| t.set_yolo(false, cx));
+                                        this.add_info_message(
+                                            i18n::t("workspace-yolo-off-notice").to_string(),
+                                            cx,
+                                        );
+                                        this.close_access_menu();
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(i18n::t("workspace-mode-yolo"))
+                                .checked(yolo_now)
+                                .on_click(move |_, _window, cx| {
+                                    ws_yolo.update(cx, |this, cx| {
+                                        this.thread.update(cx, |t, cx| t.set_yolo(true, cx));
+                                        this.add_info_message(
+                                            i18n::t("workspace-yolo-on-notice").to_string(),
+                                            cx,
+                                        );
+                                        this.close_access_menu();
+                                        cx.notify();
+                                    });
+                                }),
+                        )
                 });
                 let sub = cx.subscribe(
                     &menu,
@@ -1944,6 +1959,36 @@ impl Workspace {
             }
             None => gpui::div().into_any_element(),
         }
+    }
+
+    /// `cache: NN%` chip reflecting prefix-stability ratio. Green ≥80%, yellow
+    /// ≥40%, red below. The most recent provider cache-read token count is
+    /// appended when available so a high ratio can be cross-checked against
+    /// real cache hits.
+    fn render_cache_chip(&self, cx: &Context<Self>) -> AnyElement {
+        let thread = self.thread.read(cx);
+        let pct = thread.prefix_stability_pct();
+        let usage = thread.last_cache_usage();
+        let hue = if pct >= 80 {
+            0.33 // green
+        } else if pct >= 40 {
+            0.11 // yellow
+        } else {
+            0.0 // red
+        };
+        let label = match usage {
+            Some(u) if u.cache_read_input_tokens > 0 => {
+                format!("cache: {pct}% · {}k", u.cache_read_input_tokens / 1000)
+            }
+            _ => format!("cache: {pct}%"),
+        };
+        gpui::div()
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(gpui::hsla(hue, 0.5, 0.62, 1.0))
+            .child(label)
+            .into_any_element()
     }
 }
 
@@ -2285,7 +2330,9 @@ impl Render for Workspace {
                                         .items()
                                         .get(ix)
                                         .cloned()
-                                        .map(|item| v_flex().pt_1().pb_4().child(item).into_any_element())
+                                        .map(|item| {
+                                            v_flex().pt_1().pb_4().child(item).into_any_element()
+                                        })
                                         .unwrap_or_else(|| gpui::Empty.into_any_element())
                                 })
                                 .with_sizing_behavior(ListSizingBehavior::Auto)
