@@ -158,6 +158,20 @@ pub struct Thread {
     /// write tools (now visible since `plan_mode` was cleared) before the user
     /// has signaled to proceed.
     end_turn_after_tool: bool,
+    /// LLM-generated conversation title; `None` until the first title stream
+    /// lands. Main-thread only (sub-agents don't title). Displayed by the
+    /// sidebar in place of the mechanical first-message summary.
+    title: Option<String>,
+    /// Transient lock preventing concurrent title streams. Set `true` when a
+    /// title task is in flight, reset on completion (success or failure) so a
+    /// later turn can re-evaluate. Re-evaluation dedup is handled by
+    /// `title_last_eval_user_count` instead.
+    title_in_flight: bool,
+    /// The `user_count` at which a title was last evaluated. Prevents
+    /// re-evaluating at the same user-turn count (e.g. an assistant reply
+    /// landing without a new user message). Seeded from `restore` so a reloaded
+    /// thread continues the cadence without re-evaluating immediately.
+    title_last_eval_user_count: Option<usize>,
 }
 
 /// A forwarded authorization request from a sub-agent: which child thread holds
@@ -201,11 +215,15 @@ impl Thread {
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
                 end_turn_after_tool: false,
+                title: None,
+                title_in_flight: false,
+                title_last_eval_user_count: None,
             }
         })
     }
 
     /// Restore a `Thread` from a persisted record (messages + model rebuilt; tools rebuilt from cwd).
+    #[allow(clippy::too_many_arguments)]
     pub fn restore(
         id: ThreadId,
         cwd: PathBuf,
@@ -213,9 +231,16 @@ impl Thread {
         yolo: bool,
         messages: Vec<Message>,
         model: Option<AnyLanguageModel>,
+        title: Option<String>,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
+            // Continue the title cadence from where the persisted thread left
+            // off: a thread that already has a title is treated as if it had
+            // been evaluated at the current user-count, so it does not re-run
+            // the title stream on its first post-reload turn.
+            let user_count = messages.iter().filter(|m| m.role == Role::User).count();
+            let title_last_eval_user_count = title.as_ref().map(|_| user_count);
             let weak = cx.weak_entity();
             Self {
                 id,
@@ -241,6 +266,9 @@ impl Thread {
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
                 end_turn_after_tool: false,
+                title,
+                title_in_flight: false,
+                title_last_eval_user_count,
             }
         })
     }
@@ -287,6 +315,9 @@ impl Thread {
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
                 end_turn_after_tool: false,
+                title: None,
+                title_in_flight: false,
+                title_last_eval_user_count: None,
             }
         })
     }
@@ -297,6 +328,7 @@ impl Thread {
         Some(ThreadRecord {
             id: self.id.0.clone(),
             summary: self.summary(),
+            title: self.title.clone(),
             model_id,
             cwd: self.cwd.display().to_string(),
             project: self
@@ -309,8 +341,20 @@ impl Thread {
         })
     }
 
-    /// First user message text, truncated to 60 chars; falls back to the localized default when absent.
+    /// Display title: the LLM-generated title if present, else the mechanical
+    /// first-user-message summary. Used both for the sidebar and the persisted
+    /// `ThreadRecord::summary`.
     fn summary(&self) -> String {
+        if let Some(title) = self.title.clone().filter(|t| !t.trim().is_empty()) {
+            return title;
+        }
+        self.mechanical_summary()
+    }
+
+    /// Mechanical fallback: first user message text, truncated to 60 chars;
+    /// falls back to the localized default when absent. Used until the LLM
+    /// title stream lands.
+    fn mechanical_summary(&self) -> String {
         for m in &self.messages {
             if m.role != Role::User {
                 continue;
@@ -327,6 +371,73 @@ impl Thread {
             }
         }
         "(新对话)".to_string()
+    }
+
+    /// Maybe kick off an LLM title stream after a turn. Two modes:
+    /// - **first title** (`title` still `None`): build a request from the first
+    ///   user message + latest assistant reply and stream a concise title.
+    /// - **topic-shift re-eval** (`title` already set): on a cadence (first 3
+    ///   user turns, then every 5th), ask the model to emit a new title or the
+    ///   literal `UNCHANGED` sentinel.
+    ///
+    /// Bails out for sub-agents (`depth != 0`), when a title stream is already
+    /// in flight, when there is no assistant text yet, when the current
+    /// user-count was already evaluated, or when the cadence says skip. The
+    /// stream runs in a detached task; on success it stores the title (unless
+    /// the model said `UNCHANGED`) and persists with `touch=true` so the sidebar
+    /// refreshes.
+    fn maybe_generate_title(&mut self, cx: &mut Context<Self>) {
+        if self.depth != 0 || self.title_in_flight {
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            return;
+        };
+        if !self
+            .messages
+            .iter()
+            .any(|m| m.role == Role::Assistant && message_has_text(m))
+        {
+            return;
+        }
+        let user_count = self
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count();
+        if self.title_last_eval_user_count == Some(user_count) {
+            return;
+        }
+        if self.title.is_some() && !crate::title::should_retitle(user_count) {
+            return;
+        }
+        let is_first = self.title.is_none();
+        let request = if is_first {
+            crate::title::build_title_request(&self.messages)
+        } else {
+            crate::title::build_topic_shift_request(
+                self.title.as_deref().unwrap_or(""),
+                &self.messages,
+            )
+        };
+        self.title_in_flight = true;
+        self.title_last_eval_user_count = Some(user_count);
+        let entity = cx.entity();
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let result = crate::title::stream_thread_title(&model, request, cx).await;
+            this.update(cx, |t, cx| {
+                t.title_in_flight = false;
+                if let Ok(title) = result
+                    && !title.is_empty()
+                    && !crate::title::is_unchanged(&title)
+                {
+                    t.title = Some(title);
+                    crate::thread_store::save_thread(entity, true, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Called after the UI resolves authorization: route the response to the
@@ -549,6 +660,12 @@ impl Thread {
                 // A slash command's tool filter lasts only for its turn; clear it
                 // so a subsequent free-form message inherits the full tool set.
                 this.turn_tool_filter = None;
+                // A natural (non-cancelled) turn end is the trigger point for
+                // title re-evaluation. `maybe_generate_title` self-gates on
+                // depth, cadence, and dedup; cancelled turns skip it.
+                if !cancel.is_cancelled() {
+                    this.maybe_generate_title(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -1510,7 +1627,7 @@ fn model_facing_content(c: &MessageContent) -> MessageContent {
 }
 
 /// Truncate a summary to `max_chars` (appending an ellipsis when cut) and collapse it to a single line.
-fn truncate_summary(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_summary(s: &str, max_chars: usize) -> String {
     let one_line = s.replace('\n', " ");
     if one_line.chars().count() > max_chars {
         let t: String = one_line.chars().take(max_chars).collect();
@@ -1518,6 +1635,13 @@ fn truncate_summary(s: &str, max_chars: usize) -> String {
     } else {
         one_line
     }
+}
+
+/// Whether a message has any non-empty `Text` content block.
+fn message_has_text(m: &Message) -> bool {
+    m.content
+        .iter()
+        .any(|c| matches!(c, MessageContent::Text(t) if !t.trim().is_empty()))
 }
 
 /// Build a human-readable title for a tool call.
@@ -1757,6 +1881,7 @@ mod tests {
                 false,
                 Vec::new(),
                 None,
+                None,
                 cx,
             )
         });
@@ -1820,6 +1945,7 @@ mod tests {
                 false,
                 Vec::new(),
                 None,
+                None,
                 cx,
             )
         });
@@ -1874,6 +2000,7 @@ mod tests {
                 None,
                 false,
                 Vec::new(),
+                None,
                 None,
                 cx,
             )
@@ -1940,6 +2067,7 @@ mod tests {
                 None,
                 false,
                 Vec::new(),
+                None,
                 None,
                 cx,
             )
@@ -2055,6 +2183,7 @@ mod tests {
                 None,
                 true, // YOLO on
                 Vec::new(),
+                None,
                 None,
                 cx,
             )

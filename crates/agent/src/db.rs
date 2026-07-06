@@ -37,6 +37,10 @@ pub struct ThreadSummary {
 pub struct ThreadRecord {
     pub id: String,
     pub summary: String,
+    /// LLM-generated title; `None` until the first title-stream lands. Stored
+    /// separately from `summary` so the sidebar can show the smart title once
+    /// available without re-deriving it from the messages on every load.
+    pub title: Option<String>,
     pub model_id: String,
     pub cwd: String,
     /// Absolute project directory the thread is bound to; empty when none was chosen.
@@ -57,6 +61,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS threads (
     id TEXT PRIMARY KEY,
     summary TEXT NOT NULL DEFAULT '',
+    title TEXT,
     model_id TEXT NOT NULL DEFAULT '',
     cwd TEXT NOT NULL DEFAULT '',
     project TEXT NOT NULL DEFAULT '',
@@ -87,6 +92,9 @@ impl ThreadsDatabase {
             "ALTER TABLE threads ADD COLUMN yolo INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Migrate pre-`title` databases. Nullable column, no default needed; a
+        // duplicate-column error on already-migrated databases is expected and ignored.
+        let _ = conn.execute("ALTER TABLE threads ADD COLUMN title TEXT", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -112,10 +120,11 @@ impl ThreadsDatabase {
         let conn = self.conn.lock().expect("db mutex 中毒");
         if touch {
             conn.execute(
-                "INSERT INTO threads (id, summary, model_id, cwd, project, yolo, messages, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO threads (id, summary, title, model_id, cwd, project, yolo, messages, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
                     summary = excluded.summary,
+                    title = excluded.title,
                     model_id = excluded.model_id,
                     cwd = excluded.cwd,
                     project = excluded.project,
@@ -125,6 +134,7 @@ impl ThreadsDatabase {
                 params![
                     rec.id,
                     rec.summary,
+                    rec.title,
                     rec.model_id,
                     rec.cwd,
                     rec.project,
@@ -138,10 +148,11 @@ impl ThreadsDatabase {
             // Preserve the existing updated_at on conflict; only insert with
             // `now` when the record is brand new (no prior updated_at to keep).
             conn.execute(
-                "INSERT INTO threads (id, summary, model_id, cwd, project, yolo, messages, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO threads (id, summary, title, model_id, cwd, project, yolo, messages, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
                     summary = excluded.summary,
+                    title = excluded.title,
                     model_id = excluded.model_id,
                     cwd = excluded.cwd,
                     project = excluded.project,
@@ -150,6 +161,7 @@ impl ThreadsDatabase {
                 params![
                     rec.id,
                     rec.summary,
+                    rec.title,
                     rec.model_id,
                     rec.cwd,
                     rec.project,
@@ -167,7 +179,7 @@ impl ThreadsDatabase {
     pub fn load(&self, id: &str) -> Result<Option<ThreadRecord>> {
         let conn = self.conn.lock().expect("db mutex 中毒");
         let mut stmt = conn.prepare(
-            "SELECT id, summary, model_id, cwd, project, yolo, messages FROM threads WHERE id = ?1",
+            "SELECT id, summary, title, model_id, cwd, project, yolo, messages FROM threads WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id])?;
         let Some(row) = rows.next()? else {
@@ -175,11 +187,12 @@ impl ThreadsDatabase {
         };
         let id: String = row.get(0)?;
         let summary: String = row.get(1)?;
-        let model_id: String = row.get(2)?;
-        let cwd: String = row.get(3)?;
-        let project: String = row.get(4)?;
-        let yolo: bool = row.get::<_, i64>(5)? != 0;
-        let messages_json: String = row.get(6)?;
+        let title: Option<String> = row.get(2)?;
+        let model_id: String = row.get(3)?;
+        let cwd: String = row.get(4)?;
+        let project: String = row.get(5)?;
+        let yolo: bool = row.get::<_, i64>(6)? != 0;
+        let messages_json: String = row.get(7)?;
         let stored: Vec<StoredMessage> = serde_json::from_str(&messages_json)
             .with_context(|| format!("反序列化 messages 失败 (thread {id})"))?;
         let messages = stored
@@ -192,6 +205,7 @@ impl ThreadsDatabase {
         Ok(Some(ThreadRecord {
             id,
             summary,
+            title,
             model_id,
             cwd,
             project,
@@ -252,6 +266,7 @@ mod tests {
         let rec = ThreadRecord {
             id: "t1".into(),
             summary: "你好".into(),
+            title: Some("关于登录".into()),
             model_id: "百炼/glm-5.2[1m]/anthropic".into(),
             cwd: "/tmp".into(),
             project: "/tmp".into(),
@@ -266,6 +281,7 @@ mod tests {
         let loaded = db.load("t1").expect("load").expect("present");
         assert_eq!(loaded.id, "t1");
         assert_eq!(loaded.summary, "你好");
+        assert_eq!(loaded.title.as_deref(), Some("关于登录"));
         assert_eq!(loaded.project, "/tmp");
         assert!(loaded.yolo, "yolo flag must round-trip");
         assert_eq!(loaded.messages.len(), 2);
