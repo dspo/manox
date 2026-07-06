@@ -1014,15 +1014,27 @@ impl Thread {
                         this.handle_completion_event(ev, cx);
                     }
                 })?;
-                // Yield to the gpui foreground executor between batches so the
-                // macOS run loop can drain queued runnables (input events,
-                // frame callbacks). A fast-streaming provider keeps the
-                // async_channel non-empty, so `poll_next` returns Ready without
-                // registering a waker; without this yield the turn task starves
-                // the run loop and the UI freezes mid-turn.
-                std::future::poll_fn(|cx| {
-                    cx.waker().wake_by_ref();
-                    std::task::Poll::<()>::Pending
+                // Yield exactly once to the gpui foreground executor between
+                // batches so the macOS run loop can drain queued runnables
+                // (input events, frame callbacks). A fast-streaming provider
+                // keeps the async_channel non-empty, so `poll_next` returns
+                // Ready without registering a waker; without this yield the
+                // turn task starves the run loop and the UI freezes mid-turn.
+                //
+                // The future must resolve after a single yield — a perpetual
+                // `Pending` would hang the turn after the first batch (every
+                // subsequent delta, text chunk, and the Stop would sit unread
+                // in the channel). `yielded` ensures the second poll returns
+                // `Ready`, so control returns to the drain loop below.
+                let mut yielded = false;
+                std::future::poll_fn(move |cx: &mut std::task::Context<'_>| {
+                    if yielded {
+                        std::task::Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
                 })
                 .await;
                 if has_stop {
@@ -2557,5 +2569,88 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// Live regression guard for the inter-batch yield fix: drives a real
+    /// `run_turn` against Bailian glm-5.2[1m] through the full gpui↔tokio
+    /// bridge. Before the fix, the yield future returned `Pending` forever,
+    /// so the turn hung after the first batch — the assistant message held
+    /// only the empty `ContentBlockStart` thinking block and output_tokens
+    /// stayed 0. After the fix the turn drains the whole stream and produces
+    /// real text. Requires `MANOX_RUN_LIVE=1` + DASHSCOPE_API_KEY.
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_run_turn_drains_full_stream() {
+        if std::env::var("MANOX_RUN_LIVE").is_err() {
+            return;
+        }
+        crate::agent_def::init();
+        let config = crate::provider::CxConfig::load_default().expect("load config");
+        let registry = crate::provider::registry::ProviderRegistry::from_config(config);
+        let model = registry
+            .models()
+            .iter()
+            .find(|m| {
+                m.provider_name() == "百炼" && m.name().contains("glm-5.2")
+            })
+            .cloned()
+            .expect("百炼 glm-5.2[1m] anthropic");
+
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                "live-run-turn",
+                "/Users/chenzhongrun/projects/dspo/manox",
+                vec![Message::user("当前 thread id 是?".into())],
+            );
+            // Pin a title so `maybe_generate_title` short-circuits — its
+            // spawned title-stream task would otherwise outlive the test and
+            // trip gpui's leaked-handle check at teardown.
+            rec.title = Some("live run-turn".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        // Drive the gpui foreground executor while the tokio provider task
+        // streams events back over async_channel. The turn is done once
+        // `is_running` flips to false. Bound it so a regression (hang) fails
+        // fast instead of stalling the test runner.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 60s — inter-batch yield regression?");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+
+        let msgs = cx
+            .update(|cx| thread.read_with(cx, |t, _| t.messages.clone()));
+        // The assistant turn must have produced real text content, not just an
+        // empty `ContentBlockStart` thinking block (the pre-fix symptom).
+        let assistant_text: String = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::language_model::Role::Assistant)
+            .into_iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| match c {
+                crate::language_model::MessageContent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !assistant_text.is_empty(),
+            "assistant produced no text — stream was not fully drained (got messages: {msgs:?})"
+        );
+        eprintln!("assistant text: {}", assistant_text.chars().take(200).collect::<String>());
     }
 }
