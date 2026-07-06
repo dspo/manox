@@ -110,9 +110,9 @@ impl ConversationState {
     /// so toggling YOLO on the empty first screen doesn't prematurely leave
     /// the hero layout.
     pub fn is_empty(&self, cx: &App) -> bool {
-        self.items.iter().all(|e| {
-            matches!(e.read(cx).kind(), ConvItem::Error(_) | ConvItem::Notice(_))
-        })
+        self.items
+            .iter()
+            .all(|e| matches!(e.read(cx).kind(), ConvItem::Error(_) | ConvItem::Notice(_)))
     }
 
     /// Append a user message.
