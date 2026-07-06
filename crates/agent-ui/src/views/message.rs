@@ -117,10 +117,13 @@ impl MessageItem {
     /// single-line card so it stops competing with the assistant's final reply.
     pub fn finalize_streaming(&mut self) {
         match &mut self.kind {
-            ConvItem::Assistant { streaming, .. } => {
-                *streaming = false
-            }
-            ConvItem::Reasoning { streaming, collapsed, user_toggled, .. } => {
+            ConvItem::Assistant { streaming, .. } => *streaming = false,
+            ConvItem::Reasoning {
+                streaming,
+                collapsed,
+                user_toggled,
+                ..
+            } => {
                 *streaming = false;
                 *collapsed = !*user_toggled;
             }
@@ -185,8 +188,27 @@ pub fn render_item(
         ConvItem::Assistant { text, streaming } => {
             render_assistant(text, *streaming, ix, role, theme)
         }
-        ConvItem::Reasoning { text, streaming, collapsed, user_toggled } => render_reasoning(text, ix, *streaming, *collapsed, *user_toggled, theme, tool_ctx),
-        ConvItem::ToolCall(t) => render_tool_call(t, ix, theme, tool_ctx),
+        ConvItem::Reasoning {
+            text,
+            streaming,
+            collapsed,
+            user_toggled,
+        } => render_reasoning(
+            text,
+            ix,
+            *streaming,
+            *collapsed,
+            *user_toggled,
+            theme,
+            tool_ctx,
+        ),
+        ConvItem::ToolCall(t) => {
+            if t.name == "exit_plan_mode" {
+                render_plan_card(t, ix, theme, tool_ctx)
+            } else {
+                render_tool_call(t, ix, theme, tool_ctx)
+            }
+        }
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx),
         ConvItem::Error(msg) => render_error(msg, ix, theme),
         ConvItem::Notice(msg) => render_notice(msg, ix, theme),
@@ -204,6 +226,21 @@ fn copy_button(ix: usize, prefix: &'static str, text: String) -> Button {
         })
 }
 
+/// Copy button visible only when the parent element (group) is hovered.
+/// The caller must attach `.group(name)` to the enclosing wrapper.
+fn copy_button_hoverable(
+    ix: usize,
+    prefix: &'static str,
+    group: impl Into<gpui::SharedString>,
+    text: String,
+) -> gpui::Div {
+    let group = group.into();
+    gpui::div()
+        .opacity(0.0)
+        .group_hover(group, |s| s.opacity(1.0))
+        .child(copy_button(ix, prefix, text))
+}
+
 /// Render a user message: a right-aligned rounded card + copy button.
 pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
     h_flex()
@@ -211,6 +248,7 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
         .justify_end()
         .child(
             v_flex()
+                .group(format!("user-{ix}"))
                 .max_w(px(560.))
                 .gap_1()
                 .px_3()
@@ -219,10 +257,10 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .bg(theme.secondary)
                 .border_1()
                 .border_color(theme.border)
-                .shadow_sm()
-                .child(h_flex().w_full().justify_end().child(copy_button(
+                .child(h_flex().w_full().justify_end().child(copy_button_hoverable(
                     ix,
                     "copy-user",
+                    format!("user-{ix}"),
                     text.to_string(),
                 )))
                 .child(
@@ -249,13 +287,13 @@ pub fn render_assistant(
     theme: &Theme,
 ) -> gpui::AnyElement {
     v_flex()
+        .group(format!("assistant-{ix}"))
         .w_full()
-        .gap_2()
+        .gap_1()
         .child(
             h_flex()
-                .gap_1p5()
+                .gap_1()
                 .items_center()
-                .child(Icon::new(IconName::Bot).small().text_color(theme.green))
                 .child(
                     gpui::div()
                         .text_xs()
@@ -263,7 +301,12 @@ pub fn render_assistant(
                         .child(role.to_string()),
                 )
                 .child(gpui::div().flex_1())
-                .child(copy_button(ix, "copy-assistant", text.to_string())),
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-assistant",
+                    format!("assistant-{ix}"),
+                    text.to_string(),
+                )),
         )
         .child(render_text_body(text, streaming, ("assistant", ix), theme))
         .into_any_element()
@@ -317,44 +360,56 @@ pub fn render_reasoning(
     } else {
         IconName::ChevronDown
     };
-    let _id_for_toggle = format!("reasoning-toggle-{ix}");
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
-    let mut block = v_flex().w_full().gap_1().child(
-        h_flex()
-            .id(("reasoning-header", ix))
-            .gap_1p5()
-            .items_center()
-            .cursor_pointer()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .on_click(move |_, _window, cx: &mut App| {
-                let Some(weak) = weak_workspace.clone() else {
-                    return;
-                };
-                let ix_click = ix;
-                let _ = weak.update(cx, |w, cx| {
-                    let conv = w.conversation.clone();
-                    conv.update(cx, |c, cx| {
-                        if let Some(item) = c.items().get(ix_click)
-                        {
-                            item.update(cx, |item, cx| {
-                                if let ConvItem::Reasoning { collapsed, user_toggled, .. } = item.kind_mut() {
-                                    *collapsed = !*collapsed;
-                                    *user_toggled = true;
-                                }
-                                cx.notify();
-                            });
-                        }
+    let mut block = v_flex()
+        .group(format!("reasoning-{ix}"))
+        .w_full()
+        .gap_1()
+        .child(
+            h_flex()
+                .id(("reasoning-header", ix))
+                .gap_1p5()
+                .items_center()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .on_click(move |_, _window, cx: &mut App| {
+                    let Some(weak) = weak_workspace.clone() else {
+                        return;
+                    };
+                    let ix_click = ix;
+                    let _ = weak.update(cx, |w, cx| {
+                        let conv = w.conversation.clone();
+                        conv.update(cx, |c, cx| {
+                            if let Some(item) = c.items().get(ix_click) {
+                                item.update(cx, |item, cx| {
+                                    if let ConvItem::Reasoning {
+                                        collapsed,
+                                        user_toggled,
+                                        ..
+                                    } = item.kind_mut()
+                                    {
+                                        *collapsed = !*collapsed;
+                                        *user_toggled = true;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        w.list_state().remeasure();
+                        cx.notify();
                     });
-                    w.list_state().remeasure();
-                    cx.notify();
-                });
-            })
-            .child(Icon::new(chevron).xsmall())
-            .child(i18n::t("message-reasoning"))
-            .child(gpui::div().flex_1())
-            .child(copy_button(ix, "copy-reasoning", text.to_string())),
-    );
+                })
+                .child(Icon::new(chevron).xsmall())
+                .child(i18n::t("message-reasoning"))
+                .child(gpui::div().flex_1())
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-reasoning",
+                    format!("reasoning-{ix}"),
+                    text.to_string(),
+                )),
+        );
     if !collapsed {
         let body = render_text_body(text, streaming, ("reasoning", ix), theme);
         block = block.child(
@@ -373,21 +428,30 @@ pub fn render_reasoning(
 /// Render an error message + copy button.
 pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
     v_flex()
+        .group(format!("error-{ix}"))
         .w_full()
         .gap_1()
         .px_3()
         .py_2()
         .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.danger)
-        .bg(theme.danger.opacity(0.08))
+        .bg(theme.danger.opacity(0.06))
         .child(
             h_flex()
                 .w_full()
                 .justify_between()
                 .items_center()
-                .child(gpui::div().text_sm().text_color(theme.danger).child(i18n::t("message-error")))
-                .child(copy_button(ix, "copy-error", msg.to_string())),
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .text_color(theme.danger)
+                        .child(i18n::t("message-error")),
+                )
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-error",
+                    format!("error-{ix}"),
+                    msg.to_string(),
+                )),
         )
         .child(
             gpui::div()
@@ -403,14 +467,13 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
 /// read as a runtime error.
 pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
     v_flex()
+        .group(format!("notice-{ix}"))
         .w_full()
         .gap_1()
         .px_3()
         .py_2()
         .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary.opacity(0.3))
+        .bg(theme.secondary.opacity(0.15))
         .child(
             h_flex()
                 .w_full()
@@ -422,7 +485,12 @@ pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                         .text_color(theme.muted_foreground)
                         .child(i18n::t("message-notice")),
                 )
-                .child(copy_button(ix, "copy-notice", msg.to_string())),
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-notice",
+                    format!("notice-{ix}"),
+                    msg.to_string(),
+                )),
         )
         .child(
             gpui::div()
@@ -454,14 +522,12 @@ pub fn render_tool_call(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
-    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) = match item.status {
-        ToolCallStatus::PendingApproval => {
-            (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-pending"))
-        }
-        ToolCallStatus::Running => (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-running")),
-        ToolCallStatus::Success => (IconName::CircleCheck, theme.success, i18n::t("status-success")),
-        ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
-        ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
+    let (status_color, status_label): (gpui::Hsla, SharedString) = match item.status {
+        ToolCallStatus::PendingApproval => (theme.muted_foreground, i18n::t("status-pending")),
+        ToolCallStatus::Running => (theme.muted_foreground, i18n::t("status-running")),
+        ToolCallStatus::Success => (theme.success, i18n::t("status-success")),
+        ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
+        ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
     };
 
     let title = if item.title.is_empty() {
@@ -470,10 +536,137 @@ pub fn render_tool_call(
         item.title.clone()
     };
 
-    // Body is shown while streaming (live tail) or when the user has expanded
-    // the card post-completion. Auto-collapse hides it once the tool reaches
-    // a terminal status and the user hasn't manually opened it.
     let show_body = item.streaming || !item.collapsed;
+    let chevron = if item.collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    };
+
+    let id_for_toggle = item.id.clone();
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+
+    let mut card = v_flex().group(format!("tool-{ix}")).w_full().child(
+        h_flex()
+            .id(("tool-header", ix))
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1p5()
+            .items_center()
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+            .on_click(move |_, _window, cx: &mut App| {
+                let Some(weak) = weak_workspace.clone() else {
+                    return;
+                };
+                let _ = weak.update(cx, |w, cx| {
+                    let id = id_for_toggle.clone();
+                    let conv = w.conversation.clone();
+                    conv.update(cx, |c, cx| {
+                        if let Some(ix) = c.find_tool(&id, &*cx)
+                            && let Some(item) = c.items().get(ix)
+                        {
+                            item.update(cx, |item, cx| {
+                                if let ConvItem::ToolCall(t) = item.kind_mut() {
+                                    t.collapsed = !t.collapsed;
+                                    t.user_toggled = true;
+                                }
+                                cx.notify();
+                            });
+                        }
+                    });
+                    w.list_state().remeasure();
+                    cx.notify();
+                });
+            })
+            .child(
+                Icon::new(chevron)
+                    .xsmall()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .text_xs()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.muted_foreground)
+                    .child(truncate(&title, 80)),
+            )
+            .child(copy_button_hoverable(
+                ix,
+                "copy-tool",
+                format!("tool-{ix}"),
+                item.output.clone(),
+            ))
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(status_color)
+                    .child(status_label),
+            ),
+    );
+
+    let display_output = if item.streaming {
+        live_tail(&item.output)
+    } else {
+        item.output.clone()
+    };
+
+    if show_body && !display_output.is_empty() {
+        card = card.child(render_tool_output(
+            &display_output,
+            &item.name,
+            item.streaming,
+            ix,
+            theme,
+        ));
+    }
+    card.into_any_element()
+}
+
+/// Render an `exit_plan_mode` tool-call as a plan card. The body uses
+/// `TextView::markdown` (assistant-style, no code-block wrapping, no height
+/// cap) instead of the monospace scrollable container. PendingApproval forces
+/// the body open; terminal status auto-collapses like a regular ToolCall.
+fn render_plan_card(
+    item: &ToolCallItem,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
+    use agent::ToolCallStatus;
+    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) =
+        match item.status {
+            ToolCallStatus::PendingApproval => (
+                IconName::LoaderCircle,
+                theme.muted_foreground,
+                i18n::t("status-pending"),
+            ),
+            ToolCallStatus::Running => (
+                IconName::LoaderCircle,
+                theme.muted_foreground,
+                i18n::t("status-running"),
+            ),
+            ToolCallStatus::Success => (
+                IconName::CircleCheck,
+                theme.success,
+                i18n::t("status-success"),
+            ),
+            ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
+            ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
+        };
+
+    let title = if item.title.is_empty() {
+        item.name.clone()
+    } else {
+        item.title.clone()
+    };
+
+    // PendingApproval always shows the body; terminal status auto-collapses.
+    let show_body =
+        item.status == ToolCallStatus::PendingApproval || item.streaming || !item.collapsed;
     let chevron = if item.collapsed {
         IconName::ChevronRight
     } else {
@@ -492,7 +685,7 @@ pub fn render_tool_call(
         .overflow_hidden()
         .child(
             h_flex()
-                .id(("tool-header", ix))
+                .id(("plan-header", ix))
                 .w_full()
                 .px_3()
                 .py_1p5()
@@ -500,12 +693,6 @@ pub fn render_tool_call(
                 .items_center()
                 .cursor_pointer()
                 .on_click(move |_, _window, cx: &mut App| {
-                    // Toggle the `collapsed` flag on the matching `ToolCallItem`
-                    // so the user's choice survives scroll-driven remounts.
-                    // The list remeasure is needed because a body show/hide
-                    // changes the card's height, and the list caches a per-item
-                    // measured height that must be invalidated for the new
-                    // layout to take hold.
                     let Some(weak) = weak_workspace.clone() else {
                         return;
                     };
@@ -535,19 +722,19 @@ pub fn render_tool_call(
                         .text_color(theme.muted_foreground),
                 )
                 .child(
-                    Icon::new(IconName::SquareTerminal)
+                    Icon::new(IconName::LayoutDashboard)
                         .small()
-                        .text_color(theme.muted_foreground),
+                        .text_color(theme.accent),
                 )
                 .child(
                     gpui::div()
                         .flex_1()
-                        .text_xs()
-                        .font_family(theme.mono_font_family.clone())
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.foreground)
-                        .child(truncate(&title, 80)),
+                        .child(title),
                 )
-                .child(copy_button(ix, "copy-tool", item.output.clone()))
+                .child(copy_button(ix, "copy-plan", item.output.clone()))
                 .child(
                     h_flex()
                         .gap_1()
@@ -559,24 +746,24 @@ pub fn render_tool_call(
                 ),
         );
 
-    // While streaming, show the live tail so newly-emitted lines stay visible
-    // without a scroll handle (the full, truncated output replaces it once the
-    // final `ToolResult` lands and `streaming` flips false).
-    let display_output = if item.streaming {
-        live_tail(&item.output)
-    } else {
-        item.output.clone()
-    };
-
-    if show_body && !display_output.is_empty() {
-        card = card.child(render_tool_output(
-            &display_output,
-            &item.name,
-            item.streaming,
-            ix,
-            theme,
-        ));
+    if show_body && !item.output.is_empty() {
+        card = card.child(
+            gpui::div()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(markdown_tv(
+                    ("plan-text", ix),
+                    item.output.clone(),
+                    theme,
+                    false,
+                )),
+        );
     }
+
     card.into_any_element()
 }
 
@@ -642,14 +829,12 @@ pub fn render_agent_task(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
-    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) = match item.status {
-        ToolCallStatus::PendingApproval => {
-            (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-pending"))
-        }
-        ToolCallStatus::Running => (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-running")),
-        ToolCallStatus::Success => (IconName::CircleCheck, theme.success, i18n::t("status-success")),
-        ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
-        ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
+    let (status_color, status_label): (gpui::Hsla, SharedString) = match item.status {
+        ToolCallStatus::PendingApproval => (theme.muted_foreground, i18n::t("status-pending")),
+        ToolCallStatus::Running => (theme.muted_foreground, i18n::t("status-running")),
+        ToolCallStatus::Success => (theme.success, i18n::t("status-success")),
+        ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
+        ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
     };
 
     let expanded = agent_ctx.is_some_and(|c| c.expanded.contains(&item.id));
@@ -666,71 +851,56 @@ pub fn render_agent_task(
         item.final_text.clone()
     };
 
-    let mut card = v_flex()
-        .w_full()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary)
-        .overflow_hidden()
-        .child(
-            h_flex()
-                .id(("agent-header", ix))
-                .w_full()
-                .px_3()
-                .py_1p5()
-                .gap_2()
-                .items_center()
-                .cursor_pointer()
-                .on_click(move |_, _window, cx: &mut App| {
-                    // Toggle membership in the owning Workspace's
-                    // `expanded_tasks`, then remeasure the whole list: an
-                    // expand/collapse changes this card's height, and the
-                    // list caches a per-item measured height that must be
-                    // invalidated for the new layout to take hold.
-                    let Some(weak) = weak.clone() else {
-                        return;
-                    };
-                    let _ = weak.update(cx, |w, cx| {
-                        if !w.expanded_tasks.insert(id_for_toggle.clone()) {
-                            w.expanded_tasks.remove(&id_for_toggle);
-                        }
-                        w.list_state().remeasure();
-                        cx.notify();
-                    });
-                })
-                .child(
-                    Icon::new(IconName::Bot)
-                        .small()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    Icon::new(chevron)
-                        .xsmall()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .text_xs()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.foreground)
-                        .child(truncate(&item.title, 80)),
-                )
-                .child(copy_button(ix, "copy-agent", copy_text))
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .text_xs()
-                        .text_color(status_color)
-                        .child(Icon::new(status_icon).xsmall())
-                        .child(status_label),
-                ),
-        );
+    let mut card = v_flex().group(format!("agent-{ix}")).w_full().child(
+        h_flex()
+            .id(("agent-header", ix))
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1p5()
+            .items_center()
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+            .on_click(move |_, _window, cx: &mut App| {
+                let Some(weak) = weak.clone() else {
+                    return;
+                };
+                let _ = weak.update(cx, |w, cx| {
+                    if !w.expanded_tasks.insert(id_for_toggle.clone()) {
+                        w.expanded_tasks.remove(&id_for_toggle);
+                    }
+                    w.list_state().remeasure();
+                    cx.notify();
+                });
+            })
+            .child(
+                Icon::new(chevron)
+                    .xsmall()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .text_xs()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.muted_foreground)
+                    .child(truncate(&item.title, 80)),
+            )
+            .child(copy_button_hoverable(
+                ix,
+                "copy-agent",
+                format!("agent-{ix}"),
+                copy_text,
+            ))
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(status_color)
+                    .child(status_label),
+            ),
+    );
 
-    // Collapsed body: the live tail while streaming, the final result once done,
-    // or whatever was streamed if the sub-agent produced no final text.
     let collapsed_body = if item.streaming {
         live_tail(&item.sub_text)
     } else if !item.final_text.is_empty() {
@@ -740,9 +910,6 @@ pub fn render_agent_task(
     };
 
     if expanded {
-        // Expanded: rebuild the child conversation from its snapshot and render
-        // each item recursively. Nested agent tasks share the same expansion
-        // set (keyed by id), so they expand/collapse in place too.
         let sub_items = build_items(&item.sub_messages);
         if sub_items.is_empty() {
             if !collapsed_body.is_empty() {

@@ -5,62 +5,82 @@
 //! every request build — date changes, project may change — and prepended as a
 //! `System` message by `Thread::build_completion_request`.
 //!
-//! The static body (identity + working discipline + sandbox boundary) lives in
+//! The static body (working discipline + sandbox boundary) lives in
 //! [`system_prompt.md`] next to this file, embedded via `include_str!` so the
 //! prose reads as plain markdown and edits don't touch Rust — mirroring codex's
-//! split (static `base_instructions/default.md` + dynamic `<cwd>`/
-//! `<current_date>` environment XML). The markdown carries a
-//! `{{runtime_identity}}` placeholder where the live block belongs; this
-//! builder renders the cwd/project/os/shell/date key-value rows into it. No
-//! template engine crate — `str::replace` is enough for one tag. Thread id is
-//! deliberately NOT injected — the model fetches it on demand via the
-//! `self_info` tool (codex and zed likewise do not inject session/thread id
-//! into the prompt).
+//! split (static `base_instructions/default.md` + dynamic environment block).
+//! No template engine crate — string concatenation is enough.
+//!
+//! **Static-first layering for prefix-cache stability.** The prompt is
+//! assembled most-static → most-volatile so the provider's prefix cache hits
+//! the longest possible byte run turn-over-turn: (1) the compile-time static
+//! prose + sandbox boundary, (2) the skills block (session-stable), (3) the
+//! language directive (locale-stable), (4) the runtime identity block. Within
+//! the identity block, session-stable rows (cwd/project/os/shell) come before
+//! daily-volatile `today` and toggle-volatile `yolo`. Thread id is deliberately
+//! NOT injected — the model fetches it on demand via the `self_info` tool
+//! (codex and zed likewise do not inject session/thread id into the prompt).
 //!
 //! The prompt prose is fixed English regardless of the UI locale (the model's
 //! context stays in one language). The user's preferred reply language is
-//! conveyed by a one-line directive injected into the runtime identity block —
-//! see [`build_main_system_prompt`] and [`language_directive`].
+//! conveyed by a one-line directive appended to the system prompt — see
+//! [`build_main_system_prompt`] and [`language_directive`].
 
 use std::path::Path;
 
 const STATIC_PROMPT: &str = include_str!("system_prompt.md");
-
-/// Tag in `system_prompt.md` replaced with the live runtime identity block.
-const RUNTIME_IDENTITY_TAG: &str = "{{runtime_identity}}";
 
 /// Build the main-thread system prompt from live thread state.
 ///
 /// Sub-agents never call this — their `system` field is `Some`, so
 /// `build_completion_request` takes the `unwrap_or_else` branch only for the
 /// main thread.
+///
+/// Assembly order is static-first (see module docs): the volatile identity
+/// block lands at the very end so toggling `yolo` or a day rollover only
+/// invalidates the cached tail, not the static prose. `PLAN_MODE_ADDENDUM`
+/// (appended by `Thread::build_completion_request`) follows the identity block,
+/// so toggling plan mode likewise only busts the tail.
 pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>, yolo: bool) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
     let os = std::env::consts::OS;
 
-    let mut identity = String::from("## Runtime identity\n");
-    identity.push_str(&format!("- Current working directory: `{}`\n", cwd.display()));
-    if let Some(p) = project {
-        identity.push_str(&format!("- Project root: `{}`\n", p.display()));
-    }
-    identity.push_str(&format!("- Operating system: {os}\n"));
-    identity.push_str(&format!("- Default shell: {shell}\n"));
-    identity.push_str(&format!("- Today: {today}\n"));
-    if yolo {
-        identity.push_str("- Mode: YOLO (tool calls need no approval, bash runs outside the sandbox)\n");
-    }
-    identity.push_str(language_directive());
+    let mut prompt = String::from(STATIC_PROMPT);
 
-    let mut prompt = STATIC_PROMPT.replace(RUNTIME_IDENTITY_TAG, &identity);
     // Advertise installed skills so the model knows what reference docs it can
     // pull via the `skill` tool. The full bodies are loaded on demand, not
     // injected here — only the one-line summaries, to keep the prompt small.
+    // Session-stable, so it sits above the volatile identity block.
     let skills = crate::skill::summary_block_or_empty();
     if !skills.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&skills);
     }
+
+    // Locale-stable for the session; above the volatile identity block.
+    prompt.push_str(language_directive());
+
+    // Runtime identity — the only volatile section. Session-stable rows first
+    // (cwd/project/os/shell), then daily-volatile `today`, then toggle-volatile
+    // `yolo` last, so the cacheable prefix extends as far as possible.
+    prompt.push_str("\n\n## Runtime identity\n");
+    prompt.push_str(&format!(
+        "- Current working directory: `{}`\n",
+        cwd.display()
+    ));
+    if let Some(p) = project {
+        prompt.push_str(&format!("- Project root: `{}`\n", p.display()));
+    }
+    prompt.push_str(&format!("- Operating system: {os}\n"));
+    prompt.push_str(&format!("- Default shell: {shell}\n"));
+    prompt.push_str(&format!("- Today: {today}\n"));
+    if yolo {
+        prompt.push_str(
+            "- Mode: YOLO (tool calls need no approval, bash runs outside the sandbox)\n",
+        );
+    }
+
     prompt
 }
 
@@ -73,8 +93,12 @@ pub fn language_directive() -> &'static str {
     // The name is always an English endonym ("English", "Simplified Chinese") —
     // the model parses the directive, the user never sees this string.
     match crate::i18n::current() {
-        crate::i18n::Language::En => "\n\n## Language\n\nUnless the user specifies otherwise, write your user-facing responses in English.\n",
-        crate::i18n::Language::ZhCn => "\n\n## Language\n\nUnless the user specifies otherwise, write your user-facing responses in Simplified Chinese.\n",
+        crate::i18n::Language::En => {
+            "\n\n## Language\n\nUnless the user specifies otherwise, write your user-facing responses in English.\n"
+        }
+        crate::i18n::Language::ZhCn => {
+            "\n\n## Language\n\nUnless the user specifies otherwise, write your user-facing responses in Simplified Chinese.\n"
+        }
     }
 }
 
@@ -86,7 +110,9 @@ pub fn language_directive() -> &'static str {
 /// hit (the sub-agent keeps calling tools) is what actually hard-stops the turn
 /// in `Thread::run_turn_loop`.
 pub fn max_turns_summary_prompt(max: u32) -> String {
-    format!("You've reached the maximum turn count of {max}. Based on the work completed above, produce a concise final summary. Do not call any more tools.")
+    format!(
+        "You've reached the maximum turn count of {max}. Based on the work completed above, produce a concise final summary. Do not call any more tools."
+    )
 }
 
 /// Appended to the system prompt while the thread is in plan mode. Tells the
@@ -125,13 +151,38 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_placeholder_is_rendered() {
-        // The {{runtime_identity}} tag must be substituted with live values,
-        // never reach the model as a literal placeholder.
+    fn runtime_identity_block_appended_at_tail() {
+        // Identity is code-appended (no placeholder substitution), and it lands
+        // at the very end of the prompt — after the static prose, skills, and
+        // language directive — so the cacheable static prefix is maximal.
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(!p.contains("{{"), "placeholder leaked: {p}");
-        assert!(!p.contains("runtime_identity}}"), "placeholder leaked: {p}");
-        assert!(p.contains("## Runtime identity"), "identity block missing: {p}");
+        assert!(!p.contains("{{"), "no placeholder syntax: {p}");
+        assert!(
+            p.contains("## Runtime identity"),
+            "identity block missing: {p}"
+        );
+        let identity_idx = p.find("## Runtime identity").expect("identity block");
+        let sandbox_idx = p
+            .find("## Tool sandbox boundary")
+            .expect("sandbox boundary");
+        // Identity must come after the sandbox boundary (static doc tail).
+        assert!(
+            identity_idx > sandbox_idx,
+            "identity must follow the static sandbox boundary for cache stability: {p}"
+        );
+    }
+
+    #[test]
+    fn prompt_includes_context_economy() {
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        assert!(
+            p.contains("Context economy"),
+            "context economy section: {p}"
+        );
+        assert!(
+            p.contains("byte-stable prefix"),
+            "cache-awareness guidance: {p}"
+        );
     }
 
     #[test]
@@ -145,21 +196,33 @@ mod tests {
     #[test]
     fn prompt_contains_engineering_stance() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("Engineering stance"), "engineering stance section: {p}");
-        assert!(p.contains("Own the end state"), "end-state responsibility: {p}");
+        assert!(
+            p.contains("Engineering stance"),
+            "engineering stance section: {p}"
+        );
+        assert!(
+            p.contains("Own the end state"),
+            "end-state responsibility: {p}"
+        );
         assert!(p.contains("root cause"), "root-cause discipline: {p}");
     }
 
     #[test]
     fn prompt_contains_no_fabrication() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("don't fabricate"), "no-fabrication discipline: {p}");
+        assert!(
+            p.contains("don't fabricate"),
+            "no-fabrication discipline: {p}"
+        );
     }
 
     #[test]
     fn prompt_contains_task_completion() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("fully solved"), "task completion discipline: {p}");
+        assert!(
+            p.contains("fully solved"),
+            "task completion discipline: {p}"
+        );
     }
 
     #[test]
@@ -174,7 +237,10 @@ mod tests {
     #[test]
     fn prompt_contains_sandbox_boundary() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("Tool sandbox boundary"), "sandbox boundary section: {p}");
+        assert!(
+            p.contains("Tool sandbox boundary"),
+            "sandbox boundary section: {p}"
+        );
         assert!(
             p.contains("`.git` directory is read-only"),
             ".git protected: {p}"
@@ -226,7 +292,10 @@ mod tests {
     #[test]
     fn yolo_mode_silent_when_disabled() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(!p.contains("YOLO"), "yolo must not appear when disabled: {p}");
+        assert!(
+            !p.contains("YOLO"),
+            "yolo must not appear when disabled: {p}"
+        );
     }
 
     #[test]
@@ -236,6 +305,54 @@ mod tests {
         assert!(
             s.contains("Do not call any more tools"),
             "no-tools directive: {s}"
+        );
+    }
+
+    #[test]
+    fn prompt_distinguishes_discussion_from_implementation() {
+        // "How do I X" is a discussion request, not an implementation request —
+        // the agent must answer first and ask before touching code (thread
+        // bfb39601: agent started implementing on a "how do I add a
+        // marketplace" question).
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        assert!(
+            p.contains("Discussion vs implementation"),
+            "discussion section: {p}"
+        );
+        assert!(p.contains("discussion or Q&A"), "discussion framing: {p}");
+        assert!(
+            p.contains("shall I implement this now?"),
+            "ask-before-implementing: {p}"
+        );
+        assert!(
+            p.contains("Don't modify code without an explicit request"),
+            "no-unsolicited-code-changes: {p}"
+        );
+        assert!(
+            p.contains("the user's actual request"),
+            "task-execution scoped to actual request: {p}"
+        );
+    }
+
+    #[test]
+    fn prompt_contains_git_verification_discipline() {
+        // Every git write op must be verified with git itself before reporting
+        // success — the branch-tracking false-success regression (thread
+        // e5047fd2) came from reporting push success without checking
+        // `git log origin/<branch>`.
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        assert!(p.contains("Git operations"), "git section: {p}");
+        assert!(
+            p.contains("git log origin/<branch>"),
+            "remote verification: {p}"
+        );
+        assert!(
+            p.contains("Don't report success without verifying"),
+            "no-success-without-verify: {p}"
+        );
+        assert!(
+            p.contains("git branch --show-current"),
+            "branch name from measurement: {p}"
         );
     }
 }

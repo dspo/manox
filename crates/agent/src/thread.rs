@@ -26,9 +26,10 @@ use crate::db::ThreadRecord;
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
-    Role, StopReason,
+    Role, StopReason, TokenUsage,
 };
 use crate::message::Message;
+use crate::prefix_stability::StablePrefix;
 use crate::tool::{
     PermissionCache, PermissionDecision, PlanApprovalResponse, ToolAuthorizationResponse,
     ToolRegistry, exit_plan_mode_request_tool,
@@ -89,6 +90,15 @@ pub enum ThreadEvent {
     /// The model called `exit_plan_mode` and submitted a plan. The UI shows an
     /// approval overlay; resolution arrives via `respond_plan_approval`.
     PlanProposed { id: String, plan_text: String },
+    /// The prefix-stability fingerprint for this turn vs. the previous one.
+    /// Emitted on every turn with the current stability ratio plus the drift
+    /// flags so the UI can render a `cache: NN%` chip; `system_changed` /
+    /// `tools_changed` are `true` only when that component drifted this turn.
+    PrefixStability {
+        stability_pct: u16,
+        system_changed: bool,
+        tools_changed: bool,
+    },
 }
 
 pub struct Thread {
@@ -153,11 +163,6 @@ pub struct Thread {
     /// Pending plan-approval oneshots, keyed by the `exit_plan_mode` tool_use
     /// id. Mirrors `pending_authorizations` exactly.
     pending_plan_approval: HashMap<String, tokio::sync::oneshot::Sender<PlanApprovalResponse>>,
-    /// Set by `run_plan_approval` on approval so `run_turn_loop` ends the turn
-    /// after the current tool batch — preventing the model from barreling into
-    /// write tools (now visible since `plan_mode` was cleared) before the user
-    /// has signaled to proceed.
-    end_turn_after_tool: bool,
     /// LLM-generated conversation title; `None` until the first title stream
     /// lands. Main-thread only (sub-agents don't title). Displayed by the
     /// sidebar in place of the mechanical first-message summary.
@@ -172,6 +177,15 @@ pub struct Thread {
     /// landing without a new user message). Seeded from `restore` so a reloaded
     /// thread continues the cadence without re-evaluating immediately.
     title_last_eval_user_count: Option<usize>,
+    /// Fingerprint of the system prompt + tool specs, tracked turn-over-turn
+    /// so prefix drift (a history rewrite, tool hot-reload, plan-mode toggle)
+    /// is observable rather than silently busting the provider's prefix cache.
+    /// See [`crate::prefix_stability`].
+    prefix_stability: StablePrefix,
+    /// The most recent `TokenUsage` reported by the provider (cache read /
+    /// creation counts), surfaced alongside the stability chip so the user can
+    /// confirm cache hits by token count, not just by ratio.
+    last_usage: Option<TokenUsage>,
 }
 
 /// A forwarded authorization request from a sub-agent: which child thread holds
@@ -214,10 +228,11 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                end_turn_after_tool: false,
                 title: None,
                 title_in_flight: false,
                 title_last_eval_user_count: None,
+                prefix_stability: StablePrefix::default(),
+                last_usage: None,
             }
         })
     }
@@ -273,10 +288,11 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                end_turn_after_tool: false,
                 title,
                 title_in_flight: false,
                 title_last_eval_user_count,
+                prefix_stability: StablePrefix::default(),
+                last_usage: None,
             }
         })
     }
@@ -330,10 +346,11 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                end_turn_after_tool: false,
                 title: None,
                 title_in_flight: false,
                 title_last_eval_user_count: None,
+                prefix_stability: StablePrefix::default(),
+                last_usage: None,
             }
         })
     }
@@ -612,6 +629,18 @@ impl Thread {
         self.project.as_ref()
     }
 
+    /// Prefix-stability ratio as a whole-percent `u16` (0–100). 100 means the
+    /// system prompt + tool-spec prefix has never drifted across turns.
+    pub fn prefix_stability_pct(&self) -> u16 {
+        self.prefix_stability.stability_pct()
+    }
+
+    /// The most recent provider-reported token usage (cache read/creation
+    /// counts), or `None` if the provider has not reported any yet.
+    pub fn last_cache_usage(&self) -> Option<TokenUsage> {
+        self.last_usage
+    }
+
     pub fn turn_count(&self) -> u32 {
         self.turn_count
     }
@@ -763,16 +792,38 @@ impl Thread {
                 );
             }
         })?;
-        // Defensive: clear any `end_turn_after_tool` left over from a prior turn
-        // that exited via cancel or a sibling infra-error before the check at the
-        // end of the batch loop. Without this, the next turn's first tool batch
-        // would be cut short by a stale flag.
-        this.update(cx, |this, _| this.end_turn_after_tool = false)?;
+        // `turn_count` tracks the round-trip index within this `run_turn` only,
+        // not a session-wide total — reset on entry so `self_info` reports the
+        // current turn's progress (issue 5: it used to accumulate across user
+        // messages, reading "14/unlimited" mid-session). `cap_summary_injected`
+        // resets in lockstep so a prior turn's cap does not suppress this one's.
+        this.update(cx, |this, _| {
+            this.turn_count = 0;
+            this.cap_summary_injected = false;
+        })?;
         loop {
+            // Increment at the top so `turn_count` is 1-indexed for the
+            // round-trip about to run — `self_info` mid-batch reads the current
+            // index, not the previous batch's count.
+            this.update(cx, |this, _| this.turn_count += 1)?;
             let request = this.update(cx, |this, cx| {
                 this.pending_tool_uses.clear();
                 this.reconcile_tool_uses(cx);
                 this.build_completion_request()
+            })?;
+
+            // Fingerprint the request's system prompt + tool specs against the
+            // previous turn so prefix drift (history rewrite, tool hot-reload,
+            // plan-mode toggle) is observable. Emitted every turn with the
+            // current stability ratio; drift flags are `true` only when that
+            // component changed this turn.
+            this.update(cx, |this, cx| {
+                let change = this.prefix_stability.build(&request);
+                cx.emit(ThreadEvent::PrefixStability {
+                    stability_pct: this.prefix_stability.stability_pct(),
+                    system_changed: change.is_some_and(|c| c.system_changed),
+                    tools_changed: change.is_some_and(|c| c.tools_changed),
+                });
             })?;
 
             let mut stream = tokio::select! {
@@ -808,6 +859,17 @@ impl Thread {
                         this.handle_completion_event(ev, cx);
                     }
                 })?;
+                // Yield to the gpui foreground executor between batches so the
+                // macOS run loop can drain queued runnables (input events,
+                // frame callbacks). A fast-streaming provider keeps the
+                // async_channel non-empty, so `poll_next` returns Ready without
+                // registering a waker; without this yield the turn task starves
+                // the run loop and the UI freezes mid-turn.
+                std::future::poll_fn(|cx| {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::<()>::Pending
+                })
+                .await;
                 if has_stop {
                     break;
                 }
@@ -934,28 +996,15 @@ impl Thread {
                 break;
             }
 
-            // A plan was approved this batch: end the turn so the model does not
-            // continue into write tools (newly visible since `plan_mode` was
-            // cleared) before the user has signaled to proceed.
-            let stop_after_plan = this.update(cx, |this, cx| {
-                if this.end_turn_after_tool {
-                    this.end_turn_after_tool = false;
-                    cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
-                    true
-                } else {
-                    false
-                }
-            })?;
-            if stop_after_plan {
-                break;
-            }
-
-            // Sub-agent turn cap: stop runaway sub-agents after `max_turns` round-trips.
-            // The first hit injects one summary turn so the sub-agent can wrap up
-            // with a coherent final message instead of ending mid-work; a second
-            // hit (the summary turn itself overflowed) hard-stops.
+            // Sub-agent turn cap: stop runaway sub-agents after `max_turns`
+            // round-trips. `turn_count` is 1-indexed and incremented at the top
+            // of each round-trip, so `>= max` fires at the end of the Nth
+            // round-trip — after exactly `max` tool round-trips have run. The
+            // first hit injects one summary turn so the sub-agent can wrap up
+            // with a coherent final message instead of ending mid-work; a
+            // second hit (the summary turn itself overflowed with tools)
+            // hard-stops.
             let hit_cap = this.update(cx, |this, cx| {
-                this.turn_count += 1;
                 let Some(max) = this.max_turns else {
                     return false;
                 };
@@ -1248,8 +1297,9 @@ impl Thread {
 
         match response {
             PlanApprovalResponse::Approve => {
-                let msg =
-                    format!("User approved the plan. Plan contents:\n\n{plan_text}\n\nYou may now begin execution.");
+                let msg = format!(
+                    "User approved the plan. Plan contents:\n\n{plan_text}\n\nYou may now begin execution."
+                );
                 this.update(cx, |_, cx| {
                     cx.emit(ThreadEvent::ToolCall {
                         id: id.clone(),
@@ -1264,11 +1314,12 @@ impl Thread {
                 // the message list. Clearing `plan_mode` before `append` would
                 // leave the messages inconsistent (plan mode off but no
                 // approval result recorded) if `append_tool_result` failed.
-                // `end_turn_after_tool` is checked by `run_turn_loop` after
-                // this returns.
+                // The turn loop continues naturally: the next
+                // `build_completion_request` sees `plan_mode == false` so the
+                // write tools become visible, and the approval ToolResult
+                // ("You may now begin execution.") prompts the model to act.
                 this.update(cx, |this, cx| {
                     this.plan_mode = false;
-                    this.end_turn_after_tool = true;
                     cx.notify();
                 })?;
             }
@@ -1350,7 +1401,10 @@ impl Thread {
                 self.append_assistant_thinking(text.clone(), signature, cx);
                 cx.emit(ThreadEvent::AgentThinking(text));
             }
-            Ok(LanguageModelCompletionEvent::UsageUpdate(_)) => {}
+            Ok(LanguageModelCompletionEvent::UsageUpdate(u)) => {
+                self.last_usage = Some(u);
+                cx.notify();
+            }
             Ok(LanguageModelCompletionEvent::Stop(reason)) => {
                 self.finalize_assistant_message(cx);
                 // Fire Stop hooks (e.g. a stop-gate reviewer) fail-open; the
@@ -2208,10 +2262,6 @@ mod tests {
         cx.update(|cx| {
             thread.read_with(cx, |t, _| {
                 assert!(!t.plan_mode, "plan_mode should be false after approval");
-                assert!(
-                    t.end_turn_after_tool,
-                    "end_turn_after_tool should be set after approval"
-                );
                 let last = t.messages.last().expect("no message after approval");
                 let tr = last
                     .content

@@ -51,7 +51,8 @@ const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
 const BASH_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// Narrow-the-command hint folded into the truncation advisory. Lives here
 /// (not in `system_prompt.md`) because it is tool-specific guidance.
-const BASH_TRUNCATION_HINT: &str = "retry with a narrower command (specify columns, `| head`, `LIMIT`, tighten the pattern)";
+const BASH_TRUNCATION_HINT: &str =
+    "retry with a narrower command (specify columns, `| head`, `LIMIT`, tighten the pattern)";
 /// Grace window given to a SIGTERM'd process group before escalating to SIGKILL.
 const CANCELLATION_GRACE_MS: u64 = 50;
 /// Upper bound on draining the stdout/stderr pipes after the group is killed:
@@ -67,19 +68,64 @@ pub struct BashTool {
     /// Owning thread, read to check YOLO mode (forces the unsandboxed branch
     /// so bash runs outside seatbelt when YOLO is on). `None` in tests.
     thread: Option<WeakEntity<Thread>>,
+    /// Write-confinement policy shared with FS write tools (one derivation per
+    /// registry rebuild). The sandboxed path feeds it to `wrap_command`'s
+    /// seatbelt; the unsandboxed path uses `is_write_allowed` to reject a `cwd`
+    /// override outside the writable set or inside a protected subtree — the
+    /// c5aefe4d escape was `cd` into a sibling worktree then git ops against
+    /// its `.git`.
+    sandbox: crate::sandbox::SandboxPolicy,
 }
 
 impl BashTool {
-    pub fn new(cwd: PathBuf, thread: WeakEntity<Thread>) -> Self {
+    pub fn new(
+        cwd: PathBuf,
+        thread: WeakEntity<Thread>,
+        sandbox: crate::sandbox::SandboxPolicy,
+    ) -> Self {
         Self {
             cwd,
             shell: Arc::new(tokio::sync::Mutex::new(None)),
             thread: Some(thread),
+            sandbox,
         }
     }
 }
 
-#[derive(Deserialize, JsonSchema)]
+/// Parse `unsandboxed` from a JSON bool or a string ("true"/"false"/"1"/"0",
+/// case-insensitive). Models occasionally emit `"unsandboxed": "true"` (string);
+/// strict serde would reject the whole input as "parse failed", dropping the
+/// tool call. Returns `None` for null, absent, or unrecognized values.
+fn lenient_bool_value(v: &serde_json::Value) -> Option<bool> {
+    match v {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::String(s) => match s.to_ascii_lowercase().as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Deserialize `Option<bool>` accepting both a JSON bool and a lenient string
+/// form (see [`lenient_bool_value`]). Null yields `None`; any other shape is a
+/// hard error so a malformed value is surfaced rather than silently coerced.
+fn lenient_bool_opt<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: serde_json::Value = serde::Deserialize::deserialize(d)?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    match lenient_bool_value(&v) {
+        Some(b) => Ok(Some(b)),
+        None => Err(serde::de::Error::custom(format!("expected bool, got {v}"))),
+    }
+}
+
+#[derive(Deserialize, JsonSchema, Debug)]
 struct BashInput {
     /// Bash command to run in the persistent session (`cd` / `export` persist).
     command: String,
@@ -95,7 +141,7 @@ struct BashInput {
     /// genuinely needs the outside (network, writes outside the project) — it
     /// then runs in a persistent shell with no confinement, gated by user
     /// approval.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_bool_opt")]
     unsandboxed: Option<bool>,
 }
 
@@ -115,7 +161,7 @@ impl AgentTool for BashTool {
     fn requires_approval(&self, input: &serde_json::Value) -> bool {
         let unsandboxed = input
             .get("unsandboxed")
-            .and_then(|v| v.as_bool())
+            .and_then(lenient_bool_value)
             .unwrap_or(false);
         if unsandboxed {
             return true;
@@ -151,6 +197,7 @@ impl AgentTool for BashTool {
         };
         let shell = self.shell.clone();
         let base_cwd = self.cwd.clone();
+        let sandbox = self.sandbox.clone();
         let cwd_override = parsed.cwd.clone();
         let timeout = Duration::from_secs(parsed.timeout_secs.unwrap_or(BASH_DEFAULT_TIMEOUT_SECS));
         let command = parsed.command.clone();
@@ -172,6 +219,7 @@ impl AgentTool for BashTool {
                     &command,
                     &base_cwd,
                     cwd_override.as_deref(),
+                    &sandbox,
                     timeout,
                     cancel,
                     sink,
@@ -185,6 +233,7 @@ impl AgentTool for BashTool {
                         &command,
                         &base_cwd,
                         cwd_override.as_deref(),
+                        &sandbox,
                         timeout,
                         cancel,
                         sink,
@@ -205,6 +254,7 @@ impl AgentTool for BashTool {
                     &command,
                     &base_cwd,
                     cwd_override.as_deref(),
+                    &sandbox,
                     timeout,
                     cancel,
                     sink,
@@ -226,16 +276,38 @@ enum Outcome {
 /// and cancellation, stream live output to `sink`, and return capped
 /// stdout/stderr. On timeout/cancellation the spawned process groups are reaped
 /// (SIGTERM → SIGKILL) so orphaned grandchildren cannot keep the pipes open.
+///
+/// `policy` confines the `cwd_override`: an override outside the writable set
+/// or inside a protected subtree (`.git`) is rejected before brush runs. This
+/// is the c5aefe4d escape — `cd` into a sibling worktree then git ops against
+/// its `.git`. Direct writes outside the project root are NOT blocked here:
+/// the unsandboxed path is the user-approved / YOLO escape route, and
+/// constraining writes (not cwd) would defeat its purpose.
 #[allow(clippy::too_many_arguments)]
 async fn run_bash(
     shell: Arc<tokio::sync::Mutex<Option<Shell>>>,
     command: &str,
     base_cwd: &Path,
     cwd_override: Option<&str>,
+    policy: &crate::sandbox::SandboxPolicy,
     timeout: Duration,
     cancel: CancellationToken,
     sink: ToolOutputSink,
 ) -> Result<String, anyhow::Error> {
+    // Reject a cwd override outside the writable set or inside a protected
+    // subtree before brush executes it. `cd <sibling-worktree>` is the exact
+    // c5aefe4d escape; blocking the cwd change blocks the subsequent git ops
+    // against the foreign `.git`.
+    if let Some(cwd) = cwd_override {
+        let resolved = super::resolve_path(cwd, base_cwd);
+        if !policy.is_write_allowed(&resolved) {
+            return Err(anyhow::anyhow!(
+                "工作目录越出沙箱可写范围或落入受保护路径（`.git`）：{}。\
+                 如需在项目根外或受保护路径运行命令，请在 bash 工具中显式设 `unsandboxed: true` 并经用户审批。",
+                resolved.display()
+            ));
+        }
+    }
     // Two pipe pairs: external children and builtins both write here, the
     // spawn_blocking readers drain the read ends.
     let (out_r, out_w) = std::io::pipe()?;
@@ -269,6 +341,15 @@ async fn run_bash(
                 .await
                 .map_err(brush_err)?;
             s.set_working_dir(base_cwd).map_err(brush_err)?;
+            // Inject the login shell's PATH so brush-spawned children find
+            // Homebrew / toolchain binaries the GUI process env lacks (thread
+            // `e5047fd2`: `gh` not found). brush propagates shell env vars to
+            // external children, so a single set on init covers every call.
+            s.set_env_global(
+                "PATH",
+                brush_core::ShellVariable::new(crate::path_env::resolved_login_path().to_string()),
+            )
+            .map_err(brush_err)?;
             *guard = Some(s);
         }
         if let Some(cwd) = cwd_override {
@@ -573,6 +654,7 @@ async fn run_sandboxed_bash(
     command: &str,
     base_cwd: &Path,
     cwd_override: Option<&str>,
+    policy: &crate::sandbox::SandboxPolicy,
     timeout: Duration,
     cancel: CancellationToken,
     sink: ToolOutputSink,
@@ -583,7 +665,6 @@ async fn run_sandboxed_bash(
     let cwd = cwd_override
         .map(|c| super::resolve_path(c, base_cwd))
         .unwrap_or_else(|| base_cwd.to_path_buf());
-    let policy = crate::sandbox::SandboxPolicy::for_project(base_cwd);
     let mut cmd = policy.wrap_command(command, &cwd);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -701,6 +782,10 @@ mod tests {
         sink
     }
 
+    fn policy() -> crate::sandbox::SandboxPolicy {
+        crate::sandbox::SandboxPolicy::for_project(&PathBuf::from("."))
+    }
+
     // These exercise `run_bash` directly (no gpui App) so the brush execution,
     // timeout escalation, and cancellation paths are covered.
 
@@ -711,6 +796,7 @@ mod tests {
             "printf hello",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
@@ -734,6 +820,7 @@ mod tests {
             "true",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
@@ -750,6 +837,7 @@ mod tests {
             "exit 7",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
@@ -768,6 +856,7 @@ mod tests {
             "sleep 30",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(1),
             CancellationToken::new(),
             null_sink(),
@@ -797,6 +886,7 @@ mod tests {
             "sleep 30",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(60),
             cancel,
             null_sink(),
@@ -818,6 +908,7 @@ mod tests {
             "sleep 30 & wait",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(1),
             CancellationToken::new(),
             null_sink(),
@@ -840,6 +931,7 @@ mod tests {
             "cd /tmp",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
@@ -851,6 +943,7 @@ mod tests {
             "pwd",
             &PathBuf::from("."),
             None,
+            &policy(),
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
@@ -894,7 +987,10 @@ mod tests {
             "must advise narrowing: {note}"
         );
         assert!(
-            note.contains(&format!("{} bytes total", BASH_OUTPUT_MAX_BYTES + 12 * 1024)),
+            note.contains(&format!(
+                "{} bytes total",
+                BASH_OUTPUT_MAX_BYTES + 12 * 1024
+            )),
             "must report total bytes: {note}"
         );
         assert!(
@@ -912,5 +1008,54 @@ mod tests {
         let s = crate::tools::TruncatedText::new("plain output", BASH_OUTPUT_MAX_BYTES, 0)
             .render(BASH_TRUNCATION_HINT);
         assert_eq!(s, "plain output");
+    }
+
+    #[test]
+    fn lenient_bool_value_accepts_bool_and_string_forms() {
+        assert_eq!(lenient_bool_value(&serde_json::json!(true)), Some(true));
+        assert_eq!(lenient_bool_value(&serde_json::json!(false)), Some(false));
+        assert_eq!(lenient_bool_value(&serde_json::json!("true")), Some(true));
+        assert_eq!(lenient_bool_value(&serde_json::json!("FALSE")), Some(false));
+        assert_eq!(lenient_bool_value(&serde_json::json!("1")), Some(true));
+        assert_eq!(lenient_bool_value(&serde_json::json!("0")), Some(false));
+        assert_eq!(lenient_bool_value(&serde_json::json!(null)), None);
+        assert_eq!(lenient_bool_value(&serde_json::json!("maybe")), None);
+        assert_eq!(lenient_bool_value(&serde_json::json!(42)), None);
+    }
+
+    #[test]
+    fn bash_input_parses_string_unsandboxed() {
+        // Models sometimes emit `"unsandboxed": "true"` (string). Strict serde
+        // would reject the whole input; the lenient deserializer accepts it.
+        let parsed: BashInput =
+            serde_json::from_value(serde_json::json!({"command":"ls","unsandboxed":"true"}))
+                .expect("string \"true\" must parse");
+        assert_eq!(parsed.unsandboxed, Some(true));
+
+        let parsed: BashInput =
+            serde_json::from_value(serde_json::json!({"command":"ls","unsandboxed":"false"}))
+                .expect("string \"false\" must parse");
+        assert_eq!(parsed.unsandboxed, Some(false));
+
+        let parsed: BashInput =
+            serde_json::from_value(serde_json::json!({"command":"ls","unsandboxed":true}))
+                .expect("bool true must parse");
+        assert_eq!(parsed.unsandboxed, Some(true));
+
+        let parsed: BashInput = serde_json::from_value(serde_json::json!({"command":"ls"}))
+            .expect("absent unsandboxed must parse");
+        assert_eq!(parsed.unsandboxed, None);
+    }
+
+    #[test]
+    fn bash_input_rejects_malformed_unsandboxed() {
+        let err = serde_json::from_value::<BashInput>(serde_json::json!({
+            "command":"ls","unsandboxed":"maybe"
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expected bool"),
+            "malformed value must surface a clear error: {err}"
+        );
     }
 }

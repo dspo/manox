@@ -17,8 +17,16 @@ use crate::views::message::{MessageItem, build_items};
 #[derive(Debug, Clone)]
 pub enum ConvItem {
     User(String),
-    Assistant { text: String, streaming: bool },
-    Reasoning { text: String, streaming: bool, collapsed: bool, user_toggled: bool },
+    Assistant {
+        text: String,
+        streaming: bool,
+    },
+    Reasoning {
+        text: String,
+        streaming: bool,
+        collapsed: bool,
+        user_toggled: bool,
+    },
     ToolCall(ToolCallItem),
     AgentTask(AgentTaskItem),
     /// A runtime error from the agent (red danger styling).
@@ -102,9 +110,9 @@ impl ConversationState {
     /// so toggling YOLO on the empty first screen doesn't prematurely leave
     /// the hero layout.
     pub fn is_empty(&self, cx: &App) -> bool {
-        self.items.iter().all(|e| {
-            matches!(e.read(cx).kind(), ConvItem::Error(_))
-        })
+        self.items
+            .iter()
+            .all(|e| matches!(e.read(cx).kind(), ConvItem::Error(_) | ConvItem::Notice(_)))
     }
 
     /// Append a user message.
@@ -169,9 +177,22 @@ impl ConversationState {
         cx: &mut App,
     ) -> ApplyOutcome {
         match event {
-            // Plan approval is handled by the Workspace overlay; the
-            // conversation view has no item to render for it.
-            ThreadEvent::PlanProposed { .. } => ApplyOutcome::None,
+            // Backfill plan text into the matching exit_plan_mode ToolCall
+            // item so it renders as markdown in the chat view. The ToolCall
+            // event (PendingApproval) always arrives before PlanProposed.
+            ThreadEvent::PlanProposed { id, plan_text } => {
+                if let Some(ix) = self.find_tool(id, cx) {
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::ToolCall(t) = item.kind_mut() {
+                            t.output = plan_text.clone();
+                        }
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(ix)
+                } else {
+                    ApplyOutcome::None
+                }
+            }
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
@@ -439,6 +460,10 @@ impl ConversationState {
             }
             ThreadEvent::YoloToggled { .. } => {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
+                ApplyOutcome::None
+            }
+            ThreadEvent::PrefixStability { .. } => {
+                // UI state (cache chip) handled by `Workspace`; not a conversation item.
                 ApplyOutcome::None
             }
         }

@@ -85,9 +85,12 @@ pub(crate) fn resolve_path<P: AsRef<Path>>(input: P, cwd: &Path) -> PathBuf {
 /// The model escalates a write outside the writable set by routing through
 /// `bash` with `unsandboxed: true` (which triggers user approval); the error
 /// message says so.
-fn resolve_path_for_write<P: AsRef<Path>>(input: P, cwd: &Path) -> Result<PathBuf, String> {
+fn resolve_path_for_write<P: AsRef<Path>>(
+    input: P,
+    cwd: &Path,
+    policy: &crate::sandbox::SandboxPolicy,
+) -> Result<PathBuf, String> {
     let path = resolve_path(input, cwd);
-    let policy = crate::sandbox::SandboxPolicy::for_project(cwd);
     if policy.is_protected(&path) {
         return Err(format!(
             "Write blocked by sandbox (`.git`): {}. To write to a protected path, set `unsandboxed: true` in the bash tool and pass user approval.",
@@ -210,7 +213,8 @@ impl AgentTool for ReadFileTool {
         };
         let path = resolve_path(&parsed.path, &self.cwd);
         cx.background_spawn(async move {
-            let raw = std::fs::read_to_string(&path).map_err(|e| format!("read_file failed: {e}"))?;
+            let raw =
+                std::fs::read_to_string(&path).map_err(|e| format!("read_file failed: {e}"))?;
             let text = crate::hashline::normalize_to_lf(&raw);
             let snap = crate::hashline::global()
                 .lock()
@@ -229,6 +233,7 @@ impl AgentTool for ReadFileTool {
 
 pub struct WriteFileTool {
     cwd: Arc<PathBuf>,
+    sandbox: crate::sandbox::SandboxPolicy,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -261,7 +266,7 @@ impl AgentTool for WriteFileTool {
         let Ok(parsed) = serde_json::from_value::<WriteFileInput>(input) else {
             return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
-        let path = match resolve_path_for_write(&parsed.path, &self.cwd) {
+        let path = match resolve_path_for_write(&parsed.path, &self.cwd, &self.sandbox) {
             Ok(p) => p,
             Err(e) => return cx.background_spawn(async move { Err(e) }),
         };
@@ -281,6 +286,7 @@ impl AgentTool for WriteFileTool {
 
 pub struct EditFileTool {
     cwd: Arc<PathBuf>,
+    sandbox: crate::sandbox::SandboxPolicy,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -326,11 +332,12 @@ impl AgentTool for EditFileTool {
             return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let cwd = self.cwd.clone();
+        let sandbox = self.sandbox.clone();
         cx.background_spawn(async move {
             let patches = crate::hashline::parse_patch(&parsed.patch).map_err(|e| e.to_string())?;
             let mut results: Vec<String> = Vec::new();
             for fp in patches {
-                let path = resolve_path_for_write(&fp.path, &cwd)?;
+                let path = resolve_path_for_write(&fp.path, &cwd, &sandbox)?;
                 let path_display = path.display().to_string();
                 let raw = std::fs::read_to_string(&path)
                     .map_err(|e| format!("edit_file read failed {path_display}: {e}"))?;
@@ -717,12 +724,27 @@ impl AgentTool for GlobTool {
 /// The built-in tools as `AnyAgentTool` (no `agent` tool). Shared by the main
 /// registry and sub-agent registries (which filter by name).
 pub(crate) fn base_tools(cwd: Arc<PathBuf>, thread: WeakEntity<Thread>) -> Vec<AnyAgentTool> {
+    // Derive the write-confinement policy once and share it across every write
+    // tool (WriteFileTool / EditFileTool / BashTool) so the Rust-side FS check
+    // and the bash seatbelt / cwd pre-check classify paths identically —
+    // independent per-tool derivations drift (issue 3).
+    let sandbox = crate::sandbox::SandboxPolicy::for_project(cwd.as_ref());
     vec![
         Arc::new(ReadFileTool { cwd: cwd.clone() }) as AnyAgentTool,
-        Arc::new(WriteFileTool { cwd: cwd.clone() }),
-        Arc::new(EditFileTool { cwd: cwd.clone() }),
+        Arc::new(WriteFileTool {
+            cwd: cwd.clone(),
+            sandbox: sandbox.clone(),
+        }),
+        Arc::new(EditFileTool {
+            cwd: cwd.clone(),
+            sandbox: sandbox.clone(),
+        }),
         Arc::new(ListDirectoryTool { cwd: cwd.clone() }),
-        Arc::new(bash::BashTool::new(cwd.as_ref().clone(), thread)),
+        Arc::new(bash::BashTool::new(
+            cwd.as_ref().clone(),
+            thread,
+            sandbox.clone(),
+        )),
         Arc::new(GrepTool { cwd: cwd.clone() }),
         Arc::new(GlobTool { cwd: cwd.clone() }),
         Arc::new(ask_user::AskUserQuestionTool),
@@ -875,18 +897,16 @@ mod tests {
         assert!(r.contains("150 bytes total"), "total reported: {r}");
         assert!(r.contains("showing first 100"), "cap reported: {r}");
         assert!(r.contains("narrow the pattern"), "hint folded in: {r}");
-        assert!(
-            r.contains("do not speculate"),
-            "no-guess directive: {r}"
-        );
+        assert!(r.contains("do not speculate"), "no-guess directive: {r}");
         assert!(r.contains("body"), "text preserved: {r}");
     }
 
     #[test]
     fn write_confinement_rejects_outside_project() {
         let cwd = Path::new("/tmp/manox-write-confinement");
+        let policy = crate::sandbox::SandboxPolicy::for_project(cwd);
         // /etc is outside the project root + temp dir.
-        let r = resolve_path_for_write("/etc/manox-probe", cwd);
+        let r = resolve_path_for_write("/etc/manox-probe", cwd, &policy);
         assert!(r.is_err(), "must reject write outside project: {r:?}");
         let e = r.unwrap_err();
         assert!(e.contains("outside project root"), "error: {e}");
@@ -895,7 +915,8 @@ mod tests {
     #[test]
     fn write_confinement_rejects_dot_git() {
         let cwd = Path::new("/tmp/manox-write-confinement");
-        let r = resolve_path_for_write(".git/config", cwd);
+        let policy = crate::sandbox::SandboxPolicy::for_project(cwd);
+        let r = resolve_path_for_write(".git/config", cwd, &policy);
         assert!(r.is_err(), "must reject write to .git: {r:?}");
         let e = r.unwrap_err();
         assert!(e.contains("sandbox"), "error: {e}");
@@ -904,9 +925,10 @@ mod tests {
     #[test]
     fn write_confinement_allows_project_and_tmp() {
         let cwd = Path::new("/tmp/manox-write-confinement");
-        assert!(resolve_path_for_write("src/lib.rs", cwd).is_ok());
+        let policy = crate::sandbox::SandboxPolicy::for_project(cwd);
+        assert!(resolve_path_for_write("src/lib.rs", cwd, &policy).is_ok());
         let tmp = std::env::temp_dir().join("manox-write-confinement-probe");
-        assert!(resolve_path_for_write(&tmp, cwd).is_ok());
+        assert!(resolve_path_for_write(&tmp, cwd, &policy).is_ok());
     }
 
     #[test]

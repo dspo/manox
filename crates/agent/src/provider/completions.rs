@@ -141,6 +141,12 @@ pub async fn stream_completions(
     prompt_cache_key: &str,
     long_ttl: bool,
 ) -> Result<()> {
+    if crate::provider::is_deepseek(url, model) {
+        tracing::debug!(
+            target: "provider",
+            "deepseek endpoint detected at {url}: reasoning_content + cache telemetry parsing active"
+        );
+    }
     let body = build_request_body(model, max_tokens, &request, prompt_cache_key, long_ttl);
     let client = reqwest::Client::builder()
         .build()
@@ -365,6 +371,29 @@ fn messages_to_openai(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
 struct CompletionsChunk {
     #[serde(default)]
     choices: Vec<CompletionsChoice>,
+    /// DeepSeek (and other OpenAI-compat reasoning endpoints) report token
+    /// usage on the final chunk. Parsed unconditionally as an optional field —
+    /// present-when-relevant, harmless when absent, shared with other
+    /// OpenAI-compatible reasoning models.
+    #[serde(default)]
+    usage: Option<CompletionsUsage>,
+}
+
+/// Token-usage payload for the completions wire. DeepSeek extends the standard
+/// OpenAI usage with `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`,
+/// surfaced to the UI as cache-read / cache-creation counts. The standard
+/// fields are kept for parity even though manox currently only consumes the
+/// cache columns.
+#[derive(Debug, Default, Deserialize)]
+struct CompletionsUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -379,6 +408,11 @@ struct CompletionsChoice {
 struct CompletionsDelta {
     #[serde(default)]
     content: Option<String>,
+    /// DeepSeek-V3/V4 reasoning models stream the thinking trace in this field
+    /// (parallel to `content`). Parsed unconditionally; absent on non-reasoning
+    /// models. Mapped to `Thinking` so the existing reasoning-block UI renders it.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
@@ -439,6 +473,17 @@ impl CompletionsEventMapper {
             {
                 out.push(Ok(LanguageModelCompletionEvent::Text(content)));
             }
+            // DeepSeek reasoning models stream the thinking trace in
+            // `reasoning_content`; map it to `Thinking` so the existing
+            // reasoning-block UI renders it (previously discarded entirely).
+            if let Some(reasoning) = choice.delta.reasoning_content
+                && !reasoning.is_empty()
+            {
+                out.push(Ok(LanguageModelCompletionEvent::Thinking {
+                    text: reasoning,
+                    signature: None,
+                }));
+            }
             if let Some(tool_calls) = choice.delta.tool_calls {
                 for tc in tool_calls {
                     if let Some(event) = self.apply_tool_call_delta(tc) {
@@ -461,6 +506,20 @@ impl CompletionsEventMapper {
                 out.push(Ok(LanguageModelCompletionEvent::Stop(self.stop_reason)));
                 self.stop_emitted = true;
             }
+        }
+        // DeepSeek reports cache hit/miss token counts on the final chunk;
+        // surface them so the UI's `cache: NN%` chip can cross-check the
+        // stability ratio against real cache hits. Standard OpenAI-compat
+        // endpoints without these fields simply emit nothing extra.
+        if let Some(usage) = chunk.usage {
+            out.push(Ok(LanguageModelCompletionEvent::UsageUpdate(
+                crate::language_model::TokenUsage {
+                    input_tokens: usage.prompt_tokens.unwrap_or(0),
+                    output_tokens: usage.completion_tokens.unwrap_or(0),
+                    cache_read_input_tokens: usage.prompt_cache_hit_tokens.unwrap_or(0),
+                    cache_creation_input_tokens: usage.prompt_cache_miss_tokens.unwrap_or(0),
+                },
+            )));
         }
         out
     }
@@ -770,5 +829,76 @@ mod tests {
         }
         assert!(texts > 0, "应至少收到一个 Text 事件");
         assert!(stopped, "应收到 Stop 事件");
+    }
+
+    /// DeepSeek reasoning models stream the thinking trace in
+    /// `reasoning_content`; it must surface as a `Thinking` event so the
+    /// existing reasoning-block UI renders it (previously discarded).
+    #[test]
+    fn map_chunk_emits_thinking_for_reasoning_content() {
+        let mut mapper = CompletionsEventMapper::new();
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": { "reasoning_content": "let me think" },
+                "finish_reason": null
+            }]
+        });
+        let events = mapper.map_chunk(&chunk);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Ok(LanguageModelCompletionEvent::Thinking { text, signature: None }) if text == "let me think"
+        )), "reasoning_content must map to Thinking: {events:?}");
+    }
+
+    /// DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` must
+    /// surface as a `UsageUpdate` with the cache columns populated so the UI's
+    /// cache chip can cross-check the stability ratio against real hits.
+    #[test]
+    fn map_chunk_emits_usage_update_with_deepseek_cache_tokens() {
+        let mut mapper = CompletionsEventMapper::new();
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_cache_hit_tokens": 80,
+                "prompt_cache_miss_tokens": 20
+            }
+        });
+        let events = mapper.map_chunk(&chunk);
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(LanguageModelCompletionEvent::UsageUpdate(u)) => Some(*u),
+                _ => None,
+            })
+            .expect("UsageUpdate emitted");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 80);
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+    }
+
+    /// Endpoints that omit the `usage` field (standard OpenAI completions) must
+    /// not emit a spurious zero-UsageUpdate.
+    #[test]
+    fn map_chunk_omits_usage_when_absent() {
+        let mut mapper = CompletionsEventMapper::new();
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": { "content": "hi" },
+                "finish_reason": "stop"
+            }]
+        });
+        let events = mapper.map_chunk(&chunk);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Ok(LanguageModelCompletionEvent::UsageUpdate(_)))),
+            "no UsageUpdate when usage absent: {events:?}"
+        );
     }
 }

@@ -53,6 +53,10 @@ fn main() {
             gpui::KeyBinding::new("cmd-,", agent_ui::OpenSettings, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-,", agent_ui::OpenSettings, None),
+            // Ask drawer: left/right arrows navigate questions, escape closes.
+            gpui::KeyBinding::new("left", agent_ui::AskPrev, Some("AskDrawer")),
+            gpui::KeyBinding::new("right", agent_ui::AskNext, Some("AskDrawer")),
+            gpui::KeyBinding::new("escape", agent_ui::AskCancel, Some("AskDrawer")),
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &ToggleFullscreen, cx: &mut App| {
