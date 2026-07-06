@@ -194,7 +194,6 @@ pub fn build_plus_menu(
     menu
 }
 
-/// Build the `⁄` popup menu — entirely static decoration.
 /// Build the `⁄` popover. The top section lists registered slash commands
 /// dynamically; clicking one inserts `/name ` into the composer via
 /// `on_select(name)`. The memory and skills sections remain static decoration.

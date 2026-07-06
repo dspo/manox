@@ -441,8 +441,9 @@ impl Workspace {
         })
     }
 
-    /// Open the `⁄` command menu when the input is exactly `/`, close it otherwise. The menu is
-    /// static decoration; selecting a row does nothing but dismiss.
+    /// Open the `⁄` command menu when the input is exactly `/`, close it otherwise.
+    /// Selecting a registered command inserts `/name ` into the composer for the
+    /// user to complete and submit; the memory/skills rows remain static decoration.
     fn sync_slash_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self.input_state.read(cx).value().to_string();
         let should_open = value == "/";
