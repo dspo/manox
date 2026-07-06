@@ -115,7 +115,11 @@ impl SandboxPolicy {
 
     /// Wrap a bash command in a `sandbox-exec` invocation. `command` is passed
     /// as a single argv element to `bash -c`, so the model's command string is
-    /// never re-evaluated by an outer shell — no escaping, no injection.
+    /// never re-evaluated by an outer shell — no escaping, no injection. The
+    /// login shell's PATH is injected so the sandboxed bash finds Homebrew /
+    /// toolchain binaries the GUI process env otherwise lacks (thread
+    /// `e5047fd2`: `gh` not found). Other env (HOME, KEYCHAIN_*, LANG) is
+    /// inherited as-is.
     #[cfg(target_os = "macos")]
     pub fn wrap_command(&self, command: &str, cwd: &Path) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
@@ -125,6 +129,7 @@ impl SandboxPolicy {
             .arg("bash")
             .arg("-c")
             .arg(command)
+            .env("PATH", crate::path_env::resolved_login_path())
             .current_dir(cwd);
         cmd
     }
@@ -225,6 +230,27 @@ mod tests {
     fn seatbelt_denies_network() {
         let s = policy().render_seatbelt();
         assert!(s.contains("(deny network*)"), "network denied: {s}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wrap_command_injects_login_path() {
+        // The login-shell PATH must reach the sandboxed bash so Homebrew /
+        // toolchain binaries are found (thread e5047fd2: `gh` not found).
+        let p = policy();
+        let cmd = p.wrap_command("echo hi", Path::new("/tmp/manox-sandbox-test"));
+        let path = cmd
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v)
+            .expect("PATH env must be set on sandboxed bash");
+        let path_str = path.to_string_lossy();
+        assert!(!path_str.is_empty(), "injected PATH must not be empty");
+        assert!(
+            path_str.contains("/usr/bin"),
+            "injected PATH must include system bin dirs: {path_str}"
+        );
     }
 
     #[cfg(target_os = "macos")]

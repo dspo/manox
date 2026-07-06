@@ -269,6 +269,15 @@ async fn run_bash(
                 .await
                 .map_err(brush_err)?;
             s.set_working_dir(base_cwd).map_err(brush_err)?;
+            // Inject the login shell's PATH so brush-spawned children find
+            // Homebrew / toolchain binaries the GUI process env lacks (thread
+            // `e5047fd2`: `gh` not found). brush propagates shell env vars to
+            // external children, so a single set on init covers every call.
+            s.set_env_global(
+                "PATH",
+                brush_core::ShellVariable::new(crate::path_env::resolved_login_path().to_string()),
+            )
+            .map_err(brush_err)?;
             *guard = Some(s);
         }
         if let Some(cwd) = cwd_override {
