@@ -169,9 +169,22 @@ impl ConversationState {
         cx: &mut App,
     ) -> ApplyOutcome {
         match event {
-            // Plan approval is handled by the Workspace overlay; the
-            // conversation view has no item to render for it.
-            ThreadEvent::PlanProposed { .. } => ApplyOutcome::None,
+            // Backfill plan text into the matching exit_plan_mode ToolCall
+            // item so it renders as markdown in the chat view. The ToolCall
+            // event (PendingApproval) always arrives before PlanProposed.
+            ThreadEvent::PlanProposed { id, plan_text } => {
+                if let Some(ix) = self.find_tool(id, cx) {
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::ToolCall(t) = item.kind_mut() {
+                            t.output = plan_text.clone();
+                        }
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(ix)
+                } else {
+                    ApplyOutcome::None
+                }
+            }
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
