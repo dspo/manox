@@ -714,13 +714,13 @@ impl AgentTool for GlobTool {
 
 /// The built-in tools as `AnyAgentTool` (no `agent` tool). Shared by the main
 /// registry and sub-agent registries (which filter by name).
-pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
+pub(crate) fn base_tools(cwd: Arc<PathBuf>, thread: WeakEntity<Thread>) -> Vec<AnyAgentTool> {
     vec![
         Arc::new(ReadFileTool { cwd: cwd.clone() }) as AnyAgentTool,
         Arc::new(WriteFileTool { cwd: cwd.clone() }),
         Arc::new(EditFileTool { cwd: cwd.clone() }),
         Arc::new(ListDirectoryTool { cwd: cwd.clone() }),
-        Arc::new(bash::BashTool::new(cwd.as_ref().clone())),
+        Arc::new(bash::BashTool::new(cwd.as_ref().clone(), thread)),
         Arc::new(GrepTool { cwd: cwd.clone() }),
         Arc::new(GlobTool { cwd: cwd.clone() }),
         Arc::new(ask_user::AskUserQuestionTool),
@@ -734,7 +734,7 @@ pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
 pub fn default_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistry {
     let cwd = Arc::new(cwd);
     let mut reg = ToolRegistry::new();
-    for tool in base_tools(cwd.clone()) {
+    for tool in base_tools(cwd.clone(), parent.clone()) {
         reg.register(tool);
     }
     reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone())) as AnyAgentTool);
@@ -759,7 +759,10 @@ mod tests {
 
     #[test]
     fn base_tools_has_nine_tools() {
-        let tools = base_tools(Arc::new(PathBuf::from(".")));
+        let tools = base_tools(
+            Arc::new(PathBuf::from(".")),
+            WeakEntity::<Thread>::new_invalid(),
+        );
         assert_eq!(tools.len(), 9);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_file"));
@@ -914,7 +917,10 @@ mod tests {
     fn read_only_flags_match_plan_mode_allowlist() {
         // The plan-mode tool filter relies on `is_read_only()` being accurate:
         // read-only tools stay available, write/exec/spawn tools are hidden.
-        let tools = base_tools(Arc::new(PathBuf::from(".")));
+        let tools = base_tools(
+            Arc::new(PathBuf::from(".")),
+            WeakEntity::<Thread>::new_invalid(),
+        );
         let by_name = |n: &str| tools.iter().find(|t| t.name() == n).unwrap();
         for n in [
             "read_file",

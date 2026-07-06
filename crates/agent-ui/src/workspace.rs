@@ -16,9 +16,9 @@ use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::{PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent,
-    Entity, FollowMode, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseUpEvent,
-    Pixels, Render, Subscription, Window, ease_out_quint, list, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
+    DragMoveEvent, Entity, FollowMode, ListAlignment, ListSizingBehavior, ListState, MouseButton,
+    MouseUpEvent, Pixels, Render, Subscription, Window, ease_out_quint, list, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -113,6 +113,10 @@ pub struct Workspace {
     plus_open: bool,
     plus_menu: Option<Entity<PopupMenu>>,
     plus_menu_sub: Option<Subscription>,
+    /// Access-chip dropdown (Normal / YOLO mode). Mirrors the model selector pattern.
+    access_open: bool,
+    access_menu: Option<Entity<PopupMenu>>,
+    access_menu_sub: Option<Subscription>,
     slash_open: bool,
     slash_menu: Option<Entity<PopupMenu>>,
     slash_menu_sub: Option<Subscription>,
@@ -263,6 +267,9 @@ impl Workspace {
             plus_open: false,
             plus_menu: None,
             plus_menu_sub: None,
+            access_open: false,
+            access_menu: None,
+            access_menu_sub: None,
             slash_open: false,
             slash_menu: None,
             slash_menu_sub: None,
@@ -315,6 +322,10 @@ impl Workspace {
                         id: id.clone(),
                         plan_text: plan_text.clone(),
                     });
+                    cx.notify();
+                }
+                ThreadEvent::YoloToggled { .. } => {
+                    // Refresh the access chip + YOLO badge; no conversation item.
                     cx.notify();
                 }
                 ThreadEvent::Stop(reason) => {
@@ -525,6 +536,13 @@ impl Workspace {
         self.slash_open = false;
         self.slash_menu = None;
         self.slash_menu_sub = None;
+    }
+
+    /// Close the access-chip dropdown, dropping the menu entity + subscription.
+    fn close_access_menu(&mut self) {
+        self.access_open = false;
+        self.access_menu = None;
+        self.access_menu_sub = None;
     }
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
@@ -834,6 +852,29 @@ impl Workspace {
             self.list_state.splice(count..count, 1);
         }
         cx.notify();
+    }
+
+    /// Toggle YOLO mode on the current thread. Pushes a notice so the user
+    /// sees the state change in the conversation. Called by the `/yolo` slash
+    /// command and the access-chip dropdown.
+    pub(crate) fn toggle_yolo(&mut self, cx: &mut Context<Self>) {
+        let on = !self.thread.read(cx).yolo();
+        self.thread.update(cx, |t, cx| t.set_yolo(on, cx));
+        let msg = if on {
+            "YOLO 模式已开启：工具调用免审批，bash 在沙箱外运行。".to_string()
+        } else {
+            "YOLO 模式已关闭：恢复审批与沙箱。".to_string()
+        };
+        self.add_info_message(msg, cx);
+    }
+
+    /// Enable YOLO and immediately send `prompt` as a user turn (the `/yolo
+    /// [prompt]` form). If YOLO is already on it stays on; the prompt still runs.
+    pub(crate) fn start_yolo_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if !self.thread.read(cx).yolo() {
+            self.thread.update(cx, |t, cx| t.set_yolo(true, cx));
+        }
+        self.send_user_turn(prompt, Vec::new(), cx);
     }
 
     fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
@@ -1476,6 +1517,7 @@ impl Workspace {
         let plus = self.render_plus_button(cx);
         let cwd = self.render_cwd_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
+        let yolo = self.thread.read(cx).yolo();
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(running, cx);
         // "Choose project" binds the thread's project; only offered before the
@@ -1509,40 +1551,163 @@ impl Workspace {
                             .child(cwd)
                             .child(access),
                     )
-                    .child(h_flex().items_center().gap_1().child(model).child(send)),
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .children(yolo.then(|| {
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(gpui::hsla(0.83, 0.8, 0.55, 0.15))
+                                    .child(
+                                        Icon::new(IconName::TriangleAlert)
+                                            .xsmall()
+                                            .text_color(gpui::hsla(0.83, 0.8, 0.7, 1.0)),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .text_xs()
+                                            .text_color(gpui::hsla(0.83, 0.8, 0.85, 1.0))
+                                            .child("YOLO"),
+                                    )
+                                    .into_any_element()
+                            }))
+                            .child(model)
+                            .child(send),
+                    ),
             )
             .children(choose_project)
             .into_any_element()
     }
 
-    /// Access chip mirroring Codex's permission indicator. Reflects the
-    /// thread's plan-mode state: "计划模式" (accent dot) while planning,
-    /// "完全访问" (success dot) otherwise. Click toggles plan mode.
-    fn render_access_placeholder(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let in_plan = self.thread.read(cx).plan_mode();
-        let (dot, label) = if in_plan {
-            (theme.accent, "计划模式")
+    /// Access chip: a dropdown to switch between 普通模式 (normal, approvals +
+    /// sandbox) and YOLO 模式 (bypass approvals, bash unsandboxed). Mirrors the
+    /// model selector pattern. The dot color reflects the active mode (green for
+    /// normal, magenta for YOLO); the active row is checked in the dropdown.
+    /// Plan mode is a separate concern routed through the `+` button, not a
+    /// permission toggle.
+    fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let yolo = self.thread.read(cx).yolo();
+        let open = self.access_open;
+        let dot_color = if yolo {
+            gpui::hsla(0.83, 0.8, 0.55, 1.0)
         } else {
-            (theme.success, "完全访问")
+            theme.success
         };
-        h_flex()
+        let label = if yolo { "YOLO" } else { "普通" };
+        let workspace = cx.entity();
+
+        let trigger = h_flex()
             .id("access-chip")
-            .cursor_pointer()
             .items_center()
             .gap_1()
             .px_2()
             .py_1()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let on = this.thread.read(cx).plan_mode();
-                this.thread.update(cx, |t, cx| t.set_plan_mode(!on, cx));
-                cx.notify();
-            }))
-            .child(gpui::div().size(px(6.)).rounded_full().bg(dot))
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .child(gpui::div().size(px(6.)).rounded_full().bg(dot_color))
             .child(
                 gpui::div()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(theme.foreground)
                     .child(label),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(theme.muted_foreground),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if this.access_open {
+                    this.close_access_menu();
+                    cx.notify();
+                    return;
+                }
+                // Read yolo at click time so the checked row tracks the live
+                // state, not the snapshot from when the chip was last rendered.
+                let yolo_now = this.thread.read(cx).yolo();
+                this.access_open = true;
+                let ws_normal = workspace.clone();
+                let ws_yolo = workspace.clone();
+                let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+                    menu.max_w(gpui::px(180.))
+                        .label("模式")
+                        .item(PopupMenuItem::new("普通模式").checked(!yolo_now).on_click(
+                            move |_, _window, cx| {
+                                ws_normal.update(cx, |this, cx| {
+                                    this.thread.update(cx, |t, cx| t.set_yolo(false, cx));
+                                    this.add_info_message(
+                                        "已切换到普通模式：恢复审批与沙箱。".into(),
+                                        cx,
+                                    );
+                                    this.close_access_menu();
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                        .item(PopupMenuItem::new("YOLO 模式").checked(yolo_now).on_click(
+                            move |_, _window, cx| {
+                                ws_yolo.update(cx, |this, cx| {
+                                    this.thread.update(cx, |t, cx| t.set_yolo(true, cx));
+                                    this.add_info_message(
+                                        "已切换到 YOLO 模式：免审批，bash 沙箱外。".into(),
+                                        cx,
+                                    );
+                                    this.close_access_menu();
+                                    cx.notify();
+                                });
+                            },
+                        ))
+                });
+                let sub = cx.subscribe(
+                    &menu,
+                    |this: &mut Workspace,
+                     _menu: Entity<PopupMenu>,
+                     _: &DismissEvent,
+                     cx: &mut Context<Workspace>| {
+                        this.close_access_menu();
+                        cx.notify();
+                    },
+                );
+                this.access_menu = Some(menu);
+                this.access_menu_sub = Some(sub);
+                cx.notify();
+            }));
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        // Invariant: `access_open` is set and `access_menu` populated together,
+        // atomically inside one on_click closure, so the menu exists here.
+        debug_assert!(self.access_open);
+        debug_assert!(self.access_menu.is_some());
+        let menu = self
+            .access_menu
+            .clone()
+            .expect("access_menu exists when open");
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::div()
+                    .id("access-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .left_0()
+                    .occlude()
+                    .child(menu),
             )
             .into_any_element()
     }

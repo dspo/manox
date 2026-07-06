@@ -204,6 +204,12 @@ fn setup_child(
         .map(|p| p.read_with(cx, |t, _| t.permission_snapshot()))
         .unwrap_or_default();
     let permission = Arc::new(PermissionCache::from_snapshot(parent_snapshot));
+    // Inherit the parent's YOLO flag so a YOLO session's sub-agents also skip
+    // approvals and run bash unsandboxed.
+    let parent_yolo = parent
+        .upgrade()
+        .map(|p| p.read_with(cx, |t, _| t.yolo()))
+        .unwrap_or(false);
     let max_turns = def.max_turns.unwrap_or(10);
     let system_prompt = def_file.system_prompt.clone();
     let cwd_path = cwd.as_ref().clone();
@@ -212,6 +218,7 @@ fn setup_child(
         cwd_path,
         model,
         permission,
+        parent_yolo,
         system_prompt,
         max_turns,
         child_depth,
@@ -406,7 +413,7 @@ fn build_child_registry(
     child_weak: WeakEntity<Thread>,
 ) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
-    for tool in super::base_tools(cwd.clone()) {
+    for tool in super::base_tools(cwd.clone(), child_weak.clone()) {
         if is_tool_allowed(tool.name(), def) {
             reg.register(tool);
         }

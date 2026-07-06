@@ -30,11 +30,13 @@ use brush_builtins::ShellBuilderExt;
 use brush_core::openfiles::{self, OpenFile, OpenFiles};
 use brush_core::results::ExecutionExitCode;
 use brush_core::{ExecutionResult, Shell, SourceInfo};
+use gpui::WeakEntity;
 use gpui::{App, AppContext as _, Task};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::thread::Thread;
 use crate::tool::{AgentTool, ToolOutputSink};
 use crate::tools::{bridge_tokio, schema};
 
@@ -62,13 +64,17 @@ pub struct BashTool {
     /// Lazily-initialized persistent brush shell. One per `Thread` (the
     /// `ToolRegistry` is rebuilt per `Thread`).
     shell: Arc<tokio::sync::Mutex<Option<Shell>>>,
+    /// Owning thread, read to check YOLO mode (forces the unsandboxed branch
+    /// so bash runs outside seatbelt when YOLO is on). `None` in tests.
+    thread: Option<WeakEntity<Thread>>,
 }
 
 impl BashTool {
-    pub fn new(cwd: PathBuf) -> Self {
+    pub fn new(cwd: PathBuf, thread: WeakEntity<Thread>) -> Self {
         Self {
             cwd,
             shell: Arc::new(tokio::sync::Mutex::new(None)),
+            thread: Some(thread),
         }
     }
 }
@@ -147,10 +153,19 @@ impl AgentTool for BashTool {
         let cwd_override = parsed.cwd.clone();
         let timeout = Duration::from_secs(parsed.timeout_secs.unwrap_or(BASH_DEFAULT_TIMEOUT_SECS));
         let command = parsed.command.clone();
-        let unsandboxed = parsed.unsandboxed.unwrap_or(false);
+        // YOLO mode forces the unsandboxed branch (DangerFullAccess): when the
+        // owning thread has YOLO on, ignore the per-call `unsandboxed` flag and
+        // always run via the persistent shell without seatbelt confinement.
+        let yolo = self
+            .thread
+            .as_ref()
+            .and_then(|t| t.upgrade())
+            .map(|t| t.read_with(cx, |t, _| t.yolo()))
+            .unwrap_or(false);
+        let unsandboxed = parsed.unsandboxed.unwrap_or(false) || yolo;
         bridge_tokio(cx, async move {
             if unsandboxed {
-                // Approved escalation: brush's persistent shell, no confinement.
+                // Approved escalation / YOLO: brush's persistent shell, no confinement.
                 run_bash(
                     shell,
                     &command,

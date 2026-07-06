@@ -29,7 +29,7 @@ const RUNTIME_IDENTITY_TAG: &str = "{{runtime_identity}}";
 /// Sub-agents never call this — their `system` field is `Some`, so
 /// `build_completion_request` takes the `unwrap_or_else` branch only for the
 /// main thread.
-pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>) -> String {
+pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>, yolo: bool) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
     let os = std::env::consts::OS;
@@ -42,6 +42,9 @@ pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>) -> String {
     identity.push_str(&format!("- 操作系统：{os}\n"));
     identity.push_str(&format!("- 默认 shell：{shell}\n"));
     identity.push_str(&format!("- 今天：{today}\n"));
+    if yolo {
+        identity.push_str("- 模式：YOLO（工具调用无需审批，bash 在沙箱外运行）\n");
+    }
 
     let mut prompt = STATIC_PROMPT.replace(RUNTIME_IDENTITY_TAG, &identity);
     // Advertise installed skills so the model knows what reference docs it can
@@ -86,7 +89,7 @@ mod tests {
     #[test]
     fn prompt_contains_cwd_and_identity() {
         let cwd = Path::new("/tmp/some-proj");
-        let p = build_main_system_prompt(cwd, None);
+        let p = build_main_system_prompt(cwd, None, false);
         assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
         assert!(p.contains("manox agent"), "identity must appear: {p}");
         assert!(p.contains("今天"), "date must appear: {p}");
@@ -97,7 +100,7 @@ mod tests {
         // The identity names the product, not the implementation: the model has
         // no use for "GPUI"/"brush" or other framework names, and exposing
         // them only invites tangents.
-        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(!p.contains("GPUI"), "must not leak tech stack: {p}");
         assert!(!p.contains("gpui"), "must not leak tech stack: {p}");
         assert!(!p.contains("brush"), "must not leak tech stack: {p}");
@@ -107,7 +110,7 @@ mod tests {
     fn runtime_identity_placeholder_is_rendered() {
         // The {{runtime_identity}} tag must be substituted with live values,
         // never reach the model as a literal placeholder.
-        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(!p.contains("{{"), "placeholder leaked: {p}");
         assert!(!p.contains("runtime_identity}}"), "placeholder leaked: {p}");
         assert!(p.contains("## 运行时身份"), "identity block missing: {p}");
@@ -117,13 +120,13 @@ mod tests {
     fn prompt_includes_project_when_set() {
         let cwd = Path::new("/tmp/some-proj");
         let proj = Path::new("/tmp/some-proj");
-        let p = build_main_system_prompt(cwd, Some(proj));
+        let p = build_main_system_prompt(cwd, Some(proj), false);
         assert!(p.contains("项目根"));
     }
 
     #[test]
     fn prompt_contains_engineering_stance() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(p.contains("工程立场"), "engineering stance section: {p}");
         assert!(p.contains("对终态负责"), "end-state responsibility: {p}");
         assert!(p.contains("根因"), "root-cause discipline: {p}");
@@ -131,25 +134,25 @@ mod tests {
 
     #[test]
     fn prompt_contains_no_fabrication() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(p.contains("不要编造"), "no-fabrication discipline: {p}");
     }
 
     #[test]
     fn prompt_contains_task_completion() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(p.contains("完全解决"), "task completion discipline: {p}");
     }
 
     #[test]
     fn prompt_contains_validation_discipline() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(p.contains("没跑过不要说过了"), "validation discipline: {p}");
     }
 
     #[test]
     fn prompt_contains_sandbox_boundary() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(p.contains("工具沙箱边界"), "sandbox boundary section: {p}");
         assert!(p.contains("`.git` 目录只读"), ".git protected: {p}");
         assert!(
@@ -164,7 +167,7 @@ mod tests {
         // prompt. The runtime identity block must not carry a thread id row —
         // the prose may mention "thread id" as a concept pointing to the tool,
         // but no concrete id value is injected here.
-        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(
             !p.contains("当前 thread id"),
             "no thread id row in runtime identity block: {p}"
@@ -174,7 +177,7 @@ mod tests {
     #[test]
     fn static_prompt_is_embedded_verbatim() {
         // Editing the markdown must show through without rebuilding logic.
-        let p = build_main_system_prompt(Path::new("/tmp"), None);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(p.contains("工程立场"));
         assert!(p.contains("进程内 native agent 工作台"));
     }

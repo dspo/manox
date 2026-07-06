@@ -71,6 +71,15 @@ pub trait AgentTool: Send + Sync + 'static {
     fn is_read_only(&self) -> bool {
         false
     }
+    /// Whether the authorization flow is the tool's execution path rather than
+    /// a permission gate — the tool produces its result from the
+    /// `ToolAuthorizationResponse` itself and its `run` body is unreachable.
+    /// YOLO mode and `AlwaysAllow` must not bypass such tools, or the model
+    /// would hit the unreachable `run` and lose the user's input. Only
+    /// `AskUserQuestion` overrides this.
+    fn requires_user_input(&self) -> bool {
+        false
+    }
     /// Run the tool. `cancel` is the current turn's cancellation token; long-running
     /// tools (e.g. `bash`) select on it so a user-initiated stop reaps the work
     /// promptly. `Ok(output)` is a normal output string; `Err(output)` is an error
@@ -174,12 +183,17 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread::Thread;
     use crate::tools::base_tools;
+    use gpui::WeakEntity;
     use std::path::PathBuf;
 
     fn registry() -> ToolRegistry {
         let mut r = ToolRegistry::default();
-        for t in base_tools(Arc::new(PathBuf::from("."))) {
+        for t in base_tools(
+            Arc::new(PathBuf::from(".")),
+            WeakEntity::<Thread>::new_invalid(),
+        ) {
             r.register(t);
         }
         r
