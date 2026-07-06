@@ -175,6 +175,20 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Build the request-tool definition for a single registered tool by name.
+    /// Used by plan mode to advertise the `agent` tool alongside the read-only
+    /// set (the `agent` tool is not read-only, so it is excluded from
+    /// [`to_request_tools_read_only`], but plan mode delegates research to
+    /// read-only sub-agents via it).
+    pub fn to_request_tool(&self, name: &str) -> Option<LanguageModelRequestTool> {
+        self.tools.get(name).map(|tool| LanguageModelRequestTool {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            input_schema: tool.input_schema(),
+            use_input_streaming: false,
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }

@@ -1,11 +1,17 @@
-//! Subagent definitions loaded from `~/.config/cx/manox/agents/*.md` plus the
-//! `agents/` subdirectory of every installed plugin.
+//! Subagent definitions: a set of built-in definitions compiled into the
+//! binary (`plan`, `explore`) plus user-authored files under
+//! `~/.config/cx/manox/agents/*.md` and the `agents/` subdirectory of every
+//! installed plugin.
 //!
 //! Each file is a YAML frontmatter block (name/description/tools/model/...)
 //! followed by a markdown body that becomes the subagent's system prompt.
 //! Mirrors Claude Code's `.claude/agents/*.md` format. The registry is loaded
 //! once at startup; a missing or malformed file logs a warning and is skipped
 //! rather than aborting the whole registry.
+//!
+//! Built-in definitions are loaded first; a user-authored or plugin file with
+//! the same `name` overrides the built-in (same-key-wins on insert order), so
+//! users can customize or replace the bundled `plan`/`explore` agents.
 //!
 //! Plugin-provided definitions are registered under a `plugin:name` namespace
 //! so they never collide with built-in or user-authored agents — the parent
@@ -65,12 +71,19 @@ pub struct AgentDefinitionRegistry {
 }
 
 impl AgentDefinitionRegistry {
-    /// Scan the agents dir and every installed plugin's `agents/` subdirectory,
-    /// parsing each `*.md` file. Missing dirs or parse errors do not abort the
-    /// load; the registry ends up empty or partial. Plugin definitions are
+    /// Load the registry: built-in definitions first, then user-authored and
+    /// plugin files. Same-`name` later loads override earlier ones, so users can
+    /// customize the bundled `plan`/`explore` agents by dropping a same-named
+    /// file in `~/.config/cx/manox/agents/`. Missing dirs or parse errors do not
+    /// abort the load; the registry ends up partial. Plugin definitions are
     /// registered under `plugin:name` so they cannot shadow user-authored ones.
     pub fn load() -> Self {
         let mut defs = BTreeMap::new();
+        // Built-in definitions compiled into the binary. Inserted first so user
+        // and plugin definitions with the same `name` override them.
+        for file in builtin_definitions() {
+            defs.insert(file.def.name.clone(), Arc::new(file));
+        }
         // User-authored definitions: bare frontmatter `name`, no namespace.
         if let Ok(dir) = paths::agents_dir() {
             scan_dir(&dir, &mut |path| match load_file(path) {
@@ -131,8 +144,15 @@ fn scan_dir(dir: &std::path::Path, on_file: &mut dyn FnMut(&std::path::Path)) {
 fn load_file(path: &std::path::Path) -> Result<AgentDefinitionFile> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let parsed = crate::frontmatter::parse::<AgentDefinition>(&raw)
-        .map_err(|e| anyhow::anyhow!("parsing frontmatter in {}: {e:#}", path.display()))?;
+    parse_definition(&raw, &format!("{}", path.display()))
+}
+
+/// Parse a definition from a raw markdown string. `source` is used only for
+/// error context (a path or a builtin id). Shared by the file loader and the
+/// built-in definition loader so they apply the same validation.
+fn parse_definition(raw: &str, source: &str) -> Result<AgentDefinitionFile> {
+    let parsed = crate::frontmatter::parse::<AgentDefinition>(raw)
+        .map_err(|e| anyhow::anyhow!("parsing frontmatter in {source}: {e:#}"))?;
     let def = parsed.front;
     if def.name.trim().is_empty() {
         anyhow::bail!("agent definition has empty `name`");
@@ -144,6 +164,20 @@ fn load_file(path: &std::path::Path) -> Result<AgentDefinitionFile> {
         def,
         system_prompt: parsed.body,
     })
+}
+
+/// The built-in subagent definitions compiled into the binary. Each entry is
+/// `include_str!`-embedded markdown (frontmatter + body) living next to the
+/// source, mirroring `system_prompt.md`. A malformed builtin is a compile-time
+/// authoring error, so failures are surfaced as panics at load time rather than
+/// silently skipped.
+fn builtin_definitions() -> Vec<AgentDefinitionFile> {
+    const PLAN: &str = include_str!("agents/plan.md");
+    const EXPLORE: &str = include_str!("agents/explore.md");
+    vec![
+        parse_definition(PLAN, "builtin:plan").expect("builtin plan agent must parse"),
+        parse_definition(EXPLORE, "builtin:explore").expect("builtin explore agent must parse"),
+    ]
 }
 
 static REGISTRY: OnceLock<AgentDefinitionRegistry> = OnceLock::new();
@@ -227,5 +261,39 @@ mod tests {
         let r = AgentDefinitionRegistry::load();
         // No guarantee about contents, but it must return a registry (possibly empty).
         let _ = r.list();
+    }
+
+    #[test]
+    fn builtin_definitions_parse_and_are_read_only() {
+        let builtins = builtin_definitions();
+        let names: Vec<&str> = builtins.iter().map(|f| f.def.name.as_str()).collect();
+        assert!(
+            names.contains(&"plan"),
+            "builtin plan must exist: {names:?}"
+        );
+        assert!(
+            names.contains(&"explore"),
+            "builtin explore must exist: {names:?}"
+        );
+        for f in &builtins {
+            // Read-only agents must disallow the write/spawn tools.
+            let dis = f
+                .def
+                .disallowed_tools
+                .as_ref()
+                .expect("read-only builtin has disallowed_tools");
+            for blocked in ["write_file", "edit_file", "bash", "agent"] {
+                assert!(
+                    dis.iter().any(|x| x == blocked),
+                    "{} must disallow {blocked}",
+                    f.def.name
+                );
+            }
+            assert!(
+                !f.system_prompt.trim().is_empty(),
+                "{} has empty system prompt",
+                f.def.name
+            );
+        }
     }
 }

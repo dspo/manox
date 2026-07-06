@@ -13,6 +13,7 @@
 pub mod agent;
 pub mod ask_user;
 pub mod bash;
+pub mod monitor;
 pub mod self_info;
 pub mod skill;
 
@@ -762,7 +763,11 @@ pub fn default_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistr
         reg.register(tool);
     }
     reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone())) as AnyAgentTool);
-    reg.register(self_info::new(parent));
+    reg.register(self_info::new(parent.clone()));
+    // `monitor` is main-thread-only (not in `base_tools`, so sub-agents do not
+    // get it): streaming a long-running command is a top-level orchestration
+    // concern, and like `agent` it should not nest into sub-agent contexts.
+    reg.register(Arc::new(monitor::MonitorTool) as AnyAgentTool);
 
     // Append MCP tools discovered at startup from `mcp.toml` plus each
     // installed plugin's `.mcp.json`. The registry is process-global; `try_global`
