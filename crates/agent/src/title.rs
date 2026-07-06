@@ -197,24 +197,24 @@ pub fn sanitize_title(raw: &str) -> String {
 fn first_user_text(messages: &[Message]) -> Option<String> {
     messages
         .iter()
-        .find(|m| m.role == Role::User)
-        .and_then(message_text)
+        .filter(|m| m.role == Role::User)
+        .find_map(message_text)
 }
 
 fn last_user_text(messages: &[Message]) -> Option<String> {
     messages
         .iter()
         .rev()
-        .find(|m| m.role == Role::User)
-        .and_then(message_text)
+        .filter(|m| m.role == Role::User)
+        .find_map(message_text)
 }
 
 fn last_assistant_text(messages: &[Message]) -> Option<String> {
     messages
         .iter()
         .rev()
-        .find(|m| m.role == Role::Assistant)
-        .and_then(message_text)
+        .filter(|m| m.role == Role::Assistant)
+        .find_map(message_text)
 }
 
 /// Concatenate all `Text` blocks of a message into one trimmed string.
@@ -325,6 +325,42 @@ mod tests {
         let req = build_title_request(&messages);
         // user + instruction, no assistant turn.
         assert_eq!(req.messages.len(), 2);
+    }
+
+    #[test]
+    fn last_user_text_skips_tool_result_user_messages() {
+        // A tool result is role User with no Text block. `last_user_text` must
+        // skip it and surface the last real user-typed message instead, so a
+        // topic-shift check fired right after a tool round still has the user
+        // turn to evaluate.
+        use crate::language_model::LanguageModelToolResult;
+        use std::sync::Arc;
+        let messages = vec![
+            Message::user("旧话题".into()),
+            Message::assistant(vec![MessageContent::Text("旧回复".into())]),
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tu_1".into(),
+                tool_name: Arc::<str>::from("read_file"),
+                is_error: false,
+                content: "file contents".into(),
+            })]),
+            Message::user("现在帮我改下登录".into()),
+            Message::assistant(vec![MessageContent::Text("好的".into())]),
+            // Trailing tool result with no later user text — must not starve
+            // the topic-shift request of a user turn.
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tu_2".into(),
+                tool_name: Arc::<str>::from("bash"),
+                is_error: false,
+                content: "ok".into(),
+            })]),
+        ];
+        let req = build_topic_shift_request("旧话题", &messages);
+        // user (latest real text) + assistant + instruction.
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.messages[0].role, Role::User);
+        assert_eq!(req.messages[0].string_contents(), "现在帮我改下登录");
+        assert_eq!(req.messages[1].role, Role::Assistant);
     }
 
     #[test]

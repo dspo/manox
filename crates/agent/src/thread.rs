@@ -425,6 +425,7 @@ impl Thread {
         let entity = cx.entity();
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = crate::title::stream_thread_title(&model, request, cx).await;
+            let mut changed = false;
             this.update(cx, |t, cx| {
                 t.title_in_flight = false;
                 if let Ok(title) = result
@@ -432,10 +433,20 @@ impl Thread {
                     && !crate::title::is_unchanged(&title)
                 {
                     t.title = Some(title);
-                    crate::thread_store::save_thread(entity, true, cx);
+                    changed = true;
                 }
+                cx.notify();
             })
             .ok();
+            if changed {
+                // Persist outside the thread's write lease. `save_thread` reads
+                // the entity snapshot (`thread.read(cx)`); doing that inside
+                // `this.update` would re-lease the same entity and trip gpui's
+                // double-lease panic — the SIGABRT from thread `4543a630`.
+                cx.update(|cx: &mut App| {
+                    crate::thread_store::save_thread(entity, true, cx);
+                });
+            }
         })
         .detach();
     }
