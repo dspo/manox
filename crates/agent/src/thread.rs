@@ -249,6 +249,14 @@ impl Thread {
     /// independent permission cache, a system prompt, and a turn cap. The
     /// `tools_fn` closure receives the new thread's own `WeakEntity` so the
     /// `agent` tool (when nesting is allowed) can route back to it.
+    ///
+    /// The sub-agent must reuse the *parent's* `AnyLanguageModel` instance so its
+    /// LLM requests share the same `prompt_cache_key` (the model's stable id).
+    /// This lets the sub-agent's oneshot turns read the prompt-cache prefix the
+    /// parent's main loop already populated, instead of cold-missing the whole
+    /// prefix. If a future change lets a sub-agent use a different (e.g. cheaper
+    /// summarization) model, it must explicitly forward the parent's
+    /// `prompt_cache_key` to preserve cache affinity.
     #[allow(clippy::too_many_arguments)]
     pub fn new_subagent(
         cwd: PathBuf,
@@ -1444,6 +1452,14 @@ impl Thread {
     /// `system_prompt::build_main_system_prompt`. Thread id is deliberately
     /// absent; the model fetches it via the `self_info` tool.
     fn build_completion_request(&self) -> LanguageModelRequest {
+        // TODO(prefix-cache): once per-turn tool-result truncation / image
+        // stripping / history rewriting lands, route the request through
+        // `prefix_stability::AppendOnlyContextManager` so the byte-stable
+        // prefix is preserved up to the divergence point. manox's
+        // `Thread::messages` is append-only today, so the prefix is naturally
+        // stable and no stabilization pass is needed yet — but introducing any
+        // rewrite without that layer would silently break the provider's
+        // prefix cache.
         let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
         let mut system = self.system.clone().unwrap_or_else(|| {
             crate::system_prompt::build_main_system_prompt(
@@ -1465,14 +1481,13 @@ impl Thread {
         if self.plan_mode {
             system.push_str(crate::system_prompt::PLAN_MODE_ADDENDUM);
         }
+        // The system prompt is the head of the cached prefix; mark it so the
+        // Anthropic wire mapper can place a `cache_control` breakpoint on it
+        // (matching the `Full` policy's system block).
         messages.push(LanguageModelRequestMessage {
             role: Role::System,
             content: vec![MessageContent::Text(system)],
-            // The `cache` flag is currently advisory only — the Anthropic wire
-            // mapper (`provider/anthropic.rs::content_to_anthropic`) does not yet
-            // emit `cache_control` breakpoints. Kept `false` to avoid implying
-            // caching that isn't actually wired up.
-            cache: false,
+            cache: true,
         });
         // Map canonical messages to the request, stripping the `agent` tool's
         // JSON envelope to just its `final` text. The full sub-conversation
@@ -1480,11 +1495,26 @@ impl Thread {
         // parent model must only see the final reply — otherwise every sub-agent
         // tool call, tool result, and reasoning block leaks into the parent's
         // context, defeating the point of spawning an isolated sub-agent.
-        messages.extend(self.messages.iter().map(|m| LanguageModelRequestMessage {
-            role: m.role,
-            content: m.content.iter().map(model_facing_content).collect(),
-            cache: false,
-        }));
+        //
+        // `cache` is set on the trailing two user/assistant messages so the
+        // Anthropic wire mapper can place conversation-tail breakpoints
+        // (matching the `Full` policy's messages[-2]/messages[-1] slots).
+        let mapped: Vec<LanguageModelRequestMessage> = self
+            .messages
+            .iter()
+            .map(|m| LanguageModelRequestMessage {
+                role: m.role,
+                content: m.content.iter().map(model_facing_content).collect(),
+                cache: false,
+            })
+            .collect();
+        let len = mapped.len();
+        for (i, mut m) in mapped.into_iter().enumerate() {
+            if i + 2 >= len {
+                m.cache = true;
+            }
+            messages.push(m);
+        }
         let tools = if self.plan_mode {
             // In plan mode, advertise only read-only tools plus the synthesized
             // `exit_plan_mode` tool (not in the registry). Write tools, `bash`,

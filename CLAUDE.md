@@ -80,6 +80,18 @@ crates/
 - **多 agent（subagents）系统**：`agent` 工具 spawn 独立 context、受限工具集、独立 system prompt 的子 Thread，最终回复作为 tool result 回传。深度上限 `MAX_DEPTH=5`，`allow_nesting` + 深度双重保险。授权冒泡经复合 id，权限快照继承（子不再因父已授权工具重复弹窗）。MCP 不进子 agent。
 - **Tool 执行**：`run` 返 `Task<Result<String,String>>`（`Ok` 正常输出，`Err` 仍回传模型）。FS 工具经 `cx.background_spawn`，子进程工具经 tokio 桥。
 
+### 前缀缓存（provider 侧 prompt caching）
+
+manox 接入 provider 侧前缀缓存：客户端保证请求前缀字节稳定 + 在 wire 上打 `cache_control`/`prompt_cache_key` 标记 + 跨 turn 复用缓存亲和 key。**注意**：这是 provider 侧前缀缓存（让 Anthropic/OpenAI 服务端复用已计算的注意力 K/V），不是本地 KV 张量缓存——manox 直连 provider，无本地推理引擎。
+
+- **Anthropic wire**（`provider/anthropic_cache.rs`）— 策略枚举 `PromptCachingPolicy { None, Full, LastBreakpointOnly }`，由 `resolve_prompt_caching_policy` 按 `base_url` 启发式决定：`api.anthropic.com` → `Full`（system 末块 + 最后 tool + messages[-2] + messages[-1]，4 断点上限），第三方兼容端 → `LastBreakpointOnly`（只标最后 tool，因为第三方端在 messages[-1] 上放断点会每轮重写从不读、净负）。`apply_prompt_caching` 在 body 构造后统一放置断点（single source of truth），`enforce_cache_control_limit` 在超 4 时按「保留最后一个 system/tool 断点、剥消息断点」优先级裁剪。long TTL（`ttl:"1h"` + `extended-cache-ttl-2025-04-11` beta header）仅 `Full` + `api.anthropic.com` 时启用。
+- **OpenAI Responses/Completions wire** — 发 `prompt_cache_key`（model 稳定 id `provider/model/wire`，截断 64 字符）+ `store:false`；直连 `api.openai.com` 时加 `prompt_cache_retention:"24h"`。`provider::openai_long_ttl` 判定端点是否官方。
+- **cache key 用 model 稳定 key 而非 thread_id**：manox 的 `LanguageModel` 是全局单例、跨多 thread 共享，同一 model 跨 turn 稳定即可让 provider 命中；不同 thread 用同一 model 共享缓存无副作用（前缀不同自然 miss）。
+- **`cache` flag**（`LanguageModelRequestMessage.cache`）— `build_completion_request` 把 system 消息 + 倒数两条 user/assistant 消息的 `cache` 设 `true`，作为断点意图的 advisory 元数据。**目前 wire mapper 不读它**——断点放置统一走 `apply_prompt_caching`，避免两处逻辑冲突。
+- **前缀稳定性**（`prefix_stability.rs`）— **骨架预留，暂未激活**。manox 的 `Thread::messages` 是只追加规范状态，`build_completion_request` 每轮全量映射但前缀天然稳定，故不需要 append-only 稳定化层。但若将来引入 per-turn 工具结果截断 / 图片剥离 / 历史重写，**必须**接入 `AppendOnlyContextManager`（`sync_messages` 用 per-message digest 找最长字节稳定前缀，只 truncate 到分叉点再 append 新尾），否则会静默击穿 provider 的前缀缓存。digest 覆盖 role/content/toolCalls/toolCallId/toolName/isError/id 全字段。
+
+### tokio ↔ gpui 桥接
+
 ## i18n（重要：开发时勿忘）
 
 manox 区分**模型面向**与**用户面向**两条字符串边界，二者不可混淆：
