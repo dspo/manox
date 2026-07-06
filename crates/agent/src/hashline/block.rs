@@ -33,7 +33,10 @@ impl std::fmt::Display for BlockError {
                 "line {line} is not the start of a multi-line block (no bracket pairing); use SWAP {line}.={line}: or point at the real block-start line"
             ),
             BlockError::Unterminated { line } => {
-                write!(f, "block starting at line {line} is unterminated (brackets unbalanced to EOF)")
+                write!(
+                    f,
+                    "block starting at line {line} is unterminated (brackets unbalanced to EOF)"
+                )
             }
             BlockError::UnsupportedLanguage { line } => write!(
                 f,

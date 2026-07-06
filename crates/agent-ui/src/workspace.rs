@@ -51,12 +51,11 @@ struct PendingAuth {
     summary: String,
 }
 
-/// A pending plan approval prompted by `ThreadEvent::PlanProposed`. The overlay
-/// shows the plan text and offers approve/reject; the verdict goes back via
-/// `Thread::respond_plan_approval`.
+/// A pending plan approval prompted by `ThreadEvent::PlanProposed`. The plan
+/// text is rendered in the chat view as a ToolCall item; the overlay only
+/// shows the approval question.
 struct PendingPlan {
     id: String,
-    plan_text: String,
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -332,11 +331,30 @@ impl Workspace {
                     });
                     cx.notify();
                 }
-                ThreadEvent::PlanProposed { id, plan_text } => {
+                ThreadEvent::PlanProposed { id, .. } => {
                     this.pending_plan = Some(PendingPlan {
                         id: id.clone(),
-                        plan_text: plan_text.clone(),
                     });
+                    // Delegate to ConversationState to backfill the plan text
+                    // into the matching ToolCall item for markdown rendering.
+                    let weak = cx.weak_entity();
+                    let role = this.model_label(cx);
+                    let outcome = this
+                        .conversation
+                        .update(cx, |c, cx| c.apply(ev, &role, weak, cx));
+                    let count = this.conversation.read(cx).items().len();
+                    match outcome {
+                        ApplyOutcome::None => {}
+                        ApplyOutcome::Remeasure(ix) => {
+                            this.list_state.remeasure_items(ix..ix + 1);
+                        }
+                        ApplyOutcome::Appended => {
+                            this.list_state.splice(count - 1..count - 1, 1);
+                        }
+                        ApplyOutcome::All => {
+                            this.list_state.remeasure_items(0..count);
+                        }
+                    }
                     cx.notify();
                 }
                 ThreadEvent::YoloToggled { .. } => {
@@ -363,6 +381,10 @@ impl Workspace {
                     if !matches!(reason, StopReason::ToolUse) {
                         save_thread(this.thread.clone(), true, cx);
                     }
+                    cx.notify();
+                }
+                ThreadEvent::PrefixStability { .. } => {
+                    // Refresh the `cache: NN%` chip in the composer status row.
                     cx.notify();
                 }
                 _ => {
@@ -1206,15 +1228,14 @@ impl Workspace {
         )
     }
 
-    /// Plan approval overlay (model called `exit_plan_mode`). Mirrors
-    /// `render_auth_overlay`'s container; auth/ask overlays take precedence so
-    /// the two never compete for the slot.
-    fn render_plan_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// Plan approval overlay (model called `exit_plan_mode`). The plan text
+    /// is rendered in the chat view; this overlay only asks the approval
+    /// question. Auth/ask overlays take precedence so they never compete.
+    fn render_plan_approval_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.pending_ask.is_some() || !self.pending_auths.is_empty() {
             return None;
         }
-        let plan = self.pending_plan.as_ref()?;
-        let plan_text = plan.plan_text.clone();
+        self.pending_plan.as_ref()?;
 
         Some(
             gpui::div()
@@ -1228,8 +1249,7 @@ impl Workspace {
                 .bg(theme.background.opacity(0.6))
                 .child(
                     v_flex()
-                        .w(px(520.))
-                        .max_h(px(560.))
+                        .w(px(420.))
                         .p_4()
                         .gap_3()
                         .rounded(theme.radius)
@@ -1255,29 +1275,18 @@ impl Workspace {
                         .child(
                             gpui::div()
                                 .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child(i18n::t("workspace-plan-approval-prompt")),
-                        )
-                        .child(
-                            gpui::div()
-                                .id("plan-text")
-                                .p_3()
-                                .rounded(theme.radius)
-                                .bg(theme.secondary)
-                                .text_sm()
-                                .max_h(px(320.))
-                                .overflow_y_scroll()
-                                .child(plan_text),
+                                .text_color(theme.foreground)
+                                .child(i18n::t("workspace-plan-approval-question")),
                         )
                         .child(
                             h_flex()
                                 .gap_2()
                                 .justify_end()
                                 .child(
-                                    Button::new("plan-reject")
+                                    Button::new("plan-continue")
                                         .ghost()
                                         .small()
-                                        .label(i18n::t("workspace-deny"))
+                                        .label(i18n::t("workspace-plan-continue"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.respond_plan(false, cx);
                                         })),
@@ -1710,6 +1719,7 @@ impl Workspace {
     ) -> AnyElement {
         let plus = self.render_plus_button(cx);
         let cwd = self.render_cwd_chip(theme, cx);
+        let cache = self.render_cache_chip(cx);
         let access = self.render_access_placeholder(theme, cx);
         let yolo = self.thread.read(cx).yolo();
         let model = self.render_model_selector(theme, cx);
@@ -1740,6 +1750,7 @@ impl Workspace {
                             .gap_1()
                             .child(plus)
                             .child(cwd)
+                            .child(cache)
                             .child(access),
                     )
                     .child(
@@ -2141,6 +2152,36 @@ impl Workspace {
             None => gpui::div().into_any_element(),
         }
     }
+
+    /// `cache: NN%` chip reflecting prefix-stability ratio. Green ≥80%, yellow
+    /// ≥40%, red below. The most recent provider cache-read token count is
+    /// appended when available so a high ratio can be cross-checked against
+    /// real cache hits.
+    fn render_cache_chip(&self, cx: &Context<Self>) -> AnyElement {
+        let thread = self.thread.read(cx);
+        let pct = thread.prefix_stability_pct();
+        let usage = thread.last_cache_usage();
+        let hue = if pct >= 80 {
+            0.33 // green
+        } else if pct >= 40 {
+            0.11 // yellow
+        } else {
+            0.0 // red
+        };
+        let label = match usage {
+            Some(u) if u.cache_read_input_tokens > 0 => {
+                format!("cache: {pct}% · {}k", u.cache_read_input_tokens / 1000)
+            }
+            _ => format!("cache: {pct}%"),
+        };
+        gpui::div()
+            .px_2()
+            .py_1()
+            .text_xs()
+            .text_color(gpui::hsla(hue, 0.5, 0.62, 1.0))
+            .child(label)
+            .into_any_element()
+    }
 }
 
 impl Render for Workspace {
@@ -2190,7 +2231,7 @@ impl Render for Workspace {
 
         let overlay = self
             .render_auth_overlay(&theme, cx)
-            .or_else(|| self.render_plan_overlay(&theme, cx));
+            .or_else(|| self.render_plan_approval_overlay(&theme, cx));
 
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
@@ -2246,7 +2287,7 @@ impl Render for Workspace {
                 .iter()
                 .rev()
                 .filter_map(|e| {
-                    if let ConvItem::Error(msg) = e.read(cx).kind() {
+                    if let ConvItem::Error(msg) | ConvItem::Notice(msg) = e.read(cx).kind() {
                         Some(msg.clone())
                     } else {
                         None

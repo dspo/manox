@@ -51,7 +51,8 @@ const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
 const BASH_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// Narrow-the-command hint folded into the truncation advisory. Lives here
 /// (not in `system_prompt.md`) because it is tool-specific guidance.
-const BASH_TRUNCATION_HINT: &str = "retry with a narrower command (specify columns, `| head`, `LIMIT`, tighten the pattern)";
+const BASH_TRUNCATION_HINT: &str =
+    "retry with a narrower command (specify columns, `| head`, `LIMIT`, tighten the pattern)";
 /// Grace window given to a SIGTERM'd process group before escalating to SIGKILL.
 const CANCELLATION_GRACE_MS: u64 = 50;
 /// Upper bound on draining the stdout/stderr pipes after the group is killed:
@@ -953,7 +954,10 @@ mod tests {
             "must advise narrowing: {note}"
         );
         assert!(
-            note.contains(&format!("{} bytes total", BASH_OUTPUT_MAX_BYTES + 12 * 1024)),
+            note.contains(&format!(
+                "{} bytes total",
+                BASH_OUTPUT_MAX_BYTES + 12 * 1024
+            )),
             "must report total bytes: {note}"
         );
         assert!(
