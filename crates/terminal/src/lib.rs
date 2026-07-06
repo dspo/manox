@@ -20,6 +20,16 @@ pub mod term;
 
 use gpui::App;
 
+// Re-export the alacritty data-structure types the rendering layer needs, so
+// `terminal-ui` depends only on `terminal` and never on `alacritty_terminal`
+// directly.
+pub use alacritty_terminal;
+pub use alacritty_terminal::grid::Indexed;
+pub use alacritty_terminal::index::{Column, Line, Point};
+pub use alacritty_terminal::term::cell::{Cell, Flags};
+pub use alacritty_terminal::term::{RenderableContent, Term};
+pub use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+
 /// Register the `TerminalStore` against the shared `ThreadsDatabase`.
 /// Call at App startup, after `agent::init`.
 pub fn init(cx: &mut App) {

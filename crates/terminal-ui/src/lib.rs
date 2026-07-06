@@ -9,6 +9,9 @@
 
 use gpui::App;
 
+pub mod grid_renderer;
+pub mod theme;
+
 /// Register terminal UI actions and workspace tab integration.
 /// Call at App startup, after `terminal::init`.
 pub fn init(_cx: &mut App) {}
