@@ -34,7 +34,9 @@ pub struct StablePrefix {
     version: u32,
 }
 
-/// A captured prefix snapshot.
+/// A captured prefix snapshot: the frozen system-prompt text plus a tool-spec
+/// fingerprint. Exposed via [`StablePrefix::system`] so a future caller can
+/// reuse the exact bytes that populated the provider's cache.
 struct StablePrefixSnapshot {
     system: Vec<String>,
     tools_fingerprint: u32,
@@ -66,8 +68,17 @@ impl StablePrefix {
         self.snapshot = None;
     }
 
+    /// Monotonic version counter; bumps each time the prefix bytes change.
     pub fn version(&self) -> u32 {
         self.version
+    }
+
+    /// The frozen system-prompt text, or `None` if `build()` was never called
+    /// (or was invalidated). A future `build_completion_request` will reuse
+    /// this instead of re-deriving from live state, so the cached prefix
+    /// stays byte-identical across turns.
+    pub fn system(&self) -> Option<&[String]> {
+        self.snapshot.as_ref().map(|s| s.system.as_slice())
     }
 }
 
@@ -356,5 +367,23 @@ mod tests {
         };
         assert!(sp.build(&req)); // first build → changed
         assert!(!sp.build(&req)); // same → unchanged
+    }
+
+    #[test]
+    fn system_getter_exposes_frozen_text() {
+        let mut sp = StablePrefix::default();
+        assert!(sp.system().is_none()); // unbuilt
+        let req = LanguageModelRequest {
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text("frozen".into())],
+                cache: false,
+            }],
+            ..Default::default()
+        };
+        sp.build(&req);
+        assert_eq!(sp.system().unwrap()[0], "frozen");
+        sp.invalidate();
+        assert!(sp.system().is_none()); // invalidated → no frozen prefix
     }
 }

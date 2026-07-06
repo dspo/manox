@@ -1481,9 +1481,10 @@ impl Thread {
         if self.plan_mode {
             system.push_str(crate::system_prompt::PLAN_MODE_ADDENDUM);
         }
-        // The system prompt is the head of the cached prefix; mark it so the
-        // Anthropic wire mapper can place a `cache_control` breakpoint on it
-        // (matching the `Full` policy's system block).
+        // The system prompt is the head of the cached prefix. `cache_control`
+        // breakpoints are placed by `provider::anthropic_cache::apply_prompt_caching`
+        // (single source of truth); the `cache` flag is advisory metadata, not
+        // read by the wire mapper today — kept aligned with that intent.
         messages.push(LanguageModelRequestMessage {
             role: Role::System,
             content: vec![MessageContent::Text(system)],
@@ -1496,9 +1497,12 @@ impl Thread {
         // tool call, tool result, and reasoning block leaks into the parent's
         // context, defeating the point of spawning an isolated sub-agent.
         //
-        // `cache` is set on the trailing two user/assistant messages so the
-        // Anthropic wire mapper can place conversation-tail breakpoints
-        // (matching the `Full` policy's messages[-2]/messages[-1] slots).
+        // The `cache` flag marks the trailing two user/assistant messages as
+        // cache-anchor candidates. It is advisory metadata today — the actual
+        // `cache_control` breakpoints are placed by `apply_prompt_caching`
+        // against messages[-2]/messages[-1] — but keeping the flag aligned with
+        // that intent documents the contract for a future wire mapper that
+        // reads it.
         let mapped: Vec<LanguageModelRequestMessage> = self
             .messages
             .iter()
