@@ -17,6 +17,7 @@ pub mod message;
 pub mod model_alias;
 pub mod paths;
 pub mod plugin;
+pub mod prefix_stability;
 pub mod provider;
 pub mod runtime;
 pub mod sandbox;

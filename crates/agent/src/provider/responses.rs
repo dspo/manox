@@ -37,6 +37,9 @@ pub struct ResponsesModel {
     api_key: String,
     max_output_tokens: u64,
     max_token_count: u64,
+    /// Whether the endpoint is official OpenAI (api.openai.com) and thus
+    /// eligible for `prompt_cache_retention:"24h"`.
+    long_ttl: bool,
 }
 
 impl ResponsesModel {
@@ -54,10 +57,11 @@ impl ResponsesModel {
             name,
             provider_name,
             api_model_id,
-            endpoint_url,
+            endpoint_url: endpoint_url.clone(),
             api_key,
             max_output_tokens: max_token_count.min(8192),
             max_token_count,
+            long_ttl: crate::provider::openai_long_ttl(&endpoint_url),
         }
     }
 }
@@ -81,6 +85,9 @@ impl LanguageModel for ResponsesModel {
     fn max_token_count(&self) -> u64 {
         self.max_token_count
     }
+    fn supports_long_prompt_cache_retention(&self) -> bool {
+        self.long_ttl
+    }
 
     fn stream_completion(
         &self,
@@ -91,13 +98,24 @@ impl LanguageModel for ResponsesModel {
         let api_key = self.api_key.clone();
         let model = self.api_model_id.clone();
         let max_tokens = self.max_output_tokens;
+        let prompt_cache_key = self.id.clone();
+        let long_ttl = self.long_ttl;
 
         Box::pin(async move {
             let (tx, rx) = async_channel::bounded::<Result<LanguageModelCompletionEvent>>(64);
             let tx_clone = tx.clone();
             crate::runtime::handle().spawn(async move {
-                if let Err(e) =
-                    stream_responses(&url, &api_key, &model, max_tokens, request, tx_clone).await
+                if let Err(e) = stream_responses(
+                    &url,
+                    &api_key,
+                    &model,
+                    max_tokens,
+                    request,
+                    tx_clone,
+                    &prompt_cache_key,
+                    long_ttl,
+                )
+                .await
                 {
                     let _ = tx.send(Err(e)).await;
                 }
@@ -116,6 +134,7 @@ fn responses_url(endpoint: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_responses(
     url: &str,
     api_key: &str,
@@ -123,8 +142,10 @@ pub async fn stream_responses(
     max_tokens: u64,
     request: LanguageModelRequest,
     tx: async_channel::Sender<Result<LanguageModelCompletionEvent>>,
+    prompt_cache_key: &str,
+    long_ttl: bool,
 ) -> Result<()> {
-    let body = build_request_body(model, max_tokens, &request);
+    let body = build_request_body(model, max_tokens, &request, prompt_cache_key, long_ttl);
     let client = reqwest::Client::builder()
         .build()
         .context("构建 reqwest client 失败")?;
@@ -189,14 +210,32 @@ pub async fn stream_responses(
     Ok(())
 }
 
-fn build_request_body(model: &str, max_tokens: u64, request: &LanguageModelRequest) -> Value {
+fn build_request_body(
+    model: &str,
+    max_tokens: u64,
+    request: &LanguageModelRequest,
+    prompt_cache_key: &str,
+    long_ttl: bool,
+) -> Value {
     let (input, instructions) = build_input(&request.messages);
+    // The prompt cache key is the model's stable id (`provider/model/wire`),
+    // truncated to OpenAI's 64-char limit so it stays stable across turns of
+    // the same model — letting the provider reuse the cached prefix.
+    let cache_key = crate::provider::clamp_prompt_cache_key(prompt_cache_key);
     let mut body = json!({
         "model": model,
         "input": input,
         "max_output_tokens": max_tokens,
         "stream": true,
+        // Disable server-side response storage (manox keeps its own history);
+        // prompt caching still works via prefix matching on `prompt_cache_key`.
+        "store": false,
+        "prompt_cache_key": cache_key,
     });
+    if long_ttl {
+        // 24h retention only on official OpenAI endpoints.
+        body["prompt_cache_retention"] = Value::String("24h".to_string());
+    }
     // System prompt (e.g. a sub-agent's) goes to the top-level `instructions`
     // field — the OpenAI Responses-recommended slot — rather than a `system`
     // role message item. Anthropic wire lifts it to `system` the same way.
@@ -625,7 +664,7 @@ mod tests {
 
     #[test]
     fn build_request_body_includes_tools() {
-        let body = build_request_body("m", 64, &req_with_tool());
+        let body = build_request_body("m", 64, &req_with_tool(), "test-key", false);
         let tools = body.get("tools").and_then(Value::as_array).expect("tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
@@ -841,8 +880,10 @@ mod tests {
             cache: false,
         });
         tokio::spawn(async move {
-            if let Err(e) =
-                stream_responses(&url, &api_key, &api_model, 64, request, tx_clone).await
+            if let Err(e) = stream_responses(
+                &url, &api_key, &api_model, 64, request, tx_clone, "test-key", false,
+            )
+            .await
             {
                 let _ = tx.send(Err(e)).await;
             }

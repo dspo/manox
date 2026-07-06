@@ -30,6 +30,9 @@ pub struct AnthropicModel {
     api_key: String,
     max_output_tokens: u64,
     max_token_count: u64,
+    /// Whether the endpoint is real Anthropic (api.anthropic.com) and thus
+    /// eligible for the long (1h) cache TTL + the extended-cache-ttl beta header.
+    long_ttl: bool,
 }
 
 impl AnthropicModel {
@@ -43,15 +46,23 @@ impl AnthropicModel {
         api_key: String,
         max_token_count: u64,
     ) -> Self {
+        let long_ttl = crate::provider::anthropic_cache::supports_long_ttl(
+            crate::provider::anthropic_cache::resolve_prompt_caching_policy(
+                None,
+                Some(&endpoint_url),
+            ),
+            Some(&endpoint_url),
+        );
         Self {
             id,
             name,
             provider_name,
             api_model_id,
-            endpoint_url,
+            endpoint_url: endpoint_url.clone(),
             api_key,
             max_output_tokens: max_token_count.min(8192),
             max_token_count,
+            long_ttl,
         }
     }
 }
@@ -85,13 +96,20 @@ impl LanguageModel for AnthropicModel {
         let api_key = self.api_key.clone();
         let model = self.api_model_id.clone();
         let max_tokens = self.max_output_tokens;
+        let policy = crate::provider::anthropic_cache::resolve_prompt_caching_policy(
+            None,
+            Some(&self.endpoint_url),
+        );
+        let long_ttl = self.long_ttl;
 
         Box::pin(async move {
             let (tx, rx) = async_channel::bounded::<Result<LanguageModelCompletionEvent>>(64);
             let tx_clone = tx.clone();
             crate::runtime::handle().spawn(async move {
-                if let Err(e) =
-                    stream_anthropic(&url, &api_key, &model, max_tokens, request, tx_clone).await
+                if let Err(e) = stream_anthropic(
+                    &url, &api_key, &model, max_tokens, request, tx_clone, policy, long_ttl,
+                )
+                .await
                 {
                     let _ = tx.send(Err(e)).await;
                 }
@@ -112,6 +130,7 @@ fn messages_url(endpoint: &str) -> String {
 }
 
 /// Send the request, parse the SSE stream, map events, and forward them through `tx`.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_anthropic(
     url: &str,
     api_key: &str,
@@ -119,17 +138,30 @@ pub async fn stream_anthropic(
     max_tokens: u64,
     request: LanguageModelRequest,
     tx: async_channel::Sender<Result<LanguageModelCompletionEvent>>,
+    policy: crate::provider::anthropic_cache::PromptCachingPolicy,
+    long_ttl: bool,
 ) -> Result<()> {
-    let body = build_request_body(model, max_tokens, &request)?;
+    let body = build_request_body(model, max_tokens, &request, policy, long_ttl)?;
     let client = reqwest::Client::builder()
         .build()
         .context("构建 reqwest client 失败")?;
 
-    let response = client
+    // Real Anthropic + long TTL needs the extended-cache-ttl beta header to
+    // activate the 1h breakpoint lifetime.
+    let beta_header = if long_ttl {
+        Some(crate::provider::anthropic_cache::EXTENDED_CACHE_TTL_BETA)
+    } else {
+        None
+    };
+    let mut req = client
         .post(url)
         .header("Content-Type", "application/json")
         .header("anthropic-version", "2023-06-01")
-        .header("x-api-key", api_key)
+        .header("x-api-key", api_key);
+    if let Some(beta) = beta_header {
+        req = req.header("anthropic-beta", beta);
+    }
+    let response = req
         .json(&body)
         .send()
         .await
@@ -177,6 +209,8 @@ fn build_request_body(
     model: &str,
     max_tokens: u64,
     request: &LanguageModelRequest,
+    policy: crate::provider::anthropic_cache::PromptCachingPolicy,
+    long_ttl: bool,
 ) -> Result<serde_json::Value> {
     use serde_json::{Value, json};
 
@@ -230,6 +264,12 @@ fn build_request_body(
                 .collect(),
         );
     }
+
+    // Place cache_control breakpoints according to the resolved policy. Done
+    // after body construction so it can upgrade the system string to blocks
+    // and mark the last tool / last message text blocks uniformly.
+    crate::provider::anthropic_cache::apply_prompt_caching(&mut body, policy, long_ttl);
+
     Ok(body)
 }
 
@@ -579,6 +619,14 @@ mod tests {
         let url = messages_url(&model.endpoint_url);
         let api_model = model.api_model_id();
         tokio::spawn(async move {
+            let policy = crate::provider::anthropic_cache::resolve_prompt_caching_policy(
+                None,
+                Some(&model.endpoint_url),
+            );
+            let long_ttl = crate::provider::anthropic_cache::supports_long_ttl(
+                policy,
+                Some(&model.endpoint_url),
+            );
             if let Err(e) = stream_anthropic(
                 &url,
                 &api_key,
@@ -586,6 +634,8 @@ mod tests {
                 512,
                 simple_request("hi"),
                 tx_clone,
+                policy,
+                long_ttl,
             )
             .await
             {

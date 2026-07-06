@@ -223,6 +223,13 @@ pub trait LanguageModel: Send + Sync {
     fn supports_tools(&self) -> bool {
         true
     }
+    /// Whether the provider supports long-lived prompt cache retention
+    /// (`cache_control.ttl:"1h"` on Anthropic, `prompt_cache_retention:"24h"`
+    /// on OpenAI). Defaults to `false`; concrete providers override based on
+    /// the endpoint host (official APIs only).
+    fn supports_long_prompt_cache_retention(&self) -> bool {
+        false
+    }
     fn max_token_count(&self) -> u64;
 
     /// Stream a completion. Returns a `BoxFuture` (handshake) that yields a `BoxStream` of events.
