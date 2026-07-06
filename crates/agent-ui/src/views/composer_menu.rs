@@ -1,12 +1,16 @@
 //! Composer `+` and `⁄` menus plus pending-attachment support.
 //!
 //! The `+` menu mirrors Codex.app's "add / plugins" popover; only "文件和文件夹" is wired to a
-//! real file picker, the rest are static decoration. The `⁄` menu mirrors Codex's slash-command
-//! popover and is entirely static — manox has no slash-command or skill infrastructure yet.
+//! real file picker, the rest are static decoration. The `⁄` menu's top section lists
+//! registered slash commands dynamically (from the `SlashCommandRegistry`); the rest
+//! (memory / skills) remains static decoration. Clicking a registered command inserts
+//! `/name ` into the composer for the user to complete and submit.
 //!
 //! A [`PendingAttachment`] is a file the user picked but has not yet sent. On submit the workspace
 //! turns each into message content: images become base64 [`MessageContent::Image`] blocks, text
 //! files are inlined into the message text wrapped in `<file>` tags.
+
+use std::rc::Rc;
 
 use std::path::{Path, PathBuf};
 
@@ -80,65 +84,6 @@ const PLUS_PLUGIN_ROWS: &[MenuRow] = &[
     },
 ];
 
-/// `⁄` menu command group — all static decoration.
-const SLASH_COMMAND_ROWS: &[MenuRow] = &[
-    MenuRow {
-        icon: IconName::Network,
-        name: "MCP",
-        desc: "显示 MCP 服务器状态",
-    },
-    MenuRow {
-        icon: IconName::CircleUser,
-        name: "个性",
-        desc: "选择回应方式",
-    },
-    MenuRow {
-        icon: IconName::Search,
-        name: "代码审查",
-        desc: "审查未暂存的更改，或与某个分支进行比较",
-    },
-    MenuRow {
-        icon: IconName::PanelLeft,
-        name: "侧边",
-        desc: "在临时分支中发起侧边对话",
-    },
-    MenuRow {
-        icon: IconName::File,
-        name: "初始化",
-        desc: "创建包含说明的 AGENTS.md 文件",
-    },
-    MenuRow {
-        icon: IconName::Frame,
-        name: "压缩",
-        desc: "压缩此会话的上下文",
-    },
-    MenuRow {
-        icon: IconName::Heart,
-        name: "反馈",
-        desc: "发送有关此聊天的反馈",
-    },
-    MenuRow {
-        icon: IconName::Bot,
-        name: "宠物",
-        desc: "唤醒或收起桌面宠物",
-    },
-    MenuRow {
-        icon: IconName::Copy,
-        name: "派生",
-        desc: "为此对话创建本地分支对话",
-    },
-    MenuRow {
-        icon: IconName::Info,
-        name: "状态",
-        desc: "显示对话 ID、上下文使用情况及额度跟踪",
-    },
-    MenuRow {
-        icon: IconName::CircleCheck,
-        name: "目标",
-        desc: "设置持续努力实现的目标",
-    },
-];
-
 /// `⁄` menu skills group. The `bool` is whether the skill is "个人" (personal) vs "系统" (system).
 const SLASH_SKILL_ROWS: &[(&str, &str, bool)] = &[
     (
@@ -194,6 +139,34 @@ fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
     })
 }
 
+/// A `⁄`-popover row for a registered slash command: a `/name` label in mono
+/// style plus its description. Clicking inserts the command into the composer.
+fn slash_command_item(name: &str, desc: &str, theme: &Theme) -> PopupMenuItem {
+    let fg = theme.foreground;
+    let muted = theme.muted_foreground;
+    let name = format!("/{name}");
+    let desc = desc.to_string();
+    PopupMenuItem::element(move |_window, _cx| {
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .child(
+                gpui::div()
+                    .text_sm()
+                    .text_color(fg)
+                    .child(gpui::StyledText::new(name.clone())),
+            )
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(desc.clone()),
+            )
+    })
+}
+
 /// Build the `+` popup menu. `on_files` runs when the real "文件和文件夹" row is clicked.
 pub fn build_plus_menu(
     menu: PopupMenu,
@@ -221,11 +194,30 @@ pub fn build_plus_menu(
     menu
 }
 
-/// Build the `⁄` popup menu — entirely static decoration.
-pub fn build_slash_menu(menu: PopupMenu, theme: &Theme) -> PopupMenu {
+/// Build the `⁄` popover. The top section lists registered slash commands
+/// dynamically; clicking one inserts `/name ` into the composer via
+/// `on_select(name)`. The memory and skills sections remain static decoration.
+pub fn build_slash_menu(
+    menu: PopupMenu,
+    theme: &Theme,
+    on_select: impl Fn(&str, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(420.)).scrollable(true);
-    for row in SLASH_COMMAND_ROWS {
-        menu = menu.item(menu_row_item(row, theme));
+    menu = menu.label("命令");
+    // Registered slash commands (dynamic). Falls back to an empty section when
+    // the registry is not yet initialized.
+    let on_select = Rc::new(on_select);
+    if let Some(reg) = crate::slash_command::SlashCommandRegistry::global() {
+        for cmd in reg.commands() {
+            let name = cmd.name().to_string();
+            let desc = cmd.description().to_string();
+            let on_select = on_select.clone();
+            menu = menu.item(slash_command_item(&name, &desc, theme).on_click(
+                move |_, window, cx| {
+                    on_select(&name, window, cx);
+                },
+            ));
+        }
     }
     menu = menu.separator().label("记忆");
     menu = menu.item(PopupMenuItem::Label("生成开".into()));

@@ -57,6 +57,7 @@ crates/
 
 **核心模块：**
 
+- `system_prompt.rs` — 主 agent system prompt 构建层。`build_main_system_prompt` 注入运行时身份：thread id、cwd、project root、os/shell/date + 工作纪律（cwd 锚定、截断重试、commit 自证）。`build_completion_request` 对主 Thread 调用 `system_prompt_fn`（子 agent 不受影响，保留其 `agent_def.rs` 加载的 *.md system prompt）。
 - `thread.rs` — `Thread` 状态机（gpui `Entity<Thread>` + `EventEmitter<ThreadEvent>`）。`run_turn` 在 gpui executor 上 spawn 一个 task，task 内循环：`build_completion_request` → `model.stream_completion` → 逐事件 `handle_completion_event` → 收集 `pending_tool_uses` → 流结束后按「免审批并行 / 需审批串行」分区执行（gpui `Task` 非 Send，故并发 spawn + 顺序 await）→ 逐 tool 审批→执行→追加 ToolResult 消息→回到循环。无 tool_use 时 `EndTurn` 退出。子 agent 字段：`system`（子 system prompt，主 Thread=None）、`depth`（主=0，子=父+1）、`max_turns`/`turn_count`/`cap_summary_injected`（截断时注入一轮总结而非硬停）、`pending_authorizations`（id→oneshot，多槽）、`pending_child_auth`（复合 id→`ChildAuthRoute`，授权冒泡路由）。子 agent 对话不单独存内存 map——直接作为 JSON envelope 写进父 ToolResult.content（见「快照与持久化」）。`new_subagent` 构造子 Thread，`tools_fn` 闭包解决「AgentTool 需子 WeakEntity 但子 Thread 还没建」的先有鸡先有蛋问题。
 
 - `language_model.rs` — `LanguageModel` trait（`stream_completion` 返回 `BoxFuture` 产出 `BoxStream<Result<LanguageModelCompletionEvent>>`）。通用类型：`Role`、`MessageContent`、`LanguageModelRequest`、`LanguageModelToolUse`、`LanguageModelToolResult` 等。
@@ -78,13 +79,22 @@ crates/
 
 - `tool.rs` + `tool/permission.rs` — `AgentTool` trait + `ToolRegistry` + `PermissionCache`（会话级 always-allow），`PermissionDecision::AllowOnce | AlwaysAllow | Deny`，`ToolAuthorizationResponse`（审批载荷：`Decision(PermissionDecision)` 或 `AskUserQuestion { answers, response }`，后者由 thread 短路为 ToolResult，不经 `run` 执行）。
 
-- `tools/` — 9 个内置工具：`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`、`ask_user`（`AskUserQuestion`，向用户提多选澄清问题）、`agent`（spawn 子 agent，见「多 agent 系统」）。写操作（write_file/edit_file）、bash 与 `AskUserQuestion` 需审批；`agent` 本身不审批（spawn 是只读的，子 agent 内部工具各自审批）。bash/grep 经 tokio 子进程 + `async_channel` 桥回 gpui Task。
+- `tools/` — 10 个内置工具：`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`、`ask_user`（`AskUserQuestion`，向用户提多选澄清问题）、`agent`（spawn 子 agent，见「多 agent 系统」）、`self_info`（查看运行时身份：thread id、cwd、project、os、shell、date）。写操作（write_file/edit_file）、bash 与 `AskUserQuestion` 需审批；`agent`/`self_info` 本身不审批。bash 截断阈值 64KB（累计 dropped 总量，前置标注 + 引导收窄命令）；edit_file/read_file 工具描述使用具体例子 `[<abs-path>#<tag>]` 避免裸占位符。
 
 - `runtime.rs` — 全局 tokio runtime（`OnceLock<Handle>`），`init` 时 build 并 forget，`handle()` 取全局 Handle。供 provider 在 gpui executor 上 spawn tokio 任务跑 HTTP 流。
 
 - `db.rs` — `ThreadsDatabase`（SQLite `threads` 表，路径 `$HOME/.config/cx/manox/threads.db`），`Mutex<Connection>` 同步操作。
 
 - `thread_store.rs` — `ThreadStore` 进程全局 Entity（`OnceLock`），管理 Thread 摘要列表，提供 `save_thread` 异步落盘 + refresh。
+- `hashline/` — 行锚定补丁系统 + 快照恢复：
+  - `mod.rs` — 全局 `SnapshotStore`（`OnceLock<Mutex<>>`），`init()` 在 `agent::init` 时调用。
+  - `hash.rs` — `compute_tag` 计算 4-hex 内容哈希（规范化文本的 CRC32）。
+  - `snapshot.rs` — `SnapshotStore` 管理 path → `Snapshot`（raw bytes + tag + line_count），`read_file` 记录前调用 `store_snapshot`，`edit_file` 用 `get_snapshot` 验证 tag。
+  - `parser.rs` — 补丁解析：支持 `SWAP N.=M`、`DEL N.=M`、`INS.PRE/POST/HEAD/TAIL N`、`SWAP.BLK N` 等操作，产出 `FilePatch` → `Vec<Op>`。
+  - `apply.rs` — 补丁应用：`apply` 对 ORIGINAL 行号逐 op 后向应用；tag 过期时 `try_recover` 做 3-way merge（基于内容范围定位快照片段到当前文本）。
+  - `block.rs` — 行范围块结构（`BlockError`）。
+  - `recovery.rs` — `try_recover` / `try_recover_with_snapshot` 恢复逻辑。
+  - 工具链：`read_file` 输出 `[PATH#TAG]` 头部 + `N:TEXT` 带行号内容；`edit_file` 输入 hashline patch 格式，复用 TAG 验证后应用。
 
 **Thread 审批流：** 工具需审批时，`run_tool` 发 `ThreadEvent::ToolCallAuthorization` 携带 `oneshot::Sender`，UI 弹窗后调用 `Thread::respond_authorization` 回传 `ToolAuthorizationResponse`（普通工具为 `Decision(PermissionDecision)`，`AskUserQuestion` 为 `AskUserQuestion { answers, response }`，thread 据此短路生成 ToolResult 而不执行 `run`），task 在 gpui executor 上 `await` oneshot receiver。
 
@@ -137,6 +147,7 @@ crates/
 - **授权冒泡**：子 agent 内部工具需审批时，子 Thread emit `ToolCallAuthorization`，`agent` 工具的订阅把它以**复合 id** `<parent_tool_use_id>::<child_auth_id>` 重新 emit 到父 Thread。`Thread::respond_authorization` 三分支：命中本 Thread `pending_authorizations`→oneshot send；命中 `pending_child_auth`（复合 id）→upgrade child 转发；都不命中→静默（可能已 cancel）。UI overlay 透明处理复合 id，`pending_auths: Vec` 多槽避免两个并行子 agent 同时冒泡时互相覆盖。
 - **权限继承**：子 `PermissionCache` 用 `PermissionCache::from_snapshot(parent.permission_snapshot())` 预填父的 always-allow 快照，子不再因父已授权的工具重复弹窗；子新授权不回写父（路由回子 Thread）。
 - **深度/嵌套限制**：`Thread.depth` 主=0 子=父+1，`MAX_DEPTH=5`。`build_child_registry` 仅在 `allow_nesting && child_depth<MAX_DEPTH` 时注册 `agent` 工具，`run_streaming` 开头 `depth+1>MAX_DEPTH` 直接 Err。双重保险。
+- **工具集范围（MCP 不进子 agent）**：`build_child_registry` 基于 `base_tools` 构造（按 frontmatter `tools`/`disallowed_tools` 过滤），`default_registry` 才在 `base_tools` 之外追加 MCP 工具。故 MCP 工具仅主 agent 可用——子 agent 是受限 context，首版不继承全局 MCP 能力；若 frontmatter `tools` 列了 `mcp_*` 名也会因不在 `base_tools` 而被 `is_tool_allowed` 拒绝。
 - **max_turns 截断**：达 `max_turns` 时注入一轮总结 user 消息（`cap_summary_injected` 防二次循环），让子 agent 产出连贯最终回复而非硬停；第二轮再触顶才 `Stop(EndTurn)`。
 - **完成信号**：`setup_child` 订阅只对真终态（`Stop(EndTurn|MaxTokens|Refusal)` + `Error`）发 `done_tx`；`Stop(ToolUse)` 是非终端中间态（子下一轮继续跑工具），忽略之，否则会把子第一轮未跑工具的文本当成最终结果回传父。
 - **快照与持久化**：子结束后，`agent` 工具把 JSON envelope `{"final":..., "messages":[...]}` 作为 ToolResult.content 写入规范 `Thread::messages`——这是子对话的**唯一来源**（不另存内存 map，长会话无泄漏）。UI live 路径从 `ThreadEvent::ToolResult` 的 `output` 用 `agent_sub_messages` 解析喂展开面板；reload 路径从 `rebuild_from_messages` 同样解析 envelope 还原 `sub_messages`。**上下文隔离**：`build_completion_request` 在映射到模型请求时用 `model_facing_content` 把 `agent` 的 ToolResult envelope 剥成只 `final` 文本——规范消息保留完整 envelope（持久化+UI 用），但父 LLM 只看到 `final`，子 agent 的中间工具调用/结果/reasoning 不泄漏进父上下文。
@@ -160,6 +171,7 @@ crates/
 - LLM 配置：`~/.config/cx/cx.providers.config.yaml`（格式见 `provider/config.rs` 的 `CxConfig`）
 - SQLite 数据库：`~/.config/cx/manox/threads.db`
 - 子 agent 定义：`~/.config/cx/manox/agents/*.md`（frontmatter + system prompt，见 `agent_def.rs`）
+- MCP 配置：`~/.config/cx/manox/mcp.toml`（`[mcp_servers.<name>]` 表，stdio `command`/`args`/`env`/`cwd` 或 streamable HTTP `url`/`headers`，见 `mcp/config.rs`。纯文件配置，不接入 UI）
 - API key 源：macOS Keychain（`keychain:SERVICE`）、环境变量（`env:VAR`）、字面量（`literal:...`）、shell 命令（`$(shell ...)`）
 
 ## 项目规则
@@ -171,3 +183,4 @@ crates/
 - **PR 提交后与 remora 达成一致**：先提交 PR，再运行 `/remora:adversarial-review [prompt]`，与 remora 多轮交锋直到双方达成一致后再合并。
 - **禁止抄袭第三方 crate 代码**：若想引入第三方 crate 的特性，应规范引入该 crate 作为依赖。对于不便规范引入的（过重、未暴露相关接口、archived 等），可以参考其架构思想、设计思路、实现方法，但禁止抄袭代码（复制粘贴后修改）。
 - **注释规范**：注释一律用英文，面向终态（描述代码维持的不变量/意图）而非过程流水账，非必要不注释。详见 `~/.claude/rules/code-comments.md`。
+

@@ -109,6 +109,13 @@ impl CommandRegistry {
     pub fn list(&self) -> Vec<&Arc<CommandDefinition>> {
         self.commands.values().collect()
     }
+
+    /// `(registry_key, definition)` pairs, for populating a UI command popover
+    /// where the surfaced name must be the full key (e.g. `gitwork:deliver`),
+    /// not the bare filename stem stored in `CommandDefinition.name`.
+    pub fn entries(&self) -> Vec<(&String, &Arc<CommandDefinition>)> {
+        self.commands.iter().collect()
+    }
 }
 
 fn scan_commands_dir(
@@ -210,6 +217,13 @@ pub fn init() {
 
 pub fn global() -> &'static CommandRegistry {
     REGISTRY.get().expect("command registry not initialized")
+}
+
+/// Non-panicking accessor for callers that may run before `agent::init`
+/// (e.g. the UI slash-command registry init, which `main` calls after
+/// `agent::init` but is still safer not to assume).
+pub fn try_global() -> Option<&'static CommandRegistry> {
+    REGISTRY.get()
 }
 
 #[cfg(test)]

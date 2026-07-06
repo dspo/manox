@@ -41,6 +41,16 @@ pub struct AgentTaskCtx {
     pub weak: WeakEntity<Workspace>,
 }
 
+/// Render-time context for plain tool-call cards. Carries a weak handle to the
+/// owning `Workspace` so the card's header can toggle its own `collapsed` flag
+/// (the flag lives on the `ToolCallItem` so the user's choice survives scroll-
+/// driven remounts). `None` after the Workspace drops — clicks no-op and the
+/// card stays in whatever state it last rendered.
+#[derive(Clone)]
+pub struct ToolCallCtx {
+    pub weak: WeakEntity<Workspace>,
+}
+
 /// Build a `TextViewStyle` that matches the current theme's highlight palette.
 fn text_view_style(theme: &Theme) -> TextViewStyle {
     TextViewStyle {
@@ -102,13 +112,23 @@ impl MessageItem {
     }
 
     /// Flip every streaming flag off (terminal `Stop`). Called once per turn,
-    /// so the O(items) walk is harmless.
+    /// so the O(items) walk is harmless. Also drives the tool-call auto-collapse:
+    /// a tool card that hasn't been touched by the user gets folded into a
+    /// single-line card so it stops competing with the assistant's final reply.
     pub fn finalize_streaming(&mut self) {
         match &mut self.kind {
             ConvItem::Assistant { streaming, .. } | ConvItem::Reasoning { streaming, .. } => {
                 *streaming = false
             }
-            ConvItem::ToolCall(t) => t.streaming = false,
+            ConvItem::ToolCall(t) => {
+                t.streaming = false;
+                if matches!(
+                    t.status,
+                    ToolCallStatus::Success | ToolCallStatus::Error | ToolCallStatus::Denied
+                ) {
+                    t.collapsed = !t.user_toggled;
+                }
+            }
             ConvItem::AgentTask(t) => t.streaming = false,
             _ => {}
         }
@@ -129,25 +149,32 @@ impl Render for MessageItem {
                 weak: ws.downgrade(),
             }
         });
+        let tool_ctx = self.weak_workspace.upgrade().map(|ws| ToolCallCtx {
+            weak: ws.downgrade(),
+        });
         centered(render_item(
             &self.kind,
             self.id,
             &self.role,
             &theme,
             agent_ctx.as_ref(),
+            tool_ctx.as_ref(),
         ))
     }
 }
 
 /// Render a `ConvItem` as an element. `ix` is the entry index (stable key for collapsibles/TextView).
-/// `agent_ctx` supplies expansion state for `AgentTask` cards; `None` renders
-/// them collapsed with no-op clicks (used when the owning Workspace is gone).
+/// `agent_ctx` supplies expansion state for `AgentTask` cards; `tool_ctx` carries
+/// the workspace weak handle for `ToolCall` cards to flip their own collapse flag.
+/// `None` renders them in a static state with no-op clicks (used when the owning
+/// Workspace is gone).
 pub fn render_item(
     item: &ConvItem,
     ix: usize,
     role: &str,
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
+    tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     match item {
         ConvItem::User(text) => render_user(text, ix, theme),
@@ -155,8 +182,8 @@ pub fn render_item(
             render_assistant(text, *streaming, ix, role, theme)
         }
         ConvItem::Reasoning { text, streaming } => render_reasoning(text, ix, *streaming, theme),
-        ConvItem::ToolCall(t) => render_tool_call(t, ix, theme),
-        ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx),
+        ConvItem::ToolCall(t) => render_tool_call(t, ix, theme, tool_ctx),
+        ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx),
         ConvItem::Error(msg) => render_error(msg, ix, theme),
     }
 }
@@ -341,8 +368,16 @@ fn lang_hint_for_tool(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Render a tool-call card: title + status icon + copy button + monospace output.
-pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::AnyElement {
+/// Render a tool-call card: title + status icon + copy button + (collapsible)
+/// monospace output. While streaming the body is always shown so the user can
+/// watch the output land; once a terminal status arrives the body auto-folds
+/// to a single-line card unless the user pre-toggled it open.
+pub fn render_tool_call(
+    item: &ToolCallItem,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
     use agent::ToolCallStatus;
     let (status_icon, status_color, status_label) = match item.status {
         ToolCallStatus::PendingApproval => {
@@ -360,6 +395,19 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
         item.title.clone()
     };
 
+    // Body is shown while streaming (live tail) or when the user has expanded
+    // the card post-completion. Auto-collapse hides it once the tool reaches
+    // a terminal status and the user hasn't manually opened it.
+    let show_body = item.streaming || !item.collapsed;
+    let chevron = if item.collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    };
+
+    let id_for_toggle = item.id.clone();
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+
     let mut card = v_flex()
         .w_full()
         .rounded(theme.radius)
@@ -369,11 +417,48 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
         .overflow_hidden()
         .child(
             h_flex()
+                .id(("tool-header", ix))
                 .w_full()
                 .px_3()
                 .py_1p5()
                 .gap_2()
                 .items_center()
+                .cursor_pointer()
+                .on_click(move |_, _window, cx: &mut App| {
+                    // Toggle the `collapsed` flag on the matching `ToolCallItem`
+                    // so the user's choice survives scroll-driven remounts.
+                    // The list remeasure is needed because a body show/hide
+                    // changes the card's height, and the list caches a per-item
+                    // measured height that must be invalidated for the new
+                    // layout to take hold.
+                    let Some(weak) = weak_workspace.clone() else {
+                        return;
+                    };
+                    let _ = weak.update(cx, |w, cx| {
+                        let id = id_for_toggle.clone();
+                        let conv = w.conversation.clone();
+                        conv.update(cx, |c, cx| {
+                            if let Some(ix) = c.find_tool(&id, &*cx)
+                                && let Some(item) = c.items().get(ix)
+                            {
+                                item.update(cx, |item, cx| {
+                                    if let ConvItem::ToolCall(t) = item.kind_mut() {
+                                        t.collapsed = !t.collapsed;
+                                        t.user_toggled = true;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        w.list_state().remeasure();
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(chevron)
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
                 .child(
                     Icon::new(IconName::SquareTerminal)
                         .small()
@@ -408,7 +493,7 @@ pub fn render_tool_call(item: &ToolCallItem, ix: usize, theme: &Theme) -> gpui::
         item.output.clone()
     };
 
-    if !display_output.is_empty() {
+    if show_body && !display_output.is_empty() {
         card = card.child(render_tool_output(
             &display_output,
             &item.name,
@@ -472,11 +557,14 @@ fn render_tool_output(
 /// child conversation. Collapsed shows the live streamed tail (or the final
 /// result once the sub-agent stops); expanded rebuilds the child `Thread`'s
 /// messages into a nested conversation and renders each item recursively.
+/// `tool_ctx` is forwarded to recursive `render_item` calls so any nested
+/// tool-call cards keep their own collapse state.
 pub fn render_agent_task(
     item: &AgentTaskItem,
     ix: usize,
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
+    tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
     let (status_icon, status_color, status_label) = match item.status {
@@ -586,18 +674,17 @@ pub fn render_agent_task(
                 card = card.child(render_agent_body(&collapsed_body, ix, theme));
             }
         } else {
-            card =
-                card.child(
-                    v_flex()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .px_3()
-                        .py_2()
-                        .gap_1()
-                        .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                            render_item(sitem, six, "agent", theme, agent_ctx)
-                        })),
-                );
+            card = card.child(
+                v_flex()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .px_3()
+                    .py_2()
+                    .gap_1()
+                    .children(sub_items.iter().enumerate().map(|(six, sitem)| {
+                        render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx)
+                    })),
+            );
         }
     } else if !collapsed_body.is_empty() {
         card = card.child(render_agent_body(&collapsed_body, ix, theme));
@@ -724,6 +811,8 @@ pub fn build_items(messages: &[Message]) -> Vec<ConvItem> {
                                     output: String::new(),
                                     is_error: false,
                                     streaming: false,
+                                    collapsed: true,
+                                    user_toggled: false,
                                 }));
                             }
                         }
@@ -765,6 +854,11 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
             output: tr.content.clone(),
             is_error: tr.is_error,
             streaming: false,
+            collapsed: !matches!(
+                status,
+                ToolCallStatus::Running | ToolCallStatus::PendingApproval
+            ),
+            user_toggled: false,
         }));
         return;
     };

@@ -808,9 +808,15 @@ impl Thread {
         let input = tu.input.clone();
         let (sink, rx) = crate::tool::ToolOutputSink::channel(id.clone().into());
         let id_for_drain = id.clone();
-        let result_task: Task<Result<String, String>> = this.update(cx, |_this, cx| {
-            tool.run_streaming(input, cancel.clone(), sink, cx)
-        })?;
+        // Invoke the tool via `cx.update` (App context, no entity lease) rather
+        // than `this.update`. `this.update` would hold a write lease on the
+        // owning Thread, and tools that read the owning Thread from inside
+        // their `run` — `self_info` does `self.thread.read_with` — would
+        // re-lease the same entity and trip gpui's `double_lease_panic`. The
+        // tool returns its `Task` synchronously and does not need the Thread
+        // leased on its behalf.
+        let result_task: Task<Result<String, String>> =
+            cx.update(|cx| tool.run_streaming(input, cancel.clone(), sink, cx));
         // Drain live output chunks to the UI while the tool runs. A foreground
         // spawn is used (not background_spawn) because emitting requires an
         // `AsyncApp`, which is `!Send` (`Rc`-backed). The receiver closes once
@@ -1260,13 +1266,12 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
         "bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let single = cmd.lines().next().unwrap_or("").trim().to_string();
-            let trimmed = if single.chars().count() > 80 {
+            if single.chars().count() > 80 {
                 let t: String = single.chars().take(80).collect();
                 format!("{t}…")
             } else {
                 single
-            };
-            format!("bash: {trimmed}")
+            }
         }
         "grep" => {
             let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
@@ -1362,6 +1367,31 @@ mod tests {
         assert_eq!(tool_title("AskUserQuestion", &json!({})), "AskUserQuestion");
     }
 
+    /// Bash tool title is the first line of the command, no `bash:` prefix —
+    /// the card already carries a terminal icon, so the prefix would be
+    /// redundant. Truncates to 80 chars with a trailing ellipsis.
+    #[test]
+    fn bash_title_strips_prefix_and_uses_first_line() {
+        let input = json!({ "command": "gh pr create -R dspo/manox --title foo" });
+        assert_eq!(
+            tool_title("bash", &input),
+            "gh pr create -R dspo/manox --title foo"
+        );
+
+        let long = "a".repeat(120);
+        let input = json!({ "command": long.clone() });
+        let out = tool_title("bash", &input);
+        assert_eq!(out.chars().count(), 81);
+        assert!(out.ends_with('…'));
+
+        let multi = "git status\ncargo build --release";
+        let input = json!({ "command": multi });
+        assert_eq!(tool_title("bash", &input), "git status");
+
+        let input = json!({});
+        assert_eq!(tool_title("bash", &input), "");
+    }
+
     /// The `agent` tool's persisted ToolResult carries a JSON envelope
     /// `{"final":..., "messages":[...]}`. The model must only see the `final`
     /// text — otherwise the sub-agent's whole conversation (tool calls, results,
@@ -1421,5 +1451,73 @@ mod tests {
             panic!("expected ToolResult");
         };
         assert_eq!(out.content, "plain summary");
+    }
+
+    /// True regression guard for the `run_tool_inner` double-lease fix: it
+    /// calls `run_tool_inner` itself with a `self_info` tool use. On the
+    /// unfixed code (`this.update` wrapping the tool call) the owning
+    /// Thread holds a write lease while `self_info`'s `run` does
+    /// `read_with` on it — tripping `double_lease_panic` mid-task, so the
+    /// spawned task never completes and `result` stays `None`. On the fixed
+    /// code (`cx.update`, no entity lease) the task completes, returns
+    /// `Ok(())`, and appends a `ToolResult` carrying the thread id.
+    #[test]
+    fn run_tool_inner_self_info_does_not_double_lease() {
+        use crate::language_model::{LanguageModelToolResult, LanguageModelToolUse};
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                super::ThreadId("reg-run-tool-inner".to_string()),
+                std::path::PathBuf::from("/tmp"),
+                None,
+                Vec::new(),
+                None,
+                cx,
+            )
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_1".to_string(),
+            name: Arc::from("self_info"),
+            raw_input: "{}".to_string(),
+            input: serde_json::json!({}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let weak = thread.downgrade();
+        let cancel = CancellationToken::new();
+        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let r = result.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *r.lock().unwrap() =
+                    Some(super::Thread::run_tool_inner(weak, tu, cancel, &mut cx).await);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+
+        let res =
+            result.lock().unwrap().take().expect(
+                "run_tool_inner did not complete (task panicked — double-lease regression?)",
+            );
+        assert!(res.is_ok(), "run_tool_inner failed: {:?}", res.err());
+
+        let messages = cx.update(|cx| thread.read_with(cx, |t, _| t.messages.clone()));
+        let last = messages.last().expect("no message appended");
+        let MessageContent::ToolResult(LanguageModelToolResult { content, .. }) =
+            last.content.last().expect("no content")
+        else {
+            panic!("expected ToolResult, got {:?}", last.content);
+        };
+        assert!(
+            content.contains("reg-run-tool-inner"),
+            "expected thread id in tool result, got: {content}"
+        );
     }
 }
