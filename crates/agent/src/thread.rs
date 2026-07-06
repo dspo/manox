@@ -239,7 +239,15 @@ impl Thread {
             // off: a thread that already has a title is treated as if it had
             // been evaluated at the current user-count, so it does not re-run
             // the title stream on its first post-reload turn.
-            let user_count = messages.iter().filter(|m| m.role == Role::User).count();
+            //
+            // Count only user messages with text (real user turns); tool
+            // results are role User but carry no user-typed text, so including
+            // them would inflate the count and shift the cadence in tool-heavy
+            // turns. Mirrors the filter in `maybe_generate_title`.
+            let user_count = messages
+                .iter()
+                .filter(|m| m.role == Role::User && message_has_text(m))
+                .count();
             let title_last_eval_user_count = title.as_ref().map(|_| user_count);
             let weak = cx.weak_entity();
             Self {
@@ -403,7 +411,7 @@ impl Thread {
         let user_count = self
             .messages
             .iter()
-            .filter(|m| m.role == Role::User)
+            .filter(|m| m.role == Role::User && message_has_text(m))
             .count();
         if self.title_last_eval_user_count == Some(user_count) {
             return;
