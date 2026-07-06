@@ -1,7 +1,8 @@
 //! Composer `+` and `⁄` menus plus pending-attachment support.
 //!
-//! The `+` menu mirrors Codex.app's "add / plugins" popover; only "文件和文件夹" is wired to a
-//! real file picker, the rest are static decoration. The `⁄` menu's top section lists
+//! The `+` menu mirrors Codex.app's "add / plugins" popover; "文件和文件夹" opens
+//! a real file picker and "计划模式" toggles the thread's plan mode. The remaining
+//! rows are static decoration. The `⁄` menu's top section lists
 //! registered slash commands dynamically (from the `SlashCommandRegistry`); the rest
 //! (memory / skills) remains static decoration. Clicking a registered command inserts
 //! `/name ` into the composer for the user to complete and submit.
@@ -30,7 +31,8 @@ struct MenuRow {
     desc: &'static str,
 }
 
-/// `+` menu "添加" group. Only `文件和文件夹` carries behavior (handled by the caller); the rest
+/// `+` menu "添加" group. `文件和文件夹` (index 0) opens the file picker and
+/// `计划模式` (index 3) toggles plan mode, both wired by the caller; the rest
 /// are static decoration mirroring Codex.app.
 const PLUS_ADD_ROWS: &[MenuRow] = &[
     MenuRow {
