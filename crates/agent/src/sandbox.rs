@@ -84,6 +84,18 @@ impl SandboxPolicy {
         self.protected_paths.iter().any(|p| canon.starts_with(p))
     }
 
+    /// The combined write decision: a path is writable only if it falls under
+    /// a writable root AND is not protected. This is the single predicate both
+    /// FS write tools and the bash unsandboxed `cwd` pre-check consult, so the
+    /// Rust-side confinement and the seatbelt `(allow file-write* (subpath
+    /// ...))` + `(deny file-write* (subpath ".git"))` policy classify paths
+    /// identically — a protected subtree (`.git`) is under the project root, so
+    /// `is_writable` alone would admit it; the protection deny must be applied
+    /// on top, matching seatbelt's more-specific-rule-wins ordering.
+    pub fn is_write_allowed(&self, path: &Path) -> bool {
+        self.is_writable(path) && !self.is_protected(path)
+    }
+
     /// Render a seatbelt (`.sbpl`) policy string. Denylist base
     /// (`(allow default)`) with an allowlist over writes: deny all writes,
     /// re-allow to writable roots, deny to protected paths, deny all network
@@ -238,6 +250,36 @@ mod tests {
     fn seatbelt_denies_network() {
         let s = policy().render_seatbelt();
         assert!(s.contains("(deny network*)"), "network denied: {s}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fs_and_seatbelt_agree_on_representative_paths() {
+        // The Rust-side `is_write_allowed` (used by FS `resolve_path_for_write`
+        // and the bash unsandboxed cwd pre-check) and the seatbelt
+        // `(allow file-write* (subpath ...))` + `(deny ... .git)` lines must
+        // classify the same paths the same way — otherwise a write FS rejects
+        // bash allows (or vice-versa), the inconsistency behind issue 3. A
+        // protected subtree (`.git`) is under the project root, so the combined
+        // `is_write_allowed` (writable AND not protected) is the predicate that
+        // matches seatbelt's more-specific-rule-wins ordering.
+        let p = policy();
+        let s = p.render_seatbelt();
+        // Project root + tmp are writable on both sides.
+        assert!(p.is_write_allowed(Path::new("/tmp/manox-sandbox-test/src/lib.rs")));
+        assert!(s.contains("/tmp/manox-sandbox-test"));
+        assert!(p.is_write_allowed(&std::env::temp_dir().join("scratch")));
+        // Sibling worktree, /etc are NOT writable on either side.
+        assert!(!p.is_write_allowed(Path::new("/tmp/manox-sibling-worktree/x")));
+        assert!(!p.is_write_allowed(Path::new("/etc/passwd")));
+        // The seatbelt policy string contains no `allow` for these.
+        assert!(!s.contains("/tmp/manox-sibling-worktree"));
+        assert!(!s.contains("/etc/passwd"));
+        // `.git` is under the project root (so `is_writable` alone is true) but
+        // protected — the combined predicate must reject it, matching seatbelt's
+        // explicit deny.
+        assert!(!p.is_write_allowed(Path::new("/tmp/manox-sandbox-test/.git/config")));
+        assert!(s.contains("deny file-write* (subpath"));
     }
 
     #[cfg(target_os = "macos")]
