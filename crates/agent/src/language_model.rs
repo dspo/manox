@@ -132,6 +132,31 @@ pub enum LanguageModelToolChoice {
     None,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    #[default]
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ReasoningEffort {
+    pub const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
+
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 /// A single completion request.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LanguageModelRequest {
@@ -143,6 +168,8 @@ pub struct LanguageModelRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub thinking_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// A streaming completion event.

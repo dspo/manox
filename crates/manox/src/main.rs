@@ -91,7 +91,7 @@ fn main() {
 
         let window_options = WindowOptions {
             titlebar: Some(TitleBar::title_bar_options()),
-            window_bounds: Some(WindowBounds::centered(size(px(1100.), px(760.)), cx)),
+            window_bounds: Some(WindowBounds::centered(size(px(1320.), px(820.)), cx)),
             ..Default::default()
         };
 

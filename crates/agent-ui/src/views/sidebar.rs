@@ -206,7 +206,7 @@ impl Render for Sidebar {
         v_flex()
             .h_full()
             .w(self.width)
-            .bg(theme.background)
+            .bg(theme.secondary.opacity(0.28))
             .border_r_1()
             .border_color(theme.border)
             // Scrollable body: top menu + projects + conversations.
@@ -279,6 +279,7 @@ impl Render for Sidebar {
                         )
                     }))),
             )
+            .child(render_account_footer(&theme))
     }
 }
 
@@ -576,4 +577,58 @@ fn truncate(s: &str, max_chars: usize) -> String {
     } else {
         one_line
     }
+}
+
+fn render_account_footer(theme: &Theme) -> AnyElement {
+    let user = std::env::var("USER").unwrap_or_else(|_| "manox".to_string());
+    h_flex()
+        .w_full()
+        .flex_shrink_0()
+        .px_3()
+        .py_3()
+        .border_t_1()
+        .border_color(theme.border)
+        .gap_2()
+        .items_center()
+        .child(
+            h_flex()
+                .size(px(28.))
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme.accent.opacity(0.12))
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.foreground)
+                .child(
+                    user.chars()
+                        .next()
+                        .map(|c| c.to_uppercase().to_string())
+                        .unwrap_or_else(|| "M".to_string()),
+                ),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(user),
+                )
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(i18n::t("sidebar-account-plan")),
+                ),
+        )
+        .child(
+            Button::new("sidebar-account-menu")
+                .ghost()
+                .xsmall()
+                .icon(IconName::Ellipsis),
+        )
+        .into_any_element()
 }

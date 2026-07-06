@@ -17,6 +17,7 @@ sidebar-time-minutes = {$count} 分钟前
 sidebar-time-hours = {$count} 小时前
 sidebar-time-days = {$count} 天前
 sidebar-time-weeks = {$count} 周前
+sidebar-account-plan = Plus
 
 ### message.rs
 message-reasoning = 思考
@@ -245,6 +246,27 @@ workspace-mode-section = 模式
 workspace-yolo-on-notice = YOLO 模式已开启：工具调用免审批，bash 在沙箱外运行。
 workspace-yolo-off-notice = 已切换到普通模式：恢复审批与沙箱。
 workspace-empty-prompt = 我们该做什么？
+workspace-open-location = 打开位置
+workspace-open-location-mock = 在编辑器中打开项目的功能尚未接线。
+workspace-effort-section = 推理强度
+workspace-effort-low = 低
+workspace-effort-medium = 中
+workspace-effort-high = 高
+workspace-effort-xhigh = 极高
+workspace-effort-max = 最大
+workspace-env-title = 环境信息
+workspace-env-changes = 变更
+workspace-env-local = 本地 {$name}
+workspace-env-no-project = 暂无项目
+workspace-env-model = 模型 {$name}
+workspace-env-tokens = Token {$count}
+workspace-env-modes = 模式
+workspace-env-plan-on = 计划模式
+workspace-env-plan-off = 普通规划
+workspace-env-yolo-on = 完全访问
+workspace-env-yolo-off = 审批模式
+workspace-env-sources = 来源
+workspace-env-no-sources = 暂无来源
 
 ### views/composer_menu.rs
 composer-add-label = 添加

@@ -236,6 +236,11 @@ fn build_request_body(
         // 24h retention only on official OpenAI endpoints.
         body["prompt_cache_retention"] = Value::String("24h".to_string());
     }
+    if let Some(effort) = request.reasoning_effort {
+        body["reasoning"] = json!({
+            "effort": effort.wire_value(),
+        });
+    }
     // System prompt (e.g. a sub-agent's) goes to the top-level `instructions`
     // field — the OpenAI Responses-recommended slot — rather than a `system`
     // role message item. Anthropic wire lifts it to `system` the same way.
@@ -644,6 +649,7 @@ mod tests {
     use super::*;
     use crate::language_model::{
         LanguageModelRequestMessage, LanguageModelRequestTool, LanguageModelToolResult,
+        ReasoningEffort,
     };
     use crate::provider::WireApi;
     use std::sync::Arc;
@@ -674,6 +680,14 @@ mod tests {
         assert_eq!(tools[0]["name"], "bash");
         assert!(tools[0]["description"].is_string());
         assert!(tools[0]["parameters"].is_object());
+    }
+
+    #[test]
+    fn build_request_body_includes_reasoning_effort() {
+        let mut req = req_with_tool();
+        req.reasoning_effort = Some(ReasoningEffort::XHigh);
+        let body = build_request_body("m", 64, &req, "test-key", false);
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 
     #[test]

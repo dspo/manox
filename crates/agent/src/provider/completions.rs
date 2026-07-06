@@ -242,6 +242,9 @@ fn build_request_body(
     if long_ttl {
         body["prompt_cache_retention"] = Value::String("24h".to_string());
     }
+    if let Some(effort) = request.reasoning_effort {
+        body["reasoning_effort"] = Value::String(effort.wire_value().to_string());
+    }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
@@ -617,6 +620,7 @@ mod tests {
     use super::*;
     use crate::language_model::{
         LanguageModelRequestMessage, LanguageModelRequestTool, LanguageModelToolResult,
+        ReasoningEffort,
     };
     use crate::provider::WireApi;
 
@@ -646,6 +650,14 @@ mod tests {
         assert_eq!(tools[0]["function"]["name"], "bash");
         assert!(tools[0]["function"]["description"].is_string());
         assert!(tools[0]["function"]["parameters"].is_object());
+    }
+
+    #[test]
+    fn build_request_body_includes_reasoning_effort() {
+        let mut req = req_with_tool();
+        req.reasoning_effort = Some(ReasoningEffort::Max);
+        let body = build_request_body("m", 64, &req, "test-key", false);
+        assert_eq!(body["reasoning_effort"], "max");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use gpui::prelude::*;
 use gpui::{Div, px};
 
 /// Max content width (centered, width-capped).
-pub const CONTENT_MAX_W: f32 = 760.0;
+pub const CONTENT_MAX_W: f32 = 736.0;
 
 /// Wrap content in a full-width, centered, width-capped container.
 ///

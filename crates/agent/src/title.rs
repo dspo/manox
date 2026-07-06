@@ -79,6 +79,7 @@ pub fn build_title_request(messages: &[Message]) -> LanguageModelRequest {
         tool_choice: None,
         temperature: Some(0.3),
         thinking_allowed: false,
+        reasoning_effort: None,
     }
 }
 
@@ -155,6 +156,7 @@ pub fn build_topic_shift_request(
         tool_choice: None,
         temperature: Some(0.3),
         thinking_allowed: false,
+        reasoning_effort: None,
     }
 }
 

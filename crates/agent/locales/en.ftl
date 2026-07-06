@@ -30,6 +30,7 @@ sidebar-time-weeks = { $count ->
     [one] {$count} week ago
    *[other] {$count} weeks ago
 }
+sidebar-account-plan = Plus
 
 ### message.rs
 message-reasoning = Reasoning
@@ -258,6 +259,27 @@ workspace-mode-section = Mode
 workspace-yolo-on-notice = YOLO mode on: tool calls need no approval, bash runs outside the sandbox.
 workspace-yolo-off-notice = Switched to normal mode: approvals and sandbox restored.
 workspace-empty-prompt = What should we do?
+workspace-open-location = Open location
+workspace-open-location-mock = Opening this project in an editor is not wired yet.
+workspace-effort-section = Reasoning effort
+workspace-effort-low = Low
+workspace-effort-medium = Medium
+workspace-effort-high = High
+workspace-effort-xhigh = XHigh
+workspace-effort-max = Max
+workspace-env-title = Environment info
+workspace-env-changes = Changes
+workspace-env-local = Local {$name}
+workspace-env-no-project = No project
+workspace-env-model = Model {$name}
+workspace-env-tokens = Tokens {$count}
+workspace-env-modes = Modes
+workspace-env-plan-on = Plan mode
+workspace-env-plan-off = Normal planning
+workspace-env-yolo-on = Full access
+workspace-env-yolo-off = Approval mode
+workspace-env-sources = Sources
+workspace-env-no-sources = No sources yet
 
 ### views/composer_menu.rs
 composer-add-label = Add

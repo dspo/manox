@@ -2,8 +2,8 @@
 //!
 //! - Text blocks use `TextView::markdown(...).selectable(true)` for selection + Cmd+C copy.
 //! - Each block carries a copy button in its top-right corner that writes the whole block to the clipboard.
-//! - User: a right-aligned rounded card within the block.
-//! - Assistant: a full-width block with a role label + markdown body.
+//! - User: right-aligned bubble with a Codex-style turn rail marker.
+//! - Assistant: document-flow markdown body.
 //! - Reasoning: a collapsible block, indented secondary text with a left border.
 //! - ToolCall: a card with title + status icon + monospace output.
 //!
@@ -54,6 +54,9 @@ pub struct ToolCallCtx {
 /// Build a `TextViewStyle` that matches the current theme's highlight palette.
 fn text_view_style(theme: &Theme) -> TextViewStyle {
     TextViewStyle {
+        paragraph_gap: gpui::rems(0.55),
+        heading_base_font_size: px(14.),
+        heading_font_size: Some(std::sync::Arc::new(|_, base| base)),
         highlight_theme: theme.highlight_theme.clone(),
         is_dark: theme.is_dark(),
         ..TextViewStyle::default()
@@ -75,6 +78,93 @@ fn markdown_tv(
         .selectable(true)
         .style(text_view_style(theme));
     if scrollable { tv.scrollable(true) } else { tv }
+}
+
+fn chat_markdown_tv(
+    id: impl Into<gpui::ElementId>,
+    text: impl AsRef<str>,
+    theme: &Theme,
+    scrollable: bool,
+) -> TextView {
+    markdown_tv(
+        id,
+        normalize_chat_markdown(text.as_ref()),
+        theme,
+        scrollable,
+    )
+}
+
+fn normalize_chat_markdown(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut lines = text.lines().peekable();
+    let mut in_fence = false;
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push(line.to_string());
+            continue;
+        }
+
+        if !in_fence {
+            if let Some((level, title)) = atx_heading_title(trimmed) {
+                out.extend(render_normalized_heading(level, title));
+                continue;
+            }
+            if let Some(next) = lines.peek()
+                && let Some(level) = setext_heading_level(next)
+                && !line.trim().is_empty()
+            {
+                out.extend(render_normalized_heading(level, line.trim()));
+                lines.next();
+                continue;
+            }
+        }
+
+        out.push(line.to_string());
+    }
+
+    out.join("\n")
+}
+
+fn atx_heading_title(line: &str) -> Option<(u8, &str)> {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = line.get(hashes..)?.trim_start();
+    if rest.is_empty() || rest == line.get(hashes..)? {
+        return None;
+    }
+    Some((hashes as u8, rest.trim_end_matches('#').trim()))
+}
+
+fn setext_heading_level(line: &str) -> Option<u8> {
+    let trimmed = line.trim();
+    if trimmed.len() < 3 {
+        return None;
+    }
+    if trimmed.chars().all(|c| c == '=') {
+        Some(1)
+    } else if trimmed.chars().all(|c| c == '-') {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn render_normalized_heading(level: u8, title: &str) -> Vec<String> {
+    if level == 1 {
+        vec![format!("***{title}***"), heading_underline(title)]
+    } else {
+        vec![format!("**{title}**")]
+    }
+}
+
+fn heading_underline(title: &str) -> String {
+    let width = title.chars().count().clamp(6, 32);
+    "─".repeat(width)
 }
 
 /// One renderable conversation item, owned by its own gpui `Entity` so a
@@ -243,50 +333,138 @@ fn copy_button_hoverable(
         .child(copy_button(ix, prefix, text))
 }
 
-/// Render a user message: a right-aligned rounded card + copy button.
+/// Render a user message as a right-aligned bubble, matching Codex.app's turn shape.
 pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
-    h_flex()
+    let group = format!("user-{ix}");
+    gpui::div()
+        .group(group.clone())
+        .relative()
         .w_full()
-        .justify_end()
+        .child(render_user_turn_marker(ix, &group, theme))
+        .child(render_user_turn_preview(text, ix, &group, theme))
         .child(
-            v_flex()
-                .group(format!("user-{ix}"))
-                .max_w(px(560.))
-                .gap_1()
-                .px_3()
-                .py_2()
-                .rounded(theme.radius)
-                .bg(theme.secondary)
-                .border_1()
-                .border_color(theme.border)
-                .child(h_flex().w_full().justify_end().child(copy_button_hoverable(
-                    ix,
-                    "copy-user",
-                    format!("user-{ix}"),
-                    text.to_string(),
-                )))
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .text_color(theme.secondary_foreground)
-                        .child(markdown_tv(
-                            ("user-text", ix),
-                            text.to_string(),
-                            theme,
-                            false,
-                        )),
-                ),
+            h_flex().w_full().justify_end().child(
+                v_flex()
+                    .group(group.clone())
+                    .max_w(px(560.))
+                    .min_w_0()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary.opacity(0.65))
+                    .child(h_flex().w_full().justify_end().child(copy_button_hoverable(
+                        ix,
+                        "copy-user",
+                        group,
+                        text.to_string(),
+                    )))
+                    .child(
+                        gpui::div()
+                            .text_sm()
+                            .line_height(gpui::relative(1.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.secondary_foreground)
+                            .child(chat_markdown_tv(("user-text", ix), text, theme, false)),
+                    ),
+            ),
         )
         .into_any_element()
 }
 
-/// Render an assistant message: role label + copy button + markdown body. `role` is the model display name (dynamic).
+fn render_user_turn_marker(ix: usize, group: &str, theme: &Theme) -> gpui::AnyElement {
+    let group: SharedString = group.to_string().into();
+    v_flex()
+        .id(("user-turn-marker", ix))
+        .absolute()
+        .left(px(-42.))
+        .top(px(4.))
+        .w(px(24.))
+        .items_center()
+        .gap(px(3.))
+        .cursor_pointer()
+        .children((0..9).map(|i| {
+            let active = i == 4;
+            let width = if active { 22. } else { 9. };
+            let color = if active {
+                theme.muted_foreground.opacity(0.72)
+            } else {
+                theme.muted_foreground.opacity(0.28)
+            };
+            let hover_color = if active {
+                theme.foreground
+            } else {
+                theme.muted_foreground.opacity(0.52)
+            };
+            gpui::div()
+                .w(px(width))
+                .h(px(1.5))
+                .rounded_full()
+                .bg(color)
+                .group_hover(group.clone(), move |s| s.bg(hover_color))
+        }))
+        .into_any_element()
+}
+
+fn render_user_turn_preview(text: &str, ix: usize, group: &str, theme: &Theme) -> gpui::AnyElement {
+    let group: SharedString = group.to_string().into();
+    let (title, body) = user_turn_preview_text(text);
+    v_flex()
+        .id(("user-turn-preview", ix))
+        .absolute()
+        .left(px(-284.))
+        .top(px(-10.))
+        .w(px(232.))
+        .gap_1()
+        .px_3()
+        .py_2()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .shadow_md()
+        .invisible()
+        .group_hover(group, |s| s.visible())
+        .child(
+            gpui::div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::BOLD)
+                .line_height(gpui::relative(1.35))
+                .text_color(theme.foreground)
+                .child(title),
+        )
+        .child(
+            gpui::div()
+                .text_xs()
+                .line_height(gpui::relative(1.38))
+                .text_color(theme.muted_foreground)
+                .child(body),
+        )
+        .into_any_element()
+}
+
+fn user_turn_preview_text(text: &str) -> (String, String) {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let title_source = lines.next().unwrap_or(text.trim());
+    let body_source = lines.collect::<Vec<_>>().join(" ");
+    let body_source = if body_source.is_empty() {
+        text.trim()
+    } else {
+        body_source.as_str()
+    };
+    (truncate(title_source, 32), truncate(body_source, 96))
+}
+
+/// Render an assistant message as plain transcript text. The model label is intentionally hidden here;
+/// the active model is surfaced in the composer and environment panel.
 pub fn render_assistant(
     text: &str,
     streaming: bool,
     token_usage: Option<&TokenUsage>,
     ix: usize,
-    role: &str,
+    _role: &str,
     theme: &Theme,
 ) -> gpui::AnyElement {
     v_flex()
@@ -295,15 +473,17 @@ pub fn render_assistant(
         .gap_1()
         .child(
             h_flex()
-                .gap_1()
-                .items_center()
+                .items_start()
+                .gap_2()
                 .child(
                     gpui::div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(role.to_string()),
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .line_height(gpui::relative(1.55))
+                        .text_color(theme.foreground)
+                        .child(render_text_body(text, streaming, ("assistant", ix), theme)),
                 )
-                .child(gpui::div().flex_1())
                 .child(copy_button_hoverable(
                     ix,
                     "copy-assistant",
@@ -311,7 +491,6 @@ pub fn render_assistant(
                     text.to_string(),
                 )),
         )
-        .child(render_text_body(text, streaming, ("assistant", ix), theme))
         .children(token_usage.and_then(|u| render_token_footer(u, theme)))
         .into_any_element()
 }
@@ -337,6 +516,7 @@ fn render_token_footer(u: &TokenUsage, theme: &Theme) -> Option<gpui::AnyElement
         h_flex()
             .gap_2()
             .text_xs()
+            .line_height(gpui::relative(1.4))
             .text_color(theme.muted_foreground)
             .children(
                 fields
@@ -365,6 +545,7 @@ fn render_text_body(
         gpui::div()
             .id(id.clone())
             .text_sm()
+            .line_height(gpui::relative(1.55))
             .whitespace_normal()
             .text_color(theme.foreground)
             .child(shown)
@@ -373,7 +554,8 @@ fn render_text_body(
         gpui::div()
             .id(id.clone())
             .text_sm()
-            .child(markdown_tv(id, text.to_string(), theme, false))
+            .line_height(gpui::relative(1.55))
+            .child(chat_markdown_tv(id, text, theme, false))
             .into_any_element()
     }
 }
@@ -403,11 +585,16 @@ pub fn render_reasoning(
         .child(
             h_flex()
                 .id(("reasoning-header", ix))
+                .w_full()
+                .min_h(px(24.))
+                .py_0p5()
                 .gap_1p5()
                 .items_center()
+                .rounded(theme.radius)
                 .cursor_pointer()
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .hover(|s| s.bg(theme.accent.opacity(0.05)))
                 .on_click(move |_, _window, cx: &mut App| {
                     let Some(weak) = weak_workspace.clone() else {
                         return;
@@ -436,8 +623,13 @@ pub fn render_reasoning(
                     });
                 })
                 .child(Icon::new(chevron).xsmall())
-                .child(i18n::t("message-reasoning"))
-                .child(gpui::div().flex_1())
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(i18n::t("message-reasoning")),
+                )
                 .child(copy_button_hoverable(
                     ix,
                     "copy-reasoning",
@@ -492,7 +684,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
             gpui::div()
                 .text_sm()
                 .text_color(theme.danger)
-                .child(markdown_tv(("error", ix), msg.to_string(), theme, false)),
+                .child(chat_markdown_tv(("error", ix), msg, theme, false)),
         )
         .into_any_element()
 }
@@ -531,7 +723,7 @@ pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
             gpui::div()
                 .text_sm()
                 .text_color(theme.foreground)
-                .child(markdown_tv(("notice", ix), msg.to_string(), theme, false)),
+                .child(chat_markdown_tv(("notice", ix), msg, theme, false)),
         )
         .into_any_element()
 }
@@ -557,13 +749,26 @@ pub fn render_tool_call(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
-    let (status_color, status_label): (gpui::Hsla, SharedString) = match item.status {
-        ToolCallStatus::PendingApproval => (theme.muted_foreground, i18n::t("status-pending")),
-        ToolCallStatus::Running => (theme.muted_foreground, i18n::t("status-running")),
-        ToolCallStatus::Success => (theme.success, i18n::t("status-success")),
-        ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
-        ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
-    };
+    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) =
+        match item.status {
+            ToolCallStatus::PendingApproval => (
+                IconName::Info,
+                theme.muted_foreground,
+                i18n::t("status-pending"),
+            ),
+            ToolCallStatus::Running => (
+                IconName::LoaderCircle,
+                theme.muted_foreground,
+                i18n::t("status-running"),
+            ),
+            ToolCallStatus::Success => (
+                IconName::CircleCheck,
+                theme.muted_foreground,
+                i18n::t("status-success"),
+            ),
+            ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
+            ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
+        };
 
     let title = if item.title.is_empty() {
         item.name.clone()
@@ -581,17 +786,18 @@ pub fn render_tool_call(
     let id_for_toggle = item.id.clone();
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
 
-    let mut card = v_flex().group(format!("tool-{ix}")).w_full().child(
+    let mut card = v_flex().group(format!("tool-{ix}")).w_full().gap_1().child(
         h_flex()
             .id(("tool-header", ix))
             .w_full()
-            .px_2()
-            .py_1()
+            .min_h(px(24.))
+            .py_0p5()
             .gap_1p5()
             .items_center()
             .rounded(theme.radius)
             .cursor_pointer()
-            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+            .text_color(theme.muted_foreground)
+            .hover(|s| s.bg(theme.accent.opacity(0.06)))
             .on_click(move |_, _window, cx: &mut App| {
                 let Some(weak) = weak_workspace.clone() else {
                     return;
@@ -621,11 +827,13 @@ pub fn render_tool_call(
                     .xsmall()
                     .text_color(theme.muted_foreground),
             )
+            .child(Icon::new(status_icon).xsmall().text_color(status_color))
             .child(
                 gpui::div()
                     .flex_1()
+                    .min_w_0()
                     .text_xs()
-                    .font_family(theme.mono_font_family.clone())
+                    .truncate()
                     .text_color(theme.muted_foreground)
                     .child(truncate(&title, 80)),
             )
@@ -637,6 +845,7 @@ pub fn render_tool_call(
             ))
             .child(
                 gpui::div()
+                    .flex_shrink_0()
                     .text_xs()
                     .text_color(status_color)
                     .child(status_label),
@@ -790,9 +999,9 @@ fn render_plan_card(
                 .border_color(theme.border)
                 .text_sm()
                 .text_color(theme.foreground)
-                .child(markdown_tv(
+                .child(chat_markdown_tv(
                     ("plan-text", ix),
-                    item.output.clone(),
+                    item.output.as_str(),
                     theme,
                     false,
                 )),
@@ -816,12 +1025,14 @@ fn render_tool_output(
 ) -> gpui::AnyElement {
     let container = gpui::div()
         .id(("tool-output", ix))
-        .h(px(220.))
+        .h(px(180.))
         .overflow_hidden()
         .px_3()
         .py_2()
-        .border_t_1()
+        .rounded(theme.radius)
+        .border_1()
         .border_color(theme.border)
+        .bg(theme.secondary.opacity(0.22))
         .text_xs()
         .text_color(theme.muted_foreground);
     if streaming {
@@ -890,6 +1101,7 @@ pub fn render_agent_task(
         h_flex()
             .id(("agent-header", ix))
             .w_full()
+            .min_h(px(24.))
             .px_2()
             .py_1()
             .gap_1p5()
@@ -917,8 +1129,10 @@ pub fn render_agent_task(
             .child(
                 gpui::div()
                     .flex_1()
+                    .min_w_0()
                     .text_xs()
                     .font_family(theme.mono_font_family.clone())
+                    .truncate()
                     .text_color(theme.muted_foreground)
                     .child(truncate(&item.title, 80)),
             )
@@ -930,6 +1144,7 @@ pub fn render_agent_task(
             ))
             .child(
                 gpui::div()
+                    .flex_shrink_0()
                     .text_xs()
                     .text_color(status_color)
                     .child(status_label),
@@ -945,9 +1160,6 @@ pub fn render_agent_task(
     };
 
     if expanded {
-        // Expanded: rebuild the child conversation from its snapshot and render
-        // each item recursively. Nested agent tasks share the same expansion
-        // set (keyed by id), so they expand/collapse in place too.
         let sub_items = build_items(&item.sub_messages, &HashMap::new());
         if sub_items.is_empty() {
             if !collapsed_body.is_empty() {
@@ -956,40 +1168,71 @@ pub fn render_agent_task(
         } else {
             card = card.child(
                 v_flex()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .px_3()
-                    .py_2()
-                    .gap_1()
+                    .ml_3()
+                    .pl_3()
+                    .py_1()
+                    .gap_3()
+                    .border_l_1()
+                    .border_color(theme.border.opacity(0.8))
                     .children(sub_items.iter().enumerate().map(|(six, sitem)| {
                         render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx)
                     })),
             );
         }
-    } else if !collapsed_body.is_empty() {
-        card = card.child(render_agent_body(&collapsed_body, ix, theme));
+    } else if item.streaming && !collapsed_body.is_empty() {
+        card = card.child(render_agent_preview(&collapsed_body, ix, theme));
     }
     card.into_any_element()
 }
 
-/// Monospace, scrollable body for a sub-agent card (collapsed tail or fallback
-/// when the snapshot is empty).
+/// Short live preview for a running sub-agent. Completed tasks collapse back to
+/// a single status row so the final assistant answer remains the visual focus.
+fn render_agent_preview(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
+    if text.is_empty() {
+        return gpui::div().into_any_element();
+    }
+    gpui::div()
+        .id(("agent-preview", ix))
+        .ml_5()
+        .max_h(px(92.))
+        .overflow_hidden()
+        .px_2()
+        .py_1()
+        .rounded(theme.radius)
+        .bg(theme.secondary.opacity(0.12))
+        .font_family(theme.mono_font_family.clone())
+        .text_xs()
+        .line_height(gpui::relative(1.35))
+        .text_color(theme.muted_foreground)
+        .children(
+            text.split('\n')
+                .map(|line| gpui::div().child(line.to_string())),
+        )
+        .into_any_element()
+}
+
+/// Transcript-style fallback body for an expanded sub-agent when no message
+/// snapshot is available.
 fn render_agent_body(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
     if text.is_empty() {
         return gpui::div().into_any_element();
     }
-    let code = format!("```\n{text}\n```");
     gpui::div()
         .id(("agent-body", ix))
-        .max_h(px(220.))
-        .overflow_y_scroll()
-        .px_3()
-        .py_2()
-        .border_t_1()
-        .border_color(theme.border)
-        .text_xs()
-        .text_color(theme.muted_foreground)
-        .child(markdown_tv(("agent-body-text", ix), code, theme, false))
+        .ml_3()
+        .pl_3()
+        .py_1()
+        .border_l_1()
+        .border_color(theme.border.opacity(0.8))
+        .text_sm()
+        .line_height(gpui::relative(1.55))
+        .text_color(theme.foreground)
+        .child(chat_markdown_tv(
+            ("agent-body-text", ix),
+            text,
+            theme,
+            false,
+        ))
         .into_any_element()
 }
 
@@ -1167,5 +1410,34 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_chat_markdown;
+
+    #[test]
+    fn normalize_chat_markdown_flattens_atx_headings() {
+        assert_eq!(
+            normalize_chat_markdown("# Big\n\n### Small"),
+            "***Big***\n──────\n\n**Small**"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_markdown_keeps_code_fence_content() {
+        assert_eq!(
+            normalize_chat_markdown("```md\n# still code\n```\n# Title"),
+            "```md\n# still code\n```\n***Title***\n──────"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_markdown_flattens_setext_headings() {
+        assert_eq!(
+            normalize_chat_markdown("Title\n-----\nbody"),
+            "**Title**\nbody"
+        );
     }
 }

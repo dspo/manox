@@ -15,7 +15,8 @@ use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::{
-    PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, i18n, save_thread,
+    PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId, i18n,
+    save_thread,
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
@@ -138,6 +139,9 @@ pub struct Workspace {
     access_open: bool,
     access_menu: Option<Entity<PopupMenu>>,
     access_menu_sub: Option<Subscription>,
+    effort_open: bool,
+    effort_menu: Option<Entity<PopupMenu>>,
+    effort_menu_sub: Option<Subscription>,
     slash_open: bool,
     slash_menu: Option<Entity<PopupMenu>>,
     slash_menu_sub: Option<Subscription>,
@@ -206,6 +210,8 @@ const SIDEBAR_WIDTH: f32 = 260.;
 const SIDEBAR_MIN_WIDTH: f32 = 200.;
 const SIDEBAR_MAX_WIDTH: f32 = 480.;
 const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
+const ENV_CARD_WIDTH: f32 = 300.;
+const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
 /// Floor for the main column width when the editor pane is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
 
@@ -266,7 +272,7 @@ impl Workspace {
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
 
-        let list_state = ListState::new(0, ListAlignment::Top, px(2048.));
+        let list_state = ListState::new(0, ListAlignment::Top, px(2048.)).measure_all();
         list_state.set_follow_mode(FollowMode::Tail);
 
         let mut ws = Self {
@@ -294,6 +300,9 @@ impl Workspace {
             access_open: false,
             access_menu: None,
             access_menu_sub: None,
+            effort_open: false,
+            effort_menu: None,
+            effort_menu_sub: None,
             slash_open: false,
             slash_menu: None,
             slash_menu_sub: None,
@@ -629,6 +638,12 @@ impl Workspace {
         self.access_menu_sub = None;
     }
 
+    fn close_effort_menu(&mut self) {
+        self.effort_open = false;
+        self.effort_menu = None;
+        self.effort_menu_sub = None;
+    }
+
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
     fn attach_thread(&mut self, new_thread: Entity<Thread>, cx: &mut Context<Self>) {
         // Cancel any running turn on the old thread so parked oneshots
@@ -930,6 +945,228 @@ impl Workspace {
             .model()
             .map(|m| m.name().to_string())
             .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+    }
+
+    fn render_title_bar(&self, title_text: String, cx: &mut Context<Self>) -> AnyElement {
+        TitleBar::new()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Icon::new(IconName::Bot)
+                                    .small()
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .child(
+                                gpui::div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(title_text),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Button::new("open-location")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::FolderOpen)
+                                    .label(i18n::t("workspace-open-location"))
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.add_info_message(
+                                            i18n::t("workspace-open-location-mock").to_string(),
+                                            cx,
+                                        );
+                                    })),
+                            )
+                            .child(
+                                Button::new("header-settings")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Settings2)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.enter_settings(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("header-panel")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::PanelRight),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_environment_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (project, token_total, cache_label, plan_mode, yolo) = {
+            let thread = self.thread.read(cx);
+            (
+                thread.project().cloned(),
+                thread.cumulative_token_usage().total_tokens(),
+                format!("{}%", thread.prefix_stability_pct()),
+                thread.plan_mode(),
+                thread.yolo(),
+            )
+        };
+        let local = project.as_ref().unwrap_or(&self.cwd);
+        let local_label = local
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| local.to_str().unwrap_or("workspace"))
+            .to_string();
+        let branch_label = project
+            .as_ref()
+            .map(|_| "main".to_string())
+            .unwrap_or_else(|| i18n::t("workspace-env-no-project").to_string());
+
+        v_flex()
+            .absolute()
+            .top(px(16.))
+            .right(px(16.))
+            .w(px(ENV_CARD_WIDTH))
+            .occlude()
+            .child(
+                v_flex()
+                    .w_full()
+                    .p_4()
+                    .gap_3()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .shadow_xs()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                gpui::div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(i18n::t("workspace-env-title")),
+                            )
+                            .child(Button::new("env-add").ghost().xsmall().icon(IconName::Plus)),
+                    )
+                    .child(env_row(
+                        IconName::Frame,
+                        i18n::t("workspace-env-changes"),
+                        Some(
+                            h_flex()
+                                .gap_1()
+                                .text_xs()
+                                .child(
+                                    gpui::div()
+                                        .text_color(theme.success)
+                                        .child(if project.is_some() { "+0" } else { "--" }),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .text_color(theme.danger)
+                                        .child(if project.is_some() { "-0" } else { "" }),
+                                )
+                                .into_any_element(),
+                        ),
+                        theme,
+                    ))
+                    .child(env_row(
+                        IconName::HardDrive,
+                        i18n::t_str("workspace-env-local", &[("name", local_label.as_str())]),
+                        None,
+                        theme,
+                    ))
+                    .child(env_row(IconName::Github, branch_label.into(), None, theme))
+                    .child(env_row(
+                        IconName::Cpu,
+                        i18n::t_str(
+                            "workspace-env-model",
+                            &[("name", self.model_label(cx).as_str())],
+                        ),
+                        None,
+                        theme,
+                    ))
+                    .child(env_row(
+                        IconName::MemoryStick,
+                        i18n::t_str(
+                            "workspace-env-tokens",
+                            &[("count", compact_count(token_total).as_str())],
+                        ),
+                        Some(
+                            gpui::div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(cache_label)
+                                .into_any_element(),
+                        ),
+                        theme,
+                    ))
+                    .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(i18n::t("workspace-env-modes")),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .flex_wrap()
+                                    .children([mode_tag(
+                                        if plan_mode {
+                                            i18n::t("workspace-env-plan-on")
+                                        } else {
+                                            i18n::t("workspace-env-plan-off")
+                                        },
+                                        plan_mode,
+                                        theme,
+                                    )])
+                                    .children([mode_tag(
+                                        if yolo {
+                                            i18n::t("workspace-env-yolo-on")
+                                        } else {
+                                            i18n::t("workspace-env-yolo-off")
+                                        },
+                                        yolo,
+                                        theme,
+                                    )]),
+                            ),
+                    )
+                    .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(i18n::t("workspace-env-sources")),
+                            )
+                            .child(
+                                gpui::div()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(i18n::t("workspace-env-no-sources")),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// Push a system-styled notice into the conversation (no thread message,
@@ -1923,6 +2160,7 @@ impl Workspace {
         let cache = self.render_cache_chip(cx);
         let access = self.render_access_placeholder(theme, cx);
         let yolo = self.thread.read(cx).yolo();
+        let effort = self.render_reasoning_effort_selector(theme, cx);
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(running, cx);
 
@@ -1979,6 +2217,7 @@ impl Workspace {
                                     )
                                     .into_any_element()
                             }))
+                            .child(effort)
                             .child(model)
                             .child(send),
                     ),
@@ -2117,6 +2356,114 @@ impl Workspace {
                     .absolute()
                     .bottom_full()
                     .left_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
+    fn render_reasoning_effort_selector(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.effort_open;
+        let selected = self.thread.read(cx).reasoning_effort();
+        let workspace = cx.entity();
+        let label = i18n::t(reasoning_effort_label_key(selected));
+
+        let trigger = h_flex()
+            .id("reasoning-effort-chip")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+            .cursor_pointer()
+            .child(
+                Icon::new(IconName::Cpu)
+                    .xsmall()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(theme.muted_foreground),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if this.effort_open {
+                    this.close_effort_menu();
+                    cx.notify();
+                    return;
+                }
+
+                let current = this.thread.read(cx).reasoning_effort();
+                this.effort_open = true;
+                let menu_workspace = workspace.clone();
+                let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+                    let mut menu = menu
+                        .max_w(gpui::px(220.))
+                        .label(i18n::t("workspace-effort-section"));
+                    for effort in ReasoningEffort::ALL {
+                        let ws = menu_workspace.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(i18n::t(reasoning_effort_label_key(effort)))
+                                .checked(effort == current)
+                                .on_click(move |_, _window, cx| {
+                                    ws.update(cx, |this, cx| {
+                                        this.thread
+                                            .update(cx, |t, cx| t.set_reasoning_effort(effort, cx));
+                                        this.close_effort_menu();
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                });
+                let sub = cx.subscribe(
+                    &menu,
+                    |this: &mut Workspace,
+                     _menu: Entity<PopupMenu>,
+                     _: &DismissEvent,
+                     cx: &mut Context<Workspace>| {
+                        this.close_effort_menu();
+                        cx.notify();
+                    },
+                );
+                this.effort_menu = Some(menu);
+                this.effort_menu_sub = Some(sub);
+                cx.notify();
+            }));
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        let menu = self
+            .effort_menu
+            .clone()
+            .expect("effort_menu exists when open");
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::div()
+                    .id("reasoning-effort-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .right_0()
                     .occlude()
                     .child(menu),
             )
@@ -2462,6 +2809,7 @@ impl Render for Workspace {
             Some(
                 v_flex()
                     .w_full()
+                    .flex_shrink_0()
                     .py_2()
                     .relative()
                     .child(centered(self.render_ask_drawer(&theme, cx))),
@@ -2470,6 +2818,7 @@ impl Render for Workspace {
             Some(
                 v_flex()
                     .w_full()
+                    .flex_shrink_0()
                     .py_2()
                     .gap_2()
                     .relative()
@@ -2676,6 +3025,15 @@ impl Render for Workspace {
                             .into_any_element()
                     }),
             );
+        let show_environment_panel =
+            !editor_open && !first_screen && self.thread.read(cx).has_interacted();
+        let environment_panel =
+            show_environment_panel.then(|| self.render_environment_panel(&theme, cx));
+        let content_inset = if show_environment_panel {
+            px(ENV_CONTENT_INSET)
+        } else {
+            px(0.)
+        };
 
         h_flex()
             .size_full()
@@ -2705,29 +3063,17 @@ impl Render for Workspace {
                     .h_full()
                     .relative()
                     // Title bar (TitleBar handles window dragging via start_window_move)
-                    .child(
-                        TitleBar::new()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(Icon::new(IconName::Bot).small())
-                                    .child(
-                                        gpui::div()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child(title_text),
-                                    ),
-                            )
-                            .child(h_flex()),
-                    )
+                    .child(self.render_title_bar(title_text, cx))
                     // Body wrapper: hero / list / footer / overlay share a common
                     // horizontal inset so conversation content doesn't kiss the
                     // panel edge.
                     .child(
                         v_flex()
                             .flex_1()
+                            .min_h_0()
                             .h_full()
                             .w_full()
+                            .relative()
                             .px_4()
                             .pb_8()
                             // Empty first screen shows the centered hero in place of the
@@ -2736,24 +3082,37 @@ impl Render for Workspace {
                             // `Entity<MessageItem>`, so a streaming delta re-renders only
                             // that item; the list only re-invokes the closure for visible
                             // items and reuses cached element subtrees for the rest.
-                            .children(hero)
-                            .children((!first_screen).then(|| {
-                                let conv = self.conversation.clone();
-                                list(self.list_state.clone(), move |ix, _window, cx| {
-                                    conv.read(cx)
-                                        .items()
-                                        .get(ix)
-                                        .cloned()
-                                        .map(|item| {
-                                            v_flex().pt_1().pb_4().child(item).into_any_element()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .pr(content_inset)
+                                    .children(hero)
+                                    .children((!first_screen).then(|| {
+                                        let conv = self.conversation.clone();
+                                        list(self.list_state.clone(), move |ix, _window, cx| {
+                                            conv.read(cx)
+                                                .items()
+                                                .get(ix)
+                                                .cloned()
+                                                .map(|item| {
+                                                    v_flex()
+                                                        .pt_1()
+                                                        .pb_3()
+                                                        .child(item)
+                                                        .into_any_element()
+                                                })
+                                                .unwrap_or_else(|| gpui::Empty.into_any_element())
                                         })
-                                        .unwrap_or_else(|| gpui::Empty.into_any_element())
-                                })
-                                .with_sizing_behavior(ListSizingBehavior::Auto)
-                                .flex_1()
-                                .into_any_element()
-                            }))
-                            .children(footer)
+                                        .with_sizing_behavior(ListSizingBehavior::Auto)
+                                        .flex_1()
+                                        .min_h_0()
+                                        .into_any_element()
+                                    }))
+                                    .children(footer),
+                            )
+                            .children(environment_panel)
                             // Approval overlay (if any)
                             .children(overlay),
                     ),
@@ -2809,6 +3168,76 @@ impl Render for Workspace {
                     cx.notify();
                 },
             ))
+    }
+}
+
+fn env_row(
+    icon: IconName,
+    label: SharedString,
+    trailing: Option<AnyElement>,
+    theme: &Theme,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
+        .child(
+            gpui::div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(label),
+        )
+        .children(trailing)
+        .into_any_element()
+}
+
+fn mode_tag(label: SharedString, active: bool, theme: &Theme) -> AnyElement {
+    gpui::div()
+        .px_2()
+        .py_1()
+        .rounded_full()
+        .bg(if active {
+            theme.accent.opacity(0.14)
+        } else {
+            theme.secondary.opacity(0.35)
+        })
+        .border_1()
+        .border_color(if active {
+            theme.accent.opacity(0.24)
+        } else {
+            theme.border
+        })
+        .text_xs()
+        .text_color(if active {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        })
+        .child(label)
+        .into_any_element()
+}
+
+fn reasoning_effort_label_key(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => "workspace-effort-low",
+        ReasoningEffort::Medium => "workspace-effort-medium",
+        ReasoningEffort::High => "workspace-effort-high",
+        ReasoningEffort::XHigh => "workspace-effort-xhigh",
+        ReasoningEffort::Max => "workspace-effort-max",
+    }
+}
+
+fn compact_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
     }
 }
 
