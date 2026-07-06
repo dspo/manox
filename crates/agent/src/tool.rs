@@ -9,6 +9,7 @@
 //! `serde_json::from_value`. The registry stores `Arc<dyn AgentTool>`.
 
 pub mod permission;
+pub mod plan_mode;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::language_model::LanguageModelRequestTool;
 
 pub use permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
+pub use plan_mode::{ExitPlanModeTool, PlanApprovalResponse, exit_plan_mode_request_tool};
 
 /// Cloneable handle for live tool output. Tools that stream (e.g. `bash`)
 /// call [`ToolOutputSink::try_emit`] per output chunk; the owning `Thread`
@@ -60,6 +62,13 @@ pub trait AgentTool: Send + Sync + 'static {
     /// (e.g. `unsandboxed: true`): the sandboxed default is safe to run
     /// without approval, only the unsandboxed escalation needs a human.
     fn requires_approval(&self, _input: &serde_json::Value) -> bool {
+        false
+    }
+    /// Whether this tool only reads and never mutates the world. Plan mode
+    /// uses this to hide write tools from the model entirely (a filtered
+    /// request-tool list), so the model cannot even attempt them. Default
+    /// `false`; read-only tools override to `true`.
+    fn is_read_only(&self) -> bool {
         false
     }
     /// Run the tool. `cancel` is the current turn's cancellation token; long-running
@@ -140,7 +149,74 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Plan-mode filter: only tools whose `is_read_only()` returns true. Write
+    /// tools (`write_file`, `edit_file`, `bash`, `agent`) are excluded, leaving
+    /// the read-only allowlist. The `exit_plan_mode` tool is appended separately
+    /// by the caller — it is not in the registry.
+    pub fn to_request_tools_read_only(&self) -> Vec<LanguageModelRequestTool> {
+        self.tools
+            .values()
+            .filter(|t| t.is_read_only())
+            .map(|tool| LanguageModelRequestTool {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                input_schema: tool.input_schema(),
+                use_input_streaming: false,
+            })
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::base_tools;
+    use std::path::PathBuf;
+
+    fn registry() -> ToolRegistry {
+        let mut r = ToolRegistry::default();
+        for t in base_tools(Arc::new(PathBuf::from("."))) {
+            r.register(t);
+        }
+        r
+    }
+
+    #[test]
+    fn filtered_excludes_write_tools_in_plan_mode() {
+        let r = registry();
+        let full = r.to_request_tools();
+        let ro = r.to_request_tools_read_only();
+
+        let full_names: Vec<&str> = full.iter().map(|t| t.name.as_str()).collect();
+        let ro_names: Vec<&str> = ro.iter().map(|t| t.name.as_str()).collect();
+
+        // Write/exec tools present in full are absent from the filtered set.
+        for blocked in ["write_file", "edit_file", "bash"] {
+            assert!(full_names.contains(&blocked), "{blocked} in full set");
+            assert!(
+                !ro_names.contains(&blocked),
+                "{blocked} leaked into plan-mode set"
+            );
+        }
+        // Read-only tools survive the filter.
+        for allowed in [
+            "read_file",
+            "list_directory",
+            "grep",
+            "glob",
+            "AskUserQuestion",
+        ] {
+            assert!(
+                ro_names.contains(&allowed),
+                "{allowed} missing from plan-mode set"
+            );
+        }
+        // exit_plan_mode is NOT in the registry — it is appended by the caller.
+        assert!(!ro_names.contains(&"exit_plan_mode"));
+        assert!(ro.len() < full.len());
     }
 }

@@ -14,7 +14,7 @@ use std::time::Duration;
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::provider::registry;
-use agent::{PermissionDecision, Thread, ThreadEvent, ThreadId, save_thread};
+use agent::{PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, save_thread};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, Context, CursorStyle, DismissEvent, DragMoveEvent,
     Entity, FollowMode, ListAlignment, ListSizingBehavior, ListState, MouseButton, MouseUpEvent,
@@ -46,6 +46,14 @@ struct PendingAuth {
     id: String,
     tool_name: String,
     summary: String,
+}
+
+/// A pending plan approval prompted by `ThreadEvent::PlanProposed`. The overlay
+/// shows the plan text and offers approve/reject; the verdict goes back via
+/// `Thread::respond_plan_approval`.
+struct PendingPlan {
+    id: String,
+    plan_text: String,
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -108,6 +116,9 @@ pub struct Workspace {
     slash_open: bool,
     slash_menu: Option<Entity<PopupMenu>>,
     slash_menu_sub: Option<Subscription>,
+    /// A pending plan approval (model called `exit_plan_mode`). The overlay
+    /// takes precedence after the auth overlay.
+    pending_plan: Option<PendingPlan>,
     /// Files picked via the `+` menu, not yet sent. Cleared on submit.
     pending_attachments: Vec<PendingAttachment>,
     /// True while a native directory picker is open from the "Choose project" row.
@@ -255,6 +266,7 @@ impl Workspace {
             slash_open: false,
             slash_menu: None,
             slash_menu_sub: None,
+            pending_plan: None,
             pending_attachments: Vec::new(),
             project_picker_pending: false,
             thread_sub: None,
@@ -298,7 +310,17 @@ impl Workspace {
                     });
                     cx.notify();
                 }
+                ThreadEvent::PlanProposed { id, plan_text } => {
+                    this.pending_plan = Some(PendingPlan {
+                        id: id.clone(),
+                        plan_text: plan_text.clone(),
+                    });
+                    cx.notify();
+                }
                 ThreadEvent::Stop(reason) => {
+                    // A terminal state ends any pending plan approval (the
+                    // oneshot was resolved or cancelled on the thread side).
+                    this.pending_plan = None;
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let outcome = this
@@ -465,6 +487,8 @@ impl Workspace {
     /// user to complete and submit; the memory/skills rows remain static decoration.
     fn sync_slash_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self.input_state.read(cx).value().to_string();
+        // Open the `⁄` popover only when the input is exactly `/`; selecting a
+        // command replaces the value with `/name ` (see `on_select` below).
         let should_open = value == "/";
         if should_open && !self.slash_open {
             let theme = cx.theme().clone();
@@ -505,6 +529,10 @@ impl Workspace {
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
     fn attach_thread(&mut self, new_thread: Entity<Thread>, cx: &mut Context<Self>) {
+        // Cancel any running turn on the old thread so parked oneshots
+        // (plan approval, tool auth) are resolved immediately rather than
+        // stranding until the entity is eventually dropped.
+        self.thread.update(cx, |t, cx| t.cancel(cx));
         save_thread(self.thread.clone(), cx);
 
         self.thread = new_thread;
@@ -522,6 +550,7 @@ impl Workspace {
         self.list_state.reset(count);
         self.pending_auths.clear();
         self.pending_ask = None;
+        self.pending_plan = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id), cx));
@@ -931,6 +960,25 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Resolve the pending plan approval (approve/reject from the overlay).
+    fn respond_plan(&mut self, approve: bool, cx: &mut Context<Self>) {
+        let Some(plan) = self.pending_plan.take() else {
+            return;
+        };
+        self.thread.update(cx, |thread, cx| {
+            thread.respond_plan_approval(
+                &plan.id,
+                if approve {
+                    PlanApprovalResponse::Approve
+                } else {
+                    PlanApprovalResponse::Reject
+                },
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         // AskUserQuestion renders its own card; suppress the generic approval
         // modal while a question card is open (both share the same id).
@@ -1042,6 +1090,97 @@ impl Workspace {
                                                     cx,
                                                 );
                                             }
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Plan approval overlay (model called `exit_plan_mode`). Mirrors
+    /// `render_auth_overlay`'s container; auth/ask overlays take precedence so
+    /// the two never compete for the slot.
+    fn render_plan_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.pending_ask.is_some() || !self.pending_auths.is_empty() {
+            return None;
+        }
+        let plan = self.pending_plan.as_ref()?;
+        let plan_text = plan.plan_text.clone();
+
+        Some(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.background.opacity(0.6))
+                .child(
+                    v_flex()
+                        .w(px(520.))
+                        .max_h(px(560.))
+                        .p_4()
+                        .gap_3()
+                        .rounded(theme.radius)
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::LayoutDashboard)
+                                        .small()
+                                        .text_color(theme.accent),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child("计划审批"),
+                                ),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child("代理提交了以下计划，请批准或拒绝："),
+                        )
+                        .child(
+                            gpui::div()
+                                .id("plan-text")
+                                .p_3()
+                                .rounded(theme.radius)
+                                .bg(theme.secondary)
+                                .text_sm()
+                                .max_h(px(320.))
+                                .overflow_y_scroll()
+                                .child(plan_text),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("plan-reject")
+                                        .ghost()
+                                        .small()
+                                        .label("拒绝")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.respond_plan(false, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("plan-approve")
+                                        .primary()
+                                        .small()
+                                        .label("批准并执行")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.respond_plan(true, cx);
                                         })),
                                 ),
                         ),
@@ -1336,7 +1475,7 @@ impl Workspace {
     ) -> AnyElement {
         let plus = self.render_plus_button(cx);
         let cwd = self.render_cwd_chip(theme, cx);
-        let access = self.render_access_placeholder(theme);
+        let access = self.render_access_placeholder(theme, cx);
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(running, cx);
         // "Choose project" binds the thread's project; only offered before the
@@ -1376,21 +1515,34 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Visual-only "full access" affordance mirroring Codex's permission chip.
-    /// Not wired to any approval mode; manox still gates tools via the runtime
-    /// authorization prompt.
-    fn render_access_placeholder(&self, theme: &Theme) -> AnyElement {
+    /// Access chip mirroring Codex's permission indicator. Reflects the
+    /// thread's plan-mode state: "计划模式" (accent dot) while planning,
+    /// "完全访问" (success dot) otherwise. Click toggles plan mode.
+    fn render_access_placeholder(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let in_plan = self.thread.read(cx).plan_mode();
+        let (dot, label) = if in_plan {
+            (theme.accent, "计划模式")
+        } else {
+            (theme.success, "完全访问")
+        };
         h_flex()
+            .id("access-chip")
+            .cursor_pointer()
             .items_center()
             .gap_1()
             .px_2()
             .py_1()
-            .child(gpui::div().size(px(6.)).rounded_full().bg(theme.success))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let on = this.thread.read(cx).plan_mode();
+                this.thread.update(cx, |t, cx| t.set_plan_mode(!on, cx));
+                cx.notify();
+            }))
+            .child(gpui::div().size(px(6.)).rounded_full().bg(dot))
             .child(
                 gpui::div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("完全访问"),
+                    .child(label),
             )
             .into_any_element()
     }
@@ -1434,14 +1586,27 @@ impl Workspace {
         let theme = cx.theme().clone();
         let ws = cx.entity();
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-            let ws = ws.clone();
-            build_plus_menu(menu, &theme, move |window, cx| {
-                ws.update(cx, |this, cx| {
-                    this.close_plus_menu();
-                    this.pick_files(window, cx);
-                    cx.notify();
-                });
-            })
+            let ws_files = ws.clone();
+            let ws_plan = ws.clone();
+            build_plus_menu(
+                menu,
+                &theme,
+                move |window, cx| {
+                    ws_files.update(cx, |this, cx| {
+                        this.close_plus_menu();
+                        this.pick_files(window, cx);
+                        cx.notify();
+                    });
+                },
+                move |_window, cx| {
+                    ws_plan.update(cx, |this, cx| {
+                        this.close_plus_menu();
+                        let on = this.thread.read(cx).plan_mode();
+                        this.thread.update(cx, |t, cx| t.set_plan_mode(!on, cx));
+                        cx.notify();
+                    });
+                },
+            )
         });
         let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
             this.close_plus_menu();
@@ -1675,7 +1840,8 @@ impl Render for Workspace {
 
         let overlay = self
             .render_ask_overlay(&theme, cx)
-            .or_else(|| self.render_auth_overlay(&theme, cx));
+            .or_else(|| self.render_auth_overlay(&theme, cx))
+            .or_else(|| self.render_plan_overlay(&theme, cx));
 
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;

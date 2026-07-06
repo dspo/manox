@@ -34,7 +34,10 @@ pub use message::Message;
 pub use thread::{Thread, ThreadEvent, ThreadId, ToolCallStatus};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
 pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
-pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};
+pub use tool::{
+    AgentTool, AnyAgentTool, PlanApprovalResponse, ToolOutputSink, ToolRegistry,
+    exit_plan_mode_request_tool,
+};
 
 /// Register the tokio runtime, `ProviderRegistry`, `McpRegistry`,
 /// `ThreadStore`, the hashline snapshot store, and the subagent / skill /

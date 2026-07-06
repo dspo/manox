@@ -68,6 +68,17 @@ pub fn max_turns_summary_prompt(max: u32) -> String {
     )
 }
 
+/// Appended to the system prompt while the thread is in plan mode. Tells the
+/// model the read-only constraint and how to exit via `exit_plan_mode`. Kept in
+/// code (not in `system_prompt.md`) for the same reason as
+/// `max_turns_summary_prompt`: a short, templated instruction, not prose.
+pub const PLAN_MODE_ADDENDUM: &str = "\n\n## 计划模式\n\
+你当前处于「计划模式」。\n\
+- 你只能使用只读工具（read_file / list_directory / grep / glob / AskUserQuestion / self_info）来调研代码库。\n\
+- 写操作、bash 执行与派生子代理的工具已对你不可见；不要尝试它们。\n\
+- 充分调研后，调用 `exit_plan_mode` 工具提交计划：计划应包含分步的实施方案、每步将使用的工具、以及潜在风险。\n\
+- 调用 `exit_plan_mode` 后对话会暂停，等待用户批准或拒绝：批准则退出计划模式开始执行；拒绝则根据反馈继续修订计划，不要重复提交同一计划。\n";
+
 #[cfg(test)]
 mod tests {
     use super::*;

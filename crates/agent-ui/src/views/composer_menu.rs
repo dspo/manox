@@ -166,24 +166,36 @@ fn slash_command_item(name: &str, desc: &str, theme: &Theme) -> PopupMenuItem {
     })
 }
 
-/// Build the `+` popup menu. `on_files` runs when the real "文件和文件夹" row is clicked.
+/// Build the `+` popup menu. `on_files` runs when the "文件和文件夹" row is
+/// clicked (index 0); `on_plan` runs when the "计划模式" row is clicked (index 3).
 pub fn build_plus_menu(
     menu: PopupMenu,
     theme: &Theme,
     on_files: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    on_plan: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(360.)).scrollable(true);
     menu = menu.label("添加");
-    // First "添加" row ("文件和文件夹") is the only real action.
+    // Index 0 ("文件和文件夹") and index 3 ("计划模式") are real actions.
     let on_files = std::rc::Rc::new(on_files);
+    let on_plan = std::rc::Rc::new(on_plan);
     for (ix, row) in PLUS_ADD_ROWS.iter().enumerate() {
-        if ix == 0 {
-            let on_files = on_files.clone();
-            menu = menu.item(
-                menu_row_item(row, theme).on_click(move |_, window, cx| on_files(window, cx)),
-            );
-        } else {
-            menu = menu.item(menu_row_item(row, theme));
+        match ix {
+            0 => {
+                let on_files = on_files.clone();
+                menu = menu.item(
+                    menu_row_item(row, theme).on_click(move |_, window, cx| on_files(window, cx)),
+                );
+            }
+            3 => {
+                let on_plan = on_plan.clone();
+                menu = menu.item(
+                    menu_row_item(row, theme).on_click(move |_, window, cx| on_plan(window, cx)),
+                );
+            }
+            _ => {
+                menu = menu.item(menu_row_item(row, theme));
+            }
         }
     }
     menu = menu.separator().label("插件");
