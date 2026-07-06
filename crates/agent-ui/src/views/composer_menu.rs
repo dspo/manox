@@ -147,23 +147,22 @@ fn slash_command_item(name: &str, desc: &str, theme: &Theme) -> PopupMenuItem {
     let name = format!("/{name}");
     let desc = desc.to_string();
     PopupMenuItem::element(move |_window, _cx| {
-        h_flex()
-            .w_full()
-            .items_center()
-            .gap_2()
-            .child(
-                gpui::div()
-                    .text_sm()
-                    .text_color(fg)
-                    .child(gpui::StyledText::new(name.clone())),
-            )
-            .child(
+        let mut line = h_flex().w_full().items_center().gap_2().child(
+            gpui::div()
+                .text_sm()
+                .text_color(fg)
+                .child(gpui::StyledText::new(name.clone())),
+        );
+        if !desc.is_empty() {
+            line = line.child(
                 gpui::div()
                     .flex_1()
                     .text_xs()
                     .text_color(muted)
                     .child(desc.clone()),
-            )
+            );
+        }
+        line
     })
 }
 
