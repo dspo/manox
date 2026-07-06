@@ -3294,7 +3294,7 @@ fn render_user_turn_preview(text: &str, ix: usize, group: &str, theme: &Theme) -
     v_flex()
         .id(("user-turn-preview", ix))
         .absolute()
-        .left(px(36.))
+        .left(px(48.))
         .top(px(-14.))
         .w(px(232.))
         .gap_1()
