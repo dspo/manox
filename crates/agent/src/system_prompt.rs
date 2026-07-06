@@ -116,14 +116,16 @@ pub fn max_turns_summary_prompt(max: u32) -> String {
 }
 
 /// Appended to the system prompt while the thread is in plan mode. Tells the
-/// model the read-only constraint and how to exit via `exit_plan_mode`. Kept in
+/// model to delegate research to the read-only `plan`/`explore` sub-agents
+/// (isolated context) and then submit its plan via `exit_plan_mode`. Kept in
 /// code (not in `system_prompt.md`) for the same reason as
 /// `max_turns_summary_prompt`: a short, templated instruction, not prose.
 pub const PLAN_MODE_ADDENDUM: &str = "\n\n## Plan mode\n\
-You are currently in plan mode.\n\
-- You may only use read-only tools (read_file / list_directory / grep / glob / AskUserQuestion / self_info / skill) to research the codebase.\n\
-- Write tools, bash execution, and the sub-agent spawning tool are hidden from you; do not attempt them.\n\
-- After thorough research, call the `exit_plan_mode` tool to submit your plan: it should include a step-by-step implementation plan, the tools each step will use, and any potential risks.\n\
+You are currently in plan mode: research the codebase and produce a plan, but do not implement.\n\
+- You have read-only tools plus the `agent` tool. Delegate codebase research to the `plan` sub-agent (`agent` tool, `subagent_type=plan`) so the exploration stays in an isolated context and does not bloat this conversation. For a focused lookup (\"where is X defined\", \"which files reference Y\"), delegate to the `explore` sub-agent instead.\n\
+- The sub-agent returns only its final conclusion; synthesize that into a complete plan. If research is inconclusive, delegate again with a sharper prompt rather than guessing.\n\
+- Write tools and `bash` are hidden from you. Do not attempt to spawn write-capable sub-agents to bypass this — the bundled `plan`/`explore` are read-only by construction.\n\
+- When the plan is ready, call `exit_plan_mode` with a step-by-step implementation plan: what each step changes, which existing functions to reuse, the tools each step will use, and any risks. End the plan with a `### Critical Files for Implementation` section listing 3–5 paths.\n\
 - After you call `exit_plan_mode` the conversation pauses for user approval or rejection: approval exits plan mode and begins execution; rejection returns you to plan mode to revise the plan per the feedback — do not resubmit the same plan unchanged.\n";
 
 #[cfg(test)]
