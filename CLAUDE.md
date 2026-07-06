@@ -57,6 +57,7 @@ crates/
 
 **核心模块：**
 
+- `system_prompt.rs` — 主 agent system prompt 构建层。`build_main_system_prompt` 注入运行时身份：thread id、cwd、project root、os/shell/date + 工作纪律（cwd 锚定、截断重试、commit 自证）。`build_completion_request` 对主 Thread 调用 `system_prompt_fn`（子 agent 不受影响，保留其 `agent_def.rs` 加载的 *.md system prompt）。
 - `thread.rs` — `Thread` 状态机（gpui `Entity<Thread>` + `EventEmitter<ThreadEvent>`）。`run_turn` 在 gpui executor 上 spawn 一个 task，task 内循环：`build_completion_request` → `model.stream_completion` → 逐事件 `handle_completion_event` → 收集 `pending_tool_uses` → 流结束后按「免审批并行 / 需审批串行」分区执行（gpui `Task` 非 Send，故并发 spawn + 顺序 await）→ 逐 tool 审批→执行→追加 ToolResult 消息→回到循环。无 tool_use 时 `EndTurn` 退出。子 agent 字段：`system`（子 system prompt，主 Thread=None）、`depth`（主=0，子=父+1）、`max_turns`/`turn_count`/`cap_summary_injected`（截断时注入一轮总结而非硬停）、`pending_authorizations`（id→oneshot，多槽）、`pending_child_auth`（复合 id→`ChildAuthRoute`，授权冒泡路由）。子 agent 对话不单独存内存 map——直接作为 JSON envelope 写进父 ToolResult.content（见「快照与持久化」）。`new_subagent` 构造子 Thread，`tools_fn` 闭包解决「AgentTool 需子 WeakEntity 但子 Thread 还没建」的先有鸡先有蛋问题。
 
 - `language_model.rs` — `LanguageModel` trait（`stream_completion` 返回 `BoxFuture` 产出 `BoxStream<Result<LanguageModelCompletionEvent>>`）。通用类型：`Role`、`MessageContent`、`LanguageModelRequest`、`LanguageModelToolUse`、`LanguageModelToolResult` 等。
@@ -78,13 +79,22 @@ crates/
 
 - `tool.rs` + `tool/permission.rs` — `AgentTool` trait + `ToolRegistry` + `PermissionCache`（会话级 always-allow），`PermissionDecision::AllowOnce | AlwaysAllow | Deny`，`ToolAuthorizationResponse`（审批载荷：`Decision(PermissionDecision)` 或 `AskUserQuestion { answers, response }`，后者由 thread 短路为 ToolResult，不经 `run` 执行）。
 
-- `tools/` — 9 个内置工具：`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`、`ask_user`（`AskUserQuestion`，向用户提多选澄清问题）、`agent`（spawn 子 agent，见「多 agent 系统」）。写操作（write_file/edit_file）、bash 与 `AskUserQuestion` 需审批；`agent` 本身不审批（spawn 是只读的，子 agent 内部工具各自审批）。bash/grep 经 tokio 子进程 + `async_channel` 桥回 gpui Task。
+- `tools/` — 10 个内置工具：`read_file`、`write_file`、`edit_file`、`list_directory`、`bash`、`grep`、`glob`、`ask_user`（`AskUserQuestion`，向用户提多选澄清问题）、`agent`（spawn 子 agent，见「多 agent 系统」）、`self_info`（查看运行时身份：thread id、cwd、project、os、shell、date）。写操作（write_file/edit_file）、bash 与 `AskUserQuestion` 需审批；`agent`/`self_info` 本身不审批。bash 截断阈值 64KB（累计 dropped 总量，前置标注 + 引导收窄命令）；edit_file/read_file 工具描述使用具体例子 `[<abs-path>#<tag>]` 避免裸占位符。
 
 - `runtime.rs` — 全局 tokio runtime（`OnceLock<Handle>`），`init` 时 build 并 forget，`handle()` 取全局 Handle。供 provider 在 gpui executor 上 spawn tokio 任务跑 HTTP 流。
 
 - `db.rs` — `ThreadsDatabase`（SQLite `threads` 表，路径 `$HOME/.config/cx/manox/threads.db`），`Mutex<Connection>` 同步操作。
 
 - `thread_store.rs` — `ThreadStore` 进程全局 Entity（`OnceLock`），管理 Thread 摘要列表，提供 `save_thread` 异步落盘 + refresh。
+- `hashline/` — 行锚定补丁系统 + 快照恢复：
+  - `mod.rs` — 全局 `SnapshotStore`（`OnceLock<Mutex<>>`），`init()` 在 `agent::init` 时调用。
+  - `hash.rs` — `compute_tag` 计算 4-hex 内容哈希（规范化文本的 CRC32）。
+  - `snapshot.rs` — `SnapshotStore` 管理 path → `Snapshot`（raw bytes + tag + line_count），`read_file` 记录前调用 `store_snapshot`，`edit_file` 用 `get_snapshot` 验证 tag。
+  - `parser.rs` — 补丁解析：支持 `SWAP N.=M`、`DEL N.=M`、`INS.PRE/POST/HEAD/TAIL N`、`SWAP.BLK N` 等操作，产出 `FilePatch` → `Vec<Op>`。
+  - `apply.rs` — 补丁应用：`apply` 对 ORIGINAL 行号逐 op 后向应用；tag 过期时 `try_recover` 做 3-way merge（基于内容范围定位快照片段到当前文本）。
+  - `block.rs` — 行范围块结构（`BlockError`）。
+  - `recovery.rs` — `try_recover` / `try_recover_with_snapshot` 恢复逻辑。
+  - 工具链：`read_file` 输出 `[PATH#TAG]` 头部 + `N:TEXT` 带行号内容；`edit_file` 输入 hashline patch 格式，复用 TAG 验证后应用。
 
 **Thread 审批流：** 工具需审批时，`run_tool` 发 `ThreadEvent::ToolCallAuthorization` 携带 `oneshot::Sender`，UI 弹窗后调用 `Thread::respond_authorization` 回传 `ToolAuthorizationResponse`（普通工具为 `Decision(PermissionDecision)`，`AskUserQuestion` 为 `AskUserQuestion { answers, response }`，thread 据此短路生成 ToolResult 而不执行 `run`），task 在 gpui executor 上 `await` oneshot receiver。
 
@@ -171,3 +181,4 @@ crates/
 - **PR 提交后与 remora 达成一致**：先提交 PR，再运行 `/remora:adversarial-review [prompt]`，与 remora 多轮交锋直到双方达成一致后再合并。
 - **禁止抄袭第三方 crate 代码**：若想引入第三方 crate 的特性，应规范引入该 crate 作为依赖。对于不便规范引入的（过重、未暴露相关接口、archived 等），可以参考其架构思想、设计思路、实现方法，但禁止抄袭代码（复制粘贴后修改）。
 - **注释规范**：注释一律用英文，面向终态（描述代码维持的不变量/意图）而非过程流水账，非必要不注释。详见 `~/.claude/rules/code-comments.md`。
+

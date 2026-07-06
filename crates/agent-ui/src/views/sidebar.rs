@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use agent::{ThreadStore, ThreadStoreEvent};
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, Render, SharedString, Subscription, Window,
+    AnyElement, Context, Entity, EventEmitter, Pixels, Render, SharedString, Subscription, Window,
     prelude::*, px,
 };
 use gpui_component::{
@@ -34,13 +34,16 @@ pub struct Sidebar {
     selected: Option<String>,
     /// Project paths whose folder group is collapsed; absent means expanded.
     collapsed: HashSet<String>,
+    /// Live width driven by dragging the divider on the right edge. Updated
+    /// from the owning `Workspace` on every drag-move tick.
+    width: Pixels,
     _sub: Subscription,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
         let store = agent::thread_store_global();
         let sub = cx.subscribe(&store, |_this, _store, ev: &ThreadStoreEvent, cx| {
             if matches!(ev, ThreadStoreEvent::SummariesUpdated) {
@@ -51,12 +54,20 @@ impl Sidebar {
             store,
             selected: None,
             collapsed: HashSet::new(),
+            width,
             _sub: sub,
         }
     }
 
     pub fn store(&self) -> Entity<ThreadStore> {
         self.store.clone()
+    }
+
+    /// Update the rendered width. Called by the owning `Workspace` on every
+    /// divider drag-move tick; the new value takes effect on the next render.
+    pub fn set_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        self.width = width;
+        cx.notify();
     }
 
     /// Mark the currently selected thread id (back-filled by Workspace on switch/new, for highlight).
@@ -171,7 +182,7 @@ impl Render for Sidebar {
 
         v_flex()
             .h_full()
-            .w(px(260.))
+            .w(self.width)
             .bg(theme.background)
             .border_r_1()
             .border_color(theme.border)

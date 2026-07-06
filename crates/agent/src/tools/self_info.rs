@@ -115,4 +115,93 @@ mod tests {
         let tool = SelfInfoTool::new(WeakEntity::<Thread>::new_invalid());
         assert!(tool.description().contains("不要跑 SQL"));
     }
+
+    /// `self_info` reads the owning `Thread` via `read_with`. The owning
+    /// `Thread`'s `run_tool_inner` invokes tools through `cx.update` (App
+    /// context, no entity lease) rather than `this.update` (which would hold
+    /// a write lease on that same Thread) precisely so this `read_with` does
+    /// not re-lease it and trip gpui's `double_lease_panic` — the SIGABRT
+    /// captured in thread `4543a630`. This test locks in the safe invocation
+    /// path: construct via `Thread::restore`, call `run` from `cx.update`, and
+    /// assert the identity is returned. `agent_def::init()` is required only
+    /// because `default_registry` eagerly registers the `agent` spawn tool,
+    /// which reads the subagent definition registry.
+    #[test]
+    fn run_returns_thread_identity_without_double_lease() {
+        use std::sync::{Arc, Mutex};
+
+        crate::agent_def::init();
+
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            crate::thread::Thread::restore(
+                crate::thread::ThreadId("reg-4543a630".to_string()),
+                std::path::PathBuf::from("/tmp"),
+                None,
+                Vec::new(),
+                None,
+                cx,
+            )
+        });
+        let tool = SelfInfoTool::new(thread.downgrade());
+
+        let result: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
+        let r = result.clone();
+        cx.spawn(|cx| {
+            let task =
+                cx.update(|cx| tool.run(serde_json::json!({}), CancellationToken::new(), cx));
+            async move {
+                *r.lock().unwrap() = Some(task.await);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+
+        let out = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("self_info task did not complete")
+            .expect("self_info returned an error");
+        assert!(
+            out.contains("reg-4543a630"),
+            "expected thread id in output, got: {out}"
+        );
+    }
+
+    /// Documents the gpui invariant the `run_tool_inner` fix relies on:
+    /// holding a write lease on the owning `Thread` (via `Entity::update`)
+    /// while `self_info`'s `run` does `read_with` on the same entity
+    /// re-leases it and trips `double_lease_panic`. This is the SIGABRT from
+    /// thread `4543a630`, reproduced synchronously here without going through
+    /// `run_tool_inner` (which would need a full turn). It does not guard the
+    /// fix directly — it pins the invariant so a future re-introduction of
+    /// `this.update` wrapping in `run_tool_inner` has a concrete, failing
+    /// reference for why it breaks.
+    #[test]
+    #[should_panic(expected = "already being updated")]
+    #[allow(clippy::let_underscore_future)]
+    fn read_with_inside_owning_thread_write_lease_panics() {
+        crate::agent_def::init();
+
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            crate::thread::Thread::restore(
+                crate::thread::ThreadId("double-lease-doc".to_string()),
+                std::path::PathBuf::from("/tmp"),
+                None,
+                Vec::new(),
+                None,
+                cx,
+            )
+        });
+        let tool = SelfInfoTool::new(thread.downgrade());
+        let thread_handle = thread.clone();
+
+        cx.update(|cx| {
+            thread_handle.update(cx, |_t, cx| {
+                let _ = tool.run(serde_json::json!({}), CancellationToken::new(), cx);
+            });
+        });
+    }
 }

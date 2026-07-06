@@ -32,5 +32,8 @@ similar.workspace = true
 
 gpui.workspace = true
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [lints.clippy]
 dbg_macro = "deny"
