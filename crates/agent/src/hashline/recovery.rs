@@ -47,7 +47,7 @@ pub fn try_recover(
     let current_tag = super::hash::compute_tag(current);
     let snapshot = store.get(path, claimed_tag).ok_or_else(|| RecoverError {
         message: format!(
-            "快照 tag {claimed_tag} 未找到（文件已变更且无历史版本）；请重新 read 获取当前 tag {current_tag}"
+            "snapshot tag {claimed_tag} not found (file changed and no history version available); re-read to get the current tag {current_tag}"
         ),
         current_tag,
     })?;
@@ -88,7 +88,7 @@ pub fn try_recover_with_snapshot(
     for ch in changes {
         let loc = locate(&cur_lines, &ch).ok_or_else(|| RecoverError {
             message: format!(
-                "3-way merge 失败：在当前文件中无法唯一锚定快照行「{}」；请重新 read",
+                "3-way merge failed: cannot uniquely anchor snapshot line {:?} in the current file; re-read",
                 ch.anchor_preview()
             ),
             current_tag: current_tag.clone(),
@@ -156,7 +156,7 @@ fn resolve_changes(
                 let old: Vec<String> = snap_lines
                     .get(s..e)
                     .ok_or_else(|| RecoverError {
-                        message: format!("快照范围 {start}..={end} 越界"),
+                        message: format!("snapshot range {start}..={end} out of bounds"),
                         current_tag: current_tag.to_string(),
                     })?
                     .iter()
@@ -174,7 +174,7 @@ fn resolve_changes(
                 let old: Vec<String> = snap_lines
                     .get(s..e)
                     .ok_or_else(|| RecoverError {
-                        message: format!("快照范围 {start}..={end} 越界"),
+                        message: format!("snapshot range {start}..={end} out of bounds"),
                         current_tag: current_tag.to_string(),
                     })?
                     .iter()
@@ -193,7 +193,7 @@ fn resolve_changes(
                     (InsPos::Post, Some(a)) => (Some(*a), false, false, false),
                     _ => {
                         return Err(RecoverError {
-                            message: "INS PRE/POST 缺少锚点".to_string(),
+                            message: "INS PRE/POST requires an anchor".to_string(),
                             current_tag: current_tag.to_string(),
                         });
                     }
@@ -211,7 +211,7 @@ fn resolve_changes(
                         .get(a)
                         .map(|l| l.to_string())
                         .ok_or_else(|| RecoverError {
-                            message: format!("INS 锚点行 {} 越界", a + 1),
+                            message: format!("INS anchor line {} out of bounds", a + 1),
                             current_tag: current_tag.to_string(),
                         })?;
                 changes.push(Change::Insert {
@@ -348,7 +348,7 @@ mod tests {
     fn missing_snapshot_errors() {
         let store = SnapshotStore::new();
         let err = try_recover("A\nB\n", "FFFF", &[], &store, &PathBuf::from("x.rs")).unwrap_err();
-        assert!(err.message.contains("未找到"));
+        assert!(err.message.contains("not found"));
     }
 
     #[test]

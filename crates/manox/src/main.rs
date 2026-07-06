@@ -110,21 +110,24 @@ fn main() {
 }
 
 fn build_app_menus() -> Vec<Menu> {
+    // macOS native menus render the app-name menu regardless of the label here,
+    // so the first Menu's title is ignored on mac; the File/Settings/Quit labels
+    // are localized for the user's chosen UI language.
     #[cfg(target_os = "macos")]
     {
         vec![Menu::new("manox").items([
             MenuItem::separator(),
-            MenuItem::action("Settings…", agent_ui::OpenSettings),
+            MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
             MenuItem::separator(),
-            MenuItem::action("Quit", Quit),
+            MenuItem::action(agent::i18n::t("menu-quit"), Quit),
         ])]
     }
     #[cfg(not(target_os = "macos"))]
     {
-        vec![Menu::new("File").items([
-            MenuItem::action("Settings…", agent_ui::OpenSettings),
+        vec![Menu::new(agent::i18n::t("menu-file")).items([
+            MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
             MenuItem::separator(),
-            MenuItem::action("Quit", Quit),
+            MenuItem::action(agent::i18n::t("menu-quit"), Quit),
         ])]
     }
 }

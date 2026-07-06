@@ -5,12 +5,12 @@
 //! each entry's "×" emits `DeleteThread(id)`. Workspace subscribes to these events.
 //!
 //! Threads bound to a project (chosen on the first screen) are grouped under a collapsible folder
-//! in the "项目" section, keyed by project path; the rest fall under "对话". The top menu and bottom
-//! account footer are static decoration mirroring Codex.app's layout.
+//! in the "Projects" section, keyed by project path; the rest fall under "Conversations". The top
+//! menu and bottom account footer are static decoration mirroring Codex.app's layout.
 
 use std::collections::HashSet;
 
-use agent::{ThreadStore, ThreadStoreEvent};
+use agent::{ThreadStore, ThreadStoreEvent, i18n};
 use gpui::{
     AnyElement, Context, Entity, EventEmitter, Pixels, Render, SharedString, Subscription, Window,
     prelude::*, px,
@@ -202,21 +202,38 @@ impl Render for Sidebar {
                             .child(menu_item(
                                 "new-thread",
                                 IconName::SquareTerminal,
-                                "新对话",
+                                i18n::t("sidebar-new-chat"),
                                 &theme,
                                 Some(cx.listener(|_this, _ev, _window, cx| {
                                     cx.emit(SidebarEvent::NewThread);
                                 })),
                             ))
-                            .child(static_menu_item(IconName::Search, "搜索", &theme))
-                            .child(static_menu_item(IconName::Calendar, "已安排", &theme))
-                            .child(static_menu_item(IconName::Frame, "插件", &theme)),
+                            .child(static_menu_item(
+                                "search",
+                                IconName::Search,
+                                i18n::t("sidebar-search"),
+                                &theme,
+                            ))
+                            .child(static_menu_item(
+                                "scheduled",
+                                IconName::Calendar,
+                                i18n::t("sidebar-scheduled"),
+                                &theme,
+                            ))
+                            .child(static_menu_item(
+                                "plugins",
+                                IconName::Frame,
+                                i18n::t("sidebar-plugins"),
+                                &theme,
+                            )),
                     )
-                    .children((!projects.is_empty()).then(|| section_header("项目", &theme)))
+                    .children((!projects.is_empty())
+                        .then(|| section_header(i18n::t("sidebar-section-projects"), &theme)))
                     .children(projects.into_iter().map(|(path, group)| {
                         self.render_project_group(&path, &group, selected.as_deref(), &theme, cx)
                     }))
-                    .children((!loose.is_empty()).then(|| section_header("对话", &theme)))
+                    .children((!loose.is_empty())
+                        .then(|| section_header(i18n::t("sidebar-section-conversations"), &theme)))
                     .child(
                         v_flex()
                             .gap_0p5()
@@ -239,7 +256,7 @@ impl Render for Sidebar {
 fn menu_item(
     id: &'static str,
     icon: IconName,
-    label: &'static str,
+    label: SharedString,
     theme: &Theme,
     on_click: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
 ) -> AnyElement {
@@ -266,9 +283,14 @@ fn menu_item(
     }
 }
 
-fn static_menu_item(icon: IconName, label: &'static str, theme: &Theme) -> AnyElement {
+fn static_menu_item(
+    id: &'static str,
+    icon: IconName,
+    label: SharedString,
+    theme: &Theme,
+) -> AnyElement {
     menu_item(
-        label,
+        id,
         icon,
         label,
         theme,
@@ -276,8 +298,8 @@ fn static_menu_item(icon: IconName, label: &'static str, theme: &Theme) -> AnyEl
     )
 }
 
-/// A grey uppercase-style group header ("项目" / "对话").
-fn section_header(label: &'static str, theme: &Theme) -> AnyElement {
+/// A grey uppercase-style group header (section labels).
+fn section_header(label: SharedString, theme: &Theme) -> AnyElement {
     gpui::div()
         .px_2()
         .pt_3()
@@ -305,7 +327,7 @@ fn render_thread_item(
     let id_open = id.clone();
     let id_del = id.clone();
     let title = if summary.summary.is_empty() {
-        "(新对话)".to_string()
+        i18n::t("sidebar-empty-summary").to_string()
     } else {
         truncate(summary.summary.as_str(), 24)
     };
@@ -384,20 +406,21 @@ fn render_thread_item(
         .into_any_element()
 }
 
-/// Format epoch seconds as a coarse relative time (刚刚 / N分钟 / N小时 / N天 / N周).
+/// Format epoch seconds as a coarse relative time, locale-aware via fluent
+/// plural rules (en distinguishes one/other; zh-CN has no plural distinction).
 fn format_relative(epoch: i64) -> String {
     let now = chrono::Local::now().timestamp();
     let diff = (now - epoch).max(0);
     if diff < 60 {
-        "刚刚".to_string()
+        i18n::t("sidebar-time-just-now").to_string()
     } else if diff < 3600 {
-        format!("{}分钟", diff / 60)
+        i18n::t_count("sidebar-time-minutes", diff / 60).to_string()
     } else if diff < 86_400 {
-        format!("{}小时", diff / 3600)
+        i18n::t_count("sidebar-time-hours", diff / 3600).to_string()
     } else if diff < 604_800 {
-        format!("{}天", diff / 86_400)
+        i18n::t_count("sidebar-time-days", diff / 86_400).to_string()
     } else {
-        format!("{}周", diff / 604_800)
+        i18n::t_count("sidebar-time-weeks", diff / 604_800).to_string()
     }
 }
 

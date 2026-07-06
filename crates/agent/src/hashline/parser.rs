@@ -74,7 +74,7 @@ pub struct ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "patch 第 {} 行解析失败: {}", self.line, self.message)
+        write!(f, "patch line {} parse failed: {}", self.line, self.message)
     }
 }
 
@@ -144,7 +144,7 @@ pub fn parse_patch(text: &str) -> Result<Vec<FilePatch>, ParseError> {
     if sections.is_empty() {
         return Err(ParseError {
             line: 0,
-            message: "patch 不含任何 [PATH#TAG] 段".to_string(),
+            message: "patch contains no [PATH#TAG] section".to_string(),
         });
     }
     Ok(sections)
@@ -168,7 +168,7 @@ fn flush_body(
         }
         return Err(ParseError {
             line: 0,
-            message: "body 行无对应 `:` 头".to_string(),
+            message: "body row has no matching `:` header".to_string(),
         });
     }
     // Body-bearing header with no rows is allowed for SWAP (clears range), but
@@ -294,15 +294,15 @@ fn parse_op_header(line: &str) -> Result<ParsedOp, String> {
                 body: Vec::new(),
             }));
         }
-        return Err("未知 INS 位置（应为 PRE/POST/HEAD/TAIL）".to_string());
+        return Err("unknown INS position (expected PRE/POST/HEAD/TAIL)".to_string());
     }
     Err(format!(
-        "无法识别的操作头: {line:?}。\
-         提示：body 行（要插入/替换的正文）必须以 `+` 开头（如 `+new content`），\
-         `+` 单独一行表示空行，`+-x`/`++x` 转义字面 `-`/`+`；\
-         `-` 开头的 markdown 列表项不是 body 行，请改写成 `+` 前缀。\
-         若你确实在写操作头，可用指令：`SWAP N.=M:` / `DEL N.=M` / `INS.PRE N:` / \
-         `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` / `SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:`。"
+        "unrecognized op header: {line:?}. \
+         Hint: body rows (the content to insert/replace) must start with `+` (e.g. `+new content`); \
+         a lone `+` on a line denotes an empty line, and `+-x`/`++x` escape literal `-`/`+`. \
+         A `-`-prefixed markdown list item is not a body row — rewrite it with a `+` prefix. \
+         If you did mean to write an op header, valid directives are: `SWAP N.=M:` / `DEL N.=M` / `INS.PRE N:` / \
+         `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` / `SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:`."
     ))
 }
 
@@ -345,7 +345,7 @@ fn parse_range(s: &str) -> Result<(usize, usize, &str), String> {
     if let Some(rest) = rest.strip_prefix(".=") {
         let (end, tail) = parse_lid(rest)?;
         if end < start {
-            return Err(format!("范围结束 {end} 小于起始 {start}"));
+            return Err(format!("range end {end} is less than start {start}"));
         }
         return Ok((start, end, tail));
     }
@@ -358,12 +358,12 @@ fn parse_lid(s: &str) -> Result<(usize, &str), String> {
     let mut end = 0;
     let bytes = s.as_bytes();
     if bytes.is_empty() || !bytes[0].is_ascii_digit() || bytes[0] == b'0' {
-        return Err(format!("期望行号（非零数字开头）: {s:?}"));
+        return Err(format!("expected a line number (non-zero digit prefix): {s:?}"));
     }
     while end < bytes.len() && bytes[end].is_ascii_digit() {
         end += 1;
     }
-    let n: usize = s[..end].parse().map_err(|_| format!("行号溢出: {s:?}"))?;
+    let n: usize = s[..end].parse().map_err(|_| format!("line number overflow: {s:?}"))?;
     Ok((n, &s[end..]))
 }
 
@@ -373,7 +373,7 @@ fn expect_colon(s: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "期望 `:` 结尾，遇到 {s:?}。带 body 的指令以 `:` 收尾：`SWAP N.=M:` / `SWAP.BLK N:` / `INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` / `INS.BLK.POST N:`；不带 body 的 `DEL`/`DEL.BLK` 无冒号（如 `DEL N.=M` / `DEL.BLK N`）。若行号写成了 `N:M` 多半是误把 `N.=M:` 拼成了 `N:M`。"
+            "expected `:` terminator, got {s:?}. Body-bearing directives end with `:`: `SWAP N.=M:` / `SWAP.BLK N:` / `INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` / `INS.BLK.POST N:`; body-less `DEL`/`DEL.BLK` have no colon (e.g. `DEL N.=M` / `DEL.BLK N`). If you wrote `N:M` you most likely mistyped `N.=M:`."
         ))
     }
 }
@@ -383,7 +383,7 @@ fn expect_eol(s: &str) -> Result<(), String> {
     if s.is_empty() {
         Ok(())
     } else {
-        Err(format!("期望行尾，遇到 {:?}", s))
+        Err(format!("expected end of line, got {:?}", s))
     }
 }
 
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn error_on_unrecognized_header() {
         let e = parse_patch("[a.rs#1A2B]\nFROB 1").unwrap_err();
-        assert!(e.message.contains("无法识别"));
+        assert!(e.message.contains("unrecognized"));
     }
 
     #[test]
@@ -541,7 +541,7 @@ mod tests {
         // the parser saw it as an operation header. The error must steer the
         // model toward the `+` body-row prefix.
         let e = parse_patch("[a.rs#1A2B]\n- `hashline/` — 行锚定补丁系统").unwrap_err();
-        assert!(e.message.contains("无法识别"), "got: {}", e.message);
+        assert!(e.message.contains("unrecognized"), "got: {}", e.message);
         assert!(
             e.message.contains("`+`"),
             "must mention `+` prefix: {}",

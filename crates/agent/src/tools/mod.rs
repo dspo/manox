@@ -90,13 +90,13 @@ fn resolve_path_for_write<P: AsRef<Path>>(input: P, cwd: &Path) -> Result<PathBu
     let policy = crate::sandbox::SandboxPolicy::for_project(cwd);
     if policy.is_protected(&path) {
         return Err(format!(
-            "写被沙箱保护（`.git`）：{}。如需写入受保护路径，请在 bash 工具中显式设 `unsandboxed: true` 并经用户审批。",
+            "Write blocked by sandbox (`.git`): {}. To write to a protected path, set `unsandboxed: true` in the bash tool and pass user approval.",
             path.display()
         ));
     }
     if !policy.is_writable(&path) {
         return Err(format!(
-            "写超出项目根与临时目录：{}。如需写入项目根外路径，请在 bash 工具中显式设 `unsandboxed: true` 并经用户审批。",
+            "Write outside project root and temp dir: {}. To write outside the project root, set `unsandboxed: true` in the bash tool and pass user approval.",
             path.display()
         ));
     }
@@ -111,10 +111,11 @@ fn resolve_path_for_write<P: AsRef<Path>>(input: P, cwd: &Path) -> Result<PathBu
 /// Bash reaches this state via `CaptureBuffer::take` (streaming capture that
 /// already knows the dropped tail size); other tools reach it via
 /// [`truncate_output`], which cuts on a UTF-8 boundary. Both produce a
-/// `TruncatedText` so the rendered notice — `⚠ 输出过长（共 N 字节，显示前 M）`
-/// plus a per-tool narrow hint plus `不要臆测被截断的内容` — is identical
-/// across tools, mirroring zed's `Command output too long. The first N bytes:`
-/// and codex's `Warning: truncated output (original token count: N)`.
+/// `TruncatedText` so the rendered notice — `⚠ Output too long (N bytes total,
+/// showing first M)` plus a per-tool narrow hint plus `do not speculate about
+/// the truncated content` — is identical across tools, mirroring zed's
+/// `Command output too long. The first N bytes:` and codex's
+/// `Warning: truncated output (original token count: N)`.
 pub(crate) struct TruncatedText<'a> {
     text: &'a str,
     truncated: bool,
@@ -135,14 +136,15 @@ impl<'a> TruncatedText<'a> {
     }
 
     /// Render with the uniform advisory. `hint` is folded into one line before
-    /// the "do not guess" directive, e.g. "用更窄的命令重试（`| head`、`LIMIT`）".
+    /// the "do not guess" directive, e.g. "retry with a narrower command
+    /// (`| head`, `LIMIT`, tighten the pattern)".
     pub(crate) fn render(&self, hint: &str) -> String {
         if !self.truncated {
             return self.text.to_string();
         }
         let total = self.cap + self.dropped;
         format!(
-            "⚠ 输出过长（共 {total} 字节，显示前 {cap}）。{hint}——不要臆测被截断的内容。\n\n{text}",
+            "⚠ Output too long ({total} bytes total, showing first {cap}). {hint} — do not speculate about the truncated content.\n\n{text}",
             cap = self.cap,
             text = self.text,
         )
@@ -187,9 +189,9 @@ impl AgentTool for ReadFileTool {
         "read_file"
     }
     fn description(&self) -> &str {
-        "读取指定文件的完整内容。输出格式：首行 `[<绝对路径>#<TAG>]`，\
-         例如 `[/Users/me/proj/src/lib.rs#A557]`，其中 TAG 是 4-hex 快照标签；\
-         随后是 `N:TEXT` 行号格式（1-indexed）。"
+        "Read the full contents of the specified file. Output format: first line `[<abs-path>#<TAG>]`, \
+         e.g. `[/Users/me/proj/src/lib.rs#A557]` where TAG is a 4-hex snapshot tag; \
+         followed by `N:TEXT` line-numbered rows (1-indexed)."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<ReadFileInput>()
@@ -204,11 +206,11 @@ impl AgentTool for ReadFileTool {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<ReadFileInput>(input) else {
-            return cx.background_spawn(async { Err("input 解析失败".to_string()) });
+            return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let path = resolve_path(&parsed.path, &self.cwd);
         cx.background_spawn(async move {
-            let raw = std::fs::read_to_string(&path).map_err(|e| format!("read_file 失败: {e}"))?;
+            let raw = std::fs::read_to_string(&path).map_err(|e| format!("read_file failed: {e}"))?;
             let text = crate::hashline::normalize_to_lf(&raw);
             let snap = crate::hashline::global()
                 .lock()
@@ -242,7 +244,7 @@ impl AgentTool for WriteFileTool {
         "write_file"
     }
     fn description(&self) -> &str {
-        "把内容写入指定文件（覆盖）。用于创建或重写文件。"
+        "Write content to the specified file (overwrite). Use to create or rewrite a file."
     }
     fn requires_approval(&self, _input: &serde_json::Value) -> bool {
         true
@@ -257,7 +259,7 @@ impl AgentTool for WriteFileTool {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<WriteFileInput>(input) else {
-            return cx.background_spawn(async { Err("input 解析失败".to_string()) });
+            return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let path = match resolve_path_for_write(&parsed.path, &self.cwd) {
             Ok(p) => p,
@@ -269,8 +271,8 @@ impl AgentTool for WriteFileTool {
                 std::fs::create_dir_all(parent).ok();
             }
             std::fs::write(&path, &parsed.content)
-                .map(|_| format!("已写入 {}（{content_len} 字节）", path.display()))
-                .map_err(|e| format!("write_file 失败: {e}"))
+                .map(|_| format!("Wrote {} ({content_len} bytes)", path.display()))
+                .map_err(|e| format!("write_file failed: {e}"))
         })
     }
 }
@@ -306,7 +308,7 @@ impl AgentTool for EditFileTool {
         "edit_file"
     }
     fn description(&self) -> &str {
-        "用 hashline patch 编辑已存在文件（行号锚定 + TAG 校验）。见 input.patch 字段说明。"
+        "Edit an existing file via a hashline patch (line-anchored + TAG validation). See the input.patch field docs."
     }
     fn requires_approval(&self, _input: &serde_json::Value) -> bool {
         true
@@ -321,7 +323,7 @@ impl AgentTool for EditFileTool {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<EditFileInput>(input) else {
-            return cx.background_spawn(async { Err("input 解析失败".to_string()) });
+            return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let cwd = self.cwd.clone();
         cx.background_spawn(async move {
@@ -331,7 +333,7 @@ impl AgentTool for EditFileTool {
                 let path = resolve_path_for_write(&fp.path, &cwd)?;
                 let path_display = path.display().to_string();
                 let raw = std::fs::read_to_string(&path)
-                    .map_err(|e| format!("edit_file 读取失败 {path_display}: {e}"))?;
+                    .map_err(|e| format!("edit_file read failed {path_display}: {e}"))?;
                 let had_bom = crate::hashline::has_bom(&raw);
                 let is_crlf = crate::hashline::detect_crlf(&raw);
                 let had_trailing_nl = raw.ends_with('\n');
@@ -340,7 +342,7 @@ impl AgentTool for EditFileTool {
 
                 let new_text = if current_tag == fp.tag {
                     crate::hashline::apply(&current, &fp.ops)
-                        .map_err(|e| format!("edit_file 应用失败 {path_display}: {e}"))?
+                        .map_err(|e| format!("edit_file apply failed {path_display}: {e}"))?
                         .text
                 } else {
                     let store = crate::hashline::global()
@@ -355,7 +357,7 @@ impl AgentTool for EditFileTool {
                 // flattens formatting or drops the file's terminating newline.
                 let persisted = persist(&new_text, is_crlf, had_bom, had_trailing_nl);
                 std::fs::write(&path, persisted.as_bytes())
-                    .map_err(|e| format!("edit_file 写入失败 {path_display}: {e}"))?;
+                    .map_err(|e| format!("edit_file write failed {path_display}: {e}"))?;
 
                 let new_snap = crate::hashline::global()
                     .lock()
@@ -375,7 +377,7 @@ fn unified_diff(old: &str, new: &str) -> String {
     let diff = TextDiff::from_lines(old, new);
     let rendered = diff.unified_diff().to_string();
     if rendered.is_empty() {
-        "(无变更)".to_string()
+        "(no changes)".to_string()
     } else {
         rendered
     }
@@ -431,7 +433,7 @@ impl AgentTool for ListDirectoryTool {
         "list_directory"
     }
     fn description(&self) -> &str {
-        "列出目录下的直接子条目（文件与目录）。"
+        "List the direct children (files and directories) of a directory."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<ListDirectoryInput>()
@@ -446,7 +448,7 @@ impl AgentTool for ListDirectoryTool {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<ListDirectoryInput>(input) else {
-            return cx.background_spawn(async { Err("input 解析失败".to_string()) });
+            return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let base = parsed
             .path
@@ -454,7 +456,7 @@ impl AgentTool for ListDirectoryTool {
             .unwrap_or_else(|| self.cwd.as_ref().clone());
         cx.background_spawn(async move {
             let entries =
-                std::fs::read_dir(&base).map_err(|e| format!("list_directory 失败: {e}"))?;
+                std::fs::read_dir(&base).map_err(|e| format!("list_directory failed: {e}"))?;
             let mut lines: Vec<String> = Vec::new();
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -494,7 +496,7 @@ impl AgentTool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "按正则搜索文件内容，返回匹配行（带行号）。"
+        "Search file contents by regex, returning matching lines (with line numbers)."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<GrepInput>()
@@ -509,7 +511,7 @@ impl AgentTool for GrepTool {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<GrepInput>(input) else {
-            return cx.background_spawn(async { Err("input 解析失败".to_string()) });
+            return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let base = parsed
             .path
@@ -546,7 +548,7 @@ impl Sink for GrepSink {
 fn run_grep(pattern: &str, root: &PathBuf, glob: Option<&str>) -> Result<String, String> {
     let matcher = RegexMatcherBuilder::new()
         .build(pattern)
-        .map_err(|e| format!("grep 正则无效: {e}"))?;
+        .map_err(|e| format!("grep invalid regex: {e}"))?;
 
     let mut walker = WalkBuilder::new(root);
     walker.standard_filters(true);
@@ -555,9 +557,9 @@ fn run_grep(pattern: &str, root: &PathBuf, glob: Option<&str>) -> Result<String,
     if let Some(g) = glob {
         let overrides = OverrideBuilder::new(root)
             .add(g)
-            .map_err(|e| format!("grep glob 无效: {e}"))?
+            .map_err(|e| format!("grep invalid glob: {e}"))?
             .build()
-            .map_err(|e| format!("grep glob 构建失败: {e}"))?;
+            .map_err(|e| format!("grep glob build failed: {e}"))?;
         walker.overrides(overrides);
     }
 
@@ -591,7 +593,7 @@ fn run_grep(pattern: &str, root: &PathBuf, glob: Option<&str>) -> Result<String,
     }
 
     if all_results.is_empty() {
-        Ok("无匹配".to_string())
+        Ok("No matches".to_string())
     } else {
         Ok(all_results.join("\n"))
     }
@@ -633,7 +635,7 @@ impl AgentTool for GlobTool {
         "glob"
     }
     fn description(&self) -> &str {
-        "按 glob 模式查找文件路径（相对 cwd）。默认尊重 .gitignore 并跳过隐藏文件；返回相对路径，上限 100。可传 no_ignore/include_hidden/include_dirs/limit 放宽。注意：limit 无硬顶，调大可能撑爆上下文，优先收窄 pattern。"
+        "Find file paths matching a glob pattern (relative to cwd). Honors .gitignore and skips hidden files by default; returns relative paths, capped at 100. Pass no_ignore/include_hidden/include_dirs/limit to relax. Note: limit has no hard ceiling — raising it can blow up the context, so prefer narrowing the pattern first."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<GlobInput>()
@@ -648,7 +650,7 @@ impl AgentTool for GlobTool {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<GlobInput>(input) else {
-            return cx.background_spawn(async { Err("input 解析失败".to_string()) });
+            return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let cwd = self.cwd.as_ref().clone();
         cx.background_spawn(async move {
@@ -657,9 +659,9 @@ impl AgentTool for GlobTool {
                 .map(|p| resolve_path(&p, &cwd))
                 .unwrap_or_else(|| cwd.clone());
             let matcher = GlobSetBuilder::new()
-                .add(Glob::new(&parsed.pattern).map_err(|e| format!("glob 模式无效: {e}"))?)
+                .add(Glob::new(&parsed.pattern).map_err(|e| format!("glob invalid pattern: {e}"))?)
                 .build()
-                .map_err(|e| format!("glob 编译失败: {e}"))?;
+                .map_err(|e| format!("glob build failed: {e}"))?;
             let limit = parsed.limit.unwrap_or(100);
             // Default flags enforce the strongest filtering; each toggle relaxes one axis.
             let mut builder = WalkBuilder::new(&root);
@@ -695,12 +697,12 @@ impl AgentTool for GlobTool {
             }
             out.sort();
             if out.is_empty() {
-                Ok("无匹配文件".to_string())
+                Ok("No matching files".to_string())
             } else if truncated {
                 // Count-based truncation (not byte), so it does not go through
                 // `TruncatedText`; the wording is unified to the `⚠` advisory style.
                 Ok(format!(
-                    "⚠ 匹配过多（已显示前 {limit} 条，更多未列出）。收窄 `pattern` 或调高 `limit` 后重试——不要臆测未列出的匹配。\n\n{}",
+                    "⚠ Too many matches (showing first {limit}, more omitted). Narrow `pattern` or raise `limit` and retry — do not speculate about omitted matches.\n\n{}",
                     out.join("\n")
                 ))
             } else {
@@ -868,12 +870,15 @@ mod tests {
     #[test]
     fn render_prefixed_advisory_reports_total() {
         let t = TruncatedText::new("body", 100, 50);
-        let r = t.render("收窄 pattern");
+        let r = t.render("narrow the pattern");
         assert!(r.starts_with('⚠'), "prefixed: {r}");
-        assert!(r.contains("共 150 字节"), "total reported: {r}");
-        assert!(r.contains("显示前 100"), "cap reported: {r}");
-        assert!(r.contains("收窄 pattern"), "hint folded in: {r}");
-        assert!(r.contains("不要臆测"), "no-guess directive: {r}");
+        assert!(r.contains("150 bytes total"), "total reported: {r}");
+        assert!(r.contains("showing first 100"), "cap reported: {r}");
+        assert!(r.contains("narrow the pattern"), "hint folded in: {r}");
+        assert!(
+            r.contains("do not speculate"),
+            "no-guess directive: {r}"
+        );
         assert!(r.contains("body"), "text preserved: {r}");
     }
 
@@ -884,7 +889,7 @@ mod tests {
         let r = resolve_path_for_write("/etc/manox-probe", cwd);
         assert!(r.is_err(), "must reject write outside project: {r:?}");
         let e = r.unwrap_err();
-        assert!(e.contains("超出项目根"), "error: {e}");
+        assert!(e.contains("outside project root"), "error: {e}");
     }
 
     #[test]
@@ -893,7 +898,7 @@ mod tests {
         let r = resolve_path_for_write(".git/config", cwd);
         assert!(r.is_err(), "must reject write to .git: {r:?}");
         let e = r.unwrap_err();
-        assert!(e.contains("沙箱保护"), "error: {e}");
+        assert!(e.contains("sandbox"), "error: {e}");
     }
 
     #[test]

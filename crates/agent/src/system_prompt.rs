@@ -16,6 +16,11 @@
 //! deliberately NOT injected — the model fetches it on demand via the
 //! `self_info` tool (codex and zed likewise do not inject session/thread id
 //! into the prompt).
+//!
+//! The prompt prose is fixed English regardless of the UI locale (the model's
+//! context stays in one language). The user's preferred reply language is
+//! conveyed by a one-line directive injected into the runtime identity block —
+//! see [`build_main_system_prompt`] and [`language_directive`].
 
 use std::path::Path;
 
@@ -34,17 +39,18 @@ pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>, yolo: bool) 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
     let os = std::env::consts::OS;
 
-    let mut identity = String::from("## 运行时身份\n");
-    identity.push_str(&format!("- 当前工作目录：`{}`\n", cwd.display()));
+    let mut identity = String::from("## Runtime identity\n");
+    identity.push_str(&format!("- Current working directory: `{}`\n", cwd.display()));
     if let Some(p) = project {
-        identity.push_str(&format!("- 项目根：`{}`\n", p.display()));
+        identity.push_str(&format!("- Project root: `{}`\n", p.display()));
     }
-    identity.push_str(&format!("- 操作系统：{os}\n"));
-    identity.push_str(&format!("- 默认 shell：{shell}\n"));
-    identity.push_str(&format!("- 今天：{today}\n"));
+    identity.push_str(&format!("- Operating system: {os}\n"));
+    identity.push_str(&format!("- Default shell: {shell}\n"));
+    identity.push_str(&format!("- Today: {today}\n"));
     if yolo {
-        identity.push_str("- 模式：YOLO（工具调用无需审批，bash 在沙箱外运行）\n");
+        identity.push_str("- Mode: YOLO (tool calls need no approval, bash runs outside the sandbox)\n");
     }
+    identity.push_str(language_directive());
 
     let mut prompt = STATIC_PROMPT.replace(RUNTIME_IDENTITY_TAG, &identity);
     // Advertise installed skills so the model knows what reference docs it can
@@ -58,6 +64,20 @@ pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>, yolo: bool) 
     prompt
 }
 
+/// The language directive injected into the system prompt so the model addresses
+/// the user in the UI's chosen language. The prompt prose itself stays English;
+/// only this one directive varies with [`crate::i18n::current`]. Appendable to
+/// a sub-agent's `system` string as well, to keep sub-agent reply language
+/// consistent with the main thread.
+pub fn language_directive() -> &'static str {
+    // The name is always an English endonym ("English", "Simplified Chinese") —
+    // the model parses the directive, the user never sees this string.
+    match crate::i18n::current() {
+        crate::i18n::Language::En => "\n\n## Language\n\nUnless the user specifies otherwise, write your user-facing responses in English.\n",
+        crate::i18n::Language::ZhCn => "\n\n## Language\n\nUnless the user specifies otherwise, write your user-facing responses in Simplified Chinese.\n",
+    }
+}
+
 /// The user message injected when a sub-agent hits its `max_turns` cap.
 ///
 /// Kept here rather than in `system_prompt.md` because it is a one-line
@@ -66,21 +86,19 @@ pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>, yolo: bool) 
 /// hit (the sub-agent keeps calling tools) is what actually hard-stops the turn
 /// in `Thread::run_turn_loop`.
 pub fn max_turns_summary_prompt(max: u32) -> String {
-    format!(
-        "你已达到最大轮次 {max}。请基于上述已完成的工作，给出一个简洁的最终总结，不要再调用任何工具。"
-    )
+    format!("You've reached the maximum turn count of {max}. Based on the work completed above, produce a concise final summary. Do not call any more tools.")
 }
 
 /// Appended to the system prompt while the thread is in plan mode. Tells the
 /// model the read-only constraint and how to exit via `exit_plan_mode`. Kept in
 /// code (not in `system_prompt.md`) for the same reason as
 /// `max_turns_summary_prompt`: a short, templated instruction, not prose.
-pub const PLAN_MODE_ADDENDUM: &str = "\n\n## 计划模式\n\
-你当前处于「计划模式」。\n\
-- 你只能使用只读工具（read_file / list_directory / grep / glob / AskUserQuestion / self_info / skill）来调研代码库。\n\
-- 写操作、bash 执行与派生子代理的工具已对你不可见；不要尝试它们。\n\
-- 充分调研后，调用 `exit_plan_mode` 工具提交计划：计划应包含分步的实施方案、每步将使用的工具、以及潜在风险。\n\
-- 调用 `exit_plan_mode` 后对话会暂停，等待用户批准或拒绝：批准则退出计划模式开始执行；拒绝则根据反馈继续修订计划，不要重复提交同一计划。\n";
+pub const PLAN_MODE_ADDENDUM: &str = "\n\n## Plan mode\n\
+You are currently in plan mode.\n\
+- You may only use read-only tools (read_file / list_directory / grep / glob / AskUserQuestion / self_info / skill) to research the codebase.\n\
+- Write tools, bash execution, and the sub-agent spawning tool are hidden from you; do not attempt them.\n\
+- After thorough research, call the `exit_plan_mode` tool to submit your plan: it should include a step-by-step implementation plan, the tools each step will use, and any potential risks.\n\
+- After you call `exit_plan_mode` the conversation pauses for user approval or rejection: approval exits plan mode and begins execution; rejection returns you to plan mode to revise the plan per the feedback — do not resubmit the same plan unchanged.\n";
 
 #[cfg(test)]
 mod tests {
@@ -92,7 +110,7 @@ mod tests {
         let p = build_main_system_prompt(cwd, None, false);
         assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
         assert!(p.contains("manox agent"), "identity must appear: {p}");
-        assert!(p.contains("今天"), "date must appear: {p}");
+        assert!(p.contains("Today:"), "date row must appear: {p}");
     }
 
     #[test]
@@ -113,7 +131,7 @@ mod tests {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(!p.contains("{{"), "placeholder leaked: {p}");
         assert!(!p.contains("runtime_identity}}"), "placeholder leaked: {p}");
-        assert!(p.contains("## 运行时身份"), "identity block missing: {p}");
+        assert!(p.contains("## Runtime identity"), "identity block missing: {p}");
     }
 
     #[test]
@@ -121,40 +139,46 @@ mod tests {
         let cwd = Path::new("/tmp/some-proj");
         let proj = Path::new("/tmp/some-proj");
         let p = build_main_system_prompt(cwd, Some(proj), false);
-        assert!(p.contains("项目根"));
+        assert!(p.contains("Project root"));
     }
 
     #[test]
     fn prompt_contains_engineering_stance() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("工程立场"), "engineering stance section: {p}");
-        assert!(p.contains("对终态负责"), "end-state responsibility: {p}");
-        assert!(p.contains("根因"), "root-cause discipline: {p}");
+        assert!(p.contains("Engineering stance"), "engineering stance section: {p}");
+        assert!(p.contains("Own the end state"), "end-state responsibility: {p}");
+        assert!(p.contains("root cause"), "root-cause discipline: {p}");
     }
 
     #[test]
     fn prompt_contains_no_fabrication() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("不要编造"), "no-fabrication discipline: {p}");
+        assert!(p.contains("don't fabricate"), "no-fabrication discipline: {p}");
     }
 
     #[test]
     fn prompt_contains_task_completion() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("完全解决"), "task completion discipline: {p}");
+        assert!(p.contains("fully solved"), "task completion discipline: {p}");
     }
 
     #[test]
     fn prompt_contains_validation_discipline() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("没跑过不要说过了"), "validation discipline: {p}");
+        assert!(
+            p.contains("Don't claim something passed without running it"),
+            "validation discipline: {p}"
+        );
     }
 
     #[test]
     fn prompt_contains_sandbox_boundary() {
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("工具沙箱边界"), "sandbox boundary section: {p}");
-        assert!(p.contains("`.git` 目录只读"), ".git protected: {p}");
+        assert!(p.contains("Tool sandbox boundary"), "sandbox boundary section: {p}");
+        assert!(
+            p.contains("`.git` directory is read-only"),
+            ".git protected: {p}"
+        );
         assert!(
             p.contains("unsandboxed"),
             "unsandboxed knob documented: {p}"
@@ -169,7 +193,7 @@ mod tests {
         // but no concrete id value is injected here.
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
         assert!(
-            !p.contains("当前 thread id"),
+            !p.contains("Current thread id"),
             "no thread id row in runtime identity block: {p}"
         );
     }
@@ -178,14 +202,40 @@ mod tests {
     fn static_prompt_is_embedded_verbatim() {
         // Editing the markdown must show through without rebuilding logic.
         let p = build_main_system_prompt(Path::new("/tmp"), None, false);
-        assert!(p.contains("工程立场"));
-        assert!(p.contains("进程内 native agent 工作台"));
+        assert!(p.contains("Engineering stance"));
+        assert!(p.contains("in-process native agent workbench"));
+    }
+
+    #[test]
+    fn prompt_injects_language_directive() {
+        // The current-locale language directive must land in the built prompt.
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        assert!(p.contains("## Language"), "language section missing: {p}");
+        assert!(
+            p.contains("write your user-facing responses in"),
+            "language directive missing: {p}"
+        );
+    }
+
+    #[test]
+    fn yolo_mode_advertised_when_enabled() {
+        let p = build_main_system_prompt(Path::new("/tmp"), None, true);
+        assert!(p.contains("YOLO"), "yolo mode line missing: {p}");
+    }
+
+    #[test]
+    fn yolo_mode_silent_when_disabled() {
+        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        assert!(!p.contains("YOLO"), "yolo must not appear when disabled: {p}");
     }
 
     #[test]
     fn max_turns_summary_prompt_contains_cap_and_no_tools() {
         let s = max_turns_summary_prompt(10);
         assert!(s.contains("10"), "cap value must appear: {s}");
-        assert!(s.contains("不要再调用任何工具"), "no-tools directive: {s}");
+        assert!(
+            s.contains("Do not call any more tools"),
+            "no-tools directive: {s}"
+        );
     }
 }

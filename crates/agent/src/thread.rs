@@ -326,7 +326,11 @@ impl Thread {
                 return truncate_summary(trimmed, 60);
             }
         }
-        "(新对话)".to_string()
+        // No user text yet: return empty so the sidebar renders its localized
+        // "(New chat)" placeholder rather than storing a display string in the
+        // DB (which would freeze it to whichever language was active at first
+        // turn).
+        String::new()
     }
 
     /// Called after the UI resolves authorization: route the response to the
@@ -536,7 +540,7 @@ impl Thread {
             return;
         }
         let Some(model) = self.model.clone() else {
-            cx.emit(ThreadEvent::Error(anyhow::anyhow!("未配置模型")));
+            cx.emit(ThreadEvent::Error(anyhow::anyhow!("No model configured")));
             return;
         };
 
@@ -854,7 +858,7 @@ impl Thread {
         let tool = this.read_with(cx, |this, _| this.tools.get(&name).cloned())?;
 
         let Some(tool) = tool else {
-            let msg = format!("未知工具: {name}");
+            let msg = format!("Unknown tool: {name}");
             Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
             Self::append_tool_result(&this, tu, msg.clone(), true, cx)?;
             return Ok(());
@@ -866,7 +870,7 @@ impl Thread {
         // rather than execute it.
         let in_plan = this.read_with(cx, |this, _| this.plan_mode)?;
         if in_plan && !tool.is_read_only() {
-            let msg = format!("计划模式下不允许调用 {name}。");
+            let msg = format!("Plan mode does not permit calling {name}.");
             Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
             Self::append_tool_result(&this, tu, msg, true, cx)?;
             return Ok(());
@@ -918,7 +922,7 @@ impl Thread {
             })?;
             match response {
                 ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {
-                    let msg = "用户拒绝执行".to_string();
+                    let msg = "User denied execution".to_string();
                     Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
                     Self::append_tool_result(&this, tu, msg, true, cx)?;
                     return Ok(());
@@ -1061,13 +1065,13 @@ impl Thread {
     ) -> Result<()> {
         let id = tu.id.clone();
         let name = "exit_plan_mode".to_string();
-        let title = "提交计划".to_string();
+        let title = "Submit plan".to_string();
 
         let plan_text = tu
             .input
             .get("plan")
             .and_then(|v| v.as_str())
-            .unwrap_or("(未提供计划文本)")
+            .unwrap_or("(no plan text provided)")
             .to_string();
 
         this.update(cx, |_, cx| {
@@ -1101,7 +1105,7 @@ impl Thread {
         match response {
             PlanApprovalResponse::Approve => {
                 let msg =
-                    format!("用户已批准该计划。计划内容：\n\n{plan_text}\n\n现在可以开始执行。");
+                    format!("User approved the plan. Plan contents:\n\n{plan_text}\n\nYou may now begin execution.");
                 this.update(cx, |_, cx| {
                     cx.emit(ThreadEvent::ToolCall {
                         id: id.clone(),
@@ -1125,7 +1129,7 @@ impl Thread {
                 })?;
             }
             PlanApprovalResponse::Reject => {
-                let msg = "用户拒绝了该计划。请根据用户反馈修订计划，再次调用 exit_plan_mode。"
+                let msg = "User rejected the plan. Revise it per the user's feedback and call exit_plan_mode again."
                     .to_string();
                 this.update(cx, |_, cx| {
                     cx.emit(ThreadEvent::ToolCall {
@@ -1154,7 +1158,7 @@ impl Thread {
         let id = tu.id.clone();
         let name = tu.name.to_string();
         let title = tool_title(&name, &tu.input);
-        let msg = "工具未执行（会话被取消）".to_string();
+        let msg = "Tool not executed (session cancelled)".to_string();
         this.update(cx, |_, cx| {
             cx.emit(ThreadEvent::ToolCall {
                 id: id.clone(),
@@ -1253,7 +1257,7 @@ impl Thread {
                     tool_name: tool_name.clone(),
                     is_error: true,
                     content: format!(
-                        "工具输入 JSON 解析失败: {json_parse_error}\nraw: {raw_input}"
+                        "Tool input JSON parse failed: {json_parse_error}\nraw: {raw_input}"
                     ),
                 };
                 self.push_tool_result(result, cx);
@@ -1420,7 +1424,7 @@ impl Thread {
                     tool_use_id: id,
                     tool_name: name,
                     is_error: true,
-                    content: "工具未执行（会话中断或被取消）".to_string(),
+                    content: "Tool not executed (session interrupted or cancelled)".to_string(),
                 })
             })
             .collect();
@@ -1448,6 +1452,14 @@ impl Thread {
                 self.yolo,
             )
         });
+        // Sub-agents carry their own system prompt from `agents/*.md`; the main
+        // thread already has the language directive baked in via
+        // `build_main_system_prompt`. Append it for sub-agents so their reply
+        // language follows the UI locale too — the prompt prose itself stays
+        // English, only this one directive varies.
+        if self.system.is_some() {
+            system.push_str(crate::system_prompt::language_directive());
+        }
         // In plan mode, append the read-only-constraint addendum so the model
         // knows it must submit a plan via `exit_plan_mode` rather than act.
         if self.plan_mode {
@@ -2030,7 +2042,7 @@ mod tests {
                     .expect("no ToolResult in last message");
                 assert_eq!(tr.tool_use_id.as_str(), "tu_plan_1");
                 assert!(
-                    tr.content.contains("已批准"),
+                    tr.content.contains("approved"),
                     "expected approval message in ToolResult, got: {}",
                     tr.content
                 );
@@ -2104,7 +2116,7 @@ mod tests {
             panic!("expected ToolResult, got {:?}", last.content);
         };
         assert!(
-            content.contains("用户拒绝执行"),
+            content.contains("User denied execution"),
             "YOLO + AskUserQuestion should hit the authorization gate (Deny on cancel), \
              got: {content}"
         );

@@ -43,9 +43,10 @@ impl AgentToolTrait for SelfInfoTool {
     }
 
     fn description(&self) -> &str {
-        "查看当前 agent 的运行时身份：thread id、当前工作目录、项目根、模型、\
-         已用轮次/上限、嵌套深度。当用户问起 thread id 或你需要确认运行环境时调用——\
-         不要跑 SQL 或翻持久层（threads.db）反查自身。"
+        "Read the current agent's runtime identity: thread id, current working directory, \
+         project root, model, turns used / cap, and nesting depth. Call this when the user \
+         asks for the thread id or you need to confirm the runtime environment — do not run \
+         SQL or dig into the persistence layer (threads.db) to look yourself up."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -117,7 +118,7 @@ mod tests {
         // The c5aefe4d failure mode: agent ran SQL to find its own thread id.
         // The description must steer the model away from the persistence layer.
         let tool = SelfInfoTool::new(WeakEntity::<Thread>::new_invalid());
-        assert!(tool.description().contains("不要跑 SQL"));
+        assert!(tool.description().contains("do not run SQL"));
     }
 
     /// `self_info` reads the owning `Thread` via `read_with`. The owning

@@ -16,6 +16,7 @@ use std::rc::Rc;
 use std::path::{Path, PathBuf};
 
 use agent::language_model::MessageContent;
+use agent::i18n;
 use base64::Engine as _;
 use gpui::{SharedString, prelude::*};
 use gpui_component::{
@@ -25,45 +26,51 @@ use gpui_component::{
 };
 
 /// Static row for the `+` and `⁄` menus: an icon, a name, and a description.
+/// `name`/`desc` are fluent message ids for localized rows, or literal English
+/// text for the decorative placeholder rows that mimic Codex.app (resolved
+/// identically via [`menu_row_item`]).
 struct MenuRow {
     icon: IconName,
     name: &'static str,
     desc: &'static str,
 }
 
-/// `+` menu "添加" group. `文件和文件夹` (index 0) opens the file picker,
-/// `Choose project` (index 1) opens the directory picker to bind a project,
-/// and `计划模式` (index 4) toggles plan mode, all wired by the caller; the
-/// rest are static decoration mirroring Codex.app.
+/// `+` menu "Add" group. "Files and folders" (index 0) opens the file picker,
+/// "Choose project" (index 1) opens the directory picker to bind a project,
+/// and "Plan mode" (index 4) toggles plan mode, all wired by the caller; the
+/// rest are static decoration mirroring Codex.app. Names/descs are fluent keys
+/// resolved at render time.
 const PLUS_ADD_ROWS: &[MenuRow] = &[
     MenuRow {
         icon: IconName::Folder,
-        name: "文件和文件夹",
+        name: "composer-add-files",
         desc: "",
     },
     MenuRow {
         icon: IconName::FolderOpen,
-        name: "Choose project",
-        desc: "绑定项目目录",
+        name: "composer-choose-project",
+        desc: "composer-choose-project-desc",
     },
     MenuRow {
         icon: IconName::SquareTerminal,
-        name: "附加 Zed",
+        name: "composer-attach-zed",
         desc: "",
     },
     MenuRow {
         icon: IconName::CircleCheck,
-        name: "目标",
-        desc: "设置持续努力实现的目标",
+        name: "composer-goal-name",
+        desc: "composer-goal-desc",
     },
     MenuRow {
         icon: IconName::LayoutDashboard,
-        name: "计划模式",
-        desc: "开启计划模式",
+        name: "composer-plan-mode-name",
+        desc: "composer-plan-mode-desc",
     },
 ];
 
-/// `+` menu "插件" group — all static decoration.
+/// `+` menu "Plugins" group — all static decoration. Literal English product
+/// names (not localized); `i18n::t` returns them unchanged via the missing-key
+/// fallback, which is fine since they are proper nouns.
 const PLUS_PLUGIN_ROWS: &[MenuRow] = &[
     MenuRow {
         icon: IconName::File,
@@ -129,19 +136,24 @@ const SLASH_SKILL_ROWS: &[(&str, &str, bool)] = &[
     ("PDF", "Read, create, render, and verify PDF files", true),
 ];
 
-/// Render one menu row (icon + name + muted description) as a popup-menu element item.
+/// Render one menu row (icon + name + muted description) as a popup-menu element
+/// item. `name`/`desc` are resolved through `i18n::t`: fluent keys yield the
+/// localized text, literal English placeholders fall through unchanged.
 fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
     let fg = theme.foreground;
     let muted = theme.muted_foreground;
-    let (icon, name, desc) = (row.icon.clone(), row.name, row.desc);
+    let icon = row.icon.clone();
+    let name = i18n::t(row.name);
+    let desc = i18n::t(row.desc);
     PopupMenuItem::element(move |_window, _cx| {
         let mut line = h_flex()
             .items_center()
             .gap_2()
             .child(Icon::new(icon.clone()).small().text_color(muted))
-            .child(gpui::div().text_sm().text_color(fg).child(name));
+            .child(gpui::div().text_sm().text_color(fg).child(name.clone()));
         if !desc.is_empty() {
-            line = line.child(gpui::div().text_xs().text_color(muted).child(desc));
+            line = line
+                .child(gpui::div().text_xs().text_color(muted).child(desc.clone()));
         }
         line
     })
@@ -174,10 +186,10 @@ fn slash_command_item(name: &str, desc: &str, theme: &Theme) -> PopupMenuItem {
     })
 }
 
-/// Build the `+` popup menu. `on_files` runs when the "文件和文件夹" row is
+/// Build the `+` popup menu. `on_files` runs when the "Files and folders" row is
 /// clicked (index 0); `on_project` runs when the "Choose project" row is clicked
 /// (index 1) — when `None`, the row is omitted entirely (project binding is only
-/// available before the conversation starts); `on_plan` runs when the "计划模式"
+/// available before the conversation starts); `on_plan` runs when the "Plan mode"
 /// row is clicked (index 4, shifted when project row is omitted).
 pub fn build_plus_menu(
     menu: PopupMenu,
@@ -187,8 +199,8 @@ pub fn build_plus_menu(
     on_plan: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(360.)).scrollable(true);
-    menu = menu.label("添加");
-    // Index 0 ("文件和文件夹") and 4 ("计划模式") are always real actions.
+    menu = menu.label(i18n::t("composer-add-label"));
+    // Index 0 ("Files and folders") and 4 ("Plan mode") are always real actions.
     // Index 1 ("Choose project") is a real action when on_project is Some;
     // when None the row is skipped entirely.
     let on_files = std::rc::Rc::new(on_files);
@@ -221,7 +233,7 @@ pub fn build_plus_menu(
             }
         }
     }
-    menu = menu.separator().label("插件");
+    menu = menu.separator().label(i18n::t("composer-plugins-label"));
     for row in PLUS_PLUGIN_ROWS {
         menu = menu.item(menu_row_item(row, theme));
     }
@@ -237,7 +249,7 @@ pub fn build_slash_menu(
     on_select: impl Fn(&str, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(420.)).scrollable(true);
-    menu = menu.label("命令");
+    menu = menu.label(i18n::t("composer-commands-label"));
     // Registered slash commands (dynamic). Falls back to an empty section when
     // the registry is not yet initialized.
     let on_select = Rc::new(on_select);
@@ -253,13 +265,17 @@ pub fn build_slash_menu(
             ));
         }
     }
-    menu = menu.separator().label("记忆");
-    menu = menu.item(PopupMenuItem::Label("生成开".into()));
-    menu = menu.separator().label("技能");
+    menu = menu.separator().label(i18n::t("composer-memory-label"));
+    menu = menu.item(PopupMenuItem::Label(i18n::t("composer-generate-memory")));
+    menu = menu.separator().label(i18n::t("composer-skills-label"));
     let fg = theme.foreground;
     let muted = theme.muted_foreground;
     for (name, desc, personal) in SLASH_SKILL_ROWS {
-        let tag = if *personal { "个人" } else { "系统" };
+        let tag = if *personal {
+            i18n::t("composer-tag-personal")
+        } else {
+            i18n::t("composer-tag-system")
+        };
         menu = menu.item(PopupMenuItem::element(move |_window, _cx| {
             h_flex()
                 .w_full()
@@ -274,7 +290,7 @@ pub fn build_slash_menu(
                         .text_color(muted)
                         .child(*desc),
                 )
-                .child(gpui::div().text_xs().text_color(muted).child(tag))
+                .child(gpui::div().text_xs().text_color(muted).child(tag.clone()))
         }));
     }
     menu

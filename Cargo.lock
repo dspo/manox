@@ -138,6 +138,7 @@ dependencies = [
  "brush-core",
  "chrono",
  "cx-providers",
+ "fluent",
  "futures",
  "globset",
  "gpui",
@@ -158,6 +159,7 @@ dependencies = [
  "tokio-util",
  "toml 0.8.23",
  "tracing",
+ "unic-langid",
  "uuid",
  "xxhash-rust",
 ]

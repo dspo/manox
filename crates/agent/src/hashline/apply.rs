@@ -65,7 +65,7 @@ pub fn apply(text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
         for (os, oe) in &consumed {
             if *os <= *end && *start <= *oe {
                 return Err(ApplyError {
-                    message: format!("操作范围 {start}..={end} 与已有范围 {os}..={oe} 重叠"),
+                    message: format!("op range {start}..={end} overlaps existing range {os}..={oe}"),
                 });
             }
         }
@@ -84,7 +84,7 @@ pub fn apply(text: &str, ops: &[Op]) -> Result<ApplyResult, ApplyError> {
             if (*s - 1..=*e - 1).contains(&p) {
                 return Err(ApplyError {
                     message: format!(
-                        "INS（锚点 {anchor:?}、{pos:?}）的插入点落在操作范围 {s}..={e} 内，会被该 SWAP/DEL 吞掉；请把插入内容并入该 SWAP，或改用范围外的锚点"
+                        "INS (anchor {anchor:?}, {pos:?}) insertion point falls inside op range {s}..={e} and would be swallowed by that SWAP/DEL; fold the inserted content into that SWAP, or use an anchor outside the range"
                     ),
                 });
             }
@@ -171,14 +171,14 @@ fn resolve_op(op: &Op, lines: &[String]) -> Result<ResolvedOp, ApplyError> {
         Op::Ins { pos, anchor, body } => {
             if body.is_empty() {
                 return Err(ApplyError {
-                    message: "INS 操作的 body 不能为空".to_string(),
+                    message: "INS op body must not be empty".to_string(),
                 });
             }
             if let Some(a) = anchor
                 && (*a == 0 || *a > lines.len())
             {
                 return Err(ApplyError {
-                    message: format!("INS 锚点行 {a} 越界（文件共 {} 行）", lines.len()),
+                    message: format!("INS anchor line {a} out of bounds (file has {} lines)", lines.len()),
                 });
             }
             Ok(ResolvedOp::Ins {
@@ -209,7 +209,7 @@ fn resolve_op(op: &Op, lines: &[String]) -> Result<ResolvedOp, ApplyError> {
         Op::InsBlkPost { anchor, body } => {
             if body.is_empty() {
                 return Err(ApplyError {
-                    message: "INS.BLK.POST 操作的 body 不能为空".to_string(),
+                    message: "INS.BLK.POST op body must not be empty".to_string(),
                 });
             }
             let land =
@@ -229,17 +229,17 @@ fn resolve_op(op: &Op, lines: &[String]) -> Result<ResolvedOp, ApplyError> {
 fn validate_range(start: usize, end: usize, len: usize) -> Result<(), ApplyError> {
     if start == 0 || end == 0 {
         return Err(ApplyError {
-            message: "行号必须 ≥ 1".to_string(),
+            message: "line numbers must be >= 1".to_string(),
         });
     }
     if start > end {
         return Err(ApplyError {
-            message: format!("范围起始 {start} 大于结束 {end}"),
+            message: format!("range start {start} is greater than end {end}"),
         });
     }
     if end > len {
         return Err(ApplyError {
-            message: format!("范围结束 {end} 越界（文件共 {len} 行）"),
+            message: format!("range end {end} out of bounds (file has {len} lines)"),
         });
     }
     Ok(())
@@ -265,7 +265,7 @@ fn apply_resolved(lines: &mut Vec<String>, op: &ResolvedOp) -> Result<(), ApplyE
                 (InsPos::Post, Some(a)) => *a,
                 _ => {
                     return Err(ApplyError {
-                        message: "INS PRE/POST 缺少锚点".to_string(),
+                        message: "INS PRE/POST requires an anchor".to_string(),
                     });
                 }
             };
