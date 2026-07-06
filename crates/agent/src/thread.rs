@@ -738,9 +738,15 @@ impl Thread {
         let input = tu.input.clone();
         let (sink, rx) = crate::tool::ToolOutputSink::channel(id.clone().into());
         let id_for_drain = id.clone();
-        let result_task: Task<Result<String, String>> = this.update(cx, |_this, cx| {
-            tool.run_streaming(input, cancel.clone(), sink, cx)
-        })?;
+        // Invoke the tool via `cx.update` (App context, no entity lease) rather
+        // than `this.update`. `this.update` would hold a write lease on the
+        // owning Thread, and tools that read the owning Thread from inside
+        // their `run` — `self_info` does `self.thread.read_with` — would
+        // re-lease the same entity and trip gpui's `double_lease_panic`. The
+        // tool returns its `Task` synchronously and does not need the Thread
+        // leased on its behalf.
+        let result_task: Task<Result<String, String>> =
+            cx.update(|cx| tool.run_streaming(input, cancel.clone(), sink, cx));
         // Drain live output chunks to the UI while the tool runs. A foreground
         // spawn is used (not background_spawn) because emitting requires an
         // `AsyncApp`, which is `!Send` (`Rc`-backed). The receiver closes once
