@@ -18,9 +18,10 @@
 
 use std::sync::{Arc, OnceLock};
 
-use gpui::{App, Context, Window};
+use gpui::{App, Context, SharedString, Window};
 
 use agent::command::CommandDefinition;
+use agent::i18n;
 
 use crate::workspace::Workspace;
 
@@ -55,8 +56,10 @@ pub struct ParsedSlash {
 pub trait SlashCommand: Send + Sync {
     /// Canonical name without the leading `/` (e.g. `yolo`).
     fn name(&self) -> &str;
-    /// One-line description shown in the `⁄` popover.
-    fn description(&self) -> &str;
+    /// One-line description shown in the `⁄` popover. Localized via `i18n` for
+    /// built-in commands; markdown-defined commands return their frontmatter
+    /// description verbatim (author-chosen language).
+    fn description(&self) -> SharedString;
     /// Execute the command. `args` is the trailing text after the command name.
     fn execute(
         &self,
@@ -191,8 +194,8 @@ impl SlashCommand for YoloCommand {
     fn name(&self) -> &str {
         "yolo"
     }
-    fn description(&self) -> &str {
-        "切换 YOLO 模式（免审批 + bash 沙箱外）；带提示词则开启后直接开工"
+    fn description(&self) -> SharedString {
+        i18n::t("slash-yolo-desc")
     }
     fn execute(
         &self,
@@ -232,8 +235,8 @@ impl SlashCommand for MarkdownSlashCommand {
     fn name(&self) -> &str {
         &self.key
     }
-    fn description(&self) -> &str {
-        &self.def.description
+    fn description(&self) -> SharedString {
+        SharedString::from(self.def.description.clone())
     }
     fn execute(
         &self,
@@ -261,8 +264,8 @@ impl SlashCommand for PlanCommand {
     fn name(&self) -> &str {
         "plan"
     }
-    fn description(&self) -> &str {
-        "进入计划模式：仅允许只读工具，研究后提交计划待批准（裸 `/plan` 切换；`/plan <提示>` 带提示进入）"
+    fn description(&self) -> SharedString {
+        i18n::t("slash-plan-desc")
     }
     fn execute(
         &self,

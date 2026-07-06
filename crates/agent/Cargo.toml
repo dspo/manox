@@ -34,6 +34,8 @@ gpui.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 toml.workspace = true
 http.workspace = true
+fluent.workspace = true
+unic-langid.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

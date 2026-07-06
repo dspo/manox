@@ -29,9 +29,10 @@ impl AgentTool for SkillTool {
         "skill"
     }
     fn description(&self) -> &str {
-        "查阅指定技能的完整说明书正文。技能名见系统提示「可用技能」列表，\
-         插件技能用 `plugin:skill` 形式（如 `gitwork:review`）。\
-         仅当任务确实需要该技能的领域知识时调用；不要为已知晓的操作重复查阅。"
+        "Consult the full body of a named skill. Skill names appear in the system prompt's \
+         \"Available skills\" list; plugin skills use the `plugin:skill` form (e.g. `gitwork:review`). \
+         Call only when the task genuinely needs the skill's domain knowledge; don't re-fetch one \
+         you already know."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<SkillInput>()
@@ -47,7 +48,7 @@ impl AgentTool for SkillTool {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<SkillInput>(input) else {
-            return cx.background_spawn(async { Err("input 解析失败".to_string()) });
+            return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         cx.background_spawn(async move {
             let reg = crate::skill::global();
@@ -62,7 +63,7 @@ impl AgentTool for SkillTool {
                     Ok(out)
                 }
                 None => Err(format!(
-                    "未知技能: `{}`。请核对系统提示「可用技能」列表中的名称（插件技能需带 `plugin:` 前缀）。",
+                    "Unknown skill: `{}`. Check the name against the system prompt's \"Available skills\" list (plugin skills require a `plugin:` prefix).",
                     parsed.name
                 )),
             }

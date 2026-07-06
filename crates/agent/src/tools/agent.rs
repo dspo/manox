@@ -180,17 +180,17 @@ fn setup_child(
     cx: &mut App,
 ) -> Result<SubagentSetup, String> {
     let parsed: AgentToolInput =
-        serde_json::from_value(input.clone()).map_err(|e| format!("agent 输入解析失败: {e}"))?;
+        serde_json::from_value(input.clone()).map_err(|e| format!("agent input parse failed: {e}"))?;
 
     let def_file: Arc<AgentDefinitionFile> = agent_def::global()
         .get(&parsed.subagent_type)
         .cloned()
-        .ok_or_else(|| format!("未知 subagent 类型: {}", parsed.subagent_type))?;
+        .ok_or_else(|| format!("unknown subagent type: {}", parsed.subagent_type))?;
     let def = &def_file.def;
 
     let child_depth = depth + 1;
     if child_depth > MAX_DEPTH {
-        return Err(format!("子 agent 嵌套深度超限 ({MAX_DEPTH})"));
+        return Err(format!("subagent nesting depth exceeded ({MAX_DEPTH})"));
     }
 
     let model = resolve_model(&def.model, parent, cx)?;
@@ -318,7 +318,7 @@ fn resolve_model(
         if let Some(m) = crate::model_alias::resolve_model_ref(id) {
             return Ok(m);
         }
-        return Err(format!("子 agent model 未找到: {id}"));
+        return Err(format!("sub-agent model not found: {id}"));
     }
     if let Ok(Some(m)) = parent.read_with(cx, |t, _| t.model().cloned()) {
         return Ok(m);
@@ -327,7 +327,7 @@ fn resolve_model(
         .models()
         .first()
         .cloned()
-        .ok_or_else(|| "无可用模型".to_string())
+        .ok_or_else(|| "no model available".to_string())
 }
 
 /// The sub-agent's final result text: the last assistant message's first text

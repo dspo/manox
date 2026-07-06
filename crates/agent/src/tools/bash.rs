@@ -51,7 +51,7 @@ const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
 const BASH_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// Narrow-the-command hint folded into the truncation advisory. Lives here
 /// (not in `system_prompt.md`) because it is tool-specific guidance.
-const BASH_TRUNCATION_HINT: &str = "用更窄的命令重试（指定列、`| head`、`LIMIT`、收窄 pattern）";
+const BASH_TRUNCATION_HINT: &str = "retry with a narrower command (specify columns, `| head`, `LIMIT`, tighten the pattern)";
 /// Grace window given to a SIGTERM'd process group before escalating to SIGKILL.
 const CANCELLATION_GRACE_MS: u64 = 50;
 /// Upper bound on draining the stdout/stderr pipes after the group is killed:
@@ -104,12 +104,13 @@ impl AgentTool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "执行 bash 命令并返回 stdout。默认在 OS 沙箱内运行（macOS seatbelt：写限项目根与\
-         临时目录、`.git` 只读、网络禁止），每次调用是一次性 `bash -c`——`cd`/`export` 不跨调用\
-         保留，跨步状态请用 `&&` 链或 `cwd` 参数。需沙箱外能力（联网、写项目根外）时设 \
-         `unsandboxed: true`，经用户审批后在持久 shell 会话中运行（cd/export 跨调用保留）。\
-         默认 120s 超时（可用 timeout_secs 覆盖）；超时或取消时整个进程组被终止。stdout/stderr \
-         实时回流 UI。"
+        "Run a bash command and return stdout. Runs inside an OS sandbox by default (macOS seatbelt: writes \
+         confined to the project root and temp dir, `.git` read-only, network disabled); each call is a \
+         one-shot `bash -c` — `cd`/`export` don't persist across calls, so chain steps with `&&` or use \
+         the `cwd` parameter. For out-of-sandbox capabilities (network, writing outside the project root) \
+         set `unsandboxed: true`, which after user approval runs in a persistent shell session (cd/export \
+         persist across calls). Default timeout is 120s (override with timeout_secs); on timeout or cancel \
+         the whole process group is terminated. stdout/stderr stream back to the UI live."
     }
     fn requires_approval(&self, input: &serde_json::Value) -> bool {
         let unsandboxed = input
@@ -146,7 +147,7 @@ impl AgentTool for BashTool {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<BashInput>(input) else {
-            return cx.background_spawn(async { Err("input 解析失败".to_string()) });
+            return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let shell = self.shell.clone();
         let base_cwd = self.cwd.clone();
@@ -349,19 +350,19 @@ fn format_result(
             } else {
                 let code = exit_code_num(er.exit_code);
                 Err(anyhow::anyhow!(
-                    "bash 退出码 {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    "bash exit code {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
                 ))
             }
         }
         Outcome::Ran(Err(e)) => Err(anyhow::anyhow!(
-            "bash 执行失败: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            "bash execution failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             brush_err(e)
         )),
         Outcome::TimedOut => Err(anyhow::anyhow!(
-            "bash 超时（已终止进程组）\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "bash timed out (process group killed)\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )),
         Outcome::Cancelled => Err(anyhow::anyhow!(
-            "bash 已取消\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "bash cancelled\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )),
     }
 }
@@ -510,18 +511,18 @@ fn format_sandboxed_result(
             } else {
                 let code = status.code().unwrap_or(-1);
                 Err(anyhow::anyhow!(
-                    "bash 退出码 {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    "bash exit code {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
                 ))
             }
         }
         SandboxOutcome::SpawnFailed(e) => Err(anyhow::anyhow!(
-            "bash 启动失败: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "bash spawn failed: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )),
         SandboxOutcome::TimedOut => Err(anyhow::anyhow!(
-            "bash 超时（已终止进程组）\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "bash timed out (process group killed)\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )),
         SandboxOutcome::Cancelled => Err(anyhow::anyhow!(
-            "bash 已取消\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "bash cancelled\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )),
     }
 }
@@ -756,7 +757,7 @@ mod tests {
         .await
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("退出码 7"), "got: {msg}");
+        assert!(msg.contains("exit code 7"), "got: {msg}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -780,7 +781,7 @@ mod tests {
             start.elapsed()
         );
         let msg = err.to_string();
-        assert!(msg.contains("超时"), "got: {msg}");
+        assert!(msg.contains("timed out"), "got: {msg}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -803,7 +804,7 @@ mod tests {
         .await
         .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("取消"), "got: {msg}");
+        assert!(msg.contains("cancelled"), "got: {msg}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -889,11 +890,11 @@ mod tests {
             "notice must be prefixed so the model sees it first: {note}"
         );
         assert!(
-            note.contains("用更窄的命令"),
+            note.contains("narrower command"),
             "must advise narrowing: {note}"
         );
         assert!(
-            note.contains(&format!("共 {} 字节", BASH_OUTPUT_MAX_BYTES + 12 * 1024)),
+            note.contains(&format!("{} bytes total", BASH_OUTPUT_MAX_BYTES + 12 * 1024)),
             "must report total bytes: {note}"
         );
         assert!(

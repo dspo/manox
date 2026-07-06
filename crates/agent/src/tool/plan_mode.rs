@@ -28,8 +28,10 @@ impl AgentTool for ExitPlanModeTool {
     }
 
     fn description(&self) -> &str {
-        "提交你制定好的计划并请求用户批准。仅在计划模式下可用。调用后对话会暂停，\
-         等待用户批准或拒绝：批准则退出计划模式并开始执行；拒绝则继续在计划模式下修订。"
+        "Submit your proposed plan and ask the user for approval. Only available in plan \
+         mode. Calling it pauses the conversation while the user approves or rejects: \
+         approval exits plan mode and begins execution; rejection keeps you in plan mode \
+         for revision."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -38,7 +40,7 @@ impl AgentTool for ExitPlanModeTool {
             "properties": {
                 "plan": {
                     "type": "string",
-                    "description": "完整的计划文本：分步实施方案、每步将使用的工具、潜在风险。"
+                    "description": "The full plan text: step-by-step implementation, the tools each step will use, and potential risks."
                 }
             },
             "required": ["plan"]

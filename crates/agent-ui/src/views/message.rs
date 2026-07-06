@@ -17,9 +17,9 @@ use std::collections::HashSet;
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::tools::agent::{agent_final_text, agent_sub_messages};
-use agent::{Message, ToolCallStatus};
+use agent::{Message, ToolCallStatus, i18n};
 use gpui::prelude::*;
-use gpui::{App, ClipboardItem, Render, WeakEntity, px};
+use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
 use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
@@ -351,7 +351,7 @@ pub fn render_reasoning(
                 });
             })
             .child(Icon::new(chevron).xsmall())
-            .child("思考")
+            .child(i18n::t("message-reasoning"))
             .child(gpui::div().flex_1())
             .child(copy_button(ix, "copy-reasoning", text.to_string())),
     );
@@ -386,7 +386,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .w_full()
                 .justify_between()
                 .items_center()
-                .child(gpui::div().text_sm().text_color(theme.danger).child("错误"))
+                .child(gpui::div().text_sm().text_color(theme.danger).child(i18n::t("message-error")))
                 .child(copy_button(ix, "copy-error", msg.to_string())),
         )
         .child(
@@ -420,7 +420,7 @@ pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                     gpui::div()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child("通知"),
+                        .child(i18n::t("message-notice")),
                 )
                 .child(copy_button(ix, "copy-notice", msg.to_string())),
         )
@@ -454,14 +454,14 @@ pub fn render_tool_call(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
-    let (status_icon, status_color, status_label) = match item.status {
+    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) = match item.status {
         ToolCallStatus::PendingApproval => {
-            (IconName::LoaderCircle, theme.muted_foreground, "待审批")
+            (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-pending"))
         }
-        ToolCallStatus::Running => (IconName::LoaderCircle, theme.muted_foreground, "运行中"),
-        ToolCallStatus::Success => (IconName::CircleCheck, theme.success, "完成"),
-        ToolCallStatus::Error => (IconName::CircleX, theme.danger, "出错"),
-        ToolCallStatus::Denied => (IconName::CircleX, theme.danger, "已拒绝"),
+        ToolCallStatus::Running => (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-running")),
+        ToolCallStatus::Success => (IconName::CircleCheck, theme.success, i18n::t("status-success")),
+        ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
+        ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
     };
 
     let title = if item.title.is_empty() {
@@ -642,14 +642,14 @@ pub fn render_agent_task(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
-    let (status_icon, status_color, status_label) = match item.status {
+    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) = match item.status {
         ToolCallStatus::PendingApproval => {
-            (IconName::LoaderCircle, theme.muted_foreground, "待审批")
+            (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-pending"))
         }
-        ToolCallStatus::Running => (IconName::LoaderCircle, theme.muted_foreground, "运行中"),
-        ToolCallStatus::Success => (IconName::CircleCheck, theme.success, "完成"),
-        ToolCallStatus::Error => (IconName::CircleX, theme.danger, "出错"),
-        ToolCallStatus::Denied => (IconName::CircleX, theme.danger, "已拒绝"),
+        ToolCallStatus::Running => (IconName::LoaderCircle, theme.muted_foreground, i18n::t("status-running")),
+        ToolCallStatus::Success => (IconName::CircleCheck, theme.success, i18n::t("status-success")),
+        ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
+        ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
     };
 
     let expanded = agent_ctx.is_some_and(|c| c.expanded.contains(&item.id));
@@ -799,7 +799,7 @@ fn live_tail(output: &str) -> String {
     let cut = output.len() - TAIL_BYTES;
     // Start at the next line boundary so we don't slice mid-line.
     let start = output[cut..].find('\n').map(|i| cut + i + 1).unwrap_or(cut);
-    let mut s = String::from("…（已省略前面部分）\n");
+    let mut s = format!("{}\n", i18n::t("message-omitted-prefix"));
     s.push_str(&output[start..]);
     s
 }

@@ -14,11 +14,12 @@ use std::time::Duration;
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::provider::registry;
-use agent::{PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, save_thread};
+use agent::{PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, i18n, save_thread};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
     DragMoveEvent, Entity, FollowMode, ListAlignment, ListSizingBehavior, ListState, MouseButton,
-    MouseUpEvent, Pixels, Render, Subscription, Window, ease_out_quint, list, prelude::*, px,
+    MouseUpEvent, Pixels, Render, SharedString, Subscription, Window, ease_out_quint, list,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -230,7 +231,7 @@ impl Workspace {
                 .multi_line(true)
                 .auto_grow(4, 12)
                 .submit_on_enter(true)
-                .placeholder("输入消息，点击发送以开始使用")
+                .placeholder(i18n::t("workspace-input-placeholder"))
         });
 
         let editor_state = cx.new(|cx| {
@@ -240,7 +241,7 @@ impl Workspace {
                 .folding(false)
                 .soft_wrap(true)
                 .submit_on_enter(false)
-                .placeholder("编写 markdown…（Cmd-Enter 发送）")
+                .placeholder(i18n::t("workspace-composer-placeholder"))
         });
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
@@ -689,7 +690,8 @@ impl Workspace {
         if !hit {
             self.thread.update(cx, |_, cx| {
                 cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
-                    "未知命令：/{name}（用 `/` 菜单查看已安装命令）"
+                    "{}",
+                    i18n::t_str("workspace-unknown-command", &[("name", name)])
                 )));
             });
         }
@@ -836,7 +838,7 @@ impl Workspace {
             .read(cx)
             .model()
             .map(|m| m.name().to_string())
-            .unwrap_or_else(|| "未配置模型".to_string())
+            .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
     }
 
     /// Push a system-styled notice into the conversation (no thread message,
@@ -862,9 +864,9 @@ impl Workspace {
         let on = !self.thread.read(cx).yolo();
         self.thread.update(cx, |t, cx| t.set_yolo(on, cx));
         let msg = if on {
-            "YOLO 模式已开启：工具调用免审批，bash 在沙箱外运行。".to_string()
+            i18n::t("workspace-yolo-on-notice").to_string()
         } else {
-            "YOLO 模式已关闭：恢复审批与沙箱。".to_string()
+            i18n::t("workspace-yolo-off-notice").to_string()
         };
         self.add_info_message(msg, cx);
     }
@@ -879,7 +881,7 @@ impl Workspace {
     }
 
     fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
-        // When an AskUserQuestion card is open its "取消" button calls this; the
+        // When an AskUserQuestion card is open its "Cancel" button calls this; the
         // generic approval overlay is suppressed while a card is open, so the
         // card is the only caller in that state. Resolve the card's specific id
         // rather than the queue tail, so a non-ask auth queued behind the card
@@ -1062,21 +1064,21 @@ impl Workspace {
                                 .child(
                                     gpui::div()
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child("工具调用审批"),
+                                        .child(i18n::t("workspace-approval-title")),
                                 ),
                         )
                         .child(
                             gpui::div()
                                 .text_sm()
                                 .text_color(theme.muted_foreground)
-                                .child(format!("工具：{tool_name}")),
+                                .child(i18n::t_str("workspace-approval-tool", &[("name", tool_name.as_str())])),
                         )
                         .children(if queued > 0 {
                             Some(
                                 gpui::div()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child(format!("（队列中还有 {queued} 个待审批）")),
+                                    .child(i18n::t_count("workspace-queued", queued as i64)),
                             )
                         } else {
                             None
@@ -1099,7 +1101,7 @@ impl Workspace {
                                     Button::new("auth-deny")
                                         .ghost()
                                         .small()
-                                        .label("拒绝")
+                                        .label(i18n::t("workspace-deny"))
                                         .on_click(cx.listener({
                                             move |this, _, _, cx| {
                                                 this.resolve_auth(PermissionDecision::Deny, cx);
@@ -1110,7 +1112,7 @@ impl Workspace {
                                     Button::new("auth-allow")
                                         .ghost()
                                         .small()
-                                        .label("始终允许")
+                                        .label(i18n::t("workspace-always-allow"))
                                         .on_click(cx.listener({
                                             move |this, _, _, cx| {
                                                 this.resolve_auth(
@@ -1124,7 +1126,7 @@ impl Workspace {
                                     Button::new("auth-once")
                                         .primary()
                                         .small()
-                                        .label("允许一次")
+                                        .label(i18n::t("workspace-allow-once"))
                                         .on_click(cx.listener({
                                             move |this, _, _, cx| {
                                                 this.resolve_auth(
@@ -1183,14 +1185,14 @@ impl Workspace {
                                 .child(
                                     gpui::div()
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child("计划审批"),
+                                        .child(i18n::t("workspace-plan-approval-title")),
                                 ),
                         )
                         .child(
                             gpui::div()
                                 .text_sm()
                                 .text_color(theme.muted_foreground)
-                                .child("代理提交了以下计划，请批准或拒绝："),
+                                .child(i18n::t("workspace-plan-approval-prompt")),
                         )
                         .child(
                             gpui::div()
@@ -1211,7 +1213,7 @@ impl Workspace {
                                     Button::new("plan-reject")
                                         .ghost()
                                         .small()
-                                        .label("拒绝")
+                                        .label(i18n::t("workspace-deny"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.respond_plan(false, cx);
                                         })),
@@ -1220,7 +1222,7 @@ impl Workspace {
                                     Button::new("plan-approve")
                                         .primary()
                                         .small()
-                                        .label("批准并执行")
+                                        .label(i18n::t("workspace-plan-approve"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.respond_plan(true, cx);
                                         })),
@@ -1255,7 +1257,7 @@ impl Workspace {
                     .child(
                         gpui::div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("澄清问题"),
+                            .child(i18n::t("workspace-clarify-title")),
                     ),
             );
 
@@ -1309,7 +1311,7 @@ impl Workspace {
                             gpui::div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child("其他（自由输入）"),
+                                .child(i18n::t("workspace-clarify-other")),
                         )
                         .child(Input::new(&state)),
                 );
@@ -1325,7 +1327,7 @@ impl Workspace {
                     Button::new("ask-cancel")
                         .ghost()
                         .small()
-                        .label("取消")
+                        .label(i18n::t("workspace-cancel"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.resolve_auth(PermissionDecision::Deny, cx);
                         })),
@@ -1334,7 +1336,7 @@ impl Workspace {
                     Button::new("ask-submit")
                         .primary()
                         .small()
-                        .label("提交")
+                        .label(i18n::t("workspace-submit"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.resolve_ask(cx);
                         })),
@@ -1505,7 +1507,7 @@ impl Workspace {
 
     /// Composer card: an auto-growing text area above a single toolbar row.
     /// The card's fill matches the page background (`theme.background`) so only
-    /// the 1px border outlines it — the user-perceived "底纹" disappears.
+    /// the 1px border outlines it — the user-perceived "shading" disappears.
     /// The `Input` renders bare (no appearance/border of its own) so there is
     /// no double-layered fill.
     fn render_composer(
@@ -1580,8 +1582,8 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Access chip: a dropdown to switch between 普通模式 (normal, approvals +
-    /// sandbox) and YOLO 模式 (bypass approvals, bash unsandboxed). Mirrors the
+    /// Access chip: a dropdown to switch between normal mode (approvals +
+    /// sandbox) and YOLO mode (bypass approvals, bash unsandboxed). Mirrors the
     /// model selector pattern. The dot color reflects the active mode (green for
     /// normal, magenta for YOLO); the active row is checked in the dropdown.
     /// Plan mode is a separate concern routed through the `+` button, not a
@@ -1594,7 +1596,12 @@ impl Workspace {
         } else {
             theme.success
         };
-        let label = if yolo { "YOLO" } else { "普通" };
+        // "YOLO" is a proper noun, kept literal; the normal-mode label is localized.
+        let label: SharedString = if yolo {
+            "YOLO".into()
+        } else {
+            i18n::t("workspace-mode-normal")
+        };
         let workspace = cx.entity();
 
         let trigger = h_flex()
@@ -1638,13 +1645,13 @@ impl Workspace {
                 let ws_yolo = workspace.clone();
                 let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
                     menu.max_w(gpui::px(180.))
-                        .label("模式")
-                        .item(PopupMenuItem::new("普通模式").checked(!yolo_now).on_click(
+                        .label(i18n::t("workspace-mode-section"))
+                        .item(PopupMenuItem::new(i18n::t("workspace-mode-normal")).checked(!yolo_now).on_click(
                             move |_, _window, cx| {
                                 ws_normal.update(cx, |this, cx| {
                                     this.thread.update(cx, |t, cx| t.set_yolo(false, cx));
                                     this.add_info_message(
-                                        "已切换到普通模式：恢复审批与沙箱。".into(),
+                                        i18n::t("workspace-yolo-off-notice").to_string(),
                                         cx,
                                     );
                                     this.close_access_menu();
@@ -1652,12 +1659,12 @@ impl Workspace {
                                 });
                             },
                         ))
-                        .item(PopupMenuItem::new("YOLO 模式").checked(yolo_now).on_click(
+                        .item(PopupMenuItem::new(i18n::t("workspace-mode-yolo")).checked(yolo_now).on_click(
                             move |_, _window, cx| {
                                 ws_yolo.update(cx, |this, cx| {
                                     this.thread.update(cx, |t, cx| t.set_yolo(true, cx));
                                     this.add_info_message(
-                                        "已切换到 YOLO 模式：免审批，bash 沙箱外。".into(),
+                                        i18n::t("workspace-yolo-on-notice").to_string(),
                                         cx,
                                     );
                                     this.close_access_menu();
@@ -1944,7 +1951,7 @@ impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Settings overlay replaces the entire window content; the underlying
         // Workspace state (sidebar, conversation, composer) is preserved and
-        // returns unchanged when the user clicks 返回应用.
+        // returns unchanged when the user clicks "Back to app".
         if matches!(self.view_mode, ViewMode::Settings) {
             let settings = self
                 .settings_view
@@ -2067,7 +2074,7 @@ impl Render for Workspace {
                                         .text_2xl()
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .text_color(theme.foreground)
-                                        .child("我们该做什么？"),
+                                        .child(i18n::t("workspace-empty-prompt")),
                                 )
                                 .children(self.render_attachments(&theme, cx))
                                 .child(self.render_composer(running, &theme, cx))

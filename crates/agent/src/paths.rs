@@ -77,6 +77,13 @@ pub fn enabled_plugins_file() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("enabled_plugins.txt"))
 }
 
+/// `$HOME/.config/cx/manox/settings.toml` — plain-file user preferences (UI
+/// language, …). Read once at startup by [`crate::settings`]; absence is normal
+/// on a fresh machine and yields defaults.
+pub fn settings_file() -> Result<PathBuf> {
+    Ok(manox_config_dir()?.join("settings.toml"))
+}
+
 fn dirs() -> PathBuf {
     if let Some(p) = home_dir() {
         return p;

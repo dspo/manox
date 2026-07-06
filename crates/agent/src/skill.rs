@@ -85,7 +85,7 @@ impl SkillRegistry {
         if self.skills.is_empty() {
             return String::new();
         }
-        let mut out = String::from("## 可用技能（按需经 `skill` 工具查阅正文）\n");
+        let mut out = String::from("## Available skills (consult their full body via the `skill` tool on demand)\n");
         for s in self.skills.values() {
             out.push_str(&format!("- {}: {}\n", s.name, s.description));
         }

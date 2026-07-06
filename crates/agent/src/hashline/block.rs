@@ -30,14 +30,14 @@ impl std::fmt::Display for BlockError {
         match self {
             BlockError::NotABlock { line } => write!(
                 f,
-                "第 {line} 行不是多行块起始（无括号开合）；改用 SWAP {line}.={line}: 或指向真正的块起始行"
+                "line {line} is not the start of a multi-line block (no bracket pairing); use SWAP {line}.={line}: or point at the real block-start line"
             ),
             BlockError::Unterminated { line } => {
-                write!(f, "第 {line} 行开始的块未闭合（括号不平衡直到文件尾）")
+                write!(f, "block starting at line {line} is unterminated (brackets unbalanced to EOF)")
             }
             BlockError::UnsupportedLanguage { line } => write!(
                 f,
-                "第 {line} 行所属语言无括号块语法（如 Python）；改用 SWAP N.=M 显式范围"
+                "the language of line {line} has no bracket-block syntax (e.g. Python); use SWAP N.=M with an explicit range"
             ),
         }
     }

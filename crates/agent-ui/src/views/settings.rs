@@ -13,12 +13,17 @@ use gpui_component::{
     v_flex,
 };
 
+use agent::i18n;
+
 const SIDEBAR_W: f32 = 260.;
 /// How long the click-flash on a freshly-clicked item takes to fade from its
 /// peak intensity back to the steady selected tint.
 const CLICK_FLASH_MS: u64 = 280;
 
-/// A single static settings item (icon + label, optional trailing icon).
+/// A single static settings item (icon + label key, optional trailing icon).
+/// `label` is a fluent message id resolved via `i18n::t` at render time, so the
+/// displayed text tracks the UI locale while the id itself stays a stable key
+/// for selection / element-id purposes.
 #[derive(Clone)]
 struct SettingsItem {
     icon: IconName,
@@ -26,7 +31,7 @@ struct SettingsItem {
     trailing: Option<IconName>,
 }
 
-/// A section group (label + items).
+/// A section group (title key + items).
 struct SettingsGroup {
     title: &'static str,
     items: &'static [SettingsItem],
@@ -34,40 +39,44 @@ struct SettingsGroup {
 
 const GROUPS: &[SettingsGroup] = &[
     SettingsGroup {
-        title: "通用",
+        title: "settings-group-general",
         items: &[
-            SettingsItem::new(IconName::Settings, "常规", None),
-            SettingsItem::new(IconName::Sun, "外观", None),
-            SettingsItem::new(IconName::Cpu, "配置", None),
-            SettingsItem::new(IconName::Star, "个性化", None),
-            SettingsItem::new(IconName::Heart, "宠物", None),
-            SettingsItem::new(IconName::Frame, "键盘快捷键", None),
+            SettingsItem::new(IconName::Settings, "settings-item-general", None),
+            SettingsItem::new(IconName::Sun, "settings-item-appearance", None),
+            SettingsItem::new(IconName::Cpu, "settings-item-config", None),
+            SettingsItem::new(IconName::Star, "settings-item-personalization", None),
+            SettingsItem::new(IconName::Heart, "settings-item-pets", None),
+            SettingsItem::new(IconName::Frame, "settings-item-keyboard", None),
         ],
     },
     SettingsGroup {
-        title: "集成",
+        title: "settings-group-integrations",
         items: &[
-            SettingsItem::new(IconName::Bot, "应用快照", None),
-            SettingsItem::new(IconName::ChartPie, "MCP 服务器", None),
-            SettingsItem::new(IconName::Globe, "浏览器", None),
-            SettingsItem::new(IconName::Ellipsis, "电脑操控", None),
+            SettingsItem::new(IconName::Bot, "settings-item-snapshots", None),
+            SettingsItem::new(IconName::ChartPie, "settings-item-mcp", None),
+            SettingsItem::new(IconName::Globe, "settings-item-browser", None),
+            SettingsItem::new(IconName::Ellipsis, "settings-item-computer", None),
         ],
     },
     SettingsGroup {
-        title: "编码",
+        title: "settings-group-coding",
         items: &[
-            SettingsItem::new(IconName::Asterisk, "钩子", None),
-            SettingsItem::new(IconName::Ellipsis, "连接", None),
-            SettingsItem::new(IconName::Github, "Git", None),
-            SettingsItem::new(IconName::Folder, "环境", None),
-            SettingsItem::new(IconName::FolderOpen, "工作树", None),
+            SettingsItem::new(IconName::Asterisk, "settings-item-hooks", None),
+            SettingsItem::new(IconName::Ellipsis, "settings-item-connections", None),
+            SettingsItem::new(IconName::Github, "settings-item-git", None),
+            SettingsItem::new(IconName::Folder, "settings-item-environment", None),
+            SettingsItem::new(IconName::FolderOpen, "settings-item-worktrees", None),
         ],
     },
     SettingsGroup {
-        title: "已归档",
+        title: "settings-group-archived",
         items: &[
-            SettingsItem::new(IconName::Inbox, "已归档对话", None),
-            SettingsItem::new(IconName::Map, "Chat Settings", Some(IconName::ExternalLink)),
+            SettingsItem::new(IconName::Inbox, "settings-item-archived", None),
+            SettingsItem::new(
+                IconName::Map,
+                "settings-item-chat-settings",
+                Some(IconName::ExternalLink),
+            ),
         ],
     },
 ];
@@ -98,7 +107,7 @@ pub struct SettingsView {
 /// The host subscribes to decide what to do on each.
 #[derive(Clone)]
 pub enum SettingsEvent {
-    /// The user clicked "返回应用"; the host should switch back to the
+    /// The user clicked "Back to app"; the host should switch back to the
     /// workspace view.
     Exit,
 }
@@ -107,7 +116,8 @@ impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置…"));
+        let search =
+            cx.new(|cx| InputState::new(window, cx).placeholder(i18n::t("settings-search-placeholder")));
         Self {
             search,
             selected: None,
@@ -132,7 +142,7 @@ impl Render for SettingsView {
         // cross-helper borrow/lifetime surprises).
         let mut groups: Vec<AnyElement> = Vec::with_capacity(GROUPS.len());
         for group in GROUPS.iter() {
-            let title = group.title;
+            let title = i18n::t(group.title);
             let mut column = v_flex().gap_0p5().child(
                 gpui::div()
                     .px_3()
@@ -141,10 +151,13 @@ impl Render for SettingsView {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .child(title.to_string()),
+                    .child(title),
             );
             for it in group.items.iter() {
-                let label_str: SharedString = it.label.into();
+                // `it.label` is a fluent message id; the resolved display text
+                // is what the user sees, while the id is the stable selection
+                // key and element id.
+                let label_str: SharedString = i18n::t(it.label);
                 let is_selected = selected.as_ref().map(|s| s.as_str()) == Some(it.label);
                 let bg = if is_selected {
                     theme.accent.opacity(0.12)
@@ -153,12 +166,12 @@ impl Render for SettingsView {
                 };
                 let icon = it.icon.clone();
                 let trailing = it.trailing.clone();
-                let label_for_handler = label_str.clone();
+                let label_key = it.label;
                 // Bump the per-view click generation on every click. The
                 // render path embeds this into each item's pulse animation
                 // id, so a fresh tween fires each time the user clicks.
                 let on_click = cx.listener(move |this, _ev, _window, cx| {
-                    this.selected = Some(label_for_handler.clone());
+                    this.selected = Some(label_key.into());
                     this.click_gen = this.click_gen.wrapping_add(1);
                     cx.notify();
                 });
@@ -239,7 +252,7 @@ impl Render for SettingsView {
                                     .cursor_pointer()
                                     .on_click(on_back)
                                     .child(Icon::new(IconName::ArrowLeft).small())
-                                    .child("返回应用"),
+                                    .child(i18n::t("settings-back")),
                             )
                             .child(
                                 h_flex()
@@ -278,8 +291,11 @@ impl Render for SettingsView {
             // the currently selected item so clicks have visible feedback.
             .child({
                 let coming_label: SharedString = match selected.as_ref() {
-                    Some(label) => format!("Coming soon… {label}").into(),
-                    None => "Coming soon…".into(),
+                    Some(key) => {
+                        let displayed = i18n::t(key);
+                        i18n::t_str("settings-coming-soon-label", &[("label", displayed.as_ref())])
+                    }
+                    None => i18n::t("settings-coming-soon"),
                 };
                 h_flex()
                     .flex_1()

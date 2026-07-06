@@ -10,6 +10,7 @@ pub mod db;
 pub mod frontmatter;
 pub mod hashline;
 pub mod hook;
+pub mod i18n;
 pub mod language_model;
 pub mod mcp;
 pub mod message;
@@ -19,6 +20,7 @@ pub mod plugin;
 pub mod provider;
 pub mod runtime;
 pub mod sandbox;
+pub mod settings;
 pub mod skill;
 pub mod system_prompt;
 pub mod thread;
@@ -40,10 +42,13 @@ pub use tool::{
 };
 
 /// Register the tokio runtime, `ProviderRegistry`, `McpRegistry`,
-/// `ThreadStore`, the hashline snapshot store, and the subagent / skill /
-/// command / hook registries. Call at App startup.
+/// `ThreadStore`, the hashline snapshot store, the i18n bundle, and the
+/// subagent / skill / command / hook registries. Call at App startup.
 pub fn init(cx: &mut App) {
     runtime::init(cx);
+    // i18n before anything that renders UI or builds a system prompt, so the
+    // user's locale is settled before the first frame / first turn.
+    i18n::init();
     provider::registry::init(cx);
     mcp::registry::init(cx);
     thread_store::init(cx);

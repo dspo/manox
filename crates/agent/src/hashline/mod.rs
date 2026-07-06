@@ -43,7 +43,7 @@ pub fn init() {
 pub fn global() -> &'static Mutex<SnapshotStore> {
     GLOBAL
         .get()
-        .expect("hashline snapshot store 未初始化，请先调用 agent::init")
+        .expect("hashline snapshot store not initialized; call agent::init first")
 }
 
 /// Normalize raw file bytes for hashing and line-number display: strip a leading
