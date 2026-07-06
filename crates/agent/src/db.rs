@@ -93,7 +93,11 @@ impl ThreadsDatabase {
     }
 
     /// Insert or update a `Thread` record.
-    pub fn upsert(&self, rec: &ThreadRecord) -> Result<()> {
+    /// Upsert a thread record. When `touch` is true, `updated_at` is set to the
+    /// current timestamp (reflecting real user activity like sending a message).
+    /// When `touch` is false, the existing `updated_at` is preserved (used when
+    /// saving state on thread switch without implying the user interacted with it).
+    pub fn upsert(&self, rec: &ThreadRecord, touch: bool) -> Result<()> {
         let stored: Vec<StoredMessage> = rec
             .messages
             .iter()
@@ -106,29 +110,56 @@ impl ThreadsDatabase {
         let now = chrono::Utc::now().timestamp();
 
         let conn = self.conn.lock().expect("db mutex 中毒");
-        conn.execute(
-            "INSERT INTO threads (id, summary, model_id, cwd, project, yolo, messages, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(id) DO UPDATE SET
-                summary = excluded.summary,
-                model_id = excluded.model_id,
-                cwd = excluded.cwd,
-                project = excluded.project,
-                yolo = excluded.yolo,
-                messages = excluded.messages,
-                updated_at = excluded.updated_at",
-            params![
-                rec.id,
-                rec.summary,
-                rec.model_id,
-                rec.cwd,
-                rec.project,
-                rec.yolo,
-                messages_json,
-                now
-            ],
-        )
-        .context("upsert thread 失败")?;
+        if touch {
+            conn.execute(
+                "INSERT INTO threads (id, summary, model_id, cwd, project, yolo, messages, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    summary = excluded.summary,
+                    model_id = excluded.model_id,
+                    cwd = excluded.cwd,
+                    project = excluded.project,
+                    yolo = excluded.yolo,
+                    messages = excluded.messages,
+                    updated_at = excluded.updated_at",
+                params![
+                    rec.id,
+                    rec.summary,
+                    rec.model_id,
+                    rec.cwd,
+                    rec.project,
+                    rec.yolo,
+                    messages_json,
+                    now
+                ],
+            )
+            .context("upsert thread 失败")?;
+        } else {
+            // Preserve the existing updated_at on conflict; only insert with
+            // `now` when the record is brand new (no prior updated_at to keep).
+            conn.execute(
+                "INSERT INTO threads (id, summary, model_id, cwd, project, yolo, messages, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET
+                    summary = excluded.summary,
+                    model_id = excluded.model_id,
+                    cwd = excluded.cwd,
+                    project = excluded.project,
+                    yolo = excluded.yolo,
+                    messages = excluded.messages",
+                params![
+                    rec.id,
+                    rec.summary,
+                    rec.model_id,
+                    rec.cwd,
+                    rec.project,
+                    rec.yolo,
+                    messages_json,
+                    now
+                ],
+            )
+            .context("upsert thread 失败")?;
+        }
         Ok(())
     }
 
@@ -230,7 +261,7 @@ mod tests {
                 Message::assistant(vec![MessageContent::Text("hi".into())]),
             ],
         };
-        db.upsert(&rec).expect("upsert");
+        db.upsert(&rec, true).expect("upsert");
 
         let loaded = db.load("t1").expect("load").expect("present");
         assert_eq!(loaded.id, "t1");

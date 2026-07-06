@@ -33,7 +33,7 @@ use gpui_component::{
 };
 
 use crate::OpenSettings;
-use crate::conversation::{ApplyOutcome, ConversationState};
+use crate::conversation::{ApplyOutcome, ConvItem, ConversationState};
 use crate::views::centered;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
@@ -346,7 +346,7 @@ impl Workspace {
                     }
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
-                        save_thread(this.thread.clone(), cx);
+                        save_thread(this.thread.clone(), true, cx);
                     }
                     cx.notify();
                 }
@@ -551,7 +551,7 @@ impl Workspace {
         // (plan approval, tool auth) are resolved immediately rather than
         // stranding until the entity is eventually dropped.
         self.thread.update(cx, |t, cx| t.cancel(cx));
-        save_thread(self.thread.clone(), cx);
+        save_thread(self.thread.clone(), false, cx);
 
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
@@ -693,7 +693,8 @@ impl Workspace {
                 )));
             });
         }
-        save_thread(self.thread.clone(), cx);
+        // Persist on command submit so the sidebar shows the new entry immediately.
+        save_thread(self.thread.clone(), true, cx);
         cx.notify();
     }
 
@@ -729,7 +730,7 @@ impl Workspace {
             thread.run_turn(cx);
         });
         // Persist on submit so the sidebar shows the new entry immediately.
-        save_thread(self.thread.clone(), cx);
+        save_thread(self.thread.clone(), true, cx);
         cx.notify();
     }
 
@@ -820,7 +821,7 @@ impl Workspace {
             thread.insert_user_message(text, cx);
             thread.run_turn(cx);
         });
-        save_thread(self.thread.clone(), cx);
+        save_thread(self.thread.clone(), true, cx);
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
@@ -2024,7 +2025,7 @@ impl Render for Workspace {
         // Empty first screen: no messages and nothing streaming. The composer is
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
-        let first_screen = self.conversation.read(cx).is_empty() && !running;
+        let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
         // The inline composer and the markdown editor are mutually exclusive: while
         // the editor pane is open the footer is hidden and the draft lives in the
         // editor (moved there on open, moved back on close).
@@ -2043,6 +2044,27 @@ impl Render for Workspace {
             )
         };
         // Hero occupies the message-list region on the first screen.
+        // Notice items on the first screen (e.g. YOLO toggle acknowledgement).
+        // They are stored in the conversation but hidden behind the hero layout;
+        // show them as a temporary banner below the composer so the user sees
+        // the feedback without leaving the first-screen view.
+        let hero_notices = if first_screen {
+            self.conversation
+                .read(cx)
+                .items()
+                .iter()
+                .rev()
+                .filter_map(|e| {
+                    if let ConvItem::Error(msg) = e.read(cx).kind() {
+                        Some(msg.clone())
+                    } else {
+                        None
+                    }
+                })
+                .next()
+        } else {
+            None
+        };
         let hero = if editor_open || !first_screen {
             None
         } else {
@@ -2067,7 +2089,20 @@ impl Render for Workspace {
                                         .child("我们该做什么？"),
                                 )
                                 .children(self.render_attachments(&theme, cx))
-                                .child(self.render_composer(running, true, &theme, cx)),
+                                .child(self.render_composer(running, true, &theme, cx))
+                                .children(hero_notices.map(|msg| {
+                                    gpui::div()
+                                        .w_full()
+                                        .px_3()
+                                        .py_1p5()
+                                        .rounded(theme.radius)
+                                        .bg(theme.accent.opacity(0.1))
+                                        .border_1()
+                                        .border_color(theme.accent.opacity(0.2))
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(msg)
+                                })),
                         )
                         .relative()
                         .children(self.render_slash_overlay()),
@@ -2247,6 +2282,7 @@ impl Render for Workspace {
                             .h_full()
                             .w_full()
                             .px_4()
+                            .pb_8()
                             // Empty first screen shows the centered hero in place of the
                             // (empty) message list; otherwise the virtualized, tail-
                             // following conversation list. Each item is its own
@@ -2261,7 +2297,7 @@ impl Render for Workspace {
                                         .items()
                                         .get(ix)
                                         .cloned()
-                                        .map(|item| v_flex().py_4().child(item).into_any_element())
+                                        .map(|item| v_flex().pt_1().pb_4().child(item).into_any_element())
                                         .unwrap_or_else(|| gpui::Empty.into_any_element())
                                 })
                                 .with_sizing_behavior(ListSizingBehavior::Auto)

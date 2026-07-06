@@ -18,7 +18,7 @@ use crate::views::message::{MessageItem, build_items};
 pub enum ConvItem {
     User(String),
     Assistant { text: String, streaming: bool },
-    Reasoning { text: String, streaming: bool },
+    Reasoning { text: String, streaming: bool, collapsed: bool, user_toggled: bool },
     ToolCall(ToolCallItem),
     AgentTask(AgentTaskItem),
     Error(String),
@@ -92,8 +92,15 @@ impl ConversationState {
         &self.items
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+    /// True when the conversation has no substantive items (user, assistant,
+    /// reasoning, tool call, or agent task). Notice-only items (error cards
+    /// used for slash-command acknowledgements and mode switches) don't count
+    /// so toggling YOLO on the empty first screen doesn't prematurely leave
+    /// the hero layout.
+    pub fn is_empty(&self, cx: &App) -> bool {
+        self.items.iter().all(|e| {
+            matches!(e.read(cx).kind(), ConvItem::Error(_))
+        })
     }
 
     /// Append a user message.
@@ -215,6 +222,8 @@ impl ConversationState {
                             ConvItem::Reasoning {
                                 text: delta.clone(),
                                 streaming: true,
+                                collapsed: false,
+                                user_toggled: false,
                             },
                             role.to_string(),
                             id,

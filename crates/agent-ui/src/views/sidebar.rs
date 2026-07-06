@@ -19,6 +19,7 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
+    tag::{Tag, TagVariant},
 };
 
 /// Events the sidebar emits to the Workspace.
@@ -289,7 +290,9 @@ fn section_header(label: &'static str, theme: &Theme) -> AnyElement {
 }
 
 /// Render one conversation row. `indent` adds left padding so rows nested under
-/// a project folder align below its label.
+/// a project folder align below its label. A short thread-id tag (first 8 chars)
+/// is shown; the currently-viewed thread uses a colored tag variant, others use
+/// the secondary variant.
 fn render_thread_item(
     ix: usize,
     summary: &agent::ThreadSummary,
@@ -313,6 +316,13 @@ fn render_thread_item(
         theme.transparent
     };
     let group = gpui::SharedString::from(format!("thread-row-{ix}"));
+    // Short thread ID: first 8 hex chars of the UUID.
+    let short_id = &summary.id[..summary.id.len().min(8)];
+    let tag_variant = if selected {
+        TagVariant::Primary
+    } else {
+        TagVariant::Secondary
+    };
 
     h_flex()
         .id(("thread-item", ix))
@@ -326,9 +336,16 @@ fn render_thread_item(
         .rounded(theme.radius)
         .bg(bg)
         .hover(|s| s.bg(theme.accent.opacity(0.08)))
+        .active(|s| s.bg(theme.accent.opacity(0.18)))
         .on_click(cx.listener(move |_this, _ev, _window, cx| {
             cx.emit(SidebarEvent::OpenThread(id_open.clone()));
         }))
+        .child(
+            Tag::new()
+                .with_variant(tag_variant)
+                .xsmall()
+                .child(short_id.to_string()),
+        )
         .child(
             gpui::div()
                 .flex_1()
