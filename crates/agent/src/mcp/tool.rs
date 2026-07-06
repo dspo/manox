@@ -19,15 +19,25 @@ use crate::tool::AgentTool;
 pub type McpClientHandle = Arc<RunningService<RoleClient, rmcp::model::ClientInfo>>;
 
 pub struct McpTool {
-    server_name: String,
+    /// Cached `mcp_<server>_<tool>` id; returned by `name()` without leaking.
+    name: String,
+    /// Cached description (empty string when the server gave none).
+    description: String,
     tool: rmcp::model::Tool,
     client: McpClientHandle,
 }
 
 impl McpTool {
     pub fn new(server_name: String, tool: rmcp::model::Tool, client: McpClientHandle) -> Self {
+        let name = format!("mcp_{}_{}", server_name, tool.name);
+        let description = tool
+            .description
+            .as_ref()
+            .map(|c| c.to_string())
+            .unwrap_or_default();
         Self {
-            server_name,
+            name,
+            description,
             tool,
             client,
         }
@@ -37,20 +47,17 @@ impl McpTool {
     /// separated to match manox's existing built-in naming; built-ins never
     /// start with `mcp_`, so there is no collision.
     pub fn tool_id(&self) -> String {
-        format!("mcp_{}_{}", self.server_name, self.tool.name)
+        self.name.clone()
     }
 }
 
 impl AgentTool for McpTool {
     fn name(&self) -> &str {
-        Box::leak(self.tool_id().into_boxed_str())
+        &self.name
     }
 
     fn description(&self) -> &str {
-        match &self.tool.description {
-            Some(cow) => Box::leak(cow.as_ref().to_string().into_boxed_str()),
-            None => "",
-        }
+        &self.description
     }
 
     fn input_schema(&self) -> serde_json::Value {
