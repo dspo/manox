@@ -20,6 +20,7 @@ schemars.workspace = true
 cx-providers.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
+zstd.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 globset.workspace = true

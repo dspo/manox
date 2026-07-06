@@ -36,7 +36,7 @@ pub fn init(cx: &mut App) {
     let path = default_db_path().expect("解析 threads.db 路径失败");
     let db = ThreadsDatabase::open(&path)
         .unwrap_or_else(|e| panic!("打开 threads db 失败 ({}): {e}", path.display()));
-    let summaries = db.list().unwrap_or_else(|e| {
+    let summaries = db.list(false).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "加载历史 threads 列表失败，以空列表启动");
         Vec::new()
     });
@@ -72,7 +72,7 @@ impl ThreadStore {
         cx.spawn(async move |this, cx| {
             let list = cx
                 .background_executor()
-                .spawn(async move { db.list() })
+                .spawn(async move { db.list(false) })
                 .await;
             this.update(cx, |s, cx| {
                 if let Ok(list) = list {
@@ -90,17 +90,7 @@ impl ThreadStore {
     pub fn load_thread(&self, id: &str, cx: &mut App) -> Option<Entity<Thread>> {
         let rec: ThreadRecord = self.db.load(id).ok()??;
         let model: Option<AnyLanguageModel> = registry::global().get_model(&rec.model_id);
-        let project = (!rec.project.is_empty()).then(|| PathBuf::from(&rec.project));
-        Some(Thread::restore(
-            ThreadId(rec.id),
-            PathBuf::from(&rec.cwd),
-            project,
-            rec.yolo,
-            rec.messages,
-            model,
-            rec.title,
-            cx,
-        ))
+        Some(Thread::restore(rec, model, cx))
     }
 
     /// Delete by id, then refresh. Fires `SessionEnd` (fail-open) so plugins
@@ -123,6 +113,73 @@ impl ThreadStore {
     /// Create a fresh empty `Thread` (used by the sidebar "new conversation" button).
     pub fn new_thread(&self, cwd: PathBuf, cx: &mut App) -> Entity<Thread> {
         Thread::new(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx)
+    }
+
+    /// Rename a thread (sets the user title override). `name == None` clears it.
+    /// Runs the write off the UI thread, then refreshes so the sidebar updates.
+    pub fn rename_thread(&self, id: &str, name: Option<String>, cx: &mut Context<Self>) {
+        let db = self.db.clone();
+        let id = id.to_string();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { db.rename(&id, name.as_deref()) })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "rename thread 失败");
+            }
+            this.update(cx, |s, cx| {
+                s.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Archive (or unarchive) a thread. Refreshes so it leaves/enters the active list.
+    pub fn archive_thread(&self, id: &str, archived: bool, cx: &mut Context<Self>) {
+        let db = self.db.clone();
+        let id = id.to_string();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { db.archive(&id, archived) })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "archive thread 失败");
+            }
+            this.update(cx, |s, cx| {
+                s.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Append a `model_change` event to the thread's event stream. Called by the
+    /// workspace when `ThreadEvent::ModelChanged` fires (mid-conversation switch).
+    pub fn record_model_change(
+        &self,
+        thread_id: &str,
+        from: Option<&str>,
+        to: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let db = self.db.clone();
+        let thread_id = thread_id.to_string();
+        let data = serde_json::json!({ "from": from, "to": to });
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    db.record_event(&thread_id, crate::db::ThreadEventType::ModelChange, &data)
+                })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "record model_change 失败");
+            }
+        })
+        .detach();
     }
 }
 

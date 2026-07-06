@@ -140,12 +140,7 @@ mod tests {
         let cx = gpui::TestAppContext::single();
         let thread = cx.update(|cx| {
             crate::thread::Thread::restore(
-                crate::thread::ThreadId("reg-4543a630".to_string()),
-                std::path::PathBuf::from("/tmp"),
-                None,
-                false,
-                Vec::new(),
-                None,
+                crate::db::ThreadRecord::for_test("reg-4543a630", "/tmp", Vec::new()),
                 None,
                 cx,
             )
@@ -194,12 +189,7 @@ mod tests {
         let cx = gpui::TestAppContext::single();
         let thread = cx.update(|cx| {
             crate::thread::Thread::restore(
-                crate::thread::ThreadId("double-lease-doc".to_string()),
-                std::path::PathBuf::from("/tmp"),
-                None,
-                false,
-                Vec::new(),
-                None,
+                crate::db::ThreadRecord::for_test("double-lease-doc", "/tmp", Vec::new()),
                 None,
                 cx,
             )
