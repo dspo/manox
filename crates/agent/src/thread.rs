@@ -29,7 +29,10 @@ use crate::language_model::{
     Role, StopReason,
 };
 use crate::message::Message;
-use crate::tool::{PermissionCache, PermissionDecision, ToolAuthorizationResponse, ToolRegistry};
+use crate::tool::{
+    PermissionCache, PermissionDecision, PlanApprovalResponse, ToolAuthorizationResponse,
+    ToolRegistry, exit_plan_mode_request_tool,
+};
 use crate::tools;
 
 /// Stable `Thread` id used for persistence.
@@ -81,6 +84,9 @@ pub enum ThreadEvent {
     Stop(StopReason),
     /// An error during streaming.
     Error(anyhow::Error),
+    /// The model called `exit_plan_mode` and submitted a plan. The UI shows an
+    /// approval overlay; resolution arrives via `respond_plan_approval`.
+    PlanProposed { id: String, plan_text: String },
 }
 
 pub struct Thread {
@@ -131,6 +137,20 @@ pub struct Thread {
     /// Whether the SessionStart hook has fired for this thread. Main threads
     /// (depth 0) fire once on their first turn; sub-agents never fire it.
     session_started: bool,
+    /// Whether this thread is in plan mode. When true, `build_completion_request`
+    /// filters the tool list to read-only tools plus `exit_plan_mode` and
+    /// appends the plan-mode system-prompt addendum; `run_tool_inner` intercepts
+    /// `exit_plan_mode` to run the approval handshake. Main-thread only —
+    /// sub-agents always have `plan_mode == false`.
+    plan_mode: bool,
+    /// Pending plan-approval oneshots, keyed by the `exit_plan_mode` tool_use
+    /// id. Mirrors `pending_authorizations` exactly.
+    pending_plan_approval: HashMap<String, tokio::sync::oneshot::Sender<PlanApprovalResponse>>,
+    /// Set by `run_plan_approval` on approval so `run_turn_loop` ends the turn
+    /// after the current tool batch — preventing the model from barreling into
+    /// write tools (now visible since `plan_mode` was cleared) before the user
+    /// has signaled to proceed.
+    end_turn_after_tool: bool,
 }
 
 /// A forwarded authorization request from a sub-agent: which child thread holds
@@ -170,6 +190,9 @@ impl Thread {
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
+                plan_mode: false,
+                pending_plan_approval: HashMap::new(),
+                end_turn_after_tool: false,
             }
         })
     }
@@ -205,6 +228,9 @@ impl Thread {
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
+                plan_mode: false,
+                pending_plan_approval: HashMap::new(),
+                end_turn_after_tool: false,
             }
         })
     }
@@ -246,6 +272,9 @@ impl Thread {
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
+                plan_mode: false,
+                pending_plan_approval: HashMap::new(),
+                end_turn_after_tool: false,
             }
         })
     }
@@ -347,6 +376,33 @@ impl Thread {
 
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    /// Whether this thread is currently in plan mode.
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode
+    }
+
+    /// Toggle plan mode. Called by the UI (slash `/plan` or the `+` menu row).
+    /// Only sets the flag; the next `build_completion_request` filters tools and
+    /// appends the plan-mode addendum. Does not start a turn.
+    pub fn set_plan_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.plan_mode = on;
+        cx.notify();
+    }
+
+    /// Resolve a pending plan approval (user clicked approve/reject in the UI
+    /// overlay). Mirrors `respond_authorization` for the plan-approval oneshot.
+    pub fn respond_plan_approval(
+        &mut self,
+        id: &str,
+        response: PlanApprovalResponse,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tx) = self.pending_plan_approval.remove(id) {
+            let _ = tx.send(response);
+        }
+        let _ = cx;
     }
 
     /// Snapshot of this Thread's always-allow set, for seeding a sub-agent's
@@ -480,6 +536,11 @@ impl Thread {
             cancel.cancel();
             // A cancelled slash-command turn must also clear its tool filter.
             self.turn_tool_filter = None;
+            // Drop pending plan-approval oneshots immediately so the senders
+            // are closed. Without this, the async `run_plan_approval` task
+            // stays parked until the entity is dropped, and a late
+            // `respond_plan_approval` from the UI silently no-ops.
+            self.pending_plan_approval.clear();
             cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
             cx.notify();
         }
@@ -506,6 +567,11 @@ impl Thread {
                 );
             }
         })?;
+        // Defensive: clear any `end_turn_after_tool` left over from a prior turn
+        // that exited via cancel or a sibling infra-error before the check at the
+        // end of the batch loop. Without this, the next turn's first tool batch
+        // would be cut short by a stale flag.
+        this.update(cx, |this, _| this.end_turn_after_tool = false)?;
         loop {
             let request = this.update(cx, |this, cx| {
                 this.pending_tool_uses.clear();
@@ -563,13 +629,21 @@ impl Thread {
                 let mut free = Vec::new();
                 let mut appr = Vec::new();
                 for tu in &tool_uses {
-                    let needs_approval = this
-                        .tools
-                        .get(tu.name.as_ref())
-                        .map(|t| t.requires_approval(&tu.input))
-                        .unwrap_or(false)
+                    // `exit_plan_mode` is synthesized (not in `this.tools`), so
+                    // the registry lookup below would default it to the free
+                    // (parallel) path. Force it serial: the plan overlay is
+                    // single-slot like the auth overlay, so two parallel
+                    // `exit_plan_mode` calls would have the second overwrite the
+                    // first's `pending_plan` and strand its oneshot forever.
+                    let is_plan_exit = tu.name.as_ref() == "exit_plan_mode";
+                    let needs_approval = !is_plan_exit
+                        && this
+                            .tools
+                            .get(tu.name.as_ref())
+                            .map(|t| t.requires_approval(&tu.input))
+                            .unwrap_or(false)
                         && !this.permission.is_always_allowed(tu.name.as_ref());
-                    if needs_approval {
+                    if needs_approval || is_plan_exit {
                         appr.push(tu.clone());
                     } else {
                         free.push(tu.clone());
@@ -660,6 +734,22 @@ impl Thread {
                 break;
             }
 
+            // A plan was approved this batch: end the turn so the model does not
+            // continue into write tools (newly visible since `plan_mode` was
+            // cleared) before the user has signaled to proceed.
+            let stop_after_plan = this.update(cx, |this, cx| {
+                if this.end_turn_after_tool {
+                    this.end_turn_after_tool = false;
+                    cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
+                    true
+                } else {
+                    false
+                }
+            })?;
+            if stop_after_plan {
+                break;
+            }
+
             // Sub-agent turn cap: stop runaway sub-agents after `max_turns` round-trips.
             // The first hit injects one summary turn so the sub-agent can wrap up
             // with a coherent final message instead of ending mid-work; a second
@@ -702,6 +792,13 @@ impl Thread {
         let name = tu.name.to_string();
         let title = tool_title(&name, &tu.input);
 
+        // Plan-mode exit handshake: the model submitted a plan. Intercept before
+        // the registry lookup (`exit_plan_mode` is synthesized in
+        // `build_completion_request`, not registered) and run the approval flow.
+        if name == "exit_plan_mode" && this.read_with(cx, |this, _| this.plan_mode)? {
+            return Self::run_plan_approval(this, tu, cancel, cx).await;
+        }
+
         let tool = this.read_with(cx, |this, _| this.tools.get(&name).cloned())?;
 
         let Some(tool) = tool else {
@@ -710,6 +807,18 @@ impl Thread {
             Self::append_tool_result(&this, tu, msg.clone(), true, cx)?;
             return Ok(());
         };
+
+        // Plan-mode write backstop: a write tool should never be advertised in
+        // plan mode (the request-tool list is filtered), but if one slips
+        // through (stale registry, model hallucination) synthesize an error
+        // rather than execute it.
+        let in_plan = this.read_with(cx, |this, _| this.plan_mode)?;
+        if in_plan && !tool.is_read_only() {
+            let msg = format!("计划模式下不允许调用 {name}。");
+            Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
+            Self::append_tool_result(&this, tu, msg, true, cx)?;
+            return Ok(());
+        }
 
         let needs_approval = tool.requires_approval(&tu.input)
             && !this.read_with(cx, |this, _| this.permission.is_always_allowed(&name))?;
@@ -874,6 +983,101 @@ impl Thread {
                 "is_error": is_error,
             }),
         );
+        Ok(())
+    }
+
+    /// Handle an `exit_plan_mode` tool call: extract the plan text, emit
+    /// `ThreadEvent::PlanProposed`, park on a oneshot until the user responds
+    /// via `respond_plan_approval`. Mirrors the authorization handshake in
+    /// `run_tool_inner`. Approve → exit plan mode and end the turn (the user
+    /// sends the next message to begin executing); Reject → stay in plan mode
+    /// and feed a revision prompt back so the model revises.
+    async fn run_plan_approval(
+        this: gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        cancel: CancellationToken,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let name = "exit_plan_mode".to_string();
+        let title = "提交计划".to_string();
+
+        let plan_text = tu
+            .input
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(未提供计划文本)")
+            .to_string();
+
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: ToolCallStatus::PendingApproval,
+            });
+        })?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        this.update(cx, |this, _cx| {
+            this.pending_plan_approval.insert(id.clone(), tx);
+        })?;
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::PlanProposed {
+                id: id.clone(),
+                plan_text: plan_text.clone(),
+            });
+        })?;
+
+        let response = tokio::select! {
+            r = rx => r.unwrap_or(PlanApprovalResponse::Reject),
+            _ = cancel.cancelled() => PlanApprovalResponse::Reject,
+        };
+        this.update(cx, |this, _cx| {
+            this.pending_plan_approval.remove(&id);
+        })?;
+
+        match response {
+            PlanApprovalResponse::Approve => {
+                let msg =
+                    format!("用户已批准该计划。计划内容：\n\n{plan_text}\n\n现在可以开始执行。");
+                this.update(cx, |_, cx| {
+                    cx.emit(ThreadEvent::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        title: title.clone(),
+                        status: ToolCallStatus::Success,
+                    });
+                })?;
+                Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
+                Self::append_tool_result(&this, tu, msg, false, cx)?;
+                // Exit plan mode AFTER the tool result is safely appended to
+                // the message list. Clearing `plan_mode` before `append` would
+                // leave the messages inconsistent (plan mode off but no
+                // approval result recorded) if `append_tool_result` failed.
+                // `end_turn_after_tool` is checked by `run_turn_loop` after
+                // this returns.
+                this.update(cx, |this, cx| {
+                    this.plan_mode = false;
+                    this.end_turn_after_tool = true;
+                    cx.notify();
+                })?;
+            }
+            PlanApprovalResponse::Reject => {
+                let msg = "用户拒绝了该计划。请根据用户反馈修订计划，再次调用 exit_plan_mode。"
+                    .to_string();
+                this.update(cx, |_, cx| {
+                    cx.emit(ThreadEvent::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        title: title.clone(),
+                        status: ToolCallStatus::Denied,
+                    });
+                })?;
+                Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
+                Self::append_tool_result(&this, tu, msg, false, cx)?;
+            }
+        }
         Ok(())
     }
 
@@ -1176,9 +1380,14 @@ impl Thread {
     /// absent; the model fetches it via the `self_info` tool.
     fn build_completion_request(&self) -> LanguageModelRequest {
         let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
-        let system = self.system.clone().unwrap_or_else(|| {
+        let mut system = self.system.clone().unwrap_or_else(|| {
             crate::system_prompt::build_main_system_prompt(&self.cwd, self.project.as_deref())
         });
+        // In plan mode, append the read-only-constraint addendum so the model
+        // knows it must submit a plan via `exit_plan_mode` rather than act.
+        if self.plan_mode {
+            system.push_str(crate::system_prompt::PLAN_MODE_ADDENDUM);
+        }
         messages.push(LanguageModelRequestMessage {
             role: Role::System,
             content: vec![MessageContent::Text(system)],
@@ -1199,9 +1408,21 @@ impl Thread {
             content: m.content.iter().map(model_facing_content).collect(),
             cache: false,
         }));
-        let tools = match self.turn_tool_filter.as_deref() {
-            Some(f) if !f.is_empty() => self.tools.to_request_tools_filtered(f),
-            _ => self.tools.to_request_tools(),
+        let tools = if self.plan_mode {
+            // In plan mode, advertise only read-only tools plus the synthesized
+            // `exit_plan_mode` tool (not in the registry). Write tools, `bash`,
+            // and the `agent` sub-agent spawner are hidden so the model cannot
+            // attempt them; `run_tool_inner` backstops any stray call. Plan
+            // mode takes precedence over `turn_tool_filter` — it is the
+            // stricter, user-visible safety contract.
+            let mut list = self.tools.to_request_tools_read_only();
+            list.push(exit_plan_mode_request_tool());
+            list
+        } else {
+            match self.turn_tool_filter.as_deref() {
+                Some(f) if !f.is_empty() => self.tools.to_request_tools_filtered(f),
+                _ => self.tools.to_request_tools(),
+            }
         };
         LanguageModelRequest {
             messages,
@@ -1519,5 +1740,170 @@ mod tests {
             content.contains("reg-run-tool-inner"),
             "expected thread id in tool result, got: {content}"
         );
+    }
+
+    /// Regression: `cancel()` must clear `pending_plan_approval` immediately
+    /// so the oneshot sender is dropped. Without the fix, the UI clears its
+    /// `pending_plan` overlay (via the `Stop` event) but the thread's oneshot
+    /// lingers — a late `respond_plan_approval` silently no-ops and the async
+    /// `run_plan_approval` task stays parked until the entity is dropped.
+    #[test]
+    fn cancel_clears_pending_plan_approval() {
+        use crate::tool::PlanApprovalResponse;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                super::ThreadId("reg-cancel-plan".to_string()),
+                std::path::PathBuf::from("/tmp"),
+                None,
+                Vec::new(),
+                None,
+                cx,
+            )
+        });
+
+        // Simulate a running turn with a pending plan approval.
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.plan_mode = true;
+                let cancel = tokio_util::sync::CancellationToken::new();
+                t.turn_cancel = Some(cancel);
+                let (tx, _rx) = tokio::sync::oneshot::channel::<PlanApprovalResponse>();
+                t.pending_plan_approval.insert("plan-1".to_string(), tx);
+            });
+        });
+
+        // Cancel the turn.
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.cancel(cx));
+        });
+
+        // Both turn_cancel and pending_plan_approval must be cleared.
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                assert!(t.turn_cancel.is_none(), "cancel should take turn_cancel");
+                assert!(
+                    t.pending_plan_approval.is_empty(),
+                    "cancel should clear pending_plan_approval (oneshot sender \
+                     still lingering — UI cleared but thread didn't)"
+                );
+                // plan_mode is NOT cleared by cancel — it stays true so the
+                // next turn still builds a plan-mode request.
+                assert!(t.plan_mode, "cancel should not clear plan_mode");
+            });
+        });
+    }
+
+    /// Regression: `run_plan_approval` Approve branch must append the
+    /// ToolResult to the message list BEFORE clearing `plan_mode`. The old
+    /// code set `plan_mode = false` first; if `append_tool_result` then
+    /// failed (entity gone, infra error), the thread would exit plan mode
+    /// without recording the approval — inconsistent state for the next
+    /// `build_completion_request`.
+    #[test]
+    fn plan_approval_approve_appends_result_before_clearing_plan_mode() {
+        use crate::language_model::LanguageModelToolUse;
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                super::ThreadId("reg-plan-approve-order".to_string()),
+                std::path::PathBuf::from("/tmp"),
+                None,
+                Vec::new(),
+                None,
+                cx,
+            )
+        });
+
+        let tu = LanguageModelToolUse {
+            id: "tu_plan_1".to_string(),
+            name: Arc::from("exit_plan_mode"),
+            raw_input: r#"{"plan":"do stuff"}"#.to_string(),
+            input: serde_json::json!({"plan": "do stuff"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        // Enable plan mode; `run_plan_approval` creates its own oneshot
+        // and stores the sender in `pending_plan_approval`.
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.plan_mode = true;
+            });
+        });
+
+        let weak = thread.downgrade();
+        let cancel = CancellationToken::new();
+        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let r = result.clone();
+
+        // Spawn run_plan_approval.
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *r.lock().unwrap() =
+                    Some(super::Thread::run_plan_approval(weak, tu, cancel, &mut cx).await);
+            }
+        })
+        .detach();
+
+        // Let the task reach the tokio::select! and park on the oneshot.
+        cx.run_until_parked();
+
+        // Send the approval via `respond_plan_approval`, which extracts the
+        // sender from `pending_plan_approval` and resolves the oneshot.
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.respond_plan_approval(
+                    "tu_plan_1",
+                    crate::tool::PlanApprovalResponse::Approve,
+                    cx,
+                );
+            });
+        });
+
+        // Let the task process the approval and complete.
+        cx.run_until_parked();
+
+        let res = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("run_plan_approval did not complete");
+        assert!(res.is_ok(), "run_plan_approval failed: {:?}", res.err());
+
+        // Verify: plan_mode is now false AND the last message is the
+        // approval ToolResult. The ordering guarantee is that the
+        // ToolResult was appended before plan_mode was cleared.
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                assert!(!t.plan_mode, "plan_mode should be false after approval");
+                assert!(
+                    t.end_turn_after_tool,
+                    "end_turn_after_tool should be set after approval"
+                );
+                let last = t.messages.last().expect("no message after approval");
+                let tr = last
+                    .content
+                    .iter()
+                    .find_map(|c| match c {
+                        MessageContent::ToolResult(tr) => Some(tr),
+                        _ => None,
+                    })
+                    .expect("no ToolResult in last message");
+                assert_eq!(tr.tool_use_id.as_str(), "tu_plan_1");
+                assert!(
+                    tr.content.contains("已批准"),
+                    "expected approval message in ToolResult, got: {}",
+                    tr.content
+                );
+            });
+        });
     }
 }

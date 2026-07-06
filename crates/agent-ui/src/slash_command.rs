@@ -10,9 +10,9 @@
 //! ([`init`]). Each command is an erased `&'static dyn SlashCommand`. The
 //! `⁄` popover in the composer lists registered commands dynamically.
 //!
-//! PR1 ships only a mock `/yolo` so the infrastructure is exercised
-//! end-to-end; the real YOLO behavior lands in a follow-up PR that swaps the
-//! mock for a live implementation.
+//! Two commands ship today: the mock `/yolo` (placeholder, real YOLO lands in
+//! a follow-up PR) and the live `/plan` (enter/exit plan mode, see
+//! [`PlanCommand`]).
 
 use std::sync::{Arc, OnceLock};
 
@@ -107,6 +107,7 @@ pub fn init(_cx: &mut App) {
         // implementation replaces this command with a live toggle + execution
         // in a follow-up PR.
         Box::new(MockYoloCommand),
+        Box::new(PlanCommand),
     ];
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
@@ -239,6 +240,46 @@ impl SlashCommand for MarkdownSlashCommand {
     }
 }
 
+/// `/plan` — enter or exit plan mode.
+///
+/// - No args: toggle plan mode and consume the input (nothing sent to the
+///   model). The state change is reflected in the access chip.
+/// - With args: ensure plan mode is on, then send `args` as a normal user
+///   message so the agent plans against that prompt. `set_plan_mode(true)`
+///   runs before `InjectUserTurn` returns, so the turn `submit_input` then
+///   launches builds its request with the read-only tool filter already active.
+struct PlanCommand;
+
+impl SlashCommand for PlanCommand {
+    fn name(&self) -> &str {
+        "plan"
+    }
+    fn description(&self) -> &str {
+        "进入计划模式：仅允许只读工具，研究后提交计划待批准（裸 `/plan` 切换；`/plan <提示>` 带提示进入）"
+    }
+    fn execute(
+        &self,
+        args: &str,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        let thread = workspace.thread.clone();
+        let in_plan = thread.read(cx).plan_mode();
+        if args.is_empty() {
+            thread.update(cx, |t, cx| t.set_plan_mode(!in_plan, cx));
+            cx.notify();
+            SlashResult::Handled
+        } else {
+            if !in_plan {
+                thread.update(cx, |t, cx| t.set_plan_mode(true, cx));
+            }
+            cx.notify();
+            SlashResult::InjectUserTurn(args.to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,7 +334,20 @@ mod tests {
         register_for_tests();
         let r = REGISTRY.get().unwrap();
         assert!(r.get("yolo").is_some());
+        assert!(r.get("plan").is_some());
         assert!(r.get("nope").is_none());
+    }
+
+    #[test]
+    fn parse_plan_command() {
+        // `/plan` bare and `/plan <prompt>` both parse once /plan is registered.
+        register_for_tests();
+        let p = parse("/plan").unwrap();
+        assert_eq!(p.name, "plan");
+        assert_eq!(p.args, "");
+        let p = parse("/plan fix the auth flow").unwrap();
+        assert_eq!(p.name, "plan");
+        assert_eq!(p.args, "fix the auth flow");
     }
 
     /// Ensure the registry is populated for tests (idempotent).
@@ -301,6 +355,9 @@ mod tests {
         if REGISTRY.get().is_some() {
             return;
         }
-        let _ = REGISTRY.set(SlashCommandRegistry::new(vec![Box::new(MockYoloCommand)]));
+        let _ = REGISTRY.set(SlashCommandRegistry::new(vec![
+            Box::new(MockYoloCommand),
+            Box::new(PlanCommand),
+        ]));
     }
 }

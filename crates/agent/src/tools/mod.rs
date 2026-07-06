@@ -194,6 +194,9 @@ impl AgentTool for ReadFileTool {
     fn input_schema(&self) -> serde_json::Value {
         schema::<ReadFileInput>()
     }
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn run(
         &self,
         input: serde_json::Value,
@@ -433,6 +436,9 @@ impl AgentTool for ListDirectoryTool {
     fn input_schema(&self) -> serde_json::Value {
         schema::<ListDirectoryInput>()
     }
+    fn is_read_only(&self) -> bool {
+        true
+    }
     fn run(
         &self,
         input: serde_json::Value,
@@ -492,6 +498,9 @@ impl AgentTool for GrepTool {
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<GrepInput>()
+    }
+    fn is_read_only(&self) -> bool {
+        true
     }
     fn run(
         &self,
@@ -628,6 +637,9 @@ impl AgentTool for GlobTool {
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<GlobInput>()
+    }
+    fn is_read_only(&self) -> bool {
+        true
     }
     fn run(
         &self,
@@ -896,5 +908,25 @@ mod tests {
         let cwd = Path::new("/tmp/manox-write-confinement");
         let p = resolve_path("/etc/passwd", cwd);
         assert_eq!(p, PathBuf::from("/etc/passwd"));
+    }
+
+    #[test]
+    fn read_only_flags_match_plan_mode_allowlist() {
+        // The plan-mode tool filter relies on `is_read_only()` being accurate:
+        // read-only tools stay available, write/exec/spawn tools are hidden.
+        let tools = base_tools(Arc::new(PathBuf::from(".")));
+        let by_name = |n: &str| tools.iter().find(|t| t.name() == n).unwrap();
+        for n in [
+            "read_file",
+            "list_directory",
+            "grep",
+            "glob",
+            "AskUserQuestion",
+        ] {
+            assert!(by_name(n).is_read_only(), "{n} should be read-only");
+        }
+        for n in ["write_file", "edit_file", "bash"] {
+            assert!(!by_name(n).is_read_only(), "{n} should NOT be read-only");
+        }
     }
 }

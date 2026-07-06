@@ -56,6 +56,10 @@ impl AgentToolTrait for SelfInfoTool {
         false
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         _input: serde_json::Value,

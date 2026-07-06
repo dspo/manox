@@ -158,6 +158,9 @@ impl ConversationState {
         cx: &mut App,
     ) -> ApplyOutcome {
         match event {
+            // Plan approval is handled by the Workspace overlay; the
+            // conversation view has no item to render for it.
+            ThreadEvent::PlanProposed { .. } => ApplyOutcome::None,
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
