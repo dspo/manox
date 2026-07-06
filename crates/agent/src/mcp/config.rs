@@ -69,6 +69,20 @@ impl McpConfig {
     }
 }
 
+/// Convenience wrapper for the settings overlay: load the MCP config from the
+/// process-wide manox config dir. Returns an empty config (no servers) when
+/// the dir path is unavailable or the file is malformed, matching the
+/// startup `init` behavior — UI surfaces should not crash on a bad config.
+pub fn load_global() -> McpConfig {
+    match crate::paths::manox_config_dir() {
+        Ok(dir) => McpConfig::load(&dir).unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("MCP config dir unavailable: {e:#}; MCP settings panel will be empty");
+            McpConfig::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
