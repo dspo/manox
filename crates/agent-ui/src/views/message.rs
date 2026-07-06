@@ -156,7 +156,7 @@ fn setext_heading_level(line: &str) -> Option<u8> {
 
 fn render_normalized_heading(level: u8, title: &str) -> Vec<String> {
     if level == 1 {
-        vec![format!("***{title}***"), heading_underline(title)]
+        vec![format!("*{title}*"), heading_underline(title)]
     } else {
         vec![format!("**{title}**")]
     }
@@ -336,125 +336,38 @@ fn copy_button_hoverable(
 /// Render a user message as a right-aligned bubble, matching Codex.app's turn shape.
 pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
     let group = format!("user-{ix}");
-    gpui::div()
+    h_flex()
         .group(group.clone())
-        .relative()
-        .w_full()
-        .child(render_user_turn_marker(ix, &group, theme))
-        .child(render_user_turn_preview(text, ix, &group, theme))
+        .w(px(crate::views::CONTENT_MAX_W))
+        .max_w_full()
+        .justify_end()
         .child(
-            h_flex().w_full().justify_end().child(
-                v_flex()
-                    .group(group.clone())
-                    .max_w(px(560.))
-                    .min_w_0()
-                    .gap_1()
-                    .px_3()
-                    .py_2()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.secondary.opacity(0.65))
-                    .child(h_flex().w_full().justify_end().child(copy_button_hoverable(
-                        ix,
-                        "copy-user",
-                        group,
-                        text.to_string(),
-                    )))
-                    .child(
-                        gpui::div()
-                            .text_sm()
-                            .line_height(gpui::relative(1.5))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.secondary_foreground)
-                            .child(chat_markdown_tv(("user-text", ix), text, theme, false)),
-                    ),
-            ),
+            v_flex()
+                .max_w(px(560.))
+                .min_w_0()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .rounded(theme.radius)
+                .bg(theme.secondary)
+                .border_1()
+                .border_color(theme.border)
+                .child(h_flex().w_full().justify_end().child(copy_button_hoverable(
+                    ix,
+                    "copy-user",
+                    group,
+                    text.to_string(),
+                )))
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .line_height(gpui::relative(1.45))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.secondary_foreground)
+                        .child(text.to_string()),
+                ),
         )
         .into_any_element()
-}
-
-fn render_user_turn_marker(ix: usize, group: &str, theme: &Theme) -> gpui::AnyElement {
-    let group: SharedString = group.to_string().into();
-    v_flex()
-        .id(("user-turn-marker", ix))
-        .absolute()
-        .left(px(-42.))
-        .top(px(4.))
-        .w(px(24.))
-        .items_center()
-        .gap(px(3.))
-        .cursor_pointer()
-        .children((0..9).map(|i| {
-            let active = i == 4;
-            let width = if active { 22. } else { 9. };
-            let color = if active {
-                theme.muted_foreground.opacity(0.72)
-            } else {
-                theme.muted_foreground.opacity(0.28)
-            };
-            let hover_color = if active {
-                theme.foreground
-            } else {
-                theme.muted_foreground.opacity(0.52)
-            };
-            gpui::div()
-                .w(px(width))
-                .h(px(1.5))
-                .rounded_full()
-                .bg(color)
-                .group_hover(group.clone(), move |s| s.bg(hover_color))
-        }))
-        .into_any_element()
-}
-
-fn render_user_turn_preview(text: &str, ix: usize, group: &str, theme: &Theme) -> gpui::AnyElement {
-    let group: SharedString = group.to_string().into();
-    let (title, body) = user_turn_preview_text(text);
-    v_flex()
-        .id(("user-turn-preview", ix))
-        .absolute()
-        .left(px(-284.))
-        .top(px(-10.))
-        .w(px(232.))
-        .gap_1()
-        .px_3()
-        .py_2()
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.background)
-        .shadow_md()
-        .invisible()
-        .group_hover(group, |s| s.visible())
-        .child(
-            gpui::div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::BOLD)
-                .line_height(gpui::relative(1.35))
-                .text_color(theme.foreground)
-                .child(title),
-        )
-        .child(
-            gpui::div()
-                .text_xs()
-                .line_height(gpui::relative(1.38))
-                .text_color(theme.muted_foreground)
-                .child(body),
-        )
-        .into_any_element()
-}
-
-fn user_turn_preview_text(text: &str) -> (String, String) {
-    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-    let title_source = lines.next().unwrap_or(text.trim());
-    let body_source = lines.collect::<Vec<_>>().join(" ");
-    let body_source = if body_source.is_empty() {
-        text.trim()
-    } else {
-        body_source.as_str()
-    };
-    (truncate(title_source, 32), truncate(body_source, 96))
 }
 
 /// Render an assistant message as plain transcript text. The model label is intentionally hidden here;
@@ -1421,7 +1334,7 @@ mod tests {
     fn normalize_chat_markdown_flattens_atx_headings() {
         assert_eq!(
             normalize_chat_markdown("# Big\n\n### Small"),
-            "***Big***\n──────\n\n**Small**"
+            "*Big*\n──────\n\n**Small**"
         );
     }
 
@@ -1429,7 +1342,7 @@ mod tests {
     fn normalize_chat_markdown_keeps_code_fence_content() {
         assert_eq!(
             normalize_chat_markdown("```md\n# still code\n```\n# Title"),
-            "```md\n# still code\n```\n***Title***\n──────"
+            "```md\n# still code\n```\n*Title*\n──────"
         );
     }
 

@@ -20,9 +20,9 @@ use agent::{
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
-    DragMoveEvent, Entity, FollowMode, ListAlignment, ListSizingBehavior, ListState, MouseButton,
-    MouseUpEvent, Pixels, Render, SharedString, Subscription, Window, ease_out_quint, list,
-    prelude::*, px,
+    DragMoveEvent, Entity, FollowMode, ListAlignment, ListOffset, ListSizingBehavior, ListState,
+    MouseButton, MouseUpEvent, Pixels, Render, SharedString, Subscription, Window, ease_out_quint,
+    list, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -1166,6 +1166,87 @@ impl Workspace {
                             ),
                     ),
             )
+            .into_any_element()
+    }
+
+    fn render_user_turn_nav(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let turns: Vec<(usize, String)> = self
+            .conversation
+            .read(cx)
+            .items()
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, item)| match item.read(cx).kind() {
+                ConvItem::User(text) if !text.trim().is_empty() => Some((ix, text.clone())),
+                _ => None,
+            })
+            .collect();
+
+        if turns.is_empty() {
+            return gpui::Empty.into_any_element();
+        }
+
+        h_flex()
+            .id("user-turn-nav")
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(88.))
+            .justify_center()
+            .child(gpui::div().relative().w_full().max_w(px(crate::views::CONTENT_MAX_W)).child(
+                v_flex()
+                    .absolute()
+                    .left(px(-42.))
+                    .top_0()
+                    .w(px(30.))
+                    .gap(px(10.))
+                    .items_center()
+                    .children(turns.into_iter().map(|(ix, text)| {
+                        let group = format!("user-turn-nav-{ix}");
+                        gpui::div()
+                            .group(group.clone())
+                            .relative()
+                            .w(px(30.))
+                            .h(px(18.))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.list_state.scroll_to(ListOffset {
+                                        item_ix: ix,
+                                        offset_in_item: px(0.),
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                v_flex()
+                                    .absolute()
+                                    .left(px(0.))
+                                    .top(px(0.))
+                                    .w(px(18.))
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .children((0..5).map(|line_ix| {
+                                        let active = line_ix == 2;
+                                        gpui::div()
+                                            .w(px(if active { 18. } else { 8. }))
+                                            .h(px(1.5))
+                                            .rounded_full()
+                                            .bg(if active {
+                                                theme.muted_foreground.opacity(0.7)
+                                            } else {
+                                                theme.muted_foreground.opacity(0.26)
+                                            })
+                                            .group_hover(group.clone(), |s| {
+                                                s.bg(theme.foreground.opacity(0.74))
+                                            })
+                                    })),
+                            )
+                            .child(render_user_turn_preview(&text, ix, &group, theme))
+                            .into_any_element()
+                    })),
+            ))
             .into_any_element()
     }
 
@@ -3029,6 +3110,8 @@ impl Render for Workspace {
             !editor_open && !first_screen && self.thread.read(cx).has_interacted();
         let environment_panel =
             show_environment_panel.then(|| self.render_environment_panel(&theme, cx));
+        let user_turn_nav =
+            (!first_screen).then(|| self.render_user_turn_nav(&theme, cx));
         let content_inset = if show_environment_panel {
             px(ENV_CONTENT_INSET)
         } else {
@@ -3112,6 +3195,7 @@ impl Render for Workspace {
                                     }))
                                     .children(footer),
                             )
+                            .children(user_turn_nav)
                             .children(environment_panel)
                             // Approval overlay (if any)
                             .children(overlay),
@@ -3193,6 +3277,68 @@ fn env_row(
         )
         .children(trailing)
         .into_any_element()
+}
+
+fn render_user_turn_preview(text: &str, ix: usize, group: &str, theme: &Theme) -> AnyElement {
+    let title = first_nonempty_line(text).unwrap_or(text.trim());
+    let body = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = if body.is_empty() { text.trim() } else { &body };
+    let group: SharedString = group.to_string().into();
+
+    v_flex()
+        .id(("user-turn-preview", ix))
+        .absolute()
+        .left(px(24.))
+        .top(px(-14.))
+        .w(px(232.))
+        .gap_1()
+        .px_3()
+        .py_2()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .shadow_md()
+        .invisible()
+        .group_hover(group, |s| s.visible())
+        .child(
+            gpui::div()
+                .text_xs()
+                .line_height(gpui::relative(1.35))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.foreground)
+                .child(truncate_chars(title, 34)),
+        )
+        .child(
+            gpui::div()
+                .text_xs()
+                .line_height(gpui::relative(1.4))
+                .text_color(theme.muted_foreground)
+                .child(truncate_chars(body, 96)),
+        )
+        .into_any_element()
+}
+
+fn first_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (ix, ch) in s.chars().enumerate() {
+        if ix >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn mode_tag(label: SharedString, active: bool, theme: &Theme) -> AnyElement {
