@@ -1163,13 +1163,12 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
         "bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let single = cmd.lines().next().unwrap_or("").trim().to_string();
-            let trimmed = if single.chars().count() > 80 {
+            if single.chars().count() > 80 {
                 let t: String = single.chars().take(80).collect();
                 format!("{t}…")
             } else {
                 single
-            };
-            format!("bash: {trimmed}")
+            }
         }
         "grep" => {
             let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
@@ -1263,6 +1262,28 @@ mod tests {
     #[test]
     fn ask_user_question_title_falls_back_without_questions() {
         assert_eq!(tool_title("AskUserQuestion", &json!({})), "AskUserQuestion");
+    }
+
+    /// Bash tool title is the first line of the command, no `bash:` prefix —
+    /// the card already carries a terminal icon, so the prefix would be
+    /// redundant. Truncates to 80 chars with a trailing ellipsis.
+    #[test]
+    fn bash_title_strips_prefix_and_uses_first_line() {
+        let input = json!({ "command": "gh pr create -R dspo/manox --title foo" });
+        assert_eq!(tool_title("bash", &input), "gh pr create -R dspo/manox --title foo");
+
+        let long = "a".repeat(120);
+        let input = json!({ "command": long.clone() });
+        let out = tool_title("bash", &input);
+        assert_eq!(out.chars().count(), 81);
+        assert!(out.ends_with('…'));
+
+        let multi = "git status\ncargo build --release";
+        let input = json!({ "command": multi });
+        assert_eq!(tool_title("bash", &input), "git status");
+
+        let input = json!({});
+        assert_eq!(tool_title("bash", &input), "");
     }
 
     /// The `agent` tool's persisted ToolResult carries a JSON envelope

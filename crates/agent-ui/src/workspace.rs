@@ -75,7 +75,7 @@ pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<Thread>,
     sidebar: Entity<Sidebar>,
-    conversation: Entity<ConversationState>,
+    pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
     /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
     /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
@@ -85,6 +85,10 @@ pub struct Workspace {
     editor_preview: bool,
     /// Editor pane width, driven by dragging the divider. In-memory only.
     editor_width: Pixels,
+    /// Sidebar width, driven by dragging the divider on its right edge.
+    /// In-memory only; never persisted so the user's drag state stays
+    /// session-local.
+    sidebar_width: Pixels,
     /// Pending tool-call authorizations, keyed by their (possibly composite)
     /// id. Multiple can be open at once when parallel sub-agents each bubble an
     /// approval request — the overlay shows the most recent and queues the rest,
@@ -159,10 +163,13 @@ const EDITOR_MIN_WIDTH: f32 = 320.;
 const EDITOR_MAX_WIDTH: f32 = 960.;
 /// Width of the drag handle between the main column and the editor pane.
 const EDITOR_DIVIDER_WIDTH: f32 = 6.;
-// Mirrors `views/sidebar.rs` (`Sidebar` renders at `w(px(260.))`). Kept here so
-// the editor pane's resize clamp can reserve space for the sidebar + main
-// column without depending on the sidebar's internals.
+// Mirrors `views/sidebar.rs` (`Sidebar` renders at `w(px(SIDEBAR_WIDTH))`).
+// Kept here so the editor pane's resize clamp can reserve space for the
+// sidebar + main column without depending on the sidebar's internals.
 const SIDEBAR_WIDTH: f32 = 260.;
+const SIDEBAR_MIN_WIDTH: f32 = 200.;
+const SIDEBAR_MAX_WIDTH: f32 = 480.;
+const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the main column width when the editor pane is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
 
@@ -184,6 +191,17 @@ impl Render for DraggedEditorDivider {
     }
 }
 
+/// Drag payload for the sidebar divider. Same shape as the editor divider's
+/// payload; the two are distinguished by type so their drag-move handlers
+/// can each run only on the matching payload.
+struct DraggedSidebarDivider;
+
+impl Render for DraggedSidebarDivider {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -195,7 +213,7 @@ impl Workspace {
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
-                .auto_grow(5, 12)
+                .auto_grow(4, 12)
                 .submit_on_enter(true)
                 .placeholder("输入消息，点击发送以开始使用")
         });
@@ -210,7 +228,7 @@ impl Workspace {
                 .placeholder("编写 markdown…（Cmd-Enter 发送）")
         });
 
-        let sidebar = cx.new(Sidebar::new);
+        let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
 
         let list_state = ListState::new(0, ListAlignment::Top, px(2048.));
         list_state.set_follow_mode(FollowMode::Tail);
@@ -225,6 +243,7 @@ impl Workspace {
             editor_open: false,
             editor_preview: false,
             editor_width: px(EDITOR_PANEL_WIDTH),
+            sidebar_width: px(SIDEBAR_WIDTH),
             pending_auths: Vec::new(),
             pending_ask: None,
             model_open: false,
@@ -1575,6 +1594,16 @@ impl Render for Workspace {
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
         let editor_width = self.editor_width;
+        // Title text reflects the chosen project once one is bound; falls back
+        // to the app name so an unselected first screen stays branded.
+        let title_text = self
+            .thread
+            .read(cx)
+            .project()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("manox")
+            .to_string();
         // Empty first screen: no messages and nothing streaming. The composer is
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
@@ -1661,6 +1690,40 @@ impl Render for Workspace {
                     }
                 }),
             );
+        // Sidebar divider: same shape as the editor divider but lives on the
+        // right edge of the sidebar. Double-click resets to the default
+        // `SIDEBAR_WIDTH` for symmetry with the editor pane.
+        let sidebar_divider = gpui::div()
+            .id("sidebar-divider")
+            .w(px(SIDEBAR_DIVIDER_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .relative()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .child(
+                gpui::div()
+                    .absolute()
+                    .left(px(2.5))
+                    .w(px(1.))
+                    .h_full()
+                    .bg(theme.border),
+            )
+            .on_drag(DraggedSidebarDivider, |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| DraggedSidebarDivider)
+            })
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    if e.click_count >= 2 {
+                        let reset = px(SIDEBAR_WIDTH);
+                        this.sidebar_width = reset;
+                        this.sidebar.update(cx, |s, cx| s.set_width(reset, cx));
+                        cx.notify();
+                    }
+                }),
+            );
         let editor_pane = v_flex()
             .w(editor_width)
             .h_full()
@@ -1733,8 +1796,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &crate::CloseEditor, window, cx| {
                 this.close_editor(window, cx);
             }))
-            // Left sidebar
+            // Left sidebar with a draggable divider on its right edge.
             .child(self.sidebar.clone())
+            .child(sidebar_divider)
             // Main column
             .child(
                 v_flex()
@@ -1752,35 +1816,45 @@ impl Render for Workspace {
                                     .child(
                                         gpui::div()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child("manox"),
+                                            .child(title_text),
                                     ),
                             )
                             .child(h_flex()),
                     )
-                    // Empty first screen shows the centered hero in place of the
-                    // (empty) message list; otherwise the virtualized, tail-
-                    // following conversation list. Each item is its own
-                    // `Entity<MessageItem>`, so a streaming delta re-renders only
-                    // that item; the list only re-invokes the closure for visible
-                    // items and reuses cached element subtrees for the rest.
-                    .children(hero)
-                    .children((!first_screen).then(|| {
-                        let conv = self.conversation.clone();
-                        list(self.list_state.clone(), move |ix, _window, cx| {
-                            conv.read(cx)
-                                .items()
-                                .get(ix)
-                                .cloned()
-                                .map(|item| v_flex().py_2().child(item).into_any_element())
-                                .unwrap_or_else(|| gpui::Empty.into_any_element())
-                        })
-                        .with_sizing_behavior(ListSizingBehavior::Auto)
-                        .flex_1()
-                        .into_any_element()
-                    }))
-                    .children(footer)
-                    // Approval overlay (if any)
-                    .children(overlay),
+                    // Body wrapper: hero / list / footer / overlay share a common
+                    // horizontal inset so conversation content doesn't kiss the
+                    // panel edge.
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .h_full()
+                            .w_full()
+                            .px_4()
+                            // Empty first screen shows the centered hero in place of the
+                            // (empty) message list; otherwise the virtualized, tail-
+                            // following conversation list. Each item is its own
+                            // `Entity<MessageItem>`, so a streaming delta re-renders only
+                            // that item; the list only re-invokes the closure for visible
+                            // items and reuses cached element subtrees for the rest.
+                            .children(hero)
+                            .children((!first_screen).then(|| {
+                                let conv = self.conversation.clone();
+                                list(self.list_state.clone(), move |ix, _window, cx| {
+                                    conv.read(cx)
+                                        .items()
+                                        .get(ix)
+                                        .cloned()
+                                        .map(|item| v_flex().py_4().child(item).into_any_element())
+                                        .unwrap_or_else(|| gpui::Empty.into_any_element())
+                                })
+                                .with_sizing_behavior(ListSizingBehavior::Auto)
+                                .flex_1()
+                                .into_any_element()
+                            }))
+                            .children(footer)
+                            // Approval overlay (if any)
+                            .children(overlay),
+                    ),
             )
             .when(editor_open, |this| {
                 this.child(editor_divider).child(editor_pane)
@@ -1793,16 +1867,43 @@ impl Render for Workspace {
                     // minimum and to leave the main column at least
                     // `MAIN_MIN_WIDTH` (sidebar + main + divider sit left of
                     // the editor), so dragging wide never overflows the window
-                    // or collapses the conversation column.
+                    // or collapses the conversation column. `sidebar_width`
+                    // is read live so a wide sidebar correctly shrinks the
+                    // available editor envelope.
                     let new_w = e.bounds.right() - e.event.position.x;
                     let dynamic_max = e.bounds.size.width
-                        - px(SIDEBAR_WIDTH)
+                        - this.sidebar_width
                         - px(EDITOR_DIVIDER_WIDTH)
                         - px(MAIN_MIN_WIDTH);
                     let max_w = dynamic_max
                         .min(px(EDITOR_MAX_WIDTH))
                         .max(px(EDITOR_MIN_WIDTH));
                     this.editor_width = new_w.clamp(px(EDITOR_MIN_WIDTH), max_w);
+                    cx.notify();
+                },
+            ))
+            .on_drag_move(cx.listener(
+                |this, e: &DragMoveEvent<DraggedSidebarDivider>, _window, cx| {
+                    // The root fills the window, so the sidebar's right edge
+                    // is the cursor's x position relative to the root's left.
+                    // Clamp so the main column (and the editor pane when
+                    // open) always retain at least `MAIN_MIN_WIDTH`.
+                    let new_w = e.event.position.x - e.bounds.left();
+                    let editor_reserve = if this.editor_open {
+                        this.editor_width + px(EDITOR_DIVIDER_WIDTH)
+                    } else {
+                        px(0.)
+                    };
+                    let dynamic_max = e.bounds.size.width
+                        - px(SIDEBAR_DIVIDER_WIDTH)
+                        - editor_reserve
+                        - px(MAIN_MIN_WIDTH);
+                    let max_w = dynamic_max
+                        .min(px(SIDEBAR_MAX_WIDTH))
+                        .max(px(SIDEBAR_MIN_WIDTH));
+                    let clamped = new_w.clamp(px(SIDEBAR_MIN_WIDTH), max_w);
+                    this.sidebar_width = clamped;
+                    this.sidebar.update(cx, |s, cx| s.set_width(clamped, cx));
                     cx.notify();
                 },
             ))
