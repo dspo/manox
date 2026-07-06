@@ -14,9 +14,11 @@
 //! end-to-end; the real YOLO behavior lands in a follow-up PR that swaps the
 //! mock for a live implementation.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use gpui::{App, Context, Window};
+
+use agent::command::CommandDefinition;
 
 use crate::workspace::Workspace;
 
@@ -96,14 +98,33 @@ impl SlashCommandRegistry {
 }
 
 /// Register the built-in slash commands. Call once during app startup, before
-/// any workspace is created. Idempotent via `OnceLock::set`.
+/// any workspace is created — and after `agent::init`, which populates the
+/// markdown command registry the macro adapters mirror. Idempotent via
+/// `OnceLock::set`.
 pub fn init(_cx: &mut App) {
-    let _ = REGISTRY.set(SlashCommandRegistry::new(vec![
+    let mut commands: Vec<Box<dyn SlashCommand>> = vec![
         // Mock /yolo: pushes a placeholder notice. The real YOLO
         // implementation replaces this command with a live toggle + execution
         // in a follow-up PR.
         Box::new(MockYoloCommand),
-    ]));
+    ];
+    // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
+    // the registry so `parse` recognizes them and the `⁄` popover lists them.
+    // The adapter delegates to `Workspace::run_command_turn`, which substitutes
+    // `$ARGUMENTS` and applies `allowed-tools` via `Thread::submit_command`.
+    // `agent::command::try_global` is `None` only before `agent::init` (which
+    // `main` calls before us); fall back to no macros rather than panicking.
+    commands.extend(
+        agent::command::try_global()
+            .map(|r| r.entries())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, def)| {
+                Box::new(MarkdownSlashCommand::new(key.clone(), def.clone()))
+                    as Box<dyn SlashCommand>
+            }),
+    );
+    let _ = REGISTRY.set(SlashCommandRegistry::new(commands));
 }
 
 /// Parse a raw composer input into a slash command invocation.
@@ -178,6 +199,42 @@ impl SlashCommand for MockYoloCommand {
             "/yolo 命令已识别（mock）。真实 YOLO 模式将在后续 PR 实现。".to_string(),
             cx,
         );
+        SlashResult::Handled
+    }
+}
+
+/// Adapter wrapping a markdown prompt-macro `CommandDefinition` as a
+/// `SlashCommand`. The `key` is the full registry key (`gitwork:deliver`), not
+/// the bare filename stem, so `parse` matches what the user actually types.
+/// `execute` delegates to `Workspace::run_command_turn`, which pushes the
+/// display bubble, substitutes `$ARGUMENTS` into the body, and applies the
+/// command's `allowed-tools` whitelist for the turn.
+struct MarkdownSlashCommand {
+    key: String,
+    def: Arc<CommandDefinition>,
+}
+
+impl MarkdownSlashCommand {
+    fn new(key: String, def: Arc<CommandDefinition>) -> Self {
+        Self { key, def }
+    }
+}
+
+impl SlashCommand for MarkdownSlashCommand {
+    fn name(&self) -> &str {
+        &self.key
+    }
+    fn description(&self) -> &str {
+        &self.def.description
+    }
+    fn execute(
+        &self,
+        args: &str,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        workspace.run_command_turn(&self.key, args, cx);
         SlashResult::Handled
     }
 }

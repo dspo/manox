@@ -43,7 +43,16 @@ pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>) -> String {
     identity.push_str(&format!("- 默认 shell：{shell}\n"));
     identity.push_str(&format!("- 今天：{today}\n"));
 
-    STATIC_PROMPT.replace(RUNTIME_IDENTITY_TAG, &identity)
+    let mut prompt = STATIC_PROMPT.replace(RUNTIME_IDENTITY_TAG, &identity);
+    // Advertise installed skills so the model knows what reference docs it can
+    // pull via the `skill` tool. The full bodies are loaded on demand, not
+    // injected here — only the one-line summaries, to keep the prompt small.
+    let skills = crate::skill::summary_block_or_empty();
+    if !skills.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&skills);
+    }
+    prompt
 }
 
 /// The user message injected when a sub-agent hits its `max_turns` cap.

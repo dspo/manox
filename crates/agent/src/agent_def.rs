@@ -1,10 +1,16 @@
-//! Subagent definitions loaded from `~/.config/cx/manox/agents/*.md`.
+//! Subagent definitions loaded from `~/.config/cx/manox/agents/*.md` plus the
+//! `agents/` subdirectory of every installed plugin.
 //!
 //! Each file is a YAML frontmatter block (name/description/tools/model/...)
 //! followed by a markdown body that becomes the subagent's system prompt.
 //! Mirrors Claude Code's `.claude/agents/*.md` format. The registry is loaded
 //! once at startup; a missing or malformed file logs a warning and is skipped
 //! rather than aborting the whole registry.
+//!
+//! Plugin-provided definitions are registered under a `plugin:name` namespace
+//! so they never collide with built-in or user-authored agents — the parent
+//! model passes `subagent_type: "gitwork:reviewer"` to delegate to a plugin
+//! agent, matching Claude Code's plugin-scoped lookup.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -13,6 +19,7 @@ use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
 use crate::paths;
+use crate::plugin::PluginManager;
 
 /// A single subagent definition (frontmatter only).
 #[derive(Debug, Clone, Deserialize)]
@@ -58,47 +65,35 @@ pub struct AgentDefinitionRegistry {
 }
 
 impl AgentDefinitionRegistry {
-    /// Scan the agents dir and parse every `*.md` file. Missing dir or parse
-    /// errors do not abort the load; the registry ends up empty or partial.
+    /// Scan the agents dir and every installed plugin's `agents/` subdirectory,
+    /// parsing each `*.md` file. Missing dirs or parse errors do not abort the
+    /// load; the registry ends up empty or partial. Plugin definitions are
+    /// registered under `plugin:name` so they cannot shadow user-authored ones.
     pub fn load() -> Self {
         let mut defs = BTreeMap::new();
-        let dir = match paths::agents_dir() {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!("agents dir unavailable: {e:#}");
-                return Self { defs };
-            }
-        };
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self { defs },
-            Err(e) => {
-                tracing::warn!("failed to read agents dir {}: {e}", dir.display());
-                return Self { defs };
-            }
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let ext = path.extension().and_then(|x| x.to_str());
-            if ext != Some("md") {
-                continue;
-            }
-            match load_file(&path) {
+        // User-authored definitions: bare frontmatter `name`, no namespace.
+        if let Ok(dir) = paths::agents_dir() {
+            scan_dir(&dir, &mut |path| match load_file(path) {
                 Ok(file) => {
-                    if defs.insert(file.def.name.clone(), Arc::new(file)).is_some() {
-                        tracing::warn!(
-                            "duplicate subagent name from {}; last definition wins",
-                            path.display()
-                        );
-                    }
+                    defs.insert(file.def.name.clone(), Arc::new(file));
                 }
-                Err(e) => {
-                    tracing::warn!("skipping agent def {}: {e:#}", path.display());
-                }
+                Err(e) => tracing::warn!("skipping agent def {}: {e:#}", path.display()),
+            });
+        }
+        // Plugin definitions: `plugin:name` namespace.
+        for plugin in PluginManager::installed() {
+            let dir = plugin.root.join("agents");
+            if !dir.exists() {
+                continue;
             }
+            let ns = plugin.name.clone();
+            scan_dir(&dir, &mut |path| match load_file(path) {
+                Ok(file) => {
+                    let key = format!("{ns}:{}", file.def.name);
+                    defs.insert(key, Arc::new(file));
+                }
+                Err(e) => tracing::warn!("skipping agent def {}: {e:#}", path.display()),
+            });
         }
         Self { defs }
     }
@@ -112,14 +107,33 @@ impl AgentDefinitionRegistry {
     }
 }
 
+/// Walk a directory once, calling `on_file` for each top-level `*.md` entry.
+/// Missing dir is silent (the user/plugin may simply have no definitions).
+fn scan_dir(dir: &std::path::Path, on_file: &mut dyn FnMut(&std::path::Path)) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!("failed to read agents dir {}: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|x| x.to_str()) == Some("md") {
+            on_file(&path);
+        }
+    }
+}
+
 /// Parse one agent definition markdown file: split frontmatter from body,
 /// deserialize the frontmatter, keep the body verbatim as the system prompt.
 fn load_file(path: &std::path::Path) -> Result<AgentDefinitionFile> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let (front, body) = split_frontmatter(&raw);
-    let def: AgentDefinition = serde_yaml::from_str(front)
-        .with_context(|| format!("parsing frontmatter in {}", path.display()))?;
+    let parsed = crate::frontmatter::parse::<AgentDefinition>(&raw)
+        .map_err(|e| anyhow::anyhow!("parsing frontmatter in {}: {e:#}", path.display()))?;
+    let def = parsed.front;
     if def.name.trim().is_empty() {
         anyhow::bail!("agent definition has empty `name`");
     }
@@ -128,54 +142,8 @@ fn load_file(path: &std::path::Path) -> Result<AgentDefinitionFile> {
     }
     Ok(AgentDefinitionFile {
         def,
-        system_prompt: body,
+        system_prompt: parsed.body,
     })
-}
-
-/// Split a markdown file into `(frontmatter_yaml, body)`. Frontmatter is the
-/// content between the first and second `---` lines; everything after the
-/// closing fence is the body. A file without a leading `---` line is treated
-/// as body-only (empty frontmatter → caller errors on the empty yaml).
-fn split_frontmatter(raw: &str) -> (&str, String) {
-    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
-    let after_open = match raw
-        .strip_prefix("---\n")
-        .or_else(|| raw.strip_prefix("---\r\n"))
-    {
-        Some(s) => s,
-        None => return ("", raw.to_string()),
-    };
-    // Find the closing fence: a line that is exactly `---` (with optional `\r`).
-    // `front_end` is the byte offset where the `---` line begins, so `front`
-    // excludes the closing fence entirely (a trailing `---` would make
-    // serde_yaml reject the frontmatter as a second YAML document).
-    let mut front_end = None;
-    let mut line_start = 0;
-    for (i, ch) in after_open.char_indices() {
-        if ch != '\n' {
-            continue;
-        }
-        let line = after_open[line_start..i].trim_end_matches('\r');
-        if line == "---" {
-            front_end = Some(line_start);
-            break;
-        }
-        line_start = i + 1;
-    }
-    if front_end.is_none() && after_open[line_start..].trim_end_matches('\r') == "---" {
-        front_end = Some(line_start);
-    }
-    match front_end {
-        Some(end) => {
-            let front = &after_open[..end];
-            let body = after_open[end..]
-                .strip_prefix("---\n")
-                .or_else(|| after_open[end..].strip_prefix("---\r\n"))
-                .unwrap_or(&after_open[end..]);
-            (front, body.to_string())
-        }
-        None => (after_open, String::new()),
-    }
 }
 
 static REGISTRY: OnceLock<AgentDefinitionRegistry> = OnceLock::new();
@@ -207,7 +175,7 @@ mod tests {
 
     #[test]
     fn parses_frontmatter_and_body() {
-        let (front, body) = split_frontmatter(SAMPLE);
+        let (front, body) = crate::frontmatter::split(SAMPLE);
         let def: AgentDefinition = serde_yaml::from_str(front).unwrap();
         assert_eq!(def.name, "researcher");
         assert_eq!(def.description, "只读代码探索");
@@ -227,7 +195,7 @@ mod tests {
     #[test]
     fn body_only_file_yields_empty_frontmatter() {
         let raw = "no frontmatter here\n";
-        let (front, body) = split_frontmatter(raw);
+        let (front, body) = crate::frontmatter::split(raw);
         assert_eq!(front, "");
         assert_eq!(body, raw);
     }
@@ -235,7 +203,7 @@ mod tests {
     #[test]
     fn missing_optional_fields_default() {
         let raw = "---\nname: minimal\ndescription: bare\n---\nbody\n";
-        let (front, _) = split_frontmatter(raw);
+        let (front, _) = crate::frontmatter::split(raw);
         let def: AgentDefinition = serde_yaml::from_str(front).unwrap();
         assert!(def.tools.is_none());
         assert!(def.disallowed_tools.is_none());

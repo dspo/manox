@@ -573,6 +573,10 @@ impl Workspace {
         // input (Handled), asks to inject text as a user turn (InjectUserTurn),
         // or declines (NoOp → fall through to the normal path). Slash parsing
         // only applies to text-only input; attachments force the normal path.
+        // Markdown prompt-macro commands (`/gitwork:deliver …`) are registered
+        // into the same registry as `MarkdownSlashCommand` adapters and dispatch
+        // into `run_command_turn` → `Thread::submit_command`, which substitutes
+        // `$ARGUMENTS` and applies the command's `allowed-tools` filter.
         if attachments.is_empty()
             && let Some(parsed) = crate::slash_command::parse(&text)
         {
@@ -610,6 +614,40 @@ impl Workspace {
                 .ok();
         })
         .detach();
+    }
+
+    /// Run a markdown prompt-macro slash command turn. The display text
+    /// (`/name args`) is shown to the user as the user bubble; `Thread::submit_command`
+    /// substitutes `$ARGUMENTS` into the command body and applies the command's
+    /// `allowed-tools` whitelist for the turn. An unknown command (adapter
+    /// registered but the data registry miss — shouldn't normally happen)
+    /// surfaces an error and drops the turn.
+    pub(crate) fn run_command_turn(&mut self, name: &str, args: &str, cx: &mut Context<Self>) {
+        let display_text = if args.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("/{name} {args}")
+        };
+        let role = self.model_label(cx);
+        let weak = cx.weak_entity();
+        self.conversation
+            .update(cx, |c, cx| c.push_user(display_text, &role, weak, cx));
+        let count = self.conversation.read(cx).items().len();
+        if count > 0 {
+            self.list_state.splice(count - 1..count - 1, 1);
+        }
+        let hit = self
+            .thread
+            .update(cx, |thread, cx| thread.submit_command(name, args, cx));
+        if !hit {
+            self.thread.update(cx, |_, cx| {
+                cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
+                    "未知命令：/{name}（用 `/` 菜单查看已安装命令）"
+                )));
+            });
+        }
+        save_thread(self.thread.clone(), cx);
+        cx.notify();
     }
 
     /// Append the user turn (text plus any image content) to the thread and start the run.

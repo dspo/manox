@@ -298,17 +298,20 @@ fn setup_child(
     })
 }
 
-/// Resolve the sub-agent's model: the definition's `model` id if set, else the
-/// parent `Thread`'s current model, else the registry's first model.
+/// Resolve the sub-agent's model: the definition's `model` id if set (resolved
+/// via the alias layer so `sonnet`/`opus`/`haiku`/`gpt-5`/`o3` bridge to a live
+/// model), else the parent `Thread`'s current model, else the registry's first
+/// model.
 fn resolve_model(
     def_model: &Option<String>,
     parent: &WeakEntity<Thread>,
     cx: &mut App,
 ) -> Result<AnyLanguageModel, String> {
     if let Some(id) = def_model {
-        return registry::global()
-            .get_model(id)
-            .ok_or_else(|| format!("子 agent model 未找到: {id}"));
+        if let Some(m) = crate::model_alias::resolve_model_ref(id) {
+            return Ok(m);
+        }
+        return Err(format!("子 agent model 未找到: {id}"));
     }
     if let Ok(Some(m)) = parent.read_with(cx, |t, _| t.model().cloned()) {
         return Ok(m);

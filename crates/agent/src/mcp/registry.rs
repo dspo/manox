@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gpui::App;
+use serde::Deserialize;
 
 use crate::mcp::config::{McpConfig, McpServerTransportConfig};
 use crate::mcp::tool::{McpClientHandle, McpTool};
@@ -37,7 +38,7 @@ impl McpRegistry {
 /// Read the config, connect every server, list tools. Call at App startup,
 /// after `runtime::init` and `provider::registry::init`.
 pub fn init(_cx: &mut App) {
-    let config = match crate::paths::manox_config_dir() {
+    let mut config = match crate::paths::manox_config_dir() {
         Ok(dir) => McpConfig::load(&dir).unwrap_or_else(|e| {
             tracing::warn!("MCP 配置加载失败，已跳过: {e:#}");
             McpConfig::default()
@@ -47,6 +48,11 @@ pub fn init(_cx: &mut App) {
             McpConfig::default()
         }
     };
+    // Layer plugin-declared servers on top of the user's mcp.toml. Each
+    // plugin's `.mcp.json` contributes its `mcpServers` under a
+    // `<plugin>__<server>` key so two plugins exposing same-named servers
+    // cannot clobber each other (or a user-declared server in mcp.toml).
+    merge_plugin_declarations(&mut config);
 
     let registry = build_registry(config);
     let count = registry.tools.len();
@@ -61,6 +67,49 @@ pub fn init(_cx: &mut App) {
             rejected.tools.len()
         );
     }
+}
+
+/// Merge every installed plugin's `.mcp.json` declarations into `config`.
+///
+/// The plugin file uses the Claude Code shape `{ "mcpServers": { <name>: <cfg> } }`
+/// (camelCase key); each entry deserializes straight into `McpServerConfig`,
+/// which supports both stdio and streamable-HTTP transports. The server key
+/// becomes `<plugin>__<server>` so plugin servers never collide with each
+/// other or with user-declared `mcp.toml` entries (the user's `mcp.toml` wins
+/// on an exact key clash by being inserted first; plugin merge only fills
+/// absent keys — see the `entry().or_insert` below).
+fn merge_plugin_declarations(config: &mut McpConfig) {
+    for plugin in crate::plugin::PluginManager::installed() {
+        let path = plugin.root.join(".mcp.json");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!("reading {}: {e}", path.display());
+                continue;
+            }
+        };
+        let parsed: PluginMcpFile = match serde_json::from_str(&raw) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("parsing {}: {e}", path.display());
+                continue;
+            }
+        };
+        for (server_name, cfg) in parsed.mcp_servers {
+            let key = format!("{}__{}", plugin.name, server_name);
+            config.mcp_servers.entry(key).or_insert(cfg);
+        }
+    }
+}
+
+/// A plugin's `.mcp.json`: a `mcpServers` map (camelCase, matching Claude Code's
+/// `.mcp.json` convention) of server configs. Reuses `McpServerConfig` so
+/// plugins get the same stdio/HTTP transport support as `mcp.toml`.
+#[derive(Debug, Deserialize)]
+struct PluginMcpFile {
+    #[serde(default, alias = "mcpServers")]
+    mcp_servers: BTreeMap<String, crate::mcp::config::McpServerConfig>,
 }
 
 fn build_registry(config: McpConfig) -> McpRegistry {
@@ -196,4 +245,84 @@ fn header_map(
         map.insert(name, val);
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::config::{McpConfig, McpServerConfig, McpServerTransportConfig};
+
+    #[test]
+    fn plugin_mcp_file_parses_camel_case_key() {
+        // A plugin's .mcp.json uses the Claude Code shape (camelCase mcpServers)
+        // and the same per-entry transport shape as mcp.toml.
+        let raw = r#"{
+            "mcpServers": {
+                "fs": { "command": "npx", "args": ["-y", "fs-server"] },
+                "remote": { "url": "https://mcp.example.com/sse" }
+            }
+        }"#;
+        let parsed: PluginMcpFile = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.mcp_servers.len(), 2);
+        assert!(matches!(
+            parsed.mcp_servers["fs"].transport,
+            McpServerTransportConfig::Stdio { .. }
+        ));
+        assert!(matches!(
+            parsed.mcp_servers["remote"].transport,
+            McpServerTransportConfig::StreamableHttp { .. }
+        ));
+    }
+
+    #[test]
+    fn merge_plugin_declarations_namespaces_and_does_not_clobber_user() {
+        // User mcp.toml declares `fs`; plugin `gitwork` also declares `fs`.
+        // The merge must keep the user's entry and add the plugin's under a
+        // namespaced key, so neither is lost.
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert(
+            "fs".to_string(),
+            McpServerConfig {
+                transport: McpServerTransportConfig::Stdio {
+                    command: "user-binary".to_string(),
+                    args: vec![],
+                    env: None,
+                    cwd: None,
+                },
+            },
+        );
+        // Simulate the merge step directly (PluginManager::installed reads the
+        // filesystem, so we test the insertion policy in isolation).
+        let mut plugin_entry = BTreeMap::new();
+        plugin_entry.insert(
+            "fs".to_string(),
+            McpServerConfig {
+                transport: McpServerTransportConfig::Stdio {
+                    command: "npx".to_string(),
+                    args: vec!["-y".to_string(), "fs-server".to_string()],
+                    env: None,
+                    cwd: None,
+                },
+            },
+        );
+        for (server_name, cfg) in plugin_entry {
+            let key = format!("gitwork__{server_name}");
+            config.mcp_servers.entry(key).or_insert(cfg);
+        }
+        // User's `fs` survives untouched.
+        match &config.mcp_servers["fs"].transport {
+            McpServerTransportConfig::Stdio { command, .. } => {
+                assert_eq!(command, "user-binary");
+            }
+            _ => panic!("expected stdio"),
+        }
+        // Plugin's `fs` landed under the namespaced key.
+        assert!(config.mcp_servers.contains_key("gitwork__fs"));
+        match &config.mcp_servers["gitwork__fs"].transport {
+            McpServerTransportConfig::Stdio { command, .. } => {
+                assert_eq!(command, "npx");
+            }
+            _ => panic!("expected stdio"),
+        }
+    }
 }

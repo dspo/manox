@@ -101,8 +101,17 @@ impl ThreadStore {
         ))
     }
 
-    /// Delete by id, then refresh.
+    /// Delete by id, then refresh. Fires `SessionEnd` (fail-open) so plugins
+    /// can tear down per-session state — a deleted thread's session is over.
+    /// The thread's cwd is loaded first so handlers get the real project dir as
+    /// `CLAUDE_PROJECT_DIR` (the record is gone after `delete`, so load before).
     pub fn delete_thread(&mut self, id: &str, cx: &mut Context<Self>) {
+        let cwd = self.db.load(id).ok().flatten().map(|r| r.cwd);
+        crate::hook::fire(
+            crate::hook::HookEvent::SessionEnd,
+            cwd.as_deref(),
+            serde_json::json!({"thread_id": id}),
+        );
         if let Err(e) = self.db.delete(id) {
             tracing::warn!(error = %e, "删除 thread 失败");
         }

@@ -149,10 +149,9 @@ impl Render for MessageItem {
                 weak: ws.downgrade(),
             }
         });
-        let tool_ctx = self
-            .weak_workspace
-            .upgrade()
-            .map(|ws| ToolCallCtx { weak: ws.downgrade() });
+        let tool_ctx = self.weak_workspace.upgrade().map(|ws| ToolCallCtx {
+            weak: ws.downgrade(),
+        });
         centered(render_item(
             &self.kind,
             self.id,
@@ -432,7 +431,9 @@ pub fn render_tool_call(
                     // changes the card's height, and the list caches a per-item
                     // measured height that must be invalidated for the new
                     // layout to take hold.
-                    let Some(weak) = weak_workspace.clone() else { return; };
+                    let Some(weak) = weak_workspace.clone() else {
+                        return;
+                    };
                     let _ = weak.update(cx, |w, cx| {
                         let id = id_for_toggle.clone();
                         let conv = w.conversation.clone();
@@ -673,18 +674,17 @@ pub fn render_agent_task(
                 card = card.child(render_agent_body(&collapsed_body, ix, theme));
             }
         } else {
-            card =
-                card.child(
-                    v_flex()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .px_3()
-                        .py_2()
-                        .gap_1()
-                        .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                            render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx)
-                        })),
-                );
+            card = card.child(
+                v_flex()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .px_3()
+                    .py_2()
+                    .gap_1()
+                    .children(sub_items.iter().enumerate().map(|(six, sitem)| {
+                        render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx)
+                    })),
+            );
         }
     } else if !collapsed_body.is_empty() {
         card = card.child(render_agent_body(&collapsed_body, ix, theme));
