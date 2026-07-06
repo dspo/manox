@@ -98,6 +98,7 @@ impl ThreadStore {
             rec.yolo,
             rec.messages,
             model,
+            rec.title,
             cx,
         ))
     }

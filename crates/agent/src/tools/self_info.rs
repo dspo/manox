@@ -146,6 +146,7 @@ mod tests {
                 false,
                 Vec::new(),
                 None,
+                None,
                 cx,
             )
         });
@@ -198,6 +199,7 @@ mod tests {
                 None,
                 false,
                 Vec::new(),
+                None,
                 None,
                 cx,
             )

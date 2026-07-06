@@ -26,6 +26,7 @@ pub mod skill;
 pub mod system_prompt;
 pub mod thread;
 pub mod thread_store;
+pub mod title;
 pub mod tool;
 pub mod tools;
 
