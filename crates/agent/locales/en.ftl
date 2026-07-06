@@ -12,6 +12,7 @@ sidebar-plugins = Plugins
 sidebar-section-projects = Projects
 sidebar-section-conversations = Conversations
 sidebar-empty-summary = (New chat)
+sidebar-copy-thread-id = Copy thread id
 sidebar-time-just-now = Just now
 sidebar-time-minutes = { $count ->
     [one] {$count} minute ago

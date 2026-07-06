@@ -381,6 +381,14 @@ impl Workspace {
                     });
                     cx.notify();
                 }
+                ThreadEvent::TurnStarted => {
+                    // Light up the sidebar running indicator immediately —
+                    // before the first streaming delta arrives (model warm-up,
+                    // network latency). Terminal `Stop`/`Error` below clear it.
+                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.set_running(Some(thread_id), cx));
+                }
                 ThreadEvent::Stop(reason) => {
                     // A terminal state ends any pending plan approval (the
                     // oneshot was resolved or cancelled on the thread side).
@@ -401,6 +409,9 @@ impl Workspace {
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
                         save_thread(this.thread.clone(), true, cx);
+                        // Terminal stop → this thread is no longer running.
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| s.set_running(None, cx));
                     }
                     cx.notify();
                 }
@@ -409,6 +420,15 @@ impl Workspace {
                     cx.notify();
                 }
                 _ => {
+                    // `Error` is a terminal signal symmetric to a terminal
+                    // `Stop`: the turn aborted, so this thread is no longer
+                    // running. Pulled out of the catch-all rather than given a
+                    // dedicated arm because the conversation still needs the
+                    // generic `apply` below to render the error item.
+                    if let ThreadEvent::Error(_) = ev {
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| s.set_running(None, cx));
+                    }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
@@ -615,6 +635,12 @@ impl Workspace {
         // (plan approval, tool auth) are resolved immediately rather than
         // stranding until the entity is eventually dropped.
         self.thread.update(cx, |t, cx| t.cancel(cx));
+        // Backstop: the old thread's terminal `Stop` from `cancel` may land on
+        // the stale subscription (dropped below) or arrive after the new thread
+        // is attached. Clear running state synchronously so the sidebar
+        // indicator never lingers on a thread we just left.
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.set_running(None, cx));
         save_thread(self.thread.clone(), false, cx);
 
         self.thread = new_thread;

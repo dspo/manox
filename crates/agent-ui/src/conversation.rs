@@ -205,6 +205,10 @@ impl ConversationState {
             ThreadEvent::TokenUsageUpdated(_) | ThreadEvent::ModelChanged { .. } => {
                 ApplyOutcome::None
             }
+            // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
+            // workspace to light the sidebar running indicator; it carries no
+            // conversation content.
+            ThreadEvent::TurnStarted => ApplyOutcome::None,
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(

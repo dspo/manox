@@ -53,13 +53,30 @@ impl SandboxPolicy {
     /// best-effort so the Rust-side path checks (and seatbelt `subpath`
     /// matching, which resolves symlinks) compare against real paths — the
     /// temp dir is a symlink to `/private/var/...` on macOS.
+    ///
+    /// When `project_root` is the filesystem root (`/`), the writable set is
+    /// narrowed to the temp dir only: admitting `/` would make the entire disk
+    /// writable (every path `starts_with('/')`), turning the sandbox into a
+    /// no-op. This is the state thread 6cd3d096 ran in (manox launched with
+    /// `cwd=/`), and it silently neutralized the write confinement. The
+    /// `.git` protected path is dropped too (`/.git` is meaningless). A
+    /// `tracing::warn` marks the degenerate policy so the launch is audible.
     pub fn for_project(project_root: &Path) -> Self {
         let root = canonicalize_best_effort(project_root);
+        let temp = canonicalize_best_effort(&std::env::temp_dir());
+        if root.parent().is_none() {
+            tracing::warn!(
+                root = %root.display(),
+                "sandbox project root is the filesystem root; narrowing writable set to temp dir only — launch manox from a real project directory to restore full confinement"
+            );
+            return Self {
+                writable_roots: vec![temp],
+                protected_paths: Vec::new(),
+                allow_network: false,
+            };
+        }
         Self {
-            writable_roots: vec![
-                root.clone(),
-                canonicalize_best_effort(&std::env::temp_dir()),
-            ],
+            writable_roots: vec![root.clone(), temp],
             protected_paths: vec![root.join(".git")],
             allow_network: false,
         }
@@ -217,6 +234,27 @@ mod tests {
             p.is_protected(Path::new("/tmp/manox-sandbox-test/.git/config")),
             ".git must be protected"
         );
+    }
+
+    #[test]
+    fn policy_for_root_degenerates_to_temp_only() {
+        // Launching with `cwd=/` (thread 6cd3d096) must NOT admit the whole
+        // disk: `/` as a writable root makes every path writable. The policy
+        // narrows to temp-only and drops the meaningless `/.git` protection.
+        let p = SandboxPolicy::for_project(Path::new("/"));
+        assert!(
+            p.is_writable(&std::env::temp_dir().join("scratch")),
+            "temp dir stays writable under degenerate root policy"
+        );
+        assert!(
+            !p.is_writable(Path::new("/etc/passwd")),
+            "system paths must NOT be writable when project root is /"
+        );
+        assert!(
+            !p.is_writable(Path::new("/Users/")),
+            "user paths must NOT be writable when project root is /"
+        );
+        assert!(p.protected_paths.is_empty(), "no .git to protect at /");
     }
 
     #[cfg(target_os = "macos")]
