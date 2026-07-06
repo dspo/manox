@@ -455,6 +455,13 @@ impl Thread {
         &self.messages
     }
 
+    /// True when at least one user message has been appended — i.e. the user
+    /// has submitted real input to the model. Unpersisted empty threads (the
+    /// initial "new conversation" screen) return `false`.
+    pub fn has_interacted(&self) -> bool {
+        self.messages.iter().any(|m| m.role == Role::User)
+    }
+
     pub fn cwd(&self) -> &std::path::Path {
         &self.cwd
     }

@@ -1511,7 +1511,6 @@ impl Workspace {
     fn render_composer(
         &mut self,
         running: bool,
-        first_screen: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1521,9 +1520,6 @@ impl Workspace {
         let yolo = self.thread.read(cx).yolo();
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(running, cx);
-        // "Choose project" binds the thread's project; only offered before the
-        // conversation starts (the empty first screen), matching the reference.
-        let choose_project = first_screen.then(|| self.render_choose_project_row(theme, cx));
 
         v_flex()
             .w_full()
@@ -1581,7 +1577,6 @@ impl Workspace {
                             .child(send),
                     ),
             )
-            .children(choose_project)
             .into_any_element()
     }
 
@@ -1750,10 +1745,26 @@ impl Workspace {
 
     fn open_plus_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let theme = cx.theme().clone();
+        // "Choose project" only appears on the empty first screen — set_project
+        // silently no-ops once messages are present, so the menu item must be
+        // hidden rather than offering a dead-end action.
+        let can_choose_project = self.thread.read(cx).messages().is_empty();
         let ws = cx.entity();
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
             let ws_files = ws.clone();
+            let ws_project = ws.clone();
             let ws_plan = ws.clone();
+            let on_project = if can_choose_project {
+                Some(move |window: &mut gpui::Window, cx: &mut gpui::App| {
+                    ws_project.update(cx, |this, cx| {
+                        this.close_plus_menu();
+                        this.choose_project(window, cx);
+                        cx.notify();
+                    });
+                })
+            } else {
+                None
+            };
             build_plus_menu(
                 menu,
                 &theme,
@@ -1764,6 +1775,7 @@ impl Workspace {
                         cx.notify();
                     });
                 },
+                on_project,
                 move |_window, cx| {
                     ws_plan.update(cx, |this, cx| {
                         this.close_plus_menu();
@@ -1841,39 +1853,6 @@ impl Workspace {
         .detach();
     }
 
-    /// The "Choose project" row inside the composer card, shown only on the empty
-    /// first screen. Displays the bound project's basename once one is chosen.
-    fn render_choose_project_row(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
-        let project = self.thread.read(cx).project().cloned();
-        let (icon, label, color) = match &project {
-            Some(dir) => {
-                let name = dir
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("project")
-                    .to_string();
-                (IconName::FolderOpen, name, theme.foreground)
-            }
-            None => (
-                IconName::Folder,
-                "Choose project".to_string(),
-                theme.muted_foreground,
-            ),
-        };
-        h_flex()
-            .id("choose-project")
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .hover(|s| s.bg(theme.accent.opacity(0.08)))
-            .child(Icon::new(icon).small().text_color(color))
-            .child(gpui::div().text_xs().text_color(color).child(label))
-            .on_click(cx.listener(|this, _, window, cx| this.choose_project(window, cx)))
-            .into_any_element()
-    }
-
     /// Circular icon-only send/stop button.
     ///
     /// Reuses `Button` for built-in focus ring, keyboard activation, and disabled handling;
@@ -1936,26 +1915,28 @@ impl Workspace {
         )
     }
 
-    /// Static label of the thread's working directory basename. Reflects the
-    /// chosen project once one is bound (the thread's `cwd` follows the project).
-    ///
-    /// Rendered as a plain `div` (not `Button`): the project is picked on the
-    /// empty first screen via the "Choose project" row and fixed thereafter, so
-    /// a clickable chip would invite clicks that do nothing.
+    /// Chip showing the bound project directory basename. Empty (invisible) when
+    /// no project has been chosen; displays the basename once one is bound. The
+    /// project is picked via the `+` menu's "Choose project" item and fixed thereafter.
     fn render_cwd_chip(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
-        let cwd = self.thread.read(cx).cwd().to_path_buf();
-        let name = cwd
-            .file_name()
-            .and_then(|s| s.to_str())
-            .filter(|s| *s != ".")
-            .unwrap_or("project");
-        gpui::div()
-            .px_2()
-            .py_1()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(name.to_string())
-            .into_any_element()
+        let project = self.thread.read(cx).project().cloned();
+        match project {
+            Some(dir) => {
+                let name = dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("project")
+                    .to_string();
+                gpui::div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(name)
+                    .into_any_element()
+            }
+            None => gpui::div().into_any_element(),
+        }
     }
 }
 
@@ -2040,7 +2021,7 @@ impl Render for Workspace {
                     .relative()
                     .children(self.render_slash_overlay())
                     .children(self.render_attachments(&theme, cx))
-                    .child(centered(self.render_composer(running, false, &theme, cx))),
+                    .child(centered(self.render_composer(running, &theme, cx))),
             )
         };
         // Hero occupies the message-list region on the first screen.
@@ -2089,7 +2070,7 @@ impl Render for Workspace {
                                         .child("我们该做什么？"),
                                 )
                                 .children(self.render_attachments(&theme, cx))
-                                .child(self.render_composer(running, true, &theme, cx))
+                                .child(self.render_composer(running, &theme, cx))
                                 .children(hero_notices.map(|msg| {
                                     gpui::div()
                                         .w_full()
