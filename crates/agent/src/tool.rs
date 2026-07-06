@@ -122,6 +122,24 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Filtered tool list: only tools whose `name` appears in `allowed`. Used by
+    /// slash commands whose `allowed-tools` frontmatter narrows the turn's tool
+    /// set. Empty `allowed` yields an empty list — callers should fall back to
+    /// [`to_request_tools`] when the filter is unset rather than call this with
+    /// an empty slice.
+    pub fn to_request_tools_filtered(&self, allowed: &[String]) -> Vec<LanguageModelRequestTool> {
+        self.tools
+            .values()
+            .filter(|tool| allowed.iter().any(|a| a == tool.name()))
+            .map(|tool| LanguageModelRequestTool {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                input_schema: tool.input_schema(),
+                use_input_streaming: false,
+            })
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }

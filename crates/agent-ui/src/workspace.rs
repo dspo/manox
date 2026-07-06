@@ -536,7 +536,18 @@ impl Workspace {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.close_slash_menu();
 
+        // A leading `/` with no leading space is a slash command. Route it to
+        // the command engine rather than the model: the command body (with
+        // `$ARGUMENTS` substituted) becomes the user message, and the command's
+        // `allowed-tools` whitelist narrows the turn's tool set. Attachments are
+        // not combined with a command — the command body is the whole turn.
         if attachments.is_empty() {
+            if let Some(rest) = text.strip_prefix('/')
+                && !rest.starts_with(' ')
+            {
+                self.send_command_turn(text.clone(), rest, cx);
+                return;
+            }
             self.send_user_turn(text, Vec::new(), cx);
             return;
         }
@@ -559,6 +570,40 @@ impl Workspace {
                 .ok();
         })
         .detach();
+    }
+
+    /// Run a slash command turn. The original text (e.g. `/gitwork:deliver …`)
+    /// is shown to the user as the user bubble; the command engine injects the
+    /// rendered body as the model-facing user message. An unknown command emits
+    /// an error and drops the turn.
+    fn send_command_turn(&mut self, display_text: String, rest: &str, cx: &mut Context<Self>) {
+        let role = self.model_label(cx);
+        let weak = cx.weak_entity();
+        self.conversation
+            .update(cx, |c, cx| c.push_user(display_text, &role, weak, cx));
+        let count = self.conversation.read(cx).items().len();
+        if count > 0 {
+            self.list_state.splice(count - 1..count - 1, 1);
+        }
+        // Split `<command> <args>` — the first whitespace separates the command
+        // name from the raw arguments. Everything after the first space is the
+        // verbatim `$ARGUMENTS` payload, including further spaces.
+        let (name, args) = match rest.split_once(char::is_whitespace) {
+            Some((n, a)) => (n, a),
+            None => (rest, ""),
+        };
+        let hit = self
+            .thread
+            .update(cx, |thread, cx| thread.submit_command(name, args, cx));
+        if !hit {
+            self.thread.update(cx, |_, cx| {
+                cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
+                    "未知命令：/{name}（用 `/` 菜单查看已安装命令）"
+                )));
+            });
+        }
+        save_thread(self.thread.clone(), cx);
+        cx.notify();
     }
 
     /// Append the user turn (text plus any image content) to the thread and start the run.

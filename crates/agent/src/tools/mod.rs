@@ -14,6 +14,7 @@ pub mod agent;
 pub mod ask_user;
 pub mod bash;
 pub mod self_info;
+pub mod skill;
 
 use globset::{Glob, GlobSetBuilder};
 use gpui::{App, AppContext as _, Task, WeakEntity};
@@ -711,6 +712,7 @@ pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
         Arc::new(GrepTool { cwd: cwd.clone() }),
         Arc::new(GlobTool { cwd: cwd.clone() }),
         Arc::new(ask_user::AskUserQuestionTool),
+        Arc::new(skill::SkillTool),
     ]
 }
 
@@ -725,6 +727,12 @@ pub fn default_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistr
     }
     reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone())) as AnyAgentTool);
     reg.register(self_info::new(parent));
+    // Dynamically-registered MCP tools: bridged server tools that finished
+    // their handshake by the time this registry was built. Servers still
+    // connecting appear on the next Thread construction.
+    for tool in crate::mcp::ready_tools() {
+        reg.register(tool);
+    }
     reg
 }
 
@@ -733,9 +741,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_tools_has_eight_tools() {
+    fn base_tools_has_nine_tools() {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
@@ -745,6 +753,7 @@ mod tests {
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"AskUserQuestion"));
+        assert!(names.contains(&"skill"));
         // The sub-agent tool is registered by `default_registry`, not `base_tools`.
         assert!(!names.contains(&"agent"));
     }

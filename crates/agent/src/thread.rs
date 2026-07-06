@@ -123,6 +123,14 @@ pub struct Thread {
     /// in-flight tool (e.g. `bash`) can reap its process group promptly instead
     /// of relying on task-drop, which does not reach the detached tokio child.
     turn_cancel: Option<CancellationToken>,
+    /// Optional tool whitelist for the current turn, set by a slash command's
+    /// `allowed-tools` frontmatter. `None` or empty = inherit all tools. The
+    /// filter lasts for the turn's lifetime and is cleared when the turn ends,
+    /// so it never leaks into a subsequent free-form message.
+    turn_tool_filter: Option<Vec<String>>,
+    /// Whether the SessionStart hook has fired for this thread. Main threads
+    /// (depth 0) fire once on their first turn; sub-agents never fire it.
+    session_started: bool,
 }
 
 /// A forwarded authorization request from a sub-agent: which child thread holds
@@ -160,6 +168,8 @@ impl Thread {
                 cap_summary_injected: false,
                 running_turn: None,
                 turn_cancel: None,
+                turn_tool_filter: None,
+                session_started: false,
             }
         })
     }
@@ -193,6 +203,8 @@ impl Thread {
                 cap_summary_injected: false,
                 running_turn: None,
                 turn_cancel: None,
+                turn_tool_filter: None,
+                session_started: false,
             }
         })
     }
@@ -232,6 +244,8 @@ impl Thread {
                 cap_summary_injected: false,
                 running_turn: None,
                 turn_cancel: None,
+                turn_tool_filter: None,
+                session_started: false,
             }
         })
     }
@@ -404,6 +418,25 @@ impl Thread {
         cx.notify();
     }
 
+    /// Resolve and run a slash command. The command body (with `$ARGUMENTS`
+    /// substituted) is appended as a user message, and the command's
+    /// `allowed-tools` whitelist narrows the turn's tool set for the duration
+    /// of the run. Returns `false` when no command named `name` is registered,
+    /// leaving the thread untouched so the UI can surface an error. `name` may
+    /// be `plugin:command` or a bare `command`.
+    pub fn submit_command(&mut self, name: &str, args: &str, cx: &mut Context<Self>) -> bool {
+        let Some(cmd) = crate::command::global().get(name).cloned() else {
+            return false;
+        };
+        let rendered = cmd.render(args);
+        if !cmd.allowed_tools.is_empty() {
+            self.turn_tool_filter = Some(cmd.allowed_tools.clone());
+        }
+        self.insert_user_message(rendered, cx);
+        self.run_turn(cx);
+        true
+    }
+
     /// Start a completion turn. No-ops when a turn is already running or there is no model.
     pub fn run_turn(&mut self, cx: &mut Context<Self>) {
         if self.running_turn.is_some() {
@@ -427,6 +460,9 @@ impl Thread {
             this.update(cx, |this, cx| {
                 this.running_turn = None;
                 this.turn_cancel = None;
+                // A slash command's tool filter lasts only for its turn; clear it
+                // so a subsequent free-form message inherits the full tool set.
+                this.turn_tool_filter = None;
                 cx.notify();
             })
             .ok();
@@ -442,6 +478,8 @@ impl Thread {
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         if let Some(cancel) = self.turn_cancel.take() {
             cancel.cancel();
+            // A cancelled slash-command turn must also clear its tool filter.
+            self.turn_tool_filter = None;
             cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
             cx.notify();
         }
@@ -453,6 +491,20 @@ impl Thread {
         cancel: &CancellationToken,
         cx: &mut AsyncApp,
     ) -> Result<()> {
+        // Fire SessionStart once for a main thread (depth 0) before its first
+        // turn. Sub-agents (depth > 0) never fire it — they are scoped to a
+        // single delegation, not a user session.
+        this.update(cx, |this, _cx| {
+            if this.depth == 0 && !this.session_started {
+                this.session_started = true;
+                let thread_id = this.id.0.clone();
+                let cwd = this.cwd.display().to_string();
+                crate::hook::fire(
+                    crate::hook::HookEvent::SessionStart,
+                    serde_json::json!({"thread_id": thread_id, "cwd": cwd}),
+                );
+            }
+        })?;
         loop {
             let request = this.update(cx, |this, cx| {
                 this.pending_tool_uses.clear();
@@ -735,6 +787,19 @@ impl Thread {
             });
         })?;
 
+        // PreToolUse hooks fire after approval but before execution — the
+        // handler sees the resolved input and can observe/log the call.
+        // Notification-only: a non-zero exit cannot block the tool (fail-open).
+        crate::hook::fire(
+            crate::hook::HookEvent::PreToolUse,
+            serde_json::json!({
+                "thread_id": this.read_with(cx, |t, _| t.id.0.clone()).unwrap_or_default(),
+                "tool_name": name,
+                "tool_use_id": id,
+                "input": tu.input,
+            }),
+        );
+
         let input = tu.input.clone();
         let (sink, rx) = crate::tool::ToolOutputSink::channel(id.clone().into());
         let id_for_drain = id.clone();
@@ -779,7 +844,21 @@ impl Thread {
         })?;
 
         Self::emit_tool_result(&this, &id, &name, &title, &output_str, is_error, cx)?;
-        Self::append_tool_result(&this, tu, output_str, is_error, cx)?;
+        Self::append_tool_result(&this, tu, output_str.clone(), is_error, cx)?;
+
+        // PostToolUse hooks fire after the result is recorded. The handler sees
+        // the output and error flag; fail-open means a hook failure cannot
+        // retroactively fail the tool.
+        crate::hook::fire(
+            crate::hook::HookEvent::PostToolUse,
+            serde_json::json!({
+                "thread_id": this.read_with(cx, |t, _| t.id.0.clone()).unwrap_or_default(),
+                "tool_name": name,
+                "tool_use_id": id,
+                "output": output_str,
+                "is_error": is_error,
+            }),
+        );
         Ok(())
     }
 
@@ -846,6 +925,15 @@ impl Thread {
             Ok(LanguageModelCompletionEvent::UsageUpdate(_)) => {}
             Ok(LanguageModelCompletionEvent::Stop(reason)) => {
                 self.finalize_assistant_message(cx);
+                // Fire Stop hooks (e.g. a stop-gate reviewer) fail-open; the
+                // turn has already ended, so the handler runs detached.
+                crate::hook::fire(
+                    crate::hook::HookEvent::Stop,
+                    serde_json::json!({
+                        "thread_id": self.id.0,
+                        "stop_reason": format!("{reason:?}"),
+                    }),
+                );
                 cx.emit(ThreadEvent::Stop(reason));
             }
             Ok(LanguageModelCompletionEvent::ToolUse(tu)) => {
@@ -1094,9 +1182,13 @@ impl Thread {
             content: m.content.iter().map(model_facing_content).collect(),
             cache: false,
         }));
+        let tools = match self.turn_tool_filter.as_deref() {
+            Some(f) if !f.is_empty() => self.tools.to_request_tools_filtered(f),
+            _ => self.tools.to_request_tools(),
+        };
         LanguageModelRequest {
             messages,
-            tools: self.tools.to_request_tools(),
+            tools,
             ..Default::default()
         }
     }

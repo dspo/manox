@@ -5,14 +5,21 @@
 //! `~/.config/cx/cx.providers.config.yaml`.
 
 pub mod agent_def;
+pub mod command;
 pub mod db;
+pub mod frontmatter;
 pub mod hashline;
+pub mod hook;
 pub mod language_model;
+pub mod mcp;
 pub mod message;
+pub mod model_alias;
 pub mod paths;
+pub mod plugin;
 pub mod provider;
 pub mod runtime;
 pub mod sandbox;
+pub mod skill;
 pub mod system_prompt;
 pub mod thread;
 pub mod thread_store;
@@ -29,11 +36,15 @@ pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizatio
 pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};
 
 /// Register the tokio runtime + `ProviderRegistry` + `ThreadStore` + the
-/// hashline snapshot store + the subagent definition registry. Call at App startup.
+/// hashline snapshot store + the subagent / skill / command registries. Call at App startup.
 pub fn init(cx: &mut App) {
     runtime::init(cx);
     provider::registry::init(cx);
     thread_store::init(cx);
     hashline::init();
     agent_def::init();
+    skill::init();
+    command::init();
+    hook::init();
+    mcp::init();
 }
