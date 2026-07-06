@@ -537,6 +537,9 @@ impl ResponsesEventMapper {
                 {
                     update_responses_usage(&mut self.usage, u);
                 }
+                if self.usage.input_tokens > 0 || self.usage.output_tokens > 0 {
+                    out.push(Ok(LanguageModelCompletionEvent::UsageUpdate(self.usage)));
+                }
                 out.push(Ok(LanguageModelCompletionEvent::Stop(
                     StopReason::MaxTokens,
                 )));
@@ -550,7 +553,7 @@ impl ResponsesEventMapper {
                     .and_then(|e| e.get("message"))
                     .and_then(Value::as_str)
                     .map(String::from)
-                    .unwrap_or_else(|| "Responses API 返回错误".to_string());
+                    .unwrap_or_else(|| "Responses API returned an error".to_string());
                 out.push(Err(anyhow!(msg)));
             }
             _ => {}

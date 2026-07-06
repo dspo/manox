@@ -99,6 +99,12 @@ pub enum ThreadEvent {
         system_changed: bool,
         tools_changed: bool,
     },
+    /// Cumulative token usage changed (a `UsageUpdate` landed). The UI refreshes
+    /// its token counter. Carries the thread-wide cumulative, not per-request.
+    TokenUsageUpdated(TokenUsage),
+    /// The user switched models mid-conversation. The store records a
+    /// `model_change` event for the history timeline; emitted from `set_model`.
+    ModelChanged { from: Option<String>, to: String },
 }
 
 pub struct Thread {
@@ -186,6 +192,32 @@ pub struct Thread {
     /// creation counts), surfaced alongside the stability chip so the user can
     /// confirm cache hits by token count, not just by ratio.
     last_usage: Option<TokenUsage>,
+    /// User-supplied rename; takes display precedence over the LLM `title`.
+    /// Setting it must NOT suppress `maybe_generate_title` (the LLM may still
+    /// update `title` underneath); the sidebar reads `title_override` first.
+    title_override: Option<String>,
+    /// Provider id of the current model, for per-provider stats in the sidebar.
+    provider_id: Option<String>,
+    /// Parent thread id for sub-agent lineage. `None` for main threads.
+    parent_id: Option<String>,
+    /// Whether the user archived this thread from the sidebar.
+    archived: bool,
+    /// Creation time (Unix seconds). Stable for the thread's life; persisted so
+    /// the sidebar can show "created" separately from "last active".
+    created_at: i64,
+    /// Last real user interaction (Unix seconds). Advances on message submit;
+    /// distinct from `updated_at` (any write) so background saves don't reset
+    /// the "last active" ordering in the sidebar.
+    interacted_at: i64,
+    /// Cumulative token usage across the whole thread (all turns). Mirrors zed's
+    /// `cumulative_token_usage`.
+    cumulative_token_usage: TokenUsage,
+    /// Running usage for the in-flight request, used to derive the delta that
+    /// accumulates into `cumulative_token_usage` at each `UsageUpdate`.
+    current_request_token_usage: TokenUsage,
+    /// Per-user-message usage keyed by `Message::id`. Mirrors zed's
+    /// `request_token_usage`; persisted to the `token_usage` table for SQL queries.
+    request_token_usage: HashMap<String, TokenUsage>,
 }
 
 /// A forwarded authorization request from a sub-agent: which child thread holds
@@ -202,13 +234,16 @@ impl Thread {
     pub fn new(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let weak = cx.weak_entity();
+            let model = crate::provider::registry::global()
+                .models()
+                .first()
+                .cloned();
+            let provider_id = model.as_ref().map(|m| m.provider_id());
+            let now = chrono::Utc::now().timestamp();
             Self {
                 id,
                 messages: Vec::new(),
-                model: crate::provider::registry::global()
-                    .models()
-                    .first()
-                    .cloned(),
+                model,
                 tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
                 yolo: false,
@@ -233,20 +268,23 @@ impl Thread {
                 title_last_eval_user_count: None,
                 prefix_stability: StablePrefix::default(),
                 last_usage: None,
+                title_override: None,
+                provider_id,
+                parent_id: None,
+                archived: false,
+                created_at: now,
+                interacted_at: now,
+                cumulative_token_usage: TokenUsage::default(),
+                current_request_token_usage: TokenUsage::default(),
+                request_token_usage: HashMap::new(),
             }
         })
     }
 
     /// Restore a `Thread` from a persisted record (messages + model rebuilt; tools rebuilt from cwd).
-    #[allow(clippy::too_many_arguments)]
     pub fn restore(
-        id: ThreadId,
-        cwd: PathBuf,
-        project: Option<PathBuf>,
-        yolo: bool,
-        messages: Vec<Message>,
+        rec: ThreadRecord,
         model: Option<AnyLanguageModel>,
-        title: Option<String>,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
@@ -259,26 +297,35 @@ impl Thread {
             // results are role User but carry no user-typed text, so including
             // them would inflate the count and shift the cadence in tool-heavy
             // turns. Mirrors the filter in `maybe_generate_title`.
-            let user_count = messages
+            let user_count = rec
+                .messages
                 .iter()
                 .filter(|m| m.role == Role::User && message_has_text(m))
                 .count();
-            let title_last_eval_user_count = title.as_ref().map(|_| user_count);
+            let title_last_eval_user_count = rec.title.as_ref().map(|_| user_count);
             let weak = cx.weak_entity();
+            let cwd = std::path::PathBuf::from(&rec.cwd);
+            let project = (!rec.project.is_empty()).then(|| std::path::PathBuf::from(&rec.project));
+            // Prefer the persisted provider_id; fall back to the resolved model's
+            // provider for records that predate the column (legacy envelopes).
+            let provider_id = rec
+                .provider_id
+                .clone()
+                .or_else(|| model.as_ref().map(|m| m.provider_id()));
             Self {
-                id,
-                messages,
+                id: ThreadId(rec.id),
+                messages: rec.messages,
                 model,
                 tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
-                yolo,
+                yolo: rec.yolo,
                 cwd,
                 project,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
-                depth: 0,
+                depth: rec.depth as u32,
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
@@ -288,11 +335,20 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                title,
+                title: rec.title,
                 title_in_flight: false,
                 title_last_eval_user_count,
                 prefix_stability: StablePrefix::default(),
                 last_usage: None,
+                title_override: rec.title_override,
+                provider_id,
+                parent_id: rec.parent_id,
+                archived: rec.archived,
+                created_at: rec.created_at,
+                interacted_at: rec.interacted_at,
+                cumulative_token_usage: rec.cumulative_token_usage,
+                current_request_token_usage: TokenUsage::default(),
+                request_token_usage: rec.request_token_usage,
             }
         })
     }
@@ -351,6 +407,15 @@ impl Thread {
                 title_last_eval_user_count: None,
                 prefix_stability: StablePrefix::default(),
                 last_usage: None,
+                title_override: None,
+                provider_id: None,
+                parent_id: None,
+                archived: false,
+                created_at: chrono::Utc::now().timestamp(),
+                interacted_at: chrono::Utc::now().timestamp(),
+                cumulative_token_usage: TokenUsage::default(),
+                current_request_token_usage: TokenUsage::default(),
+                request_token_usage: HashMap::new(),
             }
         })
     }
@@ -362,7 +427,9 @@ impl Thread {
             id: self.id.0.clone(),
             summary: self.summary(),
             title: self.title.clone(),
+            title_override: self.title_override.clone(),
             model_id,
+            provider_id: self.provider_id.clone(),
             cwd: self.cwd.display().to_string(),
             project: self
                 .project
@@ -370,7 +437,17 @@ impl Thread {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             yolo: self.yolo,
+            depth: self.depth as i32,
+            parent_id: self.parent_id.clone(),
+            archived: self.archived,
+            created_at: self.created_at,
+            interacted_at: self.interacted_at,
+            updated_at: chrono::Utc::now().timestamp(),
+            // No separate field; the session starts when the thread is created.
+            session_started_at: self.created_at,
+            cumulative_token_usage: self.cumulative_token_usage,
             messages: self.messages.clone(),
+            request_token_usage: self.request_token_usage.clone(),
         })
     }
 
@@ -606,7 +683,11 @@ impl Thread {
     }
 
     pub fn set_model(&mut self, model: AnyLanguageModel, cx: &mut Context<Self>) {
+        let from = self.model.as_ref().map(|m| m.id());
+        let to = model.id();
+        self.provider_id = Some(model.provider_id());
         self.model = Some(model);
+        cx.emit(ThreadEvent::ModelChanged { from, to });
         cx.notify();
     }
 
@@ -619,6 +700,77 @@ impl Thread {
     /// initial "new conversation" screen) return `false`.
     pub fn has_interacted(&self) -> bool {
         self.messages.iter().any(|m| m.role == Role::User)
+    }
+
+    /// Id of the last `Role::User` message, if any. Used as the key for
+    /// per-request token usage: each LLM round in a tool-use loop is attributed
+    /// to the user message that triggered the turn (tool results are `User`).
+    fn last_user_message_id(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.id.as_str())
+    }
+
+    /// Cumulative token usage across the whole thread's life.
+    pub fn cumulative_token_usage(&self) -> TokenUsage {
+        self.cumulative_token_usage
+    }
+
+    /// Per-user-message usage, keyed by `Message::id`.
+    pub fn request_token_usage(&self) -> &HashMap<String, TokenUsage> {
+        &self.request_token_usage
+    }
+
+    /// Token usage attributed to the last user message, if the provider
+    /// reported any for this turn. Used by the UI to label the assistant reply
+    /// that the turn produced.
+    pub fn last_request_token_usage(&self) -> Option<TokenUsage> {
+        let id = self.last_user_message_id()?;
+        self.request_token_usage.get(id).copied()
+    }
+
+    /// Fold a streaming `UsageUpdate` into the cumulative and per-request
+    /// counters. Mirrors zed's `accumulate_token_usage`: the API reports running
+    /// totals (monotonic), so the per-request counter takes the `max` and the
+    /// delta against the previous request counter accrues to the cumulative.
+    fn accumulate_token_usage(&mut self, new: TokenUsage) {
+        let prev = self.current_request_token_usage;
+        let delta = TokenUsage {
+            input_tokens: new.input_tokens.saturating_sub(prev.input_tokens),
+            output_tokens: new.output_tokens.saturating_sub(prev.output_tokens),
+            cache_creation_input_tokens: new
+                .cache_creation_input_tokens
+                .saturating_sub(prev.cache_creation_input_tokens),
+            cache_read_input_tokens: new
+                .cache_read_input_tokens
+                .saturating_sub(prev.cache_read_input_tokens),
+        };
+        self.cumulative_token_usage = self.cumulative_token_usage + delta;
+        self.current_request_token_usage = TokenUsage {
+            input_tokens: prev.input_tokens.max(new.input_tokens),
+            output_tokens: prev.output_tokens.max(new.output_tokens),
+            cache_creation_input_tokens: prev
+                .cache_creation_input_tokens
+                .max(new.cache_creation_input_tokens),
+            cache_read_input_tokens: prev
+                .cache_read_input_tokens
+                .max(new.cache_read_input_tokens),
+        };
+    }
+
+    /// Attribute the in-flight request's usage to its triggering user message
+    /// and reset the per-request counter. Called on every terminal path —
+    /// `Stop` from the provider and `cancel()` from the user — so a cancelled
+    /// turn still lands its partial usage and the next turn starts from zero
+    /// instead of diffing against a stale counter.
+    fn finalize_request_usage(&mut self) {
+        if let Some(uid) = self.last_user_message_id().map(str::to_owned) {
+            self.request_token_usage
+                .insert(uid, self.current_request_token_usage);
+        }
+        self.current_request_token_usage = TokenUsage::default();
     }
 
     pub fn cwd(&self) -> &std::path::Path {
@@ -766,6 +918,9 @@ impl Thread {
             // response no-ops at the parent instead of traversing to a child
             // whose own pending map is already empty.
             self.pending_child_auth.clear();
+            // Attribute partial usage from the cancelled turn and reset the
+            // per-request counter so the next turn's delta starts from zero.
+            self.finalize_request_usage();
             cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
             cx.notify();
         }
@@ -1401,12 +1556,18 @@ impl Thread {
                 self.append_assistant_thinking(text.clone(), signature, cx);
                 cx.emit(ThreadEvent::AgentThinking(text));
             }
-            Ok(LanguageModelCompletionEvent::UsageUpdate(u)) => {
-                self.last_usage = Some(u);
-                cx.notify();
+            Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) => {
+                self.last_usage = Some(usage);
+                self.accumulate_token_usage(usage);
+                cx.emit(ThreadEvent::TokenUsageUpdated(self.cumulative_token_usage));
             }
             Ok(LanguageModelCompletionEvent::Stop(reason)) => {
                 self.finalize_assistant_message(cx);
+                // Attribute the just-finished request's usage to its triggering
+                // user message, then reset the per-request counter so the next
+                // round (a tool-use loop iteration or a new user turn) starts
+                // from zero.
+                self.finalize_request_usage();
                 // Fire Stop hooks (e.g. a stop-gate reviewer) fail-open; the
                 // turn has already ended, so the handler runs detached.
                 let stop_cwd = self.cwd.display().to_string();
@@ -1500,10 +1661,7 @@ impl Thread {
             None => true,
         };
         if needs_new {
-            self.messages.push(Message {
-                role: Role::User,
-                content: Vec::new(),
-            });
+            self.messages.push(Message::user_with_content(Vec::new()));
         }
         if let Some(m) = self.messages.last_mut() {
             m.push_content(MessageContent::ToolResult(result));
@@ -1626,10 +1784,7 @@ impl Thread {
                 })
             })
             .collect();
-        self.messages.push(Message {
-            role: Role::User,
-            content,
-        });
+        self.messages.push(Message::user_with_content(content));
         cx.notify();
     }
 
@@ -1852,7 +2007,7 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{model_facing_content, tool_title};
-    use crate::language_model::{LanguageModelToolResult, MessageContent};
+    use crate::language_model::{LanguageModelToolResult, MessageContent, TokenUsage};
     use crate::message::Message;
     use serde_json::json;
     use std::sync::Arc;
@@ -2001,12 +2156,7 @@ mod tests {
         let cx = gpui::TestAppContext::single();
         let thread = cx.update(|cx| {
             super::Thread::restore(
-                super::ThreadId("reg-run-tool-inner".to_string()),
-                std::path::PathBuf::from("/tmp"),
-                None,
-                false,
-                Vec::new(),
-                None,
+                crate::db::ThreadRecord::for_test("reg-run-tool-inner", "/tmp", Vec::new()),
                 None,
                 cx,
             )
@@ -2065,12 +2215,7 @@ mod tests {
         let cx = gpui::TestAppContext::single();
         let thread = cx.update(|cx| {
             super::Thread::restore(
-                super::ThreadId("reg-cancel-plan".to_string()),
-                std::path::PathBuf::from("/tmp"),
-                None,
-                false,
-                Vec::new(),
-                None,
+                crate::db::ThreadRecord::for_test("reg-cancel-plan", "/tmp", Vec::new()),
                 None,
                 cx,
             )
@@ -2121,12 +2266,7 @@ mod tests {
         let cx = gpui::TestAppContext::single();
         let thread = cx.update(|cx| {
             super::Thread::restore(
-                super::ThreadId("reg-cancel-auth".to_string()),
-                std::path::PathBuf::from("/tmp"),
-                None,
-                false,
-                Vec::new(),
-                None,
+                crate::db::ThreadRecord::for_test("reg-cancel-auth", "/tmp", Vec::new()),
                 None,
                 cx,
             )
@@ -2188,12 +2328,7 @@ mod tests {
         let cx = gpui::TestAppContext::single();
         let thread = cx.update(|cx| {
             super::Thread::restore(
-                super::ThreadId("reg-plan-approve-order".to_string()),
-                std::path::PathBuf::from("/tmp"),
-                None,
-                false,
-                Vec::new(),
-                None,
+                crate::db::ThreadRecord::for_test("reg-plan-approve-order", "/tmp", Vec::new()),
                 None,
                 cx,
             )
@@ -2299,16 +2434,10 @@ mod tests {
 
         let cx = gpui::TestAppContext::single();
         let thread = cx.update(|cx| {
-            super::Thread::restore(
-                super::ThreadId("reg-yolo-ask-user".to_string()),
-                std::path::PathBuf::from("/tmp"),
-                None,
-                true, // YOLO on
-                Vec::new(),
-                None,
-                None,
-                cx,
-            )
+            let mut rec =
+                crate::db::ThreadRecord::for_test("reg-yolo-ask-user", "/tmp", Vec::new());
+            rec.yolo = true;
+            super::Thread::restore(rec, None, cx)
         });
         let tu = LanguageModelToolUse {
             id: "tu_aq".to_string(),
@@ -2356,5 +2485,77 @@ mod tests {
             !content.contains("resolved by the UI"),
             "YOLO must not bypass AskUserQuestion into its unreachable run body, got: {content}"
         );
+    }
+
+    /// `accumulate_token_usage` mirrors zed's max+saturating_sub: the API sends
+    /// running totals, the per-request counter takes the high-water, and the
+    /// delta accrues to cumulative. `finalize_request_usage` stamps the
+    /// in-flight request onto its triggering user message and resets the
+    /// counter so the next turn diffs from zero.
+    #[test]
+    fn accumulate_token_usage_tracks_running_total_and_resets_on_finalize() {
+        crate::agent_def::init();
+
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test(
+                    "token-acc",
+                    "/tmp",
+                    vec![Message::user("hi".into())],
+                ),
+                None,
+                cx,
+            )
+        });
+
+        let u1 = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        let u2 = TokenUsage {
+            input_tokens: 120,
+            output_tokens: 40,
+            ..Default::default()
+        };
+        // Non-monotonic jitter: a later event reports a smaller running total.
+        let u_jitter = TokenUsage {
+            input_tokens: 110,
+            output_tokens: 20,
+            ..Default::default()
+        };
+
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.accumulate_token_usage(u1);
+                assert_eq!(t.cumulative_token_usage, u1);
+                assert_eq!(t.current_request_token_usage, u1);
+
+                // Second monotonic update: delta = u2 - u1, cumulative = u2.
+                t.accumulate_token_usage(u2);
+                assert_eq!(t.cumulative_token_usage, u2);
+                assert_eq!(t.current_request_token_usage, u2);
+
+                // Non-monotonic: delta = 0 (saturating_sub), high-water stays u2.
+                t.accumulate_token_usage(u_jitter);
+                assert_eq!(t.cumulative_token_usage, u2);
+                assert_eq!(t.current_request_token_usage, u2);
+
+                // Finalize: stamps u2 (the high-water) onto the user message
+                // and resets the per-request counter.
+                t.finalize_request_usage();
+                assert_eq!(t.current_request_token_usage, TokenUsage::default());
+                let uid = t
+                    .last_user_message_id()
+                    .expect("user message id")
+                    .to_owned();
+                assert_eq!(
+                    t.request_token_usage.get(&uid).copied(),
+                    Some(u2),
+                    "finalize must stamp the high-water onto the user message"
+                );
+            });
+        });
     }
 }

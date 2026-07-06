@@ -160,6 +160,15 @@ pub enum LanguageModelCompletionEvent {
         raw_input: String,
         json_parse_error: String,
     },
+    /// Running-total token usage for the in-flight request. The payload is the
+    /// cumulative usage for the whole request so far (input grows as the prefix
+    /// is cached, output grows as tokens stream), NOT a per-event delta — the
+    /// consumer takes `max()` against its own running total and derives the
+    /// delta via `saturating_sub` against the previous total (see
+    /// `Thread::accumulate_token_usage`). Providers must emit this before
+    /// `Stop` whenever they received a usage payload, including on terminal
+    /// non-success events (e.g. `response.incomplete`), so the turn's tokens
+    /// are not silently lost.
     UsageUpdate(TokenUsage),
     Stop(StopReason),
 }
@@ -197,12 +206,18 @@ impl TokenUsage {
 impl std::ops::Add for TokenUsage {
     type Output = Self;
     fn add(self, other: Self) -> Self {
+        // saturating_add: token counts are u64 and only ever grow in
+        // practice, but a corrupted/overflowing provider payload should not
+        // panic in debug or silently wrap in release.
         Self {
-            input_tokens: self.input_tokens + other.input_tokens,
-            output_tokens: self.output_tokens + other.output_tokens,
-            cache_creation_input_tokens: self.cache_creation_input_tokens
-                + other.cache_creation_input_tokens,
-            cache_read_input_tokens: self.cache_read_input_tokens + other.cache_read_input_tokens,
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_add(other.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_add(other.cache_read_input_tokens),
         }
     }
 }

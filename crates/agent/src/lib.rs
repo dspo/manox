@@ -34,6 +34,7 @@ pub mod tools;
 use gpui::App;
 
 pub use db::ThreadSummary;
+pub use language_model::TokenUsage;
 pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};
 pub use message::Message;
 pub use thread::{Thread, ThreadEvent, ThreadId, ToolCallStatus};

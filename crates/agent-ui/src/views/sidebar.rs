@@ -29,6 +29,10 @@ pub enum SidebarEvent {
     OpenThread(String),
     NewThread,
     DeleteThread(String),
+    /// User clicked the rename affordance; the workspace opens an input overlay.
+    RenameThread(String),
+    /// User clicked archive/unarchive. The bool is the new archived state.
+    ArchiveThread(String, bool),
 }
 
 pub struct Sidebar {
@@ -319,8 +323,9 @@ fn section_header(label: SharedString, theme: &Theme) -> AnyElement {
 
 /// Render one conversation row. `indent` adds left padding so rows nested under
 /// a project folder align below its label. Two-row layout: title on top, tag +
-/// relative time + delete button on bottom. The thread-id tag uses outline style
-/// matching the model-menu wire-api tags.
+/// total tokens + relative time + rename/archive/delete actions on bottom. The
+/// thread-id tag uses outline style matching the model-menu wire-api tags; the
+/// action group is revealed only on hover, taking the place of the time + tokens.
 fn render_thread_item(
     ix: usize,
     summary: &agent::ThreadSummary,
@@ -332,19 +337,26 @@ fn render_thread_item(
     let id = summary.id.clone();
     let id_open = id.clone();
     let id_del = id.clone();
-    let title = if summary.summary.is_empty() {
+    let id_rename = id.clone();
+    let id_archive = id.clone();
+    let archive_to = !summary.archived;
+    let display = summary.display_title();
+    let title = if display.is_empty() {
         i18n::t("sidebar-empty-summary").to_string()
     } else {
-        truncate(summary.summary.as_str(), 24)
+        truncate(display, 24)
     };
-    let updated = format_relative(summary.updated_at);
+    let updated = format_relative(summary.interacted_at);
+    let tokens = format_tokens(summary.cumulative_total_tokens);
     let bg = if selected {
         theme.accent.opacity(0.12)
     } else {
         theme.transparent
     };
     let group = gpui::SharedString::from(format!("thread-row-{ix}"));
-    let short_id = &summary.id[..summary.id.len().min(8)];
+    // Short thread ID: first 8 chars of the UUID. Char-based so a non-ASCII
+    // id (defensive — ids are hex today) cannot panic on a char boundary.
+    let short_id: String = summary.id.chars().take(8).collect();
     let tag_variant = if selected {
         TagVariant::Primary
     } else {
@@ -380,7 +392,8 @@ fn render_thread_item(
                         .text_color(theme.foreground)
                         .child(title),
                 )
-                // Row 2: tag + relative time + delete button.
+                // Row 2: tag + tokens + relative time, with rename/archive/delete
+                // actions taking their place on hover.
                 .child(
                     h_flex()
                         .gap_1()
@@ -390,22 +403,49 @@ fn render_thread_item(
                                 .with_variant(tag_variant)
                                 .outline()
                                 .small()
-                                .child(short_id.to_string()),
+                                .child(short_id),
                         )
-                        // Relative time, hidden while the row is hovered so the delete button can take its place.
+                        // Tokens + relative time, hidden on hover so the action
+                        // buttons can take their place. `min_w_0` + overflow
+                        // hidden so a narrow sidebar clips rather than overflows.
                         .child(
-                            gpui::div()
-                                .flex_shrink_0()
+                            h_flex()
+                                .gap_1()
+                                .min_w_0()
+                                .overflow_hidden()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .group_hover(group.clone(), |s| s.invisible())
-                                .child(updated),
+                                .child(gpui::div().child(tokens))
+                                .child(gpui::div().child(updated)),
                         )
-                        // Delete button, revealed only on row hover.
+                        // Action group (rename / archive / delete), revealed on hover.
                         .child(
-                            gpui::div()
+                            h_flex()
+                                .gap_0p5()
                                 .invisible()
-                                .group_hover(group, |s| s.visible())
+                                .group_hover(group.clone(), |s| s.visible())
+                                .child(
+                                    Button::new(("rename-thread", ix))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Replace)
+                                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
+                                            cx.emit(SidebarEvent::RenameThread(id_rename.clone()));
+                                        })),
+                                )
+                                .child(
+                                    Button::new(("archive-thread", ix))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Inbox)
+                                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
+                                            cx.emit(SidebarEvent::ArchiveThread(
+                                                id_archive.clone(),
+                                                archive_to,
+                                            ));
+                                        })),
+                                )
                                 .child(
                                     Button::new(("del-thread", ix))
                                         .ghost()
@@ -419,6 +459,17 @@ fn render_thread_item(
                 ),
         )
         .into_any_element()
+}
+
+/// Compact token count: 1234 -> "1.2k", 1234567 -> "1.2M".
+fn format_tokens(n: u64) -> String {
+    if n < 1000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
 }
 
 /// Format epoch seconds as a coarse relative time, locale-aware via fluent

@@ -73,6 +73,15 @@ struct PendingAsk {
     response_input: Option<Entity<InputState>>,
 }
 
+/// A thread rename prompted by `SidebarEvent::RenameThread`. The input entity
+/// is created lazily on first render (`InputState::new` needs a `Window`);
+/// submitting calls `ThreadStore::rename_thread` with `Some(name)` (or `None`
+/// to clear the override).
+struct PendingRename {
+    thread_id: String,
+    input: Option<Entity<InputState>>,
+}
+
 struct AskQuestion {
     question: String,
     header: String,
@@ -116,6 +125,8 @@ pub struct Workspace {
     /// Animation generation counter for the ask drawer slide, bumped on every
     /// open/close so a fresh tween fires rather than replaying a cached delta.
     ask_transition_gen: u64,
+    /// Sidebar rename overlay; lower precedence than auth/ask/plan.
+    pending_rename: Option<PendingRename>,
     pub(crate) model_open: bool,
     /// PopupMenu entity for the open model selector; created on open, destroyed on close.
     model_menu: Option<Entity<PopupMenu>>,
@@ -273,6 +284,7 @@ impl Workspace {
             pending_ask: None,
             ask_step: 0,
             ask_transition_gen: 0,
+            pending_rename: None,
             model_open: false,
             model_menu: None,
             model_menu_sub: None,
@@ -339,7 +351,7 @@ impl Workspace {
                     let role = this.model_label(cx);
                     let outcome = this
                         .conversation
-                        .update(cx, |c, cx| c.apply(ev, &role, weak, cx));
+                        .update(cx, |c, cx| c.apply(ev, &role, None, weak, cx));
                     let count = this.conversation.read(cx).items().len();
                     match outcome {
                         ApplyOutcome::None => {}
@@ -359,15 +371,26 @@ impl Workspace {
                     // Refresh the access chip + YOLO badge; no conversation item.
                     cx.notify();
                 }
+                ThreadEvent::ModelChanged { from, to } => {
+                    // Persist a model_change event to the thread's event stream.
+                    // The conversation view itself stays unchanged (no item).
+                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| {
+                        s.record_model_change(&thread_id, from.as_deref(), to, cx);
+                    });
+                    cx.notify();
+                }
                 ThreadEvent::Stop(reason) => {
                     // A terminal state ends any pending plan approval (the
                     // oneshot was resolved or cancelled on the thread side).
                     this.pending_plan = None;
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
+                    let usage = this.thread.read(cx).last_request_token_usage();
                     let outcome = this
                         .conversation
-                        .update(cx, |c, cx| c.apply(ev, &role, weak, cx));
+                        .update(cx, |c, cx| c.apply(ev, &role, usage, weak, cx));
                     // Stop flips every streaming flag off, so finalized bodies
                     // switch to `TextView::markdown` and need their real height
                     // measured across the whole list.
@@ -388,9 +411,10 @@ impl Workspace {
                 _ => {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
+                    let usage = this.thread.read(cx).last_request_token_usage();
                     let outcome = this
                         .conversation
-                        .update(cx, |c, cx| c.apply(ev, &role, weak, cx));
+                        .update(cx, |c, cx| c.apply(ev, &role, usage, weak, cx));
                     // Sub-agent tool results carry the child conversation in
                     // their JSON envelope; feed it into the matching AgentTask
                     // card's expandable panel. The envelope is the single
@@ -441,6 +465,11 @@ impl Workspace {
             SidebarEvent::NewThread => this.start_new_thread(cx),
             SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), cx),
             SidebarEvent::DeleteThread(id) => this.delete_thread(id.clone(), cx),
+            SidebarEvent::RenameThread(id) => this.open_rename(id.clone(), cx),
+            SidebarEvent::ArchiveThread(id, archived) => {
+                let store = agent::thread_store_global();
+                store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
+            }
         })
     }
 
@@ -591,10 +620,11 @@ impl Workspace {
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
+        let usage = self.thread.read(cx).request_token_usage().clone();
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
-        let new_conv =
-            cx.new(|cx| ConversationState::rebuild_from_messages(&messages, &role, weak, cx));
+        let new_conv = cx
+            .new(|cx| ConversationState::rebuild_from_messages(&messages, &usage, &role, weak, cx));
         let count = new_conv.read(cx).items().len();
         self.conversation = new_conv;
         // The list state held a measured tree for the previous thread's items;
@@ -603,6 +633,7 @@ impl Workspace {
         self.list_state.reset(count);
         self.pending_auths.clear();
         self.pending_ask = None;
+        self.pending_rename = None;
         self.pending_plan = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
         self.sidebar
@@ -954,12 +985,14 @@ impl Workspace {
             return;
         }
         ask.others = (0..ask.questions.len())
-            .map(|_| cx.new(|cx| {
-                InputState::new(window, cx)
-                    .multi_line(true)
-                    .auto_grow(2, 6)
-                    .placeholder(i18n::t("workspace-clarify-other"))
-            }))
+            .map(|_| {
+                cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .multi_line(true)
+                        .auto_grow(2, 6)
+                        .placeholder(i18n::t("workspace-clarify-other"))
+                })
+            })
             .collect();
         ask.response_input = Some(cx.new(|cx| {
             InputState::new(window, cx)
@@ -967,6 +1000,64 @@ impl Workspace {
                 .auto_grow(2, 6)
                 .placeholder(i18n::t("workspace-ask-response"))
         }));
+    }
+
+    /// Open the rename overlay for a thread. The input entity is created on the
+    /// next render (needs a `Window`); pre-fill comes from the sidebar summary.
+    fn open_rename(&mut self, id: String, cx: &mut Context<Self>) {
+        self.pending_rename = Some(PendingRename {
+            thread_id: id,
+            input: None,
+        });
+        cx.notify();
+    }
+
+    /// Lazily create the rename `InputState`, pre-filled with the thread's
+    /// current display title (user rename > LLM title > summary).
+    fn ensure_rename_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rn) = self.pending_rename.as_mut() else {
+            return;
+        };
+        if rn.input.is_some() {
+            return;
+        }
+        let current = self
+            .sidebar
+            .read(cx)
+            .store()
+            .read(cx)
+            .summaries()
+            .iter()
+            .find(|s| s.id == rn.thread_id)
+            .map(|s| s.display_title().to_string())
+            .unwrap_or_default();
+        rn.input = Some(cx.new(|cx| {
+            let mut state = InputState::new(window, cx);
+            state.set_value(current, window, cx);
+            state
+        }));
+    }
+
+    /// Submit the rename overlay: persist the new title (empty clears the
+    /// override) and close.
+    fn confirm_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rn) = self.pending_rename.take() else {
+            return;
+        };
+        let name = rn
+            .input
+            .map(|s| s.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        let name = if name.is_empty() { None } else { Some(name) };
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.rename_thread(&rn.thread_id, name, cx));
+        cx.notify();
+    }
+
+    /// Dismiss the rename overlay without persisting.
+    fn cancel_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_rename = None;
+        cx.notify();
     }
 
     /// Toggle an option in the pending ask card. Single-select questions reset
@@ -1300,6 +1391,88 @@ impl Workspace {
                                         .label(i18n::t("workspace-plan-approve"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.respond_plan(true, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Rename overlay (sidebar "rename" affordance). Lowest precedence —
+    /// auth/ask/plan overlays take the slot first.
+    fn render_rename_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.pending_ask.is_some()
+            || !self.pending_auths.is_empty()
+            || self.pending_plan.is_some()
+        {
+            return None;
+        }
+        let rn = self.pending_rename.as_ref()?;
+        let input = rn.input.as_ref()?;
+
+        Some(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.background.opacity(0.6))
+                .child(
+                    v_flex()
+                        .w(px(480.))
+                        .p_4()
+                        .gap_3()
+                        .rounded(theme.radius)
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::Replace)
+                                        .small()
+                                        .text_color(theme.accent),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(i18n::t("workspace-rename-title")),
+                                ),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(i18n::t("workspace-rename-prompt")),
+                        )
+                        .child(Input::new(input))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("rename-cancel")
+                                        .ghost()
+                                        .small()
+                                        .label(i18n::t("workspace-cancel"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.cancel_rename(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("rename-confirm")
+                                        .primary()
+                                        .small()
+                                        .label(i18n::t("workspace-rename-confirm"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.confirm_rename(window, cx);
                                         })),
                                 ),
                         ),
@@ -2230,10 +2403,12 @@ impl Render for Workspace {
         let running = self.thread.read(cx).is_running();
 
         self.ensure_ask_inputs(_window, cx);
+        self.ensure_rename_input(_window, cx);
 
         let overlay = self
             .render_auth_overlay(&theme, cx)
-            .or_else(|| self.render_plan_approval_overlay(&theme, cx));
+            .or_else(|| self.render_plan_approval_overlay(&theme, cx))
+            .or_else(|| self.render_rename_overlay(&theme, cx));
 
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;

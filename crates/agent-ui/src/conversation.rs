@@ -7,7 +7,7 @@
 //! streaming delta notifies (and re-renders) only that item, leaving already-
 //! finished items' markdown untouched.
 
-use agent::{Message, ThreadEvent, ToolCallStatus};
+use agent::{Message, ThreadEvent, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, WeakEntity};
 
 use crate::Workspace;
@@ -20,6 +20,10 @@ pub enum ConvItem {
     Assistant {
         text: String,
         streaming: bool,
+        /// Per-turn token usage (input/output/cache) for the user message that
+        /// preceded this assistant reply. Populated on turn `Stop`; `None`
+        /// while streaming or when the provider didn't report usage.
+        token_usage: Option<TokenUsage>,
     },
     Reasoning {
         text: String,
@@ -169,10 +173,13 @@ impl ConversationState {
     }
 
     /// Apply a `ThreadEvent` delta (excludes `ToolCallAuthorization`, which `Workspace` handles).
+    /// `last_request_usage` is the token usage for the turn's last user message;
+    /// consumed only on `Stop` to label the just-finished assistant reply.
     pub fn apply(
         &mut self,
         event: &ThreadEvent,
         role: &str,
+        last_request_usage: Option<TokenUsage>,
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> ApplyOutcome {
@@ -193,6 +200,11 @@ impl ConversationState {
                     ApplyOutcome::None
                 }
             }
+            // Token usage + model changes are surfaced elsewhere (sidebar /
+            // assistant footer / model-history overlay). No conversation item.
+            ThreadEvent::TokenUsageUpdated(_) | ThreadEvent::ModelChanged { .. } => {
+                ApplyOutcome::None
+            }
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
@@ -211,6 +223,7 @@ impl ConversationState {
                             ConvItem::Assistant {
                                 text: delta.clone(),
                                 streaming: true,
+                                token_usage: None,
                             },
                             role.to_string(),
                             id,
@@ -449,6 +462,26 @@ impl ConversationState {
                         cx.notify();
                     });
                 }
+                // Stamp the per-turn usage onto the last assistant reply so its
+                // footer can show input/output/cache totals for this turn. Walk
+                // backward: the last item may be a tool call or reasoning block
+                // emitted after the assistant text, not the assistant itself.
+                if let Some(usage) = last_request_usage {
+                    for e in self.items.iter().rev() {
+                        let stamped = e.update(cx, |item, _cx| {
+                            if let ConvItem::Assistant { token_usage, .. } = item.kind_mut() {
+                                *token_usage = Some(usage);
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if stamped {
+                            e.update(cx, |_, cx| cx.notify());
+                            break;
+                        }
+                    }
+                }
                 ApplyOutcome::All
             }
             ThreadEvent::Error(e) => {
@@ -476,11 +509,12 @@ impl ConversationState {
     /// Rebuild view state from a `Thread`'s canonical message list (used when loading a historical thread).
     pub fn rebuild_from_messages(
         messages: &[Message],
+        usage: &std::collections::HashMap<String, TokenUsage>,
         role: &str,
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Self {
-        let plain = build_items(messages);
+        let plain = build_items(messages, usage);
         let items = plain
             .into_iter()
             .enumerate()
@@ -496,9 +530,7 @@ impl ConversationState {
 mod tests {
     use super::*;
     use agent::Message;
-    use agent::language_model::{
-        LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role,
-    };
+    use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse, MessageContent};
     use std::sync::Arc;
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the
@@ -518,17 +550,14 @@ mod tests {
                     thought_signature: None,
                 }),
             ]),
-            Message {
-                role: Role::User,
-                content: vec![MessageContent::ToolResult(LanguageModelToolResult {
-                    tool_use_id: "tu_1".to_string(),
-                    tool_name: Arc::from("read_file"),
-                    is_error: false,
-                    content: "file contents here".to_string(),
-                })],
-            },
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tu_1".to_string(),
+                tool_name: Arc::from("read_file"),
+                is_error: false,
+                content: "file contents here".to_string(),
+            })]),
         ];
-        let items = build_items(&messages);
+        let items = build_items(&messages, &std::collections::HashMap::new());
         let tool = items
             .iter()
             .find_map(|i| match i {
@@ -548,16 +577,15 @@ mod tests {
 
     #[test]
     fn rebuild_pairs_error_tool_result() {
-        let messages = vec![Message {
-            role: Role::User,
-            content: vec![MessageContent::ToolResult(LanguageModelToolResult {
+        let messages = vec![Message::user_with_content(vec![
+            MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tu_x".to_string(),
                 tool_name: Arc::from("bash"),
                 is_error: true,
                 content: "boom".to_string(),
-            })],
-        }];
-        let items = build_items(&messages);
+            }),
+        ])];
+        let items = build_items(&messages, &std::collections::HashMap::new());
         let tool = items
             .iter()
             .find_map(|i| match i {
@@ -594,17 +622,14 @@ mod tests {
                 is_input_complete: true,
                 thought_signature: None,
             })]),
-            Message {
-                role: Role::User,
-                content: vec![MessageContent::ToolResult(LanguageModelToolResult {
-                    tool_use_id: "tu_agent".to_string(),
-                    tool_name: Arc::from("agent"),
-                    is_error: false,
-                    content: envelope,
-                })],
-            },
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tu_agent".to_string(),
+                tool_name: Arc::from("agent"),
+                is_error: false,
+                content: envelope,
+            })]),
         ];
-        let items = build_items(&messages);
+        let items = build_items(&messages, &std::collections::HashMap::new());
         let task = items
             .iter()
             .find_map(|i| match i {

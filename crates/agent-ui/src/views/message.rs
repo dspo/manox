@@ -13,11 +13,11 @@
 //! are still arriving we paint a plain monospace run and only mount the
 //! syntax-highlighted `TextView::markdown` once the final `ToolResult` lands.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::tools::agent::{agent_final_text, agent_sub_messages};
-use agent::{Message, ToolCallStatus, i18n};
+use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
 use gpui_component::text::{TextView, TextViewStyle};
@@ -185,9 +185,11 @@ pub fn render_item(
 ) -> gpui::AnyElement {
     match item {
         ConvItem::User(text) => render_user(text, ix, theme),
-        ConvItem::Assistant { text, streaming } => {
-            render_assistant(text, *streaming, ix, role, theme)
-        }
+        ConvItem::Assistant {
+            text,
+            streaming,
+            token_usage,
+        } => render_assistant(text, *streaming, token_usage.as_ref(), ix, role, theme),
         ConvItem::Reasoning {
             text,
             streaming,
@@ -282,6 +284,7 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
 pub fn render_assistant(
     text: &str,
     streaming: bool,
+    token_usage: Option<&TokenUsage>,
     ix: usize,
     role: &str,
     theme: &Theme,
@@ -309,7 +312,39 @@ pub fn render_assistant(
                 )),
         )
         .child(render_text_body(text, streaming, ("assistant", ix), theme))
+        .children(token_usage.and_then(|u| render_token_footer(u, theme)))
         .into_any_element()
+}
+
+/// One-line per-turn token breakdown shown under an assistant reply once the
+/// turn has ended (hidden while streaming or when the provider sent no usage).
+fn render_token_footer(u: &TokenUsage, theme: &Theme) -> Option<gpui::AnyElement> {
+    // Only surface non-zero fields so a fresh turn (e.g. a cached-only request
+    // with no output yet) doesn't paint a row of zeroes.
+    let fields: Vec<(&str, u64)> = [
+        ("Input", u.input_tokens),
+        ("Output", u.output_tokens),
+        ("Cache read", u.cache_read_input_tokens),
+        ("Cache creation", u.cache_creation_input_tokens),
+    ]
+    .into_iter()
+    .filter(|(_, v)| *v > 0)
+    .collect();
+    if fields.is_empty() {
+        return None;
+    }
+    Some(
+        h_flex()
+            .gap_2()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .children(
+                fields
+                    .into_iter()
+                    .map(|(label, v)| gpui::div().child(format!("{label}: {v}"))),
+            )
+            .into_any_element(),
+    )
 }
 
 /// Render the assistant / reasoning body. While the stream is live we paint a
@@ -910,7 +945,10 @@ pub fn render_agent_task(
     };
 
     if expanded {
-        let sub_items = build_items(&item.sub_messages);
+        // Expanded: rebuild the child conversation from its snapshot and render
+        // each item recursively. Nested agent tasks share the same expansion
+        // set (keyed by id), so they expand/collapse in place too.
+        let sub_items = build_items(&item.sub_messages, &HashMap::new());
         if sub_items.is_empty() {
             if !collapsed_body.is_empty() {
                 card = card.child(render_agent_body(&collapsed_body, ix, theme));
@@ -988,11 +1026,15 @@ fn truncate(s: &str, max_chars: usize) -> String {
 ///
 /// Tool calls pair ToolUse with ToolResult by `tool_use_id`; an unpaired side
 /// becomes its own item.
-pub fn build_items(messages: &[Message]) -> Vec<ConvItem> {
+pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) -> Vec<ConvItem> {
     let mut items: Vec<ConvItem> = Vec::new();
+    // Id of the most recent user message; usage is keyed by it, so an
+    // assistant reply inherits the usage of the user message preceding it.
+    let mut last_user_id: Option<&str> = None;
     for m in messages {
         match m.role {
             Role::User => {
+                last_user_id = Some(m.id.as_str());
                 // Text becomes a user bubble; ToolResult blocks pair back to the
                 // ToolCall item emitted from the preceding assistant ToolUse.
                 // ToolResults live in user messages per the Anthropic wire contract.
@@ -1023,6 +1065,7 @@ pub fn build_items(messages: &[Message]) -> Vec<ConvItem> {
                             items.push(ConvItem::Assistant {
                                 text: t.clone(),
                                 streaming: false,
+                                token_usage: last_user_id.and_then(|id| usage.get(id).copied()),
                             });
                         }
                         MessageContent::Thinking { text, .. } => {
