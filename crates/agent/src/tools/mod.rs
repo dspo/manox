@@ -725,6 +725,16 @@ pub fn default_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistr
     }
     reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone())) as AnyAgentTool);
     reg.register(self_info::new(parent));
+
+    // Append MCP tools discovered at startup from ~/.config/cx/manox/mcp.toml.
+    // The registry is process-global; `try_global` is `None` only before
+    // `agent::init` (e.g. unit tests that build a registry directly).
+    if let Some(mcp) = crate::mcp::registry::try_global() {
+        for tool in mcp.tools() {
+            reg.register(tool.clone());
+        }
+    }
+
     reg
 }
 

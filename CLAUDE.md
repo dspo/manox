@@ -160,6 +160,7 @@ crates/
 - LLM 配置：`~/.config/cx/cx.providers.config.yaml`（格式见 `provider/config.rs` 的 `CxConfig`）
 - SQLite 数据库：`~/.config/cx/manox/threads.db`
 - 子 agent 定义：`~/.config/cx/manox/agents/*.md`（frontmatter + system prompt，见 `agent_def.rs`）
+- MCP 配置：`~/.config/cx/manox/mcp.toml`（`[mcp_servers.<name>]` 表，stdio `command`/`args`/`env`/`cwd` 或 streamable HTTP `url`/`headers`，见 `mcp/config.rs`。纯文件配置，不接入 UI）
 - API key 源：macOS Keychain（`keychain:SERVICE`）、环境变量（`env:VAR`）、字面量（`literal:...`）、shell 命令（`$(shell ...)`）
 
 ## 项目规则

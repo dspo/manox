@@ -31,6 +31,9 @@ xxhash-rust.workspace = true
 similar.workspace = true
 
 gpui.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+toml.workspace = true
+http.workspace = true
 
 [lints.clippy]
 dbg_macro = "deny"
