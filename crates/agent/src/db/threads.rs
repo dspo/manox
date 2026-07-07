@@ -418,6 +418,26 @@ impl ThreadsDatabase {
         .context("pin thread")?;
         Ok(())
     }
+
+    /// Return distinct non-empty project paths ordered by most recent activity.
+    /// Used by the project-chip dropdown to populate "recent projects".
+    pub fn list_recent_projects(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT project, MAX(interacted_at) AS last_used
+             FROM threads
+             WHERE project IS NOT NULL AND project != ''
+             GROUP BY project
+             ORDER BY last_used DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("read project row")?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
