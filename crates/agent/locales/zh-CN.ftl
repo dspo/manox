@@ -297,9 +297,7 @@ menu-terminal = 终端
 menu-new-terminal = 新建终端标签页
 menu-close-terminal = 关闭终端标签页
 
-### terminal-ui (tabs / overlay)
-tab-conversation = 对话
-tab-terminal = 终端
+### terminal-ui (overlay status / search)
 terminal-placeholder = 终端运行中… 输入以交互
 terminal-exited = 终端已退出，退出码 { $code }
 terminal-search-status = 搜索：{ $pattern }（{ $count } 处匹配）
