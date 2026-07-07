@@ -508,7 +508,6 @@ impl Thread {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            yolo: self.approval_mode == ApprovalMode::Yolo,
             approval_mode: self.approval_mode.as_i64(),
             depth: self.depth as i32,
             parent_id: self.parent_id.clone(),
@@ -799,29 +798,6 @@ impl Thread {
     /// gave the parent for the same tool.
     pub fn permission_snapshot(&self) -> std::collections::HashSet<String> {
         self.permission.allowed_tools()
-    }
-
-    /// Backward-compatible `Yolo` check. Equivalent to
-    /// `self.approval_mode() == ApprovalMode::Yolo`; kept because
-    /// `tools/bash.rs` and `tools/agent.rs` only need a yes/no on Yolo to
-    /// decide the seatbelt branch and the sub-agent inheritance.
-    pub fn yolo(&self) -> bool {
-        self.approval_mode == ApprovalMode::Yolo
-    }
-
-    /// Toggle Yolo mode. Thin wrapper around [`Self::set_approval_mode`] kept
-    /// for the call sites that predate the three-state model (slash command,
-    /// workspace toggles, and any leftover UI plumbing). New code should call
-    /// `set_approval_mode` directly.
-    pub fn set_yolo(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.set_approval_mode(
-            if on {
-                ApprovalMode::Yolo
-            } else {
-                ApprovalMode::OnRequest
-            },
-            cx,
-        );
     }
 
     /// Current approval mode. Drives the access chip, the popover, and the
@@ -2754,7 +2730,6 @@ mod tests {
         let thread = cx.update(|cx| {
             let mut rec =
                 crate::db::ThreadRecord::for_test("reg-yolo-ask-user", "/tmp", Vec::new());
-            rec.yolo = true;
             rec.approval_mode = crate::thread::ApprovalMode::Yolo.as_i64();
             super::Thread::restore(rec, None, cx)
         });

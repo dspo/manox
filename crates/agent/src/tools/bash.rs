@@ -36,7 +36,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::thread::Thread;
+use crate::thread::{ApprovalMode, Thread};
 use crate::tool::{AgentTool, ToolOutputSink};
 use crate::tools::{bridge_tokio, schema};
 
@@ -208,7 +208,7 @@ impl AgentTool for BashTool {
             .thread
             .as_ref()
             .and_then(|t| t.upgrade())
-            .map(|t| t.read_with(cx, |t, _| t.yolo()))
+            .map(|t| t.read_with(cx, |t, _| t.approval_mode() == ApprovalMode::Yolo))
             .unwrap_or(false);
         let unsandboxed = parsed.unsandboxed.unwrap_or(false) || yolo;
         bridge_tokio(cx, async move {

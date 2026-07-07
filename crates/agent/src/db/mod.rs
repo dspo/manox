@@ -148,7 +148,6 @@ mod tests {
             provider_id: Some("百炼".into()),
             cwd: "/tmp".into(),
             project: "/tmp".into(),
-            yolo: true,
             approval_mode: 2,
             depth: 0,
             parent_id: None,
@@ -184,7 +183,7 @@ mod tests {
         assert_eq!(loaded.summary, "你好");
         assert_eq!(loaded.title.as_deref(), Some("关于登录"));
         assert_eq!(loaded.provider_id.as_deref(), Some("百炼"));
-        assert!(loaded.yolo);
+        assert_eq!(loaded.approval_mode, 2);
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].role, Role::User);
         assert!(!loaded.messages[0].id.is_empty());
@@ -245,7 +244,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         ThreadsDatabase::init_schema(&mut conn).unwrap();
         conn.execute(
-            "INSERT INTO threads (id, summary, model_id, cwd, yolo, created_at, interacted_at, updated_at, session_started_at) VALUES ('x','','','/tmp',0,0,0,0,0)",
+            "INSERT INTO threads (id, summary, model_id, cwd, created_at, interacted_at, updated_at, session_started_at) VALUES ('x','','','/tmp',0,0,0,0)",
             [],
         )
         .unwrap();
