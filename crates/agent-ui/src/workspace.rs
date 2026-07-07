@@ -1920,9 +1920,7 @@ impl Workspace {
     ) -> AnyElement {
         let plus = self.render_plus_button(cx);
         let cwd = self.render_cwd_chip(theme, cx);
-        let cache = self.render_cache_chip(cx);
         let access = self.render_access_placeholder(theme, cx);
-        let yolo = self.thread.read(cx).yolo();
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(running, cx);
 
@@ -1951,34 +1949,12 @@ impl Workspace {
                             .gap_1()
                             .child(plus)
                             .child(cwd)
-                            .child(cache)
                             .child(access),
                     )
                     .child(
                         h_flex()
                             .items_center()
                             .gap_1()
-                            .children(yolo.then(|| {
-                                h_flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(gpui::hsla(0.83, 0.8, 0.55, 0.15))
-                                    .child(
-                                        Icon::new(IconName::TriangleAlert)
-                                            .xsmall()
-                                            .text_color(gpui::hsla(0.83, 0.8, 0.7, 1.0)),
-                                    )
-                                    .child(
-                                        gpui::div()
-                                            .text_xs()
-                                            .text_color(gpui::hsla(0.83, 0.8, 0.85, 1.0))
-                                            .child("YOLO"),
-                                    )
-                                    .into_any_element()
-                            }))
                             .child(model)
                             .child(send),
                     ),
@@ -2352,36 +2328,6 @@ impl Workspace {
             }
             None => gpui::div().into_any_element(),
         }
-    }
-
-    /// `cache: NN%` chip reflecting prefix-stability ratio. Green ≥80%, yellow
-    /// ≥40%, red below. The most recent provider cache-read token count is
-    /// appended when available so a high ratio can be cross-checked against
-    /// real cache hits.
-    fn render_cache_chip(&self, cx: &Context<Self>) -> AnyElement {
-        let thread = self.thread.read(cx);
-        let pct = thread.prefix_stability_pct();
-        let usage = thread.last_cache_usage();
-        let hue = if pct >= 80 {
-            0.33 // green
-        } else if pct >= 40 {
-            0.11 // yellow
-        } else {
-            0.0 // red
-        };
-        let label = match usage {
-            Some(u) if u.cache_read_input_tokens > 0 => {
-                format!("cache: {pct}% · {}k", u.cache_read_input_tokens / 1000)
-            }
-            _ => format!("cache: {pct}%"),
-        };
-        gpui::div()
-            .px_2()
-            .py_1()
-            .text_xs()
-            .text_color(gpui::hsla(hue, 0.5, 0.62, 1.0))
-            .child(label)
-            .into_any_element()
     }
 }
 
