@@ -337,10 +337,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!(yolo, 1);
-        // The new column lands at 0 by default; the read path in threads.rs
-        // promotes a v2 row to Yolo at load time. Verify the column exists and
-        // defaults to 0 here, then the promotion check below.
+        // After the ALTER, the new column defaults to 0 (OnRequest) for legacy
+        // rows. The promotion of `yolo=1` rows onto ApprovalMode::Yolo is
+        // verified end-to-end by `load_promotes_legacy_yolo_to_approval_mode_yolo`
+        // above — this test only guards the schema column itself.
         assert_eq!(mode, 0);
+    }
+
+    #[test]
+    fn load_promotes_legacy_yolo_to_approval_mode_yolo() {
+        // Build a v2 db by hand with a row whose yolo = 1, run the migration,
+        // then load the record and verify the read path maps the legacy row
+        // onto ApprovalMode::Yolo (i64 == 2). The previous test only asserts
+        // the SQL column defaults to 0; the promotion happens in code at
+        // load time, so the only way to guard it is to call `load` end to end.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                title TEXT,
+                title_override TEXT,
+                model_id TEXT NOT NULL DEFAULT '',
+                provider_id TEXT,
+                cwd TEXT,
+                project TEXT,
+                yolo INTEGER NOT NULL DEFAULT 0,
+                depth INTEGER NOT NULL DEFAULT 0,
+                parent_id TEXT,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                interacted_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                session_started_at INTEGER NOT NULL DEFAULT 0,
+                cumulative_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_output_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE thread_data (
+                 thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+                 data_type TEXT NOT NULL DEFAULT 'zstd',
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE thread_events (
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 seq INTEGER NOT NULL,
+                 event_type TEXT NOT NULL,
+                 payload TEXT NOT NULL,
+                 created_at INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (thread_id, seq)
+             );
+             CREATE TABLE token_usage (
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 user_message_id TEXT NOT NULL,
+                 input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                 cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                 cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                 completed_at INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (thread_id, user_message_id)
+             );
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, summary, model_id, cwd, project, yolo, depth, archived, created_at, interacted_at, updated_at, session_started_at) VALUES ('legacy-yolo','','','/tmp','',1,0,0,0,0,0,0)",
+            [],
+        )
+        .unwrap();
+        ThreadsDatabase::init_schema(&mut conn).unwrap();
+        let db = ThreadsDatabase {
+            conn: Mutex::new(conn),
+        };
+        let rec = db.load("legacy-yolo").unwrap().expect("row must exist");
+        assert!(rec.yolo, "legacy yolo flag preserved");
+        assert_eq!(
+            rec.approval_mode, 2,
+            "v2 yolo=1 row must promote to ApprovalMode::Yolo at load time"
+        );
     }
 
     #[test]

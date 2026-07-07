@@ -86,10 +86,16 @@ pub fn build_main_system_prompt(
     prompt.push_str(&format!("- node: {node}\n"));
     prompt.push_str(&format!("- Today: {today}\n"));
     match approval_mode {
+        // OnRequest is the default; staying silent keeps the identity block
+        // byte-stable for the common case. AutoReview and Yolo are the two
+        // modes the model can act differently on, so only those are advertised
+        // — and without revealing the internal mechanism (the reviewer LLM
+        // exists, but the model doesn't need to know; adversarial framing
+        // risk if it does).
         ApprovalMode::OnRequest => {}
-        ApprovalMode::AutoReview => prompt.push_str(
-            "- Mode: AutoReview (a security-reviewer LLM vets tool calls; safe calls run without prompting, risky ones still ask)\n",
-        ),
+        ApprovalMode::AutoReview => {
+            prompt.push_str("- Mode: AutoReview (risky tool calls still ask before running)\n")
+        }
         ApprovalMode::Yolo => prompt.push_str(
             "- Mode: YOLO (tool calls need no approval, bash runs outside the sandbox)\n",
         ),

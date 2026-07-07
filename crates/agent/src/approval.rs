@@ -67,6 +67,43 @@ struct VerdictPayload {
 /// the reviewer needs only the call itself plus a sliver of context (cwd) to
 /// make a sound decision, and excluding history keeps the reviewer's own
 /// provider-side prompt cache hot across calls.
+/// Cap for any individual string field inside the reviewer prompt's tool
+/// payload. The reviewer only needs enough context to judge safety; 2 KiB is
+/// well past any plausible `command` / `path` / `pattern` while keeping a
+/// 50 KiB `write_file` content from blowing the prompt budget.
+const REVIEWER_FIELD_CAP: usize = 2048;
+
+/// Deep-clone a `serde_json::Value`, replacing any string field longer than
+/// [`REVIEWER_FIELD_CAP`] with a truncated form (first `REVIEWER_FIELD_CAP`
+/// bytes plus a length marker). The original value is left intact — only the
+/// reviewer's serialized view is affected.
+fn truncate_tool_input(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::String(s) => {
+            if s.len() <= REVIEWER_FIELD_CAP {
+                v.clone()
+            } else {
+                let head = &s[..REVIEWER_FIELD_CAP];
+                serde_json::Value::String(format!(
+                    "{head}…[truncated {} chars]",
+                    s.len() - REVIEWER_FIELD_CAP
+                ))
+            }
+        }
+        serde_json::Value::Array(a) => {
+            serde_json::Value::Array(a.iter().map(truncate_tool_input).collect())
+        }
+        serde_json::Value::Object(o) => {
+            let mut m = serde_json::Map::with_capacity(o.len());
+            for (k, v) in o {
+                m.insert(k.clone(), truncate_tool_input(v));
+            }
+            serde_json::Value::Object(m)
+        }
+        _ => v.clone(),
+    }
+}
+
 pub async fn review(
     model: &AnyLanguageModel,
     tool_name: &str,
@@ -81,7 +118,7 @@ pub async fn review(
         cwd.display(),
         tool_name,
         tool_title,
-        serde_json::to_string_pretty(tool_input)
+        serde_json::to_string_pretty(&truncate_tool_input(tool_input))
             .unwrap_or_else(|_| "<unprintable input>".to_string()),
     );
 
@@ -139,17 +176,66 @@ pub async fn review(
 }
 
 fn parse_verdict(text: &str) -> Option<ReviewVerdict> {
-    // The reviewer is told to emit a single JSON line. Be tolerant of
-    // surrounding whitespace, code fences, or a short prose preamble by
-    // pulling the first '{' through the matching '}'.
     let trimmed = text.trim();
-    let payload: VerdictPayload = if let Some(start) = trimmed.find('{') {
-        let candidate = &trimmed[start..];
-        let end = candidate.rfind('}')?;
-        serde_json::from_str(&candidate[..=end]).ok()?
-    } else {
-        serde_json::from_str(trimmed).ok()?
-    };
+    // Plain JSON: just parse it.
+    if let Some(v) = try_parse_payload(trimmed) {
+        return verdict_from(v);
+    }
+    // Prose-wrapped JSON. The reviewer prompt forbids extra text, but
+    // models occasionally add a preamble or, worse, an example in the same
+    // response. Take the most-recently-emitted balanced `{...}` block so a
+    // trailing format example doesn't swallow the actual answer.
+    let bytes = trimmed.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        if bytes[i] != b'{' {
+            continue;
+        }
+        if let Some(end) = find_matching_close(bytes, i)
+            && let Some(payload) = try_parse_payload(&trimmed[i..=end])
+        {
+            return verdict_from(payload);
+        }
+    }
+    None
+}
+
+fn find_matching_close(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut j = start;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if escape {
+            escape = false;
+        } else if c == b'\\' {
+            escape = true;
+        } else if c == b'"' {
+            in_string = !in_string;
+        } else if !in_string {
+            match c {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+fn try_parse_payload(s: &str) -> Option<VerdictPayload> {
+    serde_json::from_str(s).ok()
+}
+
+fn verdict_from(payload: VerdictPayload) -> Option<ReviewVerdict> {
     let reason = payload
         .reason
         .map(|r| r.trim().to_string())
@@ -202,5 +288,44 @@ mod tests {
     #[test]
     fn falls_through_on_garbage() {
         assert!(parse_verdict("not json at all").is_none());
+    }
+
+    #[test]
+    fn picks_latest_object_when_format_example_precedes() {
+        // The reviewer prompt forbids prose, but a model may still wrap the
+        // answer in text or, worse, include a format example before its
+        // actual verdict. The brace-scan should prefer the most recently
+        // emitted object, not the first one.
+        let v = parse_verdict(
+            r#"Format: {"verdict":"ALLOW"} and my answer: {"verdict":"ASK","reason":"risky"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            ReviewVerdict::Ask {
+                reason: "risky".into()
+            }
+        );
+    }
+
+    #[test]
+    fn truncate_tool_input_caps_long_string_fields() {
+        let big = "x".repeat(10_000);
+        let v = serde_json::json!({
+            "command": "ls -la",
+            "content": big,
+            "nested": { "deep": big.clone() },
+            "list": ["short", big.clone()],
+        });
+        let out = truncate_tool_input(&v);
+        assert_eq!(out["command"], "ls -la");
+        let content = out["content"].as_str().unwrap();
+        assert!(content.starts_with(&"x".repeat(REVIEWER_FIELD_CAP)));
+        assert!(content.contains("truncated"));
+        let deep = out["nested"]["deep"].as_str().unwrap();
+        assert!(deep.contains("truncated"));
+        let arr = out["list"].as_array().unwrap();
+        assert_eq!(arr[0], "short");
+        assert!(arr[1].as_str().unwrap().contains("truncated"));
     }
 }
