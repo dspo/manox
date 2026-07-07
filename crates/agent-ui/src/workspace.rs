@@ -3582,7 +3582,7 @@ impl Render for Workspace {
                     .child(
                         v_flex()
                             .flex_1()
-                            .h_full()
+                            .min_h_0()
                             .w_full()
                             .px_4()
                             .pb_8()
@@ -3614,9 +3614,16 @@ impl Render for Workspace {
                                     .flex_1()
                                     // The virtualized list is a custom element
                                     // that sizes from its own style, not from
-                                    // the row's cross-axis stretch. Without an
-                                    // explicit height it collapses to zero and
-                                    // no messages show; `h_full` fills the row.
+                                    // the row's cross-axis stretch. `h_full`
+                                    // gives it a definite height equal to the
+                                    // row height, so `ListSizingBehavior::Auto`
+                                    // clips the viewport to that height instead
+                                    // of laying every item out at full content
+                                    // height and overflowing into the footer
+                                    // (the message-overlap bug). The shrink that
+                                    // keeps the row itself bounded lives on the
+                                    // ancestors' `min_h_0`, not on this cross-axis
+                                    // child.
                                     .h_full();
                                 // Outline rail (left) + virtualized message
                                 // list (right) share the list region's height.
@@ -3624,6 +3631,7 @@ impl Render for Workspace {
                                     .flex_1()
                                     .w_full()
                                     .h_full()
+                                    .min_h_0()
                                     .children(outline)
                                     .child(list_el)
                             }))
