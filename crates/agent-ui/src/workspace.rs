@@ -957,12 +957,11 @@ impl Workspace {
         let weak = cx.weak_entity();
         let new_conv = cx
             .new(|cx| ConversationState::rebuild_from_messages(&messages, &usage, &role, weak, cx));
-        let count = new_conv.read(cx).items().len();
         self.conversation = new_conv;
-        // The list state held a measured tree for the previous thread's items;
-        // reset to the new count so it re-measures from scratch instead of
-        // carrying stale heights.
-        self.list_state.reset(count);
+        // A freshly loaded thread starts pinned to the bottom (most recent
+        // turn), matching the tail-follow default. `on_prepaint` snaps the flat
+        // column there once its children have laid out.
+        self.stick_to_bottom = true;
         // Hover is tied to the old thread's tick ordinals; drop it. The
         // visible-turn highlight needs no reset — it is queried live from the
         // list each frame.
@@ -1118,10 +1117,8 @@ impl Workspace {
         let weak = cx.weak_entity();
         self.conversation
             .update(cx, |c, cx| c.push_user(display_text, &role, weak, cx));
-        let count = self.conversation.read(cx).items().len();
-        if count > 0 {
-            self.list_state.splice(count - 1..count - 1, 1);
-        }
+        // Submitting a command turn re-engages tail-follow (see send_user_turn).
+        self.stick_to_bottom = true;
         let hit = self
             .thread
             .update(cx, |thread, cx| thread.submit_command(name, args, cx));
@@ -1150,12 +1147,10 @@ impl Workspace {
         let weak = cx.weak_entity();
         self.conversation
             .update(cx, |c, cx| c.push_user(text.clone(), &role, weak, cx));
-        // Splice the new user bubble into the list count; FollowMode::Tail
-        // scrolls it into view when the user is parked at the bottom.
-        let count = self.conversation.read(cx).items().len();
-        if count > 0 {
-            self.list_state.splice(count - 1..count - 1, 1);
-        }
+        // Submitting a turn re-engages tail-follow so the new bubble and the
+        // streaming reply stay in view; `on_prepaint` re-pins each frame as
+        // the reply grows (including the async markdown-parse height bump).
+        self.stick_to_bottom = true;
         self.thread.update(cx, |thread, cx| {
             if images.is_empty() {
                 thread.insert_user_message(text, cx);
@@ -1253,10 +1248,8 @@ impl Workspace {
         let weak = cx.weak_entity();
         self.conversation
             .update(cx, |c, cx| c.push_user(text.clone(), &role, weak, cx));
-        let count = self.conversation.read(cx).items().len();
-        if count > 0 {
-            self.list_state.splice(count - 1..count - 1, 1);
-        }
+        // Submitting from the editor re-engages tail-follow (see send_user_turn).
+        self.stick_to_bottom = true;
         self.thread.update(cx, |thread, cx| {
             thread.insert_user_message(text, cx);
             thread.run_turn(cx);
@@ -1323,13 +1316,12 @@ impl Workspace {
     /// `ConvItem::Notice` card (distinct from the red `ConvItem::Error`).
     pub fn add_info_message(&mut self, text: String, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
-        let count = self.conversation.read(cx).items().len();
         self.conversation.update(cx, |c, cx| {
             c.push_notice(text, weak, cx);
         });
-        if count > 0 {
-            self.list_state.splice(count..count, 1);
-        }
+        // The flat column self-measures; a plain notify re-lays out. If the
+        // user is pinned to the bottom, `on_prepaint` reveals the notice; if
+        // they've scrolled up, it stays put rather than yanking the viewport.
         cx.notify();
     }
 
