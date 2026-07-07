@@ -3156,7 +3156,8 @@ impl Workspace {
 
     /// Project chip: a clickable control showing the current project basename
     /// (or "Choose project" when unbound). Opens a dropdown listing recent
-    /// projects and a "+ New project" submenu. Mirrors the access-chip pattern.
+    /// projects followed by "Create blank project" / "Select folder" actions.
+    /// Mirrors the access-chip pattern.
     fn render_project_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let project = self.thread.read(cx).project().cloned();
         let open = self.project_chip_open;
@@ -3231,7 +3232,7 @@ impl Workspace {
                 let ws_blank = ws.clone();
                 let ws_folder = ws.clone();
 
-                let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                let menu = PopupMenu::build(window, cx, move |menu, _window, cx| {
                     let mut menu = menu.max_w(gpui::px(320.)).scrollable(true);
                     menu = menu.label(i18n::t("sidebar-section-projects"));
 
@@ -3302,36 +3303,62 @@ impl Workspace {
 
                     menu = menu.separator();
 
-                    // "+ New project" submenu
-                    let ws_blank_inner = ws_blank.clone();
-                    let ws_folder_inner = ws_folder.clone();
-                    menu = menu.submenu(
-                        i18n::t("workspace-project-new").to_string(),
-                        window,
-                        cx,
-                        move |submenu, _window, _cx| {
-                            let ws_b = ws_blank_inner.clone();
-                            let ws_f = ws_folder_inner.clone();
-                            submenu
-                                .item(
-                                    PopupMenuItem::new(i18n::t("workspace-project-blank"))
-                                        .on_click(move |_, _, cx: &mut gpui::App| {
-                                            ws_b.update(cx, |this, cx| {
-                                                this.close_project_chip_menu();
-                                                this.open_blank_project(cx);
-                                            });
-                                        }),
+                    // "New project" actions as top-level items.
+                    // PopupMenu submenus are clipped by overflow_y_scroll, so they
+                    // cannot coexist with scrollable(true) — which the recent-projects
+                    // list above needs. Flatten instead of nesting under a submenu.
+                    menu = menu.label(i18n::t("workspace-project-new"));
+
+                    let themed_blank = theme.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_window, _cx| {
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::Plus)
+                                        .xsmall()
+                                        .text_color(themed_blank.muted_foreground),
                                 )
-                                .item(
-                                    PopupMenuItem::new(i18n::t("workspace-project-select-folder"))
-                                        .on_click(move |_, _, cx: &mut gpui::App| {
-                                            ws_f.update(cx, |this, cx| {
-                                                this.close_project_chip_menu();
-                                                this.choose_project_inner(cx);
-                                            });
-                                        }),
+                                .child(
+                                    gpui::div()
+                                        .text_sm()
+                                        .text_color(themed_blank.foreground)
+                                        .child(i18n::t("workspace-project-blank")),
                                 )
-                        },
+                        })
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            ws_blank.update(cx, |this, cx| {
+                                this.close_project_chip_menu();
+                                this.open_blank_project(cx);
+                            });
+                        }),
+                    );
+
+                    let themed_folder = theme.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_window, _cx| {
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::FolderOpen)
+                                        .xsmall()
+                                        .text_color(themed_folder.muted_foreground),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .text_sm()
+                                        .text_color(themed_folder.foreground)
+                                        .child(i18n::t("workspace-project-select-folder")),
+                                )
+                        })
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            ws_folder.update(cx, |this, cx| {
+                                this.close_project_chip_menu();
+                                this.choose_project_inner(cx);
+                            });
+                        }),
                     );
 
                     // Suppress unused-variable warning for the async fetch.
