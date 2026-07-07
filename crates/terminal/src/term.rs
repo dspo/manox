@@ -287,12 +287,12 @@ impl Terminal {
         cx.notify();
     }
 
-    /// Map a visible `(row, col)` to an alacritty grid `Point`. The grid's
-    /// line 0 is the bottom-most screen line and grows negative into
-    /// scrollback; `display_offset` shifts the visible window into history.
+    /// Map a visible `(row, col)` to an alacritty grid `Point`. alacritty
+    /// numbers grid lines top-down (line 0 = topmost visible line when the
+    /// display offset is 0), so grid_line = display_row - display_offset.
     fn display_point(&self, term: &ManoxTerm, row: usize, col: usize) -> Point {
         let offset = term.grid().display_offset() as i32;
-        let line = row as i32 - (self.rows as i32 - 1) - offset;
+        let line = row as i32 - offset;
         Point::new(Line(line), Column(col))
     }
 
@@ -349,8 +349,10 @@ impl Terminal {
         let mut regex = RegexSearch::new(pattern).map_err(|e| e.to_string())?;
         let matches = self.with_term(|t| {
             let mut out = Vec::new();
-            let offset = t.grid().display_offset() as i32;
-            let mut origin = Point::new(Line(-(self.rows as i32 - 1) - offset), Column(0));
+            // Start at the grid's topmost line so scrollback above the visible
+            // window is searched too. alacritty numbers lines top-down, so the
+            // topmost line is the most negative (oldest scrollback) line.
+            let mut origin = Point::new(t.grid().topmost_line(), Column(0));
             let mut guard = 0usize;
             while let Some(m) =
                 t.search_next(&mut regex, origin, Direction::Right, Side::Left, None)

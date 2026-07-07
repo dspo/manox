@@ -113,8 +113,9 @@ impl TerminalElement {
     ) -> Vec<(Bounds<Pixels>, bool)> {
         let mut out = Vec::new();
         for (i, (start, end)) in matches.iter().enumerate() {
-            // display_row = grid_line + (rows-1) + offset
-            let display_row = start.line.0 + (rows - 1) + offset;
+            // alacritty numbers grid lines top-down (line 0 = topmost visible
+            // line when display_offset is 0), so display_row = grid_line + offset.
+            let display_row = start.line.0 + offset;
             if !(0..rows).contains(&display_row) {
                 continue;
             }
@@ -197,9 +198,12 @@ impl Element for TerminalElement {
                 let offset = term.grid().display_offset() as i32;
                 let cells = Self::display_cells(content);
                 let plan = layout_grid(cells.into_iter(), &self.theme);
+                // Cursor grid line → display row via the same offset the cells
+                // are painted with, so the block tracks the caret when scrolled.
+                let cursor_display_line = cursor_pt.line.0 + offset;
                 (
                     plan,
-                    Some((cursor_pt.line.0, cursor_pt.column.0 as i32)),
+                    Some((cursor_display_line, cursor_pt.column.0 as i32)),
                     offset,
                 )
             })
