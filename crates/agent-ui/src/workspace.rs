@@ -21,9 +21,9 @@ use agent::{
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
-    DragMoveEvent, Entity, FollowMode, ListAlignment, ListSizingBehavior, ListState, MouseButton,
-    MouseUpEvent, Pixels, Render, SharedString, Subscription, Window, ease_out_quint, list,
-    prelude::*, px,
+    DragMoveEvent, Entity, FollowMode, ListAlignment, ListOffset, ListSizingBehavior, ListState,
+    MouseButton, MouseUpEvent, Pixels, Render, SharedString, Subscription, Window, deferred,
+    ease_out_quint, list, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, TitleBar,
@@ -110,6 +110,10 @@ struct AskOption {
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<Thread>,
+    /// Threads that were running when the user switched away. Holding strong
+    /// references keeps their `run_turn_loop` tasks alive so they can finish
+    /// in the background and persist via the spawned-task save backstop.
+    background_threads: Vec<Entity<Thread>>,
     sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
@@ -210,6 +214,11 @@ pub struct Workspace {
     /// The terminal tab's view, lazily created on the first `FocusTerminal` /
     /// `NewTerminalTab`. `None` until then. Dropped on `CloseTerminalTab`.
     terminal_view: Option<Entity<TerminalView>>,
+    /// Ordinal of the outline tick currently under the cursor, if any. Drives
+    /// the "wave" hover effect: the hovered tick and its neighbors lengthen and
+    /// spread apart, tapering off with distance. `None` when the cursor is off
+    /// the rail.
+    outline_hover: Option<usize>,
 }
 
 /// Top-level rendering mode of the Workspace window. `Settings` and
@@ -240,6 +249,22 @@ const SIDEBAR_MAX_WIDTH: f32 = 480.;
 const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the main column width when the editor pane is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
+
+/// User-turn outline rail geometry. The rail is a fixed-width gutter between
+/// the sidebar divider and the message list; every tick is the same length so
+/// it reads as a pure navigation anchor, not a length-encoded minimap.
+const OUTLINE_RAIL_WIDTH: f32 = 40.;
+const OUTLINE_TICK_WIDTH: f32 = 16.;
+const OUTLINE_TICK_HEIGHT: f32 = 2.;
+/// Vertical gap between ticks.
+const OUTLINE_TICK_GAP: f32 = 8.;
+/// Hover card max width; the summary wraps within it.
+const OUTLINE_CARD_WIDTH: f32 = 260.;
+/// Wave hover displacement: at the crest a tick grows this much wider and its
+/// row this much taller, tapering to zero at the wave's edge. Neighbors bulge
+/// out around the cursor like the Codex rail.
+const OUTLINE_WAVE_EXTRA_WIDTH: f32 = 12.;
+const OUTLINE_WAVE_EXTRA_GAP: f32 = 6.;
 
 /// Settings overlay slide duration. The enter animation glides the panel in
 /// from the left edge, the exit animation glides it out to the right.
@@ -304,6 +329,7 @@ impl Workspace {
         let mut ws = Self {
             cwd,
             thread,
+            background_threads: Vec::new(),
             sidebar,
             conversation: cx.new(|_| ConversationState::new()),
             input_state,
@@ -352,6 +378,7 @@ impl Workspace {
             settings_view: None,
             settings_sub: None,
             terminal_view: None,
+            outline_hover: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
@@ -438,7 +465,7 @@ impl Workspace {
                     // network latency). Terminal `Stop`/`Error` below clear it.
                     let thread_id = this.thread.read(cx).id.0.clone();
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.set_running(Some(thread_id), cx));
+                    store.update(cx, |s, cx| s.mark_running(&thread_id, cx));
                 }
                 ThreadEvent::Stop(reason) => {
                     // A terminal state ends any pending plan approval (the
@@ -459,10 +486,14 @@ impl Workspace {
                     }
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
+                        let thread_id = this.thread.read(cx).id.0.clone();
                         save_thread(this.thread.clone(), true, cx);
                         // Terminal stop → this thread is no longer running.
                         let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| s.set_running(None, cx));
+                        store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                        // Clean up background reference if this thread was parked.
+                        this.background_threads
+                            .retain(|t| t.read(cx).id.0 != thread_id);
                     }
                     cx.notify();
                 }
@@ -479,8 +510,11 @@ impl Workspace {
                     // dedicated arm because the conversation still needs the
                     // generic `apply` below to render the error item.
                     if let ThreadEvent::Error(_) = ev {
+                        let thread_id = this.thread.read(cx).id.0.clone();
                         let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| s.set_running(None, cx));
+                        store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                        this.background_threads
+                            .retain(|t| t.read(cx).id.0 != thread_id);
                     }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -530,6 +564,169 @@ impl Workspace {
     /// toggle can invalidate the cached per-item height.
     pub(crate) fn list_state(&self) -> &ListState {
         &self.list_state
+    }
+
+    /// The Codex-style outline rail: one equal-length tick per user turn,
+    /// mounted between the sidebar divider and the message list. Ticks for the
+    /// turns currently on screen are highlighted; hovering a tick reveals a
+    /// summary card and clicking it scrolls that turn into view.
+    ///
+    /// Returns `None` when there are no user turns yet, so the first screen
+    /// stays clean.
+    fn render_outline(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::views::outline;
+
+        let turns = outline::user_turns_from(
+            self.conversation
+                .read(cx)
+                .items()
+                .iter()
+                .map(|e| e.read(cx).kind()),
+        );
+        if turns.is_empty() {
+            return None;
+        }
+        let total = self.conversation.read(cx).items().len();
+        // Which turn is on screen is queried live from the list each frame, so
+        // programmatic scrolls (click-to-reveal) highlight correctly, not just
+        // user wheel scrolls.
+        //
+        // Tail-follow is a special case: while pinned to the bottom the list
+        // forces its scroll top past the last item, which makes the positional
+        // queries below meaningless. The viewport then shows the end of the
+        // conversation, so the last turn is the visible one.
+        let following = self.list_state.is_following_tail();
+        let last_ordinal = turns.len() - 1;
+        // Fallback for the pre-layout frame, before the list has measured and
+        // the positional queries can answer.
+        let fallback_top = self.list_state.logical_scroll_top().item_ix;
+
+        let hovered = self.outline_hover;
+        let ticks = turns.iter().map(|turn| {
+            let span = outline::turn_span(&turns, turn.ordinal, total);
+            // A turn is visible unless its whole span sits above or below the
+            // viewport. `item_is_*_viewport` returns `None` before layout; then
+            // fall back to the logical scroll top intersecting the span.
+            let last = span.end.saturating_sub(1);
+            let active = if following {
+                turn.ordinal == last_ordinal
+            } else {
+                match (
+                    self.list_state.item_is_above_viewport(last),
+                    self.list_state.item_is_below_viewport(span.start),
+                ) {
+                    (Some(a), Some(b)) => !a && !b,
+                    _ => span.contains(&fallback_top),
+                }
+            };
+            let target = turn.item_ix;
+            let ordinal = turn.ordinal;
+            let has_summary = !turn.summary.is_empty();
+
+            // Wave displacement: the hovered tick and its neighbors grow wider
+            // and their rows taller, so the rail bulges around the cursor.
+            let weight = outline::wave_weight(ordinal, hovered);
+            let tick_width = OUTLINE_TICK_WIDTH + weight * OUTLINE_WAVE_EXTRA_WIDTH;
+            let row_height =
+                OUTLINE_TICK_HEIGHT + OUTLINE_TICK_GAP + weight * OUTLINE_WAVE_EXTRA_GAP;
+
+            // On-screen turns read at full strength; the wave lifts the rest
+            // toward the foreground as the cursor nears them.
+            let tick_color = if active {
+                theme.foreground.opacity(0.8)
+            } else {
+                theme.muted_foreground.opacity(0.35 + weight * 0.45)
+            };
+            let tick = gpui::div()
+                .w(px(tick_width))
+                .h(px(OUTLINE_TICK_HEIGHT))
+                .rounded_full()
+                .bg(tick_color);
+
+            // The card is driven by `outline_hover`, not `group_hover`: every
+            // hover fires `on_hover` → re-render, which rebuilds the tree and
+            // resets any `group_hover` state, so a group-driven card would flash
+            // and vanish. Keying off the persisted hover ordinal keeps it up.
+            let card = (has_summary && hovered == Some(ordinal)).then(|| {
+                // `deferred` paints the card after the whole workspace tree, so
+                // it floats above the message list instead of being occluded by
+                // the chat bubbles it overlaps.
+                //
+                // A fixed width is required: an absolutely-positioned box with
+                // only `max_w` collapses to its min-content width, which for CJK
+                // text is one glyph per line. `w` + `flex_shrink_0` pins it so
+                // the summary wraps at the card edge, not at every character.
+                deferred(
+                    gpui::div()
+                        .absolute()
+                        .left_full()
+                        .ml_2()
+                        .w(px(OUTLINE_CARD_WIDTH))
+                        .flex_shrink_0()
+                        .px_3()
+                        .py_2()
+                        .rounded(theme.radius)
+                        .bg(theme.popover)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_color(theme.popover_foreground)
+                        .text_sm()
+                        .shadow_md()
+                        .child(turn.summary.clone()),
+                )
+                .with_priority(1)
+            });
+
+            h_flex()
+                .id(target)
+                .relative()
+                .h(px(row_height))
+                .w_full()
+                .justify_center()
+                .items_center()
+                .cursor_pointer()
+                .child(tick)
+                .children(card)
+                .on_hover(cx.listener(move |this, entered: &bool, _window, cx| {
+                    let next = if *entered { Some(ordinal) } else { None };
+                    // Clear only if the cursor left *this* tick; a newer tick's
+                    // enter has already overwritten `outline_hover`.
+                    if *entered || this.outline_hover == Some(ordinal) {
+                        this.outline_hover = next;
+                        cx.notify();
+                    }
+                }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    // `scroll_to` disengages tail-follow before positioning;
+                    // `scroll_to_reveal_item` does not, so under follow mode the
+                    // reveal is overwritten by the snap-to-bottom on the next
+                    // layout and the click appears to do nothing. Pin the turn
+                    // to the top of the viewport.
+                    this.list_state.scroll_to(ListOffset {
+                        item_ix: target,
+                        offset_in_item: px(0.),
+                    });
+                    cx.notify();
+                }))
+        });
+
+        // `overflow_hidden` + `min_h_0` clip the tick column when a long
+        // conversation's ticks exceed the rail height, instead of overflowing
+        // the layout. Widened wave ticks stay within the fixed width (28px max
+        // < 40px rail), and the hover card is `deferred` — painted outside this
+        // subtree — so neither is affected by the clip.
+        Some(
+            v_flex()
+                .flex_shrink_0()
+                .w(px(OUTLINE_RAIL_WIDTH))
+                .h_full()
+                .min_h_0()
+                .overflow_hidden()
+                .justify_center()
+                .items_center()
+                .children(ticks)
+                .into_any_element(),
+        )
     }
 
     fn subscribe_sidebar(&self, cx: &mut Context<Self>) -> Subscription {
@@ -746,16 +943,26 @@ impl Workspace {
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
     fn attach_thread(&mut self, new_thread: Entity<Thread>, cx: &mut Context<Self>) {
-        // Cancel any running turn on the old thread so parked oneshots
-        // (plan approval, tool auth) are resolved immediately rather than
-        // stranding until the entity is eventually dropped.
-        self.thread.update(cx, |t, cx| t.cancel(cx));
-        // Backstop: the old thread's terminal `Stop` from `cancel` may land on
-        // the stale subscription (dropped below) or arrive after the new thread
-        // is attached. Clear running state synchronously so the sidebar
-        // indicator never lingers on a thread we just left.
-        let store = agent::thread_store_global();
-        store.update(cx, |s, cx| s.set_running(None, cx));
+        let old_thread = self.thread.clone();
+        let old_id = old_thread.read(cx).id.0.clone();
+        let new_id = new_thread.read(cx).id.0.clone();
+
+        // If the old thread is still running a turn, park it in the background
+        // so its `run_turn_loop` task stays alive (the entity is otherwise only
+        // held by `self.thread`; overwriting that field would drop it and
+        // silently kill the turn via `WeakEntity::upgrade() -> None`).
+        if old_thread.read(cx).is_running() && old_id != new_id {
+            self.background_threads.push(old_thread);
+        }
+
+        // If the new thread was previously parked in the background, reclaim it
+        // so it becomes the foreground thread and is no longer double-held.
+        self.background_threads
+            .retain(|t| t.read(cx).id.0 != new_id);
+
+        // Persist the old thread's current state before switching away. The
+        // spawned-task save backstop in `run_turn` will persist again when the
+        // turn actually finishes, capturing the final assistant messages.
         save_thread(self.thread.clone(), false, cx);
 
         self.thread = new_thread;
@@ -772,14 +979,54 @@ impl Workspace {
         // reset to the new count so it re-measures from scratch instead of
         // carrying stale heights.
         self.list_state.reset(count);
+        // Hover is tied to the old thread's tick ordinals; drop it. The
+        // visible-turn highlight needs no reset — it is queried live from the
+        // list each frame.
+        self.outline_hover = None;
         self.pending_auths.clear();
         self.pending_ask = None;
         self.pending_rename = None;
         self.pending_plan = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
+        // If the new thread has pending authorizations (e.g. it was parked
+        // while waiting for tool approval), re-surface them so the overlay
+        // appears immediately upon switching back.
+        self.resurface_pending_auths(cx);
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id), cx));
         cx.notify();
+    }
+
+    /// Re-surface any pending authorizations on the current thread that were
+    /// emitted while the thread was in the background (no subscription). Called
+    /// after switching threads so the overlay appears without requiring the
+    /// user to wait for the next event.
+    fn resurface_pending_auths(&mut self, cx: &mut Context<Self>) {
+        // Query the thread for any pending authorization metadata that was
+        // stored when the auth event was originally emitted. If the thread was
+        // parked waiting for user approval while in the background, re-surface
+        // the events so the overlay appears immediately upon switching back.
+        let entries: Vec<(String, String, String)> = self
+            .thread
+            .read(cx)
+            .pending_auth_entries()
+            .into_iter()
+            .map(|(id, meta)| (id, meta.tool_name.clone(), meta.summary.clone()))
+            .collect();
+        for (id, tool_name, summary) in entries {
+            let reason = self
+                .thread
+                .update(cx, |t, _cx| t.take_approval_ask_reason(&id));
+            self.pending_auths.push(PendingAuth {
+                id,
+                tool_name,
+                summary,
+                reason,
+            });
+        }
+        if !self.pending_auths.is_empty() {
+            cx.notify();
+        }
     }
 
     fn start_new_thread(&mut self, cx: &mut Context<Self>) {
@@ -789,6 +1036,17 @@ impl Workspace {
     }
 
     fn open_thread(&mut self, id: String, cx: &mut Context<Self>) {
+        // If the thread is already running in the background, reclaim it
+        // instead of loading a stale snapshot from the db.
+        if let Some(pos) = self
+            .background_threads
+            .iter()
+            .position(|t| t.read(cx).id.0 == id)
+        {
+            let thread = self.background_threads.remove(pos);
+            self.attach_thread(thread, cx);
+            return;
+        }
         let store = self.sidebar.read(cx).store();
         let Some(loaded) = store.update(cx, |s, cx| s.load_thread(&id, cx)) else {
             return;
@@ -3205,6 +3463,11 @@ impl Render for Workspace {
                     ),
             )
         };
+        // Outline rail sits left of the message list (right of the sidebar
+        // divider), so it only shows alongside a live conversation.
+        let outline = (!first_screen && !editor_open)
+            .then(|| self.render_outline(&theme, cx))
+            .flatten();
         // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
         // toggles preview — all keyboard-driven per the no-button constraint.
         // The divider is the visual separator and the drag handle for resizing.
@@ -3388,7 +3651,7 @@ impl Render for Workspace {
                     .child(
                         v_flex()
                             .flex_1()
-                            .h_full()
+                            .min_h_0()
                             .w_full()
                             .px_4()
                             .pb_8()
@@ -3401,19 +3664,45 @@ impl Render for Workspace {
                             .children(hero)
                             .children((!first_screen).then(|| {
                                 let conv = self.conversation.clone();
-                                list(self.list_state.clone(), move |ix, _window, cx| {
-                                    conv.read(cx)
-                                        .items()
-                                        .get(ix)
-                                        .cloned()
-                                        .map(|item| {
-                                            v_flex().pt_1().pb_4().child(item).into_any_element()
-                                        })
-                                        .unwrap_or_else(|| gpui::Empty.into_any_element())
-                                })
-                                .with_sizing_behavior(ListSizingBehavior::Auto)
-                                .flex_1()
-                                .into_any_element()
+                                let list_el =
+                                    list(self.list_state.clone(), move |ix, _window, cx| {
+                                        conv.read(cx)
+                                            .items()
+                                            .get(ix)
+                                            .cloned()
+                                            .map(|item| {
+                                                v_flex()
+                                                    .pt_1()
+                                                    .pb_4()
+                                                    .child(item)
+                                                    .into_any_element()
+                                            })
+                                            .unwrap_or_else(|| gpui::Empty.into_any_element())
+                                    })
+                                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                                    .flex_1()
+                                    // The virtualized list is a custom element
+                                    // that sizes from its own style, not from
+                                    // the row's cross-axis stretch. `h_full`
+                                    // gives it a definite height equal to the
+                                    // row height, so `ListSizingBehavior::Auto`
+                                    // clips the viewport to that height instead
+                                    // of laying every item out at full content
+                                    // height and overflowing into the footer
+                                    // (the message-overlap bug). The shrink that
+                                    // keeps the row itself bounded lives on the
+                                    // ancestors' `min_h_0`, not on this cross-axis
+                                    // child.
+                                    .h_full();
+                                // Outline rail (left) + virtualized message
+                                // list (right) share the list region's height.
+                                h_flex()
+                                    .flex_1()
+                                    .w_full()
+                                    .h_full()
+                                    .min_h_0()
+                                    .children(outline)
+                                    .child(list_el)
                             }))
                             .children(footer)
                             // Approval overlay (if any)

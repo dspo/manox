@@ -19,6 +19,7 @@ agent.workspace = true
 terminal.workspace = true
 terminal-ui.workspace = true
 
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 # MCP server (`manox --mcp`): optional, pulled in only by the `debug` feature.

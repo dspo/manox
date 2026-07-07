@@ -2,6 +2,7 @@
 
 pub mod composer_menu;
 pub mod message;
+pub mod outline;
 pub mod settings;
 pub mod sidebar;
 pub mod title_menu;

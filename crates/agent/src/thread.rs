@@ -159,6 +159,15 @@ pub enum ThreadEvent {
     ModelChanged { from: Option<String>, to: String },
 }
 
+/// UI metadata for a pending tool-call authorization. Stored alongside the
+/// oneshot sender so the workspace can re-emit `ToolCallAuthorization` when
+/// the user switches back to a thread parked on an approval prompt.
+pub struct PendingAuthMeta {
+    pub tool_name: String,
+    pub summary: String,
+    pub input: serde_json::Value,
+}
+
 pub struct Thread {
     pub id: ThreadId,
     messages: Vec<Message>,
@@ -184,8 +193,12 @@ pub struct Thread {
     /// Pending authorizations for THIS thread's own tool calls, keyed by
     /// tool_use id. A map (not a single slot) so parallel tool calls can each
     /// await their own decision without overwriting one another.
-    pending_authorizations:
+    pub(crate) pending_authorizations:
         HashMap<String, tokio::sync::oneshot::Sender<ToolAuthorizationResponse>>,
+    /// UI metadata for pending authorizations, mirroring `pending_authorizations`.
+    /// Stored so the workspace can re-emit `ToolCallAuthorization` events when
+    /// switching back to a thread that was parked waiting for user approval.
+    pending_auth_meta: HashMap<String, PendingAuthMeta>,
     /// Authorization requests bubbled up from a sub-agent, keyed by a composite
     /// id `<parent_tool_use_id>::<child_auth_id>`. Routing a response back
     /// forwards it to the owning child thread.
@@ -298,6 +311,7 @@ impl Thread {
                 project: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
+                pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
                 depth: 0,
@@ -368,6 +382,7 @@ impl Thread {
                 project,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
+                pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
                 depth: rec.depth as u32,
@@ -439,6 +454,7 @@ impl Thread {
                 project: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
+                pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: Some(system),
                 depth,
@@ -622,6 +638,7 @@ impl Thread {
         cx: &mut Context<Self>,
     ) {
         if let Some(tx) = self.pending_authorizations.remove(id) {
+            self.pending_auth_meta.remove(id);
             let _ = tx.send(response);
             return;
         }
@@ -864,6 +881,20 @@ impl Thread {
         self.running_turn.is_some()
     }
 
+    /// Return the UI metadata for pending authorizations. Used by the workspace
+    /// to re-emit `ToolCallAuthorization` events when switching back to a thread
+    /// that was parked waiting for user approval.
+    pub fn pending_auth_entries(&self) -> Vec<(String, &PendingAuthMeta)> {
+        self.pending_authorizations
+            .keys()
+            .filter_map(|id| {
+                self.pending_auth_meta
+                    .get(id)
+                    .map(|meta| (id.clone(), meta))
+            })
+            .collect()
+    }
+
     /// Append a user message.
     pub fn insert_user_message(&mut self, text: String, cx: &mut Context<Self>) {
         self.messages.push(Message::user(text));
@@ -979,6 +1010,7 @@ impl Thread {
             // late `respond_authorization` from the UI silently no-ops instead
             // of panicking on a closed channel.
             self.pending_authorizations.clear();
+            self.pending_auth_meta.clear();
             // Drop bubbled sub-agent auth routes too: a parent cancel must
             // unwind child-authorization routing so a late composite-id
             // response no-ops at the parent instead of traversing to a child
@@ -1415,6 +1447,14 @@ impl Thread {
             let (tx, rx) = tokio::sync::oneshot::channel();
             this.update(cx, |this, _cx| {
                 this.pending_authorizations.insert(id.clone(), tx);
+                this.pending_auth_meta.insert(
+                    id.clone(),
+                    PendingAuthMeta {
+                        tool_name: name.clone(),
+                        summary: title.clone(),
+                        input: tu.input.clone(),
+                    },
+                );
             })?;
             this.update(cx, |_, cx| {
                 cx.emit(ThreadEvent::ToolCallAuthorization {
@@ -1434,6 +1474,7 @@ impl Thread {
             // cancelled turn.
             this.update(cx, |this, _cx| {
                 this.pending_authorizations.remove(&id);
+                this.pending_auth_meta.remove(&id);
             })?;
             match response {
                 ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {

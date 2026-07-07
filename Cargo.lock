@@ -4435,6 +4435,7 @@ dependencies = [
  "terminal",
  "terminal-ui",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

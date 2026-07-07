@@ -17,11 +17,41 @@ use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 actions!(manox, [Quit, ToggleFullscreen]);
 
 fn main() {
+    // Install a panic hook before anything else so a panic anywhere — main
+    // thread, gpui foreground task, or a detached tokio worker — surfaces with
+    // location and a forced backtrace. Without this a panic in a spawned task
+    // prints a terse one-liner and the process disappears, leaving no clue for
+    // crash diagnosis.
+    // Edition 2024 marks `set_var` unsafe because it can race with reads on
+    // other threads; safe here because this runs before any other thread exists.
+    unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".into());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<non-string panic payload>");
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!(
+            "panic: {payload}\n  location: {location}\n  thread: {:?}\n{bt}",
+            std::thread::current().name().unwrap_or("<unnamed>")
+        );
+        eprintln!("{msg}");
+        tracing::error!("{msg}");
+    }));
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_thread_ids(true)
+        .with_thread_names(true)
         .init();
 
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);

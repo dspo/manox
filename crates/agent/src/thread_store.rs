@@ -5,6 +5,7 @@
 //! refresh its list. `save_thread` persists asynchronously on turn end or user
 //! message submit and then refreshes.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -20,21 +21,19 @@ use crate::thread::{Thread, ThreadId};
 pub enum ThreadStoreEvent {
     /// The summary list changed (created / saved / deleted).
     SummariesUpdated,
-    /// The running thread changed (a turn started or ended). Carries the
-    /// thread id that is now running, or `None` when no thread is running.
-    /// Distinct from `SummariesUpdated` so the sidebar can re-render a single
-    /// row without re-querying the db.
-    RunningChanged(Option<String>),
+    /// The set of running threads changed (a turn started or ended). The sidebar
+    /// re-renders per-row running indicators by querying `is_running` for each
+    /// summary id. Distinct from `SummariesUpdated` so the sidebar can re-render
+    /// without re-querying the db.
+    RunningChanged,
 }
 
 pub struct ThreadStore {
     db: Arc<ThreadsDatabase>,
     summaries: Vec<ThreadSummary>,
-    /// The thread id currently running a turn, or `None` when idle. Set by the
-    /// workspace on `ThreadEvent::TurnStarted` and cleared on terminal
-    /// `Stop`/`Error`. Drives the sidebar's running indicator on the matching
-    /// thread item.
-    running: Option<String>,
+    /// Thread ids currently running a turn. Multiple threads can run concurrently;
+    /// the sidebar shows a running indicator on every row whose id is in this set.
+    running: HashSet<String>,
 }
 
 impl EventEmitter<ThreadStoreEvent> for ThreadStore {}
@@ -65,7 +64,7 @@ pub fn init(cx: &mut App) {
     let entity = cx.new(|_cx| ThreadStore {
         db: Arc::new(db),
         summaries,
-        running: None,
+        running: HashSet::new(),
     });
     let _ = GLOBAL.set(entity);
 }
@@ -87,21 +86,27 @@ impl ThreadStore {
         &self.summaries
     }
 
-    /// The thread id currently running a turn, or `None` when idle.
-    pub fn running(&self) -> Option<&str> {
-        self.running.as_deref()
+    /// Whether the given thread id is currently running a turn.
+    pub fn is_running(&self, id: &str) -> bool {
+        self.running.contains(id)
     }
 
-    /// Set the running thread id (or clear it). Emits `RunningChanged` so the
-    /// sidebar re-renders the affected rows. Called by the workspace on
-    /// `ThreadEvent::TurnStarted` / terminal `Stop` / `Error`.
-    pub fn set_running(&mut self, id: Option<String>, cx: &mut Context<Self>) {
-        if self.running == id {
-            return;
+    /// Mark a thread as running (turn started). Emits `RunningChanged` so the
+    /// sidebar re-renders the affected row.
+    pub fn mark_running(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.running.insert(id.to_string()) {
+            cx.emit(ThreadStoreEvent::RunningChanged);
+            cx.notify();
         }
-        self.running = id;
-        cx.emit(ThreadStoreEvent::RunningChanged(self.running.clone()));
-        cx.notify();
+    }
+
+    /// Mark a thread as idle (turn ended). Emits `RunningChanged` so the
+    /// sidebar re-renders the affected row.
+    pub fn mark_idle(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.running.remove(id) {
+            cx.emit(ThreadStoreEvent::RunningChanged);
+            cx.notify();
+        }
     }
 
     /// Re-read the db, refresh the summary list, and emit. The `db.list()`
@@ -305,7 +310,7 @@ pub fn init_for_test(db: Arc<ThreadsDatabase>, cx: &mut App) {
     let entity = cx.new(|_cx| ThreadStore {
         db,
         summaries: Vec::new(),
-        running: None,
+        running: HashSet::new(),
     });
     *TEST_OVERRIDE.lock().unwrap() = Some(entity);
 }
