@@ -573,11 +573,18 @@ impl Workspace {
         // forces its scroll top past the last item, which makes the positional
         // queries below meaningless. The viewport then shows the end of the
         // conversation, so the last turn is the visible one.
-        let following = self.list_state.is_following_tail();
+        let following = self.stick_to_bottom;
         let last_ordinal = turns.len() - 1;
-        // Fallback for the pre-layout frame, before the list has measured and
-        // the positional queries can answer.
-        let fallback_top = self.list_state.logical_scroll_top().item_ix;
+        // Fallback for the pre-layout frame, before the scroll handle has
+        // captured child bounds to answer positional queries.
+        let fallback_top = self.scroll_handle.top_item();
+        // Viewport box + scroll offset, read once for all ticks. A child's
+        // painted position is its layout bounds shifted by `offset_y` (<= 0 as
+        // you scroll down), so a span is off-screen when its last item's
+        // painted bottom is above the viewport top, or its first item's painted
+        // top is below the viewport bottom.
+        let vp = self.scroll_handle.bounds();
+        let offset_y = self.scroll_handle.offset().y;
 
         let hovered = self.outline_hover;
         let ticks = turns.iter().map(|turn| {
@@ -590,10 +597,20 @@ impl Workspace {
                 turn.ordinal == last_ordinal
             } else {
                 match (
-                    self.list_state.item_is_above_viewport(last),
-                    self.list_state.item_is_below_viewport(span.start),
+                    self.scroll_handle.bounds_for_item(last),
+                    self.scroll_handle.bounds_for_item(span.start),
                 ) {
-                    (Some(a), Some(b)) => !a && !b,
+                    // `last`'s painted bottom above the viewport top ⇒ the whole
+                    // span sits above; `span.start`'s painted top at/below the
+                    // viewport bottom ⇒ the whole span sits below. Visible
+                    // otherwise.
+                    (Some(lb), Some(sb)) => {
+                        let above = lb.bottom() + offset_y <= vp.top();
+                        let below = sb.top() + offset_y >= vp.bottom();
+                        !above && !below
+                    }
+                    // Pre-layout (bounds not captured yet): fall back to the
+                    // top visible item intersecting the span.
                     _ => span.contains(&fallback_top),
                 }
             };
@@ -675,15 +692,12 @@ impl Workspace {
                     }
                 }))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    // `scroll_to` disengages tail-follow before positioning;
-                    // `scroll_to_reveal_item` does not, so under follow mode the
-                    // reveal is overwritten by the snap-to-bottom on the next
-                    // layout and the click appears to do nothing. Pin the turn
-                    // to the top of the viewport.
-                    this.list_state.scroll_to(ListOffset {
-                        item_ix: target,
-                        offset_in_item: px(0.),
-                    });
+                    // Pin the turn to the top of the viewport. Disengage
+                    // tail-follow first, otherwise `on_prepaint` would re-pin
+                    // to the bottom on the next frame and the reveal would be
+                    // overwritten (the click would appear to do nothing).
+                    this.stick_to_bottom = false;
+                    this.scroll_handle.scroll_to_top_of_item(target);
                     cx.notify();
                 }))
         });
