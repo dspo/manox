@@ -13,7 +13,7 @@
 //! the user's answers), which the task `await`s on the gpui executor.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -188,6 +188,13 @@ pub struct Thread {
     /// `None` means no project was chosen; tools then resolve paths against the
     /// app launch directory (`cwd`). Once set, it is fixed for the thread's life.
     project: Option<PathBuf>,
+    /// Active worktree state. `None` unless the thread has entered a git
+    /// worktree via the `enter_worktree` tool. While `Some`, `cwd` is the
+    /// worktree path and the tool registry carries a worktree-aware sandbox
+    /// (bound repo `.git` writable, network on). Session-scoped — never
+    /// persisted: a worktree is an ephemeral isolation context, not part of
+    /// the thread record.
+    worktree: Option<WorktreeState>,
     /// tool_uses collected during the current turn, processed after the stream ends.
     pending_tool_uses: Vec<LanguageModelToolUse>,
     /// Pending authorizations for THIS thread's own tool calls, keyed by
@@ -289,7 +296,108 @@ struct ChildAuthRoute {
     child_auth_id: String,
 }
 
+/// Session-scoped state for a thread currently inside a git worktree. Not
+/// persisted — a worktree is an ephemeral isolation context tied to the live
+/// session, so a reloaded thread always starts outside any worktree.
+pub struct WorktreeState {
+    /// Absolute path of the worktree directory (equals `Thread::cwd` while
+    /// active).
+    pub path: PathBuf,
+    /// cwd to restore on exit — the project root or launch dir the thread was
+    /// in before entering the worktree.
+    pub prior_cwd: PathBuf,
+    /// The branch the worktree was created on. Used for cleanup (`git branch
+    /// -D`) and the UI status chip.
+    pub branch: String,
+    /// The bound repo's shared `.git` directory (`git rev-parse
+    /// --git-common-dir` from inside the worktree). The worktree-aware sandbox
+    /// de-protects this path so git ops against the main repo succeed.
+    pub git_common_dir: PathBuf,
+    /// Whether the worktree was created by a sub-agent (P3 isolation). Such
+    /// worktrees are auto-removed on session end when clean; user-entered
+    /// worktrees are left for the user to return to.
+    pub subagent_created: bool,
+}
+
 impl EventEmitter<ThreadEvent> for Thread {}
+
+impl Drop for Thread {
+    /// Auto-remove a sub-agent's worktree when it is clean, so isolated
+    /// sub-agent runs do not litter `.claude/worktrees/`. A dirty worktree is
+    /// left on disk for the user to inspect. Fire-and-forget on the tokio
+    /// runtime — `Drop` cannot await, and the runtime may already be gone at
+    /// process teardown, so a missing handle is a quiet no-op. User-entered
+    /// worktrees (`subagent_created == false`) are never auto-removed here;
+    /// they live until `exit_worktree` with `action=remove`.
+    fn drop(&mut self) {
+        let Some(wt) = self.worktree.take() else {
+            return;
+        };
+        if !wt.subagent_created {
+            return;
+        }
+        let Some(handle) = crate::runtime::try_handle() else {
+            return;
+        };
+        let path = wt.path.clone();
+        let branch = wt.branch.clone();
+        // Run `git worktree remove` from the main repo root (the bound
+        // `.git`'s parent) so the worktree being removed is not its own cwd.
+        let repo_root = wt
+            .git_common_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(path.clone());
+        handle.spawn(async move {
+            let status = tokio::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&path)
+                .output()
+                .await;
+            let clean = matches!(status, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty());
+            if !clean {
+                tracing::debug!(
+                    worktree = %path.display(),
+                    "subagent worktree dirty or status failed — left on disk for inspection"
+                );
+                return;
+            }
+            let path_str = path.display().to_string();
+            // Remove the worktree first; only delete the branch on success so a
+            // failed remove (e.g. a concurrent write between the clean check
+            // and the remove) does not leave a branch-less orphan worktree.
+            let remove = tokio::process::Command::new("git")
+                .args(["worktree", "remove", &path_str])
+                .current_dir(&repo_root)
+                .output()
+                .await;
+            let removed = matches!(&remove, Ok(o) if o.status.success());
+            if !removed {
+                let stderr = remove
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                    .unwrap_or_default();
+                tracing::warn!(
+                    worktree = %path.display(),
+                    stderr = %stderr,
+                    "git worktree remove failed — worktree left on disk, branch preserved"
+                );
+                return;
+            }
+            let branch_del = tokio::process::Command::new("git")
+                .args(["branch", "-D", &branch])
+                .current_dir(&repo_root)
+                .output()
+                .await;
+            if !matches!(branch_del, Ok(o) if o.status.success()) {
+                tracing::warn!(
+                    branch = %branch,
+                    "worktree removed but branch -D failed — branch left behind"
+                );
+            }
+        });
+    }
+}
 
 impl Thread {
     /// Construct a new `Thread`, defaulting to the registry's first model and registering the built-in tools plus the `agent` tool.
@@ -312,6 +420,7 @@ impl Thread {
                 approval_ask_reasons: HashMap::new(),
                 cwd,
                 project: None,
+                worktree: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
@@ -384,6 +493,7 @@ impl Thread {
                 approval_ask_reasons: HashMap::new(),
                 cwd,
                 project,
+                worktree: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
@@ -458,6 +568,7 @@ impl Thread {
                 approval_ask_reasons: HashMap::new(),
                 cwd,
                 project: None,
+                worktree: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
@@ -903,6 +1014,96 @@ impl Thread {
         self.cwd = dir.clone();
         self.tools = Arc::new(tools::main_registry(dir.clone(), cx.weak_entity()));
         self.project = Some(dir);
+        cx.notify();
+    }
+
+    /// Active worktree state, if the thread has entered a git worktree.
+    pub fn worktree(&self) -> Option<&WorktreeState> {
+        self.worktree.as_ref()
+    }
+
+    /// Enter a git worktree: switch the session cwd to `path`, rebuild the
+    /// tool registry with a worktree-aware sandbox (bound repo `.git`
+    /// writable, network on), and stash the prior cwd for `exit_worktree` to
+    /// restore. Unlike `set_project`, this is an explicit mid-conversation
+    /// harness operation — the model directs the transition via the
+    /// `enter_worktree` tool, so the messages-nonempty gate does not apply.
+    ///
+    /// `git_common_dir` is `git rev-parse --git-common-dir` resolved from
+    /// inside the worktree (the main repo's shared `.git`). The caller (the
+    /// worktree tool) has already run `git worktree add` before invoking this.
+    pub fn enter_worktree(
+        &mut self,
+        path: PathBuf,
+        branch: String,
+        git_common_dir: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let prior_cwd = self.cwd.clone();
+        let project_root = self.project.clone().unwrap_or_else(|| prior_cwd.clone());
+        let sandbox = self
+            .sandbox_anchor(&project_root)
+            .with_worktree(&path, &git_common_dir);
+        self.cwd = path.clone();
+        self.tools = Arc::new(tools::main_registry_with_policy(
+            path.clone(),
+            sandbox,
+            cx.weak_entity(),
+        ));
+        self.worktree = Some(WorktreeState {
+            path,
+            prior_cwd,
+            branch,
+            git_common_dir,
+            subagent_created: false,
+        });
+        // A worktree transition changes the system-prompt cwd line and the
+        // tool registry's baked sandbox — force a clean prefix re-baseline so
+        // the next turn captures the new prefix as a version bump rather than
+        // silent drift.
+        self.prefix_stability.invalidate();
+        cx.notify();
+    }
+
+    /// Leave the active worktree. `Keep` switches cwd back but leaves the
+    /// worktree and branch on disk; `Remove` also deletes them, refusing when
+    /// the working tree is dirty unless `discard_changes` is set. The caller
+    /// (the `exit_worktree` tool) is responsible for the actual `git worktree
+    /// remove` shell-out when dirty-checking is needed; this method only
+    /// restores thread state once the git side has succeeded.
+    pub fn exit_worktree(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+        let Some(wt) = self.worktree.take() else {
+            return Err("Not in a worktree.".to_string());
+        };
+        let prior_cwd = wt.prior_cwd.clone();
+        self.cwd = prior_cwd.clone();
+        let sandbox = self.sandbox_anchor(self.project.as_deref().unwrap_or(&prior_cwd));
+        self.tools = Arc::new(tools::main_registry_with_policy(
+            prior_cwd,
+            sandbox,
+            cx.weak_entity(),
+        ));
+        self.prefix_stability.invalidate();
+        cx.notify();
+        Ok(())
+    }
+
+    /// The base sandbox anchor (project root or launch cwd) without any
+    /// worktree relaxation. Factored so `enter_worktree` extends it with
+    /// `.with_worktree` and `exit_worktree` restores the plain policy.
+    fn sandbox_anchor(&self, root: &Path) -> crate::sandbox::SandboxPolicy {
+        crate::sandbox::SandboxPolicy::for_project(root)
+    }
+
+    /// Stamp an initial worktree state on a freshly-constructed sub-agent whose
+    /// tool registry was already built worktree-aware (P3 `isolation: worktree`
+    /// path). Unlike `enter_worktree`, this does NOT rebuild the registry — the
+    /// child's registry carries the `for_worktree` sandbox from construction.
+    /// Sets the state field so the system prompt advertises the worktree and
+    /// session-end auto-cleanup (Drop) can remove it when clean.
+    pub(crate) fn set_worktree_state(&mut self, state: WorktreeState, cx: &mut Context<Self>) {
+        self.worktree = Some(state);
+        self.prefix_stability.invalidate();
         cx.notify();
     }
 
@@ -2047,10 +2248,15 @@ impl Thread {
         // prefix cache.
         let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
         let mut system = self.system.clone().unwrap_or_else(|| {
+            let wt = self
+                .worktree
+                .as_ref()
+                .map(|w| (w.branch.as_str(), w.path.as_path()));
             crate::system_prompt::build_main_system_prompt(
                 &self.cwd,
                 self.project.as_deref(),
                 self.approval_mode,
+                wt,
             )
         });
         // Sub-agents carry their own system prompt from `agents/*.md`; the main
@@ -2060,6 +2266,25 @@ impl Thread {
         // English, only this one directive varies.
         if self.system.is_some() {
             system.push_str(crate::system_prompt::language_directive());
+            // A worktree-isolated sub-agent carries its own `system` from
+            // `agents/*.md`, so it never goes through
+            // `build_main_system_prompt` and would otherwise not see the
+            // "Active worktree" identity row. Append the worktree context so
+            // the sub-agent knows its cwd is a temporary worktree on a fresh
+            // branch (not the branch the parent mentioned) and that clean
+            // worktrees are auto-removed on exit.
+            if let Some(wt) = &self.worktree {
+                system.push_str(&format!(
+                    "\n\n## Active worktree\n\
+                     You are running inside a git worktree on branch `{branch}` at `{path}`. \
+                     Your cwd is this worktree, not the parent's project root. Work here; \
+                     git operations (commit/push) run without approval. A clean worktree is \
+                     auto-removed when you finish — commit or keep your work explicitly if it \
+                     must persist.",
+                    branch = wt.branch,
+                    path = wt.path.display()
+                ));
+            }
         }
         // In plan mode, append the read-only-constraint addendum so the model
         // knows it must submit a plan via `exit_plan_mode` rather than act.

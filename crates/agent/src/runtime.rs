@@ -27,3 +27,11 @@ pub fn handle() -> &'static tokio::runtime::Handle {
         .get()
         .expect("tokio runtime 未初始化，请先调用 agent::init")
 }
+
+/// Returns the global tokio `Handle`, or `None` before `init` / after process
+/// teardown. Safe to call from `Drop` implementations where panicking would
+/// abort — the worktree auto-cleanup path uses this to fire-and-forget a git
+/// `worktree remove` without risking a panic if the runtime is gone.
+pub fn try_handle() -> Option<&'static tokio::runtime::Handle> {
+    HANDLE.get()
+}
