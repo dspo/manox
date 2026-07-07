@@ -3811,47 +3811,72 @@ impl Render for Workspace {
                             .pt(TITLE_BAR_HEIGHT)
                             .pr(content_inset)
                             .pb_2()
-                            // Empty first screen shows the centered hero in place of the
-                            // (empty) message list; otherwise the virtualized, tail-
-                            // following conversation list. Each item is its own
-                            // `Entity<MessageItem>`, so a streaming delta re-renders only
-                            // that item; the list only re-invokes the closure for visible
-                            // items and reuses cached element subtrees for the rest.
+                            // Empty first screen shows the centered hero in place of
+                            // the (empty) message list; otherwise a flat, tail-
+                            // following conversation column. Each item is its own
+                            // `Entity<MessageItem>`, so a streaming delta re-renders
+                            // only that item (unchanged siblings reuse their cached
+                            // paint). The column is NOT virtualized: every item lays
+                            // out at its true height each frame, so there is no per-
+                            // item height cache to fall out of sync with async
+                            // markdown parsing — the root cause of the old
+                            // message-overlap bug under the virtualized `list`.
                             .children(hero)
                             .children((!first_screen).then(|| {
                                 let conv = self.conversation.clone();
-                                let list_el =
-                                    list(self.list_state.clone(), move |ix, _window, cx| {
-                                        conv.read(cx)
-                                            .items()
-                                            .get(ix)
-                                            .cloned()
-                                            .map(|item| {
-                                                v_flex()
-                                                    .pt_1()
-                                                    .pb_4()
-                                                    .child(item)
-                                                    .into_any_element()
-                                            })
-                                            .unwrap_or_else(|| gpui::Empty.into_any_element())
+                                // A flat, non-virtualized scroll column. `track_scroll`
+                                // wires the wheel/offset to `scroll_handle`; each
+                                // `MessageItem` renders at its true height so nothing
+                                // overlaps. Every item is painted every frame, but
+                                // unchanged `Entity<MessageItem>` subtrees reuse their
+                                // cached paint, so the per-frame cost stays bounded for
+                                // the conversation lengths manox handles.
+                                let items: Vec<_> = conv
+                                    .read(cx)
+                                    .items()
+                                    .iter()
+                                    .cloned()
+                                    .map(|item| {
+                                        v_flex().pt_1().pb_4().child(item).into_any_element()
                                     })
-                                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                                    .collect();
+                                // Tail-follow: while `stick_to_bottom` holds, re-pin the
+                                // viewport to the current bottom every prepaint. This
+                                // survives async content growth (a reply that grows a
+                                // frame later when its markdown parse lands) that a
+                                // one-shot scroll-on-append would miss. `scroll_to_bottom`
+                                // only sets a flag consumed in the scroll element's own
+                                // prepaint against that frame's fresh content height.
+                                let sticky = self.stick_to_bottom;
+                                let pin_handle = self.scroll_handle.clone();
+                                let list_el = v_flex()
+                                    .id("msg-scroll")
                                     .flex_1()
-                                    // The virtualized list is a custom element
-                                    // that sizes from its own style, not from
-                                    // the row's cross-axis stretch. `h_full`
-                                    // gives it a definite height equal to the
-                                    // row height, so `ListSizingBehavior::Auto`
-                                    // clips the viewport to that height instead
-                                    // of laying every item out at full content
-                                    // height and overflowing into the footer
-                                    // (the message-overlap bug). The shrink that
-                                    // keeps the row itself bounded lives on the
-                                    // ancestors' `min_h_0`, not on this cross-axis
-                                    // child.
-                                    .h_full();
-                                // Outline rail (left) + virtualized message
-                                // list (right) share the list region's height.
+                                    .w_full()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll_handle)
+                                    .children(items)
+                                    .on_prepaint(move |_bounds, _window, _cx| {
+                                        if sticky {
+                                            pin_handle.scroll_to_bottom();
+                                        }
+                                    })
+                                    .on_scroll_wheel(cx.listener(|this, _, _window, cx| {
+                                        // The built-in scroll handler applies the wheel
+                                        // delta before this (registered later ⇒ runs
+                                        // first in the reverse-order bubble phase), so
+                                        // `offset` is fresh here. `offset.y <= 0`, most
+                                        // negative at the bottom where it equals
+                                        // `-max_offset.y`; re-arm stick only within an
+                                        // 8px threshold of the bottom, disengage above.
+                                        let off = this.scroll_handle.offset().y;
+                                        let max = this.scroll_handle.max_offset().y;
+                                        this.stick_to_bottom = (max + off) < px(8.);
+                                        cx.notify();
+                                    }));
+                                // Outline rail (left) + flat message column (right)
+                                // share the list region's height.
                                 h_flex()
                                     .flex_1()
                                     .w_full()
