@@ -450,6 +450,13 @@ impl Workspace {
                         ApplyOutcome::All => {
                             this.list_state.remeasure_items(0..count);
                         }
+                        ApplyOutcome::RemovedTail => {
+                            // A transient Retry badge was popped without a
+                            // replacement; `count` is the new length, so the
+                            // dangling slot list_state still counts is at index
+                            // `count`. Splice it out.
+                            this.list_state.splice(count..count + 1, 0);
+                        }
                     }
                     cx.notify();
                 }
@@ -560,6 +567,9 @@ impl Workspace {
                         }
                         ApplyOutcome::All => {
                             this.list_state.remeasure_items(0..count);
+                        }
+                        ApplyOutcome::RemovedTail => {
+                            this.list_state.splice(count..count + 1, 0);
                         }
                         ApplyOutcome::Appended => {}
                     }

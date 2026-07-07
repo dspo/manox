@@ -101,6 +101,9 @@ pub enum ApplyOutcome {
     Appended,
     /// Every item may have changed (terminal `Stop`); remeasure all.
     All,
+    /// A trailing transient item (a `Retry` badge) was popped without a
+    /// replacement pushed. Splice the list count down by one at the tail.
+    RemovedTail,
 }
 
 #[derive(Debug, Default)]
@@ -206,6 +209,7 @@ impl ConversationState {
                 | ThreadEvent::ToolCall { .. }
                 | ThreadEvent::Error(_)
         ) && self.pop_trailing_retry(cx);
+        let len_after_pop = self.items.len();
 
         let outcome = match event {
             // Backfill plan text into the matching exit_plan_mode ToolCall
@@ -576,12 +580,19 @@ impl ConversationState {
             }
         };
 
-        // The arm pushed a real item into the slot the stale Retry badge
-        // occupied (pop + push = net zero), so the list length is unchanged.
-        // Tell the list state to remeasure that tail slot instead of splicing
-        // a new one.
-        if replaces_retry && matches!(outcome, ApplyOutcome::Appended) {
-            return ApplyOutcome::Remeasure(self.items.len().saturating_sub(1));
+        // Reconcile the list state with the stale `Retry` badge we popped at
+        // the top. The arm either pushed a new item into the freed slot (net
+        // zero — remeasure the tail) or updated an earlier item in place
+        // (net -1 — splice the dangling slot out). Detecting via length, not
+        // the arm's returned outcome, keeps this correct for arms like
+        // `ToolCall` whose Remeasure-vs-Appended branch depends on whether the
+        // tool id already existed.
+        if replaces_retry {
+            let len_after_arm = self.items.len();
+            if len_after_arm > len_after_pop {
+                return ApplyOutcome::Remeasure(len_after_arm.saturating_sub(1));
+            }
+            return ApplyOutcome::RemovedTail;
         }
         outcome
     }
