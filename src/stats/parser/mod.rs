@@ -8,6 +8,7 @@
 pub(super) mod claude;
 pub(super) mod codex;
 pub(super) mod copilot;
+pub(super) mod manox;
 pub(super) mod mimo;
 pub(super) mod omp_session;
 pub(super) mod pi;
@@ -66,6 +67,8 @@ pub(super) enum SourceKind {
     OmpSession,
     /// Mimo CLI session SQLite（~/.local/share/mimocode/mimocode.db）。
     MimoSession,
+    /// Manox agent SQLite（~/.config/cx/manox/threads.db）。
+    ManoxSession,
     /// pi coding-agent session jsonl（~/.pi/agent/sessions/）。
     PiSession,
 }
@@ -93,6 +96,12 @@ pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Result<ParseResult> {
                 consumed_bytes: 0,
             })
             .with_context(|| format!("Mimo 解析失败 ({})", path.display())),
+        SourceKind::ManoxSession => manox::parse(path)
+            .map(|entries| ParseResult {
+                entries,
+                consumed_bytes: 0,
+            })
+            .with_context(|| format!("Manox 解析失败 ({})", path.display())),
         _ => {
             let bytes = std::fs::read(path)
                 .with_context(|| format!("读取日志失败 ({})", path.display()))?;
@@ -107,7 +116,7 @@ pub(super) fn parse_file_from_offset(
     offset: u64,
 ) -> Result<ParseResult> {
     match kind {
-        SourceKind::MimoSession => parse_file(path, kind),
+        SourceKind::MimoSession | SourceKind::ManoxSession => parse_file(path, kind),
         _ => {
             let mut file =
                 File::open(path).with_context(|| format!("打开日志失败 ({})", path.display()))?;
@@ -139,7 +148,7 @@ fn parse_jsonl_content(path: &Path, kind: SourceKind, content: &str) -> Vec<RawE
         SourceKind::Copilot(agent) => copilot::parse(content, agent, path),
         SourceKind::OmpSession => omp_session::parse(content),
         SourceKind::PiSession => pi::parse(content),
-        SourceKind::MimoSession => unreachable!(),
+        SourceKind::MimoSession | SourceKind::ManoxSession => unreachable!(),
     }
 }
 
@@ -239,5 +248,6 @@ mod tests {
         assert!(!SourceKind::CodexLike("codex").supports_append_scan());
         assert!(!SourceKind::Copilot("copilot").supports_append_scan());
         assert!(!SourceKind::MimoSession.supports_append_scan());
+        assert!(!SourceKind::ManoxSession.supports_append_scan());
     }
 }

@@ -24,7 +24,12 @@ pub(super) fn date_field(value: Option<&Value>) -> Option<String> {
     if date.is_empty() { None } else { Some(date) }
 }
 
-/// Howard Hinnant date 算法：unix 秒 → "YYYY-MM-DD"（UTC）。
+/// Unix seconds → `"YYYY-MM-DD"` (UTC).
+pub(super) fn date_from_unix_secs(secs: i64) -> String {
+    unix_to_date(secs)
+}
+
+/// Howard Hinnant date algorithm: unix seconds → "YYYY-MM-DD" (UTC).
 fn unix_to_date(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let z = days + 719_468;
@@ -103,6 +108,12 @@ pub(super) fn previous_month_days(today: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn date_from_unix_secs_converts_to_ymd() {
+        assert_eq!(date_from_unix_secs(0), "1970-01-01");
+        assert_eq!(date_from_unix_secs(1_779_772_684), "2026-05-26");
+    }
 
     #[test]
     fn previous_month_days_varies_by_month() {

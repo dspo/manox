@@ -125,6 +125,7 @@ pub(crate) const AGENT_COPILOT: &str = "copilot";
 pub(crate) const AGENT_OMP: &str = "omp";
 pub(crate) const AGENT_MIMO: &str = "mimo";
 pub(crate) const AGENT_PI: &str = "pi";
+pub(crate) const AGENT_MANOX: &str = "manox";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_CLAUDE, "Claude Code"),
@@ -134,6 +135,7 @@ pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_COPILOT, "Copilot"),
     (AGENT_MIMO, "Mimo"),
     (AGENT_PI, "Pi"),
+    (AGENT_MANOX, "Manox"),
 ];
 
 /// 折线图调色板（与 Claude `/usage` 风格相近）。
@@ -206,6 +208,11 @@ fn log_sources() -> Vec<LogSource> {
             root: home.join(".pi/agent/sessions"),
             extra_file: None,
             kind: SourceKind::PiSession,
+        },
+        LogSource {
+            root: home.join(".config/cx/manox"),
+            extra_file: None,
+            kind: SourceKind::ManoxSession,
         },
     ]
 }
@@ -403,17 +410,25 @@ pub fn run_stats(config: StatsOutputConfig) -> Result<()> {
             active_extra_files.push(extra.clone());
         }
 
-        let mut files = if matches!(source.kind, SourceKind::MimoSession) {
-            let db_path = source.root.join("mimocode.db");
-            if db_path.is_file() {
-                vec![db_path]
-            } else {
-                Vec::new()
+        let mut files = match source.kind {
+            SourceKind::MimoSession => {
+                let db_path = source.root.join("mimocode.db");
+                if db_path.is_file() {
+                    vec![db_path]
+                } else {
+                    Vec::new()
+                }
             }
-        } else if source.root.exists() {
-            collect_jsonl_files(&source.root)
-        } else {
-            Vec::new()
+            SourceKind::ManoxSession => {
+                let db_path = source.root.join("threads.db");
+                if db_path.is_file() {
+                    vec![db_path]
+                } else {
+                    Vec::new()
+                }
+            }
+            _ if source.root.exists() => collect_jsonl_files(&source.root),
+            _ => Vec::new(),
         };
         if let Some(extra) = source.extra_file {
             if !files.iter().any(|p| p == &extra) {
@@ -612,6 +627,11 @@ fn render_race(records: &[UsageRecord], today: &str, period: types::Period) -> R
 /// 此函数将 `claude-*` 模型名中版本号部分的点号替换为连字符，
 /// 使之统一为 `claude-opus-4-7` 风格。非 Claude 模型保持原样（如 `gpt-5.4`）。
 pub(crate) fn normalize_model_name(model: &str) -> String {
+    // Manox model IDs carry a wire-API suffix: `{provider}/{model}/{wire_api}`.
+    // Strip it before the provider-prefix step so that rsplit_once picks the
+    // real model name, not the wire-API label.
+    let model = strip_wire_api_suffix(model);
+
     // 先剥离 provider 前缀（取最后一个 '/' 之后的部分）
     let base_model = model
         .rsplit_once('/')
@@ -655,6 +675,21 @@ fn strip_context_variant_suffix(model: &str) -> &str {
         Some(m) if m.start() > 0 => &model[..m.start()],
         _ => model,
     }
+}
+
+/// Strip known wire-API suffixes from manox-style model IDs.
+///
+/// Manox stores model IDs as `{provider}/{model}/{wire_api}`.
+/// Known wire-API labels: `"anthropic"`, `"completions"`, `"responses"`.
+/// Returns the input unchanged if the last segment is not a known label.
+fn strip_wire_api_suffix(model: &str) -> &str {
+    const WIRE_APIS: &[&str] = &["anthropic", "completions", "responses"];
+    if let Some((prefix, tail)) = model.rsplit_once('/') {
+        if !tail.is_empty() && WIRE_APIS.contains(&tail) && !prefix.is_empty() {
+            return prefix;
+        }
+    }
+    model
 }
 
 fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
@@ -754,6 +789,29 @@ mod tests {
         assert_eq!(normalize_model_name("model"), "model");
         // 空串不应崩溃
         assert_eq!(normalize_model_name(""), "");
+    }
+
+    #[test]
+    fn normalize_model_name_strips_wire_api_suffix() {
+        // Manox model IDs: {provider}/{model}/{wire_api}
+        assert_eq!(
+            normalize_model_name("百炼/glm-5.2[1m]/anthropic"),
+            "glm-5.2"
+        );
+        assert_eq!(
+            normalize_model_name("Anthropic/claude-opus-4.7[1m]/anthropic"),
+            "claude-opus-4-7"
+        );
+        assert_eq!(
+            normalize_model_name("OpenAI/gpt-4o[1m]/completions"),
+            "gpt-4o"
+        );
+        assert_eq!(
+            normalize_model_name("OpenAI/gpt-5.4/responses"),
+            "gpt-5.4"
+        );
+        // Unknown wire-API label → treated as provider prefix (last segment kept)
+        assert_eq!(normalize_model_name("provider/model/unknown"), "unknown");
     }
 
     #[test]
