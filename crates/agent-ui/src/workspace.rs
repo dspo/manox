@@ -3814,12 +3814,11 @@ impl Render for Workspace {
                             // Empty first screen shows the centered hero in place of
                             // the (empty) message list; otherwise a flat, tail-
                             // following conversation column. Each item is its own
-                            // `Entity<MessageItem>`, so a streaming delta re-renders
-                            // only that item (unchanged siblings reuse their cached
-                            // paint). The column is NOT virtualized: every item lays
-                            // out at its true height each frame, so there is no per-
-                            // item height cache to fall out of sync with async
-                            // markdown parsing — the root cause of the old
+                            // `Entity<MessageItem>`, so a streaming delta only marks
+                            // that item's entity dirty. The column is NOT virtualized:
+                            // every item lays out at its true height each frame, so
+                            // there is no per-item height cache to fall out of sync
+                            // with async markdown parsing — the root cause of the old
                             // message-overlap bug under the virtualized `list`.
                             .children(hero)
                             .children((!first_screen).then(|| {
@@ -3827,10 +3826,13 @@ impl Render for Workspace {
                                 // A flat, non-virtualized scroll column. `track_scroll`
                                 // wires the wheel/offset to `scroll_handle`; each
                                 // `MessageItem` renders at its true height so nothing
-                                // overlaps. Every item is painted every frame, but
-                                // unchanged `Entity<MessageItem>` subtrees reuse their
-                                // cached paint, so the per-frame cost stays bounded for
-                                // the conversation lengths manox handles.
+                                // overlaps. NOTE: without `.cached()` these items are
+                                // not paint-cached — every item re-renders, re-lays
+                                // out, and re-paints on each frame the workspace is
+                                // dirty (no virtualization culling either). Acceptable
+                                // for the conversation lengths manox handles; revisit
+                                // with `.cached()` or virtualization if long threads
+                                // drop frames during streaming.
                                 let items: Vec<_> = conv
                                     .read(cx)
                                     .items()
