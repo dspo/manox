@@ -212,6 +212,27 @@ mod tests {
     }
 
     #[test]
+    fn archive_round_trip() {
+        let db = open_mem();
+        db.upsert(&sample_record("t1"), true).unwrap();
+        assert!(!db.load("t1").unwrap().unwrap().archived);
+        assert!(db.list(false).unwrap().iter().any(|s| s.id == "t1"));
+
+        // Archive: row stays in `list(true)` but drops out of the default
+        // active-only list, and the loaded record reflects the flag.
+        db.archive("t1", true).unwrap();
+        let rec = db.load("t1").unwrap().unwrap();
+        assert!(rec.archived);
+        assert!(!db.list(false).unwrap().iter().any(|s| s.id == "t1"));
+        assert!(db.list(true).unwrap().iter().any(|s| s.id == "t1" && s.archived));
+
+        // Unarchive: row comes back into the active list.
+        db.archive("t1", false).unwrap();
+        assert!(!db.load("t1").unwrap().unwrap().archived);
+        assert!(db.list(false).unwrap().iter().any(|s| s.id == "t1"));
+    }
+
+    #[test]
     fn schema_rebuild_on_version_mismatch() {
         let mut conn = Connection::open_in_memory().unwrap();
         ThreadsDatabase::init_schema(&mut conn).unwrap();
