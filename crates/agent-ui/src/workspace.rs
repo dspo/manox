@@ -1299,6 +1299,24 @@ impl Workspace {
             .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
     }
 
+    /// Pin / unpin the active thread. The DB write + sidebar refresh runs
+    /// through `ThreadStore::pin_thread`; the in-memory `Thread` mirror is
+    /// flipped first so the menu label updates immediately on the next
+    /// re-open. Notifies the workspace so the menu trigger re-renders.
+    fn title_menu_toggle_pin(&mut self, cx: &mut Context<Self>) {
+        let id = self.thread.read(cx).id.0.clone();
+        let next = !self.thread.read(cx).is_pinned();
+        self.thread.update(cx, |t, cx| t.set_pinned(next, cx));
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.pin_thread(&id, next, cx));
+        let msg = if next {
+            i18n::t("titlebar-pinned-notice")
+        } else {
+            i18n::t("titlebar-unpinned-notice")
+        };
+        self.add_info_message(msg.to_string(), cx);
+    }
+
     /// Archive the active thread. Mirrors the sidebar archive action:
     /// mark the thread archived, drop its row from the list (default
     /// `include_archived=false`), and notice the user. Switching to a new
@@ -2295,6 +2313,7 @@ impl Workspace {
         use crate::views::title_menu::{TitleMenuCallbacks, build_title_menu};
 
         let open = self.title_menu_open;
+        let is_pinned = self.thread.read(cx).is_pinned();
         let is_archived = self.thread.read(cx).archived();
 
         let trigger = Button::new("titlebar-trigger")
@@ -2311,6 +2330,12 @@ impl Workspace {
                 let workspace = cx.entity();
                 let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
                     let cb = TitleMenuCallbacks {
+                        on_pin: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
+                            })
+                        },
                         on_archive: {
                             let ws = workspace.clone();
                             Rc::new(move |_, _, cx| {
@@ -2376,6 +2401,7 @@ impl Workspace {
                                 });
                             })
                         },
+                        is_pinned,
                         is_archived,
                     };
                     build_title_menu(menu, window, cx, cb)
