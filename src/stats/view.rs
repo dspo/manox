@@ -23,6 +23,7 @@ type ChartOccupancy = HashSet<(u16, u16)>;
 type RaceSnapshot = (usize, HashMap<(String, String), UsageTotals>);
 
 const MODEL_MIN_WIDTH: u16 = 26;
+const MAX_BAR_WIDTH: u16 = 30; // 视觉上限；与列宽解耦以避免宽终端下柱状图横贯整行
 const SHARE_WIDTH: u16 = 6;
 const TABLE_COLUMN_SPACING: u16 = 1;
 const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
@@ -1491,7 +1492,9 @@ fn draw_model_table_rows(
                 } else {
                     0.0
                 };
-                let share_width = (model_col_width as f64 * ratio).round() as usize;
+                // 柱状图容量封顶，避免宽终端下 max 模型底纹横扫整行
+                let bar_capacity = model_col_width.min(MAX_BAR_WIDTH as usize) as f64;
+                let share_width = (bar_capacity * ratio).round() as usize;
                 let model_len = model.chars().count();
                 let share_chars = share_width.min(model_len);
 
@@ -2495,15 +2498,22 @@ mod tests {
     }
 
     // Overview 的 Model 列底纹按 Total tokens 归一化（除以最大值，非总和）。
-    // 以下两组测试复刻 draw_model_table 中 ratio -> share_width 的计算公式，
-    // 锁定其行为契约：最大模型填满整列、其余按比例、不溢出列宽、空数据安全。
-    fn normalized_bar_width(total_tokens: u64, max_total_tokens: u64, col_width: usize) -> usize {
+    // 以下测试复刻 draw_model_table 中 ratio -> share_width 的计算公式，
+    // 锁定其行为契约：最大模型填满整列、其余按比例、不溢出列宽、空数据安全，
+    // 且在宽终端下被 MAX_BAR_WIDTH 封顶。
+    fn normalized_bar_width(
+        total_tokens: u64,
+        max_total_tokens: u64,
+        col_width: usize,
+        max_bar_width: usize,
+    ) -> usize {
         let ratio = if max_total_tokens > 0 {
             total_tokens as f64 / max_total_tokens as f64
         } else {
             0.0
         };
-        (col_width as f64 * ratio).round() as usize
+        let bar_capacity = (col_width as f64).min(max_bar_width as f64);
+        (bar_capacity * ratio).round() as usize
     }
 
     #[test]
@@ -2513,22 +2523,31 @@ mod tests {
 
         // 最大模型：ratio 恒为 1.0（同值自除），填满整列
         assert_eq!(
-            normalized_bar_width(max_tokens, max_tokens, col_width),
+            normalized_bar_width(max_tokens, max_tokens, col_width, MAX_BAR_WIDTH as usize),
             col_width
         );
 
         // 半量模型：恰好半宽
-        assert_eq!(normalized_bar_width(500_000, max_tokens, col_width), 12);
+        assert_eq!(
+            normalized_bar_width(500_000, max_tokens, col_width, MAX_BAR_WIDTH as usize),
+            12
+        );
 
         // 微量模型：四舍五入到 0
-        assert_eq!(normalized_bar_width(1, max_tokens, col_width), 0);
+        assert_eq!(
+            normalized_bar_width(1, max_tokens, col_width, MAX_BAR_WIDTH as usize),
+            0
+        );
 
         // 无数据（max_total_tokens = 0）：ratio = 0.0，安全降级为空底纹
-        assert_eq!(normalized_bar_width(0, 0, col_width), 0);
+        assert_eq!(
+            normalized_bar_width(0, 0, col_width, MAX_BAR_WIDTH as usize),
+            0
+        );
 
         // 即使 total_tokens 等于 max（并列最大）也填满整列，不溢出
         assert_eq!(
-            normalized_bar_width(max_tokens, max_tokens, col_width),
+            normalized_bar_width(max_tokens, max_tokens, col_width, MAX_BAR_WIDTH as usize),
             col_width
         );
     }
@@ -2541,7 +2560,9 @@ mod tests {
 
         let widths: Vec<usize> = tokens
             .iter()
-            .map(|&t| normalized_bar_width(t, max_tokens, col_width))
+            .map(|&t| {
+                normalized_bar_width(t, max_tokens, col_width, MAX_BAR_WIDTH as usize)
+            })
             .collect();
 
         // 比例正确：500 恰为 1000 的一半宽度
@@ -2550,5 +2571,42 @@ mod tests {
 
         // 任何模型底纹都不超过列宽（ratio <= 1.0 保证）
         assert!(widths.iter().all(|&w| w <= col_width));
+    }
+
+    #[test]
+    fn overview_bar_capped_at_max_bar_width_on_wide_terminal() {
+        // 宽终端下 Model 列会被 Min 约束扩到 200 字符，但柱状图封顶在 MAX_BAR_WIDTH
+        let col_width = 200;
+        let max_tokens = 1_000_000u64;
+        let cap = MAX_BAR_WIDTH as usize;
+
+        // 最大模型：被封顶在 MAX_BAR_WIDTH，不再等于扩出去的 col_width
+        assert_eq!(
+            normalized_bar_width(max_tokens, max_tokens, col_width, cap),
+            cap
+        );
+        // 半量模型：恰好 cap 的一半
+        assert_eq!(
+            normalized_bar_width(500_000, max_tokens, col_width, cap),
+            cap / 2
+        );
+        // 微量模型：四舍五入到 0
+        assert_eq!(
+            normalized_bar_width(1, max_tokens, col_width, cap),
+            0
+        );
+        // 窄列下 cap 不可见，行为与旧公式一致
+        assert_eq!(
+            normalized_bar_width(500_000, max_tokens, 24, cap),
+            12
+        );
+        // 任意占比都不超过 cap
+        let widths: Vec<usize> = (0..=100)
+            .map(|pct| {
+                let tokens = max_tokens * pct as u64 / 100;
+                normalized_bar_width(tokens, max_tokens, col_width, cap)
+            })
+            .collect();
+        assert!(widths.iter().all(|&w| w <= cap));
     }
 }
