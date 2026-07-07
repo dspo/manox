@@ -2745,10 +2745,18 @@ impl Workspace {
                             .child(plus)
                             .child(project_chip)
                             .when_some(worktree_chip, |el, chip| el.child(chip))
-                            .child(access)
-                            .child(effort),
+                            .child(access),
                     )
-                    .child(h_flex().items_center().gap_1().child(model).child(send)),
+                    // Effort lives next to the model selector — both describe
+                    // how the model reasons, so they read as one group.
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(effort)
+                            .child(model)
+                            .child(send),
+                    ),
             )
             .into_any_element()
     }
@@ -3600,10 +3608,16 @@ impl Render for Workspace {
                                 h_flex()
                                     .gap_2()
                                     .items_center()
+                                    .flex_1()
+                                    .min_w_0()
                                     .child(Icon::new(IconName::SquareTerminal).small())
                                     .child(
                                         gpui::div()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_sm()
+                                            .text_left()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
                                             .child(title_text),
                                     ),
                             ),
@@ -3995,10 +4009,16 @@ impl Render for Workspace {
                                         h_flex()
                                             .gap_2()
                                             .items_center()
+                                            .flex_1()
+                                            .min_w_0()
                                             .child(Icon::new(IconName::Bot).small())
                                             .child(
                                                 gpui::div()
-                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_sm()
+                                                    .text_left()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .child(title_text),
                                             )
                                             .child(self.render_title_menu_trigger(&theme, cx)),

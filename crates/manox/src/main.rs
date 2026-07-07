@@ -16,6 +16,15 @@ use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 
 actions!(manox, [Quit, ToggleFullscreen]);
 
+/// Minimum window width: sidebar (260) + divider (6) + a conversation column
+/// wide enough for the composer toolbar and a readable message line, with
+/// horizontal insets so content never kisses the edges.
+const MIN_WINDOW_W: f32 = 820.0;
+
+/// Minimum window height: title bar + several message lines + composer +
+/// footer hairline, with breathing room.
+const MIN_WINDOW_H: f32 = 520.0;
+
 fn main() {
     // Install a panic hook before anything else so a panic anywhere — main
     // thread, gpui foreground task, or a detached tokio worker — surfaces with
@@ -201,6 +210,9 @@ fn main() {
         let window_options = WindowOptions {
             titlebar: Some(TitleBar::title_bar_options()),
             window_bounds: Some(WindowBounds::centered(size(px(1100.), px(760.)), cx)),
+            // Floor below which the window can no longer shrink. Shared with
+            // Settings so both views respect one minimum width.
+            window_min_size: Some(size(px(MIN_WINDOW_W), px(MIN_WINDOW_H))),
             ..Default::default()
         };
 
