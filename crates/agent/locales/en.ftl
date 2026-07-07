@@ -218,6 +218,65 @@ settings-btn-add-server = + Add server
 settings-section-mcp-plugins = From plugins
 settings-row-mcp-plugin-name = codex_apps
 
+### views/plugin_manager.rs
+plugins-title = Plugins
+plugins-search-placeholder = Search plugins, skills, MCP…
+plugins-tab-marketplace = Marketplace
+plugins-tab-plugin = Plugin
+plugins-tab-skill = Skill
+plugins-tab-mcp = MCP
+plugins-busy = Working…
+plugins-new = New
+plugins-edit = Edit
+plugins-view = View
+plugins-copy = Copy
+plugins-select = Select
+plugins-delete = Delete
+plugins-update = Update
+plugins-install = Install
+plugins-uninstall = Uninstall
+plugins-installed = Installed
+plugins-not-installed = Not installed
+plugins-description = Description
+
+plugins-marketplace-url = Git URL, for example https://github.com/org/marketplace.git
+plugins-add-marketplace = Add marketplace
+plugins-marketplace-count = {$count} plugins
+plugins-marketplace-detail = {$name} plugins
+plugins-empty-marketplaces = No marketplaces found.
+plugins-empty-marketplace-selection = Select a marketplace to manage its plugins.
+plugins-empty-marketplace-plugins = This marketplace has no plugins.
+plugins-empty-installed = No installed plugins.
+plugins-error-marketplace-url = Enter a marketplace Git URL.
+plugins-notice-marketplace-added = Marketplace added.
+plugins-notice-marketplace-updated = Marketplace updated.
+plugins-notice-marketplace-removed = Marketplace removed.
+plugins-notice-plugin-installed = Plugin installed. Restart manox to load newly registered tools, skills, agents, hooks, and MCP servers.
+plugins-notice-plugin-removed = Plugin removed. Restart manox to unload runtime registries that were loaded at startup.
+
+plugins-skill-new = New user skill
+plugins-skill-edit = Edit user skill
+plugins-skill-name = Skill name
+plugins-skill-body = Skill body
+plugins-origin-user = User skill
+plugins-origin-plugin = Plugin: {$name}
+plugins-empty-skills = No skills found.
+plugins-notice-skill-saved = Skill saved. Restart manox or start a new process to refresh the model-visible skill registry.
+plugins-notice-skill-removed = Skill removed. Restart manox or start a new process to refresh the model-visible skill registry.
+
+plugins-mcp-new = New MCP server
+plugins-mcp-edit = Edit MCP server
+plugins-mcp-name = Server name
+plugins-mcp-command = Command, for example npx
+plugins-mcp-args = Args, space separated
+plugins-mcp-url = Streamable HTTP URL
+plugins-mcp-user = User mcp.toml
+plugins-mcp-plugin = Plugin-declared MCP
+plugins-empty-mcp = No user MCP servers configured.
+plugins-empty-plugin-mcp = No plugin-declared MCP servers found.
+plugins-notice-mcp-saved = MCP server saved to mcp.toml. Restart manox to connect it.
+plugins-notice-mcp-removed = MCP server removed from mcp.toml. Restart manox to disconnect a server already loaded at startup.
+
 ### views/settings.rs — Environment panel
 settings-panel-environment = Environment
 settings-desc-environment = Local environment for indicating how Codex should set up a worktree for a project
