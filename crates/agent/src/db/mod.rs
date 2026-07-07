@@ -91,14 +91,21 @@ impl ThreadsDatabase {
             )
             .context("drop legacy tables")?;
         } else {
-            // v2 → v3: add the `approval_mode` column. Existing rows default
-            // to 0 (OnRequest); any thread with `yolo = 1` is upgraded to
-            // Yolo by the read path in `threads.rs`.
+            // v2 → v3: add the columns that v3's `create_table` expects but
+            // that `CREATE TABLE IF NOT EXISTS` can't add to an existing
+            // pre-v3 table. The new columns default to 0/OnRequest; any
+            // thread with `yolo = 1` is upgraded to Yolo by the read path
+            // in `threads.rs`.
             tx.execute(
                 "ALTER TABLE threads ADD COLUMN approval_mode INTEGER NOT NULL DEFAULT 0;",
                 [],
             )
             .context("alter threads add approval_mode")?;
+            tx.execute(
+                "ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+                [],
+            )
+            .context("alter threads add pinned")?;
         }
         threads::create_table(&tx)?;
         events::create_table(&tx)?;
@@ -342,6 +349,18 @@ mod tests {
         // verified end-to-end by `load_promotes_legacy_yolo_to_approval_mode_yolo`
         // above — this test only guards the schema column itself.
         assert_eq!(mode, 0);
+        // The v2→v3 migration also adds the `pinned` column (added to the
+        // v3 `create_table` by main; pre-existing v2 dbs don't have it, and
+        // `CREATE TABLE IF NOT EXISTS` is a no-op on those, so the migration
+        // has to do it explicitly).
+        let pinned: i64 = conn
+            .query_row(
+                "SELECT pinned FROM threads WHERE id = 'yolo-row'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pinned, 0);
     }
 
     #[test]
