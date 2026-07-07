@@ -136,6 +136,7 @@ mod tests {
             depth: 0,
             parent_id: None,
             archived: false,
+            pinned: false,
             created_at: 1_700_000_000,
             interacted_at: 1_700_000_100,
             updated_at: 1_700_000_200,

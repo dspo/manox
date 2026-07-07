@@ -34,6 +34,8 @@ pub enum SidebarEvent {
     RenameThread(String),
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
+    /// User toggled the pin indicator. The bool is the new pinned state.
+    PinThread(String, bool),
 }
 
 pub struct Sidebar {
@@ -364,8 +366,10 @@ fn render_thread_item(
     let id_del = id.clone();
     let id_rename = id.clone();
     let id_archive = id.clone();
+    let id_pin = id.clone();
     let id_copy = id.clone();
     let archive_to = !summary.archived;
+    let pin_to = !summary.pinned;
     let display = summary.display_title();
     let title = if display.is_empty() {
         i18n::t("sidebar-empty-summary").to_string()
@@ -467,14 +471,25 @@ fn render_thread_item(
                 .gap_0p5()
                 .flex_1()
                 .min_w_0()
-                // Row 1: title (full width, no inline tag clutter).
+                // Row 1: title (full width, no inline tag clutter). A small
+                // pin star sits inline when the thread is pinned, so the
+                // floating-to-top ordering has a visible marker.
                 .child(
-                    gpui::div()
+                    h_flex()
+                        .gap_1()
+                        .items_center()
                         .min_w_0()
-                        .overflow_hidden()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(title),
+                        .when(summary.pinned, |this| {
+                            this.child(Icon::new(IconName::Star).xsmall().text_color(theme.accent))
+                        })
+                        .child(
+                            gpui::div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_sm()
+                                .text_color(theme.foreground)
+                                .child(title),
+                        ),
                 )
                 // Row 2: tag + tokens + relative time, with rename/archive/delete
                 // actions taking their place on hover.
@@ -497,7 +512,7 @@ fn render_thread_item(
                                 .child(gpui::div().child(tokens))
                                 .child(gpui::div().child(updated)),
                         )
-                        // Action group (rename / archive / delete), revealed on hover.
+                        // Action group (rename / pin / archive / delete), revealed on hover.
                         .child(
                             h_flex()
                                 .gap_0p5()
@@ -510,6 +525,22 @@ fn render_thread_item(
                                         .icon(IconName::Replace)
                                         .on_click(cx.listener(move |_this, _ev, _window, cx| {
                                             cx.emit(SidebarEvent::RenameThread(id_rename.clone()));
+                                        })),
+                                )
+                                .child(
+                                    Button::new(format!("pin-thread-{id_pin}"))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(if pin_to {
+                                            IconName::StarOff
+                                        } else {
+                                            IconName::Star
+                                        })
+                                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
+                                            cx.emit(SidebarEvent::PinThread(
+                                                id_pin.clone(),
+                                                pin_to,
+                                            ));
                                         })),
                                 )
                                 .child(

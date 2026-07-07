@@ -184,6 +184,28 @@ impl ThreadStore {
         .detach();
     }
 
+    /// Toggle the pinned flag on a thread. Pinned threads float to the top of
+    /// the sidebar list (SQL `ORDER BY pinned DESC, interacted_at DESC`).
+    /// Refreshes so the sidebar re-sorts after the toggle.
+    pub fn pin_thread(&self, id: &str, pinned: bool, cx: &mut Context<Self>) {
+        let db = self.db.clone();
+        let id = id.to_string();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { db.pin(&id, pinned) })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "pin thread 失败");
+            }
+            this.update(cx, |s, cx| {
+                s.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Append a `model_change` event to the thread's event stream. Called by the
     /// workspace when `ThreadEvent::ModelChanged` fires (mid-conversation switch).
     pub fn record_model_change(
