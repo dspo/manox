@@ -15,13 +15,14 @@ use std::collections::HashMap;
 
 use crate::language_model::TokenUsage;
 
-/// Cumulative + per-request token accounting, decoupled from `Thread`'s
+/// Cumulative + per-request + per-model token accounting, decoupled from `Thread`'s
 /// message storage. The owning `Thread` owns one of these and forwards.
 #[derive(Default)]
 pub struct TokenMeter {
     cumulative: TokenUsage,
     current_request: TokenUsage,
     per_request: HashMap<String, TokenUsage>,
+    per_model: HashMap<String, TokenUsage>,
 }
 
 impl TokenMeter {
@@ -32,6 +33,7 @@ impl TokenMeter {
             cumulative,
             current_request: TokenUsage::default(),
             per_request,
+            per_model: HashMap::new(),
         }
     }
 
@@ -43,6 +45,11 @@ impl TokenMeter {
     /// Per-user-message usage, keyed by `Message::id`.
     pub fn per_request(&self) -> &HashMap<String, TokenUsage> {
         &self.per_request
+    }
+
+    /// Per-model cumulative usage, keyed by model display name.
+    pub fn per_model(&self) -> &HashMap<String, TokenUsage> {
+        &self.per_model
     }
 
     /// Token usage attributed to the last user message, if the provider
@@ -58,8 +65,45 @@ impl TokenMeter {
     /// counter accrues to the cumulative. Returns the new cumulative so the
     /// caller can emit it without a second read.
     pub fn accumulate(&mut self, new: TokenUsage) -> TokenUsage {
+        let delta = self.compute_delta(new);
+        self.cumulative = self.cumulative + delta;
+        self.current_request = TokenUsage {
+            input_tokens: self.current_request.input_tokens.max(new.input_tokens),
+            output_tokens: self.current_request.output_tokens.max(new.output_tokens),
+            cache_creation_input_tokens: self
+                .current_request
+                .cache_creation_input_tokens
+                .max(new.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .current_request
+                .cache_read_input_tokens
+                .max(new.cache_read_input_tokens),
+        };
+        self.cumulative
+    }
+
+    /// Same as `accumulate` but also attributes the delta to a specific model.
+    pub fn accumulate_for_model(&mut self, new: TokenUsage, model: &str) -> TokenUsage {
+        let delta = self.compute_delta(new);
+        let cumulative = self.accumulate(new);
+        let entry = self.per_model.entry(model.to_owned()).or_default();
+        *entry = TokenUsage {
+            input_tokens: entry.input_tokens.saturating_add(delta.input_tokens),
+            output_tokens: entry.output_tokens.saturating_add(delta.output_tokens),
+            cache_creation_input_tokens: entry
+                .cache_creation_input_tokens
+                .saturating_add(delta.cache_creation_input_tokens),
+            cache_read_input_tokens: entry
+                .cache_read_input_tokens
+                .saturating_add(delta.cache_read_input_tokens),
+        };
+        cumulative
+    }
+
+    /// Delta between a new running-total report and the current high-water mark.
+    fn compute_delta(&self, new: TokenUsage) -> TokenUsage {
         let prev = self.current_request;
-        let delta = TokenUsage {
+        TokenUsage {
             input_tokens: new.input_tokens.saturating_sub(prev.input_tokens),
             output_tokens: new.output_tokens.saturating_sub(prev.output_tokens),
             cache_creation_input_tokens: new
@@ -68,19 +112,7 @@ impl TokenMeter {
             cache_read_input_tokens: new
                 .cache_read_input_tokens
                 .saturating_sub(prev.cache_read_input_tokens),
-        };
-        self.cumulative = self.cumulative + delta;
-        self.current_request = TokenUsage {
-            input_tokens: prev.input_tokens.max(new.input_tokens),
-            output_tokens: prev.output_tokens.max(new.output_tokens),
-            cache_creation_input_tokens: prev
-                .cache_creation_input_tokens
-                .max(new.cache_creation_input_tokens),
-            cache_read_input_tokens: prev
-                .cache_read_input_tokens
-                .max(new.cache_read_input_tokens),
-        };
-        self.cumulative
+        }
     }
 
     /// Attribute the in-flight request's usage to its triggering user message
@@ -150,5 +182,50 @@ mod tests {
             Some(u2),
             "finalize must stamp the high-water onto the user message"
         );
+    }
+
+    /// `accumulate_for_model` tracks per-model deltas independently while
+    /// keeping the same cumulative + high-water semantics as `accumulate`.
+    #[test]
+    fn accumulate_for_model_tracks_per_model_deltas() {
+        let mut m = TokenMeter::default();
+
+        // First turn with model A.
+        let a1 = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            ..Default::default()
+        };
+        m.accumulate_for_model(a1, "model-a");
+        assert_eq!(m.per_model.get("model-a").unwrap().input_tokens, 100);
+        assert_eq!(m.per_model.get("model-a").unwrap().output_tokens, 10);
+
+        // Second update still model A: delta = 50 in, 20 out.
+        let a2 = TokenUsage {
+            input_tokens: 150,
+            output_tokens: 30,
+            ..Default::default()
+        };
+        m.accumulate_for_model(a2, "model-a");
+        assert_eq!(m.per_model.get("model-a").unwrap().input_tokens, 150);
+        assert_eq!(m.per_model.get("model-a").unwrap().output_tokens, 30);
+
+        // Finalize and start a new turn with model B.
+        m.finalize_request(Some("uid-1"));
+        let b1 = TokenUsage {
+            input_tokens: 200,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        m.accumulate_for_model(b1, "model-b");
+        assert_eq!(m.per_model.get("model-b").unwrap().input_tokens, 200);
+        assert_eq!(m.per_model.get("model-b").unwrap().output_tokens, 50);
+
+        // Model A totals are preserved.
+        assert_eq!(m.per_model.get("model-a").unwrap().input_tokens, 150);
+
+        // Cumulative tracks the overall total.
+        assert_eq!(m.cumulative.input_tokens, 350);
+        assert_eq!(m.cumulative.output_tokens, 80);
     }
 }

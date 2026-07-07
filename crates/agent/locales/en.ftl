@@ -345,3 +345,19 @@ titlebar-unpinned-notice = Conversation unpinned.
 titlebar-archive-notice = Conversation archived.
 titlebar-not-implemented = Not implemented yet.
 titlebar-rename-notice = Rename dialog opened.
+
+# ── Environment info panel ──────────────────────────────────────────────
+workspace-env-title = Environment info
+workspace-env-changes = Changes
+workspace-env-local = Local {$name}
+workspace-env-no-project = No project
+workspace-env-model = Model {$name}
+workspace-env-modes = Modes
+workspace-env-plan-on = Plan mode
+workspace-env-plan-off = Normal planning
+workspace-env-yolo-on = Full access
+workspace-env-yolo-off = Approval mode
+workspace-env-auto-review = Auto review
+workspace-env-tokens = Tokens
+workspace-env-sources = Sources
+workspace-env-no-sources = No sources yet
