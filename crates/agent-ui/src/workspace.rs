@@ -39,7 +39,7 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::conversation::{ApplyOutcome, ConvItem, ConversationState};
+use crate::conversation::{ConvItem, ConversationState};
 use crate::views::centered;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
