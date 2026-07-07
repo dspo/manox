@@ -5,6 +5,8 @@
 
 pub mod conversation;
 pub mod dispatch;
+#[cfg(feature = "debug")]
+pub mod harness;
 pub mod slash_command;
 pub mod views;
 pub mod workspace;

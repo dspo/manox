@@ -4072,3 +4072,53 @@ impl Workspace {
         cx.notify();
     }
 }
+
+// Harness shims: pub(crate) wrappers over the private turn-driving methods so
+// the in-crate `harness` module (and the MCP dispatcher built on it) can drive
+// a Workspace programmatically — without a real `&mut Window` or physical
+// input. Each forwards to the existing private method; behavior is unchanged.
+// Gated on `debug` so the shims (and their Harness consumers) are absent from
+// a default build.
+#[cfg(feature = "debug")]
+impl Workspace {
+    pub(crate) fn harness_send_message(
+        &mut self,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.thread.read(cx).is_running() {
+            return Err("thread is already running a turn".into());
+        }
+        self.send_user_turn(text, Vec::new(), cx);
+        Ok(())
+    }
+
+    pub(crate) fn harness_approve(
+        &mut self,
+        decision: PermissionDecision,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let has = self.pending_ask.is_some() || !self.pending_auths.is_empty();
+        self.resolve_auth(decision, cx);
+        has
+    }
+
+    pub(crate) fn harness_plan_respond(&mut self, approve: bool, cx: &mut Context<Self>) -> bool {
+        let has = self.pending_plan.is_some();
+        self.respond_plan(approve, cx);
+        has
+    }
+
+    pub(crate) fn harness_new_thread(&mut self, cx: &mut Context<Self>) {
+        self.start_new_thread(cx);
+    }
+
+    pub(crate) fn harness_open_thread(&mut self, id: String, cx: &mut Context<Self>) -> bool {
+        let store = self.sidebar.read(cx).store();
+        let Some(loaded) = store.update(cx, |s, cx| s.load_thread(&id, cx)) else {
+            return false;
+        };
+        self.attach_thread(loaded, cx);
+        true
+    }
+}

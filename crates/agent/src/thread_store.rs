@@ -45,7 +45,7 @@ static GLOBAL: OnceLock<Entity<ThreadStore>> = OnceLock::new();
 /// don't touch the real `~/.config/cx/manox/threads.db`; `drop_for_test`
 /// clears it so gpui's leaked-handle check at teardown doesn't trip on an
 /// entity held alive by a process-global `OnceLock`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_OVERRIDE: std::sync::Mutex<Option<Entity<ThreadStore>>> = std::sync::Mutex::new(None);
 
 /// Open the db, load the summary list, and register the global `Entity`. Call at App startup.
@@ -71,7 +71,7 @@ pub fn init(cx: &mut App) {
 
 /// Returns the global `ThreadStore` `Entity`. Panics if `init` was not called.
 pub fn global() -> Entity<ThreadStore> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(entity) = TEST_OVERRIDE.lock().unwrap().clone() {
         return entity;
     }
@@ -305,7 +305,7 @@ pub fn save_thread(thread: Entity<Thread>, touch: bool, cx: &mut App) {
 /// `TEST_OVERRIDE` (not `GLOBAL`) precisely so `drop_for_test` can release the
 /// entity before teardown — a `OnceLock` can't be cleared, which would trip
 /// gpui's leaked-handle check. Pair every call with `drop_for_test`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn init_for_test(db: Arc<ThreadsDatabase>, cx: &mut App) {
     let entity = cx.new(|_cx| ThreadStore {
         db,
@@ -318,7 +318,7 @@ pub fn init_for_test(db: Arc<ThreadsDatabase>, cx: &mut App) {
 /// Release the test-only `ThreadStore` entity so its gpui handle is dropped
 /// before `TestAppContext` tears down. Call this at the end of any test that
 /// used `init_for_test` (a Drop guard is the robust pattern).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn drop_for_test() {
     *TEST_OVERRIDE.lock().unwrap() = None;
 }

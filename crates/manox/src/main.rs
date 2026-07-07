@@ -2,6 +2,13 @@
 //!
 //! Only handles window, theme, and tracing init, and mounts `agent_ui::Workspace` in the window.
 //! Agent logic lives in the `agent` crate; UI lives in the `agent-ui` crate.
+//!
+//! With the `debug` feature, `--mcp` keeps the same visible window and
+//! additionally serves the debug Harness over stdio JSON-RPC (see
+//! `mcp_server.rs`), so an external agent can drive the UI programmatically.
+
+#[cfg(feature = "debug")]
+mod mcp_server;
 
 use gpui::{App, AppContext as _, Menu, MenuItem, actions, px, size};
 use gpui::{WindowBounds, WindowOptions};
@@ -210,6 +217,26 @@ fn main() {
                 })
                 .expect("failed to open window");
             agent_ui::dispatch::set_window(handle);
+
+            // MCP mode: serve the debug Harness over stdio on the tokio runtime,
+            // bridged to the gpui-side dispatcher via an async_channel. The
+            // window stays visible. When stdio closes (the agent disconnected),
+            // `serve_server` returns, the sender drops, the dispatcher's
+            // `rx.recv()` errors out, and the dispatcher calls `cx.quit()`.
+            // Compiled only under `--features debug`.
+            #[cfg(feature = "debug")]
+            if std::env::args().any(|a| a == "--mcp") {
+                let Some(workspace) = agent_ui::dispatch::workspace_global() else {
+                    return;
+                };
+                let (tx, rx) = async_channel::bounded::<agent_ui::harness::bridge::McpRequest>(64);
+                cx.update(|cx| agent_ui::harness::bridge::spawn_dispatcher(cx, rx, workspace));
+                let server = mcp_server::ManoxMcpServer::new(tx);
+                agent::runtime::handle().spawn(async move {
+                    let (stdin, stdout) = rmcp::transport::stdio();
+                    let _ = rmcp::serve_server(server, (stdin, stdout)).await;
+                });
+            }
         })
         .detach();
     });

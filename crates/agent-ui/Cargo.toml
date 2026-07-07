@@ -16,6 +16,7 @@ chrono.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
@@ -23,9 +24,19 @@ gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 
-agent = { path = "../agent" }
-terminal = { path = "../terminal" }
-terminal-ui = { path = "../terminal-ui" }
+agent.workspace = true
+terminal.workspace = true
+terminal-ui.workspace = true
+
+[features]
+# In-process debug Harness + the `manox --mcp` server build on it. Off by
+# default so a release build pulls in neither the Harness code nor the rmcp
+# server; enable with `--features debug` (the `manox` crate forwards it).
+debug = []
+
+[dev-dependencies]
+agent = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
 
 [lints.clippy]
 dbg_macro = "deny"
