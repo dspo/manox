@@ -11,7 +11,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
@@ -158,10 +160,76 @@ impl Terminal {
         f(&term)
     }
 
+    /// Mutable access to the alacritty Term — for selection/scroll writes.
+    fn with_term_mut<R>(&self, f: impl FnOnce(&mut ManoxTerm) -> R) -> R {
+        let mut term = self.term.lock();
+        f(&mut term)
+    }
+
     /// Current terminal mode flags — callers (key/mouse mapping) branch on
     /// `APP_CURSOR`, `BRACKETED_PASTE`, mouse modes, etc.
     pub fn mode(&self) -> TermMode {
         self.with_term(|t| *t.mode())
+    }
+
+    /// Scroll the scrollback view by `delta` lines (negative = up into
+    /// history). The alt screen has no scrollback, so this is a no-op there.
+    pub fn scroll(&self, delta: i32, cx: &mut Context<Self>) {
+        self.with_term_mut(|t| t.scroll_display(Scroll::Delta(delta)));
+        cx.notify();
+    }
+
+    /// Selected text as a plain string, if a selection is active.
+    pub fn selection_to_string(&self) -> Option<String> {
+        self.with_term(|t| t.selection_to_string())
+    }
+
+    pub fn clear_selection(&self) {
+        self.with_term_mut(|t| t.selection = None);
+    }
+
+    /// Begin a simple (char-granularity) selection at `(row, col)` in visible
+    /// display coordinates. `row` 0 is the visible top line.
+    pub fn start_selection(&self, row: usize, col: usize, cx: &mut Context<Self>) {
+        self.with_term_mut(|t| {
+            let point = self.display_point(t, row, col);
+            t.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        });
+        cx.notify();
+    }
+
+    /// Extend the existing selection to `(row, col)`. No-op if no selection.
+    pub fn update_selection(&self, row: usize, col: usize, cx: &mut Context<Self>) {
+        self.with_term_mut(|t| {
+            if t.selection.is_none() {
+                return;
+            }
+            let point = self.display_point(t, row, col);
+            if let Some(sel) = t.selection.as_mut() {
+                sel.update(point, Side::Right);
+            }
+        });
+        cx.notify();
+    }
+
+    /// Map a visible `(row, col)` to an alacritty grid `Point`. The grid's
+    /// line 0 is the bottom-most screen line and grows negative into
+    /// scrollback; `display_offset` shifts the visible window into history.
+    fn display_point(&self, term: &ManoxTerm, row: usize, col: usize) -> Point {
+        let offset = term.grid().display_offset() as i32;
+        let line = row as i32 - (self.rows as i32 - 1) - offset;
+        Point::new(Line(line), Column(col))
+    }
+
+    /// Paste text, wrapping in bracketed-paste markers when the mode is set.
+    pub fn paste(&self, text: &str) -> std::io::Result<()> {
+        let mode = self.mode();
+        let bytes = if mode.contains(TermMode::BRACKETED_PASTE) {
+            format!("\x1b[200~{}\x1b[201~", text).into_bytes()
+        } else {
+            text.as_bytes().to_vec()
+        };
+        self.pty.write(&bytes)
     }
 }
 
