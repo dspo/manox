@@ -356,19 +356,45 @@ impl Drop for Thread {
                 .await;
             let clean = matches!(status, Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim().is_empty());
             if !clean {
-                return; // dirty — leave for inspection
+                tracing::debug!(
+                    worktree = %path.display(),
+                    "subagent worktree dirty or status failed — left on disk for inspection"
+                );
+                return;
             }
             let path_str = path.display().to_string();
-            let _ = tokio::process::Command::new("git")
+            // Remove the worktree first; only delete the branch on success so a
+            // failed remove (e.g. a concurrent write between the clean check
+            // and the remove) does not leave a branch-less orphan worktree.
+            let remove = tokio::process::Command::new("git")
                 .args(["worktree", "remove", &path_str])
                 .current_dir(&repo_root)
                 .output()
                 .await;
-            let _ = tokio::process::Command::new("git")
+            let removed = matches!(&remove, Ok(o) if o.status.success());
+            if !removed {
+                let stderr = remove
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                    .unwrap_or_default();
+                tracing::warn!(
+                    worktree = %path.display(),
+                    stderr = %stderr,
+                    "git worktree remove failed — worktree left on disk, branch preserved"
+                );
+                return;
+            }
+            let branch_del = tokio::process::Command::new("git")
                 .args(["branch", "-D", &branch])
                 .current_dir(&repo_root)
                 .output()
                 .await;
+            if !matches!(branch_del, Ok(o) if o.status.success()) {
+                tracing::warn!(
+                    branch = %branch,
+                    "worktree removed but branch -D failed — branch left behind"
+                );
+            }
         });
     }
 }
@@ -2240,6 +2266,25 @@ impl Thread {
         // English, only this one directive varies.
         if self.system.is_some() {
             system.push_str(crate::system_prompt::language_directive());
+            // A worktree-isolated sub-agent carries its own `system` from
+            // `agents/*.md`, so it never goes through
+            // `build_main_system_prompt` and would otherwise not see the
+            // "Active worktree" identity row. Append the worktree context so
+            // the sub-agent knows its cwd is a temporary worktree on a fresh
+            // branch (not the branch the parent mentioned) and that clean
+            // worktrees are auto-removed on exit.
+            if let Some(wt) = &self.worktree {
+                system.push_str(&format!(
+                    "\n\n## Active worktree\n\
+                     You are running inside a git worktree on branch `{branch}` at `{path}`. \
+                     Your cwd is this worktree, not the parent's project root. Work here; \
+                     git operations (commit/push) run without approval. A clean worktree is \
+                     auto-removed when you finish — commit or keep your work explicitly if it \
+                     must persist.",
+                    branch = wt.branch,
+                    path = wt.path.display()
+                ));
+            }
         }
         // In plan mode, append the read-only-constraint addendum so the model
         // knows it must submit a plan via `exit_plan_mode` rather than act.

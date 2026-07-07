@@ -155,8 +155,30 @@ impl AgentTool for EnterWorktreeTool {
                 .map_err(|_| "thread dropped".to_string())?;
 
             let (worktree_path, known_branch, is_existing) = match (&parsed.name, &parsed.path) {
-                (Some(name), None) => (worktree_dir(&project_root, name), Some(name.clone()), false),
-                (None, Some(path_str)) => (PathBuf::from(path_str), None, true),
+                (Some(name), None) => {
+                    validate_worktree_name(name)?;
+                    (worktree_dir(&project_root, name), Some(name.clone()), false)
+                }
+                (None, Some(path_str)) => {
+                    // Restrict re-entry to worktrees under this project's
+                    // `.claude/worktrees/` — otherwise an approval-gated
+                    // `enter_worktree path=/foreign/repo` would de-protect a
+                    // foreign repo's `.git` and enable network for it, a
+                    // privilege escalation beyond the intended same-repo
+                    // isolation context.
+                    let candidate = PathBuf::from(path_str);
+                    let anchor = project_root.join(".claude").join("worktrees");
+                    let canon_candidate = canonicalize_best_effort(&candidate);
+                    let canon_anchor = canonicalize_best_effort(&anchor);
+                    if !canon_candidate.starts_with(&canon_anchor) {
+                        return Err(format!(
+                            "enter_worktree `path` must be under {}. Got: {}",
+                            canon_anchor.display(),
+                            candidate.display()
+                        ));
+                    }
+                    (candidate, None, true)
+                }
                 (None, None) => {
                     let name = generate_name();
                     (worktree_dir(&project_root, &name), Some(name), false)
@@ -261,7 +283,16 @@ impl AgentTool for ExitWorktreeTool {
                 Ok(p) => p,
                 Err(e) => return Err(format!("exit_worktree input parse failed: {e}")),
             };
-            let action = parsed.action.as_deref().unwrap_or("keep").to_string();
+            let action = match parsed.action.as_deref() {
+                None | Some("keep") => "keep",
+                Some("remove") => "remove",
+                Some(other) => {
+                    return Err(format!(
+                        "exit_worktree `action` must be `keep` or `remove`, got: {other:?}"
+                    ));
+                }
+            }
+            .to_string();
             let discard = parsed.discard_changes.unwrap_or(false);
 
             let snap = parent
@@ -390,6 +421,54 @@ fn worktree_dir(project_root: &Path, name: &str) -> PathBuf {
     project_root.join(".claude").join("worktrees").join(name)
 }
 
+/// Validate a user-supplied worktree `name` (used as both the directory leaf
+/// and the git branch name). Rejects path separators, traversal, null, and a
+/// leading dash/dot — git's `check-ref-format` would reject most of these for
+/// the branch name anyway, but validating up front avoids stray directory
+/// creation via `ensure_parent` for a name that git will then refuse.
+fn validate_worktree_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("enter_worktree `name` cannot be empty".to_string());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(format!(
+            "enter_worktree `name` must not contain path separators: {name:?}"
+        ));
+    }
+    if name.contains("..") {
+        return Err(format!(
+            "enter_worktree `name` must not contain `..`: {name:?}"
+        ));
+    }
+    if name.starts_with('-') || name.starts_with('.') {
+        return Err(format!(
+            "enter_worktree `name` must not start with `-` or `.`: {name:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort canonicalize that resolves the longest existing ancestor and
+/// rejoins the tail — `Path::canonicalize` fails for non-existent paths, and a
+/// not-yet-created worktree leaf must still be compared against the anchor.
+/// Mirrors `sandbox::canonicalize_best_effort` without reaching across modules.
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    }
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    if parent == Path::new("") {
+        return path.to_path_buf();
+    }
+    let canon_parent = canonicalize_best_effort(parent);
+    match path.file_name() {
+        Some(name) => canon_parent.join(name),
+        None => canon_parent,
+    }
+}
+
 /// `wt-` + first 8 hex chars of a fresh UUID — short, unique, valid as both a
 /// directory and branch name.
 fn generate_name() -> String {
@@ -440,5 +519,22 @@ mod tests {
             absolutize(wt, ".git"),
             PathBuf::from("/tmp/proj/.claude/worktrees/wt-1/.git")
         );
+    }
+
+    #[test]
+    fn validate_name_rejects_traversal_and_separators() {
+        // A valid branch/dir name — accepted.
+        assert!(validate_worktree_name("feat-x").is_ok());
+        assert!(validate_worktree_name("wt-abc123").is_ok());
+        // Path separators, traversal, null, and leading dash/dot rejected so
+        // `name` cannot escape `.claude/worktrees/` or form a bad branch.
+        assert!(validate_worktree_name("").is_err());
+        assert!(validate_worktree_name("a/b").is_err());
+        assert!(validate_worktree_name(r"a\b").is_err());
+        assert!(validate_worktree_name("..").is_err());
+        assert!(validate_worktree_name("foo/../bar").is_err());
+        assert!(validate_worktree_name("a\0b").is_err());
+        assert!(validate_worktree_name("-branch").is_err());
+        assert!(validate_worktree_name(".hidden").is_err());
     }
 }
