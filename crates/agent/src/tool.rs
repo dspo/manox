@@ -12,15 +12,97 @@ pub mod permission;
 pub mod plan_mode;
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{App, Task};
 use tokio_util::sync::CancellationToken;
 
-use crate::language_model::LanguageModelRequestTool;
+use crate::language_model::{AnyLanguageModel, LanguageModelRequestTool};
 
 pub use permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
 pub use plan_mode::{ExitPlanModeTool, PlanApprovalResponse, exit_plan_mode_request_tool};
+
+/// Read-only runtime identity a tool reads from its owning `Thread`, passed
+/// into [`AgentTool::run`] / [`AgentTool::run_streaming`] per invocation.
+///
+/// Tools no longer hold a `WeakEntity<Thread>` reverse-reference: the snapshot
+/// is built once by `Thread::run_tool_inner` before the call, so the dependency
+/// direction is `Thread → tools` (the thread knows about its tools; tools do
+/// not know about the thread). The borrow lives only for the synchronous `run`
+/// call — tools extract owned data before spawning their `Task`, so the
+/// `&dyn ToolContext` never crosses an await boundary.
+pub trait ToolContext {
+    fn thread_id(&self) -> &str;
+    fn cwd(&self) -> &Path;
+    fn project(&self) -> Option<&PathBuf>;
+    fn model(&self) -> Option<&AnyLanguageModel>;
+    fn max_turns(&self) -> Option<u32>;
+    fn turn_count(&self) -> u32;
+    fn depth(&self) -> u32;
+    /// Whether the owning thread is in YOLO / AutoReview mode (bash uses this
+    /// to force the unsandboxed branch without a per-call escalation flag).
+    fn yolo(&self) -> bool;
+}
+
+/// Owned snapshot of a `Thread`'s read-only fields, built per tool call. The
+/// `AnyLanguageModel` is an `Arc` clone, so the snapshot is cheap; tools read
+/// what they need off `&self` synchronously and move owned data into their
+/// `Task`.
+pub struct ToolContextSnapshot {
+    thread_id: String,
+    cwd: PathBuf,
+    project: Option<PathBuf>,
+    model: Option<AnyLanguageModel>,
+    max_turns: Option<u32>,
+    turn_count: u32,
+    depth: u32,
+    yolo: bool,
+}
+
+impl ToolContextSnapshot {
+    /// Build a snapshot from a `Thread`'s current state. Called by
+    /// `run_tool_inner` immediately before invoking the tool.
+    pub fn from_thread(t: &crate::thread::Thread) -> Self {
+        Self {
+            thread_id: t.id.0.clone(),
+            cwd: t.cwd().to_path_buf(),
+            project: t.project().cloned(),
+            model: t.model().cloned(),
+            max_turns: t.max_turns(),
+            turn_count: t.turn_count(),
+            depth: t.depth(),
+            yolo: t.approval_mode() == crate::thread::ApprovalMode::Yolo,
+        }
+    }
+}
+
+impl ToolContext for ToolContextSnapshot {
+    fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+    fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+    fn project(&self) -> Option<&PathBuf> {
+        self.project.as_ref()
+    }
+    fn model(&self) -> Option<&AnyLanguageModel> {
+        self.model.as_ref()
+    }
+    fn max_turns(&self) -> Option<u32> {
+        self.max_turns
+    }
+    fn turn_count(&self) -> u32 {
+        self.turn_count
+    }
+    fn depth(&self) -> u32 {
+        self.depth
+    }
+    fn yolo(&self) -> bool {
+        self.yolo
+    }
+}
 
 /// Cloneable handle for live tool output. Tools that stream (e.g. `bash`)
 /// call [`ToolOutputSink::try_emit`] per output chunk; the owning `Thread`
@@ -88,6 +170,7 @@ pub trait AgentTool: Send + Sync + 'static {
         &self,
         input: serde_json::Value,
         cancel: CancellationToken,
+        ctx: &dyn ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>>;
 
@@ -100,10 +183,11 @@ pub trait AgentTool: Send + Sync + 'static {
         input: serde_json::Value,
         cancel: CancellationToken,
         sink: ToolOutputSink,
+        ctx: &dyn ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let _ = sink;
-        self.run(input, cancel, cx)
+        self.run(input, cancel, ctx, cx)
     }
 }
 
@@ -183,17 +267,12 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::thread::Thread;
     use crate::tools::base_tools;
-    use gpui::WeakEntity;
     use std::path::PathBuf;
 
     fn registry() -> ToolRegistry {
         let mut r = ToolRegistry::default();
-        for t in base_tools(
-            Arc::new(PathBuf::from(".")),
-            WeakEntity::<Thread>::new_invalid(),
-        ) {
+        for t in base_tools(Arc::new(PathBuf::from("."))) {
             r.register(t);
         }
         r
@@ -219,6 +298,7 @@ mod tests {
             &self,
             _input: serde_json::Value,
             _cancel: CancellationToken,
+            _ctx: &dyn ToolContext,
             _cx: &mut App,
         ) -> Task<Result<String, String>> {
             Task::ready(Ok("stub".to_string()))

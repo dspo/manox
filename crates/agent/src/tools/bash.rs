@@ -30,14 +30,12 @@ use brush_builtins::ShellBuilderExt;
 use brush_core::openfiles::{self, OpenFile, OpenFiles};
 use brush_core::results::ExecutionExitCode;
 use brush_core::{ExecutionResult, Shell, SourceInfo};
-use gpui::WeakEntity;
 use gpui::{App, AppContext as _, Task};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::thread::{ApprovalMode, Thread};
-use crate::tool::{AgentTool, ToolOutputSink};
+use crate::tool::{AgentTool, ToolContext, ToolOutputSink};
 use crate::tools::{bridge_tokio, schema};
 
 /// Wall-clock limit before a hung command is killed.
@@ -65,9 +63,6 @@ pub struct BashTool {
     /// Lazily-initialized persistent brush shell. One per `Thread` (the
     /// `ToolRegistry` is rebuilt per `Thread`).
     shell: Arc<tokio::sync::Mutex<Option<Shell>>>,
-    /// Owning thread, read to check YOLO mode (forces the unsandboxed branch
-    /// so bash runs outside seatbelt when YOLO is on). `None` in tests.
-    thread: Option<WeakEntity<Thread>>,
     /// Write-confinement policy shared with FS write tools (one derivation per
     /// registry rebuild). The sandboxed path feeds it to `wrap_command`'s
     /// seatbelt; the unsandboxed path uses `is_write_allowed` to reject a `cwd`
@@ -78,15 +73,10 @@ pub struct BashTool {
 }
 
 impl BashTool {
-    pub fn new(
-        cwd: PathBuf,
-        thread: WeakEntity<Thread>,
-        sandbox: crate::sandbox::SandboxPolicy,
-    ) -> Self {
+    pub fn new(cwd: PathBuf, sandbox: crate::sandbox::SandboxPolicy) -> Self {
         Self {
             cwd,
             shell: Arc::new(tokio::sync::Mutex::new(None)),
-            thread: Some(thread),
             sandbox,
         }
     }
@@ -179,17 +169,19 @@ impl AgentTool for BashTool {
         &self,
         input: serde_json::Value,
         cancel: CancellationToken,
+        ctx: &dyn ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         // Non-streaming entry: a throwaway sink whose chunks go unread.
         let (sink, _rx) = ToolOutputSink::channel("".into());
-        self.run_streaming(input, cancel, sink, cx)
+        self.run_streaming(input, cancel, sink, ctx, cx)
     }
     fn run_streaming(
         &self,
         input: serde_json::Value,
         cancel: CancellationToken,
         sink: ToolOutputSink,
+        ctx: &dyn ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<BashInput>(input) else {
@@ -204,12 +196,7 @@ impl AgentTool for BashTool {
         // YOLO mode forces the unsandboxed branch (DangerFullAccess): when the
         // owning thread has YOLO on, ignore the per-call `unsandboxed` flag and
         // always run via the persistent shell without seatbelt confinement.
-        let yolo = self
-            .thread
-            .as_ref()
-            .and_then(|t| t.upgrade())
-            .map(|t| t.read_with(cx, |t, _| t.approval_mode() == ApprovalMode::Yolo))
-            .unwrap_or(false);
+        let yolo = ctx.yolo();
         let unsandboxed = parsed.unsandboxed.unwrap_or(false) || yolo;
         bridge_tokio(cx, async move {
             if unsandboxed {

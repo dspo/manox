@@ -32,6 +32,8 @@ use crate::language_model::{
 };
 use crate::message::Message;
 use crate::prefix_stability::StablePrefix;
+use crate::title_state::TitleState;
+use crate::token_meter::TokenMeter;
 use crate::tool::{
     PermissionCache, PermissionDecision, PlanApprovalResponse, ToolAuthorizationResponse,
     ToolRegistry, exit_plan_mode_request_tool,
@@ -223,29 +225,16 @@ pub struct Thread {
     /// Pending plan-approval oneshots, keyed by the `exit_plan_mode` tool_use
     /// id. Mirrors `pending_authorizations` exactly.
     pending_plan_approval: HashMap<String, tokio::sync::oneshot::Sender<PlanApprovalResponse>>,
-    /// LLM-generated conversation title; `None` until the first title stream
-    /// lands. Main-thread only (sub-agents don't title). Displayed by the
-    /// sidebar in place of the mechanical first-message summary.
-    title: Option<String>,
-    /// Transient lock preventing concurrent title streams. Set `true` when a
-    /// title task is in flight, reset on completion (success or failure) so a
-    /// later turn can re-evaluate. Re-evaluation dedup is handled by
-    /// `title_last_eval_user_count` instead.
-    title_in_flight: bool,
-    /// The `user_count` at which a title was last evaluated. Prevents
-    /// re-evaluating at the same user-turn count (e.g. an assistant reply
-    /// landing without a new user message). Seeded from `restore` so a reloaded
-    /// thread continues the cadence without re-evaluating immediately.
-    title_last_eval_user_count: Option<usize>,
+    /// LLM title + re-eval cadence + user rename. The spawn that drives a
+    /// title turn lives in [`TitleState::maybe_generate`]; `Thread` passes in
+    /// depth / model / messages each call. `pub(crate)` so the spawn callback
+    /// in `title_state.rs` can write back the in-flight lock and the new title.
+    pub(crate) title_state: TitleState,
     /// Fingerprint of the system prompt + tool specs, tracked turn-over-turn
     /// so prefix drift (a history rewrite, tool hot-reload, plan-mode toggle)
     /// is observable rather than silently busting the provider's prefix cache.
     /// See [`crate::prefix_stability`].
     prefix_stability: StablePrefix,
-    /// User-supplied rename; takes display precedence over the LLM `title`.
-    /// Setting it must NOT suppress `maybe_generate_title` (the LLM may still
-    /// update `title` underneath); the sidebar reads `title_override` first.
-    title_override: Option<String>,
     /// Provider id of the current model, for per-provider stats in the sidebar.
     provider_id: Option<String>,
     /// Parent thread id for sub-agent lineage. `None` for main threads.
@@ -263,15 +252,11 @@ pub struct Thread {
     /// distinct from `updated_at` (any write) so background saves don't reset
     /// the "last active" ordering in the sidebar.
     interacted_at: i64,
-    /// Cumulative token usage across the whole thread (all turns). Mirrors zed's
-    /// `cumulative_token_usage`.
-    cumulative_token_usage: TokenUsage,
-    /// Running usage for the in-flight request, used to derive the delta that
-    /// accumulates into `cumulative_token_usage` at each `UsageUpdate`.
-    current_request_token_usage: TokenUsage,
-    /// Per-user-message usage keyed by `Message::id`. Mirrors zed's
-    /// `request_token_usage`; persisted to the `token_usage` table for SQL queries.
-    request_token_usage: HashMap<String, TokenUsage>,
+    /// Streaming token-usage accounting. Cumulative across the thread's life,
+    /// plus per-user-message attribution persisted to the `token_usage` table.
+    /// Decoupled from the message list: the triggering user-message id is
+    /// passed in by `Thread` on each `accumulate` / `finalize_request`.
+    token_meter: TokenMeter,
     /// Monotonic counter stamped into every `snapshot()` so the db `upsert`
     /// can reject out-of-order writes. `save_thread` is fire-and-forget: an
     /// older snapshot (e.g. taken at submit, before the turn produced assistant
@@ -305,7 +290,7 @@ impl Thread {
                 id,
                 messages: Vec::new(),
                 model,
-                tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
+                tools: Arc::new(tools::main_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
                 approval_mode: ApprovalMode::default(),
                 approval_ask_reasons: HashMap::new(),
@@ -325,20 +310,15 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                title: None,
-                title_in_flight: false,
-                title_last_eval_user_count: None,
+                title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
-                title_override: None,
                 provider_id,
                 parent_id: None,
                 archived: false,
                 pinned: false,
                 created_at: now,
                 interacted_at: now,
-                cumulative_token_usage: TokenUsage::default(),
-                current_request_token_usage: TokenUsage::default(),
-                request_token_usage: HashMap::new(),
+                token_meter: TokenMeter::default(),
                 persist_revision: AtomicU64::new(0),
             }
         })
@@ -380,7 +360,7 @@ impl Thread {
                 id: ThreadId(rec.id),
                 messages: rec.messages,
                 model,
-                tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
+                tools: Arc::new(tools::main_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
                 approval_mode: ApprovalMode::from_i64(rec.approval_mode),
                 approval_ask_reasons: HashMap::new(),
@@ -400,20 +380,22 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                title: rec.title,
-                title_in_flight: false,
-                title_last_eval_user_count,
+                title_state: TitleState::restore(
+                    rec.title,
+                    rec.title_override,
+                    title_last_eval_user_count,
+                ),
                 prefix_stability: StablePrefix::default(),
-                title_override: rec.title_override,
                 provider_id,
                 parent_id: rec.parent_id,
                 archived: rec.archived,
                 pinned: rec.pinned,
                 created_at: rec.created_at,
                 interacted_at: rec.interacted_at,
-                cumulative_token_usage: rec.cumulative_token_usage,
-                current_request_token_usage: TokenUsage::default(),
-                request_token_usage: rec.request_token_usage,
+                token_meter: TokenMeter::restore(
+                    rec.cumulative_token_usage,
+                    rec.request_token_usage,
+                ),
                 persist_revision: AtomicU64::new(rec.revision),
             }
         })
@@ -469,20 +451,15 @@ impl Thread {
                 session_started: false,
                 plan_mode: false,
                 pending_plan_approval: HashMap::new(),
-                title: None,
-                title_in_flight: false,
-                title_last_eval_user_count: None,
+                title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
-                title_override: None,
                 provider_id: None,
                 parent_id: None,
                 archived: false,
                 pinned: false,
                 created_at: chrono::Utc::now().timestamp(),
                 interacted_at: chrono::Utc::now().timestamp(),
-                cumulative_token_usage: TokenUsage::default(),
-                current_request_token_usage: TokenUsage::default(),
-                request_token_usage: HashMap::new(),
+                token_meter: TokenMeter::default(),
                 persist_revision: AtomicU64::new(0),
             }
         })
@@ -498,8 +475,8 @@ impl Thread {
         Some(ThreadRecord {
             id: self.id.0.clone(),
             summary: self.summary(),
-            title: self.title.clone(),
-            title_override: self.title_override.clone(),
+            title: self.title_state.snapshot_title(),
+            title_override: self.title_state.snapshot_override(),
             model_id,
             provider_id: self.provider_id.clone(),
             cwd: self.cwd.display().to_string(),
@@ -519,9 +496,9 @@ impl Thread {
             // No separate field; the session starts when the thread is created.
             session_started_at: self.created_at,
             revision,
-            cumulative_token_usage: self.cumulative_token_usage,
+            cumulative_token_usage: self.token_meter.cumulative(),
             messages: self.messages.clone(),
-            request_token_usage: self.request_token_usage.clone(),
+            request_token_usage: self.token_meter.per_request().clone(),
         })
     }
 
@@ -529,20 +506,18 @@ impl Thread {
     /// first-user-message summary. Used both for the sidebar and the persisted
     /// `ThreadRecord::summary`.
     fn summary(&self) -> String {
-        if let Some(title) = self.title.clone().filter(|t| !t.trim().is_empty()) {
-            return title;
-        }
-        self.mechanical_summary()
+        self.title_state
+            .title()
+            .map(str::to_string)
+            .unwrap_or_else(|| self.mechanical_summary())
     }
 
     /// User-facing display title with precedence: user rename > LLM title >
     /// mechanical summary. Mirrors [`crate::db::ThreadSummary::display_title`]
     /// so the title bar (live thread) and sidebar (loaded summaries) agree.
     pub fn display_title(&self) -> String {
-        self.title_override
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .or(self.title.as_deref().filter(|s| !s.trim().is_empty()))
+        self.title_state
+            .display()
             .map(str::to_string)
             .unwrap_or_else(|| self.summary())
     }
@@ -626,82 +601,12 @@ impl Thread {
         String::new()
     }
 
-    /// Maybe kick off an LLM title stream after a turn. Two modes:
-    /// - **first title** (`title` still `None`): build a request from the first
-    ///   user message + latest assistant reply and stream a concise title.
-    /// - **topic-shift re-eval** (`title` already set): on a cadence (first 3
-    ///   user turns, then every 5th), ask the model to emit a new title or the
-    ///   literal `UNCHANGED` sentinel.
-    ///
-    /// Bails out for sub-agents (`depth != 0`), when a title stream is already
-    /// in flight, when there is no assistant text yet, when the current
-    /// user-count was already evaluated, or when the cadence says skip. The
-    /// stream runs in a detached task; on success it stores the title (unless
-    /// the model said `UNCHANGED`) and persists with `touch=true` so the sidebar
-    /// refreshes.
+    /// Maybe kick off an LLM title stream after a turn. Delegates to
+    /// [`TitleState::maybe_generate`], passing this thread's depth / model /
+    /// messages as runtime context. See that method for the gating + cadence.
     fn maybe_generate_title(&mut self, cx: &mut Context<Self>) {
-        if self.depth != 0 || self.title_in_flight {
-            return;
-        }
-        let Some(model) = self.model.clone() else {
-            return;
-        };
-        if !self
-            .messages
-            .iter()
-            .any(|m| m.role == Role::Assistant && message_has_text(m))
-        {
-            return;
-        }
-        let user_count = self
-            .messages
-            .iter()
-            .filter(|m| m.role == Role::User && message_has_text(m))
-            .count();
-        if self.title_last_eval_user_count == Some(user_count) {
-            return;
-        }
-        if self.title.is_some() && !crate::title::should_retitle(user_count) {
-            return;
-        }
-        let is_first = self.title.is_none();
-        let request = if is_first {
-            crate::title::build_title_request(&self.messages)
-        } else {
-            crate::title::build_topic_shift_request(
-                self.title.as_deref().unwrap_or(""),
-                &self.messages,
-            )
-        };
-        self.title_in_flight = true;
-        self.title_last_eval_user_count = Some(user_count);
-        let entity = cx.entity();
-        cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let result = crate::title::stream_thread_title(&model, request, cx).await;
-            let mut changed = false;
-            this.update(cx, |t, cx| {
-                t.title_in_flight = false;
-                if let Ok(title) = result
-                    && !title.is_empty()
-                    && !crate::title::is_unchanged(&title)
-                {
-                    t.title = Some(title);
-                    changed = true;
-                }
-                cx.notify();
-            })
-            .ok();
-            if changed {
-                // Persist outside the thread's write lease. `save_thread` reads
-                // the entity snapshot (`thread.read(cx)`); doing that inside
-                // `this.update` would re-lease the same entity and trip gpui's
-                // double-lease panic — the SIGABRT from thread `4543a630`.
-                cx.update(|cx: &mut App| {
-                    crate::thread_store::save_thread(entity, true, cx);
-                });
-            }
-        })
-        .detach();
+        self.title_state
+            .maybe_generate(self.depth, self.model.as_ref(), &self.messages, cx);
     }
 
     /// Called after the UI resolves authorization: route the response to the
@@ -895,49 +800,25 @@ impl Thread {
 
     /// Cumulative token usage across the whole thread's life.
     pub fn cumulative_token_usage(&self) -> TokenUsage {
-        self.cumulative_token_usage
+        self.token_meter.cumulative()
     }
 
     /// Per-user-message usage, keyed by `Message::id`.
     pub fn request_token_usage(&self) -> &HashMap<String, TokenUsage> {
-        &self.request_token_usage
+        self.token_meter.per_request()
     }
 
     /// Token usage attributed to the last user message, if the provider
     /// reported any for this turn. Used by the UI to label the assistant reply
     /// that the turn produced.
     pub fn last_request_token_usage(&self) -> Option<TokenUsage> {
-        let id = self.last_user_message_id()?;
-        self.request_token_usage.get(id).copied()
+        self.token_meter.last_request(self.last_user_message_id())
     }
 
-    /// Fold a streaming `UsageUpdate` into the cumulative and per-request
-    /// counters. Mirrors zed's `accumulate_token_usage`: the API reports running
-    /// totals (monotonic), so the per-request counter takes the `max` and the
-    /// delta against the previous request counter accrues to the cumulative.
+    /// Fold a streaming `UsageUpdate` into the meter. The caller emits the
+    /// cumulative on `ThreadEvent::TokenUsageUpdated` after this returns.
     fn accumulate_token_usage(&mut self, new: TokenUsage) {
-        let prev = self.current_request_token_usage;
-        let delta = TokenUsage {
-            input_tokens: new.input_tokens.saturating_sub(prev.input_tokens),
-            output_tokens: new.output_tokens.saturating_sub(prev.output_tokens),
-            cache_creation_input_tokens: new
-                .cache_creation_input_tokens
-                .saturating_sub(prev.cache_creation_input_tokens),
-            cache_read_input_tokens: new
-                .cache_read_input_tokens
-                .saturating_sub(prev.cache_read_input_tokens),
-        };
-        self.cumulative_token_usage = self.cumulative_token_usage + delta;
-        self.current_request_token_usage = TokenUsage {
-            input_tokens: prev.input_tokens.max(new.input_tokens),
-            output_tokens: prev.output_tokens.max(new.output_tokens),
-            cache_creation_input_tokens: prev
-                .cache_creation_input_tokens
-                .max(new.cache_creation_input_tokens),
-            cache_read_input_tokens: prev
-                .cache_read_input_tokens
-                .max(new.cache_read_input_tokens),
-        };
+        self.token_meter.accumulate(new);
     }
 
     /// Attribute the in-flight request's usage to its triggering user message
@@ -946,11 +827,8 @@ impl Thread {
     /// turn still lands its partial usage and the next turn starts from zero
     /// instead of diffing against a stale counter.
     fn finalize_request_usage(&mut self) {
-        if let Some(uid) = self.last_user_message_id().map(str::to_owned) {
-            self.request_token_usage
-                .insert(uid, self.current_request_token_usage);
-        }
-        self.current_request_token_usage = TokenUsage::default();
+        let uid = self.last_user_message_id().map(str::to_owned);
+        self.token_meter.finalize_request(uid.as_deref());
     }
 
     pub fn cwd(&self) -> &std::path::Path {
@@ -977,7 +855,7 @@ impl Thread {
             return;
         }
         self.cwd = dir.clone();
-        self.tools = Arc::new(tools::default_registry(dir.clone(), cx.weak_entity()));
+        self.tools = Arc::new(tools::main_registry(dir.clone(), cx.weak_entity()));
         self.project = Some(dir);
         cx.notify();
     }
@@ -1619,15 +1497,17 @@ impl Thread {
         let input = tu.input.clone();
         let (sink, rx) = crate::tool::ToolOutputSink::channel(id.clone().into());
         let id_for_drain = id.clone();
-        // Invoke the tool via `cx.update` (App context, no entity lease) rather
-        // than `this.update`. `this.update` would hold a write lease on the
-        // owning Thread, and tools that read the owning Thread from inside
-        // their `run` — `self_info` does `self.thread.read_with` — would
-        // re-lease the same entity and trip gpui's `double_lease_panic`. The
-        // tool returns its `Task` synchronously and does not need the Thread
-        // leased on its behalf.
+        // Snapshot the read-only runtime identity once, before invocation. Tools
+        // read it off the `&dyn ToolContext` passed to `run_streaming` instead of
+        // holding a `WeakEntity<Thread>` and re-entering the entity from `run` —
+        // so the tool call itself never needs the Thread leased on its behalf.
+        // Invoke via `cx.update` (App context, no entity lease) rather than
+        // `this.update`: a write lease here would still block the drain spawn
+        // below from re-entering the entity, and historically tripped gpui's
+        // `double_lease_panic` when tools did their own `read_with`.
+        let ctx = this.read_with(cx, |t, _| crate::tool::ToolContextSnapshot::from_thread(t))?;
         let result_task: Task<Result<String, String>> =
-            cx.update(|cx| tool.run_streaming(input, cancel.clone(), sink, cx));
+            cx.update(|cx| tool.run_streaming(input, cancel.clone(), sink, &ctx, cx));
         // Drain live output chunks to the UI while the tool runs. A foreground
         // spawn is used (not background_spawn) because emitting requires an
         // `AsyncApp`, which is `!Send` (`Rc`-backed). The receiver closes once
@@ -1847,7 +1727,9 @@ impl Thread {
             }
             Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) => {
                 self.accumulate_token_usage(usage);
-                cx.emit(ThreadEvent::TokenUsageUpdated(self.cumulative_token_usage));
+                cx.emit(ThreadEvent::TokenUsageUpdated(
+                    self.cumulative_token_usage(),
+                ));
             }
             Ok(LanguageModelCompletionEvent::Stop(reason)) => {
                 self.finalize_assistant_message(cx);
@@ -2210,7 +2092,7 @@ pub(crate) fn truncate_summary(s: &str, max_chars: usize) -> String {
 }
 
 /// Whether a message has any non-empty `Text` content block.
-fn message_has_text(m: &Message) -> bool {
+pub(crate) fn message_has_text(m: &Message) -> bool {
     m.content
         .iter()
         .any(|c| matches!(c, MessageContent::Text(t) if !t.trim().is_empty()))
@@ -2300,7 +2182,7 @@ mod tests {
     use super::{model_facing_content, tool_title};
     use crate::language_model::{
         AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
-        LanguageModelToolResult, MessageContent, TokenUsage,
+        LanguageModelToolResult, MessageContent,
     };
     use crate::message::Message;
     use serde_json::json;
@@ -2781,78 +2663,10 @@ mod tests {
         );
     }
 
-    /// `accumulate_token_usage` mirrors zed's max+saturating_sub: the API sends
-    /// running totals, the per-request counter takes the high-water, and the
-    /// delta accrues to cumulative. `finalize_request_usage` stamps the
-    /// in-flight request onto its triggering user message and resets the
-    /// counter so the next turn diffs from zero.
-    #[test]
-    fn accumulate_token_usage_tracks_running_total_and_resets_on_finalize() {
-        crate::agent_def::init();
-
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            super::Thread::restore(
-                crate::db::ThreadRecord::for_test(
-                    "token-acc",
-                    "/tmp",
-                    vec![Message::user("hi".into())],
-                ),
-                None,
-                cx,
-            )
-        });
-
-        let u1 = TokenUsage {
-            input_tokens: 100,
-            output_tokens: 10,
-            ..Default::default()
-        };
-        let u2 = TokenUsage {
-            input_tokens: 120,
-            output_tokens: 40,
-            ..Default::default()
-        };
-        // Non-monotonic jitter: a later event reports a smaller running total.
-        let u_jitter = TokenUsage {
-            input_tokens: 110,
-            output_tokens: 20,
-            ..Default::default()
-        };
-
-        cx.update(|cx| {
-            thread.update(cx, |t, _cx| {
-                t.accumulate_token_usage(u1);
-                assert_eq!(t.cumulative_token_usage, u1);
-                assert_eq!(t.current_request_token_usage, u1);
-
-                // Second monotonic update: delta = u2 - u1, cumulative = u2.
-                t.accumulate_token_usage(u2);
-                assert_eq!(t.cumulative_token_usage, u2);
-                assert_eq!(t.current_request_token_usage, u2);
-
-                // Non-monotonic: delta = 0 (saturating_sub), high-water stays u2.
-                t.accumulate_token_usage(u_jitter);
-                assert_eq!(t.cumulative_token_usage, u2);
-                assert_eq!(t.current_request_token_usage, u2);
-
-                // Finalize: stamps u2 (the high-water) onto the user message
-                // and resets the per-request counter.
-                t.finalize_request_usage();
-                assert_eq!(t.current_request_token_usage, TokenUsage::default());
-                let uid = t
-                    .last_user_message_id()
-                    .expect("user message id")
-                    .to_owned();
-                assert_eq!(
-                    t.request_token_usage.get(&uid).copied(),
-                    Some(u2),
-                    "finalize must stamp the high-water onto the user message"
-                );
-            });
-        });
-    }
-
+    /// `accumulate_token_usage` / `finalize_request_usage` accounting is covered
+    /// in `token_meter::tests::accumulate_tracks_running_total_and_resets_on_finalize`
+    /// (no `Thread`/gpui fixture needed there — the meter is self-contained).
+    ///
     /// Live regression guard for the inter-batch yield fix: drives a real
     /// `run_turn` against Bailian glm-5.2[1m] through the full gpui↔tokio
     /// bridge. Before the fix, the yield future returned `Pending` forever,

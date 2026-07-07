@@ -3,7 +3,7 @@
 //! Mirrors `ProviderRegistry`: `init()` loads `~/.config/cx/manox/mcp.toml`,
 //! connects each server (stdio or streamable HTTP) on the tokio runtime,
 //! runs `tools/list`, and wraps each tool in an `McpTool`. `global()` serves
-//! the tool list to `tools::default_registry`.
+//! the tool list to `tools::main_registry`.
 //!
 //! First version is synchronous at startup: `init` blocks until all servers
 //! finish connecting (per-server 30s timeout). A failed server is warn-logged

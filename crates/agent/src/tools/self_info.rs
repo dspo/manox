@@ -9,28 +9,32 @@
 //! into `threads.db` (the failure mode behind thread `c5aefe4d`, where the
 //! agent ran `SELECT * FROM threads` and hallucinated off the truncated dump).
 //!
-//! Read-only, no approval. Holds a `WeakEntity<Thread>` to the owning thread,
-//! mirroring the `agent` tool's pattern.
+//! Read-only, no approval. Reads the owning `Thread`'s identity through a
+//! [`ToolContext`](crate::tool::ToolContext) snapshot built per call by
+//! `run_tool_inner`, so the tool itself holds no `Thread` reference.
 
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, Task, WeakEntity};
+use gpui::{App, AppContext as _, Task};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::thread::Thread;
-use crate::tool::{AgentTool as AgentToolTrait, AnyAgentTool};
+use crate::tool::{AgentTool as AgentToolTrait, AnyAgentTool, ToolContext};
 
-/// The `self_info` tool. `thread` weakly references the `Thread` that owns
-/// this tool so it can read the live runtime identity.
-pub struct SelfInfoTool {
-    thread: WeakEntity<Thread>,
+/// The `self_info` tool. Stateless — the runtime identity is read off the
+/// `ToolContext` snapshot passed into `run`, not held as a `Thread` reference.
+pub struct SelfInfoTool;
+
+impl Default for SelfInfoTool {
+    fn default() -> Self {
+        Self
+    }
 }
 
 impl SelfInfoTool {
-    pub fn new(thread: WeakEntity<Thread>) -> Self {
-        Self { thread }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -65,40 +69,38 @@ impl AgentToolTrait for SelfInfoTool {
         &self,
         _input: serde_json::Value,
         _cancel: CancellationToken,
+        ctx: &dyn ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let body = self.thread.read_with(cx, |t, _| {
-            let model = t
-                .model()
-                .map(|m| format!("{} ({})", m.name(), m.provider_name()))
-                .unwrap_or_else(|| "(none)".to_string());
-            let project = t
-                .project()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(unset)".to_string());
-            let max = t
-                .max_turns()
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "unlimited".to_string());
-            format!(
-                "thread id: {}\ncwd: {}\nproject: {}\nmodel: {}\nturn: {}/{}\ndepth: {}",
-                t.id.0,
-                t.cwd().display(),
-                project,
-                model,
-                t.turn_count(),
-                max,
-                t.depth(),
-            )
-        });
-        let s = body.unwrap_or_else(|_| "thread unavailable".to_string());
+        let model = ctx
+            .model()
+            .map(|m| format!("{} ({})", m.name(), m.provider_name()))
+            .unwrap_or_else(|| "(none)".to_string());
+        let project = ctx
+            .project()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unset)".to_string());
+        let max = ctx
+            .max_turns()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "unlimited".to_string());
+        let s = format!(
+            "thread id: {}\ncwd: {}\nproject: {}\nmodel: {}\nturn: {}/{}\ndepth: {}",
+            ctx.thread_id(),
+            ctx.cwd().display(),
+            project,
+            model,
+            ctx.turn_count(),
+            max,
+            ctx.depth(),
+        );
         cx.background_spawn(async move { Ok(s) })
     }
 }
 
 /// Upcast helper for registry construction.
-pub fn new(thread: WeakEntity<Thread>) -> AnyAgentTool {
-    Arc::new(SelfInfoTool::new(thread)) as AnyAgentTool
+pub fn new() -> AnyAgentTool {
+    Arc::new(SelfInfoTool) as AnyAgentTool
 }
 
 #[cfg(test)]
@@ -109,7 +111,7 @@ mod tests {
     fn name_is_self_info() {
         // provider API tool name charset is [a-zA-Z0-9_-]; "self_info" is valid
         // and reads like `self.info()` in OOP style.
-        let tool = SelfInfoTool::new(WeakEntity::<Thread>::new_invalid());
+        let tool = SelfInfoTool::new();
         assert_eq!(tool.name(), "self_info");
     }
 
@@ -117,22 +119,20 @@ mod tests {
     fn description_mentions_no_sql() {
         // The c5aefe4d failure mode: agent ran SQL to find its own thread id.
         // The description must steer the model away from the persistence layer.
-        let tool = SelfInfoTool::new(WeakEntity::<Thread>::new_invalid());
+        let tool = SelfInfoTool::new();
         assert!(tool.description().contains("do not run SQL"));
     }
 
-    /// `self_info` reads the owning `Thread` via `read_with`. The owning
-    /// `Thread`'s `run_tool_inner` invokes tools through `cx.update` (App
-    /// context, no entity lease) rather than `this.update` (which would hold
-    /// a write lease on that same Thread) precisely so this `read_with` does
-    /// not re-lease it and trip gpui's `double_lease_panic` — the SIGABRT
-    /// captured in thread `4543a630`. This test locks in the safe invocation
-    /// path: construct via `Thread::restore`, call `run` from `cx.update`, and
-    /// assert the identity is returned. `agent_def::init()` is required only
-    /// because `default_registry` eagerly registers the `agent` spawn tool,
-    /// which reads the subagent definition registry.
+    /// `self_info` reads the runtime identity off a `ToolContext` snapshot
+    /// built by `run_tool_inner`, not off a `WeakEntity<Thread>` held by the
+    /// tool. This test drives `run` directly with a snapshot built from a
+    /// restored `Thread` and asserts the identity is returned. The tool no
+    /// longer touches the `Thread` entity from `run`, so the double-lease
+    /// hazard that motivated the `cx.update` (not `this.update`) invocation
+    /// path in `run_tool_inner` is gone — `run_tool_inner_self_info_does_not_double_lease`
+    /// in `thread.rs` still guards the invocation path end-to-end.
     #[test]
-    fn run_returns_thread_identity_without_double_lease() {
+    fn run_returns_thread_identity_from_snapshot() {
         use std::sync::{Arc, Mutex};
 
         crate::agent_def::init();
@@ -145,13 +145,21 @@ mod tests {
                 cx,
             )
         });
-        let tool = SelfInfoTool::new(thread.downgrade());
+        let snapshot =
+            thread.read_with(&cx, |t, _| crate::tool::ToolContextSnapshot::from_thread(t));
+        let tool = SelfInfoTool::new();
 
         let result: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
         let r = result.clone();
         cx.spawn(|cx| {
-            let task =
-                cx.update(|cx| tool.run(serde_json::json!({}), CancellationToken::new(), cx));
+            let task = cx.update(|cx| {
+                tool.run(
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                    &snapshot,
+                    cx,
+                )
+            });
             async move {
                 *r.lock().unwrap() = Some(task.await);
             }
@@ -169,38 +177,5 @@ mod tests {
             out.contains("reg-4543a630"),
             "expected thread id in output, got: {out}"
         );
-    }
-
-    /// Documents the gpui invariant the `run_tool_inner` fix relies on:
-    /// holding a write lease on the owning `Thread` (via `Entity::update`)
-    /// while `self_info`'s `run` does `read_with` on the same entity
-    /// re-leases it and trips `double_lease_panic`. This is the SIGABRT from
-    /// thread `4543a630`, reproduced synchronously here without going through
-    /// `run_tool_inner` (which would need a full turn). It does not guard the
-    /// fix directly — it pins the invariant so a future re-introduction of
-    /// `this.update` wrapping in `run_tool_inner` has a concrete, failing
-    /// reference for why it breaks.
-    #[test]
-    #[should_panic(expected = "already being updated")]
-    #[allow(clippy::let_underscore_future)]
-    fn read_with_inside_owning_thread_write_lease_panics() {
-        crate::agent_def::init();
-
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            crate::thread::Thread::restore(
-                crate::db::ThreadRecord::for_test("double-lease-doc", "/tmp", Vec::new()),
-                None,
-                cx,
-            )
-        });
-        let tool = SelfInfoTool::new(thread.downgrade());
-        let thread_handle = thread.clone();
-
-        cx.update(|cx| {
-            thread_handle.update(cx, |_t, cx| {
-                let _ = tool.run(serde_json::json!({}), CancellationToken::new(), cx);
-            });
-        });
     }
 }

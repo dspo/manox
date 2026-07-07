@@ -103,6 +103,7 @@ impl AgentToolTrait for SpawnAgentTool {
         &self,
         input: serde_json::Value,
         cancel: CancellationToken,
+        ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         // The non-streaming entry point delegates to `run_streaming` with a
@@ -110,7 +111,7 @@ impl AgentToolTrait for SpawnAgentTool {
         // `run_streaming` directly, so this path is rarely hit.
         let (sink, _rx) = ToolOutputSink::channel(Arc::from(""));
         let _ = _rx;
-        self.run_streaming(input, cancel, sink, cx)
+        self.run_streaming(input, cancel, sink, ctx, cx)
     }
 
     fn run_streaming(
@@ -118,6 +119,7 @@ impl AgentToolTrait for SpawnAgentTool {
         input: serde_json::Value,
         cancel: CancellationToken,
         sink: ToolOutputSink,
+        _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let cwd = self.cwd.clone();
@@ -456,15 +458,17 @@ fn build_child_registry(
     child_weak: WeakEntity<Thread>,
 ) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
-    for tool in super::base_tools(cwd.clone(), child_weak.clone()) {
+    for tool in super::base_tools(cwd.clone()) {
         if is_tool_allowed(tool.name(), def) {
             reg.register(tool);
         }
     }
-    // self_info is per-thread (needs the child's WeakEntity), so it can't live
-    // in base_tools; register it here, subject to the same allow/disallow filter.
+    // self_info is per-thread (main-thread-only in `main_registry`); sub-agents
+    // register it here subject to the same allow/disallow filter. It is
+    // stateless now (reads the per-call `ToolContext`), but stays main+child
+    // only — never in `base_tools`.
     if is_tool_allowed("self_info", def) {
-        reg.register(super::self_info::new(child_weak.clone()));
+        reg.register(super::self_info::new());
     }
     if can_nest(def, child_depth) {
         reg.register(

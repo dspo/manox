@@ -1,0 +1,128 @@
+//! `glob` tool: gitignore-aware file-path glob match (the `ignore` crate walk
+//! + `globset` pattern match), capped and relaxable via flags.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use globset::{Glob, GlobSetBuilder};
+use gpui::{App, AppContext as _, Task};
+use ignore::WalkBuilder;
+use schemars::JsonSchema;
+use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
+
+use crate::tool::AgentTool;
+
+use super::{resolve_path, schema};
+
+pub struct GlobTool {
+    pub(crate) cwd: Arc<PathBuf>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GlobInput {
+    /// Glob pattern (e.g. `**/*.rs`), relative to `path`/cwd.
+    /// Supports `{a,b}` alternation, `[ab]` classes, `**` recursion.
+    /// `*.rs` matches top-level only; use `**/*.rs` for recursion.
+    pattern: String,
+    /// Search root, defaults to cwd.
+    #[serde(default)]
+    path: Option<String>,
+    /// When true, ignore all `.gitignore`/`.ignore`/global gitignore rules.
+    #[serde(default)]
+    no_ignore: bool,
+    /// When true, do not skip hidden (dot) files and directories.
+    #[serde(default)]
+    include_hidden: bool,
+    /// When true, also yield directory entries that match the pattern.
+    #[serde(default)]
+    include_dirs: bool,
+    /// Max results to return. Default 100. No hard ceiling — raising this
+    /// risks blowing up your own context window with a huge repo; narrow
+    /// `pattern` instead of raising `limit` when possible.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+impl AgentTool for GlobTool {
+    fn name(&self) -> &str {
+        "glob"
+    }
+    fn description(&self) -> &str {
+        "Find file paths matching a glob pattern (relative to cwd). Honors .gitignore and skips hidden files by default; returns relative paths, capped at 100. Pass no_ignore/include_hidden/include_dirs/limit to relax. Note: limit has no hard ceiling — raising it can blow up the context, so prefer narrowing the pattern first."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema::<GlobInput>()
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn run(
+        &self,
+        input: serde_json::Value,
+        _cancel: CancellationToken,
+        _ctx: &dyn crate::tool::ToolContext,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
+        let Ok(parsed) = serde_json::from_value::<GlobInput>(input) else {
+            return cx.background_spawn(async { Err("input parse failed".to_string()) });
+        };
+        let cwd = self.cwd.as_ref().clone();
+        cx.background_spawn(async move {
+            let root = parsed
+                .path
+                .map(|p| resolve_path(&p, &cwd))
+                .unwrap_or_else(|| cwd.clone());
+            let matcher = GlobSetBuilder::new()
+                .add(Glob::new(&parsed.pattern).map_err(|e| format!("glob invalid pattern: {e}"))?)
+                .build()
+                .map_err(|e| format!("glob build failed: {e}"))?;
+            let limit = parsed.limit.unwrap_or(100);
+            // Default flags enforce the strongest filtering; each toggle relaxes one axis.
+            let mut builder = WalkBuilder::new(&root);
+            builder
+                .hidden(!parsed.include_hidden)
+                .ignore(!parsed.no_ignore)
+                .git_ignore(!parsed.no_ignore)
+                .git_global(!parsed.no_ignore)
+                .git_exclude(!parsed.no_ignore)
+                .parents(!parsed.no_ignore);
+            let mut out: Vec<String> = Vec::new();
+            let mut truncated = false;
+            for entry in builder.build().by_ref() {
+                let Ok(e) = entry else { continue };
+                let path = e.path();
+                let is_dir = path.is_dir();
+                if is_dir {
+                    if !parsed.include_dirs {
+                        continue;
+                    }
+                } else if !path.is_file() {
+                    // Skip symlinks-to-nonfiles and special nodes.
+                    continue;
+                }
+                let rel = path.strip_prefix(&root).unwrap_or(path);
+                if matcher.is_match(rel) {
+                    out.push(rel.display().to_string());
+                    if out.len() >= limit {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+            out.sort();
+            if out.is_empty() {
+                Ok("No matching files".to_string())
+            } else if truncated {
+                // Count-based truncation (not byte), so it does not go through
+                // `TruncatedText`; the wording is unified to the `⚠` advisory style.
+                Ok(format!(
+                    "⚠ Too many matches (showing first {limit}, more omitted). Narrow `pattern` or raise `limit` and retry — do not speculate about omitted matches.\n\n{}",
+                    out.join("\n")
+                ))
+            } else {
+                Ok(out.join("\n"))
+            }
+        })
+    }
+}

@@ -89,6 +89,7 @@ impl AgentTool for AskUserQuestionTool {
         &self,
         _input: serde_json::Value,
         _cancel: CancellationToken,
+        _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         // Unreachable in normal flow: the thread intercepts AskUserQuestion at
