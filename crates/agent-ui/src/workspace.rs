@@ -2964,6 +2964,12 @@ impl Workspace {
         // `h_flex().flex_1().min_h(26)`, which both leaked vertical space
         // and — in the single-item case — clipped the v_flex content to
         // 26px. Doing it ourselves gives a content-sized, opaque popover.
+        //
+        // `w(360)` (not `max_w`) — with `min_w_0` on every text div, the
+        // v_flex's intrinsic min-content is tiny (just icon widths + padding),
+        // so `max_w` alone leaves the popover at ~140px and the subtitles
+        // wrap into single-word lines. A fixed 360px width gives the
+        // subtitles room to wrap at word boundaries.
         let content = build_approval_content(workspace.clone(), mode, cx);
         gpui::div()
             .relative()
@@ -2975,7 +2981,7 @@ impl Workspace {
                     .bottom_full()
                     .left_0()
                     .occlude()
-                    .max_w(gpui::px(360.))
+                    .w(gpui::px(360.))
                     .popover_style(cx)
                     .child(content)
                     .on_mouse_down_out(cx.listener(|this, _, _, cx| {
