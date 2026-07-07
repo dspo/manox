@@ -6,7 +6,9 @@
 //! `mcp_smoke_send_message` additionally needs the live provider config at
 //! `~/.config/cx/` and `MANOX_RUN_LIVE=1`.
 //!
-//! Run: `cargo test -p manox --test mcp_smoke -- --ignored --nocapture`
+//! Run: `cargo test -p manox --features debug --test mcp_smoke -- --ignored --nocapture`
+
+#![cfg(feature = "debug")]
 
 use std::collections::HashSet;
 use std::time::Duration;

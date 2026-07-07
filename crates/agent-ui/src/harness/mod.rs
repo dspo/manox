@@ -16,14 +16,14 @@
 pub mod bridge;
 pub mod types;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "debug"))]
 pub mod test_support;
-#[cfg(test)]
+#[cfg(all(test, feature = "debug"))]
 mod tests;
 
 pub use types::{IdleState, MessageSnapshot, ThreadInfo};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "debug"))]
 use std::time::Duration;
 
 use agent::language_model::Role;
@@ -213,7 +213,7 @@ impl Harness {
 /// executor (a `TestAppContext` test). Mirrors the live-test pattern at
 /// `thread.rs:~2927`: poll `is_running()`, run until parked, bound by a
 /// deadline. Real-window MCP callers use `bridge::await_idle` instead.
-#[cfg(test)]
+#[cfg(all(test, feature = "debug"))]
 pub fn await_idle_sync(
     workspace: &Entity<Workspace>,
     cx: &mut gpui::TestAppContext,

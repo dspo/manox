@@ -24,6 +24,14 @@ version = "0.1.0"
 publish = false
 
 [workspace.dependencies]
+# Workspace members — declared here so sub-crates reference them via
+# `foo.workspace = true` instead of relative `path = "../foo"`.
+agent = { path = "crates/agent" }
+agent-ui = { path = "crates/agent-ui" }
+manox = { path = "crates/manox" }
+terminal = { path = "crates/terminal" }
+terminal-ui = { path = "crates/terminal-ui" }
+
 anyhow = "1"
 async-channel = "2"
 futures = "0.3"

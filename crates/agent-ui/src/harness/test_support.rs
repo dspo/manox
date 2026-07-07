@@ -3,7 +3,7 @@
 //! (`thread.rs`) and live-test setup so `agent-ui` tests can drive turns
 //! offline without touching a real provider.
 
-#![cfg(test)]
+#![cfg(all(test, feature = "debug"))]
 
 use std::sync::Arc;
 

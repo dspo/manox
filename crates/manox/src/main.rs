@@ -3,10 +3,11 @@
 //! Only handles window, theme, and tracing init, and mounts `agent_ui::Workspace` in the window.
 //! Agent logic lives in the `agent` crate; UI lives in the `agent-ui` crate.
 //!
-//! `--mcp` keeps the same visible window and additionally serves the debug
-//! Harness over stdio JSON-RPC (see `mcp_server.rs`), so an external agent
-//! can drive the UI programmatically.
+//! With the `debug` feature, `--mcp` keeps the same visible window and
+//! additionally serves the debug Harness over stdio JSON-RPC (see
+//! `mcp_server.rs`), so an external agent can drive the UI programmatically.
 
+#[cfg(feature = "debug")]
 mod mcp_server;
 
 use gpui::{App, AppContext as _, Menu, MenuItem, actions, px, size};
@@ -16,8 +17,6 @@ use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 actions!(manox, [Quit, ToggleFullscreen]);
 
 fn main() {
-    let mcp_mode = std::env::args().any(|a| a == "--mcp");
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -194,7 +193,9 @@ fn main() {
             // window stays visible. When stdio closes (the agent disconnected),
             // `serve_server` returns, the sender drops, the dispatcher's
             // `rx.recv()` errors out, and the dispatcher calls `cx.quit()`.
-            if mcp_mode {
+            // Compiled only under `--features debug`.
+            #[cfg(feature = "debug")]
+            if std::env::args().any(|a| a == "--mcp") {
                 let Some(workspace) = agent_ui::dispatch::workspace_global() else {
                     return;
                 };

@@ -2,7 +2,7 @@
 //! they need the real provider config at `~/.config/cx/` and (for the live
 //! variant) `MANOX_RUN_LIVE=1`. Run with `cargo test -p agent-ui -- --ignored`.
 
-#![cfg(test)]
+#![cfg(all(test, feature = "debug"))]
 
 use std::time::Duration;
 

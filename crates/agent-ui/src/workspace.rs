@@ -3788,6 +3788,9 @@ impl Workspace {
 // the in-crate `harness` module (and the MCP dispatcher built on it) can drive
 // a Workspace programmatically — without a real `&mut Window` or physical
 // input. Each forwards to the existing private method; behavior is unchanged.
+// Gated on `debug` so the shims (and their Harness consumers) are absent from
+// a default build.
+#[cfg(feature = "debug")]
 impl Workspace {
     pub(crate) fn harness_send_message(
         &mut self,
