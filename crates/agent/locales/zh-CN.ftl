@@ -240,10 +240,28 @@ workspace-rename-title = 重命名对话
 workspace-rename-prompt = 输入新标题。留空则清除自定义名称，回退到生成的摘要。
 workspace-rename-confirm = 保存
 workspace-mode-normal = 普通
-workspace-mode-yolo = YOLO 模式
 workspace-mode-section = 模式
-workspace-yolo-on-notice = YOLO 模式已开启：工具调用免审批，bash 在沙箱外运行。
-workspace-yolo-off-notice = 已切换到普通模式：恢复审批与沙箱。
+workspace-mode-on-request-title = 请求审批
+workspace-mode-on-request-desc = 编辑外部文件或使用网络时总是询问
+workspace-mode-auto-review-title = 替我审批
+workspace-mode-auto-review-desc = 仅对检测到的风险操作请求审批
+workspace-mode-yolo-title = 完全访问
+workspace-mode-yolo-desc = 不受限制地访问互联网和电脑上的任何文件
+workspace-chip-mode-on-request = 请求审批
+workspace-chip-mode-auto-review = 替我审批
+workspace-chip-mode-yolo = 完全访问
+workspace-mode-title = 如何批准 Codex 操作？
+workspace-mode-learn-more = 了解更多
+workspace-mode-custom-title = 自定义 (config.toml)
+workspace-mode-custom-desc = 使用 config.toml 中定义的权限
+workspace-mode-notice = { $mode ->
+    [on-request] 已切换到请求审批模式。
+    [auto-review] 替我审批模式：安全工具调用免提示，风险操作仍会询问。
+   *[yolo] 完全访问：工具调用免审批，bash 在沙箱外运行。
+}
+workspace-approval-auto-review-note = 自动审核：{$reason}
+workspace-yolo-on-notice = 完全访问已开启：工具调用免审批，bash 在沙箱外运行。
+workspace-yolo-off-notice = 已切换到请求审批模式：恢复审批与沙箱。
 workspace-empty-prompt = 我们该做什么？
 
 ### views/composer_menu.rs
@@ -265,7 +283,7 @@ composer-tag-personal = 个人
 composer-tag-system = 系统
 
 ### slash_command.rs
-slash-yolo-desc = 切换 YOLO 模式（免审批 + bash 沙箱外）；带提示词则开启后直接开工
+slash-yolo-desc = 切换到完全访问（免审批 + bash 沙箱外）；带提示词则切换后直接开工
 slash-plan-desc = 进入计划模式：仅允许只读工具，研究后提交计划待批准（裸 `/plan` 切换；`/plan <提示>` 带提示进入）
 
 ### main.rs (system menus)

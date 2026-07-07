@@ -253,10 +253,28 @@ workspace-rename-title = Rename conversation
 workspace-rename-prompt = Enter a new title. Leave empty to clear the override and fall back to the generated summary.
 workspace-rename-confirm = Save
 workspace-mode-normal = Normal
-workspace-mode-yolo = YOLO mode
 workspace-mode-section = Mode
-workspace-yolo-on-notice = YOLO mode on: tool calls need no approval, bash runs outside the sandbox.
-workspace-yolo-off-notice = Switched to normal mode: approvals and sandbox restored.
+workspace-mode-on-request-title = Request approval
+workspace-mode-on-request-desc = Always ask when editing external files or using the internet
+workspace-mode-auto-review-title = Approve for me
+workspace-mode-auto-review-desc = Only request approval for detected risky operations
+workspace-mode-yolo-title = Full access
+workspace-mode-yolo-desc = Unrestricted access to the internet and any file on your computer
+workspace-chip-mode-on-request = Request approval
+workspace-chip-mode-auto-review = Approve for me
+workspace-chip-mode-yolo = Full access
+workspace-mode-title = How should Codex actions be approved?
+workspace-mode-learn-more = Learn more
+workspace-mode-custom-title = Custom (config.toml)
+workspace-mode-custom-desc = Use permissions defined in config.toml
+workspace-mode-notice = { $mode ->
+    [on-request] Switched to request-approval mode.
+    [auto-review] Approve-for-me mode: safe tool calls run without prompting, risky ones still ask.
+   *[yolo] Full access: tool calls need no approval, bash runs outside the sandbox.
+}
+workspace-approval-auto-review-note = Auto-review: {$reason}
+workspace-yolo-on-notice = Full access on: tool calls need no approval, bash runs outside the sandbox.
+workspace-yolo-off-notice = Switched to request-approval mode: approvals and sandbox restored.
 workspace-empty-prompt = What should we do?
 
 ### views/composer_menu.rs
@@ -278,7 +296,7 @@ composer-tag-personal = Personal
 composer-tag-system = System
 
 ### slash_command.rs
-slash-yolo-desc = Toggle YOLO mode (no approvals + bash outside sandbox); with a prompt, enables YOLO and starts working immediately
+slash-yolo-desc = Switch to Full access (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
 slash-plan-desc = Enter plan mode: read-only tools only, research then submit a plan for approval (bare `/plan` toggles; `/plan <prompt>` enters with a prompt)
 
 ### main.rs (system menus)

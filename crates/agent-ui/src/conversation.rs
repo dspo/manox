@@ -495,7 +495,7 @@ impl ConversationState {
                 }));
                 ApplyOutcome::Appended
             }
-            ThreadEvent::YoloToggled { .. } => {
+            ThreadEvent::ApprovalModeChanged { .. } => {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
                 ApplyOutcome::None
             }
