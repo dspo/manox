@@ -3370,8 +3370,8 @@ impl Render for Workspace {
                     .gap_2()
                     .relative()
                     .children(self.render_slash_overlay())
-                    .children(self.render_attachments(&theme, cx))
                     .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
+                    .children(self.render_attachments(&theme, cx))
                     .child(centered(self.render_composer(running, &theme, cx))),
             )
         };
