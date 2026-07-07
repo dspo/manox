@@ -234,12 +234,13 @@ fn setup_child(
         .map(|p| p.read_with(cx, |t, _| t.permission_snapshot()))
         .unwrap_or_default();
     let permission = Arc::new(PermissionCache::from_snapshot(parent_snapshot));
-    // Inherit the parent's YOLO flag so a YOLO session's sub-agents also skip
-    // approvals and run bash unsandboxed.
-    let parent_yolo = parent
+    // Inherit the parent's approval mode so an AutoReview/Yolo session's
+    // sub-agents also bypass the relevant permission gate and (for Yolo) run
+    // bash unsandboxed.
+    let parent_mode = parent
         .upgrade()
-        .map(|p| p.read_with(cx, |t, _| t.yolo()))
-        .unwrap_or(false);
+        .map(|p| p.read_with(cx, |t, _| t.approval_mode()))
+        .unwrap_or_default();
     let max_turns = def.max_turns.unwrap_or(10);
     let system_prompt = def_file.system_prompt.clone();
     let cwd_path = cwd.as_ref().clone();
@@ -248,7 +249,7 @@ fn setup_child(
         cwd_path,
         model,
         permission,
-        parent_yolo,
+        parent_mode,
         system_prompt,
         max_turns,
         child_depth,

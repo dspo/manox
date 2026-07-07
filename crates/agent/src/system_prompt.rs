@@ -29,6 +29,8 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
+use crate::thread::ApprovalMode;
+
 const STATIC_PROMPT: &str = include_str!("system_prompt.md");
 
 /// Build the main-thread system prompt from live thread state.
@@ -38,11 +40,15 @@ const STATIC_PROMPT: &str = include_str!("system_prompt.md");
 /// main thread.
 ///
 /// Assembly order is static-first (see module docs): the volatile identity
-/// block lands at the very end so toggling `yolo` or a day rollover only
-/// invalidates the cached tail, not the static prose. `PLAN_MODE_ADDENDUM`
+/// block lands at the very end so toggling `approval_mode` or a day rollover
+/// only invalidates the cached tail, not the static prose. `PLAN_MODE_ADDENDUM`
 /// (appended by `Thread::build_completion_request`) follows the identity block,
 /// so toggling plan mode likewise only busts the tail.
-pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>, yolo: bool) -> String {
+pub fn build_main_system_prompt(
+    cwd: &Path,
+    project: Option<&Path>,
+    approval_mode: ApprovalMode,
+) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
     let os = std::env::consts::OS;
@@ -79,10 +85,20 @@ pub fn build_main_system_prompt(cwd: &Path, project: Option<&Path>, yolo: bool) 
     prompt.push_str(&format!("- python3: {python3}\n"));
     prompt.push_str(&format!("- node: {node}\n"));
     prompt.push_str(&format!("- Today: {today}\n"));
-    if yolo {
-        prompt.push_str(
+    match approval_mode {
+        // OnRequest is the default; staying silent keeps the identity block
+        // byte-stable for the common case. AutoReview and Yolo are the two
+        // modes the model can act differently on, so only those are advertised
+        // — and without revealing the internal mechanism (the reviewer LLM
+        // exists, but the model doesn't need to know; adversarial framing
+        // risk if it does).
+        ApprovalMode::OnRequest => {}
+        ApprovalMode::AutoReview => {
+            prompt.push_str("- Mode: AutoReview (risky tool calls still ask before running)\n")
+        }
+        ApprovalMode::Yolo => prompt.push_str(
             "- Mode: YOLO (tool calls need no approval, bash runs outside the sandbox)\n",
-        );
+        ),
     }
 
     prompt
@@ -167,7 +183,7 @@ mod tests {
     #[test]
     fn prompt_contains_cwd_and_identity() {
         let cwd = Path::new("/tmp/some-proj");
-        let p = build_main_system_prompt(cwd, None, false);
+        let p = build_main_system_prompt(cwd, None, ApprovalMode::OnRequest);
         assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
         assert!(p.contains("manox agent"), "identity must appear: {p}");
         assert!(p.contains("Today:"), "date row must appear: {p}");
@@ -183,7 +199,7 @@ mod tests {
         // The identity names the product, not the implementation: the model has
         // no use for "GPUI"/"brush" or other framework names, and exposing
         // them only invites tangents.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(!p.contains("GPUI"), "must not leak tech stack: {p}");
         assert!(!p.contains("gpui"), "must not leak tech stack: {p}");
         assert!(!p.contains("brush"), "must not leak tech stack: {p}");
@@ -194,7 +210,7 @@ mod tests {
         // Identity is code-appended (no placeholder substitution), and it lands
         // at the very end of the prompt — after the static prose, skills, and
         // language directive — so the cacheable static prefix is maximal.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(!p.contains("{{"), "no placeholder syntax: {p}");
         assert!(
             p.contains("## Runtime identity"),
@@ -213,7 +229,7 @@ mod tests {
 
     #[test]
     fn prompt_includes_context_economy() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(
             p.contains("Context economy"),
             "context economy section: {p}"
@@ -228,13 +244,13 @@ mod tests {
     fn prompt_includes_project_when_set() {
         let cwd = Path::new("/tmp/some-proj");
         let proj = Path::new("/tmp/some-proj");
-        let p = build_main_system_prompt(cwd, Some(proj), false);
+        let p = build_main_system_prompt(cwd, Some(proj), ApprovalMode::OnRequest);
         assert!(p.contains("Project root"));
     }
 
     #[test]
     fn prompt_contains_engineering_stance() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(
             p.contains("Engineering stance"),
             "engineering stance section: {p}"
@@ -248,7 +264,7 @@ mod tests {
 
     #[test]
     fn prompt_contains_no_fabrication() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(
             p.contains("don't fabricate"),
             "no-fabrication discipline: {p}"
@@ -257,7 +273,7 @@ mod tests {
 
     #[test]
     fn prompt_contains_task_completion() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(
             p.contains("fully solved"),
             "task completion discipline: {p}"
@@ -266,7 +282,7 @@ mod tests {
 
     #[test]
     fn prompt_contains_validation_discipline() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(
             p.contains("Don't claim something passed without running it"),
             "validation discipline: {p}"
@@ -275,7 +291,7 @@ mod tests {
 
     #[test]
     fn prompt_contains_sandbox_boundary() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(
             p.contains("Tool sandbox boundary"),
             "sandbox boundary section: {p}"
@@ -296,7 +312,7 @@ mod tests {
         // prompt. The runtime identity block must not carry a thread id row —
         // the prose may mention "thread id" as a concept pointing to the tool,
         // but no concrete id value is injected here.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(
             !p.contains("Current thread id"),
             "no thread id row in runtime identity block: {p}"
@@ -306,7 +322,7 @@ mod tests {
     #[test]
     fn static_prompt_is_embedded_verbatim() {
         // Editing the markdown must show through without rebuilding logic.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(p.contains("Engineering stance"));
         assert!(p.contains("in-process native agent workbench"));
     }
@@ -314,7 +330,7 @@ mod tests {
     #[test]
     fn prompt_injects_language_directive() {
         // The current-locale language directive must land in the built prompt.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(p.contains("## Language"), "language section missing: {p}");
         assert!(
             p.contains("write your user-facing responses in"),
@@ -324,13 +340,13 @@ mod tests {
 
     #[test]
     fn yolo_mode_advertised_when_enabled() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, true);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::Yolo);
         assert!(p.contains("YOLO"), "yolo mode line missing: {p}");
     }
 
     #[test]
     fn yolo_mode_silent_when_disabled() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(
             !p.contains("YOLO"),
             "yolo must not appear when disabled: {p}"
@@ -353,7 +369,7 @@ mod tests {
         // the agent must answer first and ask before touching code (thread
         // bfb39601: agent started implementing on a "how do I add a
         // marketplace" question).
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(
             p.contains("Discussion vs implementation"),
             "discussion section: {p}"
@@ -379,7 +395,7 @@ mod tests {
         // success — the branch-tracking false-success regression (thread
         // e5047fd2) came from reporting push success without checking
         // `git log origin/<branch>`.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, false);
+        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest);
         assert!(p.contains("Git operations"), "git section: {p}");
         assert!(
             p.contains("git log origin/<branch>"),

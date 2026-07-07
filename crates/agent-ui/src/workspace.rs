@@ -15,6 +15,7 @@ use std::time::Duration;
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::provider::registry;
+use agent::thread::ApprovalMode;
 use agent::{
     PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, i18n, save_thread,
 };
@@ -46,10 +47,16 @@ use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::{AskCancel, AskNext, AskPrev, OpenSettings};
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
+///
+/// `reason` is populated by the `AutoReview` approval agent when it returns
+/// `Ask` for a tool call. It is rendered as a one-line muted note under the
+/// tool title in the auth overlay so the user can see why the reviewer
+/// escalated the call rather than auto-approving it.
 struct PendingAuth {
     id: String,
     tool_name: String,
     summary: String,
+    reason: Option<String>,
 }
 
 /// A pending plan approval prompted by `ThreadEvent::PlanProposed`. The plan
@@ -346,10 +353,20 @@ impl Workspace {
                         this.ask_step = 0;
                         this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
                     }
+                    // The `AutoReview` approval agent attaches a one-line reason
+                    // to every tool it escalates back to the overlay; pull it
+                    // out here so the user can see *why* the reviewer did not
+                    // auto-approve. We snapshot-and-clear on the Thread side
+                    // because each reason is single-use — a stale reason on
+                    // the next tool call would mislead the user.
+                    let reason = this
+                        .thread
+                        .update(cx, |t, _cx| t.take_approval_ask_reason(id.as_str()));
                     this.pending_auths.push(PendingAuth {
                         id: id.clone(),
                         tool_name: tool_name.clone(),
                         summary: summary.clone(),
+                        reason,
                     });
                     cx.notify();
                 }
@@ -377,7 +394,7 @@ impl Workspace {
                     }
                     cx.notify();
                 }
-                ThreadEvent::YoloToggled { .. } => {
+                ThreadEvent::ApprovalModeChanged { .. } => {
                     // Refresh the access chip + YOLO badge; no conversation item.
                     cx.notify();
                 }
@@ -1013,21 +1030,24 @@ impl Workspace {
     /// sees the state change in the conversation. Called by the `/yolo` slash
     /// command and the access-chip dropdown.
     pub(crate) fn toggle_yolo(&mut self, cx: &mut Context<Self>) {
-        let on = !self.thread.read(cx).yolo();
-        self.thread.update(cx, |t, cx| t.set_yolo(on, cx));
-        let msg = if on {
-            i18n::t("workspace-yolo-on-notice").to_string()
+        // `/yolo` (no args) flips between full access and request-approval —
+        // `AutoReview` is its own state and is only reachable via the chip
+        // popover, since slash-command users explicitly want "the other
+        // extreme" rather than the middle tier.
+        let next = if self.thread.read(cx).yolo() {
+            ApprovalMode::OnRequest
         } else {
-            i18n::t("workspace-yolo-off-notice").to_string()
+            ApprovalMode::Yolo
         };
-        self.add_info_message(msg, cx);
+        self.apply_approval_mode(next, cx);
     }
 
-    /// Enable YOLO and immediately send `prompt` as a user turn (the `/yolo
-    /// [prompt]` form). If YOLO is already on it stays on; the prompt still runs.
+    /// Enable full access and immediately send `prompt` as a user turn (the
+    /// `/yolo [prompt]` form). If full access is already on it stays on;
+    /// the prompt still runs.
     pub(crate) fn start_yolo_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
         if !self.thread.read(cx).yolo() {
-            self.thread.update(cx, |t, cx| t.set_yolo(true, cx));
+            self.apply_approval_mode(ApprovalMode::Yolo, cx);
         }
         self.send_user_turn(prompt, Vec::new(), cx);
     }
@@ -1291,6 +1311,7 @@ impl Workspace {
         let auth = self.pending_auths.last()?;
         let summary = auth.summary.clone();
         let tool_name = auth.tool_name.clone();
+        let reason = auth.reason.clone();
         // When several auths are queued behind the visible one, signal that
         // dismissing this card will surface the next.
         let queued = self.pending_auths.len().saturating_sub(1);
@@ -1335,6 +1356,19 @@ impl Workspace {
                                     &[("name", tool_name.as_str())],
                                 )),
                         )
+                        // Auto-review reason: a one-line muted note saying why the
+                        // reviewer escalated the call. Sourced from the thread's
+                        // `approval_ask_reasons` map; absent for tools that came
+                        // through `OnRequest` or `Yolo` paths.
+                        .children(reason.as_deref().map(|reason| {
+                            gpui::div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(i18n::t_str(
+                                    "workspace-approval-auto-review-note",
+                                    &[("reason", reason)],
+                                ))
+                        }))
                         .children(if queued > 0 {
                             Some(
                                 gpui::div()
@@ -2180,26 +2214,28 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Access chip: a dropdown to switch between normal mode (approvals +
-    /// sandbox) and YOLO mode (bypass approvals, bash unsandboxed). Mirrors the
-    /// model selector pattern. The dot color reflects the active mode (green for
-    /// normal, magenta for YOLO); the active row is checked in the dropdown.
-    /// Plan mode is a separate concern routed through the `+` button, not a
-    /// permission toggle.
+    /// Access chip + 3-tier approval popover.
+    ///
+    /// The chip is a mode-aware pill rendered next to the composer send button.
+    /// Each `ApprovalMode` gets its own icon + accent color (green thumbs-up for
+    /// `OnRequest`, blue bot for `AutoReview`, red triangle for `Yolo`) so the
+    /// current permission posture is legible at a glance — a 1-line summary of
+    /// what the model is allowed to do without prompting.
+    ///
+    /// Clicking the chip opens a `PopupMenu` mirroring the Codex-style header:
+    /// a question row with a "Learn more" link, three selectable rows (icon +
+    /// title + subtitle, check on the right), a hairline, and a 4th non-clickable
+    /// row pointing at `config.toml` for users who want a fully custom policy.
+    /// The popover is `max_w(360)` to fit the longest bilingual subtitle
+    /// ("Unrestricted access to the internet and any file on your computer")
+    /// without wrapping.
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let yolo = self.thread.read(cx).yolo();
+        let mode = self.thread.read(cx).approval_mode();
         let open = self.access_open;
-        let dot_color = if yolo {
-            gpui::hsla(0.83, 0.8, 0.55, 1.0)
-        } else {
-            theme.success
-        };
-        // "YOLO" is a proper noun, kept literal; the normal-mode label is localized.
-        let label: SharedString = if yolo {
-            "YOLO".into()
-        } else {
-            i18n::t("workspace-mode-normal")
-        };
+        // Pre-extract chip visuals so the click handler closure doesn't
+        // capture `theme` (which only lives for the method body) — closures
+        // passed to `cx.listener` must be `'static`.
+        let (chip_label, chip_color, chip_icon) = mode_chip_visual(mode, theme);
         let workspace = cx.entity();
 
         let trigger = h_flex()
@@ -2208,17 +2244,19 @@ impl Workspace {
             .gap_1()
             .px_2()
             .py_1()
+            .min_w(px(96.))
             .rounded(theme.radius)
             .bg(theme.secondary)
             .border_1()
             .border_color(theme.border)
             .cursor_pointer()
-            .child(gpui::div().size(px(6.)).rounded_full().bg(dot_color))
+            .child(Icon::new(chip_icon).xsmall().text_color(chip_color))
             .child(
                 gpui::div()
+                    .flex_1()
                     .text_xs()
-                    .text_color(theme.foreground)
-                    .child(label),
+                    .text_color(chip_color)
+                    .child(chip_label),
             )
             .child(
                 Icon::new(if open {
@@ -2235,46 +2273,11 @@ impl Workspace {
                     cx.notify();
                     return;
                 }
-                // Read yolo at click time so the checked row tracks the live
-                // state, not the snapshot from when the chip was last rendered.
-                let yolo_now = this.thread.read(cx).yolo();
+                // Snapshot the live mode at click time so the checkmark tracks
+                // the current state, not whatever the chip last rendered.
+                let mode_now = this.thread.read(cx).approval_mode();
                 this.access_open = true;
-                let ws_normal = workspace.clone();
-                let ws_yolo = workspace.clone();
-                let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-                    menu.max_w(gpui::px(180.))
-                        .label(i18n::t("workspace-mode-section"))
-                        .item(
-                            PopupMenuItem::new(i18n::t("workspace-mode-normal"))
-                                .checked(!yolo_now)
-                                .on_click(move |_, _window, cx| {
-                                    ws_normal.update(cx, |this, cx| {
-                                        this.thread.update(cx, |t, cx| t.set_yolo(false, cx));
-                                        this.add_info_message(
-                                            i18n::t("workspace-yolo-off-notice").to_string(),
-                                            cx,
-                                        );
-                                        this.close_access_menu();
-                                        cx.notify();
-                                    });
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new(i18n::t("workspace-mode-yolo"))
-                                .checked(yolo_now)
-                                .on_click(move |_, _window, cx| {
-                                    ws_yolo.update(cx, |this, cx| {
-                                        this.thread.update(cx, |t, cx| t.set_yolo(true, cx));
-                                        this.add_info_message(
-                                            i18n::t("workspace-yolo-on-notice").to_string(),
-                                            cx,
-                                        );
-                                        this.close_access_menu();
-                                        cx.notify();
-                                    });
-                                }),
-                        )
-                });
+                let menu = build_approval_popover(window, workspace.clone(), mode_now, cx);
                 let sub = cx.subscribe(
                     &menu,
                     |this: &mut Workspace,
@@ -3030,4 +3033,257 @@ fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk>
         others: Vec::new(),
         response_input: None,
     })
+}
+
+/// Map an `ApprovalMode` to the chip's (label, accent color, icon) triple.
+///
+/// Colors are theme tokens, not raw hsla values, so the chip follows the
+/// active theme (light/dark) without bespoke palettes per mode. The
+/// `OnRequest` accent uses `success` (green) as a "this is the safe default"
+/// signal — staying gray would be visually identical to a disabled state.
+fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::Hsla, IconName) {
+    match mode {
+        ApprovalMode::OnRequest => (
+            i18n::t("workspace-chip-mode-on-request"),
+            theme.success,
+            IconName::ThumbsUp,
+        ),
+        ApprovalMode::AutoReview => (
+            i18n::t("workspace-chip-mode-auto-review"),
+            theme.info,
+            IconName::Bot,
+        ),
+        ApprovalMode::Yolo => (
+            i18n::t("workspace-chip-mode-yolo"),
+            theme.danger,
+            IconName::TriangleAlert,
+        ),
+    }
+}
+
+/// Build the 3-tier approval `PopupMenu`. Mirrors the Codex layout:
+///   - title row: localized question + a "Learn more" link on the right
+///   - three selectable rows (icon + title + subtitle, check on the right)
+///   - hairline separator
+///   - non-clickable "Custom (config.toml)" info row
+///
+/// Width is `360px` to fit the longest bilingual subtitle. Each clickable row
+/// routes through `Workspace::apply_approval_mode` so the mode switch +
+/// notice + menu close stay in one place.
+///
+/// `theme` is consumed up front: every value used inside the `'static` row
+/// closures is pre-extracted into owned `SharedString`/`Hsla`/`IconName`,
+/// so the closures don't capture a short-lived theme reference.
+fn build_approval_popover(
+    window: &mut gpui::Window,
+    workspace: Entity<Workspace>,
+    current: ApprovalMode,
+    cx: &mut gpui::App,
+) -> Entity<PopupMenu> {
+    let fg: gpui::Hsla = cx.theme().foreground;
+    let muted: gpui::Hsla = cx.theme().muted_foreground;
+    let success: gpui::Hsla = cx.theme().success;
+    let info: gpui::Hsla = cx.theme().info;
+    let danger: gpui::Hsla = cx.theme().danger;
+    let border: gpui::Hsla = cx.theme().border;
+
+    PopupMenu::build(window, cx, move |menu, _window, _cx| {
+        // Title row: localized question on the left, "Learn more" link on the
+        // right (decorative for now — surfaces a question, doesn't navigate).
+        let title_text = i18n::t("workspace-mode-title");
+        let learn_more = i18n::t("workspace-mode-learn-more");
+        let header = PopupMenuItem::element(move |_window, _cx| {
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(title_text.clone()),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            gpui::div()
+                                .text_xs()
+                                .text_color(info)
+                                .child(learn_more.clone()),
+                        )
+                        .child(Icon::new(IconName::ArrowRight).xsmall().text_color(info)),
+                )
+        });
+        let menu = menu.max_w(gpui::px(360.)).item(header);
+
+        // Three selectable rows — one per ApprovalMode. Theme values are
+        // pre-extracted into the `RowSpec` so the helper stays at ≤7 args
+        // (clippy::too_many_arguments) — passing 9 distinct colors / strings
+        // every call was the only thing tripping the lint.
+        let menu = append_mode_row(
+            menu,
+            workspace.clone(),
+            RowSpec {
+                mode: ApprovalMode::OnRequest,
+                title: i18n::t("workspace-mode-on-request-title"),
+                subtitle: i18n::t("workspace-mode-on-request-desc"),
+                icon: IconName::ThumbsUp,
+                accent: success,
+                muted,
+                selected: current == ApprovalMode::OnRequest,
+            },
+        );
+        let menu = append_mode_row(
+            menu,
+            workspace.clone(),
+            RowSpec {
+                mode: ApprovalMode::AutoReview,
+                title: i18n::t("workspace-mode-auto-review-title"),
+                subtitle: i18n::t("workspace-mode-auto-review-desc"),
+                icon: IconName::Bot,
+                accent: info,
+                muted,
+                selected: current == ApprovalMode::AutoReview,
+            },
+        );
+        let menu = append_mode_row(
+            menu,
+            workspace.clone(),
+            RowSpec {
+                mode: ApprovalMode::Yolo,
+                title: i18n::t("workspace-mode-yolo-title"),
+                subtitle: i18n::t("workspace-mode-yolo-desc"),
+                icon: IconName::TriangleAlert,
+                accent: danger,
+                muted,
+                selected: current == ApprovalMode::Yolo,
+            },
+        );
+
+        // Hairline + the 4th non-clickable info row pointing users at
+        // config.toml for fully custom policy. Disabled so hover/click
+        // pass through; styled with `muted` to read as a label, not a
+        // selectable option.
+        let custom_title = i18n::t("workspace-mode-custom-title");
+        let custom_desc = i18n::t("workspace-mode-custom-desc");
+        let custom_row = PopupMenuItem::element(move |_window, _cx| {
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .child(Icon::new(IconName::Settings).small().text_color(muted))
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(custom_title.clone()),
+                )
+        })
+        .disabled(true);
+        let separator_row = PopupMenuItem::element(move |_window, _cx| {
+            // Hairline rendered as a 1px-tall background div so it sits in the
+            // popup's padding without breaking the menu's row tap targets.
+            v_flex()
+                .w_full()
+                .py_1()
+                .child(gpui::div().w_full().h(px(1.)).bg(border.opacity(0.6)))
+                .child(custom_desc.clone())
+                .into_any_element()
+        })
+        .disabled(true);
+
+        menu.separator().item(separator_row).item(custom_row)
+    })
+}
+
+/// Pre-extracted inputs for [`append_mode_row`]. Bundling these into a struct
+/// keeps the helper below the 7-argument `clippy::too_many_arguments` ceiling
+/// while still letting the call site express the row's full visual contract.
+struct RowSpec {
+    mode: ApprovalMode,
+    title: SharedString,
+    subtitle: SharedString,
+    icon: IconName,
+    accent: gpui::Hsla,
+    muted: gpui::Hsla,
+    selected: bool,
+}
+
+/// Append a single `ApprovalMode` row to the popover. The selected row is
+/// marked with a check icon on the right; the row's title color matches the
+/// mode's accent (success/info/danger) so the visual link between chip and
+/// selected row is immediate.
+fn append_mode_row(menu: PopupMenu, workspace: Entity<Workspace>, spec: RowSpec) -> PopupMenu {
+    let RowSpec {
+        mode,
+        title,
+        subtitle,
+        icon,
+        accent,
+        muted,
+        selected,
+    } = spec;
+    let title_for_render = title.clone();
+    let subtitle_for_render = subtitle.clone();
+    let row = PopupMenuItem::element(move |_window, _cx| {
+        // `icon` is `Clone` but not `Copy`, so re-clone per render rather
+        // than move it out of the captured environment.
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .child(Icon::new(icon.clone()).small().text_color(accent))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .gap_0p5()
+                    .child(
+                        gpui::div()
+                            .text_sm()
+                            .text_color(accent)
+                            .child(title_for_render.clone()),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(subtitle_for_render.clone()),
+                    ),
+            )
+            .when(selected, |el| {
+                el.child(Icon::new(IconName::Check).small().text_color(accent))
+            })
+    })
+    .on_click(move |_event, _window, cx| {
+        workspace.update(cx, |this, cx| {
+            this.apply_approval_mode(mode, cx);
+        });
+    });
+    menu.item(row)
+}
+
+impl Workspace {
+    /// Switch the thread's `ApprovalMode`, post a localized notice, and close
+    /// the popover. Centralized so slash command, chip click, and the
+    /// future settings-panel wiring all funnel through one path.
+    pub(crate) fn apply_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
+        let mode_key = match mode {
+            ApprovalMode::OnRequest => "on-request",
+            ApprovalMode::AutoReview => "auto-review",
+            ApprovalMode::Yolo => "yolo",
+        };
+        self.thread
+            .update(cx, |t, cx| t.set_approval_mode(mode, cx));
+        self.add_info_message(
+            i18n::t_str("workspace-mode-notice", &[("mode", mode_key)]).to_string(),
+            cx,
+        );
+        self.close_access_menu();
+        cx.notify();
+    }
 }

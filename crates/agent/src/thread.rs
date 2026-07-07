@@ -20,6 +20,7 @@ use anyhow::Result;
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::ThreadRecord;
@@ -48,6 +49,46 @@ pub enum ToolCallStatus {
     Success,
     Error,
     Denied,
+}
+
+/// User-facing approval policy for tool calls. Drives both the access chip in
+/// the composer and the free / approval branch in `run_turn_loop`. Persisted on
+/// the thread so switching threads restores the mode the user last picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalMode {
+    /// Every approval-required tool call shows the authorization overlay.
+    #[serde(rename = "on-request")]
+    #[default]
+    OnRequest,
+    /// A built-in security-reviewer LLM agent vet each approval-required tool
+    /// call. Safe calls run without prompting; risky ones still raise the
+    /// overlay (with a one-line reason from the agent). Failures (timeout,
+    /// parse error, unsupported verdict) fall back to the overlay.
+    #[serde(rename = "auto-review")]
+    AutoReview,
+    /// All approvals are bypassed and `bash` runs unsandboxed
+    /// (DangerFullAccess equivalent). Inherited by sub-agents.
+    #[serde(rename = "yolo")]
+    Yolo,
+}
+
+impl ApprovalMode {
+    pub fn from_i64(v: i64) -> Self {
+        match v {
+            1 => Self::AutoReview,
+            2 => Self::Yolo,
+            _ => Self::OnRequest,
+        }
+    }
+
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::OnRequest => 0,
+            Self::AutoReview => 1,
+            Self::Yolo => 2,
+        }
+    }
 }
 
 /// Events emitted by `Thread` to the UI.
@@ -81,8 +122,9 @@ pub enum ThreadEvent {
         summary: String,
         input: serde_json::Value,
     },
-    /// YOLO mode toggled on/off. The UI refreshes its badge and access chip.
-    YoloToggled { on: bool },
+    /// Approval mode changed. The UI refreshes its badge, access chip, and
+    /// the popover's selected row.
+    ApprovalModeChanged { mode: ApprovalMode },
     /// A completion turn started. Signals the UI (via `ThreadStore`) that this
     /// thread is now running — covers the gap before the first `AgentText`/
     /// `AgentThinking` delta arrives (model warming up, network latency) so
@@ -120,11 +162,15 @@ pub struct Thread {
     model: Option<AnyLanguageModel>,
     tools: Arc<ToolRegistry>,
     permission: Arc<PermissionCache>,
-    /// YOLO mode: when true, all tool approvals are bypassed and `bash` runs
-    /// unsandboxed (DangerFullAccess equivalent). Session-scoped; inherited by
-    /// sub-agents. Distinct from the always-allow cache so disabling YOLO
+    /// Approval mode for this thread. Drives the access chip and the
+    /// free / approval branch in `run_turn_loop`. Thread-scoped; inherited by
+    /// sub-agents. Distinct from the always-allow cache so flipping modes
     /// returns to normal approval without leaving stale always-allow grants.
-    yolo: bool,
+    approval_mode: ApprovalMode,
+    /// Reasons the auto-review approval agent attached to `Ask` verdicts, keyed
+    /// by `tool_use.id`. Drained into the auth overlay as a one-line
+    /// justification. Cleared every turn with the rest of the per-turn state.
+    approval_ask_reasons: HashMap<String, String>,
     cwd: PathBuf,
     /// The project directory the thread is bound to, chosen on the first screen.
     /// `None` means no project was chosen; tools then resolve paths against the
@@ -253,7 +299,8 @@ impl Thread {
                 model,
                 tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
-                yolo: false,
+                approval_mode: ApprovalMode::default(),
+                approval_ask_reasons: HashMap::new(),
                 cwd,
                 project: None,
                 pending_tool_uses: Vec::new(),
@@ -325,7 +372,8 @@ impl Thread {
                 model,
                 tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
-                yolo: rec.yolo,
+                approval_mode: ApprovalMode::from_i64(rec.approval_mode),
+                approval_ask_reasons: HashMap::new(),
                 cwd,
                 project,
                 pending_tool_uses: Vec::new(),
@@ -377,7 +425,7 @@ impl Thread {
         cwd: PathBuf,
         model: AnyLanguageModel,
         permission: Arc<PermissionCache>,
-        yolo: bool,
+        approval_mode: ApprovalMode,
         system: String,
         max_turns: u32,
         depth: u32,
@@ -392,7 +440,8 @@ impl Thread {
                 model: Some(model),
                 tools: Arc::new(tools_fn(weak)),
                 permission,
-                yolo,
+                approval_mode,
+                approval_ask_reasons: HashMap::new(),
                 cwd,
                 project: None,
                 pending_tool_uses: Vec::new(),
@@ -443,7 +492,8 @@ impl Thread {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            yolo: self.yolo,
+            yolo: self.approval_mode == ApprovalMode::Yolo,
+            approval_mode: self.approval_mode.as_i64(),
             depth: self.depth as i32,
             parent_id: self.parent_id.clone(),
             archived: self.archived,
@@ -734,20 +784,44 @@ impl Thread {
         self.permission.allowed_tools()
     }
 
-    /// Whether YOLO mode is active (approvals bypassed, bash unsandboxed).
+    /// Backward-compatible `Yolo` check. Equivalent to
+    /// `self.approval_mode() == ApprovalMode::Yolo`; kept because
+    /// `tools/bash.rs` and `tools/agent.rs` only need a yes/no on Yolo to
+    /// decide the seatbelt branch and the sub-agent inheritance.
     pub fn yolo(&self) -> bool {
-        self.yolo
+        self.approval_mode == ApprovalMode::Yolo
     }
 
-    /// Toggle YOLO mode. Emits [`ThreadEvent::YoloToggled`] so the UI refreshes
-    /// its badge and access chip. Bypasses approvals for all subsequent tool
-    /// calls in this thread (and any sub-agents spawned after the toggle).
+    /// Toggle Yolo mode. Thin wrapper around [`Self::set_approval_mode`] kept
+    /// for the call sites that predate the three-state model (slash command,
+    /// workspace toggles, and any leftover UI plumbing). New code should call
+    /// `set_approval_mode` directly.
     pub fn set_yolo(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.yolo == on {
+        self.set_approval_mode(
+            if on {
+                ApprovalMode::Yolo
+            } else {
+                ApprovalMode::OnRequest
+            },
+            cx,
+        );
+    }
+
+    /// Current approval mode. Drives the access chip, the popover, and the
+    /// free / approval branch in `run_turn_loop`.
+    pub fn approval_mode(&self) -> ApprovalMode {
+        self.approval_mode
+    }
+
+    /// Switch approval mode. Emits [`ThreadEvent::ApprovalModeChanged`] so the
+    /// UI refreshes the chip, the popover's selected row, and (for Yolo) the
+    /// seatbelt branch in the next tool call. No-op when the mode is unchanged.
+    pub fn set_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
+        if self.approval_mode == mode {
             return;
         }
-        self.yolo = on;
-        cx.emit(ThreadEvent::YoloToggled { on });
+        self.approval_mode = mode;
+        cx.emit(ThreadEvent::ApprovalModeChanged { mode });
         cx.notify();
     }
 
@@ -782,6 +856,13 @@ impl Thread {
         }
         self.archived = archived;
         cx.notify();
+    }
+
+    /// Take a reason the auto-review agent attached to an `Ask` verdict,
+    /// removing it so a follow-up call with the same id is empty. Used by the
+    /// auth overlay to render the justification under the tool title.
+    pub fn take_approval_ask_reason(&mut self, id: &str) -> Option<String> {
+        self.approval_ask_reasons.remove(id)
     }
 
     pub fn model(&self) -> Option<&AnyLanguageModel> {
@@ -1149,39 +1230,123 @@ impl Thread {
                 break;
             }
 
-            let (tool_uses, free_tus, approval_tus) = this.update(cx, |this, _cx| {
+            // Categorize tool_uses into free / approval / auto-review queues.
+            // The auto-review queue is settled in a second pass below — we
+            // need a model handle and the cancel token, so it cannot be
+            // decided inside the borrow of `this`.
+            let (
+                tool_uses,
+                mut free_tus,
+                mut approval_tus,
+                auto_review_tus,
+                model,
+                cancel_for_review,
+                cwd,
+            ) = this.update(cx, |this, _cx| {
                 let tool_uses = std::mem::take(&mut this.pending_tool_uses);
                 let mut free = Vec::new();
                 let mut appr = Vec::new();
+                let mut review = Vec::new();
                 for tu in &tool_uses {
                     // `exit_plan_mode` is synthesized (not in `this.tools`), so
                     // the registry lookup below would default it to the free
                     // (parallel) path; it has its own plan-overlay routing.
                     let is_plan_exit = tu.name.as_ref() == "exit_plan_mode";
-                    // YOLO bypasses permission gates, but not tools whose
-                    // authorization flow IS their execution (AskUserQuestion):
-                    // bypassing those would drop the user's input and hit an
-                    // unreachable `run`.
+                    // YOLO/AutoReview bypass the permission gate, but not tools
+                    // whose authorization flow IS their execution
+                    // (AskUserQuestion): bypassing those would drop the user's
+                    // input and hit an unreachable `run`. AutoReview also
+                    // consults the security-reviewer agent before allowing.
                     let tool = this.tools.get(tu.name.as_ref());
                     let requires_approval = tool
                         .map(|t| t.requires_approval(&tu.input))
                         .unwrap_or(false);
                     let requires_user_input =
                         tool.map(|t| t.requires_user_input()).unwrap_or(false);
-                    let needs_approval = !is_plan_exit
-                        && (!this.yolo || requires_user_input)
-                        && requires_approval
-                        && !this.permission.is_always_allowed(tu.name.as_ref());
-                    if needs_approval || is_plan_exit {
+                    let always_allowed = this.permission.is_always_allowed(tu.name.as_ref());
+                    let bypassed = matches!(
+                        this.approval_mode,
+                        ApprovalMode::Yolo | ApprovalMode::AutoReview
+                    ) && !requires_user_input;
+
+                    if is_plan_exit {
                         appr.push(tu.clone());
-                    } else {
+                    } else if !requires_approval || always_allowed {
                         free.push(tu.clone());
+                    } else if bypassed && this.approval_mode == ApprovalMode::Yolo {
+                        // Yolo short-circuits; AutoReview must consult the
+                        // reviewer below.
+                        free.push(tu.clone());
+                    } else if bypassed {
+                        review.push(tu.clone());
+                    } else {
+                        appr.push(tu.clone());
                     }
                 }
-                (tool_uses, free, appr)
+                // Reset per-turn ask-reason map so a previous turn's
+                // reasons never bleed into the current one if a tool id
+                // collides across turns.
+                this.approval_ask_reasons.clear();
+                let model = this.model.clone();
+                let cancel = this
+                    .turn_cancel
+                    .clone()
+                    .unwrap_or_else(CancellationToken::new);
+                (
+                    tool_uses,
+                    free,
+                    appr,
+                    review,
+                    model,
+                    cancel,
+                    this.cwd.clone(),
+                )
             })?;
             if tool_uses.is_empty() {
                 break;
+            }
+
+            // AutoReview: ask the security-reviewer agent for each pending call.
+            // Allow verdicts flow into `free_tus`; Ask verdicts flow into
+            // `approval_tus` with a one-line reason surfaced in the overlay.
+            if !auto_review_tus.is_empty() {
+                match model.as_ref() {
+                    None => {
+                        // No model loaded — defer everything to the overlay so
+                        // the user is never silently auto-approved without a
+                        // model in the loop.
+                        approval_tus.extend(auto_review_tus);
+                    }
+                    Some(model) => {
+                        for tu in auto_review_tus {
+                            if cancel_for_review.is_cancelled() {
+                                approval_tus.push(tu);
+                                continue;
+                            }
+                            let title = tool_title(&tu.name, &tu.input);
+                            let verdict = crate::approval::review(
+                                model,
+                                &tu.name,
+                                &tu.input,
+                                &title,
+                                &cwd,
+                                cancel_for_review.clone(),
+                                cx,
+                            )
+                            .await;
+                            match verdict {
+                                crate::approval::ReviewVerdict::Allow => free_tus.push(tu),
+                                crate::approval::ReviewVerdict::Ask { reason } => {
+                                    let id = tu.id.clone();
+                                    let _ = this.update(cx, |this, _cx| {
+                                        this.approval_ask_reasons.insert(id, reason);
+                                    });
+                                    approval_tus.push(tu);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Approval-free tools run in parallel; approval-needed tools run
@@ -1336,16 +1501,21 @@ impl Thread {
             return Ok(());
         }
 
-        // YOLO mode bypasses permission approvals: skip the authorization
-        // prompt entirely so the tool runs immediately. This is the
-        // session-level equivalent of codex's `approval_policy = Never`. Tools
-        // whose authorization flow IS their execution (`AskUserQuestion`) are
-        // exempt: bypassing them would drop the user's input and hit an
-        // unreachable `run`.
+        // YOLO/AutoReview bypasses the permission gate: skip the authorization
+        // prompt entirely so the tool runs immediately. YOLO is the
+        // session-level equivalent of codex's `approval_policy = Never`;
+        // AutoReview additionally consults the security-reviewer agent before
+        // allowing. Tools whose authorization flow IS their execution
+        // (`AskUserQuestion`) are exempt: bypassing them would drop the user's
+        // input and hit an unreachable `run`.
         let requires_user_input = tool.requires_user_input();
         let needs_approval = tool.requires_approval(&tu.input)
             && !this.read_with(cx, |this, _| {
-                (this.yolo && !requires_user_input) || this.permission.is_always_allowed(&name)
+                (matches!(
+                    this.approval_mode,
+                    ApprovalMode::Yolo | ApprovalMode::AutoReview
+                ) && !requires_user_input)
+                    || this.permission.is_always_allowed(&name)
             })?;
         if needs_approval {
             this.update(cx, |_, cx| {
@@ -1921,7 +2091,7 @@ impl Thread {
             crate::system_prompt::build_main_system_prompt(
                 &self.cwd,
                 self.project.as_deref(),
-                self.yolo,
+                self.approval_mode,
             )
         });
         // Sub-agents carry their own system prompt from `agents/*.md`; the main
@@ -2551,6 +2721,7 @@ mod tests {
             let mut rec =
                 crate::db::ThreadRecord::for_test("reg-yolo-ask-user", "/tmp", Vec::new());
             rec.yolo = true;
+            rec.approval_mode = crate::thread::ApprovalMode::Yolo.as_i64();
             super::Thread::restore(rec, None, cx)
         });
         let tu = LanguageModelToolUse {
