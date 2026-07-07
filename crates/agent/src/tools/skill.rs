@@ -45,6 +45,7 @@ impl AgentTool for SkillTool {
         &self,
         input: serde_json::Value,
         _cancel: CancellationToken,
+        _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<SkillInput>(input) else {
@@ -74,8 +75,9 @@ impl AgentTool for SkillTool {
         input: serde_json::Value,
         cancel: CancellationToken,
         _sink: ToolOutputSink,
+        ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        self.run(input, cancel, cx)
+        self.run(input, cancel, ctx, cx)
     }
 }

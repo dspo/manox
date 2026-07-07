@@ -81,6 +81,7 @@ impl AgentTool for McpTool {
         &self,
         input: serde_json::Value,
         cancel: CancellationToken,
+        _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let client = self.client.clone();

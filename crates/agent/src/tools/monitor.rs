@@ -82,11 +82,12 @@ impl AgentTool for MonitorTool {
         &self,
         input: serde_json::Value,
         cancel: CancellationToken,
+        ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let (sink, _rx) = ToolOutputSink::channel("".into());
         drop(_rx);
-        self.run_streaming(input, cancel, sink, cx)
+        self.run_streaming(input, cancel, sink, ctx, cx)
     }
 
     fn run_streaming(
@@ -94,6 +95,7 @@ impl AgentTool for MonitorTool {
         input: serde_json::Value,
         cancel: CancellationToken,
         sink: ToolOutputSink,
+        _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let parsed: MonitorInput = match serde_json::from_value(input) {
