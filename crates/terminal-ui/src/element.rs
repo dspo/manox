@@ -12,23 +12,28 @@
 //! `TerminalView`'s wrapping `div`, keeping this element paint-only.
 
 use gpui::{
-    App, Bounds, Element, ElementId, Entity, Font, FontFeatures, FontStyle, FontWeight,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, SharedString,
+    App, Bounds, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
+    FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, SharedString,
     StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, point, px,
     relative, size,
 };
 use terminal::{Cell, Flags, Terminal};
 
 use crate::grid_renderer::layout_grid;
+use crate::terminal_view::{TerminalInputHandler, TerminalView};
 use crate::theme::TerminalTheme;
 
 /// The paint-only terminal element. Constructed by `TerminalView::render`.
 pub struct TerminalElement {
     pub terminal: Entity<Terminal>,
+    pub view: Entity<TerminalView>,
+    pub focus_handle: FocusHandle,
     pub theme: TerminalTheme,
     pub font: Font,
     pub font_size: Pixels,
     pub line_height: f32,
+    /// In-flight IME marked text, painted inline at the cursor.
+    pub marked_text: SharedString,
 }
 
 /// Computed during prepaint, consumed during paint.
@@ -41,9 +46,15 @@ pub struct PrepaintState {
 }
 
 impl TerminalElement {
-    pub fn new(terminal: Entity<Terminal>) -> Self {
+    pub fn new(
+        terminal: Entity<Terminal>,
+        view: Entity<TerminalView>,
+        focus_handle: FocusHandle,
+    ) -> Self {
         Self {
             terminal,
+            view,
+            focus_handle,
             theme: TerminalTheme::default(),
             font: Font {
                 family: "Menlo".into(),
@@ -54,6 +65,7 @@ impl TerminalElement {
             },
             font_size: px(14.),
             line_height: 1.2,
+            marked_text: SharedString::default(),
         }
     }
 
@@ -217,13 +229,48 @@ impl Element for TerminalElement {
             let _ = shaped.paint(pos, lh, TextAlign::Left, None, window, cx);
         }
 
-        // Cursor block.
+        // Cursor block + inline IME marked (preedit) text.
         if let Some((line, col)) = prepaint.cursor {
             let x = origin.x + col as f32 * cell_w;
             let y = origin.y + line as f32 * lh;
             let pos = point(x, y);
             let sz = size(cell_w, lh);
-            window.paint_quad(fill(Bounds::new(pos, sz), self.theme.cursor));
+            let cursor_bounds = Bounds::new(pos, sz);
+
+            if !self.marked_text.is_empty() {
+                // Paint the preedit text over the cursor with a highlight bg.
+                let probe = TextRun {
+                    len: self.marked_text.len(),
+                    font: self.font.clone(),
+                    color: self.theme.default_bg,
+                    background_color: Some(self.theme.cursor),
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window.text_system().shape_line(
+                    self.marked_text.clone(),
+                    self.font_size,
+                    std::slice::from_ref(&probe),
+                    Some(cell_w),
+                );
+                let bg = size(shaped.width().max(cell_w), lh);
+                window.paint_quad(fill(Bounds::new(pos, bg), self.theme.cursor));
+                let _ = shaped.paint(pos, lh, TextAlign::Left, None, window, cx);
+            } else {
+                window.paint_quad(fill(cursor_bounds, self.theme.cursor));
+            }
+
+            // Register the IME input handler for this frame so the platform
+            // routes composition events here, with the candidate window placed
+            // at the cursor.
+            window.handle_input(
+                &self.focus_handle,
+                TerminalInputHandler {
+                    view: self.view.clone(),
+                    cursor_bounds: Some(cursor_bounds),
+                },
+                cx,
+            );
         }
     }
 }

@@ -20,7 +20,7 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vi_mode::ViMotion;
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::Result;
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task};
+use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Context, Entity, EventEmitter, Task};
 
 use crate::event::{ManoxListener, TerminalEvent};
 use crate::pty;
@@ -99,6 +99,32 @@ impl Terminal {
                                 t.title = title.clone();
                                 cx.emit(TerminalEvent::Title(title));
                                 cx.notify();
+                            });
+                        }
+                        // OSC 52 write: store text on the system clipboard.
+                        TerminalEvent::ClipboardStore(text) => {
+                            let _ = this.update(cx, |_t: &mut Terminal, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            });
+                        }
+                        // OSC 52 read: load the clipboard, let the TUI's
+                        // callback format its response, write that back to the
+                        // PTY so the application can read it.
+                        TerminalEvent::ClipboardLoad(cb) => {
+                            let _ = this.update(cx, |t: &mut Terminal, cx| {
+                                let text = cx
+                                    .read_from_clipboard()
+                                    .and_then(|i| i.text())
+                                    .unwrap_or_default();
+                                let response = cb(&text);
+                                let _ = t.input(response.as_bytes());
+                            });
+                        }
+                        // Bytes the TUI emitted via the terminal (rare; e.g.
+                        // some DCS responses). Forward to the PTY verbatim.
+                        TerminalEvent::PtyWrite(text) => {
+                            let _ = this.update(cx, |t: &mut Terminal, _cx| {
+                                let _ = t.input(text.as_bytes());
                             });
                         }
                         other => {
