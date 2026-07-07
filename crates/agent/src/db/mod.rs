@@ -149,6 +149,7 @@ mod tests {
             cwd: "/tmp".into(),
             project: "/tmp".into(),
             approval_mode: 2,
+            reasoning_effort: 4,
             depth: 0,
             parent_id: None,
             archived: false,

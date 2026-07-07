@@ -243,6 +243,10 @@ fn setup_child(
         .upgrade()
         .map(|p| p.read_with(cx, |t, _| t.approval_mode()))
         .unwrap_or_default();
+    let parent_effort = parent
+        .upgrade()
+        .map(|p| p.read_with(cx, |t, _| t.reasoning_effort()))
+        .unwrap_or_default();
     let max_turns = def.max_turns.unwrap_or(10);
     let system_prompt = def_file.system_prompt.clone();
     let cwd_path = cwd.as_ref().clone();
@@ -252,6 +256,7 @@ fn setup_child(
         model,
         permission,
         parent_mode,
+        parent_effort,
         system_prompt,
         max_turns,
         child_depth,

@@ -268,6 +268,14 @@ workspace-project-name-prompt = 项目文件夹名称
 workspace-yolo-on-notice = 完全访问已开启：工具调用免审批，bash 在沙箱外运行。
 workspace-yolo-off-notice = 已切换到请求审批模式：恢复审批与沙箱。
 workspace-empty-prompt = 我们该做什么？
+workspace-effort-section = 推理强度
+workspace-effort-low = 低
+workspace-effort-medium = 中
+workspace-effort-high = 高
+workspace-effort-xhigh = 极高
+workspace-effort-max = 最大
+workspace-effort-ultracode = 超强
+workspace-effort-auto = 自动
 
 ### views/composer_menu.rs
 composer-add-label = 添加
