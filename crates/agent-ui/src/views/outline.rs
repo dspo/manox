@@ -75,7 +75,8 @@ fn truncate(s: &str, max_chars: usize) -> String {
 /// tool / reasoning item produced in reply, so the rail can treat any of them
 /// being on screen as "this turn is visible".
 pub fn turn_span(turns: &[UserTurn], ordinal: usize, total: usize) -> Range<usize> {
-    let start = turns[ordinal].item_ix;
+    debug_assert!(ordinal < turns.len(), "turn_span ordinal out of range");
+    let start = turns.get(ordinal).map_or(total, |t| t.item_ix);
     let end = turns.get(ordinal + 1).map_or(total, |next| next.item_ix);
     start..end
 }

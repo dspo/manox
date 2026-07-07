@@ -698,13 +698,18 @@ impl Workspace {
                 }))
         });
 
-        // No `overflow_hidden`: the hover card and the widened wave ticks
-        // extend past the rail's fixed width and must not be clipped.
+        // `overflow_hidden` + `min_h_0` clip the tick column when a long
+        // conversation's ticks exceed the rail height, instead of overflowing
+        // the layout. Widened wave ticks stay within the fixed width (28px max
+        // < 40px rail), and the hover card is `deferred` — painted outside this
+        // subtree — so neither is affected by the clip.
         Some(
             v_flex()
                 .flex_shrink_0()
                 .w(px(OUTLINE_RAIL_WIDTH))
                 .h_full()
+                .min_h_0()
+                .overflow_hidden()
                 .justify_center()
                 .items_center()
                 .children(ticks)
