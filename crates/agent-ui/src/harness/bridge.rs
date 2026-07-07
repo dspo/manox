@@ -16,7 +16,7 @@
 use std::time::Duration;
 
 use agent::PermissionDecision;
-use gpui::{App, AppContext as _, AsyncApp, Entity};
+use gpui::{App, AsyncApp, Entity};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -158,9 +158,12 @@ async fn handle_request(req: McpRequest, workspace: &Entity<Workspace>, cx: &mut
     }
 }
 
-/// Poll `Thread::is_running()` until idle or the deadline. Sleeps on the tokio
-/// runtime via `background_spawn` so the gpui executor is never blocked;
-/// mirrors the live-test pattern at `thread.rs` (`live_run_turn_drains_full_stream`).
+/// Poll `Thread::is_running()` until idle or the deadline. The gpui-native
+/// `BackgroundExecutor::timer` yields this future back to the gpui executor
+/// without blocking it — and, unlike `tokio::time::sleep`, does not require a
+/// tokio reactor to be active (the gpui background executor is not a tokio
+/// context; spawning a tokio sleep there would panic with "no reactor
+/// running"). Mirrors the live-test pattern at `thread.rs`.
 async fn await_idle(
     workspace: &Entity<Workspace>,
     cx: &mut AsyncApp,
@@ -176,12 +179,8 @@ async fn await_idle(
         if Instant::now() > deadline {
             return IdleState::StillRunning;
         }
-        // Park the gpui executor by sleeping on the tokio runtime — the
-        // background task's completion wakes this future back up.
-        let _: () = cx
-            .background_spawn(async move {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            })
+        cx.background_executor()
+            .timer(Duration::from_millis(25))
             .await;
     }
 }
