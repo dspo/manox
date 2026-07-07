@@ -23,7 +23,6 @@ type ChartOccupancy = HashSet<(u16, u16)>;
 type RaceSnapshot = (usize, HashMap<(String, String), UsageTotals>);
 
 const MODEL_MIN_WIDTH: u16 = 26;
-const MAX_BAR_WIDTH: u16 = 30; // 视觉上限；与列宽解耦以避免宽终端下柱状图横贯整行
 const SHARE_WIDTH: u16 = 6;
 const TABLE_COLUMN_SPACING: u16 = 1;
 const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
@@ -1410,8 +1409,14 @@ fn draw_model_table_rows(
     // 窄终端下优先保证高用量（左侧）agent 列完整显示，低用量（右侧）列
     // 整列隐藏；拉宽终端后右侧列逐步「弹出」——不再等比压缩所有列。
     let inner_width = area.width.saturating_sub(2);
+    let model_width = sorted
+        .iter()
+        .map(|row| row.model.chars().count())
+        .max()
+        .unwrap_or(MODEL_MIN_WIDTH as usize) as u16
+        + 2;
     let total_width_val = usage_column_width("Total", sorted.iter().map(|row| &row.usage));
-    let fixed_columns_width = MODEL_MIN_WIDTH + SHARE_WIDTH + total_width_val;
+    let fixed_columns_width = model_width + SHARE_WIDTH + total_width_val;
     let ideal_agent_widths: Vec<u16> = agent_columns
         .iter()
         .map(|(agent, label)| {
@@ -1449,7 +1454,8 @@ fn draw_model_table_rows(
         app.models_scroll = max_scroll;
     }
 
-    let constraints = model_table_widths_with_agent_widths(&sorted, &visible_agent_widths);
+    let constraints =
+        model_table_widths_with_agent_widths(&sorted, &visible_agent_widths, model_width);
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints.clone())
@@ -1492,8 +1498,8 @@ fn draw_model_table_rows(
                 } else {
                     0.0
                 };
-                // 柱状图容量封顶，避免宽终端下 max 模型底纹横扫整行
-                let bar_capacity = model_col_width.min(MAX_BAR_WIDTH as usize) as f64;
+                // 柱状图填满整列宽度，最大模型归一化为 1.0
+                let bar_capacity = model_col_width as f64;
                 let share_width = (bar_capacity * ratio).round() as usize;
                 let model_len = model.chars().count();
                 let share_chars = share_width.min(model_len);
@@ -1693,7 +1699,12 @@ fn model_table_widths(
     agent_columns: &[(&'static str, &'static str)],
 ) -> Vec<Constraint> {
     let total_width = usage_column_width("Total", sorted.iter().map(|row| &row.usage));
-    let model_width = MODEL_MIN_WIDTH;
+    let model_width = sorted
+        .iter()
+        .map(|row| row.model.chars().count())
+        .max()
+        .unwrap_or(MODEL_MIN_WIDTH as usize) as u16
+        + 2;
     let fixed_columns_width = model_width + SHARE_WIDTH + total_width;
     let inner_width = area_width.saturating_sub(2);
     let ideal_agent_widths: Vec<u16> = agent_columns
@@ -1713,19 +1724,19 @@ fn model_table_widths(
         fixed_columns_width,
         TABLE_COLUMN_SPACING,
     );
-    model_table_widths_with_agent_widths(sorted, &visible_agent_widths)
+    model_table_widths_with_agent_widths(sorted, &visible_agent_widths, model_width)
 }
 
 /// Build table constraints from pre-computed visible agent widths.
 fn model_table_widths_with_agent_widths(
     sorted: &[OverviewTableRow],
     agent_widths: &[u16],
+    model_width: u16,
 ) -> Vec<Constraint> {
     let total_width = usage_column_width("Total", sorted.iter().map(|row| &row.usage));
-    let model_width = MODEL_MIN_WIDTH;
 
     let mut widths = vec![
-        Constraint::Min(model_width),
+        Constraint::Length(model_width),
         Constraint::Length(SHARE_WIDTH),
         Constraint::Length(total_width),
     ];
@@ -2390,8 +2401,8 @@ mod tests {
 
         let widths = model_table_widths(103, &sorted, &cells, &agent_columns);
 
-        // Model column: Min constraint, capped at MODEL_MIN_WIDTH (26)
-        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
+        // Model column: Length constraint, dynamic width = longest model name + 2
+        assert_eq!(constraint_length(widths[0]), 17); // "deepseek-v4-pro" (15) + 2
         assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
         // With 103px wide terminal, all agents get ideal widths (no shrinking).
         // Only agents that fit at their ideal width are shown.
@@ -2424,12 +2435,12 @@ mod tests {
         let widths = model_table_widths(50, &sorted, &cells, &agent_columns);
         // Should have 3 fixed columns + at most 1 visible agent column
         assert!(widths.len() <= 4);
-        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
+        assert_eq!(constraint_length(widths[0]), 17); // "deepseek-v4-pro" (15) + 2
     }
 
     #[test]
-    fn model_table_model_column_capped_at_min_width() {
-        // 26-char model name fits within MODEL_MIN_WIDTH
+    fn model_table_model_column_fits_longest_model_name() {
+        // 25-char model name → column = 27
         let sorted = sorted_rows(&[
             ("claude-haiku-4-5-20251001", usage(100, 0)),
             ("short", usage(50, 0)),
@@ -2438,56 +2449,56 @@ mod tests {
         let agent_columns: Vec<(&str, &str)> = vec![];
 
         let widths = model_table_widths(60, &sorted, &cells, &agent_columns);
-        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
+        assert_eq!(constraint_length(widths[0]), 27);
 
-        // 30-char model name still capped at MODEL_MIN_WIDTH, not expanded
+        // 31-char model name → column = 33 (expands to fit, no fixed cap)
         let longer_sorted = sorted_rows(&[("copilot-suggestions-himalia-001", usage(100, 0))]);
         let widths = model_table_widths(60, &longer_sorted, &cells, &agent_columns);
-        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
+        assert_eq!(constraint_length(widths[0]), 33);
     }
 
     #[test]
     fn prioritize_agent_columns_greedy_left_to_right() {
-        let fixed = 26 + 6 + 10; // model + share + total
+        let fixed = 27 + 6 + 10; // model + share + total
         let sp = 1; // TABLE_COLUMN_SPACING
 
         // All agents fit → all shown at ideal width
-        // base = 42 + 2*1 = 44; a(10+1)=55; b(20+1)=76; c(10+1)=87 → need ≥87
+        // base = 43 + 2*1 = 45; a(10+1)=56; b(20+1)=77; c(10+1)=88 → need ≥88
         let (agents, widths) = prioritize_agent_columns(
             &[("a", "A"), ("b", "B"), ("c", "C")],
             &[10, 20, 10],
-            87,
+            88,
             fixed,
             sp,
         );
         assert_eq!(agents, vec![("a", "A"), ("b", "B"), ("c", "C")]);
         assert_eq!(widths, vec![10, 20, 10]);
 
-        // Only a fits (inner=55); b would need 55+21=76 >55 → break
+        // Only a fits (inner=56); b would need 56+21=77 >56 → break
         let (agents, widths) = prioritize_agent_columns(
             &[("a", "A"), ("b", "B"), ("c", "C")],
             &[10, 20, 10],
-            55,
+            56,
             fixed,
             sp,
         );
         assert_eq!(agents, vec![("a", "A")]);
         assert_eq!(widths, vec![10]);
 
-        // a + b fit, c doesn't (inner=76; c needs 76+11=87>76)
+        // a + b fit, c doesn't (inner=77; c needs 77+11=88>77)
         let (agents, widths) = prioritize_agent_columns(
             &[("a", "A"), ("b", "B"), ("c", "C")],
             &[10, 20, 10],
-            76,
+            77,
             fixed,
             sp,
         );
         assert_eq!(agents, vec![("a", "A"), ("b", "B")]);
         assert_eq!(widths, vec![10, 20]);
 
-        // Very narrow → no agent columns (inner=44 < 44+11=55)
+        // Very narrow → no agent columns (inner=45 < 45+11=56)
         let (agents, widths) =
-            prioritize_agent_columns(&[("a", "A"), ("b", "B")], &[10, 20], 44, fixed, sp);
+            prioritize_agent_columns(&[("a", "A"), ("b", "B")], &[10, 20], 45, fixed, sp);
         assert_eq!(agents, Vec::<(&str, &str)>::new());
         assert_eq!(widths, Vec::<u16>::new());
 
@@ -2499,20 +2510,18 @@ mod tests {
 
     // Overview 的 Model 列底纹按 Total tokens 归一化（除以最大值，非总和）。
     // 以下测试复刻 draw_model_table 中 ratio -> share_width 的计算公式，
-    // 锁定其行为契约：最大模型填满整列、其余按比例、不溢出列宽、空数据安全，
-    // 且在宽终端下被 MAX_BAR_WIDTH 封顶。
+    // 锁定其行为契约：最大模型填满整列、其余按比例、不溢出列宽、空数据安全。
     fn normalized_bar_width(
         total_tokens: u64,
         max_total_tokens: u64,
         col_width: usize,
-        max_bar_width: usize,
     ) -> usize {
         let ratio = if max_total_tokens > 0 {
             total_tokens as f64 / max_total_tokens as f64
         } else {
             0.0
         };
-        let bar_capacity = (col_width as f64).min(max_bar_width as f64);
+        let bar_capacity = col_width as f64;
         (bar_capacity * ratio).round() as usize
     }
 
@@ -2522,34 +2531,19 @@ mod tests {
         let max_tokens = 1_000_000u64;
 
         // 最大模型：ratio 恒为 1.0（同值自除），填满整列
-        assert_eq!(
-            normalized_bar_width(max_tokens, max_tokens, col_width, MAX_BAR_WIDTH as usize),
-            col_width
-        );
+        assert_eq!(normalized_bar_width(max_tokens, max_tokens, col_width), col_width);
 
         // 半量模型：恰好半宽
-        assert_eq!(
-            normalized_bar_width(500_000, max_tokens, col_width, MAX_BAR_WIDTH as usize),
-            12
-        );
+        assert_eq!(normalized_bar_width(500_000, max_tokens, col_width), 12);
 
         // 微量模型：四舍五入到 0
-        assert_eq!(
-            normalized_bar_width(1, max_tokens, col_width, MAX_BAR_WIDTH as usize),
-            0
-        );
+        assert_eq!(normalized_bar_width(1, max_tokens, col_width), 0);
 
         // 无数据（max_total_tokens = 0）：ratio = 0.0，安全降级为空底纹
-        assert_eq!(
-            normalized_bar_width(0, 0, col_width, MAX_BAR_WIDTH as usize),
-            0
-        );
+        assert_eq!(normalized_bar_width(0, 0, col_width), 0);
 
         // 即使 total_tokens 等于 max（并列最大）也填满整列，不溢出
-        assert_eq!(
-            normalized_bar_width(max_tokens, max_tokens, col_width, MAX_BAR_WIDTH as usize),
-            col_width
-        );
+        assert_eq!(normalized_bar_width(max_tokens, max_tokens, col_width), col_width);
     }
 
     #[test]
@@ -2560,9 +2554,7 @@ mod tests {
 
         let widths: Vec<usize> = tokens
             .iter()
-            .map(|&t| {
-                normalized_bar_width(t, max_tokens, col_width, MAX_BAR_WIDTH as usize)
-            })
+            .map(|&t| normalized_bar_width(t, max_tokens, col_width))
             .collect();
 
         // 比例正确：500 恰为 1000 的一半宽度
@@ -2574,39 +2566,24 @@ mod tests {
     }
 
     #[test]
-    fn overview_bar_capped_at_max_bar_width_on_wide_terminal() {
-        // 宽终端下 Model 列会被 Min 约束扩到 200 字符，但柱状图封顶在 MAX_BAR_WIDTH
-        let col_width = 200;
+    fn overview_bar_fills_full_column_width() {
+        // Model 列宽 = longest model name + 2，柱状图填满整列
+        let col_width = 30;
         let max_tokens = 1_000_000u64;
-        let cap = MAX_BAR_WIDTH as usize;
 
-        // 最大模型：被封顶在 MAX_BAR_WIDTH，不再等于扩出去的 col_width
-        assert_eq!(
-            normalized_bar_width(max_tokens, max_tokens, col_width, cap),
-            cap
-        );
-        // 半量模型：恰好 cap 的一半
-        assert_eq!(
-            normalized_bar_width(500_000, max_tokens, col_width, cap),
-            cap / 2
-        );
-        // 微量模型：四舍五入到 0
-        assert_eq!(
-            normalized_bar_width(1, max_tokens, col_width, cap),
-            0
-        );
-        // 窄列下 cap 不可见，行为与旧公式一致
-        assert_eq!(
-            normalized_bar_width(500_000, max_tokens, 24, cap),
-            12
-        );
-        // 任意占比都不超过 cap
+        // 最大模型填满整列
+        assert_eq!(normalized_bar_width(max_tokens, max_tokens, col_width), col_width);
+        // 半量模型恰好一半
+        assert_eq!(normalized_bar_width(500_000, max_tokens, col_width), col_width / 2);
+        // 微量模型四舍五入到 0
+        assert_eq!(normalized_bar_width(1, max_tokens, col_width), 0);
+        // 任意占比都不超过列宽
         let widths: Vec<usize> = (0..=100)
             .map(|pct| {
                 let tokens = max_tokens * pct as u64 / 100;
-                normalized_bar_width(tokens, max_tokens, col_width, cap)
+                normalized_bar_width(tokens, max_tokens, col_width)
             })
             .collect();
-        assert!(widths.iter().all(|&w| w <= cap));
+        assert!(widths.iter().all(|&w| w <= col_width));
     }
 }
