@@ -2492,11 +2492,11 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Composer card: an auto-growing text area above a single toolbar row.
-    /// The card's fill matches the page background (`theme.background`) so only
-    /// the 1px border outlines it — the user-perceived "shading" disappears.
-    /// The `Input` renders bare (no appearance/border of its own) so there is
-    /// no double-layered fill.
+    /// Composer: an auto-growing text area above a single toolbar row.
+    /// Rendered bare — no card border, fill, or rounding — so it shares the
+    /// page background with the message list and reads as the same layer.
+    /// The `Input` has no appearance of its own; the only visual separator
+    /// from the messages above is the hairline injected by the footer caller.
     fn render_composer(
         &mut self,
         running: bool,
@@ -2512,11 +2512,6 @@ impl Workspace {
         v_flex()
             .w_full()
             .gap_2()
-            .p_2()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.background)
             .child(
                 Input::new(&self.input_state)
                     .appearance(false)
@@ -3375,6 +3370,7 @@ impl Render for Workspace {
                     .gap_2()
                     .relative()
                     .children(self.render_slash_overlay())
+                    .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
                     .children(self.render_attachments(&theme, cx))
                     .child(centered(self.render_composer(running, &theme, cx))),
             )
@@ -3648,7 +3644,7 @@ impl Render for Workspace {
                             .min_h_0()
                             .w_full()
                             .px_4()
-                            .pb_8()
+                            .pb_2()
                             // Empty first screen shows the centered hero in place of the
                             // (empty) message list; otherwise the virtualized, tail-
                             // following conversation list. Each item is its own
