@@ -242,6 +242,9 @@ fn build_request_body(
     if long_ttl {
         body["prompt_cache_retention"] = Value::String("24h".to_string());
     }
+    if let Some(effort) = request.reasoning_effort {
+        body["reasoning_effort"] = Value::String(effort.openai_wire_value(long_ttl).to_string());
+    }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
             request
@@ -617,6 +620,7 @@ mod tests {
     use super::*;
     use crate::language_model::{
         LanguageModelRequestMessage, LanguageModelRequestTool, LanguageModelToolResult,
+        ReasoningEffort,
     };
     use crate::provider::WireApi;
 
@@ -646,6 +650,30 @@ mod tests {
         assert_eq!(tools[0]["function"]["name"], "bash");
         assert!(tools[0]["function"]["description"].is_string());
         assert!(tools[0]["function"]["parameters"].is_object());
+    }
+
+    #[test]
+    fn build_request_body_includes_reasoning_effort() {
+        let mut req = req_with_tool();
+        req.reasoning_effort = Some(ReasoningEffort::Max);
+        let body = build_request_body("m", 64, &req, "test-key", false);
+        assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    #[test]
+    fn build_request_body_clamps_reasoning_effort_for_official_openai() {
+        let mut req = req_with_tool();
+        req.reasoning_effort = Some(ReasoningEffort::Ultracode);
+        let body = build_request_body("m", 64, &req, "test-key", true);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn build_request_body_omits_reasoning_effort_when_auto() {
+        let mut req = req_with_tool();
+        req.reasoning_effort = Some(ReasoningEffort::Auto);
+        let body = build_request_body("m", 64, &req, "test-key", true);
+        assert_eq!(body["reasoning_effort"], "auto");
     }
 
     #[test]

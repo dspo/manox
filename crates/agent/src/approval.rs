@@ -139,6 +139,7 @@ pub async fn review(
         tool_choice: None,
         temperature: Some(0.0),
         thinking_allowed: false,
+        reasoning_effort: None,
     };
 
     let model = Arc::clone(model);

@@ -132,6 +132,57 @@ pub enum LanguageModelToolChoice {
     None,
 }
 
+/// User-facing reasoning effort knob for providers that expose an effort
+/// parameter (Anthropic `thinking.type`, OpenAI `reasoning.effort`, etc.).
+/// `Auto` lets the provider decide; the rest map to explicit effort levels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    #[default]
+    Medium,
+    High,
+    XHigh,
+    Max,
+    Ultracode,
+    Auto,
+}
+
+impl ReasoningEffort {
+    pub const ALL: [Self; 7] = [
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+        Self::Ultracode,
+        Self::Auto,
+    ];
+
+    /// Wire value for Anthropic-style and generic providers.
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultracode => "ultracode",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// Wire value for official OpenAI endpoints, which only accept
+    /// `low` / `medium` / `high`. Everything above `high` is clamped.
+    pub fn openai_wire_value(self, official_openai: bool) -> &'static str {
+        if official_openai && !matches!(self, Self::Low | Self::Medium | Self::High | Self::Auto) {
+            "high"
+        } else {
+            self.wire_value()
+        }
+    }
+}
+
 /// A single completion request.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LanguageModelRequest {
@@ -143,6 +194,8 @@ pub struct LanguageModelRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub thinking_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// A streaming completion event.

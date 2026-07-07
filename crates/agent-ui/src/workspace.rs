@@ -17,7 +17,8 @@ use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::thread::ApprovalMode;
 use agent::{
-    PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, i18n, save_thread,
+    PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId,
+    i18n, save_thread,
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
@@ -155,6 +156,10 @@ pub struct Workspace {
     access_open: bool,
     access_menu: Option<Entity<PopupMenu>>,
     access_menu_sub: Option<Subscription>,
+    /// Reasoning-effort dropdown (Low / Medium / High / XHigh / Max / Ultracode / Auto).
+    effort_open: bool,
+    effort_menu: Option<Entity<PopupMenu>>,
+    effort_menu_sub: Option<Subscription>,
     /// Project-chip dropdown (recent projects + new project submenu).
     project_chip_open: bool,
     project_chip_menu: Option<Entity<PopupMenu>>,
@@ -352,6 +357,9 @@ impl Workspace {
             access_open: false,
             access_menu: None,
             access_menu_sub: None,
+            effort_open: false,
+            effort_menu: None,
+            effort_menu_sub: None,
             project_chip_open: false,
             project_chip_menu: None,
             project_chip_menu_sub: None,
@@ -926,6 +934,12 @@ impl Workspace {
         self.access_open = false;
         self.access_menu = None;
         self.access_menu_sub = None;
+    }
+
+    fn close_effort_menu(&mut self) {
+        self.effort_open = false;
+        self.effort_menu = None;
+        self.effort_menu_sub = None;
     }
 
     /// Close the project-chip dropdown.
@@ -2182,6 +2196,114 @@ impl Workspace {
             .into_any_element()
     }
 
+    fn render_reasoning_effort_selector(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.effort_open;
+        let selected = self.thread.read(cx).reasoning_effort();
+        let workspace = cx.entity();
+        let label = i18n::t(reasoning_effort_label_key(selected));
+
+        let trigger = h_flex()
+            .id("reasoning-effort-chip")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+            .cursor_pointer()
+            .child(
+                Icon::new(IconName::Cpu)
+                    .xsmall()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(theme.muted_foreground),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if this.effort_open {
+                    this.close_effort_menu();
+                    cx.notify();
+                    return;
+                }
+
+                let current = this.thread.read(cx).reasoning_effort();
+                this.effort_open = true;
+                let menu_workspace = workspace.clone();
+                let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+                    let mut menu = menu
+                        .max_w(gpui::px(220.))
+                        .label(i18n::t("workspace-effort-section"));
+                    for effort in ReasoningEffort::ALL {
+                        let ws = menu_workspace.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(i18n::t(reasoning_effort_label_key(effort)))
+                                .checked(effort == current)
+                                .on_click(move |_, _window, cx| {
+                                    ws.update(cx, |this, cx| {
+                                        this.thread
+                                            .update(cx, |t, cx| t.set_reasoning_effort(effort, cx));
+                                        this.close_effort_menu();
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                });
+                let sub = cx.subscribe(
+                    &menu,
+                    |this: &mut Workspace,
+                     _menu: Entity<PopupMenu>,
+                     _: &DismissEvent,
+                     cx: &mut Context<Workspace>| {
+                        this.close_effort_menu();
+                        cx.notify();
+                    },
+                );
+                this.effort_menu = Some(menu);
+                this.effort_menu_sub = Some(sub);
+                cx.notify();
+            }));
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        let menu = self
+            .effort_menu
+            .clone()
+            .expect("effort_menu exists when open");
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::div()
+                    .id("reasoning-effort-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .right_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
     /// Cascading model selector using PopupMenu with Provider → Model submenus.
     ///
     /// Closed: a ghost button showing the current model with a chevron.
@@ -2506,6 +2628,7 @@ impl Workspace {
         let plus = self.render_plus_button(cx);
         let project_chip = self.render_project_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
+        let effort = self.render_reasoning_effort_selector(theme, cx);
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(running, cx);
 
@@ -2534,7 +2657,8 @@ impl Workspace {
                             .gap_1()
                             .child(plus)
                             .child(project_chip)
-                            .child(access),
+                            .child(access)
+                            .child(effort),
                     )
                     .child(h_flex().items_center().gap_1().child(model).child(send)),
             )
@@ -4114,5 +4238,17 @@ impl Workspace {
         };
         self.attach_thread(loaded, cx);
         true
+    }
+}
+
+fn reasoning_effort_label_key(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::Low => "workspace-effort-low",
+        ReasoningEffort::Medium => "workspace-effort-medium",
+        ReasoningEffort::High => "workspace-effort-high",
+        ReasoningEffort::XHigh => "workspace-effort-xhigh",
+        ReasoningEffort::Max => "workspace-effort-max",
+        ReasoningEffort::Ultracode => "workspace-effort-ultracode",
+        ReasoningEffort::Auto => "workspace-effort-auto",
     }
 }

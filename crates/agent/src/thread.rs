@@ -28,7 +28,7 @@ use crate::db::ThreadRecord;
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
-    Role, StopReason, TokenUsage,
+    ReasoningEffort, Role, StopReason, TokenUsage,
 };
 use crate::message::Message;
 use crate::prefix_stability::StablePrefix;
@@ -235,6 +235,9 @@ pub struct Thread {
     /// `exit_plan_mode` to run the approval handshake. Main-thread only —
     /// sub-agents always have `plan_mode == false`.
     plan_mode: bool,
+    /// User-selected reasoning effort for providers that expose an effort knob.
+    /// This is request metadata, not model-visible prompt text.
+    reasoning_effort: ReasoningEffort,
     /// Pending plan-approval oneshots, keyed by the `exit_plan_mode` tool_use
     /// id. Mirrors `pending_authorizations` exactly.
     pending_plan_approval: HashMap<String, tokio::sync::oneshot::Sender<PlanApprovalResponse>>,
@@ -323,6 +326,7 @@ impl Thread {
                 turn_tool_filter: None,
                 session_started: false,
                 plan_mode: false,
+                reasoning_effort: ReasoningEffort::default(),
                 pending_plan_approval: HashMap::new(),
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
@@ -394,6 +398,7 @@ impl Thread {
                 turn_tool_filter: None,
                 session_started: false,
                 plan_mode: false,
+                reasoning_effort: ReasoningEffort::default(),
                 pending_plan_approval: HashMap::new(),
                 title_state: TitleState::restore(
                     rec.title,
@@ -434,6 +439,7 @@ impl Thread {
         model: AnyLanguageModel,
         permission: Arc<PermissionCache>,
         approval_mode: ApprovalMode,
+        reasoning_effort: ReasoningEffort,
         system: String,
         max_turns: u32,
         depth: u32,
@@ -466,6 +472,7 @@ impl Thread {
                 turn_tool_filter: None,
                 session_started: false,
                 plan_mode: false,
+                reasoning_effort,
                 pending_plan_approval: HashMap::new(),
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
@@ -698,6 +705,18 @@ impl Thread {
     /// appends the plan-mode addendum. Does not start a turn.
     pub fn set_plan_mode(&mut self, on: bool, cx: &mut Context<Self>) {
         self.plan_mode = on;
+        cx.notify();
+    }
+
+    pub fn reasoning_effort(&self) -> ReasoningEffort {
+        self.reasoning_effort
+    }
+
+    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort, cx: &mut Context<Self>) {
+        if self.reasoning_effort == effort {
+            return;
+        }
+        self.reasoning_effort = effort;
         cx.notify();
     }
 
@@ -2097,6 +2116,7 @@ impl Thread {
         LanguageModelRequest {
             messages,
             tools,
+            reasoning_effort: Some(self.reasoning_effort),
             ..Default::default()
         }
     }
