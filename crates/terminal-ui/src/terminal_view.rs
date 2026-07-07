@@ -9,12 +9,13 @@
 
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures, FontStyle,
-    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, Styled, Window, black, div, px,
+    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, Styled, Window, black, div, px,
 };
 use terminal::Terminal;
 use terminal::alacritty_terminal::term::TermMode;
+use terminal::alacritty_terminal::vi_mode::ViMotion;
 use terminal::mappings::keys;
 
 use crate::element::TerminalElement;
@@ -65,13 +66,40 @@ impl TerminalView {
     }
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let k = &ev.keystroke;
+
+        // Toggle the terminal's built-in vi mode (alacritty's, not `vim`)
+        // on ctrl+shift+v.
+        if k.modifiers.control && k.modifiers.shift && k.key == "v" {
+            self.terminal.update(cx, |t, cx| t.toggle_vi_mode(cx));
+            return;
+        }
+
         let mode = self.terminal.read_with(cx, |t, _| t.mode());
-        if let Some(s) = keys::to_esc_str(&ev.keystroke, mode) {
+
+        // In vi mode, motion keys move the vi cursor and are NOT forwarded
+        // to the PTY; unmapped keys are swallowed.
+        if mode.contains(TermMode::VI) {
+            if let Some(motion) = vi_motion_for(k) {
+                self.terminal.update(cx, |t, cx| t.vi_motion(motion, cx));
+            }
+            return;
+        }
+
+        if let Some(s) = keys::to_esc_str(k, mode) {
             let _ = self.terminal.update(cx, |t, _cx| t.input(s.as_bytes()));
         }
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // cmd/ctrl+click opens an OSC 8 hyperlink under the cursor.
+        if ev.modifiers.platform || ev.modifiers.control {
+            let (row, col) = self.px_to_grid(ev.position, window);
+            if let Some(url) = self.terminal.read_with(cx, |t, _| t.hyperlink_at(row, col)) {
+                let _ = std::process::Command::new("open").arg(url).spawn();
+                return;
+            }
+        }
         // Mouse-reporting modes: the TUI app owns the mouse; defer to the
         // PTY report path (stage 5) instead of starting a local selection.
         let mode = self.terminal.read_with(cx, |t, _| t.mode());
@@ -170,4 +198,26 @@ impl Render for TerminalView {
                 line_height: self.line_height,
             })
     }
+}
+
+/// Map a vi-mode keystroke to an alacritty `ViMotion`. Returns `None` for
+/// keys without a mapping (the caller swallows them in vi mode).
+fn vi_motion_for(k: &Keystroke) -> Option<ViMotion> {
+    if k.modifiers.control || k.modifiers.alt {
+        return None;
+    }
+    let shift = k.modifiers.shift;
+    Some(match k.key.as_ref() {
+        "h" => ViMotion::Left,
+        "j" => ViMotion::Down,
+        "k" => ViMotion::Up,
+        "l" => ViMotion::Right,
+        "0" => ViMotion::First,
+        "4" if shift => ViMotion::Last, // $ = shift+4
+        "w" => ViMotion::WordRight,
+        "b" => ViMotion::WordLeft,
+        "e" => ViMotion::WordRightEnd,
+        "g" if shift => ViMotion::Low, // G → bottom
+        _ => return None,
+    })
 }

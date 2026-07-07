@@ -12,10 +12,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vi_mode::ViMotion;
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::Result;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task};
@@ -230,6 +232,72 @@ impl Terminal {
             text.as_bytes().to_vec()
         };
         self.pty.write(&bytes)
+    }
+
+    /// Toggle the terminal's built-in vi mode (alacritty's, not the `vim`
+    /// process) — used for keyboard-driven selection/scrollback navigation.
+    pub fn toggle_vi_mode(&self, cx: &mut Context<Self>) {
+        self.with_term_mut(|t| t.toggle_vi_mode());
+        cx.notify();
+    }
+
+    /// Apply a vi motion. Only meaningful while vi mode is on.
+    pub fn vi_motion(&self, motion: ViMotion, cx: &mut Context<Self>) {
+        self.with_term_mut(|t| t.vi_motion(motion));
+        cx.notify();
+    }
+
+    /// The OSC 8 hyperlink URI at `(row, col)`, if any.
+    pub fn hyperlink_at(&self, row: usize, col: usize) -> Option<String> {
+        self.with_term(|t| {
+            let content = t.renderable_content();
+            let mut display_line = -1i32;
+            let mut prev: Option<i32> = None;
+            for idx in content.display_iter {
+                let line = idx.point.line.0;
+                if prev != Some(line) {
+                    display_line += 1;
+                    prev = Some(line);
+                }
+                if display_line == row as i32
+                    && idx.point.column.0 == col
+                    && let Some(h) = idx.cell.hyperlink()
+                {
+                    return Some(h.uri().to_owned());
+                }
+            }
+            None
+        })
+    }
+
+    /// All regex matches in the visible+scrollback grid, as `(start, end)`
+    /// grid points. The UI overlays highlight from these.
+    pub fn search_matches(&self, pattern: &str) -> Result<Vec<(Point, Point)>, String> {
+        let mut regex = RegexSearch::new(pattern).map_err(|e| e.to_string())?;
+        let matches = self.with_term(|t| {
+            let mut out = Vec::new();
+            let offset = t.grid().display_offset() as i32;
+            let mut origin = Point::new(Line(-(self.rows as i32 - 1) - offset), Column(0));
+            let mut guard = 0usize;
+            while let Some(m) =
+                t.search_next(&mut regex, origin, Direction::Right, Side::Left, None)
+            {
+                let start = *m.start();
+                let end = *m.end();
+                out.push((start, end));
+                // Advance past the match; break on zero-width to avoid loops.
+                if end <= origin {
+                    break;
+                }
+                origin = end;
+                guard += 1;
+                if guard > 4096 {
+                    break;
+                }
+            }
+            out
+        });
+        Ok(matches)
     }
 }
 
