@@ -4,8 +4,8 @@
 //! `TerminalSettings` override these. `convert` resolves any alacritty
 //! `Color` (named, truecolor, 256-indexed) against a `TerminalTheme`.
 
-use terminal::{Color, NamedColor, Rgb};
 use gpui::Hsla;
+use terminal::{Color, NamedColor, Rgb};
 
 /// Resolved terminal palette used by the renderer.
 pub struct TerminalTheme {
@@ -23,22 +23,22 @@ impl Default for TerminalTheme {
             default_bg: hsla(0.0, 0.0, 0.06, 1.0),
             cursor: hsla(0.0, 0.0, 0.87, 1.0),
             ansi: [
-                hsla(0.0, 0.0, 0.0, 1.0),       // Black
-                hsla(0.0, 0.78, 0.47, 1.0),    // Red
-                hsla(0.33, 0.70, 0.40, 1.0),   // Green
-                hsla(0.08, 0.78, 0.47, 1.0),   // Yellow
-                hsla(0.58, 0.70, 0.45, 1.0),   // Blue
-                hsla(0.83, 0.70, 0.45, 1.0),   // Magenta
-                hsla(0.50, 0.70, 0.45, 1.0),   // Cyan
-                hsla(0.0, 0.0, 0.87, 1.0),     // White
-                hsla(0.0, 0.0, 0.40, 1.0),     // BrightBlack
-                hsla(0.0, 0.81, 0.57, 1.0),    // BrightRed
-                hsla(0.33, 0.75, 0.50, 1.0),   // BrightGreen
-                hsla(0.08, 0.81, 0.57, 1.0),   // BrightYellow
-                hsla(0.58, 0.75, 0.55, 1.0),   // BrightBlue
-                hsla(0.83, 0.75, 0.55, 1.0),   // BrightMagenta
-                hsla(0.50, 0.75, 0.55, 1.0),   // BrightCyan
-                hsla(0.0, 0.0, 0.97, 1.0),     // BrightWhite
+                hsla(0.0, 0.0, 0.0, 1.0),    // Black
+                hsla(0.0, 0.78, 0.47, 1.0),  // Red
+                hsla(0.33, 0.70, 0.40, 1.0), // Green
+                hsla(0.08, 0.78, 0.47, 1.0), // Yellow
+                hsla(0.58, 0.70, 0.45, 1.0), // Blue
+                hsla(0.83, 0.70, 0.45, 1.0), // Magenta
+                hsla(0.50, 0.70, 0.45, 1.0), // Cyan
+                hsla(0.0, 0.0, 0.87, 1.0),   // White
+                hsla(0.0, 0.0, 0.40, 1.0),   // BrightBlack
+                hsla(0.0, 0.81, 0.57, 1.0),  // BrightRed
+                hsla(0.33, 0.75, 0.50, 1.0), // BrightGreen
+                hsla(0.08, 0.81, 0.57, 1.0), // BrightYellow
+                hsla(0.58, 0.75, 0.55, 1.0), // BrightBlue
+                hsla(0.83, 0.75, 0.55, 1.0), // BrightMagenta
+                hsla(0.50, 0.75, 0.55, 1.0), // BrightCyan
+                hsla(0.0, 0.0, 0.97, 1.0),   // BrightWhite
             ],
         }
     }
@@ -75,13 +75,7 @@ fn indexed(idx: u8, theme: &TerminalTheme) -> Hsla {
             let r = idx / 36;
             let g = (idx / 6) % 6;
             let b = idx % 6;
-            let ramp = |v: u8| -> u8 {
-                if v == 0 {
-                    0
-                } else {
-                    40 + 55 * v
-                }
-            };
+            let ramp = |v: u8| -> u8 { if v == 0 { 0 } else { 40 + 55 * v } };
             rgb_to_hsla(&Rgb {
                 r: ramp(r),
                 g: ramp(g),
@@ -155,6 +149,8 @@ mod tests {
     #[test]
     fn default_background_detected() {
         assert!(is_default_background(&Color::Named(NamedColor::Background)));
-        assert!(!is_default_background(&Color::Named(NamedColor::Foreground)));
+        assert!(!is_default_background(&Color::Named(
+            NamedColor::Foreground
+        )));
     }
 }

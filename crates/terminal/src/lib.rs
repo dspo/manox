@@ -29,6 +29,7 @@ pub use alacritty_terminal::index::{Column, Line, Point};
 pub use alacritty_terminal::term::cell::{Cell, Flags};
 pub use alacritty_terminal::term::{RenderableContent, Term};
 pub use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
+pub use term::Terminal;
 
 /// Register the `TerminalStore` against the shared `ThreadsDatabase`.
 /// Call at App startup, after `agent::init`.

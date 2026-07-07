@@ -11,8 +11,8 @@
 //! of a wide glyph). The element layer converts each run to a gpui `TextRun`
 //! at paint time; here we keep the raw fg/bg/flags to stay gpui-agnostic.
 
-use terminal::{Cell, Flags};
 use gpui::Hsla;
+use terminal::{Cell, Flags};
 
 use crate::theme::{TerminalTheme, convert, is_default_background};
 
@@ -231,9 +231,36 @@ mod tests {
     fn merges_horizontal_same_color() {
         let red = Color::Named(NamedColor::Red);
         let cells = [
-            (0, 0, cell('a', Color::Named(NamedColor::Foreground), red, Flags::empty())),
-            (0, 1, cell('b', Color::Named(NamedColor::Foreground), red, Flags::empty())),
-            (0, 2, cell('c', Color::Named(NamedColor::Foreground), red, Flags::empty())),
+            (
+                0,
+                0,
+                cell(
+                    'a',
+                    Color::Named(NamedColor::Foreground),
+                    red,
+                    Flags::empty(),
+                ),
+            ),
+            (
+                0,
+                1,
+                cell(
+                    'b',
+                    Color::Named(NamedColor::Foreground),
+                    red,
+                    Flags::empty(),
+                ),
+            ),
+            (
+                0,
+                2,
+                cell(
+                    'c',
+                    Color::Named(NamedColor::Foreground),
+                    red,
+                    Flags::empty(),
+                ),
+            ),
         ];
         let plan = layout_grid(cells.iter().map(|(l, c, cell)| (*l, *c, cell)), &theme());
         // One merged background region across cols 0..=2, one text run "abc".
@@ -250,8 +277,26 @@ mod tests {
         let red = Color::Named(NamedColor::Red);
         let green = Color::Named(NamedColor::Green);
         let cells = [
-            (0, 0, cell('a', Color::Named(NamedColor::Foreground), red, Flags::empty())),
-            (0, 1, cell('b', Color::Named(NamedColor::Foreground), green, Flags::empty())),
+            (
+                0,
+                0,
+                cell(
+                    'a',
+                    Color::Named(NamedColor::Foreground),
+                    red,
+                    Flags::empty(),
+                ),
+            ),
+            (
+                0,
+                1,
+                cell(
+                    'b',
+                    Color::Named(NamedColor::Foreground),
+                    green,
+                    Flags::empty(),
+                ),
+            ),
         ];
         let plan = layout_grid(cells.iter().map(|(l, c, cell)| (*l, *c, cell)), &theme());
         assert_eq!(plan.background.len(), 2);
@@ -262,9 +307,36 @@ mod tests {
     fn blank_cells_break_text_run_only() {
         let fg = Color::Named(NamedColor::Foreground);
         let cells = [
-            (0, 0, cell('a', fg, Color::Named(NamedColor::Background), Flags::empty())),
-            (0, 1, cell(' ', fg, Color::Named(NamedColor::Background), Flags::empty())),
-            (0, 2, cell('b', fg, Color::Named(NamedColor::Background), Flags::empty())),
+            (
+                0,
+                0,
+                cell(
+                    'a',
+                    fg,
+                    Color::Named(NamedColor::Background),
+                    Flags::empty(),
+                ),
+            ),
+            (
+                0,
+                1,
+                cell(
+                    ' ',
+                    fg,
+                    Color::Named(NamedColor::Background),
+                    Flags::empty(),
+                ),
+            ),
+            (
+                0,
+                2,
+                cell(
+                    'b',
+                    fg,
+                    Color::Named(NamedColor::Background),
+                    Flags::empty(),
+                ),
+            ),
         ];
         let plan = layout_grid(cells.iter().map(|(l, c, cell)| (*l, *c, cell)), &theme());
         assert_eq!(plan.runs.len(), 2);

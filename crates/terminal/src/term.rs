@@ -80,9 +80,8 @@ impl Terminal {
                 while let Ok(ev) = rx.recv().await {
                     match ev {
                         TerminalEvent::PtyOutput(bytes) => {
-                            let _ = this.update(cx, |t: &mut Terminal, cx| {
-                                t.write_pty_output(&bytes, cx)
-                            });
+                            let _ = this
+                                .update(cx, |t: &mut Terminal, cx| t.write_pty_output(&bytes, cx));
                         }
                         TerminalEvent::ChildExit(code) => {
                             let _ = this.update(cx, |t: &mut Terminal, cx| {
@@ -187,19 +186,10 @@ mod tests {
         let (event_tx, event_rx) = async_channel::bounded::<TerminalEvent>(256);
         let listener = ManoxListener::new(event_tx.clone());
         let cfg = Config::default();
-        let size = TermSize {
-            cols: 80,
-            rows: 24,
-        };
+        let size = TermSize { cols: 80, rows: 24 };
         let term = Arc::new(FairMutex::new(Term::new(cfg, &size, listener)));
-        let pty = pty::spawn(
-            &PathBuf::from("/tmp"),
-            80,
-            24,
-            &[],
-            event_tx.clone(),
-        )
-        .expect("spawn pty");
+        let pty =
+            pty::spawn(&PathBuf::from("/tmp"), 80, 24, &[], event_tx.clone()).expect("spawn pty");
 
         // Let the shell start, then send a command.
         std::thread::sleep(Duration::from_millis(150));
@@ -209,7 +199,10 @@ mod tests {
         let start = Instant::now();
         loop {
             if start.elapsed() > Duration::from_secs(8) {
-                panic!("timeout waiting for echo output; grid:\n{}", grid_text(&term.lock(), 24, 80));
+                panic!(
+                    "timeout waiting for echo output; grid:\n{}",
+                    grid_text(&term.lock(), 24, 80)
+                );
             }
             while let Ok(ev) = event_rx.try_recv() {
                 if let TerminalEvent::PtyOutput(bytes) = ev {

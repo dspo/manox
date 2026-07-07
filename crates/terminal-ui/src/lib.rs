@@ -9,7 +9,9 @@
 
 use gpui::App;
 
+pub mod element;
 pub mod grid_renderer;
+pub mod terminal_view;
 pub mod theme;
 
 /// Register terminal UI actions and workspace tab integration.
