@@ -27,7 +27,8 @@ use gpui::{
     ease_out_quint, list, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme,
+    TitleBar,
     animation::{Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -4017,32 +4018,18 @@ impl Render for Workspace {
                     .flex_1()
                     .h_full()
                     .relative()
-                    // Title bar (TitleBar handles window dragging via start_window_move)
-                    .child(
-                        TitleBar::new()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(Icon::new(IconName::Bot).small())
-                                    .child(
-                                        gpui::div()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child(title_text),
-                                    )
-                                    .child(self.render_title_menu_trigger(&theme, cx)),
-                            )
-                            .child(h_flex()),
-                    )
                     // Body wrapper: hero / list / footer / overlay share a common
                     // horizontal inset so conversation content doesn't kiss the
-                    // environment panel edge.
+<<<<<<< HEAD
+                    // panel edge. `pt` reserves space for the title-bar overlay
+                    // (last child below); the overlay paints after the body so
+                    // the "..." menu isn't covered by the conversation list.
                     .child(
                         v_flex()
                             .flex_1()
                             .min_h_0()
                             .w_full()
-                            .px_4()
+                            .pt(TITLE_BAR_HEIGHT)
                             .pr(content_inset)
                             .pb_2()
                             // Empty first screen shows the centered hero in place of the
@@ -4098,9 +4085,35 @@ impl Render for Workspace {
                             // Approval overlay (if any)
                             .children(overlay),
                     )
-                    // Environment info card (floating, top-right)
-                    .children(env_panel)
-            })
+<<<<<<< HEAD
+                    // Title-bar overlay: absolute top of the main column,
+                    // painted after the body so the "..." menu isn't covered
+                    // by the conversation list.
+                    .child(
+                        gpui::div()
+                            .absolute()
+                            .top(px(0.))
+                            .left(px(0.))
+                            .right(px(0.))
+                            .h(TITLE_BAR_HEIGHT)
+                            .child(
+                                TitleBar::new()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(Icon::new(IconName::Bot).small())
+                                            .child(
+                                                gpui::div()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .child(title_text),
+                                            )
+                                            .child(self.render_title_menu_trigger(&theme, cx)),
+                                    )
+                                    .child(h_flex()),
+                            ),
+                    ),
+            )
             .when(editor_open, |this| {
                 this.child(editor_divider).child(editor_pane)
             })
