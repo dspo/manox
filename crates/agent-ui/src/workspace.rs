@@ -1683,7 +1683,10 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                // Scrim must use the dark foreground, not `background`. A white
+                // veil over a white conversation does not dim, so the page shows
+                // through and the modal reads as transparent.
+                .bg(theme.foreground.opacity(0.6))
                 .child(
                     v_flex()
                         .w(px(420.))
@@ -1818,7 +1821,10 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                // Scrim must use the dark foreground, not `background`. A white
+                // veil over a white conversation does not dim, so the page shows
+                // through and the modal reads as transparent.
+                .bg(theme.foreground.opacity(0.6))
                 .child(
                     v_flex()
                         .w(px(420.))
@@ -1899,7 +1905,10 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                // Scrim must use the dark foreground, not `background`. A white
+                // veil over a white conversation does not dim, so the page shows
+                // through and the modal reads as transparent.
+                .bg(theme.foreground.opacity(0.6))
                 .child(
                     v_flex()
                         .w(px(480.))
@@ -3538,7 +3547,10 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                // Scrim must use the dark foreground, not `background`. A white
+                // veil over a white conversation does not dim, so the page shows
+                // through and the modal reads as transparent.
+                .bg(theme.foreground.opacity(0.6))
                 .child(
                     v_flex()
                         .w(px(480.))
