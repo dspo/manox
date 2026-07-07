@@ -71,12 +71,12 @@ impl Sidebar {
         let store = agent::thread_store_global();
         let sub = cx.subscribe(&store, |_this, _store, ev: &ThreadStoreEvent, cx| {
             // `SummariesUpdated` re-renders the whole list (a thread was
-            // created/saved/deleted). `RunningChanged` only flips the running
-            // indicator on one row, but a `cx.notify()` here is enough — the
+            // created/saved/deleted). `RunningChanged` flips the running
+            // indicator on affected rows; `cx.notify()` is enough — the
             // per-row `running` bool is recomputed in `render` from the store's
-            // `running()` and the shimmer animation starts/stops accordingly.
+            // `is_running` and the shimmer animation starts/stops accordingly.
             match ev {
-                ThreadStoreEvent::SummariesUpdated | ThreadStoreEvent::RunningChanged(_) => {
+                ThreadStoreEvent::SummariesUpdated | ThreadStoreEvent::RunningChanged => {
                     cx.notify();
                 }
             }
@@ -122,7 +122,7 @@ impl Sidebar {
         path: &str,
         group: &[agent::ThreadSummary],
         selected: Option<&str>,
-        running_id: Option<&str>,
+        store: &Entity<ThreadStore>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -181,7 +181,7 @@ impl Sidebar {
                 render_thread_item(
                     s,
                     selected == Some(s.id.as_str()),
-                    running_id == Some(s.id.as_str()),
+                    store.read(cx).is_running(&s.id),
                     px(16.),
                     theme,
                     cx,
@@ -202,9 +202,7 @@ impl Render for Sidebar {
         let theme = cx.theme().clone();
         let summaries = self.store.read(cx).summaries().to_vec();
         let selected = self.selected.clone();
-        // The thread id currently running a turn, if any. Drives the per-row
-        // shimmer: only the row whose id matches lights up.
-        let running_id = self.store.read(cx).running().map(|s| s.to_string());
+        let store = self.store.clone();
 
         // Partition into project-bound groups (keyed by project path, first-seen
         // order preserved) and the projectless remainder. `summaries` is already
@@ -311,7 +309,7 @@ impl Render for Sidebar {
                             &path,
                             &group,
                             selected.as_deref(),
-                            running_id.as_deref(),
+                            &store,
                             &theme,
                             cx,
                         )
@@ -325,7 +323,7 @@ impl Render for Sidebar {
                         render_thread_item(
                             s,
                             selected.as_deref() == Some(s.id.as_str()),
-                            running_id.as_deref() == Some(s.id.as_str()),
+                            store.read(cx).is_running(&s.id),
                             px(0.),
                             &theme,
                             cx,

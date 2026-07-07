@@ -110,6 +110,10 @@ struct AskOption {
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<Thread>,
+    /// Threads that were running when the user switched away. Holding strong
+    /// references keeps their `run_turn_loop` tasks alive so they can finish
+    /// in the background and persist via the spawned-task save backstop.
+    background_threads: Vec<Entity<Thread>>,
     sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
@@ -325,6 +329,7 @@ impl Workspace {
         let mut ws = Self {
             cwd,
             thread,
+            background_threads: Vec::new(),
             sidebar,
             conversation: cx.new(|_| ConversationState::new()),
             input_state,
@@ -460,7 +465,7 @@ impl Workspace {
                     // network latency). Terminal `Stop`/`Error` below clear it.
                     let thread_id = this.thread.read(cx).id.0.clone();
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.set_running(Some(thread_id), cx));
+                    store.update(cx, |s, cx| s.mark_running(&thread_id, cx));
                 }
                 ThreadEvent::Stop(reason) => {
                     // A terminal state ends any pending plan approval (the
@@ -481,10 +486,14 @@ impl Workspace {
                     }
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
+                        let thread_id = this.thread.read(cx).id.0.clone();
                         save_thread(this.thread.clone(), true, cx);
                         // Terminal stop → this thread is no longer running.
                         let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| s.set_running(None, cx));
+                        store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                        // Clean up background reference if this thread was parked.
+                        this.background_threads
+                            .retain(|t| t.read(cx).id.0 != thread_id);
                     }
                     cx.notify();
                 }
@@ -501,8 +510,11 @@ impl Workspace {
                     // dedicated arm because the conversation still needs the
                     // generic `apply` below to render the error item.
                     if let ThreadEvent::Error(_) = ev {
+                        let thread_id = this.thread.read(cx).id.0.clone();
                         let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| s.set_running(None, cx));
+                        store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                        this.background_threads
+                            .retain(|t| t.read(cx).id.0 != thread_id);
                     }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -931,16 +943,26 @@ impl Workspace {
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
     fn attach_thread(&mut self, new_thread: Entity<Thread>, cx: &mut Context<Self>) {
-        // Cancel any running turn on the old thread so parked oneshots
-        // (plan approval, tool auth) are resolved immediately rather than
-        // stranding until the entity is eventually dropped.
-        self.thread.update(cx, |t, cx| t.cancel(cx));
-        // Backstop: the old thread's terminal `Stop` from `cancel` may land on
-        // the stale subscription (dropped below) or arrive after the new thread
-        // is attached. Clear running state synchronously so the sidebar
-        // indicator never lingers on a thread we just left.
-        let store = agent::thread_store_global();
-        store.update(cx, |s, cx| s.set_running(None, cx));
+        let old_thread = self.thread.clone();
+        let old_id = old_thread.read(cx).id.0.clone();
+        let new_id = new_thread.read(cx).id.0.clone();
+
+        // If the old thread is still running a turn, park it in the background
+        // so its `run_turn_loop` task stays alive (the entity is otherwise only
+        // held by `self.thread`; overwriting that field would drop it and
+        // silently kill the turn via `WeakEntity::upgrade() -> None`).
+        if old_thread.read(cx).is_running() && old_id != new_id {
+            self.background_threads.push(old_thread);
+        }
+
+        // If the new thread was previously parked in the background, reclaim it
+        // so it becomes the foreground thread and is no longer double-held.
+        self.background_threads
+            .retain(|t| t.read(cx).id.0 != new_id);
+
+        // Persist the old thread's current state before switching away. The
+        // spawned-task save backstop in `run_turn` will persist again when the
+        // turn actually finishes, capturing the final assistant messages.
         save_thread(self.thread.clone(), false, cx);
 
         self.thread = new_thread;
@@ -966,9 +988,45 @@ impl Workspace {
         self.pending_rename = None;
         self.pending_plan = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
+        // If the new thread has pending authorizations (e.g. it was parked
+        // while waiting for tool approval), re-surface them so the overlay
+        // appears immediately upon switching back.
+        self.resurface_pending_auths(cx);
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id), cx));
         cx.notify();
+    }
+
+    /// Re-surface any pending authorizations on the current thread that were
+    /// emitted while the thread was in the background (no subscription). Called
+    /// after switching threads so the overlay appears without requiring the
+    /// user to wait for the next event.
+    fn resurface_pending_auths(&mut self, cx: &mut Context<Self>) {
+        // Query the thread for any pending authorization metadata that was
+        // stored when the auth event was originally emitted. If the thread was
+        // parked waiting for user approval while in the background, re-surface
+        // the events so the overlay appears immediately upon switching back.
+        let entries: Vec<(String, String, String)> = self
+            .thread
+            .read(cx)
+            .pending_auth_entries()
+            .into_iter()
+            .map(|(id, meta)| (id, meta.tool_name.clone(), meta.summary.clone()))
+            .collect();
+        for (id, tool_name, summary) in entries {
+            let reason = self
+                .thread
+                .update(cx, |t, _cx| t.take_approval_ask_reason(&id));
+            self.pending_auths.push(PendingAuth {
+                id,
+                tool_name,
+                summary,
+                reason,
+            });
+        }
+        if !self.pending_auths.is_empty() {
+            cx.notify();
+        }
     }
 
     fn start_new_thread(&mut self, cx: &mut Context<Self>) {
@@ -978,6 +1036,17 @@ impl Workspace {
     }
 
     fn open_thread(&mut self, id: String, cx: &mut Context<Self>) {
+        // If the thread is already running in the background, reclaim it
+        // instead of loading a stale snapshot from the db.
+        if let Some(pos) = self
+            .background_threads
+            .iter()
+            .position(|t| t.read(cx).id.0 == id)
+        {
+            let thread = self.background_threads.remove(pos);
+            self.attach_thread(thread, cx);
+            return;
+        }
         let store = self.sidebar.read(cx).store();
         let Some(loaded) = store.update(cx, |s, cx| s.load_thread(&id, cx)) else {
             return;
