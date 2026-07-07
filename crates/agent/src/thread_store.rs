@@ -153,47 +153,9 @@ impl ThreadStore {
         Some(Thread::restore(rec, model, cx))
     }
 
-    /// Delete by id, then refresh. Fires `SessionEnd` (fail-open) so plugins
-    /// can tear down per-session state — a deleted thread's session is over.
-    /// The thread's cwd is loaded first so handlers get the real project dir as
-    /// `CLAUDE_PROJECT_DIR` (the record is gone after `delete`, so load before).
-    pub fn delete_thread(&mut self, id: &str, cx: &mut Context<Self>) {
-        let cwd = self.db.load(id).ok().flatten().map(|r| r.cwd);
-        crate::hook::fire(
-            crate::hook::HookEvent::SessionEnd,
-            cwd.as_deref(),
-            serde_json::json!({"thread_id": id}),
-        );
-        if let Err(e) = self.db.delete(id) {
-            tracing::warn!(error = %e, "删除 thread 失败");
-        }
-        self.refresh(cx);
-    }
-
     /// Create a fresh empty `Thread` (used by the sidebar "new conversation" button).
     pub fn new_thread(&self, cwd: PathBuf, cx: &mut App) -> Entity<Thread> {
         Thread::new(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx)
-    }
-
-    /// Rename a thread (sets the user title override). `name == None` clears it.
-    /// Runs the write off the UI thread, then refreshes so the sidebar updates.
-    pub fn rename_thread(&self, id: &str, name: Option<String>, cx: &mut Context<Self>) {
-        let db = self.db.clone();
-        let id = id.to_string();
-        cx.spawn(async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move { db.rename(&id, name.as_deref()) })
-                .await;
-            if let Err(e) = res {
-                tracing::warn!(error = %e, "rename thread 失败");
-            }
-            this.update(cx, |s, cx| {
-                s.refresh(cx);
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// Archive (or unarchive) a thread. Refreshes so it leaves/enters the active list.

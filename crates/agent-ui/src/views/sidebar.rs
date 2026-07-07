@@ -1,8 +1,8 @@
 //! Conversation history sidebar.
 //!
 //! A standalone gpui Entity that subscribes to `ThreadStore` and lists past threads. Clicking a
-//! conversation entry emits `OpenThread(id)`; the "new conversation" menu item emits `NewThread`;
-//! each entry's "×" emits `DeleteThread(id)`. Workspace subscribes to these events.
+//! conversation entry emits `OpenThread(id)`; the "new conversation" menu item emits `NewThread`.
+//! Workspace subscribes to these events.
 //!
 //! Threads bound to a project (chosen on the first screen) are grouped under a collapsible folder
 //! in the "Projects" section, keyed by project path; the rest fall under "Conversations". The top
@@ -29,13 +29,8 @@ use gpui_component::{
 pub enum SidebarEvent {
     OpenThread(String),
     NewThread,
-    DeleteThread(String),
-    /// User clicked the rename affordance; the workspace opens an input overlay.
-    RenameThread(String),
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
-    /// User toggled the pin indicator. The bool is the new pinned state.
-    PinThread(String, bool),
 }
 
 pub struct Sidebar {
@@ -354,7 +349,7 @@ fn section_header(label: SharedString, theme: &Theme) -> AnyElement {
 
 /// Render one conversation row. `indent` adds left padding so rows nested under
 /// a project folder align below its label. Two-row layout: title on top, tag +
-/// total tokens + relative time + rename/archive/delete actions on bottom. The
+/// total tokens + relative time + archive action on bottom. The
 /// thread-id tag is clickable to copy the full thread id (F1); while `running`
 /// is true a highlight band sweeps across the tag (F2).
 ///
@@ -372,13 +367,9 @@ fn render_thread_item(
 ) -> AnyElement {
     let id = summary.id.clone();
     let id_open = id.clone();
-    let id_del = id.clone();
-    let id_rename = id.clone();
     let id_archive = id.clone();
-    let id_pin = id.clone();
     let id_copy = id.clone();
     let archive_to = !summary.archived;
-    let pin_to = !summary.pinned;
     let display = summary.display_title();
     let title = if display.is_empty() {
         i18n::t("sidebar-empty-summary").to_string()
@@ -502,15 +493,15 @@ fn render_thread_item(
                                 .child(title),
                         ),
                 )
-                // Row 2: tag + tokens + relative time, with rename/archive/delete
-                // actions taking their place on hover.
+                // Row 2: tag + tokens + relative time, with the archive
+                // action taking their place on hover.
                 .child(
                     h_flex()
                         .gap_1()
                         .items_center()
                         .child(tag_element)
                         // Tokens + relative time, hidden on hover so the action
-                        // buttons can take their place. `min_w_0` + overflow
+                        // button can take their place. `min_w_0` + overflow
                         // hidden so a narrow sidebar clips rather than overflows.
                         .child(
                             h_flex()
@@ -523,56 +514,22 @@ fn render_thread_item(
                                 .child(gpui::div().child(tokens))
                                 .child(gpui::div().child(updated)),
                         )
-                        // Action group (rename / pin / archive / delete), revealed on hover.
+                        // Archive action, revealed on hover.
                         .child(
                             h_flex()
                                 .gap_0p5()
                                 .invisible()
                                 .group_hover(group.clone(), |s| s.visible())
                                 .child(
-                                    Button::new(format!("rename-thread-{id_rename}"))
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Replace)
-                                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
-                                            cx.emit(SidebarEvent::RenameThread(id_rename.clone()));
-                                        })),
-                                )
-                                .child(
-                                    Button::new(format!("pin-thread-{id_pin}"))
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(if pin_to {
-                                            IconName::StarOff
-                                        } else {
-                                            IconName::Star
-                                        })
-                                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
-                                            cx.emit(SidebarEvent::PinThread(
-                                                id_pin.clone(),
-                                                pin_to,
-                                            ));
-                                        })),
-                                )
-                                .child(
                                     Button::new(format!("archive-thread-{id_archive}"))
                                         .ghost()
                                         .xsmall()
-                                        .icon(IconName::Inbox)
+                                        .icon(IconName::FolderClosed)
                                         .on_click(cx.listener(move |_this, _ev, _window, cx| {
                                             cx.emit(SidebarEvent::ArchiveThread(
                                                 id_archive.clone(),
                                                 archive_to,
                                             ));
-                                        })),
-                                )
-                                .child(
-                                    Button::new(format!("del-thread-{id_del}"))
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Close)
-                                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
-                                            cx.emit(SidebarEvent::DeleteThread(id_del.clone()));
                                         })),
                                 ),
                         ),

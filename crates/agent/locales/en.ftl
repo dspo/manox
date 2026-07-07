@@ -249,9 +249,6 @@ workspace-ask-next = Next
 workspace-ask-response = Free-form response (overrides all selections)
 workspace-cancel = Cancel
 workspace-submit = Submit
-workspace-rename-title = Rename conversation
-workspace-rename-prompt = Enter a new title. Leave empty to clear the override and fall back to the generated summary.
-workspace-rename-confirm = Save
 workspace-mode-normal = Normal
 workspace-mode-section = Mode
 workspace-mode-on-request-title = Request approval
@@ -326,9 +323,6 @@ terminal-search-status = search: { $pattern }  ({ $count ->
 
 ### views/title_menu.rs
 titlebar-menu-label = Conversation
-titlebar-pin = Pin conversation
-titlebar-unpin = Unpin conversation
-titlebar-rename = Rename conversation
 titlebar-archive = Archive conversation
 titlebar-unarchive = Unarchive conversation
 titlebar-sidebar-toggle = Open side chat
@@ -346,11 +340,8 @@ titlebar-copied-id = Conversation ID copied to clipboard.
 titlebar-copied-cwd = Working directory copied to clipboard.
 titlebar-copied-deeplink = Deep link copied to clipboard (manox://thread/{ $id }).
 titlebar-copied-markdown = Conversation copied to clipboard as Markdown.
-titlebar-pinned-notice = Conversation pinned.
-titlebar-unpinned-notice = Conversation unpinned.
 titlebar-archive-notice = Conversation archived.
 titlebar-not-implemented = Not implemented yet.
-titlebar-rename-notice = Rename dialog opened.
 
 # ── Environment info panel ──────────────────────────────────────────────
 workspace-env-title = Environment info
