@@ -15,7 +15,7 @@ use gpui::{
     App, Bounds, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
     FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, SharedString,
     StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, point, px,
-    relative, size,
+    relative, rgba, size,
 };
 use terminal::{Cell, Flags, Terminal};
 
@@ -34,6 +34,10 @@ pub struct TerminalElement {
     pub line_height: f32,
     /// In-flight IME marked text, painted inline at the cursor.
     pub marked_text: SharedString,
+    /// `/pattern` match ranges in grid coordinates, painted as highlights.
+    pub search_matches: Vec<(terminal::Point, terminal::Point)>,
+    /// Index of the active match (highlighted distinctly).
+    pub active_match: Option<usize>,
 }
 
 /// Computed during prepaint, consumed during paint.
@@ -43,6 +47,8 @@ pub struct PrepaintState {
     line_height_px: Pixels,
     bounds: Bounds<Pixels>,
     cursor: Option<(i32, i32)>,
+    /// Pixel rects for search matches; `true` = the active match.
+    search_rects: Vec<(Bounds<Pixels>, bool)>,
 }
 
 impl TerminalElement {
@@ -66,6 +72,8 @@ impl TerminalElement {
             font_size: px(14.),
             line_height: 1.2,
             marked_text: SharedString::default(),
+            search_matches: Vec::new(),
+            active_match: None,
         }
     }
 
@@ -86,6 +94,36 @@ impl TerminalElement {
                 prev = Some(line);
             }
             out.push((display_line, idx.point.column.0, idx.cell));
+        }
+        out
+    }
+
+    /// Convert grid-coordinate match ranges to pixel rects, keeping only the
+    /// portion visible in the current display window. Multi-line matches are
+    /// truncated to their first line (rare for `/pattern` search). The active
+    /// match index is flagged so paint can color it distinctly.
+    fn match_rects(
+        matches: &[(terminal::Point, terminal::Point)],
+        active: Option<usize>,
+        offset: i32,
+        rows: i32,
+        bounds: Bounds<Pixels>,
+        cell_w: Pixels,
+        lh: Pixels,
+    ) -> Vec<(Bounds<Pixels>, bool)> {
+        let mut out = Vec::new();
+        for (i, (start, end)) in matches.iter().enumerate() {
+            // display_row = grid_line + (rows-1) + offset
+            let display_row = start.line.0 + (rows - 1) + offset;
+            if !(0..rows).contains(&display_row) {
+                continue;
+            }
+            let start_col = start.column.0 as i32;
+            let end_col = (end.column.0 as i32).max(start_col);
+            let x = bounds.origin.x + start_col as f32 * cell_w;
+            let y = bounds.origin.y + display_row as f32 * lh;
+            let w = ((end_col - start_col + 1).max(1) as f32) * cell_w;
+            out.push((Bounds::new(point(x, y), size(w, lh)), active == Some(i)));
         }
         out
     }
@@ -152,15 +190,30 @@ impl Element for TerminalElement {
         }
 
         // Build the paint plan from the terminal's renderable snapshot.
-        let (plan, cursor) = self.terminal.read_with(cx, |t, _cx| {
+        let (plan, cursor, offset) = self.terminal.read_with(cx, |t, _cx| {
             t.with_term(|term| {
                 let content = term.renderable_content();
                 let cursor_pt = content.cursor.point;
+                let offset = term.grid().display_offset() as i32;
                 let cells = Self::display_cells(content);
                 let plan = layout_grid(cells.into_iter(), &self.theme);
-                (plan, Some((cursor_pt.line.0, cursor_pt.column.0 as i32)))
+                (
+                    plan,
+                    Some((cursor_pt.line.0, cursor_pt.column.0 as i32)),
+                    offset,
+                )
             })
         });
+        let rows = self.terminal.read_with(cx, |t, _| t.rows as i32);
+        let search_rects = Self::match_rects(
+            &self.search_matches,
+            self.active_match,
+            offset,
+            rows,
+            bounds,
+            cell_width,
+            line_height_px,
+        );
 
         PrepaintState {
             plan,
@@ -168,6 +221,7 @@ impl Element for TerminalElement {
             line_height_px,
             bounds,
             cursor,
+            search_rects,
         }
     }
 
@@ -197,6 +251,16 @@ impl Element for TerminalElement {
             let pos = point(x, y);
             let sz = size(w, h);
             window.paint_quad(fill(Bounds::new(pos, sz), region.color));
+        }
+
+        // `/pattern` search highlights. The active match gets a stronger color.
+        for (rect, is_active) in &prepaint.search_rects {
+            let color = if *is_active {
+                rgba(0xffa500cc)
+            } else {
+                rgba(0xffe06666)
+            };
+            window.paint_quad(fill(*rect, color));
         }
 
         // Text runs.

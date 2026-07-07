@@ -16,14 +16,15 @@ use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::search::RegexSearch;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vi_mode::ViMotion;
-use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Processor, StdSyncHandler};
 use anyhow::Result;
 use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Context, Entity, EventEmitter, Task};
 
 use crate::event::{ManoxListener, TerminalEvent};
 use crate::pty;
+use crate::settings::{BellMode, CursorShapeSetting, Osc52Access, TerminalSettings};
 
 pub(crate) type ManoxTerm = Term<ManoxListener>;
 pub(crate) type ManoxTermLock = FairMutex<ManoxTerm>;
@@ -47,6 +48,37 @@ impl Dimensions for TermSize {
     }
 }
 
+/// Build the alacritty `Config` from `[terminal]` settings: scrollback size,
+/// cursor glyph, and OSC 52 policy. Alacritty gates OSC 52 internally per
+/// `Config.osc52`, so the gpui task only sees allowed clipboard requests.
+fn build_config(settings: &TerminalSettings) -> Config {
+    Config {
+        scrolling_history: settings.scrolling_history,
+        default_cursor_style: map_cursor(settings.cursor_shape),
+        osc52: map_osc52(settings.osc52_access),
+        ..Config::default()
+    }
+}
+
+fn map_cursor(s: CursorShapeSetting) -> CursorStyle {
+    let shape = match s {
+        CursorShapeSetting::Block => CursorShape::Block,
+        CursorShapeSetting::Underline => CursorShape::Underline,
+        CursorShapeSetting::Beam => CursorShape::Beam,
+    };
+    CursorStyle {
+        shape,
+        blinking: false,
+    }
+}
+
+fn map_osc52(a: Osc52Access) -> Osc52 {
+    match a {
+        Osc52Access::Allow => Osc52::CopyPaste,
+        Osc52Access::Deny => Osc52::Disabled,
+    }
+}
+
 pub struct Terminal {
     pub id: String,
     pub cwd: PathBuf,
@@ -57,13 +89,17 @@ pub struct Terminal {
     output_processor: Processor<StdSyncHandler>,
     pub child_exited: Option<i32>,
     pub title: Option<String>,
+    /// Bell policy — the view reads this to decide whether to flash / beep.
+    pub bell: BellMode,
     _task: Option<Task<()>>,
 }
 
 impl EventEmitter<TerminalEvent> for Terminal {}
 
 impl Terminal {
-    /// Create a Terminal running the user's default shell in `cwd`.
+    /// Create a Terminal running the user's shell in `cwd`. Shell, font,
+    /// scrollback, cursor, bell, and OSC 52 policy come from
+    /// `[terminal]` in `settings.toml`.
     pub fn new(
         id: String,
         cwd: PathBuf,
@@ -71,12 +107,22 @@ impl Terminal {
         rows: usize,
         cx: &mut App,
     ) -> Result<Entity<Self>> {
+        let settings = crate::settings::load();
         let (event_tx, event_rx) = async_channel::bounded::<TerminalEvent>(256);
         let listener = ManoxListener::new(event_tx.clone());
-        let cfg = Config::default();
+        let cfg = build_config(&settings);
         let size = TermSize { cols, rows };
         let term = Arc::new(FairMutex::new(Term::new(cfg, &size, listener)));
-        let pty = pty::spawn(&cwd, cols as u16, rows as u16, &[], event_tx.clone())?;
+        let shell = settings.shell.as_deref();
+        let pty = pty::spawn(
+            &cwd,
+            cols as u16,
+            rows as u16,
+            shell,
+            &settings.env,
+            event_tx.clone(),
+        )?;
+        let bell = settings.bell;
 
         let entity = cx.new(|cx| {
             let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
@@ -146,6 +192,7 @@ impl Terminal {
                 output_processor: Processor::<StdSyncHandler>::new(),
                 child_exited: None,
                 title: None,
+                bell,
                 _task: Some(task),
             }
         });
@@ -356,8 +403,8 @@ mod tests {
         let cfg = Config::default();
         let size = TermSize { cols: 80, rows: 24 };
         let term = Arc::new(FairMutex::new(Term::new(cfg, &size, listener)));
-        let pty =
-            pty::spawn(&PathBuf::from("/tmp"), 80, 24, &[], event_tx.clone()).expect("spawn pty");
+        let pty = pty::spawn(&PathBuf::from("/tmp"), 80, 24, None, &[], event_tx.clone())
+            .expect("spawn pty");
 
         // Let the shell start, then send a command.
         std::thread::sleep(Duration::from_millis(150));

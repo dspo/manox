@@ -26,6 +26,7 @@ portable-pty = { workspace = true }
 
 gpui.workspace = true
 agent = { path = "../agent" }
+toml = { workspace = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

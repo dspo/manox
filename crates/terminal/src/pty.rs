@@ -49,12 +49,14 @@ pub struct PtyHandle {
     wait_thread: Option<JoinHandle<()>>,
 }
 
-/// Spawn the default shell in a PTY of the given size, returning a handle that
-/// owns the master, writer, child-killer, and the two background threads.
+/// Spawn the shell in a PTY of the given size, returning a handle that owns
+/// the master, writer, child-killer, and the two background threads. `shell`
+/// overrides the default user program when `Some`.
 pub fn spawn(
     cwd: &Path,
     cols: u16,
     rows: u16,
+    shell: Option<&str>,
     env: &[(String, String)],
     event_tx: async_channel::Sender<TerminalEvent>,
 ) -> Result<PtyHandle> {
@@ -68,8 +70,18 @@ pub fn spawn(
         })
         .context("openpty")?;
 
-    let mut cmd = CommandBuilder::new_default_prog();
-    cmd.cwd(cwd);
+    let mut cmd = match shell {
+        Some(prog) => {
+            let mut c = CommandBuilder::new(prog);
+            c.cwd(cwd);
+            c
+        }
+        None => {
+            let mut c = CommandBuilder::new_default_prog();
+            c.cwd(cwd);
+            c
+        }
+    };
     for (k, v) in env {
         cmd.env(k, v);
     }

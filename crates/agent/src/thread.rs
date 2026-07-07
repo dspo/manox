@@ -2592,9 +2592,7 @@ mod tests {
         let model = registry
             .models()
             .iter()
-            .find(|m| {
-                m.provider_name() == "百炼" && m.name().contains("glm-5.2")
-            })
+            .find(|m| m.provider_name() == "百炼" && m.name().contains("glm-5.2"))
             .cloned()
             .expect("百炼 glm-5.2[1m] anthropic");
 
@@ -2635,8 +2633,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
 
-        let msgs = cx
-            .update(|cx| thread.read_with(cx, |t, _| t.messages.clone()));
+        let msgs = cx.update(|cx| thread.read_with(cx, |t, _| t.messages.clone()));
         // The assistant turn must have produced real text content, not just an
         // empty `ContentBlockStart` thinking block (the pre-fix symptom).
         let assistant_text: String = msgs
@@ -2654,6 +2651,9 @@ mod tests {
             !assistant_text.is_empty(),
             "assistant produced no text — stream was not fully drained (got messages: {msgs:?})"
         );
-        eprintln!("assistant text: {}", assistant_text.chars().take(200).collect::<String>());
+        eprintln!(
+            "assistant text: {}",
+            assistant_text.chars().take(200).collect::<String>()
+        );
     }
 }

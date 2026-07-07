@@ -17,15 +17,25 @@ use gpui::{
     FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
     Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, UTF16Selection, Window, black,
-    div, px,
+    div, px, rgba,
 };
 use terminal::Terminal;
 use terminal::alacritty_terminal::term::TermMode;
 use terminal::alacritty_terminal::vi_mode::ViMotion;
 use terminal::mappings::keys;
+use terminal::settings::BellMode;
 
 use crate::element::TerminalElement;
 use crate::theme::TerminalTheme;
+
+/// In-flight `/pattern` search state — the pattern, the grid-coordinate match
+/// ranges, and the index of the active (highlighted) match.
+#[derive(Default, Clone)]
+struct Search {
+    pattern: String,
+    matches: Vec<(terminal::Point, terminal::Point)>,
+    active: usize,
+}
 
 /// A view that hosts one terminal session. Created by the workspace when the
 /// user opens a terminal tab.
@@ -41,30 +51,42 @@ pub struct TerminalView {
     /// In-flight IME marked (preedit) text, painted at the cursor by the
     /// element. Empty when no composition is active.
     marked_text: String,
+    /// Open search overlay (cmd-f). `None` when closed.
+    search: Option<Search>,
+    /// True while a visual bell flash is active; cleared by a timer.
+    bell_flash: bool,
 }
 
 impl TerminalView {
     pub fn new(terminal: Entity<Terminal>, cx: &mut App) -> Entity<Self> {
         let terminal_for_view = terminal.clone();
+        let s = terminal::settings::load();
         let view = cx.new(move |cx| Self {
             terminal: terminal_for_view,
             focus_handle: cx.focus_handle(),
             font: Font {
-                family: "Menlo".into(),
+                family: s.font_family.clone().into(),
                 features: FontFeatures::default(),
                 fallbacks: None,
                 weight: FontWeight::default(),
                 style: FontStyle::Normal,
             },
-            font_size: px(14.),
-            line_height: 1.2,
+            font_size: px(s.font_size),
+            line_height: s.line_height,
             selecting: false,
             marked_text: String::new(),
+            search: None,
+            bell_flash: false,
         });
         cx.subscribe(&terminal, {
             let view = view.clone();
-            move |_t, _ev: &terminal::event::TerminalEvent, cx| {
-                view.update(cx, |_, cx| cx.notify());
+            move |_t, ev: &terminal::event::TerminalEvent, cx| match ev {
+                terminal::event::TerminalEvent::Bell => {
+                    view.update(cx, |v, cx| v.ring_bell(cx));
+                }
+                _ => {
+                    view.update(cx, |_, cx| cx.notify());
+                }
             }
         })
         .detach();
@@ -77,6 +99,59 @@ impl TerminalView {
 
     fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
+
+        // cmd/ctrl-f toggles the search overlay.
+        if (k.modifiers.platform || k.modifiers.control) && k.key == "f" {
+            if self.search.is_some() {
+                self.search = None;
+            } else {
+                self.search = Some(Search::default());
+            }
+            cx.notify();
+            return;
+        }
+
+        // While the search overlay is open, keystrokes edit the pattern (the
+        // TUI does not receive them). esc closes; enter closes; cmd-g would
+        // cycle but is left to vi mode's own search for now.
+        if let Some(search) = self.search.as_mut() {
+            match k.key.as_ref() {
+                "escape" => {
+                    self.search = None;
+                    cx.notify();
+                    return;
+                }
+                "enter" | "return" => {
+                    self.search = None;
+                    cx.notify();
+                    return;
+                }
+                "backspace" => {
+                    search.pattern.pop();
+                    self.run_search(cx);
+                    return;
+                }
+                _ => {}
+            }
+            // Append a single printable char to the pattern.
+            if !k.modifiers.control && !k.modifiers.platform {
+                let mut chars = k.key.chars();
+                if let Some(c) = chars.next()
+                    && chars.next().is_none()
+                    && c.is_ascii()
+                    && !c.is_ascii_control()
+                {
+                    let ch = if k.modifiers.shift && c.is_ascii_alphabetic() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    };
+                    search.pattern.push(ch);
+                    self.run_search(cx);
+                }
+            }
+            return;
+        }
 
         // Toggle the terminal's built-in vi mode (alacritty's, not `vim`)
         // on ctrl+shift+v.
@@ -99,6 +174,32 @@ impl TerminalView {
         if let Some(s) = keys::to_esc_str(k, mode) {
             let _ = self.terminal.update(cx, |t, _cx| t.input(s.as_bytes()));
         }
+    }
+
+    /// Run the current search pattern against the terminal grid and store the
+    /// matches so the element can highlight them.
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let pattern = self
+            .search
+            .as_ref()
+            .map(|s| s.pattern.clone())
+            .unwrap_or_default();
+        if pattern.is_empty() {
+            if let Some(search) = self.search.as_mut() {
+                search.matches.clear();
+                search.active = 0;
+            }
+            cx.notify();
+            return;
+        }
+        let matches = self
+            .terminal
+            .read_with(cx, |t, _| t.search_matches(&pattern).unwrap_or_default());
+        if let Some(search) = self.search.as_mut() {
+            search.matches = matches;
+            search.active = 0;
+        }
+        cx.notify();
     }
 
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -189,7 +290,44 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let (search_matches, active_match, pattern, count) = self
+            .search
+            .as_ref()
+            .map(|s| {
+                (
+                    s.matches.clone(),
+                    Some(s.active),
+                    s.pattern.clone(),
+                    s.matches.len(),
+                )
+            })
+            .unwrap_or_default();
+
+        let overlay = if !pattern.is_empty() {
+            Some(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .px_2()
+                    .py_1()
+                    .bg(gpui::rgba(0x000000cc))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(gpui::hsla(0., 0., 0.9, 1.))
+                            .child(SharedString::from(format!(
+                                "search: {pattern}  ({count} match{})",
+                                if count == 1 { "" } else { "es" }
+                            ))),
+                    ),
+            )
+        } else {
+            None
+        };
+
+        let mut content = div()
             .flex_1()
             .w_full()
             .h_full()
@@ -209,11 +347,50 @@ impl Render for TerminalView {
                 font_size: self.font_size,
                 line_height: self.line_height,
                 marked_text: SharedString::from(self.marked_text.clone()),
-            })
+                search_matches,
+                active_match,
+            });
+        if let Some(o) = overlay {
+            content = content.child(o);
+        }
+        if self.bell_flash {
+            content = content.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba(0xffffffff)),
+            );
+        }
+        content
     }
 }
 
 impl TerminalView {
+    /// React to a terminal bell per the configured `bell` mode: `Visual`
+    /// flashes a brief overlay, `System` is silent here (no audio bridge yet),
+    /// `Off` does nothing.
+    fn ring_bell(&mut self, cx: &mut Context<Self>) {
+        let mode = self.terminal.read_with(cx, |t, _| t.bell);
+        if !matches!(mode, BellMode::Visual) {
+            return;
+        }
+        self.bell_flash = true;
+        cx.notify();
+        let entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(120))
+                .await;
+            let _ = entity.update(cx, |v, cx| {
+                v.bell_flash = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn set_marked_text(&mut self, text: String, cx: &mut Context<Self>) {
         self.marked_text = text;
         cx.notify();
