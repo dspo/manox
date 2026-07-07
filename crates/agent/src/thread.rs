@@ -296,16 +296,6 @@ struct ChildAuthRoute {
     child_auth_id: String,
 }
 
-/// How `exit_worktree` disposes of the worktree directory and its branch.
-pub enum WorktreeExitAction {
-    /// Switch cwd back to the prior directory but leave the worktree and branch
-    /// on disk (the user may return to it).
-    Keep,
-    /// Remove the worktree and delete its branch. Refused when the working tree
-    /// is dirty unless `discard_changes` is set.
-    Remove { discard_changes: bool },
-}
-
 /// Session-scoped state for a thread currently inside a git worktree. Not
 /// persisted — a worktree is an ephemeral isolation context tied to the live
 /// session, so a reloaded thread always starts outside any worktree.
@@ -1004,18 +994,6 @@ impl Thread {
     /// Active worktree state, if the thread has entered a git worktree.
     pub fn worktree(&self) -> Option<&WorktreeState> {
         self.worktree.as_ref()
-    }
-
-    /// The sandbox policy the live tool registry was built with. Used by the
-    /// `enter_worktree`/`exit_worktree` tools to resolve the bound repo's
-    /// `.git` and by tests asserting confinement.
-    pub fn sandbox(&self) -> crate::sandbox::SandboxPolicy {
-        let root = self.project.as_deref().unwrap_or(&self.cwd);
-        let base = crate::sandbox::SandboxPolicy::for_project(root);
-        match &self.worktree {
-            Some(wt) => base.with_worktree(&wt.path, &wt.git_common_dir),
-            None => base,
-        }
     }
 
     /// Enter a git worktree: switch the session cwd to `path`, rebuild the

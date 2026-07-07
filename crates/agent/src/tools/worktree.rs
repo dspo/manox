@@ -133,6 +133,19 @@ impl AgentTool for EnterWorktreeTool {
                 );
             }
 
+            // Refuse to nest: a second enter would overwrite the prior-cwd
+            // restore point, losing the original project root on exit. Exit the
+            // current worktree first.
+            if parent
+                .read_with(cx, |t, _| t.worktree().is_some())
+                .unwrap_or(false)
+            {
+                return Err(
+                    "Already in a worktree — call `exit_worktree` first before entering another."
+                        .to_string(),
+                );
+            }
+
             let project_root = parent
                 .read_with(cx, |t, _| {
                     t.project()
@@ -227,14 +240,13 @@ impl AgentTool for ExitWorktreeTool {
     fn input_schema(&self) -> serde_json::Value {
         super::schema::<ExitWorktreeInput>()
     }
-    /// `remove` deletes a branch + worktree — destructive, gate on approval.
-    /// `keep` only switches cwd back, so it skips the overlay.
-    fn requires_approval(&self, input: &serde_json::Value) -> bool {
-        input
-            .get("action")
-            .and_then(|v| v.as_str())
-            .map(|a| a == "remove")
-            .unwrap_or(false)
+    /// Both `keep` and `remove` switch the session cwd and rebuild the tool
+    /// registry — a harness-level state mutation that must run in the serial
+    /// approval queue, not the free-parallel batch (a parallel `read_file` would
+    /// resolve paths against a cwd mid-transition). `remove` additionally
+    /// deletes a branch + worktree. Gate both on approval.
+    fn requires_approval(&self, _input: &serde_json::Value) -> bool {
+        true
     }
     fn run(
         &self,
