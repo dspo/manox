@@ -217,7 +217,9 @@ pub struct Workspace {
     /// per-model counters re-trigger their slide animation.
     token_anim_gen: u64,
     /// Previously displayed per-model token values, keyed by `(model, kind)`.
-    /// Used to detect value changes and animate from old → new.
+    /// Used to detect value changes and animate from old → new. Read/written
+    /// by `render_environment_panel` (not yet wired into `Render`).
+    #[allow(dead_code)]
     token_prev: HashMap<(String, String), u64>,
 }
 
@@ -2429,6 +2431,11 @@ impl Workspace {
     /// area. Shows project, branch, model, per-model token usage (animated),
     /// approval modes, and sources. Only rendered once the thread has been
     /// interacted with and the editor pane is closed.
+    ///
+    /// Not yet wired into the main `Render` impl — left in place so the
+    /// panel logic doesn't get rewritten. CI uses `-D warnings`, so
+    /// `dead_code` must be locally allowed here.
+    #[allow(dead_code)]
     fn render_environment_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let model_label = self.model_label(cx);
         let (project, approval_mode, per_model) = {
@@ -4240,7 +4247,13 @@ fn reasoning_effort_label_key(effort: ReasoningEffort) -> &'static str {
 }
 
 // ── Environment panel helpers ──────────────────────────────────────────────
+//
+// Helpers for `Workspace::render_environment_panel`, which is not yet wired
+// into `Render for Workspace`; the panel sits dormant until its render
+// call site lands. `#[allow(dead_code)]` keeps CI's `-D warnings` happy
+// in the meantime.
 
+#[allow(dead_code)]
 fn env_row(
     icon: IconName,
     label: SharedString,
@@ -4265,6 +4278,7 @@ fn env_row(
         .into_any_element()
 }
 
+#[allow(dead_code)]
 fn mode_tag(label: SharedString, active: bool, theme: &Theme) -> AnyElement {
     gpui::div()
         .px_2()
@@ -4292,6 +4306,7 @@ fn mode_tag(label: SharedString, active: bool, theme: &Theme) -> AnyElement {
 }
 
 /// Compact token count display: `1m,357k`, `168k,653`, `999`.
+#[allow(dead_code)]
 fn format_tokens(n: u64) -> String {
     const MILLION: u64 = 1_000_000;
     const THOUSAND: u64 = 1_000;
@@ -4320,6 +4335,7 @@ fn format_tokens(n: u64) -> String {
 /// values stacked vertically inside a clip container; `Transition::slide_y`
 /// slides the stack up so the old value exits top and the new value enters
 /// from bottom — an odometer-style roll.
+#[allow(dead_code)]
 fn animated_counter(
     kind: &str,
     prev: u64,

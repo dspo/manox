@@ -524,7 +524,7 @@ fn render_thread_item(
                                     Button::new(format!("archive-thread-{id_archive}"))
                                         .ghost()
                                         .xsmall()
-                                        .icon(IconName::FolderClosed)
+                                        .icon(IconName::Inbox)
                                         .on_click(cx.listener(move |_this, _ev, _window, cx| {
                                             cx.emit(SidebarEvent::ArchiveThread(
                                                 id_archive.clone(),
