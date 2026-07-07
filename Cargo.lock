@@ -182,6 +182,7 @@ dependencies = [
  "serde_json",
  "terminal",
  "terminal-ui",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -732,7 +733,7 @@ dependencies = [
  "log",
  "num-rational",
  "num-traits",
- "pastey",
+ "pastey 0.1.1",
  "rayon",
  "thiserror 2.0.18",
  "v_frame",
@@ -4422,12 +4423,18 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "agent-ui",
+ "anyhow",
+ "async-channel 2.5.0",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "rmcp",
+ "serde",
+ "serde_json",
  "terminal",
  "terminal-ui",
+ "tokio",
  "tracing-subscriber",
 ]
 
@@ -5358,6 +5365,12 @@ name = "pastey"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "pathfinder_geometry"
@@ -6447,9 +6460,11 @@ dependencies = [
  "chrono",
  "futures",
  "http",
+ "pastey 0.2.3",
  "pin-project-lite",
  "process-wrap",
  "reqwest 0.13.4",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "sse-stream",
@@ -6797,6 +6812,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "indexmap",
  "ref-cast",

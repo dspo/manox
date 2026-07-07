@@ -4,6 +4,12 @@ edition.workspace = true
 version.workspace = true
 publish.workspace = true
 
+[features]
+# Exposes `thread_store::init_for_test` / `drop_for_test` (and the `TEST_OVERRIDE`
+# slot they mutate) to downstream crates' test suites. Production builds keep
+# these hidden so the global `ThreadStore` path is the only one reachable.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
