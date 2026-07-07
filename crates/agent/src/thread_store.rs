@@ -114,6 +114,21 @@ impl ThreadStore {
         .detach();
     }
 
+    /// Fetch distinct recent project paths from the db on the background
+    /// executor. Returns up to `limit` paths ordered by most recent activity.
+    pub fn fetch_recent_projects(
+        &self,
+        limit: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<Vec<String>> {
+        let db = self.db.clone();
+        cx.spawn(async move |_this, cx| {
+            cx.background_executor()
+                .spawn(async move { db.list_recent_projects(limit).unwrap_or_default() })
+                .await
+        })
+    }
+
     /// Load and restore a `Thread` by id (model resolved from the registry by id; `None` if not found).
     pub fn load_thread(&self, id: &str, cx: &mut App) -> Option<Entity<Thread>> {
         let rec: ThreadRecord = self.db.load(id).ok()??;

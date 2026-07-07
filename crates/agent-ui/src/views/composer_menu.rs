@@ -36,8 +36,7 @@ struct MenuRow {
 }
 
 /// `+` menu "Add" group. "Files and folders" (index 0) opens the file picker,
-/// "Choose project" (index 1) opens the directory picker to bind a project,
-/// and "Plan mode" (index 4) toggles plan mode, all wired by the caller; the
+/// and "Plan mode" (index 3) toggles plan mode, both wired by the caller; the
 /// rest are static decoration mirroring Codex.app. Names/descs are fluent keys
 /// resolved at render time.
 const PLUS_ADD_ROWS: &[MenuRow] = &[
@@ -45,11 +44,6 @@ const PLUS_ADD_ROWS: &[MenuRow] = &[
         icon: IconName::Folder,
         name: "composer-add-files",
         desc: "",
-    },
-    MenuRow {
-        icon: IconName::FolderOpen,
-        name: "composer-choose-project",
-        desc: "composer-choose-project-desc",
     },
     MenuRow {
         icon: IconName::SquareTerminal,
@@ -186,24 +180,16 @@ fn slash_command_item(name: &str, desc: &str, theme: &Theme) -> PopupMenuItem {
 }
 
 /// Build the `+` popup menu. `on_files` runs when the "Files and folders" row is
-/// clicked (index 0); `on_project` runs when the "Choose project" row is clicked
-/// (index 1) — when `None`, the row is omitted entirely (project binding is only
-/// available before the conversation starts); `on_plan` runs when the "Plan mode"
-/// row is clicked (index 4, shifted when project row is omitted).
+/// clicked (index 0); `on_plan` runs when the "Plan mode" row is clicked (index 3).
 pub fn build_plus_menu(
     menu: PopupMenu,
     theme: &Theme,
     on_files: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
-    on_project: Option<impl Fn(&mut gpui::Window, &mut gpui::App) + 'static>,
     on_plan: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(360.)).scrollable(true);
     menu = menu.label(i18n::t("composer-add-label"));
-    // Index 0 ("Files and folders") and 4 ("Plan mode") are always real actions.
-    // Index 1 ("Choose project") is a real action when on_project is Some;
-    // when None the row is skipped entirely.
     let on_files = std::rc::Rc::new(on_files);
-    let on_project = on_project.map(std::rc::Rc::new);
     let on_plan = std::rc::Rc::new(on_plan);
     for (ix, row) in PLUS_ADD_ROWS.iter().enumerate() {
         match ix {
@@ -213,16 +199,7 @@ pub fn build_plus_menu(
                     menu_row_item(row, theme).on_click(move |_, window, cx| on_files(window, cx)),
                 );
             }
-            1 => {
-                if let Some(on_project) = on_project.clone() {
-                    menu = menu.item(
-                        menu_row_item(row, theme)
-                            .on_click(move |_, window, cx| on_project(window, cx)),
-                    );
-                }
-                // When on_project is None, skip the "Choose project" row entirely.
-            }
-            4 => {
+            3 => {
                 let on_plan = on_plan.clone();
                 menu = menu.item(
                     menu_row_item(row, theme).on_click(move |_, window, cx| on_plan(window, cx)),

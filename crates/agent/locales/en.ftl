@@ -273,6 +273,11 @@ workspace-mode-notice = { $mode ->
    *[yolo] Full access: tool calls need no approval, bash runs outside the sandbox.
 }
 workspace-approval-auto-review-note = Auto-review: {$reason}
+workspace-project-choose = Choose project
+workspace-project-new = New project
+workspace-project-blank = Create blank project
+workspace-project-select-folder = Select folder
+workspace-project-name-prompt = Project folder name
 workspace-yolo-on-notice = Full access on: tool calls need no approval, bash runs outside the sandbox.
 workspace-yolo-off-notice = Switched to request-approval mode: approvals and sandbox restored.
 workspace-empty-prompt = What should we do?
@@ -284,8 +289,6 @@ composer-commands-label = Commands
 composer-memory-label = Memory
 composer-skills-label = Skills
 composer-add-files = Files and folders
-composer-choose-project = Choose project
-composer-choose-project-desc = Bind a project directory
 composer-attach-zed = Attach Zed
 composer-goal-name = Goal
 composer-goal-desc = Set a goal for sustained effort

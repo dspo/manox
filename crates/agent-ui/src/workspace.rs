@@ -146,6 +146,10 @@ pub struct Workspace {
     access_open: bool,
     access_menu: Option<Entity<PopupMenu>>,
     access_menu_sub: Option<Subscription>,
+    /// Project-chip dropdown (recent projects + new project submenu).
+    project_chip_open: bool,
+    project_chip_menu: Option<Entity<PopupMenu>>,
+    project_chip_menu_sub: Option<Subscription>,
     slash_open: bool,
     slash_menu: Option<Entity<PopupMenu>>,
     slash_menu_sub: Option<Subscription>,
@@ -164,6 +168,10 @@ pub struct Workspace {
     /// Guards against the user submitting a message before the picker resolves
     /// (which would make `set_project` a silent no-op once `messages` is non-empty).
     project_picker_pending: bool,
+    /// Parent directory selected for "Create blank project"; waiting for name input.
+    blank_project_parent: Option<PathBuf>,
+    /// Input state for the blank project folder name overlay.
+    blank_project_name_input: Option<Entity<InputState>>,
     thread_sub: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
@@ -308,6 +316,9 @@ impl Workspace {
             access_open: false,
             access_menu: None,
             access_menu_sub: None,
+            project_chip_open: false,
+            project_chip_menu: None,
+            project_chip_menu_sub: None,
             slash_open: false,
             slash_menu: None,
             slash_menu_sub: None,
@@ -317,6 +328,8 @@ impl Workspace {
             pending_plan: None,
             pending_attachments: Vec::new(),
             project_picker_pending: false,
+            blank_project_parent: None,
+            blank_project_name_input: None,
             thread_sub: None,
             sidebar_sub: None,
             input_sub: None,
@@ -667,6 +680,13 @@ impl Workspace {
         self.access_open = false;
         self.access_menu = None;
         self.access_menu_sub = None;
+    }
+
+    /// Close the project-chip dropdown.
+    fn close_project_chip_menu(&mut self) {
+        self.project_chip_open = false;
+        self.project_chip_menu = None;
+        self.project_chip_menu_sub = None;
     }
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
@@ -2177,7 +2197,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let plus = self.render_plus_button(cx);
-        let cwd = self.render_cwd_chip(theme, cx);
+        let project_chip = self.render_project_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(running, cx);
@@ -2206,7 +2226,7 @@ impl Workspace {
                             .items_center()
                             .gap_1()
                             .child(plus)
-                            .child(cwd)
+                            .child(project_chip)
                             .child(access),
                     )
                     .child(h_flex().items_center().gap_1().child(model).child(send)),
@@ -2357,26 +2377,10 @@ impl Workspace {
 
     fn open_plus_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let theme = cx.theme().clone();
-        // "Choose project" only appears on the empty first screen — set_project
-        // silently no-ops once messages are present, so the menu item must be
-        // hidden rather than offering a dead-end action.
-        let can_choose_project = self.thread.read(cx).messages().is_empty();
         let ws = cx.entity();
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
             let ws_files = ws.clone();
-            let ws_project = ws.clone();
             let ws_plan = ws.clone();
-            let on_project = if can_choose_project {
-                Some(move |window: &mut gpui::Window, cx: &mut gpui::App| {
-                    ws_project.update(cx, |this, cx| {
-                        this.close_plus_menu();
-                        this.choose_project(window, cx);
-                        cx.notify();
-                    });
-                })
-            } else {
-                None
-            };
             build_plus_menu(
                 menu,
                 &theme,
@@ -2387,7 +2391,6 @@ impl Workspace {
                         cx.notify();
                     });
                 },
-                on_project,
                 move |_window, cx| {
                     ws_plan.update(cx, |this, cx| {
                         this.close_plus_menu();
@@ -2431,36 +2434,6 @@ impl Workspace {
                 })
                 .ok();
             }
-        })
-        .detach();
-    }
-
-    /// Open the native directory picker and bind the chosen folder to the thread
-    /// as its project. Tools then resolve paths against it. Offered only on the
-    /// empty first screen; `set_project` no-ops once the conversation has started.
-    fn choose_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.project_picker_pending {
-            return;
-        }
-        self.project_picker_pending = true;
-        let dir = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: None,
-        });
-        cx.spawn(async move |this, cx| {
-            let result = dir.await;
-            this.update(cx, |this, cx| {
-                this.project_picker_pending = false;
-                if let Ok(Ok(Some(paths))) = result
-                    && let Some(path) = paths.into_iter().next()
-                {
-                    this.thread.update(cx, |t, cx| t.set_project(path, cx));
-                }
-                cx.notify();
-            })
-            .ok();
         })
         .detach();
     }
@@ -2527,28 +2500,426 @@ impl Workspace {
         )
     }
 
-    /// Chip showing the bound project directory basename. Empty (invisible) when
-    /// no project has been chosen; displays the basename once one is bound. The
-    /// project is picked via the `+` menu's "Choose project" item and fixed thereafter.
-    fn render_cwd_chip(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+    /// Project chip: a clickable control showing the current project basename
+    /// (or "Choose project" when unbound). Opens a dropdown listing recent
+    /// projects and a "+ New project" submenu. Mirrors the access-chip pattern.
+    fn render_project_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let project = self.thread.read(cx).project().cloned();
-        match project {
+        let open = self.project_chip_open;
+        let workspace = cx.entity();
+
+        let (icon, label): (Option<IconName>, SharedString) = match &project {
             Some(dir) => {
                 let name = dir
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("project")
                     .to_string();
-                gpui::div()
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(name)
-                    .into_any_element()
+                (Some(IconName::FolderOpen), name.into())
             }
-            None => gpui::div().into_any_element(),
+            None => (
+                Some(IconName::FolderOpen),
+                i18n::t("workspace-project-choose"),
+            ),
+        };
+
+        let trigger = h_flex()
+            .id("project-chip")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .when_some(icon.clone(), |el, ic| {
+                el.child(Icon::new(ic).xsmall().text_color(theme.muted_foreground))
+            })
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(theme.muted_foreground),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if this.project_chip_open {
+                    this.close_project_chip_menu();
+                    cx.notify();
+                    return;
+                }
+                // Only allow project selection on empty threads.
+                let can_set = this.thread.read(cx).messages().is_empty();
+                if !can_set {
+                    return;
+                }
+                this.project_chip_open = true;
+
+                // Fetch recent projects from the store.
+                let store = agent::thread_store_global();
+                let recent = store.update(cx, |s, cx| s.fetch_recent_projects(20, cx));
+
+                let ws = workspace.clone();
+                let theme = cx.theme().clone();
+
+                // Build menu synchronously with whatever recent list we have
+                // cached; the async fetch will refresh on the next open.
+                let ws_blank = ws.clone();
+                let ws_folder = ws.clone();
+
+                let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                    let mut menu = menu.max_w(gpui::px(320.)).scrollable(true);
+                    menu = menu.label(i18n::t("sidebar-section-projects"));
+
+                    let ws_recent = ws.clone();
+                    let theme_recent = theme.clone();
+
+                    // Fetch synchronously from the store's cached summaries.
+                    let store = agent::thread_store_global();
+                    let summaries = store.read(cx).summaries();
+                    let mut seen = std::collections::HashSet::new();
+                    let mut recent_projects: Vec<String> = Vec::new();
+                    for s in summaries {
+                        if !s.project.is_empty() && seen.insert(s.project.clone()) {
+                            recent_projects.push(s.project.clone());
+                        }
+                        if recent_projects.len() >= 20 {
+                            break;
+                        }
+                    }
+
+                    for path_str in &recent_projects {
+                        let path = std::path::PathBuf::from(path_str);
+                        let name = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(path_str)
+                            .to_string();
+                        let display_path = path_str.clone();
+                        let click_path = path_str.clone();
+                        let ws_sel = ws_recent.clone();
+                        let themed = theme_recent.clone();
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_window, _cx| {
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(IconName::FolderOpen)
+                                            .xsmall()
+                                            .text_color(themed.muted_foreground),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .text_sm()
+                                            .text_color(themed.foreground)
+                                            .child(name.clone()),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .flex_1()
+                                            .text_xs()
+                                            .text_color(themed.muted_foreground)
+                                            .child(display_path.clone()),
+                                    )
+                            })
+                            .on_click(
+                                move |_, _, cx: &mut gpui::App| {
+                                    let p = std::path::PathBuf::from(&click_path);
+                                    ws_sel.update(cx, |this, cx| {
+                                        this.close_project_chip_menu();
+                                        this.thread.update(cx, |t, cx| t.set_project(p, cx));
+                                        cx.notify();
+                                    });
+                                },
+                            ),
+                        );
+                    }
+
+                    menu = menu.separator();
+
+                    // "+ New project" submenu
+                    let ws_blank_inner = ws_blank.clone();
+                    let ws_folder_inner = ws_folder.clone();
+                    menu = menu.submenu(
+                        i18n::t("workspace-project-new").to_string(),
+                        window,
+                        cx,
+                        move |submenu, _window, _cx| {
+                            let ws_b = ws_blank_inner.clone();
+                            let ws_f = ws_folder_inner.clone();
+                            submenu
+                                .item(
+                                    PopupMenuItem::new(i18n::t("workspace-project-blank"))
+                                        .on_click(move |_, _, cx: &mut gpui::App| {
+                                            ws_b.update(cx, |this, cx| {
+                                                this.close_project_chip_menu();
+                                                this.open_blank_project(cx);
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new(i18n::t("workspace-project-select-folder"))
+                                        .on_click(move |_, _, cx: &mut gpui::App| {
+                                            ws_f.update(cx, |this, cx| {
+                                                this.close_project_chip_menu();
+                                                this.choose_project_inner(cx);
+                                            });
+                                        }),
+                                )
+                        },
+                    );
+
+                    // Suppress unused-variable warning for the async fetch.
+                    drop(recent);
+
+                    menu
+                });
+                let sub = cx.subscribe(
+                    &menu,
+                    |this: &mut Workspace,
+                     _menu: Entity<PopupMenu>,
+                     _: &DismissEvent,
+                     cx: &mut Context<Workspace>| {
+                        this.close_project_chip_menu();
+                        cx.notify();
+                    },
+                );
+                this.project_chip_menu = Some(menu);
+                this.project_chip_menu_sub = Some(sub);
+                cx.notify();
+            }));
+
+        if !open {
+            return trigger.into_any_element();
         }
+
+        debug_assert!(self.project_chip_open);
+        debug_assert!(self.project_chip_menu.is_some());
+        let menu = self
+            .project_chip_menu
+            .clone()
+            .expect("project_chip_menu exists when open");
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::div()
+                    .id("project-chip-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .left_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
+    /// Open the blank-project flow: pick a parent directory, then prompt for name.
+    fn open_blank_project(&mut self, cx: &mut Context<Self>) {
+        if self.project_picker_pending {
+            return;
+        }
+        self.project_picker_pending = true;
+        let dir = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = dir.await;
+            this.update(cx, |this, cx| {
+                this.project_picker_pending = false;
+                if let Ok(Ok(Some(paths))) = result
+                    && let Some(parent) = paths.into_iter().next()
+                {
+                    this.blank_project_parent = Some(parent);
+                    this.blank_project_name_input = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Lazily create the blank-project name input (needs a Window).
+    fn ensure_blank_project_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blank_project_parent.is_none() {
+            return;
+        }
+        if self.blank_project_name_input.is_some() {
+            return;
+        }
+        self.blank_project_name_input = Some(cx.new(|cx| InputState::new(window, cx)));
+    }
+
+    /// Submit the blank project: create the directory and bind it.
+    fn confirm_blank_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(parent) = self.blank_project_parent.take() else {
+            return;
+        };
+        let name = self
+            .blank_project_name_input
+            .as_ref()
+            .map(|s| s.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        if name.is_empty() {
+            self.blank_project_parent = Some(parent);
+            return;
+        }
+        let new_path = parent.join(&name);
+        if let Err(e) = std::fs::create_dir_all(&new_path) {
+            tracing::warn!(error = %e, "failed to create project directory");
+            cx.notify();
+            return;
+        }
+        self.thread.update(cx, |t, cx| t.set_project(new_path, cx));
+        self.blank_project_name_input = None;
+        cx.notify();
+    }
+
+    /// Cancel the blank project overlay.
+    fn cancel_blank_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.blank_project_parent = None;
+        self.blank_project_name_input = None;
+        cx.notify();
+    }
+
+    /// Shared inner logic for "Select folder" (directory picker → bind project).
+    fn choose_project_inner(&mut self, cx: &mut Context<Self>) {
+        if self.project_picker_pending {
+            return;
+        }
+        self.project_picker_pending = true;
+        let dir = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = dir.await;
+            this.update(cx, |this, cx| {
+                this.project_picker_pending = false;
+                if let Ok(Ok(Some(paths))) = result
+                    && let Some(path) = paths.into_iter().next()
+                {
+                    this.thread.update(cx, |t, cx| t.set_project(path, cx));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Overlay prompting for the blank-project folder name.
+    fn render_blank_project_overlay(
+        &self,
+        _window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.pending_ask.is_some()
+            || !self.pending_auths.is_empty()
+            || self.pending_plan.is_some()
+        {
+            return None;
+        }
+        self.blank_project_parent.as_ref()?;
+        let input = self.blank_project_name_input.as_ref()?;
+        let parent_name = self
+            .blank_project_parent
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("…")
+            .to_string();
+
+        Some(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.background.opacity(0.6))
+                .child(
+                    v_flex()
+                        .w(px(480.))
+                        .p_4()
+                        .gap_3()
+                        .rounded(theme.radius)
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::FolderOpen)
+                                        .small()
+                                        .text_color(theme.accent),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(i18n::t("workspace-project-blank")),
+                                ),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(format!(
+                                    "{}: {}",
+                                    i18n::t("workspace-project-name-prompt"),
+                                    parent_name
+                                )),
+                        )
+                        .child(Input::new(input))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("blank-project-cancel")
+                                        .ghost()
+                                        .small()
+                                        .label(i18n::t("workspace-cancel"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.cancel_blank_project(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("blank-project-confirm")
+                                        .primary()
+                                        .small()
+                                        .label(i18n::t("workspace-rename-confirm"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.confirm_blank_project(window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -2597,10 +2968,12 @@ impl Render for Workspace {
 
         self.ensure_ask_inputs(_window, cx);
         self.ensure_rename_input(_window, cx);
+        self.ensure_blank_project_input(_window, cx);
 
         let overlay = self
             .render_auth_overlay(&theme, cx)
             .or_else(|| self.render_plan_approval_overlay(&theme, cx))
+            .or_else(|| self.render_blank_project_overlay(_window, &theme, cx))
             .or_else(|| self.render_rename_overlay(&theme, cx));
 
         let editor_open = self.editor_open;

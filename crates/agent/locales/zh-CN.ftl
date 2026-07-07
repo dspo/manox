@@ -260,6 +260,11 @@ workspace-mode-notice = { $mode ->
    *[yolo] 完全访问：工具调用免审批，bash 在沙箱外运行。
 }
 workspace-approval-auto-review-note = 自动审核：{$reason}
+workspace-project-choose = 选择项目
+workspace-project-new = 新建项目
+workspace-project-blank = 新建空白项目
+workspace-project-select-folder = 选择文件夹
+workspace-project-name-prompt = 项目文件夹名称
 workspace-yolo-on-notice = 完全访问已开启：工具调用免审批，bash 在沙箱外运行。
 workspace-yolo-off-notice = 已切换到请求审批模式：恢复审批与沙箱。
 workspace-empty-prompt = 我们该做什么？
@@ -271,8 +276,6 @@ composer-commands-label = 命令
 composer-memory-label = 记忆
 composer-skills-label = 技能
 composer-add-files = 文件和文件夹
-composer-choose-project = 选择项目
-composer-choose-project-desc = 绑定项目目录
 composer-attach-zed = 附加 Zed
 composer-goal-name = 目标
 composer-goal-desc = 设置持续努力实现的目标
