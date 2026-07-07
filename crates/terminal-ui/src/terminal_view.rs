@@ -8,9 +8,10 @@
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    Keystroke, ParentElement, Render, Styled, Window, black, div,
+    ParentElement, Render, Styled, Window, black, div,
 };
 use terminal::Terminal;
+use terminal::mappings::keys;
 
 use crate::element::TerminalElement;
 
@@ -46,57 +47,12 @@ impl TerminalView {
         &self.terminal
     }
 
-    /// Translate a keystroke to the bytes the PTY expects and write them.
-    /// Stage-2 subset; stage 3 swaps in `mappings::keys::to_esc_str`.
-    fn keystroke_to_bytes(keystroke: &Keystroke) -> Vec<u8> {
-        if keystroke.key.is_empty() {
-            return Vec::new();
-        }
-
-        let bytes: Vec<u8> = match keystroke.key.as_ref() {
-            "enter" | "return" => b"\r".to_vec(),
-            "backspace" => b"\x7f".to_vec(),
-            "tab" => b"\t".to_vec(),
-            "escape" => b"\x1b".to_vec(),
-            "up" => b"\x1b[A".to_vec(),
-            "down" => b"\x1b[B".to_vec(),
-            "right" => b"\x1b[C".to_vec(),
-            "left" => b"\x1b[D".to_vec(),
-            "home" => b"\x1b[H".to_vec(),
-            "end" => b"\x1b[F".to_vec(),
-            "pageup" => b"\x1b[5~".to_vec(),
-            "pagedown" => b"\x1b[6~".to_vec(),
-            "delete" => b"\x1b[3~".to_vec(),
-            "space" => b" ".to_vec(),
-            _ => {
-                let mut chars = keystroke.key.chars();
-                let first = match chars.next() {
-                    Some(c) if chars.next().is_none() => c,
-                    _ => return Vec::new(),
-                };
-                if first.is_ascii() {
-                    let c = if keystroke.modifiers.control {
-                        let lower = first.to_ascii_lowercase();
-                        let code = (lower as u8).wrapping_sub(b'a').wrapping_add(1);
-                        code as char
-                    } else {
-                        first
-                    };
-                    c.to_string().into_bytes()
-                } else {
-                    // Non-ASCII (CJK etc.) — stage 6 routes through IME; pass
-                    // the raw codepoint through for now.
-                    first.to_string().into_bytes()
-                }
-            }
-        };
-        bytes
-    }
-
     fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let bytes = Self::keystroke_to_bytes(&ev.keystroke);
-        if !bytes.is_empty() {
-            let _ = self.terminal.update(cx, |t, _cx| t.input(&bytes));
+        // Branch on APP_CURSOR / APP_KEYPAD so vim, mc, and readline all get
+        // the escape sequence their mode expects.
+        let mode = self.terminal.read_with(cx, |t, _| t.mode());
+        if let Some(s) = keys::to_esc_str(&ev.keystroke, mode) {
+            let _ = self.terminal.update(cx, |t, _cx| t.input(s.as_bytes()));
         }
     }
 }

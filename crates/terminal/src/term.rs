@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use anyhow::Result;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task};
@@ -156,6 +156,12 @@ impl Terminal {
     pub fn with_term<R>(&self, f: impl FnOnce(&ManoxTerm) -> R) -> R {
         let term = self.term.lock();
         f(&term)
+    }
+
+    /// Current terminal mode flags — callers (key/mouse mapping) branch on
+    /// `APP_CURSOR`, `BRACKETED_PASTE`, mouse modes, etc.
+    pub fn mode(&self) -> TermMode {
+        self.with_term(|t| *t.mode())
     }
 }
 
