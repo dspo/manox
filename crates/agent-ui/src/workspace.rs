@@ -43,7 +43,7 @@ use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
 };
 use crate::views::settings::{SettingsEvent, SettingsView};
-use crate::views::sidebar::{ActiveTab, Sidebar, SidebarEvent};
+use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::{
     AskCancel, AskNext, AskPrev, CloseTerminalTab, FocusConversation, FocusTerminal,
     NewTerminalTab, OpenSettings,
@@ -744,8 +744,6 @@ impl Workspace {
                 let store = agent::thread_store_global();
                 store.update(cx, |s, cx| s.pin_thread(id, *pinned, cx));
             }
-            SidebarEvent::FocusConversation => this.focus_conversation(cx),
-            SidebarEvent::FocusTerminal => this.focus_terminal(cx),
         })
     }
 
@@ -805,11 +803,9 @@ impl Workspace {
         })
     }
 
-    /// Switch to the conversation pane. The sidebar highlight follows.
+    /// Switch to the conversation pane.
     pub fn focus_conversation(&mut self, cx: &mut Context<Self>) {
         self.view_mode = ViewMode::Workspace;
-        self.sidebar
-            .update(cx, |s, cx| s.set_active_tab(ActiveTab::Conversation, cx));
         cx.notify();
     }
 
@@ -828,8 +824,6 @@ impl Workspace {
             self.terminal_view = Some(TerminalView::new(terminal, cx));
         }
         self.view_mode = ViewMode::Terminal;
-        self.sidebar
-            .update(cx, |s, cx| s.set_active_tab(ActiveTab::Terminal, cx));
         cx.notify();
     }
 

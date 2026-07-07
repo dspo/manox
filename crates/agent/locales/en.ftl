@@ -310,9 +310,7 @@ menu-terminal = Terminal
 menu-new-terminal = New Terminal Tab
 menu-close-terminal = Close Terminal Tab
 
-### terminal-ui (tabs / overlay)
-tab-conversation = Conversation
-tab-terminal = Terminal
+### terminal-ui (overlay status / search)
 terminal-placeholder = Terminal running… type to interact
 terminal-exited = Terminal exited with code { $code }
 terminal-search-status = search: { $pattern }  ({ $count ->
