@@ -4251,19 +4251,19 @@ fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::H
     }
 }
 
-/// Build the 3-tier approval `PopupMenu`. Mirrors the Codex layout:
-///   - title row: localized question + a "Learn more" link on the right
-///   - three selectable rows (icon + title + subtitle, check on the right)
-///   - hairline separator
-///   - non-clickable "Custom (config.toml)" info row
+/// Build the 3-tier approval `PopupMenu`. The whole popover is a single
+/// `PopupMenuItem::element` whose content is a `v_flex` of the title row and
+/// the three mode rows — that way the items container has exactly one child
+/// and the menu sizes to its content (no `flex_1` distribution across
+/// multiple items, no per-item `min_h` padding). Width is `360px` to fit
+/// the longest localized subtitle; the subtitle's flex column carries
+/// `min_w_0` so it wraps inside the 360px cap instead of overflowing.
 ///
-/// Width is `360px` to fit the longest bilingual subtitle. Each clickable row
-/// routes through `Workspace::apply_approval_mode` so the mode switch +
-/// notice + menu close stay in one place.
-///
-/// `theme` is consumed up front: every value used inside the `'static` row
-/// closures is pre-extracted into owned `SharedString`/`Hsla`/`IconName`,
-/// so the closures don't capture a short-lived theme reference.
+/// Each row's `on_click` funnels through `Workspace::apply_approval_mode`
+/// so the mode switch + notice + menu close stay in one place. `theme` is
+/// consumed up front: every value used inside the `'static` row closures
+/// is pre-extracted into owned `Hsla` / `IconName`, so the closures don't
+/// capture a short-lived theme reference.
 fn build_approval_popover(
     window: &mut gpui::Window,
     workspace: Entity<Workspace>,
@@ -4277,163 +4277,130 @@ fn build_approval_popover(
     let danger: gpui::Hsla = cx.theme().danger;
 
     PopupMenu::build(window, cx, move |menu, _window, _cx| {
-        // Title row: localized question on the left, "Learn more" link on the
-        // right (decorative for now — surfaces a question, doesn't navigate).
-        let title_text = i18n::t("workspace-mode-title");
-        let learn_more = i18n::t("workspace-mode-learn-more");
-        let header = PopupMenuItem::element(move |_window, _cx| {
-            h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    // `flex_1` + `min_w_0` lets the localized title wrap
-                    // instead of pushing the "Learn more" link off-row.
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(fg)
-                        .child(title_text.clone()),
-                )
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            gpui::div()
-                                .text_xs()
-                                .text_color(info)
-                                .child(learn_more.clone()),
-                        )
-                        .child(Icon::new(IconName::ArrowRight).xsmall().text_color(info)),
-                )
-        });
-        let menu = menu.max_w(gpui::px(360.)).item(header);
-
-        // Three selectable rows — one per ApprovalMode. Theme values are
-        // pre-extracted into the `RowSpec` so the helper stays at ≤7 args
-        // (clippy::too_many_arguments) — passing 9 distinct colors / strings
-        // every call was the only thing tripping the lint.
-        let menu = append_mode_row(
-            menu,
-            workspace.clone(),
-            RowSpec {
-                mode: ApprovalMode::OnRequest,
-                title: i18n::t("workspace-mode-on-request-title"),
-                subtitle: i18n::t("workspace-mode-on-request-desc"),
-                icon: IconName::ThumbsUp,
-                accent: success,
-                muted,
-                selected: current == ApprovalMode::OnRequest,
-            },
-        );
-        let menu = append_mode_row(
-            menu,
-            workspace.clone(),
-            RowSpec {
-                mode: ApprovalMode::AutoReview,
-                title: i18n::t("workspace-mode-auto-review-title"),
-                subtitle: i18n::t("workspace-mode-auto-review-desc"),
-                icon: IconName::Bot,
-                accent: info,
-                muted,
-                selected: current == ApprovalMode::AutoReview,
-            },
-        );
-        let menu = append_mode_row(
-            menu,
-            workspace.clone(),
-            RowSpec {
-                mode: ApprovalMode::Yolo,
-                title: i18n::t("workspace-mode-yolo-title"),
-                subtitle: i18n::t("workspace-mode-yolo-desc"),
-                icon: IconName::TriangleAlert,
-                accent: danger,
-                muted,
-                selected: current == ApprovalMode::Yolo,
-            },
-        );
-
-        // Three selectable rows. We don't read permissions from `config.toml`
-        // yet, so the popover stops here: no "Use permissions defined in
-        // config.toml" / "Custom (config.toml)" footer.
-        menu
+        // One `PopupMenuItem` whose content is the whole v_flex: the items
+        // container then has exactly one child and the popover sizes to its
+        // content. No per-item `flex_1` growth, no leftover blank space when
+        // items are added or removed. The render closure rebuilds the v_flex
+        // on every paint — `Div`/`AnyElement` aren't `Clone`, so a fresh
+        // element is the only way to satisfy the `Fn` bound on the closure.
+        menu.max_w(gpui::px(360.))
+            .item(PopupMenuItem::element(move |_window, _cx| {
+                let header = h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        gpui::div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child(i18n::t("workspace-mode-title").to_string()),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(info)
+                                    .child(i18n::t("workspace-mode-learn-more").to_string()),
+                            )
+                            .child(Icon::new(IconName::ArrowRight).xsmall().text_color(info)),
+                    );
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .child(header)
+                    .child(build_mode_row(
+                        workspace.clone(),
+                        ApprovalMode::OnRequest,
+                        i18n::t("workspace-mode-on-request-title"),
+                        i18n::t("workspace-mode-on-request-desc"),
+                        IconName::ThumbsUp,
+                        success,
+                        current == ApprovalMode::OnRequest,
+                        muted,
+                    ))
+                    .child(build_mode_row(
+                        workspace.clone(),
+                        ApprovalMode::AutoReview,
+                        i18n::t("workspace-mode-auto-review-title"),
+                        i18n::t("workspace-mode-auto-review-desc"),
+                        IconName::Bot,
+                        info,
+                        current == ApprovalMode::AutoReview,
+                        muted,
+                    ))
+                    .child(build_mode_row(
+                        workspace.clone(),
+                        ApprovalMode::Yolo,
+                        i18n::t("workspace-mode-yolo-title"),
+                        i18n::t("workspace-mode-yolo-desc"),
+                        IconName::TriangleAlert,
+                        danger,
+                        current == ApprovalMode::Yolo,
+                        muted,
+                    ))
+            }))
     })
 }
 
-/// Pre-extracted inputs for [`append_mode_row`]. Bundling these into a struct
-/// keeps the helper below the 7-argument `clippy::too_many_arguments` ceiling
-/// while still letting the call site express the row's full visual contract.
-struct RowSpec {
+/// One selectable approval-mode row: icon, wrapped title + subtitle, and a
+/// check on the right when this mode is active. The whole row is clickable
+/// and funnels through `apply_approval_mode`.
+#[allow(clippy::too_many_arguments, clippy::let_and_return)]
+fn build_mode_row(
+    workspace: Entity<Workspace>,
     mode: ApprovalMode,
     title: SharedString,
     subtitle: SharedString,
     icon: IconName,
     accent: gpui::Hsla,
-    muted: gpui::Hsla,
     selected: bool,
-}
-
-/// Append a single `ApprovalMode` row to the popover. The selected row is
-/// marked with a check icon on the right; the row's title color matches the
-/// mode's accent (success/info/danger) so the visual link between chip and
-/// selected row is immediate.
-fn append_mode_row(menu: PopupMenu, workspace: Entity<Workspace>, spec: RowSpec) -> PopupMenu {
-    let RowSpec {
-        mode,
-        title,
-        subtitle,
-        icon,
-        accent,
-        muted,
-        selected,
-    } = spec;
-    let title_for_render = title.clone();
-    let subtitle_for_render = subtitle.clone();
-    let row = PopupMenuItem::element(move |_window, _cx| {
-        // `icon` is `Clone` but not `Copy`, so re-clone per render rather
-        // than move it out of the captured environment.
-        h_flex()
-            .w_full()
-            .items_center()
-            .gap_2()
-            .child(Icon::new(icon.clone()).small().text_color(accent))
-            .child(
-                // `min_w_0` lets the v_flex shrink below the natural
-                // unwrapped subtitle width so the text wraps inside the
-                // 360px popover instead of overflowing past it.
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(
-                        gpui::div()
-                            .min_w_0()
-                            .text_sm()
-                            .text_color(accent)
-                            .child(title_for_render.clone()),
-                    )
-                    .child(
-                        gpui::div()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(subtitle_for_render.clone()),
-                    ),
-            )
-            .when(selected, |el| {
-                el.child(Icon::new(IconName::Check).small().text_color(accent))
-            })
-    })
-    .on_click(move |_event, _window, cx| {
-        workspace.update(cx, |this, cx| {
-            this.apply_approval_mode(mode, cx);
+    muted: gpui::Hsla,
+) -> impl gpui::IntoElement {
+    // `on_click` consumes the receiver and returns `()`, so the h_flex chain
+    // is bound and returned explicitly — letting the compiler infer the
+    // return type was making the function resolve to `()` and break the
+    // `v_flex().child(...)` call site.
+    let row = h_flex()
+        .id(("approval-mode-row", mode as usize))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .child(Icon::new(icon).small().text_color(accent))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    gpui::div()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(accent)
+                        .child(title),
+                )
+                .child(
+                    gpui::div()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(subtitle),
+                ),
+        )
+        .when(selected, |el| {
+            el.child(Icon::new(IconName::Check).small().text_color(accent))
+        })
+        .on_click(move |_event, _window, cx| {
+            workspace.update(cx, |this, cx| this.apply_approval_mode(mode, cx));
         });
-    });
-    menu.item(row)
+    row
 }
 
 impl Workspace {
