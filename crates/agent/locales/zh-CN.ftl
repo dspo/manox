@@ -216,6 +216,7 @@ plugins-busy = 正在处理…
 plugins-new = 新建
 plugins-edit = 编辑
 plugins-view = 查看
+plugins-copy = 复制
 plugins-select = 选择
 plugins-delete = 删除
 plugins-update = 更新

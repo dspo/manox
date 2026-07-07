@@ -191,7 +191,10 @@ impl PluginManagerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.editing_skill_name = Some(record.name.clone());
+        self.editing_skill_name = match record.origin {
+            SkillOrigin::User => Some(record.key.clone()),
+            SkillOrigin::Plugin { .. } => None,
+        };
         self.skill_name
             .update(cx, |s, cx| s.set_value(record.name, window, cx));
         self.skill_description
@@ -343,7 +346,7 @@ impl PluginManagerView {
 }
 
 impl Render for PluginManagerView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let tab_ix = match self.tab {
             PluginManagerTab::Marketplace => 0,
@@ -447,8 +450,8 @@ impl Render for PluginManagerView {
             .child(match self.tab {
                 PluginManagerTab::Marketplace => self.render_marketplace(cx),
                 PluginManagerTab::Plugin => self.render_plugins(cx),
-                PluginManagerTab::Skill => self.render_skills(_window, cx),
-                PluginManagerTab::Mcp => self.render_mcp(_window, cx),
+                PluginManagerTab::Skill => self.render_skills(window, cx),
+                PluginManagerTab::Mcp => self.render_mcp(window, cx),
             })
     }
 }
@@ -623,6 +626,7 @@ impl PluginManagerView {
     }
 
     fn render_skill_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
         let title = if self.editing_skill_name.is_some() {
             i18n::t("plugins-skill-edit")
         } else {
@@ -664,7 +668,7 @@ impl PluginManagerView {
                     )
                     .into_any_element(),
             ],
-            cx,
+            &theme,
         )
     }
 
@@ -722,6 +726,7 @@ impl PluginManagerView {
     }
 
     fn render_mcp_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
         let title = if self.editing_mcp_name.is_some() {
             i18n::t("plugins-mcp-edit")
         } else {
@@ -773,7 +778,7 @@ impl PluginManagerView {
                     )
                     .into_any_element(),
             ],
-            cx,
+            &theme,
         )
     }
 }
@@ -979,7 +984,8 @@ fn skill_card(
         }
     };
     let edit_record = record.clone();
-    let delete_name = record.name.clone();
+    let action_key = record.key.clone();
+    let delete_key = record.key.clone();
     item_card(&theme, false)
         .child(
             h_flex()
@@ -990,26 +996,26 @@ fn skill_card(
                     h_flex()
                         .gap_1()
                         .child(
-                            Button::new(format!("edit-skill-{}", delete_name))
+                            Button::new(format!("edit-skill-{}", action_key))
                                 .small()
                                 .outline()
                                 .label(if is_user {
                                     i18n::t("plugins-edit")
                                 } else {
-                                    i18n::t("plugins-view")
+                                    i18n::t("plugins-copy")
                                 })
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.edit_skill(edit_record.clone(), window, cx);
                                 })),
                         )
                         .children(is_user.then(|| {
-                            Button::new(format!("delete-skill-{}", delete_name))
+                            Button::new(format!("delete-skill-{}", delete_key))
                                 .small()
                                 .danger()
                                 .label(i18n::t("plugins-delete"))
                                 .disabled(busy)
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.delete_skill(delete_name.clone(), window, cx);
+                                    this.delete_skill(delete_key.clone(), window, cx);
                                 }))
                                 .into_any_element()
                         })),
@@ -1076,12 +1082,7 @@ fn plugin_mcp_card(record: mcp_config::PluginMcpServerRecord, theme: &Theme) -> 
         .into_any_element()
 }
 
-fn form_card(
-    title: SharedString,
-    children: Vec<AnyElement>,
-    cx: &mut Context<PluginManagerView>,
-) -> AnyElement {
-    let theme = cx.theme().clone();
+fn form_card(title: SharedString, children: Vec<AnyElement>, theme: &Theme) -> AnyElement {
     v_flex()
         .w_full()
         .gap_3()

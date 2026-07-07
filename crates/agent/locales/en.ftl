@@ -229,6 +229,7 @@ plugins-busy = Working…
 plugins-new = New
 plugins-edit = Edit
 plugins-view = View
+plugins-copy = Copy
 plugins-select = Select
 plugins-delete = Delete
 plugins-update = Update
