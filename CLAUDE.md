@@ -82,7 +82,7 @@ crates/
 
 ### 前缀缓存（provider 侧 prompt caching）
 
-manox 接入 provider 侧前缀缓存，让 Anthropic/OpenAI 服务端复用已计算的注意力 K/V（非本地 KV 张量缓存）。核心机制是 `build_completion_request` 保持跨 turn 请求前缀字节稳定，配合 wire 层 `cache_control`/`prompt_cache_key` 标记使 provider 命中缓存。任何对消息组装管线的改动不得破坏前缀稳定性——若需重写历史，须先接入 `AppendOnlyContextManager`（`prefix_stability.rs`）；若新集成变更了缓存实现但仍能保障有效、高效命中，也属可接受的范围。
+manox 接入 provider 侧前缀缓存，让 Anthropic/OpenAI 服务端复用已计算的注意力 K/V。核心机制是 `build_completion_request` 保持跨 turn 请求前缀字节稳定，配合 wire 层 `cache_control`/`prompt_cache_key` 标记使 provider 命中缓存。任何对消息组装管线的改动不得破坏前缀稳定性；若新集成变更了缓存实现但仍能保障有效、高效命中，也可接受。
 
 ### tokio ↔ gpui 桥接
 
