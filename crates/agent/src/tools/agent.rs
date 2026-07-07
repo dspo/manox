@@ -15,7 +15,7 @@
 //! - Nesting depth is capped at `MAX_DEPTH`; a sub-agent may only spawn its own
 //!   sub-agents when its definition sets `allow_nesting: true`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -68,6 +68,15 @@ struct AgentToolInput {
     /// sub-agent has no access to the parent's conversation history, so include
     /// any needed file paths, error text, or context here.
     prompt: String,
+    /// When `"worktree"`, the sub-agent runs in its own git worktree on a fresh
+    /// branch — full filesystem isolation from the parent's working tree. The
+    /// child's cwd is the worktree path; its sandbox confines writes to that
+    /// worktree (the parent's project root is out of reach) while admitting the
+    /// bound repo's `.git` and network for git ops. A clean worktree is
+    /// auto-removed when the sub-agent finishes; a dirty one is left for
+    /// inspection. Absent / `"none"` = share the parent's cwd (default).
+    #[serde(default)]
+    isolation: Option<String>,
 }
 
 impl AgentToolTrait for SpawnAgentTool {
@@ -249,10 +258,44 @@ fn setup_child(
         .unwrap_or_default();
     let max_turns = def.max_turns.unwrap_or(10);
     let system_prompt = def_file.system_prompt.clone();
-    let cwd_path = cwd.as_ref().clone();
+
+    // Worktree isolation: create a fresh worktree for the child so it works on
+    // its own branch with no filesystem overlap with the parent's working tree.
+    // The git ops run synchronously via `std::process::Command` — `git worktree
+    // add` is sub-second and does not prompt for credentials, so the brief UI
+    // thread block is acceptable for the isolation guarantee it buys.
+    let isolation = parsed.isolation.as_deref() == Some("worktree");
+    let (cwd_path, sandbox, wt_state) = if isolation {
+        let project_root = parent
+            .upgrade()
+            .ok_or_else(|| "parent thread dropped before worktree isolation".to_string())?
+            .read_with(cx, |t, _| {
+                t.project()
+                    .cloned()
+                    .unwrap_or_else(|| t.cwd().to_path_buf())
+            });
+        let (wt_path, branch, git_common_dir) = create_subagent_worktree(&project_root)
+            .map_err(|e| format!("subagent worktree creation failed: {e}"))?;
+        let sandbox = crate::sandbox::SandboxPolicy::for_worktree(&wt_path, &git_common_dir);
+        let state = crate::thread::WorktreeState {
+            path: wt_path.clone(),
+            prior_cwd: wt_path.clone(),
+            branch,
+            git_common_dir,
+            subagent_created: true,
+        };
+        (wt_path, sandbox, Some(state))
+    } else {
+        (
+            cwd.as_ref().clone(),
+            crate::sandbox::SandboxPolicy::for_project(cwd.as_ref()),
+            None,
+        )
+    };
+    let sandbox_for_registry = sandbox.clone();
 
     let child = Thread::new_subagent(
-        cwd_path,
+        cwd_path.clone(),
         model,
         permission,
         parent_mode,
@@ -260,9 +303,28 @@ fn setup_child(
         system_prompt,
         max_turns,
         child_depth,
-        |weak| build_child_registry(cwd, def, child_depth, weak),
+        |weak| {
+            build_child_registry_with_policy(
+                Arc::new(cwd_path.clone()),
+                sandbox_for_registry.clone(),
+                def,
+                child_depth,
+                weak,
+            )
+        },
         cx,
     );
+
+    // If the child was spawned into a worktree, record the worktree state on
+    // the child so its system prompt advertises it, its sandbox stays
+    // worktree-aware, and session-end auto-cleanup can remove it when clean.
+    // The registry above was already built with the worktree sandbox, so this
+    // does NOT rebuild — it just stamps the state field.
+    if let Some(state) = wt_state {
+        child.update(cx, |c, cx| {
+            c.set_worktree_state(state, cx);
+        });
+    }
 
     child.update(cx, |c, cx| {
         c.insert_user_message(parsed.prompt.clone(), cx);
@@ -453,17 +515,19 @@ fn can_nest(def: &AgentDefinition, child_depth: u32) -> bool {
     def.allow_nesting && child_depth < MAX_DEPTH
 }
 
-/// Build the sub-agent's restricted tool registry from its definition: the
-/// built-in tools filtered by `tools`/`disallowed_tools`, plus the `agent`
-/// tool itself only when `allow_nesting` is set and depth permits.
-fn build_child_registry(
-    cwd: &Arc<PathBuf>,
+/// Same as [`build_child_registry`] but with an explicit sandbox policy. The
+/// worktree-isolation path passes a `for_worktree` policy so the child's write
+/// confinement anchors on its own worktree (the parent's project root is out
+/// of reach) while the bound repo's `.git` and network stay open for git ops.
+fn build_child_registry_with_policy(
+    cwd: Arc<PathBuf>,
+    sandbox: crate::sandbox::SandboxPolicy,
     def: &AgentDefinition,
     child_depth: u32,
     child_weak: WeakEntity<Thread>,
 ) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
-    for tool in super::base_tools(cwd.clone()) {
+    for tool in super::base_tools_with_policy(cwd.clone(), sandbox) {
         if is_tool_allowed(tool.name(), def) {
             reg.register(tool);
         }
@@ -501,6 +565,83 @@ fn capability_tag(def: &AgentDefinition) -> &'static str {
     }
 }
 
+/// Create a fresh git worktree for a sub-agent and return `(worktree_path,
+/// branch, git_common_dir)`. Synchronous (`std::process::Command`) because
+/// `setup_child` runs on the UI thread with `&mut App`; `git worktree add` is
+/// sub-second and never prompts for credentials, so the brief block is the
+/// trade-off for not restructuring the sync spawn handshake. The worktree
+/// lives under `<project_root>/.claude/worktrees/subagent-<short>` on a branch
+/// of the same name, based off `origin/<default-branch>` (fallback `HEAD`).
+fn create_subagent_worktree(project_root: &Path) -> Result<(PathBuf, String, PathBuf), String> {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let short = &id[..8];
+    let branch = format!("subagent-{short}");
+    let wt_path = project_root.join(".claude").join("worktrees").join(&branch);
+    if let Some(parent) = wt_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
+    }
+    let base_ref = resolve_base_ref_sync(project_root);
+    let path_str = wt_path.display().to_string();
+    let mut args: Vec<&str> = vec!["worktree", "add", "-b", &branch, &path_str];
+    let owned_base;
+    if base_ref != "HEAD" {
+        owned_base = base_ref.clone();
+        args.push(&owned_base);
+    } else {
+        args.push("HEAD");
+    }
+    run_git_sync(project_root, &args).map_err(|e| format!("git worktree add: {e}"))?;
+    let git_dir_str = run_git_sync(&wt_path, &["rev-parse", "--git-common-dir"])
+        .map_err(|e| format!("git rev-parse --git-common-dir: {e}"))?;
+    let git_common_dir = absolutize_path(&wt_path, &git_dir_str);
+    Ok((wt_path, branch, git_common_dir))
+}
+
+/// Synchronous `git` invocation returning trimmed stdout. Used only by
+/// [`create_subagent_worktree`] on the UI thread; the main-thread worktree
+/// tools use the async tokio path in `tools/worktree.rs`.
+fn run_git_sync(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "exit {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `origin/<default-branch>` when a remote HEAD is configured, else `HEAD`.
+fn resolve_base_ref_sync(project_root: &Path) -> String {
+    match run_git_sync(project_root, &["rev-parse", "--abbrev-ref", "origin/HEAD"]) {
+        Ok(s) => {
+            let s = s.trim();
+            if s.is_empty() || s == "origin/HEAD" {
+                "HEAD".into()
+            } else {
+                s.to_string()
+            }
+        }
+        Err(_) => "HEAD".into(),
+    }
+}
+
+/// Resolve a possibly-relative `git rev-parse --git-common-dir` result against
+/// the worktree dir so the sandbox de-protects the right path.
+fn absolutize_path(worktree_dir: &Path, git_common_dir: &str) -> PathBuf {
+    let p = PathBuf::from(git_common_dir);
+    if p.is_absolute() {
+        p
+    } else {
+        worktree_dir.join(p)
+    }
+}
+
 /// Compose the tool description advertised to the parent model, listing the
 /// available sub-agent types with a capability tag and their one-line
 /// descriptions.
@@ -510,7 +651,11 @@ fn build_description() -> Arc<str> {
          its own fresh context (no parent history), with a restricted tool set \
          and a specialized system prompt. Only its final assistant message \
          returns as the tool result. Useful for: exploring code, research, \
-         parallel subtasks, or any work that would bloat the main context.",
+         parallel subtasks, or any work that would bloat the main context. \
+         Set `isolation: \"worktree\"` to run the sub-agent in its own git \
+         worktree on a fresh branch — full filesystem isolation from the \
+         parent's working tree (the child cannot write the parent's project \
+         root); a clean worktree is auto-removed when the sub-agent finishes.",
     );
     let defs = agent_def::global().list();
     if !defs.is_empty() {

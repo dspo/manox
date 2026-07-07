@@ -29,6 +29,7 @@ use gpui_component::{
 pub enum SidebarEvent {
     OpenThread(String),
     NewThread,
+    OpenPlugins,
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
 }
@@ -218,6 +219,11 @@ impl Render for Sidebar {
                 v_flex()
                     .id("sidebar-body")
                     .flex_1()
+                    // `min_h_0` lets the body shrink below its content height so
+                    // `overflow_y_scroll` actually engages; without it the flex
+                    // item's min-height defaults to content and the list grows
+                    // past the viewport instead of scrolling.
+                    .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
                     .pt(top_inset)
@@ -246,11 +252,14 @@ impl Render for Sidebar {
                                 i18n::t("sidebar-scheduled"),
                                 &theme,
                             ))
-                            .child(static_menu_item(
+                            .child(menu_item(
                                 "plugins",
                                 IconName::Frame,
                                 i18n::t("sidebar-plugins"),
                                 &theme,
+                                Some(cx.listener(|_this, _ev, _window, cx| {
+                                    cx.emit(SidebarEvent::OpenPlugins);
+                                })),
                             )),
                     )
                     .children(

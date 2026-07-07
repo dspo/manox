@@ -6,13 +6,13 @@
 //! skipped so manox still starts.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level config: a map of server name → server config.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct McpConfig {
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
@@ -20,13 +20,13 @@ pub struct McpConfig {
 
 /// One MCP server entry. The transport is chosen by which field is present:
 /// `command` → stdio, `url` → streamable HTTP.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
     #[serde(flatten)]
     pub transport: McpServerTransportConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum McpServerTransportConfig {
     /// Launch a local process speaking JSON-RPC over stdin/stdout.
@@ -45,6 +45,14 @@ pub enum McpServerTransportConfig {
         #[serde(default)]
         headers: Option<BTreeMap<String, String>>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginMcpServerRecord {
+    pub plugin: String,
+    pub name: String,
+    pub source: PathBuf,
+    pub config: McpServerConfig,
 }
 
 impl McpConfig {
@@ -81,6 +89,59 @@ pub fn load_global() -> McpConfig {
             McpConfig::default()
         }
     }
+}
+
+/// Persist the user's `mcp.toml` using the same schema that `load_global`
+/// reads. Plugin-declared servers are not written here; they continue to live
+/// inside each installed plugin's `.mcp.json`.
+pub fn save_global(config: &McpConfig) -> Result<()> {
+    let dir = crate::paths::ensure_manox_config_dir()
+        .context("ensuring manox config dir exists before writing mcp.toml")?;
+    let path = dir.join("mcp.toml");
+    let body = toml::to_string_pretty(config).context("serializing mcp.toml")?;
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Scan installed plugins for `.mcp.json` declarations. The returned records
+/// are read-only from the UI's perspective; editing happens in each plugin's
+/// source, not in `mcp.toml`.
+pub fn list_plugin_declared_servers() -> Vec<PluginMcpServerRecord> {
+    #[derive(Debug, Deserialize, Default)]
+    struct PluginMcpFile {
+        #[serde(default, alias = "mcpServers")]
+        mcp_servers: BTreeMap<String, McpServerConfig>,
+    }
+
+    let mut out = Vec::new();
+    for plugin in crate::plugin::PluginManager::installed() {
+        let path = plugin.root.join(".mcp.json");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                tracing::warn!("reading {}: {e}", path.display());
+                continue;
+            }
+        };
+        let parsed: PluginMcpFile = match serde_json::from_str(&raw) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!("parsing {}: {e}", path.display());
+                continue;
+            }
+        };
+        for (name, config) in parsed.mcp_servers {
+            out.push(PluginMcpServerRecord {
+                plugin: plugin.name.clone(),
+                name,
+                source: path.clone(),
+                config,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.plugin.cmp(&b.plugin).then_with(|| a.name.cmp(&b.name)));
+    out
 }
 
 #[cfg(test)]

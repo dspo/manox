@@ -41,6 +41,8 @@ fn panel_scroll(content: impl IntoElement) -> AnyElement {
     v_flex()
         .flex_1()
         .h_full()
+        .min_h_0()
+        .min_w_0()
         .id("settings-right-pane")
         .overflow_y_scroll()
         .p_4()
@@ -67,11 +69,13 @@ fn row_with_control(
         .child(
             v_flex()
                 .flex_1()
+                .min_w_0()
                 .gap_1()
                 .child(
                     div()
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
+                        .truncate()
                         .child(title),
                 )
                 .when_some(description, |this, desc| {
@@ -334,6 +338,7 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
             let icon_color = if active { theme.foreground } else { muted };
             h_flex()
                 .flex_1()
+                .min_w_0()
                 .items_center()
                 .gap_3()
                 .p_3()
@@ -353,11 +358,13 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
                 .child(
                     v_flex()
                         .flex_1()
+                        .min_w_0()
                         .gap_0p5()
                         .child(
                             div()
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::MEDIUM)
+                                .truncate()
                                 .child(title),
                         )
                         .child(div().text_xs().text_color(muted).child(desc)),

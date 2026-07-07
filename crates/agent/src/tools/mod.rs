@@ -20,6 +20,7 @@ pub mod monitor;
 pub mod read_file;
 pub mod self_info;
 pub mod skill;
+pub mod worktree;
 pub mod write_file;
 
 use gpui::{App, AppContext as _, Task, WeakEntity};
@@ -184,12 +185,23 @@ pub(crate) fn truncate_output(s: &str, max: usize) -> TruncatedText<'_> {
 /// reference: every base tool is stateless w.r.t. its owner — runtime identity
 /// flows in through the per-call `ToolContext` snapshot, so the dependency
 /// direction stays `Thread → tools`.
+///
+/// Derives the write-confinement policy from `cwd` via `for_project`. For a
+/// worktree-active thread, use [`base_tools_with_policy`] with a
+/// worktree-aware policy so the bound repo's `.git` and network open up.
+#[allow(dead_code)] // convenience constructor; the live paths use _with_policy
 pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
-    // Derive the write-confinement policy once and share it across every write
-    // tool (WriteFileTool / EditFileTool / BashTool) so the Rust-side FS check
-    // and the bash seatbelt / cwd pre-check classify paths identically —
-    // independent per-tool derivations drift (issue 3).
     let sandbox = crate::sandbox::SandboxPolicy::for_project(cwd.as_ref());
+    base_tools_with_policy(cwd, sandbox)
+}
+
+/// Same as [`base_tools`] but with an explicit sandbox policy. The worktree
+/// path passes a `with_worktree` / `for_worktree` policy so git ops and network
+/// are admitted; the default path delegates to [`base_tools`].
+pub(crate) fn base_tools_with_policy(
+    cwd: Arc<PathBuf>,
+    sandbox: crate::sandbox::SandboxPolicy,
+) -> Vec<AnyAgentTool> {
     vec![
         Arc::new(read_file::ReadFileTool { cwd: cwd.clone() }) as AnyAgentTool,
         Arc::new(write_file::WriteFileTool {
@@ -210,17 +222,30 @@ pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
 }
 
 /// Build the main-thread `ToolRegistry`: the built-in tools plus the
-/// `agent` sub-agent tool, `self_info`, `monitor`, and MCP tools. `parent` is
-/// the owning `Thread` so the `agent` tool can route bubbled-up authorizations
-/// and read the parent's model.
+/// `agent` sub-agent tool, `self_info`, `monitor`, the `enter_worktree` /
+/// `exit_worktree` harness tools, and MCP tools. `parent` is the owning
+/// `Thread` so the `agent` and worktree tools can route bubbled-up
+/// authorizations and mutate thread cwd.
 ///
 /// Sub-agents do not use this — they build their own filtered registry from
 /// [`base_tools`] (plus their own `agent` tool), so `agent` / `self_info` /
-/// `monitor` / MCP stay main-thread-only.
+/// `monitor` / worktree / MCP stay main-thread-only.
 pub fn main_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistry {
+    let sandbox = crate::sandbox::SandboxPolicy::for_project(&cwd);
+    main_registry_with_policy(cwd, sandbox, parent)
+}
+
+/// Same as [`main_registry`] but with an explicit sandbox policy. The worktree
+/// entry/exit path rebuilds the registry with a `with_worktree` policy so the
+/// whole tool set re-derives path confinement against the active worktree.
+pub fn main_registry_with_policy(
+    cwd: PathBuf,
+    sandbox: crate::sandbox::SandboxPolicy,
+    parent: WeakEntity<Thread>,
+) -> ToolRegistry {
     let cwd = Arc::new(cwd);
     let mut reg = ToolRegistry::new();
-    for tool in base_tools(cwd.clone()) {
+    for tool in base_tools_with_policy(cwd.clone(), sandbox) {
         reg.register(tool);
     }
     reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone())) as AnyAgentTool);
@@ -229,6 +254,10 @@ pub fn main_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistry {
     // get it): streaming a long-running command is a top-level orchestration
     // concern, and like `agent` it should not nest into sub-agent contexts.
     reg.register(Arc::new(monitor::MonitorTool) as AnyAgentTool);
+    // Worktree harness tools: main-thread-only, they mutate the owning
+    // Thread's cwd and rebuild its tool registry on enter/exit.
+    reg.register(Arc::new(worktree::EnterWorktreeTool::new(parent.clone())) as AnyAgentTool);
+    reg.register(Arc::new(worktree::ExitWorktreeTool::new(parent)) as AnyAgentTool);
 
     // Append MCP tools discovered at startup from `mcp.toml` plus each
     // installed plugin's `.mcp.json`. The registry is process-global; `try_global`

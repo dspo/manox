@@ -40,6 +40,29 @@ pub struct SkillDefinition {
     pub source: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub enum SkillOrigin {
+    User,
+    Plugin { plugin: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillRecord {
+    pub key: String,
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    pub source: PathBuf,
+    pub origin: SkillOrigin,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserSkillDraft {
+    pub name: String,
+    pub description: String,
+    pub body: String,
+}
+
 /// Process-wide registry of skills, keyed by lookup name (`<plugin>:<skill>`
 /// or bare `<skill>`). Loaded once at startup; malformed files are skipped.
 #[derive(Debug, Default)]
@@ -172,6 +195,78 @@ pub fn global() -> &'static SkillRegistry {
     REGISTRY.get().expect("skill registry not initialized")
 }
 
+/// Freshly scan the filesystem and return a UI-friendly list of skills,
+/// including user-authored and plugin-provided entries. This bypasses the
+/// process-global registry so management views can reflect changes made during
+/// the current app session.
+pub fn list_skill_records() -> Vec<SkillRecord> {
+    let registry = SkillRegistry::load();
+    let user_root = paths::skills_dir().ok();
+    registry
+        .skills
+        .iter()
+        .map(|(key, skill)| SkillRecord {
+            key: key.clone(),
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            body: skill.body.clone(),
+            source: skill.source.clone(),
+            origin: classify_origin(key, &skill.source, user_root.as_deref()),
+        })
+        .collect()
+}
+
+/// Write a user-authored skill to `~/.config/cx/manox/skills/<name>/SKILL.md`.
+/// When `previous_name` differs from `draft.name`, the old directory is removed
+/// after the new one is written so renames do not leave stale copies behind.
+pub fn save_user_skill(draft: &UserSkillDraft, previous_name: Option<&str>) -> Result<()> {
+    let name = validate_user_skill_name(&draft.name)?;
+    let root = paths::skills_dir()?.join(&name);
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating skill dir {}", root.display()))?;
+    let path = root.join("SKILL.md");
+    #[derive(serde::Serialize)]
+    struct Frontmatter<'a> {
+        name: &'a str,
+        description: &'a str,
+    }
+    let front = serde_yaml::to_string(&Frontmatter {
+        name: &name,
+        description: &draft.description,
+    })
+    .context("serializing skill frontmatter")?;
+    let mut doc = String::from("---\n");
+    doc.push_str(&front);
+    doc.push_str("---\n");
+    doc.push_str(&draft.body);
+    if !doc.ends_with('\n') {
+        doc.push('\n');
+    }
+    std::fs::write(&path, doc).with_context(|| format!("writing {}", path.display()))?;
+
+    if let Some(previous) = previous_name {
+        let previous = previous.trim();
+        if !previous.is_empty() && previous != name {
+            let old_root = paths::skills_dir()?.join(previous);
+            if old_root.exists() {
+                std::fs::remove_dir_all(&old_root)
+                    .with_context(|| format!("removing old skill dir {}", old_root.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn remove_user_skill(name: &str) -> Result<()> {
+    let name = validate_user_skill_name(name)?;
+    let root = paths::skills_dir()?.join(name);
+    if root.exists() {
+        std::fs::remove_dir_all(&root)
+            .with_context(|| format!("removing skill dir {}", root.display()))?;
+    }
+    Ok(())
+}
+
 /// Safe accessor for callers that may run before `init` (e.g. system-prompt
 /// construction in tests): returns an empty summary when the registry is not
 /// yet installed, so the prompt is well-formed throughout boot.
@@ -200,4 +295,35 @@ mod tests {
         let r = SkillRegistry::default();
         assert!(r.summary_block().is_empty());
     }
+}
+
+fn classify_origin(key: &str, source: &Path, user_root: Option<&Path>) -> SkillOrigin {
+    if let Some(root) = user_root
+        && source.starts_with(root)
+    {
+        return SkillOrigin::User;
+    }
+    let plugin = key
+        .split_once(':')
+        .map(|(plugin, _)| plugin.to_string())
+        .or_else(|| {
+            source
+                .components()
+                .rev()
+                .nth(2)
+                .map(|part| part.as_os_str().to_string_lossy().to_string())
+        })
+        .unwrap_or_default();
+    SkillOrigin::Plugin { plugin }
+}
+
+fn validate_user_skill_name(name: &str) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("skill name cannot be empty");
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed == "." || trimmed == ".." {
+        anyhow::bail!("skill name contains an invalid path segment");
+    }
+    Ok(trimmed.to_string())
 }

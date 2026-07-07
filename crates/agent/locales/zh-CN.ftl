@@ -206,6 +206,65 @@ settings-btn-add-server = + 添加服务器
 settings-section-mcp-plugins = 来自插件
 settings-row-mcp-plugin-name = codex_apps
 
+### views/plugin_manager.rs
+plugins-title = 插件
+plugins-search-placeholder = 搜索插件、技能、MCP…
+plugins-tab-marketplace = 市场
+plugins-tab-plugin = 插件
+plugins-tab-skill = 技能
+plugins-tab-mcp = MCP
+plugins-busy = 正在处理…
+plugins-new = 新建
+plugins-edit = 编辑
+plugins-view = 查看
+plugins-copy = 复制
+plugins-select = 选择
+plugins-delete = 删除
+plugins-update = 更新
+plugins-install = 安装
+plugins-uninstall = 卸载
+plugins-installed = 已安装
+plugins-not-installed = 未安装
+plugins-description = 描述
+
+plugins-marketplace-url = Git URL，例如 https://github.com/org/marketplace.git
+plugins-add-marketplace = 添加市场
+plugins-marketplace-count = {$count} 个插件
+plugins-marketplace-detail = {$name} 插件
+plugins-empty-marketplaces = 尚无市场。
+plugins-empty-marketplace-selection = 选择一个市场来管理其中的插件。
+plugins-empty-marketplace-plugins = 此市场没有插件。
+plugins-empty-installed = 尚未安装插件。
+plugins-error-marketplace-url = 请输入市场 Git URL。
+plugins-notice-marketplace-added = 市场已添加。
+plugins-notice-marketplace-updated = 市场已更新。
+plugins-notice-marketplace-removed = 市场已删除。
+plugins-notice-plugin-installed = 插件已安装。重启 manox 后会加载新注册的工具、技能、agent、hook 和 MCP 服务器。
+plugins-notice-plugin-removed = 插件已移除。重启 manox 后会卸载启动时加载的运行时注册表。
+
+plugins-skill-new = 新建用户技能
+plugins-skill-edit = 编辑用户技能
+plugins-skill-name = 技能名称
+plugins-skill-body = 技能正文
+plugins-origin-user = 用户技能
+plugins-origin-plugin = 插件：{$name}
+plugins-empty-skills = 尚无技能。
+plugins-notice-skill-saved = 技能已保存。重启 manox 或启动新进程后，模型可见的技能注册表会刷新。
+plugins-notice-skill-removed = 技能已删除。重启 manox 或启动新进程后，模型可见的技能注册表会刷新。
+
+plugins-mcp-new = 新建 MCP 服务器
+plugins-mcp-edit = 编辑 MCP 服务器
+plugins-mcp-name = 服务器名称
+plugins-mcp-command = 命令，例如 npx
+plugins-mcp-args = 参数，以空格分隔
+plugins-mcp-url = Streamable HTTP URL
+plugins-mcp-user = 用户 mcp.toml
+plugins-mcp-plugin = 插件声明的 MCP
+plugins-empty-mcp = 尚未配置用户 MCP 服务器。
+plugins-empty-plugin-mcp = 尚未发现插件声明的 MCP 服务器。
+plugins-notice-mcp-saved = MCP 服务器已保存到 mcp.toml。重启 manox 后会连接它。
+plugins-notice-mcp-removed = MCP 服务器已从 mcp.toml 删除。已在启动时加载的服务器需重启 manox 后断开。
+
 ### views/settings.rs — 环境面板
 settings-panel-environment = 环境
 settings-desc-environment = 本地环境用于指示 Codex 如何为项目设置工作树

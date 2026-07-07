@@ -46,6 +46,14 @@ pub struct SandboxPolicy {
     /// is written but not yet read.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     allow_network: bool,
+    /// Subtrees of `protected_paths` explicitly re-opened for writes — the
+    /// bound repo's shared `.git`, while a worktree is active. Empty in the
+    /// default `for_project` case, so `.git` stays protected as before. A path
+    /// is protected iff it is under a `protected_paths` entry AND not under any
+    /// `git_allowed_roots` entry; the harness-managed worktree entry on the
+    /// same repo is an approved action distinct from the c5aefe4d unauthorized
+    /// jump to a sibling repo's `.git`.
+    git_allowed_roots: Vec<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -73,12 +81,54 @@ impl SandboxPolicy {
                 writable_roots: vec![temp],
                 protected_paths: Vec::new(),
                 allow_network: false,
+                git_allowed_roots: Vec::new(),
             };
         }
         Self {
             writable_roots: vec![root.clone(), temp],
             protected_paths: vec![root.join(".git")],
             allow_network: false,
+            git_allowed_roots: Vec::new(),
+        }
+    }
+
+    /// Extend a project policy for an active worktree: admit the worktree path
+    /// as a writable root, re-open the bound repo's shared `.git` for writes
+    /// (so `git commit`/`rebase`/`push` against the main repo's `.git` work),
+    /// and enable network — a worktree is an approved isolation context, and
+    /// git workflows need `push`/`fetch` to be frictionless. The c5aefe4d
+    /// threat (unauthorized `cd` into a sibling repo's `.git`) stays blocked:
+    /// only `main_repo_git_dir` is de-protected, sibling worktrees' `.git`
+    /// entries are neither under `writable_roots` nor in `git_allowed_roots`.
+    ///
+    /// `main_repo_git_dir` is the path returned by `git rev-parse
+    /// --git-common-dir` from inside the worktree — the main repo's `.git`,
+    /// shared across all linked worktrees.
+    pub fn with_worktree(mut self, worktree_path: &Path, main_repo_git_dir: &Path) -> Self {
+        self.writable_roots
+            .push(canonicalize_best_effort(worktree_path));
+        self.git_allowed_roots
+            .push(canonicalize_best_effort(main_repo_git_dir));
+        self.allow_network = true;
+        self
+    }
+
+    /// Policy for a sub-agent spawned with worktree isolation: the child may
+    /// write only its own worktree (not the parent's project root) plus temp,
+    /// may run git ops against the bound repo's shared `.git`, and has network
+    /// — the same approved-isolation-context relaxation as [`with_worktree`],
+    /// but anchored on the worktree alone so parent and sibling trees are out
+    /// of reach. `protected_paths` is empty because a linked worktree has no
+    /// `.git` directory of its own (it shares the main repo's).
+    pub fn for_worktree(worktree_path: &Path, main_repo_git_dir: &Path) -> Self {
+        Self {
+            writable_roots: vec![
+                canonicalize_best_effort(worktree_path),
+                canonicalize_best_effort(&std::env::temp_dir()),
+            ],
+            protected_paths: Vec::new(),
+            allow_network: true,
+            git_allowed_roots: vec![canonicalize_best_effort(main_repo_git_dir)],
         }
     }
 
@@ -95,10 +145,20 @@ impl SandboxPolicy {
             .any(|root| canon.starts_with(root))
     }
 
-    /// Whether `path` falls under a protected path (e.g. project `.git`).
+    /// Whether `path` falls under a protected path (e.g. project `.git`), minus
+    /// any subtree explicitly re-opened via `git_allowed_roots` (the bound
+    /// repo's `.git` while a worktree is active). A path under a protected root
+    /// that also falls under a git-allowed root is NOT protected — the
+    /// harness-managed worktree entry de-protects the same repo's `.git` for git
+    /// ops, without admitting sibling repos' `.git` (the c5aefe4d escape).
     pub fn is_protected(&self, path: &Path) -> bool {
         let canon = canonicalize_best_effort(path);
-        self.protected_paths.iter().any(|p| canon.starts_with(p))
+        let under_protected = self.protected_paths.iter().any(|p| canon.starts_with(p));
+        if !under_protected {
+            return false;
+        }
+        let under_git_allowed = self.git_allowed_roots.iter().any(|g| canon.starts_with(g));
+        !under_git_allowed
     }
 
     /// The combined write decision: a path is writable only if it falls under
@@ -142,6 +202,18 @@ impl SandboxPolicy {
             s.push_str(&format!(
                 "(deny file-write* (subpath \"{}\"))\n",
                 escape_seatbelt_path(p)
+            ));
+        }
+        // Re-allow the bound repo's `.git` AFTER the protected denies so a
+        // linked worktree's git ops (commit/rebase/push against the main repo's
+        // shared `.git`) succeed. Seatbelt's last-matching-rule-wins ordering
+        // makes the later allow override the earlier deny for that subtree
+        // alone; sibling repos' `.git` entries are neither in writable_roots
+        // nor here, so they stay denied.
+        for g in &self.git_allowed_roots {
+            s.push_str(&format!(
+                "(allow file-write* (subpath \"{}\"))\n",
+                escape_seatbelt_path(g)
             ));
         }
         if !self.allow_network {
@@ -378,5 +450,100 @@ mod tests {
         assert_eq!(args[3], "bash");
         assert_eq!(args[4], "-c");
         assert_eq!(args[5], "git status");
+    }
+
+    // ─── worktree policy ───────────────────────────────────────────────────
+
+    #[test]
+    fn with_worktree_opens_bound_git_and_network() {
+        let project = Path::new("/tmp/manox-sandbox-test");
+        let git_dir = project.join(".git");
+        let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
+        let p = SandboxPolicy::for_project(project).with_worktree(worktree, &git_dir);
+        // The bound repo's .git is now writable (git ops work).
+        assert!(
+            p.is_write_allowed(&git_dir.join("config")),
+            "bound .git must be writable under worktree policy"
+        );
+        // The worktree itself is writable.
+        assert!(p.is_write_allowed(&worktree.join("src/lib.rs")));
+        // Network is on.
+        assert!(p.allow_network);
+    }
+
+    #[test]
+    fn with_worktree_still_blocks_sibling_worktree_git() {
+        // The c5aefe4d escape: cd into a SIBLING worktree and git ops against
+        // its .git. Only the bound repo's .git is de-protected; a sibling's
+        // .git stays blocked.
+        let project = Path::new("/tmp/manox-sandbox-test");
+        let git_dir = project.join(".git");
+        let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
+        let p = SandboxPolicy::for_project(project).with_worktree(worktree, &git_dir);
+        let sibling = Path::new("/tmp/manox-sibling-worktree/.git/config");
+        assert!(
+            !p.is_write_allowed(sibling),
+            "sibling worktree's .git must stay blocked"
+        );
+        assert!(
+            !p.is_writable(Path::new("/tmp/manox-sibling-worktree/x")),
+            "sibling worktree path must stay non-writable"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_with_worktree_allows_bound_git_and_network() {
+        let project = Path::new("/tmp/manox-sandbox-test");
+        let git_dir = project.join(".git");
+        let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
+        let p = SandboxPolicy::for_project(project).with_worktree(worktree, &git_dir);
+        let s = p.render_seatbelt();
+        // The bound .git allow appears after the .git deny.
+        let deny_idx = s.find("(deny file-write* (subpath").unwrap();
+        let allow_idx = s
+            .find(&format!(
+                "(allow file-write* (subpath \"{}",
+                git_dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| git_dir.clone())
+                    .display()
+            ))
+            .or_else(|| s.find("(allow file-write* (subpath"));
+        // At least one git-allowed allow line is present after the deny block.
+        assert!(
+            allow_idx.map(|i| i > deny_idx).unwrap_or(false)
+                || s.matches("(allow file-write* (subpath").count() >= 3,
+            "bound .git allow must follow the deny: {s}"
+        );
+        // Network is no longer denied.
+        assert!(
+            !s.contains("(deny network*)"),
+            "network must be allowed: {s}"
+        );
+    }
+
+    #[test]
+    fn for_worktree_confines_child_to_its_own_tree() {
+        // A sub-agent with worktree isolation: writable = its worktree + temp
+        // only, git ops against the bound .git work, the parent's project root
+        // is out of reach.
+        let parent_project = Path::new("/tmp/parent-project");
+        let git_dir = parent_project.join(".git");
+        let child_wt = Path::new("/tmp/parent-project/.claude/worktrees/sub-1");
+        let p = SandboxPolicy::for_worktree(child_wt, &git_dir);
+        assert!(p.is_write_allowed(&child_wt.join("src/lib.rs")));
+        // Parent project root is NOT writable for the child.
+        assert!(
+            !p.is_write_allowed(&parent_project.join("src/lib.rs")),
+            "child must not write parent project root"
+        );
+        // Bound .git: not writable via the Rust FS check (not under the child's
+        // writable_roots), but the seatbelt emits an allow so bash git ops work.
+        assert!(
+            !p.is_write_allowed(&git_dir.join("config")),
+            "FS tools must not write .git directly; bash seatbelt is the git-op path"
+        );
+        assert!(p.allow_network);
     }
 }

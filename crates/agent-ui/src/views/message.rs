@@ -436,7 +436,6 @@ pub fn render_reasoning(
                                 });
                             }
                         });
-                        w.list_state().remeasure();
                         cx.notify();
                     });
                 })
@@ -658,7 +657,6 @@ pub fn render_tool_call(
                             });
                         }
                     });
-                    w.list_state().remeasure();
                     cx.notify();
                 });
             })
@@ -793,7 +791,6 @@ fn render_plan_card(
                                 });
                             }
                         });
-                        w.list_state().remeasure();
                         cx.notify();
                     });
                 })
@@ -951,7 +948,6 @@ pub fn render_agent_task(
                     if !w.expanded_tasks.insert(id_for_toggle.clone()) {
                         w.expanded_tasks.remove(&id_for_toggle);
                     }
-                    w.list_state().remeasure();
                     cx.notify();
                 });
             })
