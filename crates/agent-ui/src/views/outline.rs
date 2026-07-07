@@ -192,6 +192,19 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "turn_span ordinal out of range")]
+    fn turn_span_debug_asserts_on_out_of_range_ordinal() {
+        // Callers only ever pass ordinals from `user_turns_from`, but the
+        // debug-assert guards the public API against a future off-by-one.
+        let turns = [UserTurn {
+            item_ix: 0,
+            ordinal: 0,
+            summary: String::new(),
+        }];
+        let _ = turn_span(&turns, 5, 1);
+    }
+
+    #[test]
     fn turn_visibility_is_range_intersection() {
         let tests = [
             (0..3, 1..2, true),  // viewport inside span
