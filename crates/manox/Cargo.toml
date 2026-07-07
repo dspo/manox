@@ -19,6 +19,7 @@ agent = { path = "../agent" }
 terminal = { path = "../terminal" }
 terminal-ui = { path = "../terminal-ui" }
 
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [package.metadata.bundle]

@@ -4428,6 +4428,7 @@ dependencies = [
  "gpui_platform",
  "terminal",
  "terminal-ui",
+ "tracing",
  "tracing-subscriber",
 ]
 
