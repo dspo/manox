@@ -3996,7 +3996,6 @@ impl Render for Workspace {
             .child({
                 let show_env =
                     !editor_open && !first_screen && self.thread.read(cx).has_interacted();
-                let env_panel = show_env.then(|| self.render_environment_panel(&theme, cx));
                 let content_inset = if show_env {
                     px(ENV_CONTENT_INSET)
                 } else {
@@ -4008,7 +4007,6 @@ impl Render for Workspace {
                     .relative()
                     // Body wrapper: hero / list / footer / overlay share a common
                     // horizontal inset so conversation content doesn't kiss the
-<<<<<<< HEAD
                     // panel edge. `pt` reserves space for the title-bar overlay
                     // (last child below); the overlay paints after the body so
                     // the "..." menu isn't covered by the conversation list.
@@ -4073,7 +4071,6 @@ impl Render for Workspace {
                             // Approval overlay (if any)
                             .children(overlay),
                     )
-<<<<<<< HEAD
                     // Title-bar overlay: absolute top of the main column,
                     // painted after the body so the "..." menu isn't covered
                     // by the conversation list.
@@ -4099,9 +4096,9 @@ impl Render for Workspace {
                                             .child(self.render_title_menu_trigger(&theme, cx)),
                                     )
                                     .child(h_flex()),
-                            ),
-                    ),
-            )
+                            )
+                    )
+            })
             .when(editor_open, |this| {
                 this.child(editor_divider).child(editor_pane)
             })
