@@ -832,10 +832,19 @@ impl Thread {
         self.token_meter.last_request(self.last_user_message_id())
     }
 
+    /// Per-model cumulative token usage, keyed by model display name.
+    pub fn per_model_token_usage(&self) -> &HashMap<String, TokenUsage> {
+        self.token_meter.per_model()
+    }
+
     /// Fold a streaming `UsageUpdate` into the meter. The caller emits the
     /// cumulative on `ThreadEvent::TokenUsageUpdated` after this returns.
     fn accumulate_token_usage(&mut self, new: TokenUsage) {
-        self.token_meter.accumulate(new);
+        if let Some(model) = self.model.as_ref() {
+            self.token_meter.accumulate_for_model(new, &model.name());
+        } else {
+            self.token_meter.accumulate(new);
+        }
     }
 
     /// Attribute the in-flight request's usage to its triggering user message
