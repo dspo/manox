@@ -1044,6 +1044,10 @@ fn live_tail(output: &str) -> String {
         return output.to_string();
     }
     let cut = output.len() - TAIL_BYTES;
+    // `cut` is a byte offset; round it down to a UTF-8 char boundary so the
+    // slices below stay valid when the tail split lands inside a multi-byte
+    // glyph (e.g. CJK output). Without this, `output[cut..]` panics.
+    let cut = output.floor_char_boundary(cut);
     // Start at the next line boundary so we don't slice mid-line.
     let start = output[cut..].find('\n').map(|i| cut + i + 1).unwrap_or(cut);
     let mut s = format!("{}\n", i18n::t("message-omitted-prefix"));
@@ -1209,5 +1213,43 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_tail_short_output_unchanged() {
+        let s = "line\nline2\n";
+        assert_eq!(live_tail(s), s);
+    }
+
+    #[test]
+    fn live_tail_long_ascii_splits_on_newline() {
+        let s = "a".repeat(13 * 1024);
+        let out = live_tail(&s);
+        assert!(out.starts_with(&i18n::t("message-omitted-prefix").to_string()));
+        // No newline in the input -> fall back to the byte cut; still valid.
+        assert!(out.ends_with('a'));
+    }
+
+    /// Regression: a byte cut landing inside a multi-byte CJK glyph used to panic
+    /// `output[cut..]` with a slice-out-of-bounds. The tail must split on a char
+    /// boundary instead.
+    #[test]
+    fn live_tail_multibyte_cut_does_not_panic() {
+        // Each line is a CJK char repeated so the tail boundary lands mid-glyph.
+        let line = "中".repeat(64);
+        let mut s = String::new();
+        for _ in 0..(13 * 1024 / line.len() + 1) {
+            s.push_str(&line);
+            s.push('\n');
+        }
+        let out = live_tail(&s);
+        assert!(out.starts_with(&i18n::t("message-omitted-prefix").to_string()));
+        // The retained tail must be valid UTF-8 (would have panicked before).
+        assert!(out.contains('中'));
     }
 }
