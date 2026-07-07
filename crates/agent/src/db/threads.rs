@@ -64,6 +64,9 @@ pub struct ThreadRecord {
     /// Three-state approval mode (0 = OnRequest, 1 = AutoReview, 2 = Yolo).
     /// Persisted as INTEGER for schema-stability across enum reorderings.
     pub approval_mode: i64,
+    /// Reasoning effort (0 = Low, 1 = Medium, …, 6 = Auto).
+    /// Persisted as INTEGER matching `ReasoningEffort::as_i64`.
+    pub reasoning_effort: i64,
     pub depth: i32,
     pub parent_id: Option<String>,
     pub archived: bool,
@@ -108,6 +111,7 @@ pub fn create_table(conn: &Connection) -> Result<()> {
             cwd TEXT,
             project TEXT,
             approval_mode INTEGER NOT NULL DEFAULT 0,
+            reasoning_effort INTEGER NOT NULL DEFAULT 1,
             depth INTEGER NOT NULL DEFAULT 0,
             parent_id TEXT,
             archived INTEGER NOT NULL DEFAULT 0,
@@ -180,11 +184,11 @@ impl ThreadsDatabase {
         tx.execute(
             "INSERT INTO threads (
                 id, summary, title, title_override, model_id, provider_id, cwd, project,
-                approval_mode, depth, parent_id, archived, pinned, created_at, interacted_at, updated_at,
+                approval_mode, reasoning_effort, depth, parent_id, archived, pinned, created_at, interacted_at, updated_at,
                 session_started_at, revision, cumulative_input_tokens, cumulative_output_tokens,
                 cumulative_cache_creation_input_tokens, cumulative_cache_read_input_tokens
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(id) DO UPDATE SET
                 summary = excluded.summary,
                 title = excluded.title,
@@ -194,6 +198,7 @@ impl ThreadsDatabase {
                 cwd = excluded.cwd,
                 project = excluded.project,
                 approval_mode = excluded.approval_mode,
+                reasoning_effort = excluded.reasoning_effort,
                 depth = excluded.depth,
                 parent_id = excluded.parent_id,
                 archived = excluded.archived,
@@ -216,6 +221,7 @@ impl ThreadsDatabase {
                 rec.cwd,
                 rec.project,
                 rec.approval_mode,
+                rec.reasoning_effort,
                 rec.depth,
                 rec.parent_id,
                 rec.archived as i64,
@@ -279,7 +285,7 @@ impl ThreadsDatabase {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let row = conn.query_row(
             "SELECT id, summary, title, title_override, model_id, provider_id, cwd, project,
-                    approval_mode, depth, parent_id, archived, pinned, created_at, interacted_at, updated_at,
+                    approval_mode, reasoning_effort, depth, parent_id, archived, pinned, created_at, interacted_at, updated_at,
                     session_started_at, revision, cumulative_input_tokens, cumulative_output_tokens,
                     cumulative_cache_creation_input_tokens, cumulative_cache_read_input_tokens
              FROM threads WHERE id = ?1",
@@ -295,20 +301,21 @@ impl ThreadsDatabase {
                     cwd: row.get(6)?,
                     project: row.get(7)?,
                     approval_mode: row.get(8)?,
-                    depth: row.get(9)?,
-                    parent_id: row.get(10)?,
-                    archived: row.get::<_, i64>(11)? != 0,
-                    pinned: row.get::<_, i64>(12)? != 0,
-                    created_at: row.get(13)?,
-                    interacted_at: row.get(14)?,
-                    updated_at: row.get(15)?,
-                    session_started_at: row.get(16)?,
-                    revision: row.get::<_, i64>(17)? as u64,
+                    reasoning_effort: row.get(9)?,
+                    depth: row.get(10)?,
+                    parent_id: row.get(11)?,
+                    archived: row.get::<_, i64>(12)? != 0,
+                    pinned: row.get::<_, i64>(13)? != 0,
+                    created_at: row.get(14)?,
+                    interacted_at: row.get(15)?,
+                    updated_at: row.get(16)?,
+                    session_started_at: row.get(17)?,
+                    revision: row.get::<_, i64>(18)? as u64,
                     cumulative_token_usage: TokenUsage {
-                        input_tokens: row.get::<_, i64>(18)? as u64,
-                        output_tokens: row.get::<_, i64>(19)? as u64,
-                        cache_creation_input_tokens: row.get::<_, i64>(20)? as u64,
-                        cache_read_input_tokens: row.get::<_, i64>(21)? as u64,
+                        input_tokens: row.get::<_, i64>(19)? as u64,
+                        output_tokens: row.get::<_, i64>(20)? as u64,
+                        cache_creation_input_tokens: row.get::<_, i64>(21)? as u64,
+                        cache_read_input_tokens: row.get::<_, i64>(22)? as u64,
                     },
                     // Filled from the BLOB below.
                     messages: Vec::new(),
@@ -464,6 +471,7 @@ impl ThreadRecord {
             cwd: cwd.into(),
             project: String::new(),
             approval_mode: 0,
+            reasoning_effort: 1,
             depth: 0,
             parent_id: None,
             archived: false,

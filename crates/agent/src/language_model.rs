@@ -181,6 +181,32 @@ impl ReasoningEffort {
             self.wire_value()
         }
     }
+
+    /// Integer encoding for SQLite persistence. Mirrors `ApprovalMode::as_i64`.
+    pub fn from_i64(v: i64) -> Self {
+        match v {
+            0 => Self::Low,
+            1 => Self::Medium,
+            2 => Self::High,
+            3 => Self::XHigh,
+            4 => Self::Max,
+            5 => Self::Ultracode,
+            6 => Self::Auto,
+            _ => Self::Medium,
+        }
+    }
+
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+            Self::XHigh => 3,
+            Self::Max => 4,
+            Self::Ultracode => 5,
+            Self::Auto => 6,
+        }
+    }
 }
 
 /// A single completion request.

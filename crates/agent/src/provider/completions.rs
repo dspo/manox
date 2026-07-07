@@ -669,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn build_request_body_omits_reasoning_effort_when_auto() {
+    fn build_request_body_passes_auto_effort_to_official_openai() {
         let mut req = req_with_tool();
         req.reasoning_effort = Some(ReasoningEffort::Auto);
         let body = build_request_body("m", 64, &req, "test-key", true);

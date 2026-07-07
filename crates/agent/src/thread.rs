@@ -398,7 +398,7 @@ impl Thread {
                 turn_tool_filter: None,
                 session_started: false,
                 plan_mode: false,
-                reasoning_effort: ReasoningEffort::default(),
+                reasoning_effort: ReasoningEffort::from_i64(rec.reasoning_effort),
                 pending_plan_approval: HashMap::new(),
                 title_state: TitleState::restore(
                     rec.title,
@@ -509,6 +509,7 @@ impl Thread {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             approval_mode: self.approval_mode.as_i64(),
+            reasoning_effort: self.reasoning_effort.as_i64(),
             depth: self.depth as i32,
             parent_id: self.parent_id.clone(),
             archived: self.archived,
