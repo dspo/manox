@@ -280,3 +280,4 @@ tab-conversation = 对话
 tab-terminal = 终端
 terminal-placeholder = 终端运行中… 输入以交互
 terminal-exited = 终端已退出，退出码 { $code }
+terminal-search-status = 搜索：{ $pattern }（{ $count } 处匹配）

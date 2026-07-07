@@ -160,15 +160,16 @@ impl PtyHandle {
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
-        // Kill the child first so the waiter reaps it and the reader hits EOF;
-        // both threads then exit on their own. Join so the process group is
-        // guaranteed gone before we return.
+        // Kill the child so the waiter reaps it and the reader hits EOF; both
+        // threads then exit on their own. They are detached rather than joined:
+        // joining would hang if the gpui-side receiver — dropped just after
+        // this handle in the same `Terminal` destructor — were not being
+        // polled, leaving a thread blocked in `send_blocking` with no drainer.
+        // The threads own their reader fd / child handle and channel-clone
+        // senders, so they are safe to outlive this handle.
         let _ = self.killer.kill();
-        if let Some(t) = self.reader_thread.take() {
-            let _ = t.join();
-        }
-        if let Some(t) = self.wait_thread.take() {
-            let _ = t.join();
-        }
+        // Drop the join handles to detach the threads.
+        self.reader_thread.take();
+        self.wait_thread.take();
     }
 }

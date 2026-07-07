@@ -317,10 +317,11 @@ impl Render for TerminalView {
                         div()
                             .text_xs()
                             .text_color(gpui::hsla(0., 0., 0.9, 1.))
-                            .child(SharedString::from(format!(
-                                "search: {pattern}  ({count} match{})",
-                                if count == 1 { "" } else { "es" }
-                            ))),
+                            .child(agent::i18n::t_str_count(
+                                "terminal-search-status",
+                                &[("pattern", pattern.as_str())],
+                                count as i64,
+                            )),
                     ),
             )
         } else {

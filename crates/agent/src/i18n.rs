@@ -177,6 +177,17 @@ pub fn t_count(key: &str, count: i64) -> SharedString {
     format(key, Some(&fa))
 }
 
+/// Resolve `key` with string arguments plus a numeric `$count`, for
+/// plural-aware messages that also carry named string args.
+pub fn t_str_count(key: &str, args: &[(&str, &str)], count: i64) -> SharedString {
+    let mut fa = FluentArgs::new();
+    for (k, v) in args {
+        fa.set(*k, FluentValue::String(std::borrow::Cow::Borrowed(*v)));
+    }
+    fa.set("count", FluentValue::from(count));
+    format(key, Some(&fa))
+}
+
 fn format(key: &str, args: Option<&FluentArgs>) -> SharedString {
     ensure_init();
     L10N.with(|cell| {

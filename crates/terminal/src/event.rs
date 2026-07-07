@@ -73,7 +73,19 @@ impl EventListener for ManoxListener {
             _ => None,
         };
         if let Some(ev) = mapped {
-            let _ = self.tx.send_blocking(ev);
+            // `send_event` runs on the gpui side under the `FairMutex` lock,
+            // inside `Processor::advance`. A blocking send would deadlock the
+            // gpui thread if the channel were ever full (the draining task
+            // also lives on the gpui executor and could not run). Use
+            // `try_send` and drop on backpressure instead — `Wakeup`, the
+            // frequent event, is idempotent; rare events re-sync on the next.
+            match self.tx.try_send(ev) {
+                Ok(()) => {}
+                Err(async_channel::TrySendError::Full(_)) => {
+                    tracing::warn!("terminal event channel full; dropping event");
+                }
+                Err(async_channel::TrySendError::Closed(_)) => {}
+            }
         }
     }
 }

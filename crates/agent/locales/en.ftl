@@ -293,3 +293,7 @@ tab-conversation = Conversation
 tab-terminal = Terminal
 terminal-placeholder = Terminal running… type to interact
 terminal-exited = Terminal exited with code { $code }
+terminal-search-status = search: { $pattern }  ({ $count ->
+    [one] 1 match
+   *[other] { $count } matches
+})
