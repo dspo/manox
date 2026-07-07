@@ -36,6 +36,19 @@ pub enum SidebarEvent {
     ArchiveThread(String, bool),
     /// User toggled the pin indicator. The bool is the new pinned state.
     PinThread(String, bool),
+    /// User clicked the Conversation / Terminal tab switcher.
+    FocusConversation,
+    FocusTerminal,
+}
+
+/// Which top-level tab the sidebar highlights as active. Driven by the
+/// Workspace's `view_mode` so the sidebar reflects the current pane without
+/// owning the state.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveTab {
+    #[default]
+    Conversation,
+    Terminal,
 }
 
 pub struct Sidebar {
@@ -46,6 +59,8 @@ pub struct Sidebar {
     /// Live width driven by dragging the divider on the right edge. Updated
     /// from the owning `Workspace` on every drag-move tick.
     width: Pixels,
+    /// Highlighted tab in the top switcher; set by the Workspace on switch.
+    active_tab: ActiveTab,
     _sub: Subscription,
 }
 
@@ -71,6 +86,7 @@ impl Sidebar {
             selected: None,
             collapsed: HashSet::new(),
             width,
+            active_tab: ActiveTab::default(),
             _sub: sub,
         }
     }
@@ -89,6 +105,13 @@ impl Sidebar {
     /// Mark the currently selected thread id (back-filled by Workspace on switch/new, for highlight).
     pub fn set_selected(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         self.selected = id;
+        cx.notify();
+    }
+
+    /// Set the highlighted top-level tab. Called by the Workspace whenever the
+    /// active pane changes so the switcher reflects the current view.
+    pub fn set_active_tab(&mut self, tab: ActiveTab, cx: &mut Context<Self>) {
+        self.active_tab = tab;
         cx.notify();
     }
 
@@ -211,6 +234,34 @@ impl Render for Sidebar {
             .bg(theme.background)
             .border_r_1()
             .border_color(theme.border)
+            // Top Conversation / Terminal tab switcher. Sits above the
+            // scrollable body so it stays pinned at the top of the sidebar.
+            .child(
+                h_flex()
+                    .w_full()
+                    .pt(top_inset)
+                    .px_2()
+                    .pb_1()
+                    .gap_1()
+                    .child(tab_button(
+                        "tab-conversation",
+                        i18n::t("tab-conversation"),
+                        self.active_tab == ActiveTab::Conversation,
+                        &theme,
+                        cx.listener(|_this, _ev, _window, cx| {
+                            cx.emit(SidebarEvent::FocusConversation);
+                        }),
+                    ))
+                    .child(tab_button(
+                        "tab-terminal",
+                        i18n::t("tab-terminal"),
+                        self.active_tab == ActiveTab::Terminal,
+                        &theme,
+                        cx.listener(|_this, _ev, _window, cx| {
+                            cx.emit(SidebarEvent::FocusTerminal);
+                        }),
+                    )),
+            )
             // Scrollable body: top menu + projects + conversations.
             .child(
                 v_flex()
@@ -312,6 +363,37 @@ fn menu_item(
     match on_click {
         Some(handler) => row.on_click(handler).into_any_element(),
         None => row.into_any_element(),
+    }
+}
+
+/// A pill-shaped tab button for the Conversation / Terminal switcher. The
+/// active tab gets the accent background; inactive tabs are transparent with
+/// a hover wash.
+fn tab_button(
+    id: &'static str,
+    label: SharedString,
+    active: bool,
+    theme: &Theme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let base = gpui::div()
+        .id(id)
+        .flex_1()
+        .py_1()
+        .text_center()
+        .text_xs()
+        .rounded(theme.radius);
+    if active {
+        base.bg(theme.accent.opacity(0.18))
+            .text_color(theme.foreground)
+            .child(label)
+            .into_any_element()
+    } else {
+        base.hover(|s| s.bg(theme.accent.opacity(0.06)))
+            .text_color(theme.muted_foreground)
+            .child(label)
+            .on_click(on_click)
+            .into_any_element()
     }
 }
 

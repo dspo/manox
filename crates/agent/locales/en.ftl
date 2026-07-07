@@ -306,6 +306,19 @@ slash-plan-desc = Enter plan mode: read-only tools only, research then submit a 
 menu-settings = Settings…
 menu-quit = Quit
 menu-file = File
+menu-terminal = Terminal
+menu-new-terminal = New Terminal Tab
+menu-close-terminal = Close Terminal Tab
+
+### terminal-ui (tabs / overlay)
+tab-conversation = Conversation
+tab-terminal = Terminal
+terminal-placeholder = Terminal running… type to interact
+terminal-exited = Terminal exited with code { $code }
+terminal-search-status = search: { $pattern }  ({ $count ->
+    [one] 1 match
+   *[other] { $count } matches
+})
 
 ### views/title_menu.rs
 titlebar-menu-label = Conversation

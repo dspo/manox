@@ -1,6 +1,6 @@
 //! SQLite persistence.
 //!
-//! Four tables back the metadata model:
+//! Five tables back the metadata model:
 //! - `threads`: lightweight per-thread metadata + cumulative token columns.
 //!   The sidebar list query reads only this table — never the message BLOB —
 //!   so a long history stays cheap to enumerate.
@@ -10,11 +10,14 @@
 //!   branch_summary / custom) mirroring pi's JSONL entry types as rows.
 //! - `token_usage`: per-user-message token breakdown, queryable without
 //!   decompressing the message BLOB.
+//! - `terminal_sessions`: per-terminal metadata (cwd/env/title) for tab
+//!   restore; scrollback is not persisted.
 //!
 //! `ThreadsDatabase` holds a `Mutex<Connection>`; all methods are synchronous
 //! and blocking (callers wrap them in `background_spawn`).
 
 mod events;
+mod terminals;
 mod threads;
 mod token_usage;
 
@@ -25,6 +28,7 @@ use anyhow::{Context as _, Result};
 use rusqlite::Connection;
 
 pub use events::{ThreadEventRecord, ThreadEventType};
+pub use terminals::TerminalSession;
 pub use threads::{ThreadRecord, ThreadSummary};
 pub use token_usage::TokenUsageRecord;
 
@@ -73,6 +77,7 @@ impl ThreadsDatabase {
             threads::create_table(conn)?;
             events::create_table(conn)?;
             token_usage::create_table(conn)?;
+            terminals::create_table(conn)?;
             return Ok(());
         }
         let tx = conn
@@ -110,6 +115,7 @@ impl ThreadsDatabase {
         threads::create_table(&tx)?;
         events::create_table(&tx)?;
         token_usage::create_table(&tx)?;
+        terminals::create_table(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .context("set user_version")?;
         tx.commit().context("commit schema migration transaction")?;
