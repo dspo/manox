@@ -92,6 +92,7 @@ impl ThreadsDatabase {
         // re-created, not upgraded).
         tx.execute_batch(
             "DROP TABLE IF EXISTS token_usage;
+             DROP TABLE IF EXISTS terminal_sessions;
              DROP TABLE IF EXISTS thread_events;
              DROP TABLE IF EXISTS thread_data;
              DROP TABLE IF EXISTS threads;",
@@ -248,14 +249,24 @@ mod tests {
             [],
         )
         .unwrap();
-        // Simulate an older schema version: a second init at a lower version
-        // must wipe the row we just inserted.
+        conn.execute(
+            "INSERT INTO terminal_sessions (id, cwd, created_at, updated_at) VALUES ('t1', '/tmp', 0, 0)",
+            [],
+        )
+        .unwrap();
+        // A lower user_version triggers a wholesale rebuild that must wipe
+        // every table — including terminal_sessions, which the drop batch must
+        // not forget just because it was added after the others.
         conn.pragma_update(None, "user_version", 1).unwrap();
         ThreadsDatabase::init_schema(&mut conn).unwrap();
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 0);
+        let n_term: i64 = conn
+            .query_row("SELECT COUNT(*) FROM terminal_sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_term, 0, "terminal_sessions must be wiped on rebuild");
         let v: i32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();

@@ -369,8 +369,9 @@ impl Thread {
             let weak = cx.weak_entity();
             let cwd = std::path::PathBuf::from(&rec.cwd);
             let project = (!rec.project.is_empty()).then(|| std::path::PathBuf::from(&rec.project));
-            // Prefer the persisted provider_id; fall back to the resolved model's
-            // provider for records that predate the column (legacy envelopes).
+            // Persisted provider_id wins; a thread saved before its model was
+            // resolved (provider_id stays None until set_model) picks up the
+            // restore-time resolved model's provider.
             let provider_id = rec
                 .provider_id
                 .clone()

@@ -12,16 +12,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     /// Stable unique id (UUID v4). Used as the key for per-user-message token
-    /// usage and for event linkage. `#[serde(default)]` so legacy envelopes
-    /// (which predate the field) deserialize with a nil placeholder.
-    #[serde(default)]
+    /// usage and for event linkage.
     pub id: String,
-    /// Creation time, Unix seconds. `#[serde(default)]` for legacy envelopes.
-    #[serde(default)]
+    /// Creation time, Unix seconds.
     pub timestamp: i64,
     /// Parent message id for branch/fork linking. Reserved: not yet wired to any
     /// branch-switch UI; linear conversations leave it `None`.
-    #[serde(default)]
     pub parent_id: Option<String>,
     pub role: Role,
     pub content: Vec<MessageContent>,
