@@ -123,3 +123,16 @@ manox 区分**模型面向**与**用户面向**两条字符串边界，二者不
 - **禁止抄袭第三方 crate 代码**：不便规范引入的可参考架构思想，但禁止复制粘贴后修改。`git2` 即因此被禁（plugin marketplace shell out 系统 `git`）。
 - **注释一律英文，面向终态（描述不变量/意图）而非过程流水账，非必要不注释**。详见 `~/.claude/rules/code-comments.md`。
 - **迭代时不得破坏前缀缓存**：provider 侧前缀缓存是透明优化——命中时零成本，击穿时静默回退为全量重算，无 warning、无 error。任何对 `build_completion_request` 或消息组装管线的改动，必须保持跨 turn 的请求前缀字节一致；若确实需要重写历史（截断、剥离图片等），须先接入 `AppendOnlyContextManager`（`prefix_stability.rs`）或显式禁用该路径的缓存。缓存正确性完全依赖调用方维护前缀稳定——没有运行时护栏。
+
+## 激进开发纪律
+
+manox 处于开发早期，不存在 v1 / v2 / v3 之分，不维护 v0→v1 升级路径，不背历史负债。
+
+- **不写升级脚本 / migration**：schema 变更靠 `DROP TABLE + CREATE TABLE` 走 schema-version 不匹配的全量重建（参见 `crates/agent/src/db/mod.rs` 的 `init_schema`），不要写 `ALTER TABLE` / `INSERT ... SELECT` / 多步迁移链。
+- **不保留兼容字段**：当某个字段（列、JSON key、enum variant）失去存在理由时直接删，不要用 `#[serde(rename = "old_name")]` / 双写 / `if new_present else read_old` 之类的"读旧写新"模式给它续命。删了数据丢了就丢了，用户重做即可。
+- **不写 fallback 兼容读**：模型读不到某个 key 就报错，不要静默回退到旧字段、不要用 `Option::unwrap_or(default)` 假装存在、不要在 load 路径上做"如果 v2 schema 则 promote"的运行时翻译层。
+- **不写 `v0` / `legacy_` / `backward_compat` 模块**：任何以"向后兼容"为名的子模块、helper、trait、wrapper 都是债务，直接拒。
+- **新枚举 / 新 schema 直接上**：v 字段从 0 改成 1 时不必保留 v=0 的语义，重新规划 enum variant 与 SQL column，原地替换不是可选。
+- **删代码时同步删测试**：被删字段 / 路径的单元测试、迁移测试、compat 测试全部一起删，不要保留"以防 v2 回来"。
+
+> 当不确定要不要保留兼容层时，问自己一句：当前有没有外部用户的数据会因此被破坏？答案是"没有 / 用户可以接受丢"——就按激进方向走，不要做"以防万一"的折中。

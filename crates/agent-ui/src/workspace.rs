@@ -1109,7 +1109,7 @@ impl Workspace {
         // `AutoReview` is its own state and is only reachable via the chip
         // popover, since slash-command users explicitly want "the other
         // extreme" rather than the middle tier.
-        let next = if self.thread.read(cx).yolo() {
+        let next = if self.thread.read(cx).approval_mode() == ApprovalMode::Yolo {
             ApprovalMode::OnRequest
         } else {
             ApprovalMode::Yolo
@@ -1121,7 +1121,7 @@ impl Workspace {
     /// `/yolo [prompt]` form). If full access is already on it stays on;
     /// the prompt still runs.
     pub(crate) fn start_yolo_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
-        if !self.thread.read(cx).yolo() {
+        if self.thread.read(cx).approval_mode() != ApprovalMode::Yolo {
             self.apply_approval_mode(ApprovalMode::Yolo, cx);
         }
         self.send_user_turn(prompt, Vec::new(), cx);
