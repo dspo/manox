@@ -17,8 +17,8 @@ use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::thread::ApprovalMode;
 use agent::{
-    PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId,
-    i18n, save_thread,
+    PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId, i18n,
+    save_thread,
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
@@ -2649,6 +2649,7 @@ impl Workspace {
     ) -> AnyElement {
         let plus = self.render_plus_button(cx);
         let project_chip = self.render_project_chip(theme, cx);
+        let worktree_chip = self.render_worktree_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
         let effort = self.render_reasoning_effort_selector(theme, cx);
         let model = self.render_model_selector(theme, cx);
@@ -2674,6 +2675,7 @@ impl Workspace {
                             .gap_1()
                             .child(plus)
                             .child(project_chip)
+                            .when_some(worktree_chip, |el, chip| el.child(chip))
                             .child(access)
                             .child(effort),
                     )
@@ -2697,6 +2699,46 @@ impl Workspace {
     /// The popover is `max_w(360)` to fit the longest bilingual subtitle
     /// ("Unrestricted access to the internet and any file on your computer")
     /// without wrapping.
+    /// Worktree status chip — shown only while the thread is inside a git
+    /// worktree. Displays the branch name; clicking exits the worktree with
+    /// `action=keep` (cwd restored, worktree + branch left on disk for
+    /// re-entry). For removal, the model calls `exit_worktree` with
+    /// `action=remove` directly.
+    fn render_worktree_chip(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let branch = self.thread.read(cx).worktree().map(|w| w.branch.clone())?;
+        let label: SharedString = branch.into();
+        let theme_bg = theme.secondary;
+        let theme_border = theme.border;
+        let theme_fg = theme.foreground;
+        let theme_muted = theme.muted_foreground;
+
+        Some(
+            h_flex()
+                .id("worktree-chip")
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius)
+                .bg(theme_bg)
+                .border_1()
+                .border_color(theme_border)
+                .cursor_pointer()
+                .child(Icon::new(IconName::Github).xsmall().text_color(theme_muted))
+                .child(gpui::div().text_xs().text_color(theme_fg).child(label))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.thread.update(cx, |t, cx| {
+                        let _ = t.exit_worktree(cx);
+                    });
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.thread.read(cx).approval_mode();
         let open = self.access_open;
@@ -3884,7 +3926,7 @@ impl Render for Workspace {
                                             .child(self.render_title_menu_trigger(&theme, cx)),
                                     )
                                     .child(h_flex()),
-                            )
+                            ),
                     )
             })
             .when(editor_open, |this| {

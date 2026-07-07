@@ -256,6 +256,7 @@ workspace-mode-notice = { $mode ->
 }
 workspace-approval-auto-review-note = 自动审核：{$reason}
 workspace-project-choose = 选择项目
+workspace-worktree-exit-tooltip = 当前位于 git worktree — 点击退出（保留 worktree 于磁盘）
 workspace-project-new = 新建项目
 workspace-project-blank = 新建空白项目
 workspace-project-select-folder = 选择文件夹

@@ -269,6 +269,7 @@ workspace-mode-notice = { $mode ->
 }
 workspace-approval-auto-review-note = Auto-review: {$reason}
 workspace-project-choose = Choose project
+workspace-worktree-exit-tooltip = In a git worktree — click to exit (keep the worktree on disk)
 workspace-project-new = New project
 workspace-project-blank = Create blank project
 workspace-project-select-folder = Select folder
