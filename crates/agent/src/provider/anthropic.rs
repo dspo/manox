@@ -201,6 +201,17 @@ pub async fn stream_anthropic(
         }
     }
 
+    // A stream that ends without MessageStop is incomplete — the model may have
+    // been producing text the consumer never sees as terminal. Surface it as an
+    // error event so the caller can persist whatever was received rather than
+    // silently dropping the turn.
+    if !mapper.saw_message_stop {
+        let _ = tx
+            .send(Err(anyhow!(
+                "Anthropic stream ended without a MessageStop event"
+            )))
+            .await;
+    }
     Ok(())
 }
 
@@ -418,6 +429,11 @@ struct AnthropicEventMapper {
     tool_uses_by_index: HashMap<usize, RawToolUse>,
     usage: TokenUsage,
     stop_reason: StopReason,
+    /// Whether a `MessageStop` event has been seen. A stream that ends without
+    /// one terminated abnormally (provider hiccup, non-SSE compatibility
+    /// response) — `stream_anthropic` surfaces this as an error so the caller
+    /// does not mistake a truncated stream for a clean turn end.
+    saw_message_stop: bool,
 }
 
 struct RawToolUse {
@@ -432,6 +448,7 @@ impl AnthropicEventMapper {
             tool_uses_by_index: HashMap::new(),
             usage: TokenUsage::default(),
             stop_reason: StopReason::EndTurn,
+            saw_message_stop: false,
         }
     }
 
@@ -547,6 +564,7 @@ impl AnthropicEventMapper {
                 vec![Ok(LanguageModelCompletionEvent::UsageUpdate(self.usage))]
             }
             AnthropicEvent::MessageStop => {
+                self.saw_message_stop = true;
                 vec![Ok(LanguageModelCompletionEvent::Stop(self.stop_reason))]
             }
             AnthropicEvent::Error { error } => {
@@ -662,5 +680,32 @@ mod tests {
             "应至少收到一个内容事件（Text/Thinking）"
         );
         assert!(stopped, "应收到 Stop 事件");
+    }
+
+    /// `stream_anthropic` flags a stream that ends without `MessageStop` by
+    /// emitting a trailing `Err` event. That contract rests on the mapper's
+    /// `saw_message_stop` flag toggling exactly once on the `MessageStop` arm
+    /// and never otherwise — pin it here so a future refactor can't silently
+    /// break the only signal the turn-end backstop relies on.
+    #[test]
+    fn mapper_saw_message_stop_flag_contract() {
+        let mut mapper = AnthropicEventMapper::new();
+
+        // A text delta must NOT set the flag — the stream is still in flight.
+        let events = mapper.map_event(AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: AnthropicDelta::TextDelta {
+                text: "partial".into(),
+            },
+        });
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Ok(LanguageModelCompletionEvent::Text(t)) if t == "partial"
+        )));
+        assert!(!mapper.saw_message_stop);
+
+        // `MessageStop` is the only event that sets the flag.
+        mapper.map_event(AnthropicEvent::MessageStop);
+        assert!(mapper.saw_message_stop);
     }
 }

@@ -41,6 +41,14 @@ impl EventEmitter<ThreadStoreEvent> for ThreadStore {}
 
 static GLOBAL: OnceLock<Entity<ThreadStore>> = OnceLock::new();
 
+/// Test-only override of the process-global `ThreadStore`. `init_for_test`
+/// stores an in-memory-db-backed entity here so persistence-bearing tests
+/// don't touch the real `~/.config/cx/manox/threads.db`; `drop_for_test`
+/// clears it so gpui's leaked-handle check at teardown doesn't trip on an
+/// entity held alive by a process-global `OnceLock`.
+#[cfg(test)]
+static TEST_OVERRIDE: std::sync::Mutex<Option<Entity<ThreadStore>>> = std::sync::Mutex::new(None);
+
 /// Open the db, load the summary list, and register the global `Entity`. Call at App startup.
 pub fn init(cx: &mut App) {
     let path = default_db_path().expect("解析 threads.db 路径失败");
@@ -64,6 +72,10 @@ pub fn init(cx: &mut App) {
 
 /// Returns the global `ThreadStore` `Entity`. Panics if `init` was not called.
 pub fn global() -> Entity<ThreadStore> {
+    #[cfg(test)]
+    if let Some(entity) = TEST_OVERRIDE.lock().unwrap().clone() {
+        return entity;
+    }
     GLOBAL
         .get()
         .expect("ThreadStore 未初始化，请先调用 agent::init")
@@ -280,4 +292,28 @@ pub fn save_thread(thread: Entity<Thread>, touch: bool, cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// Test-only initializer that primes the process-global `ThreadStore` with a
+/// caller-provided db (typically `:memory:`) so persistence-bearing tests
+/// don't touch the real `~/.config/cx/manox/threads.db`. The override lives in
+/// `TEST_OVERRIDE` (not `GLOBAL`) precisely so `drop_for_test` can release the
+/// entity before teardown — a `OnceLock` can't be cleared, which would trip
+/// gpui's leaked-handle check. Pair every call with `drop_for_test`.
+#[cfg(test)]
+pub fn init_for_test(db: Arc<ThreadsDatabase>, cx: &mut App) {
+    let entity = cx.new(|_cx| ThreadStore {
+        db,
+        summaries: Vec::new(),
+        running: None,
+    });
+    *TEST_OVERRIDE.lock().unwrap() = Some(entity);
+}
+
+/// Release the test-only `ThreadStore` entity so its gpui handle is dropped
+/// before `TestAppContext` tears down. Call this at the end of any test that
+/// used `init_for_test` (a Drop guard is the robust pattern).
+#[cfg(test)]
+pub fn drop_for_test() {
+    *TEST_OVERRIDE.lock().unwrap() = None;
 }

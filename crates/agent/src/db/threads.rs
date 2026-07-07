@@ -2,7 +2,7 @@
 //! zstd-compressed message BLOB.
 
 use anyhow::{Context as _, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::language_model::TokenUsage;
@@ -78,6 +78,13 @@ pub struct ThreadRecord {
     pub interacted_at: i64,
     pub updated_at: i64,
     pub session_started_at: i64,
+    /// Monotonic snapshot revision from `Thread::persist_revision`. `upsert`
+    /// refuses to write a record whose revision is older than the row's
+    /// current revision, so an out-of-order (fire-and-forget) older snapshot
+    /// can never clobber a newer one already committed — the root cause of
+    /// assistant content vanishing after a thread switch when the submit-time
+    /// snapshot raced ahead of the turn-end snapshot.
+    pub revision: u64,
     pub cumulative_token_usage: TokenUsage,
     pub messages: Vec<Message>,
     /// Per-user-message token usage keyed by `Message::id`. Mirrored to the
@@ -116,6 +123,7 @@ pub fn create_table(conn: &Connection) -> Result<()> {
             interacted_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
             session_started_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            revision INTEGER NOT NULL DEFAULT 0,
             cumulative_input_tokens INTEGER NOT NULL DEFAULT 0,
             cumulative_output_tokens INTEGER NOT NULL DEFAULT 0,
             cumulative_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -157,14 +165,33 @@ impl ThreadsDatabase {
         // land together or not at all — a partial write would leave a sidebar
         // entry that fails to load. One transaction wraps all three.
         let tx = conn.transaction().context("begin upsert transaction")?;
+        // Stale-snapshot guard: `save_thread` is fire-and-forget, so an older
+        // snapshot (e.g. taken at submit, before the turn produced any assistant
+        // content) can commit after a newer snapshot (taken at turn end) if the
+        // background executor reorders them. Without this guard the older write
+        // would clobber the newer one — silently deleting assistant messages and
+        // the token_usage mirror. The Mutex serializes upserts, so a
+        // within-transaction SELECT-then-UPDATE is atomic: if this record's
+        // revision is not newer than the row's, abandon the write entirely.
+        let existing_revision: Option<i64> = tx
+            .query_row(
+                "SELECT revision FROM threads WHERE id = ?1",
+                params![rec.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .context("read existing revision")?;
+        if existing_revision.is_some_and(|r| (rec.revision as i64) < r) {
+            return Ok(());
+        }
         tx.execute(
             "INSERT INTO threads (
                 id, summary, title, title_override, model_id, provider_id, cwd, project,
                 yolo, approval_mode, depth, parent_id, archived, pinned, created_at, interacted_at, updated_at,
-                session_started_at, cumulative_input_tokens, cumulative_output_tokens,
+                session_started_at, revision, cumulative_input_tokens, cumulative_output_tokens,
                 cumulative_cache_creation_input_tokens, cumulative_cache_read_input_tokens
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(id) DO UPDATE SET
                 summary = excluded.summary,
                 title = excluded.title,
@@ -182,6 +209,7 @@ impl ThreadsDatabase {
                 interacted_at = excluded.interacted_at,
                 updated_at = excluded.updated_at,
                 session_started_at = excluded.session_started_at,
+                revision = excluded.revision,
                 cumulative_input_tokens = excluded.cumulative_input_tokens,
                 cumulative_output_tokens = excluded.cumulative_output_tokens,
                 cumulative_cache_creation_input_tokens = excluded.cumulative_cache_creation_input_tokens,
@@ -205,6 +233,7 @@ impl ThreadsDatabase {
                 interacted_at,
                 now,
                 rec.session_started_at,
+                rec.revision as i64,
                 rec.cumulative_token_usage.input_tokens as i64,
                 rec.cumulative_token_usage.output_tokens as i64,
                 rec.cumulative_token_usage.cache_creation_input_tokens as i64,
@@ -260,7 +289,7 @@ impl ThreadsDatabase {
         let row = conn.query_row(
             "SELECT id, summary, title, title_override, model_id, provider_id, cwd, project,
                     yolo, approval_mode, depth, parent_id, archived, pinned, created_at, interacted_at, updated_at,
-                    session_started_at, cumulative_input_tokens, cumulative_output_tokens,
+                    session_started_at, revision, cumulative_input_tokens, cumulative_output_tokens,
                     cumulative_cache_creation_input_tokens, cumulative_cache_read_input_tokens
              FROM threads WHERE id = ?1",
             params![id],
@@ -294,11 +323,12 @@ impl ThreadsDatabase {
                     interacted_at: row.get(15)?,
                     updated_at: row.get(16)?,
                     session_started_at: row.get(17)?,
+                    revision: row.get::<_, i64>(18)? as u64,
                     cumulative_token_usage: TokenUsage {
-                        input_tokens: row.get::<_, i64>(18)? as u64,
-                        output_tokens: row.get::<_, i64>(19)? as u64,
-                        cache_creation_input_tokens: row.get::<_, i64>(20)? as u64,
-                        cache_read_input_tokens: row.get::<_, i64>(21)? as u64,
+                        input_tokens: row.get::<_, i64>(19)? as u64,
+                        output_tokens: row.get::<_, i64>(20)? as u64,
+                        cache_creation_input_tokens: row.get::<_, i64>(21)? as u64,
+                        cache_read_input_tokens: row.get::<_, i64>(22)? as u64,
                     },
                     // Filled from the BLOB below.
                     messages: Vec::new(),
@@ -463,6 +493,7 @@ impl ThreadRecord {
             interacted_at: 0,
             updated_at: 0,
             session_started_at: 0,
+            revision: 0,
             cumulative_token_usage: TokenUsage::default(),
             messages,
             request_token_usage: std::collections::HashMap::new(),
