@@ -26,6 +26,4 @@ pub enum IdleState {
     Idle,
     /// The deadline elapsed while the thread was still running.
     StillRunning,
-    /// The Workspace entity was dropped (window closed) while waiting.
-    WindowGone,
 }
