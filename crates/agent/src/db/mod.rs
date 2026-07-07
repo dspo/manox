@@ -212,35 +212,6 @@ mod tests {
     }
 
     #[test]
-    fn rename_and_archive() {
-        let db = open_mem();
-        db.upsert(&sample_record("t1"), true).unwrap();
-        db.rename("t1", Some("我的重命名")).unwrap();
-        db.archive("t1", true).unwrap();
-        let loaded = db.load("t1").unwrap().unwrap();
-        assert_eq!(loaded.title_override.as_deref(), Some("我的重命名"));
-        assert!(loaded.archived);
-    }
-
-    #[test]
-    fn delete_cascades() {
-        let db = open_mem();
-        db.upsert(&sample_record("t1"), true).unwrap();
-        db.record_event(
-            "t1",
-            ThreadEventType::ModelChange,
-            &serde_json::json!({"to":"m2"}),
-        )
-        .unwrap();
-        db.upsert_token_usage("t1", "u1", &TokenUsage::default())
-            .unwrap();
-        db.delete("t1").unwrap();
-        assert!(db.load("t1").unwrap().is_none());
-        assert!(db.query_events("t1", None).unwrap().is_empty());
-        assert!(db.query_token_usage("t1").unwrap().is_empty());
-    }
-
-    #[test]
     fn schema_rebuild_on_version_mismatch() {
         let mut conn = Connection::open_in_memory().unwrap();
         ThreadsDatabase::init_schema(&mut conn).unwrap();

@@ -394,25 +394,6 @@ impl ThreadsDatabase {
         Ok(out)
     }
 
-    /// Delete by id. Cascades to `thread_data`, `thread_events`, `token_usage`.
-    pub fn delete(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute("DELETE FROM threads WHERE id = ?1", params![id])
-            .context("delete thread")?;
-        Ok(())
-    }
-
-    /// Set the user-supplied title override (rename). Clears when `name` is `None`.
-    pub fn rename(&self, id: &str, name: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "UPDATE threads SET title_override = ?1, updated_at = unixepoch() WHERE id = ?2",
-            params![name, id],
-        )
-        .context("rename thread")?;
-        Ok(())
-    }
-
     /// Mark a thread archived (or unarchive).
     pub fn archive(&self, id: &str, archived: bool) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
