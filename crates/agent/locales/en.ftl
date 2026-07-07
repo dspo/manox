@@ -265,8 +265,6 @@ workspace-chip-mode-auto-review = Approve for me
 workspace-chip-mode-yolo = Full access
 workspace-mode-title = How should Codex actions be approved?
 workspace-mode-learn-more = Learn more
-workspace-mode-custom-title = Custom (config.toml)
-workspace-mode-custom-desc = Use permissions defined in config.toml
 workspace-mode-notice = { $mode ->
     [on-request] Switched to request-approval mode.
     [auto-review] Approve-for-me mode: safe tool calls run without prompting, risky ones still ask.

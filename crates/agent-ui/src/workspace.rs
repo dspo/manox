@@ -27,7 +27,8 @@ use gpui::{
     ease_out_quint, list, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
+    TITLE_BAR_HEIGHT, Theme, TitleBar,
     animation::{Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -155,8 +156,6 @@ pub struct Workspace {
     plus_menu_sub: Option<Subscription>,
     /// Access-chip dropdown (Normal / YOLO mode). Mirrors the model selector pattern.
     access_open: bool,
-    access_menu: Option<Entity<PopupMenu>>,
-    access_menu_sub: Option<Subscription>,
     /// Reasoning-effort dropdown (Low / Medium / High / XHigh / Max / Ultracode / Auto).
     effort_open: bool,
     effort_menu: Option<Entity<PopupMenu>>,
@@ -366,8 +365,6 @@ impl Workspace {
             plus_menu: None,
             plus_menu_sub: None,
             access_open: false,
-            access_menu: None,
-            access_menu_sub: None,
             effort_open: false,
             effort_menu: None,
             effort_menu_sub: None,
@@ -949,8 +946,6 @@ impl Workspace {
     /// Close the access-chip dropdown, dropping the menu entity + subscription.
     fn close_access_menu(&mut self) {
         self.access_open = false;
-        self.access_menu = None;
-        self.access_menu_sub = None;
     }
 
     fn close_effort_menu(&mut self) {
@@ -1683,7 +1678,10 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                // Scrim must use the dark foreground, not `background`. A white
+                // veil over a white conversation does not dim, so the page shows
+                // through and the modal reads as transparent.
+                .bg(theme.foreground.opacity(0.6))
                 .child(
                     v_flex()
                         .w(px(420.))
@@ -1818,7 +1816,10 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                // Scrim must use the dark foreground, not `background`. A white
+                // veil over a white conversation does not dim, so the page shows
+                // through and the modal reads as transparent.
+                .bg(theme.foreground.opacity(0.6))
                 .child(
                     v_flex()
                         .w(px(420.))
@@ -1899,7 +1900,10 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                // Scrim must use the dark foreground, not `background`. A white
+                // veil over a white conversation does not dim, so the page shows
+                // through and the modal reads as transparent.
+                .bg(theme.foreground.opacity(0.6))
                 .child(
                     v_flex()
                         .w(px(480.))
@@ -2941,29 +2945,12 @@ impl Workspace {
                 .xsmall()
                 .text_color(theme.muted_foreground),
             )
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 if this.access_open {
                     this.close_access_menu();
-                    cx.notify();
-                    return;
+                } else {
+                    this.access_open = true;
                 }
-                // Snapshot the live mode at click time so the checkmark tracks
-                // the current state, not whatever the chip last rendered.
-                let mode_now = this.thread.read(cx).approval_mode();
-                this.access_open = true;
-                let menu = build_approval_popover(window, workspace.clone(), mode_now, cx);
-                let sub = cx.subscribe(
-                    &menu,
-                    |this: &mut Workspace,
-                     _menu: Entity<PopupMenu>,
-                     _: &DismissEvent,
-                     cx: &mut Context<Workspace>| {
-                        this.close_access_menu();
-                        cx.notify();
-                    },
-                );
-                this.access_menu = Some(menu);
-                this.access_menu_sub = Some(sub);
                 cx.notify();
             }));
 
@@ -2971,14 +2958,19 @@ impl Workspace {
             return trigger.into_any_element();
         }
 
-        // Invariant: `access_open` is set and `access_menu` populated together,
-        // atomically inside one on_click closure, so the menu exists here.
-        debug_assert!(self.access_open);
-        debug_assert!(self.access_menu.is_some());
-        let menu = self
-            .access_menu
-            .clone()
-            .expect("access_menu exists when open");
+        // The popover is a plain `div` with `popover_style` (opaque card
+        // chrome: bg + border + shadow + rounded). We don't route it through
+        // `PopupMenu` because `PopupMenuItem::element` wraps every row in
+        // `h_flex().flex_1().min_h(26)`, which both leaked vertical space
+        // and — in the single-item case — clipped the v_flex content to
+        // 26px. Doing it ourselves gives a content-sized, opaque popover.
+        //
+        // `w(360)` (not `max_w`) — with `min_w_0` on every text div, the
+        // v_flex's intrinsic min-content is tiny (just icon widths + padding),
+        // so `max_w` alone leaves the popover at ~140px and the subtitles
+        // wrap into single-word lines. A fixed 360px width gives the
+        // subtitles room to wrap at word boundaries.
+        let content = build_approval_content(workspace.clone(), mode, cx);
         gpui::div()
             .relative()
             .child(trigger)
@@ -2989,7 +2981,13 @@ impl Workspace {
                     .bottom_full()
                     .left_0()
                     .occlude()
-                    .child(menu),
+                    .w(gpui::px(360.))
+                    .popover_style(cx)
+                    .child(content)
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.close_access_menu();
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }
@@ -3156,7 +3154,8 @@ impl Workspace {
 
     /// Project chip: a clickable control showing the current project basename
     /// (or "Choose project" when unbound). Opens a dropdown listing recent
-    /// projects and a "+ New project" submenu. Mirrors the access-chip pattern.
+    /// projects followed by "Create blank project" / "Select folder" actions.
+    /// Mirrors the access-chip pattern.
     fn render_project_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let project = self.thread.read(cx).project().cloned();
         let open = self.project_chip_open;
@@ -3231,7 +3230,7 @@ impl Workspace {
                 let ws_blank = ws.clone();
                 let ws_folder = ws.clone();
 
-                let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                let menu = PopupMenu::build(window, cx, move |menu, _window, cx| {
                     let mut menu = menu.max_w(gpui::px(320.)).scrollable(true);
                     menu = menu.label(i18n::t("sidebar-section-projects"));
 
@@ -3302,36 +3301,62 @@ impl Workspace {
 
                     menu = menu.separator();
 
-                    // "+ New project" submenu
-                    let ws_blank_inner = ws_blank.clone();
-                    let ws_folder_inner = ws_folder.clone();
-                    menu = menu.submenu(
-                        i18n::t("workspace-project-new").to_string(),
-                        window,
-                        cx,
-                        move |submenu, _window, _cx| {
-                            let ws_b = ws_blank_inner.clone();
-                            let ws_f = ws_folder_inner.clone();
-                            submenu
-                                .item(
-                                    PopupMenuItem::new(i18n::t("workspace-project-blank"))
-                                        .on_click(move |_, _, cx: &mut gpui::App| {
-                                            ws_b.update(cx, |this, cx| {
-                                                this.close_project_chip_menu();
-                                                this.open_blank_project(cx);
-                                            });
-                                        }),
+                    // "New project" actions as top-level items.
+                    // PopupMenu submenus are clipped by overflow_y_scroll, so they
+                    // cannot coexist with scrollable(true) — which the recent-projects
+                    // list above needs. Flatten instead of nesting under a submenu.
+                    menu = menu.label(i18n::t("workspace-project-new"));
+
+                    let themed_blank = theme.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_window, _cx| {
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::Plus)
+                                        .xsmall()
+                                        .text_color(themed_blank.muted_foreground),
                                 )
-                                .item(
-                                    PopupMenuItem::new(i18n::t("workspace-project-select-folder"))
-                                        .on_click(move |_, _, cx: &mut gpui::App| {
-                                            ws_f.update(cx, |this, cx| {
-                                                this.close_project_chip_menu();
-                                                this.choose_project_inner(cx);
-                                            });
-                                        }),
+                                .child(
+                                    gpui::div()
+                                        .text_sm()
+                                        .text_color(themed_blank.foreground)
+                                        .child(i18n::t("workspace-project-blank")),
                                 )
-                        },
+                        })
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            ws_blank.update(cx, |this, cx| {
+                                this.close_project_chip_menu();
+                                this.open_blank_project(cx);
+                            });
+                        }),
+                    );
+
+                    let themed_folder = theme.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_window, _cx| {
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::FolderOpen)
+                                        .xsmall()
+                                        .text_color(themed_folder.muted_foreground),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .text_sm()
+                                        .text_color(themed_folder.foreground)
+                                        .child(i18n::t("workspace-project-select-folder")),
+                                )
+                        })
+                        .on_click(move |_, _, cx: &mut gpui::App| {
+                            ws_folder.update(cx, |this, cx| {
+                                this.close_project_chip_menu();
+                                this.choose_project_inner(cx);
+                            });
+                        }),
                     );
 
                     // Suppress unused-variable warning for the async fetch.
@@ -3511,7 +3536,10 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(theme.background.opacity(0.6))
+                // Scrim must use the dark foreground, not `background`. A white
+                // veil over a white conversation does not dim, so the page shows
+                // through and the modal reads as transparent.
+                .bg(theme.foreground.opacity(0.6))
                 .child(
                     v_flex()
                         .w(px(480.))
@@ -3968,7 +3996,6 @@ impl Render for Workspace {
             .child({
                 let show_env =
                     !editor_open && !first_screen && self.thread.read(cx).has_interacted();
-                let env_panel = show_env.then(|| self.render_environment_panel(&theme, cx));
                 let content_inset = if show_env {
                     px(ENV_CONTENT_INSET)
                 } else {
@@ -3978,32 +4005,17 @@ impl Render for Workspace {
                     .flex_1()
                     .h_full()
                     .relative()
-                    // Title bar (TitleBar handles window dragging via start_window_move)
-                    .child(
-                        TitleBar::new()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(Icon::new(IconName::Bot).small())
-                                    .child(
-                                        gpui::div()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child(title_text),
-                                    )
-                                    .child(self.render_title_menu_trigger(&theme, cx)),
-                            )
-                            .child(h_flex()),
-                    )
                     // Body wrapper: hero / list / footer / overlay share a common
                     // horizontal inset so conversation content doesn't kiss the
-                    // environment panel edge.
+                    // panel edge. `pt` reserves space for the title-bar overlay
+                    // (last child below); the overlay paints after the body so
+                    // the "..." menu isn't covered by the conversation list.
                     .child(
                         v_flex()
                             .flex_1()
                             .min_h_0()
                             .w_full()
-                            .px_4()
+                            .pt(TITLE_BAR_HEIGHT)
                             .pr(content_inset)
                             .pb_2()
                             // Empty first screen shows the centered hero in place of the
@@ -4059,8 +4071,33 @@ impl Render for Workspace {
                             // Approval overlay (if any)
                             .children(overlay),
                     )
-                    // Environment info card (floating, top-right)
-                    .children(env_panel)
+                    // Title-bar overlay: absolute top of the main column,
+                    // painted after the body so the "..." menu isn't covered
+                    // by the conversation list.
+                    .child(
+                        gpui::div()
+                            .absolute()
+                            .top(px(0.))
+                            .left(px(0.))
+                            .right(px(0.))
+                            .h(TITLE_BAR_HEIGHT)
+                            .child(
+                                TitleBar::new()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(Icon::new(IconName::Bot).small())
+                                            .child(
+                                                gpui::div()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .child(title_text),
+                                            )
+                                            .child(self.render_title_menu_trigger(&theme, cx)),
+                                    )
+                                    .child(h_flex()),
+                            )
+                    )
             })
             .when(editor_open, |this| {
                 this.child(editor_divider).child(editor_pane)
@@ -4212,25 +4249,72 @@ fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::H
 /// `theme` is consumed up front: every value used inside the `'static` row
 /// closures is pre-extracted into owned `SharedString`/`Hsla`/`IconName`,
 /// so the closures don't capture a short-lived theme reference.
-fn build_approval_popover(
-    window: &mut gpui::Window,
+/// Build the popover content for the access chip: a header row (question +
+/// "Learn more" link) and three selectable mode rows (icon + title +
+/// subtitle, check on the right for the active one). The whole thing is a
+/// plain `v_flex` so it sizes to its content with no `flex_1` distribution
+/// across items. The chip's dropdown wraps this in a `popover_style` div
+/// for the opaque card chrome — that path doesn't go through `PopupMenu`
+/// at all, sidestepping the per-`ElementItem` `flex_1`/`min_h(26)` wrapper
+/// that was producing both the height-leak bug and the clip-to-26 bug.
+fn build_approval_content(
     workspace: Entity<Workspace>,
     current: ApprovalMode,
     cx: &mut gpui::App,
-) -> Entity<PopupMenu> {
+) -> gpui::Div {
     let fg: gpui::Hsla = cx.theme().foreground;
     let muted: gpui::Hsla = cx.theme().muted_foreground;
     let success: gpui::Hsla = cx.theme().success;
     let info: gpui::Hsla = cx.theme().info;
     let danger: gpui::Hsla = cx.theme().danger;
-    let border: gpui::Hsla = cx.theme().border;
 
-    PopupMenu::build(window, cx, move |menu, _window, _cx| {
-        // Title row: localized question on the left, "Learn more" link on the
-        // right (decorative for now — surfaces a question, doesn't navigate).
-        let title_text = i18n::t("workspace-mode-title");
-        let learn_more = i18n::t("workspace-mode-learn-more");
-        let header = PopupMenuItem::element(move |_window, _cx| {
+    let make_row = |mode: ApprovalMode,
+                    title: SharedString,
+                    subtitle: SharedString,
+                    icon: IconName,
+                    accent: gpui::Hsla,
+                    selected: bool| {
+        let ws = workspace.clone();
+        h_flex()
+            .id(("approval-mode-row", mode as usize))
+            .w_full()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .child(Icon::new(icon).small().text_color(accent))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        gpui::div()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(accent)
+                            .child(title),
+                    )
+                    .child(
+                        gpui::div()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(subtitle),
+                    ),
+            )
+            .when(selected, |el| {
+                el.child(Icon::new(IconName::Check).small().text_color(accent))
+            })
+            .on_click(move |_event, _window, cx| {
+                ws.update(cx, |this, cx| this.apply_approval_mode(mode, cx));
+            })
+    };
+
+    v_flex()
+        .w_full()
+        .gap_2()
+        .p_2()
+        .child(
             h_flex()
                 .w_full()
                 .items_center()
@@ -4238,10 +4322,12 @@ fn build_approval_popover(
                 .gap_2()
                 .child(
                     gpui::div()
+                        .flex_1()
+                        .min_w_0()
                         .text_sm()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(fg)
-                        .child(title_text.clone()),
+                        .child(i18n::t("workspace-mode-title").to_string()),
                 )
                 .child(
                     h_flex()
@@ -4251,158 +4337,35 @@ fn build_approval_popover(
                             gpui::div()
                                 .text_xs()
                                 .text_color(info)
-                                .child(learn_more.clone()),
+                                .child(i18n::t("workspace-mode-learn-more").to_string()),
                         )
                         .child(Icon::new(IconName::ArrowRight).xsmall().text_color(info)),
-                )
-        });
-        let menu = menu.max_w(gpui::px(360.)).item(header);
-
-        // Three selectable rows — one per ApprovalMode. Theme values are
-        // pre-extracted into the `RowSpec` so the helper stays at ≤7 args
-        // (clippy::too_many_arguments) — passing 9 distinct colors / strings
-        // every call was the only thing tripping the lint.
-        let menu = append_mode_row(
-            menu,
-            workspace.clone(),
-            RowSpec {
-                mode: ApprovalMode::OnRequest,
-                title: i18n::t("workspace-mode-on-request-title"),
-                subtitle: i18n::t("workspace-mode-on-request-desc"),
-                icon: IconName::ThumbsUp,
-                accent: success,
-                muted,
-                selected: current == ApprovalMode::OnRequest,
-            },
-        );
-        let menu = append_mode_row(
-            menu,
-            workspace.clone(),
-            RowSpec {
-                mode: ApprovalMode::AutoReview,
-                title: i18n::t("workspace-mode-auto-review-title"),
-                subtitle: i18n::t("workspace-mode-auto-review-desc"),
-                icon: IconName::Bot,
-                accent: info,
-                muted,
-                selected: current == ApprovalMode::AutoReview,
-            },
-        );
-        let menu = append_mode_row(
-            menu,
-            workspace.clone(),
-            RowSpec {
-                mode: ApprovalMode::Yolo,
-                title: i18n::t("workspace-mode-yolo-title"),
-                subtitle: i18n::t("workspace-mode-yolo-desc"),
-                icon: IconName::TriangleAlert,
-                accent: danger,
-                muted,
-                selected: current == ApprovalMode::Yolo,
-            },
-        );
-
-        // Hairline + the 4th non-clickable info row pointing users at
-        // config.toml for fully custom policy. Disabled so hover/click
-        // pass through; styled with `muted` to read as a label, not a
-        // selectable option.
-        let custom_title = i18n::t("workspace-mode-custom-title");
-        let custom_desc = i18n::t("workspace-mode-custom-desc");
-        let custom_row = PopupMenuItem::element(move |_window, _cx| {
-            h_flex()
-                .w_full()
-                .items_center()
-                .gap_2()
-                .child(Icon::new(IconName::Settings).small().text_color(muted))
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(custom_title.clone()),
-                )
-        })
-        .disabled(true);
-        let separator_row = PopupMenuItem::element(move |_window, _cx| {
-            // Hairline rendered as a 1px-tall background div so it sits in the
-            // popup's padding without breaking the menu's row tap targets.
-            v_flex()
-                .w_full()
-                .py_1()
-                .child(gpui::div().w_full().h(px(1.)).bg(border.opacity(0.6)))
-                .child(custom_desc.clone())
-                .into_any_element()
-        })
-        .disabled(true);
-
-        menu.separator().item(separator_row).item(custom_row)
-    })
-}
-
-/// Pre-extracted inputs for [`append_mode_row`]. Bundling these into a struct
-/// keeps the helper below the 7-argument `clippy::too_many_arguments` ceiling
-/// while still letting the call site express the row's full visual contract.
-struct RowSpec {
-    mode: ApprovalMode,
-    title: SharedString,
-    subtitle: SharedString,
-    icon: IconName,
-    accent: gpui::Hsla,
-    muted: gpui::Hsla,
-    selected: bool,
-}
-
-/// Append a single `ApprovalMode` row to the popover. The selected row is
-/// marked with a check icon on the right; the row's title color matches the
-/// mode's accent (success/info/danger) so the visual link between chip and
-/// selected row is immediate.
-fn append_mode_row(menu: PopupMenu, workspace: Entity<Workspace>, spec: RowSpec) -> PopupMenu {
-    let RowSpec {
-        mode,
-        title,
-        subtitle,
-        icon,
-        accent,
-        muted,
-        selected,
-    } = spec;
-    let title_for_render = title.clone();
-    let subtitle_for_render = subtitle.clone();
-    let row = PopupMenuItem::element(move |_window, _cx| {
-        // `icon` is `Clone` but not `Copy`, so re-clone per render rather
-        // than move it out of the captured environment.
-        h_flex()
-            .w_full()
-            .items_center()
-            .gap_2()
-            .child(Icon::new(icon.clone()).small().text_color(accent))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .gap_0p5()
-                    .child(
-                        gpui::div()
-                            .text_sm()
-                            .text_color(accent)
-                            .child(title_for_render.clone()),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(subtitle_for_render.clone()),
-                    ),
-            )
-            .when(selected, |el| {
-                el.child(Icon::new(IconName::Check).small().text_color(accent))
-            })
-    })
-    .on_click(move |_event, _window, cx| {
-        workspace.update(cx, |this, cx| {
-            this.apply_approval_mode(mode, cx);
-        });
-    });
-    menu.item(row)
+                ),
+        )
+        .child(make_row(
+            ApprovalMode::OnRequest,
+            i18n::t("workspace-mode-on-request-title"),
+            i18n::t("workspace-mode-on-request-desc"),
+            IconName::ThumbsUp,
+            success,
+            current == ApprovalMode::OnRequest,
+        ))
+        .child(make_row(
+            ApprovalMode::AutoReview,
+            i18n::t("workspace-mode-auto-review-title"),
+            i18n::t("workspace-mode-auto-review-desc"),
+            IconName::Bot,
+            info,
+            current == ApprovalMode::AutoReview,
+        ))
+        .child(make_row(
+            ApprovalMode::Yolo,
+            i18n::t("workspace-mode-yolo-title"),
+            i18n::t("workspace-mode-yolo-desc"),
+            IconName::TriangleAlert,
+            danger,
+            current == ApprovalMode::Yolo,
+        ))
 }
 
 impl Workspace {
