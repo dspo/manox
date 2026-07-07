@@ -4275,7 +4275,6 @@ fn build_approval_popover(
     let success: gpui::Hsla = cx.theme().success;
     let info: gpui::Hsla = cx.theme().info;
     let danger: gpui::Hsla = cx.theme().danger;
-    let border: gpui::Hsla = cx.theme().border;
 
     PopupMenu::build(window, cx, move |menu, _window, _cx| {
         // Title row: localized question on the left, "Learn more" link on the
@@ -4289,7 +4288,11 @@ fn build_approval_popover(
                 .justify_between()
                 .gap_2()
                 .child(
+                    // `flex_1` + `min_w_0` lets the localized title wrap
+                    // instead of pushing the "Learn more" link off-row.
                     gpui::div()
+                        .flex_1()
+                        .min_w_0()
                         .text_sm()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(fg)
@@ -4354,40 +4357,10 @@ fn build_approval_popover(
             },
         );
 
-        // Hairline + the 4th non-clickable info row pointing users at
-        // config.toml for fully custom policy. Disabled so hover/click
-        // pass through; styled with `muted` to read as a label, not a
-        // selectable option.
-        let custom_title = i18n::t("workspace-mode-custom-title");
-        let custom_desc = i18n::t("workspace-mode-custom-desc");
-        let custom_row = PopupMenuItem::element(move |_window, _cx| {
-            h_flex()
-                .w_full()
-                .items_center()
-                .gap_2()
-                .child(Icon::new(IconName::Settings).small().text_color(muted))
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(custom_title.clone()),
-                )
-        })
-        .disabled(true);
-        let separator_row = PopupMenuItem::element(move |_window, _cx| {
-            // Hairline rendered as a 1px-tall background div so it sits in the
-            // popup's padding without breaking the menu's row tap targets.
-            v_flex()
-                .w_full()
-                .py_1()
-                .child(gpui::div().w_full().h(px(1.)).bg(border.opacity(0.6)))
-                .child(custom_desc.clone())
-                .into_any_element()
-        })
-        .disabled(true);
-
-        menu.separator().item(separator_row).item(custom_row)
+        // Three selectable rows. We don't read permissions from `config.toml`
+        // yet, so the popover stops here: no "Use permissions defined in
+        // config.toml" / "Custom (config.toml)" footer.
+        menu
     })
 }
 
@@ -4429,17 +4402,23 @@ fn append_mode_row(menu: PopupMenu, workspace: Entity<Workspace>, spec: RowSpec)
             .gap_2()
             .child(Icon::new(icon.clone()).small().text_color(accent))
             .child(
+                // `min_w_0` lets the v_flex shrink below the natural
+                // unwrapped subtitle width so the text wraps inside the
+                // 360px popover instead of overflowing past it.
                 v_flex()
                     .flex_1()
+                    .min_w_0()
                     .gap_0p5()
                     .child(
                         gpui::div()
+                            .min_w_0()
                             .text_sm()
                             .text_color(accent)
                             .child(title_for_render.clone()),
                     )
                     .child(
                         gpui::div()
+                            .min_w_0()
                             .text_xs()
                             .text_color(muted)
                             .child(subtitle_for_render.clone()),

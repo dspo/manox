@@ -252,8 +252,6 @@ workspace-chip-mode-auto-review = 替我审批
 workspace-chip-mode-yolo = 完全访问
 workspace-mode-title = 如何批准 Codex 操作？
 workspace-mode-learn-more = 了解更多
-workspace-mode-custom-title = 自定义 (config.toml)
-workspace-mode-custom-desc = 使用 config.toml 中定义的权限
 workspace-mode-notice = { $mode ->
     [on-request] 已切换到请求审批模式。
     [auto-review] 替我审批模式：安全工具调用免提示，风险操作仍会询问。
