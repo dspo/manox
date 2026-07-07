@@ -22,13 +22,12 @@ use agent::{
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
-    DragMoveEvent, Entity, FollowMode, ListAlignment, ListOffset, ListSizingBehavior, ListState,
-    MouseButton, MouseUpEvent, Pixels, Render, SharedString, Subscription, Window, deferred,
-    ease_out_quint, list, prelude::*, px,
+    DragMoveEvent, Entity, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle, SharedString,
+    Subscription, Window, deferred, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
-    TITLE_BAR_HEIGHT, Theme, TitleBar,
+    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
+    StyledExt as _, TITLE_BAR_HEIGHT, Theme, TitleBar,
     animation::{Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -179,11 +178,17 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
-    /// Virtualized, follow-the-tail scroll state for the message list. Replaces
-    /// the old `ScrollHandle` + `stick_to_bottom` hand-rolled auto-follow:
-    /// `FollowMode::Tail` keeps the viewport pinned to the latest item while the
-    /// user is at the bottom and disengages the moment they scroll up.
-    list_state: ListState,
+    /// Scroll state for the flat (non-virtualized) message column. Each
+    /// `MessageItem` lays out at its true height, so there is no per-item
+    /// height cache to fall out of sync with async markdown parsing (the old
+    /// virtualized `list` + `FollowMode::Tail` did, which is what produced the
+    /// message-overlap bug). `stick_to_bottom` hand-rolls tail-follow: while
+    /// true, every prepaint re-pins the viewport to the current bottom, so a
+    /// reply that grows taller a frame later (markdown parse landing) stays
+    /// pinned. A wheel scroll away from the bottom clears it; scrolling back
+    /// within a small threshold re-arms it.
+    scroll_handle: ScrollHandle,
+    stick_to_bottom: bool,
     /// Sub-agent task ids whose cards are expanded to show the child
     /// conversation. Toggled by clicking the card header; shared across all
     /// nesting levels so nested agent tasks expand in place.
@@ -329,8 +334,6 @@ impl Workspace {
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
 
-        let list_state = ListState::new(0, ListAlignment::Top, px(2048.));
-        list_state.set_follow_mode(FollowMode::Tail);
 
         let mut ws = Self {
             cwd,
@@ -376,7 +379,8 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
-            list_state,
+            scroll_handle: ScrollHandle::new(),
+            stick_to_bottom: true,
             expanded_tasks: HashSet::new(),
             view_mode: ViewMode::default(),
             exiting_settings: false,
