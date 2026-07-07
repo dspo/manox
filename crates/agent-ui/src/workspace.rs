@@ -9,11 +9,13 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::provider::registry;
+use agent::thread::ApprovalMode;
 use agent::{
     PermissionDecision, PlanApprovalResponse, Thread, ThreadEvent, ThreadId, i18n, save_thread,
 };
@@ -50,10 +52,16 @@ use terminal::Terminal;
 use terminal_ui::TerminalView;
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
+///
+/// `reason` is populated by the `AutoReview` approval agent when it returns
+/// `Ask` for a tool call. It is rendered as a one-line muted note under the
+/// tool title in the auth overlay so the user can see why the reviewer
+/// escalated the call rather than auto-approving it.
 struct PendingAuth {
     id: String,
     tool_name: String,
     summary: String,
+    reason: Option<String>,
 }
 
 /// A pending plan approval prompted by `ThreadEvent::PlanProposed`. The plan
@@ -143,9 +151,19 @@ pub struct Workspace {
     access_open: bool,
     access_menu: Option<Entity<PopupMenu>>,
     access_menu_sub: Option<Subscription>,
+    /// Project-chip dropdown (recent projects + new project submenu).
+    project_chip_open: bool,
+    project_chip_menu: Option<Entity<PopupMenu>>,
+    project_chip_menu_sub: Option<Subscription>,
     slash_open: bool,
     slash_menu: Option<Entity<PopupMenu>>,
     slash_menu_sub: Option<Subscription>,
+    /// Title bar "..." dropdown (Codex-style conversation menu). Mirrors the
+    /// model selector pattern: a button toggles `title_menu_open`; the
+    /// `PopupMenu` entity and its dismiss subscription are created on open.
+    title_menu_open: bool,
+    title_menu: Option<Entity<PopupMenu>>,
+    title_menu_sub: Option<Subscription>,
     /// A pending plan approval (model called `exit_plan_mode`). The overlay
     /// takes precedence after the auth overlay.
     pending_plan: Option<PendingPlan>,
@@ -155,6 +173,10 @@ pub struct Workspace {
     /// Guards against the user submitting a message before the picker resolves
     /// (which would make `set_project` a silent no-op once `messages` is non-empty).
     project_picker_pending: bool,
+    /// Parent directory selected for "Create blank project"; waiting for name input.
+    blank_project_parent: Option<PathBuf>,
+    /// Input state for the blank project folder name overlay.
+    blank_project_name_input: Option<Entity<InputState>>,
     thread_sub: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
@@ -304,12 +326,20 @@ impl Workspace {
             access_open: false,
             access_menu: None,
             access_menu_sub: None,
+            project_chip_open: false,
+            project_chip_menu: None,
+            project_chip_menu_sub: None,
             slash_open: false,
             slash_menu: None,
             slash_menu_sub: None,
+            title_menu_open: false,
+            title_menu: None,
+            title_menu_sub: None,
             pending_plan: None,
             pending_attachments: Vec::new(),
             project_picker_pending: false,
+            blank_project_parent: None,
+            blank_project_name_input: None,
             thread_sub: None,
             sidebar_sub: None,
             input_sub: None,
@@ -347,10 +377,20 @@ impl Workspace {
                         this.ask_step = 0;
                         this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
                     }
+                    // The `AutoReview` approval agent attaches a one-line reason
+                    // to every tool it escalates back to the overlay; pull it
+                    // out here so the user can see *why* the reviewer did not
+                    // auto-approve. We snapshot-and-clear on the Thread side
+                    // because each reason is single-use — a stale reason on
+                    // the next tool call would mislead the user.
+                    let reason = this
+                        .thread
+                        .update(cx, |t, _cx| t.take_approval_ask_reason(id.as_str()));
                     this.pending_auths.push(PendingAuth {
                         id: id.clone(),
                         tool_name: tool_name.clone(),
                         summary: summary.clone(),
+                        reason,
                     });
                     cx.notify();
                 }
@@ -378,7 +418,7 @@ impl Workspace {
                     }
                     cx.notify();
                 }
-                ThreadEvent::YoloToggled { .. } => {
+                ThreadEvent::ApprovalModeChanged { .. } => {
                     // Refresh the access chip + YOLO badge; no conversation item.
                     cx.notify();
                 }
@@ -391,6 +431,14 @@ impl Workspace {
                         s.record_model_change(&thread_id, from.as_deref(), to, cx);
                     });
                     cx.notify();
+                }
+                ThreadEvent::TurnStarted => {
+                    // Light up the sidebar running indicator immediately —
+                    // before the first streaming delta arrives (model warm-up,
+                    // network latency). Terminal `Stop`/`Error` below clear it.
+                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.set_running(Some(thread_id), cx));
                 }
                 ThreadEvent::Stop(reason) => {
                     // A terminal state ends any pending plan approval (the
@@ -412,14 +460,28 @@ impl Workspace {
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
                         save_thread(this.thread.clone(), true, cx);
+                        // Terminal stop → this thread is no longer running.
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| s.set_running(None, cx));
                     }
                     cx.notify();
                 }
                 ThreadEvent::PrefixStability { .. } => {
-                    // Refresh the `cache: NN%` chip in the composer status row.
+                    // Per-turn cache stability signal. The composer chip that
+                    // used to render this was removed in #62; the event stays
+                    // emitted for any future telemetry/debug subscriber.
                     cx.notify();
                 }
                 _ => {
+                    // `Error` is a terminal signal symmetric to a terminal
+                    // `Stop`: the turn aborted, so this thread is no longer
+                    // running. Pulled out of the catch-all rather than given a
+                    // dedicated arm because the conversation still needs the
+                    // generic `apply` below to render the error item.
+                    if let ThreadEvent::Error(_) = ev {
+                        let store = agent::thread_store_global();
+                        store.update(cx, |s, cx| s.set_running(None, cx));
+                    }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
@@ -480,6 +542,10 @@ impl Workspace {
             SidebarEvent::ArchiveThread(id, archived) => {
                 let store = agent::thread_store_global();
                 store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
+            }
+            SidebarEvent::PinThread(id, pinned) => {
+                let store = agent::thread_store_global();
+                store.update(cx, |s, cx| s.pin_thread(id, *pinned, cx));
             }
             SidebarEvent::FocusConversation => this.focus_conversation(cx),
             SidebarEvent::FocusTerminal => this.focus_terminal(cx),
@@ -657,11 +723,25 @@ impl Workspace {
         self.slash_menu_sub = None;
     }
 
+    /// Close the title bar "..." dropdown, dropping the menu entity + subscription.
+    fn close_title_menu(&mut self) {
+        self.title_menu_open = false;
+        self.title_menu = None;
+        self.title_menu_sub = None;
+    }
+
     /// Close the access-chip dropdown, dropping the menu entity + subscription.
     fn close_access_menu(&mut self) {
         self.access_open = false;
         self.access_menu = None;
         self.access_menu_sub = None;
+    }
+
+    /// Close the project-chip dropdown.
+    fn close_project_chip_menu(&mut self) {
+        self.project_chip_open = false;
+        self.project_chip_menu = None;
+        self.project_chip_menu_sub = None;
     }
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
@@ -670,6 +750,12 @@ impl Workspace {
         // (plan approval, tool auth) are resolved immediately rather than
         // stranding until the entity is eventually dropped.
         self.thread.update(cx, |t, cx| t.cancel(cx));
+        // Backstop: the old thread's terminal `Stop` from `cancel` may land on
+        // the stale subscription (dropped below) or arrive after the new thread
+        // is attached. Clear running state synchronously so the sidebar
+        // indicator never lingers on a thread we just left.
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.set_running(None, cx));
         save_thread(self.thread.clone(), false, cx);
 
         self.thread = new_thread;
@@ -961,6 +1047,44 @@ impl Workspace {
             .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
     }
 
+    /// Pin / unpin the active thread. The DB write + sidebar refresh runs
+    /// through `ThreadStore::pin_thread`; the in-memory `Thread` mirror is
+    /// flipped first so the menu label updates immediately on the next
+    /// re-open. Notifies the workspace so the menu trigger re-renders.
+    fn title_menu_toggle_pin(&mut self, cx: &mut Context<Self>) {
+        let id = self.thread.read(cx).id.0.clone();
+        let next = !self.thread.read(cx).is_pinned();
+        self.thread.update(cx, |t, cx| t.set_pinned(next, cx));
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.pin_thread(&id, next, cx));
+        let msg = if next {
+            i18n::t("titlebar-pinned-notice")
+        } else {
+            i18n::t("titlebar-unpinned-notice")
+        };
+        self.add_info_message(msg.to_string(), cx);
+    }
+
+    /// Archive the active thread. Mirrors the sidebar archive action:
+    /// mark the thread archived, drop its row from the list (default
+    /// `include_archived=false`), and notice the user. Switching to a new
+    /// thread is left to the sidebar — the menu just persists the toggle.
+    fn title_menu_archive(&mut self, cx: &mut Context<Self>) {
+        let id = self.thread.read(cx).id.0.clone();
+        self.thread.update(cx, |t, cx| t.set_archived(true, cx));
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
+        self.add_info_message(i18n::t("titlebar-archive-notice").to_string(), cx);
+    }
+
+    /// Copy a string to the system clipboard, then push a localized notice
+    /// so the user sees what landed in the clipboard. Single funnel for all
+    /// `titlebar-copy-*` actions so the notice phrasing stays consistent.
+    fn title_menu_copy(&mut self, label_key: &str, value: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(value));
+        self.add_info_message(i18n::t(label_key).to_string(), cx);
+    }
+
     /// Push a system-styled notice into the conversation (no thread message,
     /// no model turn). Used by slash commands to report outcomes — e.g. the
     /// `/yolo` toggle acknowledging the mode change. Renders as a neutral-toned
@@ -981,21 +1105,24 @@ impl Workspace {
     /// sees the state change in the conversation. Called by the `/yolo` slash
     /// command and the access-chip dropdown.
     pub(crate) fn toggle_yolo(&mut self, cx: &mut Context<Self>) {
-        let on = !self.thread.read(cx).yolo();
-        self.thread.update(cx, |t, cx| t.set_yolo(on, cx));
-        let msg = if on {
-            i18n::t("workspace-yolo-on-notice").to_string()
+        // `/yolo` (no args) flips between full access and request-approval —
+        // `AutoReview` is its own state and is only reachable via the chip
+        // popover, since slash-command users explicitly want "the other
+        // extreme" rather than the middle tier.
+        let next = if self.thread.read(cx).yolo() {
+            ApprovalMode::OnRequest
         } else {
-            i18n::t("workspace-yolo-off-notice").to_string()
+            ApprovalMode::Yolo
         };
-        self.add_info_message(msg, cx);
+        self.apply_approval_mode(next, cx);
     }
 
-    /// Enable YOLO and immediately send `prompt` as a user turn (the `/yolo
-    /// [prompt]` form). If YOLO is already on it stays on; the prompt still runs.
+    /// Enable full access and immediately send `prompt` as a user turn (the
+    /// `/yolo [prompt]` form). If full access is already on it stays on;
+    /// the prompt still runs.
     pub(crate) fn start_yolo_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
         if !self.thread.read(cx).yolo() {
-            self.thread.update(cx, |t, cx| t.set_yolo(true, cx));
+            self.apply_approval_mode(ApprovalMode::Yolo, cx);
         }
         self.send_user_turn(prompt, Vec::new(), cx);
     }
@@ -1259,6 +1386,7 @@ impl Workspace {
         let auth = self.pending_auths.last()?;
         let summary = auth.summary.clone();
         let tool_name = auth.tool_name.clone();
+        let reason = auth.reason.clone();
         // When several auths are queued behind the visible one, signal that
         // dismissing this card will surface the next.
         let queued = self.pending_auths.len().saturating_sub(1);
@@ -1303,6 +1431,19 @@ impl Workspace {
                                     &[("name", tool_name.as_str())],
                                 )),
                         )
+                        // Auto-review reason: a one-line muted note saying why the
+                        // reviewer escalated the call. Sourced from the thread's
+                        // `approval_ask_reasons` map; absent for tools that came
+                        // through `OnRequest` or `Yolo` paths.
+                        .children(reason.as_deref().map(|reason| {
+                            gpui::div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(i18n::t_str(
+                                    "workspace-approval-auto-review-note",
+                                    &[("reason", reason)],
+                                ))
+                        }))
                         .children(if queued > 0 {
                             Some(
                                 gpui::div()
@@ -1936,6 +2077,169 @@ impl Workspace {
         menu
     }
 
+    /// Title bar "..." trigger + dropdown (Codex-style conversation menu).
+    ///
+    /// Closed: a small ghost icon button (horizontal ellipsis) next to the
+    /// session title. Open: an absolute-positioned PopupMenu anchored under
+    /// the button. Mirrors the model selector pattern: the menu entity and
+    /// its dismiss subscription are created lazily on open, dropped on close.
+    fn render_title_menu_trigger(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        use crate::views::title_menu::{TitleMenuCallbacks, build_title_menu};
+
+        let open = self.title_menu_open;
+        let is_pinned = self.thread.read(cx).is_pinned();
+        let is_archived = self.thread.read(cx).archived();
+
+        let trigger = Button::new("titlebar-trigger")
+            .ghost()
+            .small()
+            .icon(IconName::Ellipsis)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.title_menu_open {
+                    this.close_title_menu();
+                    cx.notify();
+                    return;
+                }
+                this.title_menu_open = true;
+                let workspace = cx.entity();
+                let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                    let cb = TitleMenuCallbacks {
+                        on_pin: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
+                            })
+                        },
+                        on_rename: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let id = this.thread.read(cx).id.0.clone();
+                                    this.open_rename(id, cx);
+                                    this.add_info_message(
+                                        i18n::t("titlebar-rename-notice").to_string(),
+                                        cx,
+                                    );
+                                });
+                            })
+                        },
+                        on_archive: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| this.title_menu_archive(cx));
+                            })
+                        },
+                        on_copy_id: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let id = this.thread.read(cx).id.0.clone();
+                                    this.title_menu_copy("titlebar-copied-id", id, cx);
+                                });
+                            })
+                        },
+                        on_copy_markdown: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let md = this.thread.read(cx).to_markdown();
+                                    this.title_menu_copy("titlebar-copied-markdown", md, cx);
+                                });
+                            })
+                        },
+                        on_copy_cwd: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let cwd = this.thread.read(cx).cwd().display().to_string();
+                                    this.title_menu_copy("titlebar-copied-cwd", cwd, cx);
+                                });
+                            })
+                        },
+                        on_copy_deeplink: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let id = this.thread.read(cx).id.0.clone();
+                                    let link = format!("manox://thread/{id}");
+                                    this.title_menu_copy("titlebar-copied-deeplink", link, cx);
+                                });
+                            })
+                        },
+                        on_schedule: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    this.add_info_message(
+                                        i18n::t("titlebar-not-implemented").to_string(),
+                                        cx,
+                                    );
+                                });
+                            })
+                        },
+                        on_new_window: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    this.add_info_message(
+                                        i18n::t("titlebar-not-implemented").to_string(),
+                                        cx,
+                                    );
+                                });
+                            })
+                        },
+                        is_pinned,
+                        is_archived,
+                    };
+                    build_title_menu(menu, window, cx, cb)
+                });
+                let sub = cx.subscribe(
+                    &menu,
+                    |this: &mut Workspace,
+                     _menu: Entity<PopupMenu>,
+                     _: &DismissEvent,
+                     cx: &mut Context<Workspace>| {
+                        this.close_title_menu();
+                        cx.notify();
+                    },
+                );
+                this.title_menu = Some(menu);
+                this.title_menu_sub = Some(sub);
+                cx.notify();
+            }));
+
+        // Color the trigger when open so the affordance matches the dropdown's
+        // presence (a clicked "..." otherwise looks identical to a hovered one).
+        let trigger = if open {
+            trigger.text_color(theme.accent)
+        } else {
+            trigger
+        };
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        let menu = self
+            .title_menu
+            .clone()
+            .expect("title_menu exists when open");
+
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::div()
+                    .id("titlebar-dropdown")
+                    .absolute()
+                    .top_full()
+                    .left_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
     /// Composer card: an auto-growing text area above a single toolbar row.
     /// The card's fill matches the page background (`theme.background`) so only
     /// the 1px border outlines it — the user-perceived "shading" disappears.
@@ -1948,10 +2252,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let plus = self.render_plus_button(cx);
-        let cwd = self.render_cwd_chip(theme, cx);
-        let cache = self.render_cache_chip(cx);
+        let project_chip = self.render_project_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
-        let yolo = self.thread.read(cx).yolo();
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(running, cx);
 
@@ -1979,62 +2281,36 @@ impl Workspace {
                             .items_center()
                             .gap_1()
                             .child(plus)
-                            .child(cwd)
-                            .child(cache)
+                            .child(project_chip)
                             .child(access),
                     )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .children(yolo.then(|| {
-                                h_flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(gpui::hsla(0.83, 0.8, 0.55, 0.15))
-                                    .child(
-                                        Icon::new(IconName::TriangleAlert)
-                                            .xsmall()
-                                            .text_color(gpui::hsla(0.83, 0.8, 0.7, 1.0)),
-                                    )
-                                    .child(
-                                        gpui::div()
-                                            .text_xs()
-                                            .text_color(gpui::hsla(0.83, 0.8, 0.85, 1.0))
-                                            .child("YOLO"),
-                                    )
-                                    .into_any_element()
-                            }))
-                            .child(model)
-                            .child(send),
-                    ),
+                    .child(h_flex().items_center().gap_1().child(model).child(send)),
             )
             .into_any_element()
     }
 
-    /// Access chip: a dropdown to switch between normal mode (approvals +
-    /// sandbox) and YOLO mode (bypass approvals, bash unsandboxed). Mirrors the
-    /// model selector pattern. The dot color reflects the active mode (green for
-    /// normal, magenta for YOLO); the active row is checked in the dropdown.
-    /// Plan mode is a separate concern routed through the `+` button, not a
-    /// permission toggle.
+    /// Access chip + 3-tier approval popover.
+    ///
+    /// The chip is a mode-aware pill rendered next to the composer send button.
+    /// Each `ApprovalMode` gets its own icon + accent color (green thumbs-up for
+    /// `OnRequest`, blue bot for `AutoReview`, red triangle for `Yolo`) so the
+    /// current permission posture is legible at a glance — a 1-line summary of
+    /// what the model is allowed to do without prompting.
+    ///
+    /// Clicking the chip opens a `PopupMenu` mirroring the Codex-style header:
+    /// a question row with a "Learn more" link, three selectable rows (icon +
+    /// title + subtitle, check on the right), a hairline, and a 4th non-clickable
+    /// row pointing at `config.toml` for users who want a fully custom policy.
+    /// The popover is `max_w(360)` to fit the longest bilingual subtitle
+    /// ("Unrestricted access to the internet and any file on your computer")
+    /// without wrapping.
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let yolo = self.thread.read(cx).yolo();
+        let mode = self.thread.read(cx).approval_mode();
         let open = self.access_open;
-        let dot_color = if yolo {
-            gpui::hsla(0.83, 0.8, 0.55, 1.0)
-        } else {
-            theme.success
-        };
-        // "YOLO" is a proper noun, kept literal; the normal-mode label is localized.
-        let label: SharedString = if yolo {
-            "YOLO".into()
-        } else {
-            i18n::t("workspace-mode-normal")
-        };
+        // Pre-extract chip visuals so the click handler closure doesn't
+        // capture `theme` (which only lives for the method body) — closures
+        // passed to `cx.listener` must be `'static`.
+        let (chip_label, chip_color, chip_icon) = mode_chip_visual(mode, theme);
         let workspace = cx.entity();
 
         let trigger = h_flex()
@@ -2043,17 +2319,19 @@ impl Workspace {
             .gap_1()
             .px_2()
             .py_1()
+            .min_w(px(96.))
             .rounded(theme.radius)
             .bg(theme.secondary)
             .border_1()
             .border_color(theme.border)
             .cursor_pointer()
-            .child(gpui::div().size(px(6.)).rounded_full().bg(dot_color))
+            .child(Icon::new(chip_icon).xsmall().text_color(chip_color))
             .child(
                 gpui::div()
+                    .flex_1()
                     .text_xs()
-                    .text_color(theme.foreground)
-                    .child(label),
+                    .text_color(chip_color)
+                    .child(chip_label),
             )
             .child(
                 Icon::new(if open {
@@ -2070,46 +2348,11 @@ impl Workspace {
                     cx.notify();
                     return;
                 }
-                // Read yolo at click time so the checked row tracks the live
-                // state, not the snapshot from when the chip was last rendered.
-                let yolo_now = this.thread.read(cx).yolo();
+                // Snapshot the live mode at click time so the checkmark tracks
+                // the current state, not whatever the chip last rendered.
+                let mode_now = this.thread.read(cx).approval_mode();
                 this.access_open = true;
-                let ws_normal = workspace.clone();
-                let ws_yolo = workspace.clone();
-                let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-                    menu.max_w(gpui::px(180.))
-                        .label(i18n::t("workspace-mode-section"))
-                        .item(
-                            PopupMenuItem::new(i18n::t("workspace-mode-normal"))
-                                .checked(!yolo_now)
-                                .on_click(move |_, _window, cx| {
-                                    ws_normal.update(cx, |this, cx| {
-                                        this.thread.update(cx, |t, cx| t.set_yolo(false, cx));
-                                        this.add_info_message(
-                                            i18n::t("workspace-yolo-off-notice").to_string(),
-                                            cx,
-                                        );
-                                        this.close_access_menu();
-                                        cx.notify();
-                                    });
-                                }),
-                        )
-                        .item(
-                            PopupMenuItem::new(i18n::t("workspace-mode-yolo"))
-                                .checked(yolo_now)
-                                .on_click(move |_, _window, cx| {
-                                    ws_yolo.update(cx, |this, cx| {
-                                        this.thread.update(cx, |t, cx| t.set_yolo(true, cx));
-                                        this.add_info_message(
-                                            i18n::t("workspace-yolo-on-notice").to_string(),
-                                            cx,
-                                        );
-                                        this.close_access_menu();
-                                        cx.notify();
-                                    });
-                                }),
-                        )
-                });
+                let menu = build_approval_popover(window, workspace.clone(), mode_now, cx);
                 let sub = cx.subscribe(
                     &menu,
                     |this: &mut Workspace,
@@ -2189,26 +2432,10 @@ impl Workspace {
 
     fn open_plus_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let theme = cx.theme().clone();
-        // "Choose project" only appears on the empty first screen — set_project
-        // silently no-ops once messages are present, so the menu item must be
-        // hidden rather than offering a dead-end action.
-        let can_choose_project = self.thread.read(cx).messages().is_empty();
         let ws = cx.entity();
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
             let ws_files = ws.clone();
-            let ws_project = ws.clone();
             let ws_plan = ws.clone();
-            let on_project = if can_choose_project {
-                Some(move |window: &mut gpui::Window, cx: &mut gpui::App| {
-                    ws_project.update(cx, |this, cx| {
-                        this.close_plus_menu();
-                        this.choose_project(window, cx);
-                        cx.notify();
-                    });
-                })
-            } else {
-                None
-            };
             build_plus_menu(
                 menu,
                 &theme,
@@ -2219,7 +2446,6 @@ impl Workspace {
                         cx.notify();
                     });
                 },
-                on_project,
                 move |_window, cx| {
                     ws_plan.update(cx, |this, cx| {
                         this.close_plus_menu();
@@ -2263,36 +2489,6 @@ impl Workspace {
                 })
                 .ok();
             }
-        })
-        .detach();
-    }
-
-    /// Open the native directory picker and bind the chosen folder to the thread
-    /// as its project. Tools then resolve paths against it. Offered only on the
-    /// empty first screen; `set_project` no-ops once the conversation has started.
-    fn choose_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.project_picker_pending {
-            return;
-        }
-        self.project_picker_pending = true;
-        let dir = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: None,
-        });
-        cx.spawn(async move |this, cx| {
-            let result = dir.await;
-            this.update(cx, |this, cx| {
-                this.project_picker_pending = false;
-                if let Ok(Ok(Some(paths))) = result
-                    && let Some(path) = paths.into_iter().next()
-                {
-                    this.thread.update(cx, |t, cx| t.set_project(path, cx));
-                }
-                cx.notify();
-            })
-            .ok();
         })
         .detach();
     }
@@ -2359,58 +2555,426 @@ impl Workspace {
         )
     }
 
-    /// Chip showing the bound project directory basename. Empty (invisible) when
-    /// no project has been chosen; displays the basename once one is bound. The
-    /// project is picked via the `+` menu's "Choose project" item and fixed thereafter.
-    fn render_cwd_chip(&self, theme: &Theme, cx: &Context<Self>) -> AnyElement {
+    /// Project chip: a clickable control showing the current project basename
+    /// (or "Choose project" when unbound). Opens a dropdown listing recent
+    /// projects and a "+ New project" submenu. Mirrors the access-chip pattern.
+    fn render_project_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let project = self.thread.read(cx).project().cloned();
-        match project {
+        let open = self.project_chip_open;
+        let workspace = cx.entity();
+
+        let (icon, label): (Option<IconName>, SharedString) = match &project {
             Some(dir) => {
                 let name = dir
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("project")
                     .to_string();
-                gpui::div()
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(name)
-                    .into_any_element()
+                (Some(IconName::FolderOpen), name.into())
             }
-            None => gpui::div().into_any_element(),
-        }
-    }
+            None => (
+                Some(IconName::FolderOpen),
+                i18n::t("workspace-project-choose"),
+            ),
+        };
 
-    /// `cache: NN%` chip reflecting prefix-stability ratio. Green ≥80%, yellow
-    /// ≥40%, red below. The most recent provider cache-read token count is
-    /// appended when available so a high ratio can be cross-checked against
-    /// real cache hits.
-    fn render_cache_chip(&self, cx: &Context<Self>) -> AnyElement {
-        let thread = self.thread.read(cx);
-        let pct = thread.prefix_stability_pct();
-        let usage = thread.last_cache_usage();
-        let hue = if pct >= 80 {
-            0.33 // green
-        } else if pct >= 40 {
-            0.11 // yellow
-        } else {
-            0.0 // red
-        };
-        let label = match usage {
-            Some(u) if u.cache_read_input_tokens > 0 => {
-                format!("cache: {pct}% · {}k", u.cache_read_input_tokens / 1000)
-            }
-            _ => format!("cache: {pct}%"),
-        };
-        gpui::div()
+        let trigger = h_flex()
+            .id("project-chip")
+            .items_center()
+            .gap_1()
             .px_2()
             .py_1()
-            .text_xs()
-            .text_color(gpui::hsla(hue, 0.5, 0.62, 1.0))
-            .child(label)
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .when_some(icon.clone(), |el, ic| {
+                el.child(Icon::new(ic).xsmall().text_color(theme.muted_foreground))
+            })
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(theme.muted_foreground),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                if this.project_chip_open {
+                    this.close_project_chip_menu();
+                    cx.notify();
+                    return;
+                }
+                // Only allow project selection on empty threads.
+                let can_set = this.thread.read(cx).messages().is_empty();
+                if !can_set {
+                    return;
+                }
+                this.project_chip_open = true;
+
+                // Fetch recent projects from the store.
+                let store = agent::thread_store_global();
+                let recent = store.update(cx, |s, cx| s.fetch_recent_projects(20, cx));
+
+                let ws = workspace.clone();
+                let theme = cx.theme().clone();
+
+                // Build menu synchronously with whatever recent list we have
+                // cached; the async fetch will refresh on the next open.
+                let ws_blank = ws.clone();
+                let ws_folder = ws.clone();
+
+                let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                    let mut menu = menu.max_w(gpui::px(320.)).scrollable(true);
+                    menu = menu.label(i18n::t("sidebar-section-projects"));
+
+                    let ws_recent = ws.clone();
+                    let theme_recent = theme.clone();
+
+                    // Fetch synchronously from the store's cached summaries.
+                    let store = agent::thread_store_global();
+                    let summaries = store.read(cx).summaries();
+                    let mut seen = std::collections::HashSet::new();
+                    let mut recent_projects: Vec<String> = Vec::new();
+                    for s in summaries {
+                        if !s.project.is_empty() && seen.insert(s.project.clone()) {
+                            recent_projects.push(s.project.clone());
+                        }
+                        if recent_projects.len() >= 20 {
+                            break;
+                        }
+                    }
+
+                    for path_str in &recent_projects {
+                        let path = std::path::PathBuf::from(path_str);
+                        let name = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(path_str)
+                            .to_string();
+                        let display_path = path_str.clone();
+                        let click_path = path_str.clone();
+                        let ws_sel = ws_recent.clone();
+                        let themed = theme_recent.clone();
+                        menu = menu.item(
+                            PopupMenuItem::element(move |_window, _cx| {
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Icon::new(IconName::FolderOpen)
+                                            .xsmall()
+                                            .text_color(themed.muted_foreground),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .text_sm()
+                                            .text_color(themed.foreground)
+                                            .child(name.clone()),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .flex_1()
+                                            .text_xs()
+                                            .text_color(themed.muted_foreground)
+                                            .child(display_path.clone()),
+                                    )
+                            })
+                            .on_click(
+                                move |_, _, cx: &mut gpui::App| {
+                                    let p = std::path::PathBuf::from(&click_path);
+                                    ws_sel.update(cx, |this, cx| {
+                                        this.close_project_chip_menu();
+                                        this.thread.update(cx, |t, cx| t.set_project(p, cx));
+                                        cx.notify();
+                                    });
+                                },
+                            ),
+                        );
+                    }
+
+                    menu = menu.separator();
+
+                    // "+ New project" submenu
+                    let ws_blank_inner = ws_blank.clone();
+                    let ws_folder_inner = ws_folder.clone();
+                    menu = menu.submenu(
+                        i18n::t("workspace-project-new").to_string(),
+                        window,
+                        cx,
+                        move |submenu, _window, _cx| {
+                            let ws_b = ws_blank_inner.clone();
+                            let ws_f = ws_folder_inner.clone();
+                            submenu
+                                .item(
+                                    PopupMenuItem::new(i18n::t("workspace-project-blank"))
+                                        .on_click(move |_, _, cx: &mut gpui::App| {
+                                            ws_b.update(cx, |this, cx| {
+                                                this.close_project_chip_menu();
+                                                this.open_blank_project(cx);
+                                            });
+                                        }),
+                                )
+                                .item(
+                                    PopupMenuItem::new(i18n::t("workspace-project-select-folder"))
+                                        .on_click(move |_, _, cx: &mut gpui::App| {
+                                            ws_f.update(cx, |this, cx| {
+                                                this.close_project_chip_menu();
+                                                this.choose_project_inner(cx);
+                                            });
+                                        }),
+                                )
+                        },
+                    );
+
+                    // Suppress unused-variable warning for the async fetch.
+                    drop(recent);
+
+                    menu
+                });
+                let sub = cx.subscribe(
+                    &menu,
+                    |this: &mut Workspace,
+                     _menu: Entity<PopupMenu>,
+                     _: &DismissEvent,
+                     cx: &mut Context<Workspace>| {
+                        this.close_project_chip_menu();
+                        cx.notify();
+                    },
+                );
+                this.project_chip_menu = Some(menu);
+                this.project_chip_menu_sub = Some(sub);
+                cx.notify();
+            }));
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        debug_assert!(self.project_chip_open);
+        debug_assert!(self.project_chip_menu.is_some());
+        let menu = self
+            .project_chip_menu
+            .clone()
+            .expect("project_chip_menu exists when open");
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::div()
+                    .id("project-chip-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .left_0()
+                    .occlude()
+                    .child(menu),
+            )
             .into_any_element()
+    }
+
+    /// Open the blank-project flow: pick a parent directory, then prompt for name.
+    fn open_blank_project(&mut self, cx: &mut Context<Self>) {
+        if self.project_picker_pending {
+            return;
+        }
+        self.project_picker_pending = true;
+        let dir = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = dir.await;
+            this.update(cx, |this, cx| {
+                this.project_picker_pending = false;
+                if let Ok(Ok(Some(paths))) = result
+                    && let Some(parent) = paths.into_iter().next()
+                {
+                    this.blank_project_parent = Some(parent);
+                    this.blank_project_name_input = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Lazily create the blank-project name input (needs a Window).
+    fn ensure_blank_project_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blank_project_parent.is_none() {
+            return;
+        }
+        if self.blank_project_name_input.is_some() {
+            return;
+        }
+        self.blank_project_name_input = Some(cx.new(|cx| InputState::new(window, cx)));
+    }
+
+    /// Submit the blank project: create the directory and bind it.
+    fn confirm_blank_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(parent) = self.blank_project_parent.take() else {
+            return;
+        };
+        let name = self
+            .blank_project_name_input
+            .as_ref()
+            .map(|s| s.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        if name.is_empty() {
+            self.blank_project_parent = Some(parent);
+            return;
+        }
+        let new_path = parent.join(&name);
+        if let Err(e) = std::fs::create_dir_all(&new_path) {
+            tracing::warn!(error = %e, "failed to create project directory");
+            cx.notify();
+            return;
+        }
+        self.thread.update(cx, |t, cx| t.set_project(new_path, cx));
+        self.blank_project_name_input = None;
+        cx.notify();
+    }
+
+    /// Cancel the blank project overlay.
+    fn cancel_blank_project(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.blank_project_parent = None;
+        self.blank_project_name_input = None;
+        cx.notify();
+    }
+
+    /// Shared inner logic for "Select folder" (directory picker → bind project).
+    fn choose_project_inner(&mut self, cx: &mut Context<Self>) {
+        if self.project_picker_pending {
+            return;
+        }
+        self.project_picker_pending = true;
+        let dir = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = dir.await;
+            this.update(cx, |this, cx| {
+                this.project_picker_pending = false;
+                if let Ok(Ok(Some(paths))) = result
+                    && let Some(path) = paths.into_iter().next()
+                {
+                    this.thread.update(cx, |t, cx| t.set_project(path, cx));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Overlay prompting for the blank-project folder name.
+    fn render_blank_project_overlay(
+        &self,
+        _window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.pending_ask.is_some()
+            || !self.pending_auths.is_empty()
+            || self.pending_plan.is_some()
+        {
+            return None;
+        }
+        self.blank_project_parent.as_ref()?;
+        let input = self.blank_project_name_input.as_ref()?;
+        let parent_name = self
+            .blank_project_parent
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("…")
+            .to_string();
+
+        Some(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.background.opacity(0.6))
+                .child(
+                    v_flex()
+                        .w(px(480.))
+                        .p_4()
+                        .gap_3()
+                        .rounded(theme.radius)
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::FolderOpen)
+                                        .small()
+                                        .text_color(theme.accent),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(i18n::t("workspace-project-blank")),
+                                ),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(format!(
+                                    "{}: {}",
+                                    i18n::t("workspace-project-name-prompt"),
+                                    parent_name
+                                )),
+                        )
+                        .child(Input::new(input))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("blank-project-cancel")
+                                        .ghost()
+                                        .small()
+                                        .label(i18n::t("workspace-cancel"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.cancel_blank_project(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("blank-project-confirm")
+                                        .primary()
+                                        .small()
+                                        .label(i18n::t("workspace-rename-confirm"))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.confirm_blank_project(window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -2515,25 +3079,25 @@ impl Render for Workspace {
 
         self.ensure_ask_inputs(_window, cx);
         self.ensure_rename_input(_window, cx);
+        self.ensure_blank_project_input(_window, cx);
 
         let overlay = self
             .render_auth_overlay(&theme, cx)
             .or_else(|| self.render_plan_approval_overlay(&theme, cx))
+            .or_else(|| self.render_blank_project_overlay(_window, &theme, cx))
             .or_else(|| self.render_rename_overlay(&theme, cx));
 
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
         let editor_width = self.editor_width;
-        // Title text reflects the chosen project once one is bound; falls back
-        // to the app name so an unselected first screen stays branded.
-        let title_text = self
-            .thread
-            .read(cx)
-            .project()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("manox")
-            .to_string();
+        // Title text is the active thread's display title (user rename > LLM
+        // title > mechanical summary). Falls back to "manox" so an unselected
+        // first screen stays branded before any title is generated.
+        let title_text: SharedString = {
+            let s = self.thread.read(cx).display_title();
+            if s.is_empty() { "manox".to_string() } else { s }
+        }
+        .into();
         // Empty first screen: no messages and nothing streaming. The composer is
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
@@ -2813,7 +3377,8 @@ impl Render for Workspace {
                                         gpui::div()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .child(title_text),
-                                    ),
+                                    )
+                                    .child(self.render_title_menu_trigger(&theme, cx)),
                             )
                             .child(h_flex()),
                     )
@@ -2964,4 +3529,257 @@ fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk>
         others: Vec::new(),
         response_input: None,
     })
+}
+
+/// Map an `ApprovalMode` to the chip's (label, accent color, icon) triple.
+///
+/// Colors are theme tokens, not raw hsla values, so the chip follows the
+/// active theme (light/dark) without bespoke palettes per mode. The
+/// `OnRequest` accent uses `success` (green) as a "this is the safe default"
+/// signal — staying gray would be visually identical to a disabled state.
+fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::Hsla, IconName) {
+    match mode {
+        ApprovalMode::OnRequest => (
+            i18n::t("workspace-chip-mode-on-request"),
+            theme.success,
+            IconName::ThumbsUp,
+        ),
+        ApprovalMode::AutoReview => (
+            i18n::t("workspace-chip-mode-auto-review"),
+            theme.info,
+            IconName::Bot,
+        ),
+        ApprovalMode::Yolo => (
+            i18n::t("workspace-chip-mode-yolo"),
+            theme.danger,
+            IconName::TriangleAlert,
+        ),
+    }
+}
+
+/// Build the 3-tier approval `PopupMenu`. Mirrors the Codex layout:
+///   - title row: localized question + a "Learn more" link on the right
+///   - three selectable rows (icon + title + subtitle, check on the right)
+///   - hairline separator
+///   - non-clickable "Custom (config.toml)" info row
+///
+/// Width is `360px` to fit the longest bilingual subtitle. Each clickable row
+/// routes through `Workspace::apply_approval_mode` so the mode switch +
+/// notice + menu close stay in one place.
+///
+/// `theme` is consumed up front: every value used inside the `'static` row
+/// closures is pre-extracted into owned `SharedString`/`Hsla`/`IconName`,
+/// so the closures don't capture a short-lived theme reference.
+fn build_approval_popover(
+    window: &mut gpui::Window,
+    workspace: Entity<Workspace>,
+    current: ApprovalMode,
+    cx: &mut gpui::App,
+) -> Entity<PopupMenu> {
+    let fg: gpui::Hsla = cx.theme().foreground;
+    let muted: gpui::Hsla = cx.theme().muted_foreground;
+    let success: gpui::Hsla = cx.theme().success;
+    let info: gpui::Hsla = cx.theme().info;
+    let danger: gpui::Hsla = cx.theme().danger;
+    let border: gpui::Hsla = cx.theme().border;
+
+    PopupMenu::build(window, cx, move |menu, _window, _cx| {
+        // Title row: localized question on the left, "Learn more" link on the
+        // right (decorative for now — surfaces a question, doesn't navigate).
+        let title_text = i18n::t("workspace-mode-title");
+        let learn_more = i18n::t("workspace-mode-learn-more");
+        let header = PopupMenuItem::element(move |_window, _cx| {
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(title_text.clone()),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            gpui::div()
+                                .text_xs()
+                                .text_color(info)
+                                .child(learn_more.clone()),
+                        )
+                        .child(Icon::new(IconName::ArrowRight).xsmall().text_color(info)),
+                )
+        });
+        let menu = menu.max_w(gpui::px(360.)).item(header);
+
+        // Three selectable rows — one per ApprovalMode. Theme values are
+        // pre-extracted into the `RowSpec` so the helper stays at ≤7 args
+        // (clippy::too_many_arguments) — passing 9 distinct colors / strings
+        // every call was the only thing tripping the lint.
+        let menu = append_mode_row(
+            menu,
+            workspace.clone(),
+            RowSpec {
+                mode: ApprovalMode::OnRequest,
+                title: i18n::t("workspace-mode-on-request-title"),
+                subtitle: i18n::t("workspace-mode-on-request-desc"),
+                icon: IconName::ThumbsUp,
+                accent: success,
+                muted,
+                selected: current == ApprovalMode::OnRequest,
+            },
+        );
+        let menu = append_mode_row(
+            menu,
+            workspace.clone(),
+            RowSpec {
+                mode: ApprovalMode::AutoReview,
+                title: i18n::t("workspace-mode-auto-review-title"),
+                subtitle: i18n::t("workspace-mode-auto-review-desc"),
+                icon: IconName::Bot,
+                accent: info,
+                muted,
+                selected: current == ApprovalMode::AutoReview,
+            },
+        );
+        let menu = append_mode_row(
+            menu,
+            workspace.clone(),
+            RowSpec {
+                mode: ApprovalMode::Yolo,
+                title: i18n::t("workspace-mode-yolo-title"),
+                subtitle: i18n::t("workspace-mode-yolo-desc"),
+                icon: IconName::TriangleAlert,
+                accent: danger,
+                muted,
+                selected: current == ApprovalMode::Yolo,
+            },
+        );
+
+        // Hairline + the 4th non-clickable info row pointing users at
+        // config.toml for fully custom policy. Disabled so hover/click
+        // pass through; styled with `muted` to read as a label, not a
+        // selectable option.
+        let custom_title = i18n::t("workspace-mode-custom-title");
+        let custom_desc = i18n::t("workspace-mode-custom-desc");
+        let custom_row = PopupMenuItem::element(move |_window, _cx| {
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .child(Icon::new(IconName::Settings).small().text_color(muted))
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(custom_title.clone()),
+                )
+        })
+        .disabled(true);
+        let separator_row = PopupMenuItem::element(move |_window, _cx| {
+            // Hairline rendered as a 1px-tall background div so it sits in the
+            // popup's padding without breaking the menu's row tap targets.
+            v_flex()
+                .w_full()
+                .py_1()
+                .child(gpui::div().w_full().h(px(1.)).bg(border.opacity(0.6)))
+                .child(custom_desc.clone())
+                .into_any_element()
+        })
+        .disabled(true);
+
+        menu.separator().item(separator_row).item(custom_row)
+    })
+}
+
+/// Pre-extracted inputs for [`append_mode_row`]. Bundling these into a struct
+/// keeps the helper below the 7-argument `clippy::too_many_arguments` ceiling
+/// while still letting the call site express the row's full visual contract.
+struct RowSpec {
+    mode: ApprovalMode,
+    title: SharedString,
+    subtitle: SharedString,
+    icon: IconName,
+    accent: gpui::Hsla,
+    muted: gpui::Hsla,
+    selected: bool,
+}
+
+/// Append a single `ApprovalMode` row to the popover. The selected row is
+/// marked with a check icon on the right; the row's title color matches the
+/// mode's accent (success/info/danger) so the visual link between chip and
+/// selected row is immediate.
+fn append_mode_row(menu: PopupMenu, workspace: Entity<Workspace>, spec: RowSpec) -> PopupMenu {
+    let RowSpec {
+        mode,
+        title,
+        subtitle,
+        icon,
+        accent,
+        muted,
+        selected,
+    } = spec;
+    let title_for_render = title.clone();
+    let subtitle_for_render = subtitle.clone();
+    let row = PopupMenuItem::element(move |_window, _cx| {
+        // `icon` is `Clone` but not `Copy`, so re-clone per render rather
+        // than move it out of the captured environment.
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_2()
+            .child(Icon::new(icon.clone()).small().text_color(accent))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .gap_0p5()
+                    .child(
+                        gpui::div()
+                            .text_sm()
+                            .text_color(accent)
+                            .child(title_for_render.clone()),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(subtitle_for_render.clone()),
+                    ),
+            )
+            .when(selected, |el| {
+                el.child(Icon::new(IconName::Check).small().text_color(accent))
+            })
+    })
+    .on_click(move |_event, _window, cx| {
+        workspace.update(cx, |this, cx| {
+            this.apply_approval_mode(mode, cx);
+        });
+    });
+    menu.item(row)
+}
+
+impl Workspace {
+    /// Switch the thread's `ApprovalMode`, post a localized notice, and close
+    /// the popover. Centralized so slash command, chip click, and the
+    /// future settings-panel wiring all funnel through one path.
+    pub(crate) fn apply_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
+        let mode_key = match mode {
+            ApprovalMode::OnRequest => "on-request",
+            ApprovalMode::AutoReview => "auto-review",
+            ApprovalMode::Yolo => "yolo",
+        };
+        self.thread
+            .update(cx, |t, cx| t.set_approval_mode(mode, cx));
+        self.add_info_message(
+            i18n::t_str("workspace-mode-notice", &[("mode", mode_key)]).to_string(),
+            cx,
+        );
+        self.close_access_menu();
+        cx.notify();
+    }
 }

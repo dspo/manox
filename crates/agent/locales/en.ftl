@@ -12,6 +12,7 @@ sidebar-plugins = Plugins
 sidebar-section-projects = Projects
 sidebar-section-conversations = Conversations
 sidebar-empty-summary = (New chat)
+sidebar-copy-thread-id = Copy thread id
 sidebar-time-just-now = Just now
 sidebar-time-minutes = { $count ->
     [one] {$count} minute ago
@@ -252,10 +253,33 @@ workspace-rename-title = Rename conversation
 workspace-rename-prompt = Enter a new title. Leave empty to clear the override and fall back to the generated summary.
 workspace-rename-confirm = Save
 workspace-mode-normal = Normal
-workspace-mode-yolo = YOLO mode
 workspace-mode-section = Mode
-workspace-yolo-on-notice = YOLO mode on: tool calls need no approval, bash runs outside the sandbox.
-workspace-yolo-off-notice = Switched to normal mode: approvals and sandbox restored.
+workspace-mode-on-request-title = Request approval
+workspace-mode-on-request-desc = Always ask when editing external files or using the internet
+workspace-mode-auto-review-title = Approve for me
+workspace-mode-auto-review-desc = Only request approval for detected risky operations
+workspace-mode-yolo-title = Full access
+workspace-mode-yolo-desc = Unrestricted access to the internet and any file on your computer
+workspace-chip-mode-on-request = Request approval
+workspace-chip-mode-auto-review = Approve for me
+workspace-chip-mode-yolo = Full access
+workspace-mode-title = How should Codex actions be approved?
+workspace-mode-learn-more = Learn more
+workspace-mode-custom-title = Custom (config.toml)
+workspace-mode-custom-desc = Use permissions defined in config.toml
+workspace-mode-notice = { $mode ->
+    [on-request] Switched to request-approval mode.
+    [auto-review] Approve-for-me mode: safe tool calls run without prompting, risky ones still ask.
+   *[yolo] Full access: tool calls need no approval, bash runs outside the sandbox.
+}
+workspace-approval-auto-review-note = Auto-review: {$reason}
+workspace-project-choose = Choose project
+workspace-project-new = New project
+workspace-project-blank = Create blank project
+workspace-project-select-folder = Select folder
+workspace-project-name-prompt = Project folder name
+workspace-yolo-on-notice = Full access on: tool calls need no approval, bash runs outside the sandbox.
+workspace-yolo-off-notice = Switched to request-approval mode: approvals and sandbox restored.
 workspace-empty-prompt = What should we do?
 
 ### views/composer_menu.rs
@@ -265,8 +289,6 @@ composer-commands-label = Commands
 composer-memory-label = Memory
 composer-skills-label = Skills
 composer-add-files = Files and folders
-composer-choose-project = Choose project
-composer-choose-project-desc = Bind a project directory
 composer-attach-zed = Attach Zed
 composer-goal-name = Goal
 composer-goal-desc = Set a goal for sustained effort
@@ -277,7 +299,7 @@ composer-tag-personal = Personal
 composer-tag-system = System
 
 ### slash_command.rs
-slash-yolo-desc = Toggle YOLO mode (no approvals + bash outside sandbox); with a prompt, enables YOLO and starts working immediately
+slash-yolo-desc = Switch to Full access (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
 slash-plan-desc = Enter plan mode: read-only tools only, research then submit a plan for approval (bare `/plan` toggles; `/plan <prompt>` enters with a prompt)
 
 ### main.rs (system menus)
@@ -297,3 +319,31 @@ terminal-search-status = search: { $pattern }  ({ $count ->
     [one] 1 match
    *[other] { $count } matches
 })
+
+### views/title_menu.rs
+titlebar-menu-label = Conversation
+titlebar-pin = Pin conversation
+titlebar-unpin = Unpin conversation
+titlebar-rename = Rename conversation
+titlebar-archive = Archive conversation
+titlebar-unarchive = Unarchive conversation
+titlebar-sidebar-toggle = Open side chat
+titlebar-copy-label = Copy
+titlebar-copy-id = Copy conversation ID
+titlebar-copy-markdown = Copy as Markdown
+titlebar-copy-cwd = Copy working directory
+titlebar-copy-deeplink = Copy deep link
+titlebar-branch-label = Branch
+titlebar-branch-from-here = Branch from here
+titlebar-branch-from-start = Branch from start
+titlebar-schedule = Add scheduled task...
+titlebar-new-window = Open in new window
+titlebar-copied-id = Conversation ID copied to clipboard.
+titlebar-copied-cwd = Working directory copied to clipboard.
+titlebar-copied-deeplink = Deep link copied to clipboard (manox://thread/{ $id }).
+titlebar-copied-markdown = Conversation copied to clipboard as Markdown.
+titlebar-pinned-notice = Conversation pinned.
+titlebar-unpinned-notice = Conversation unpinned.
+titlebar-archive-notice = Conversation archived.
+titlebar-not-implemented = Not implemented yet.
+titlebar-rename-notice = Rename dialog opened.

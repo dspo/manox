@@ -35,9 +35,10 @@ pub use token_usage::TokenUsageRecord;
 use crate::paths;
 
 /// Schema version. `open()` compares `PRAGMA user_version` against this; a
-/// mismatch drops every table and recreates them. There is no incremental
-/// migration — per the upgrade design, legacy data is not carried forward.
-const SCHEMA_VERSION: i32 = 2;
+/// version that *predates* the current one runs the incremental migration
+/// chain. A version that pre-dates v2 (i.e. unknown legacy) is still treated
+/// as legacy and dropped wholesale — only the v2 → v3 step is preserved.
+const SCHEMA_VERSION: i32 = 3;
 
 /// Thread database handle.
 pub struct ThreadsDatabase {
@@ -59,10 +60,11 @@ impl ThreadsDatabase {
         })
     }
 
-    /// Recreate the schema when `user_version` does not match `SCHEMA_VERSION`.
-    /// Legacy data is dropped wholesale — no migration path, by design. The
-    /// drop + recreate + version bump runs in one transaction so a crash mid-way
-    /// cannot leave a half-dropped database that the next open would mis-read.
+    /// Apply incremental migrations from `version` up to [`SCHEMA_VERSION`],
+    /// or — if `version` is too old to be safely migrated — drop and recreate
+    /// the schema. The v2 → v3 step adds the `approval_mode` column to
+    /// `threads`; pre-v2 schemas are not understood and are wiped so a corrupt
+    /// or unrelated database never silently loads.
     fn init_schema(conn: &mut Connection) -> Result<()> {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -80,22 +82,43 @@ impl ThreadsDatabase {
         }
         let tx = conn
             .transaction()
-            .context("begin schema rebuild transaction")?;
-        tx.execute_batch(
-            "DROP TABLE IF EXISTS terminal_sessions;
-             DROP TABLE IF EXISTS token_usage;
-             DROP TABLE IF EXISTS thread_events;
-             DROP TABLE IF EXISTS thread_data;
-             DROP TABLE IF EXISTS threads;",
-        )
-        .context("drop legacy tables")?;
+            .context("begin schema migration transaction")?;
+        if version < 2 {
+            // Unknown legacy schema: safest course is a full rebuild. Pre-v2
+            // databases pre-date the current persistence design; any rows they
+            // hold would be misinterpreted by the new schema, so dropping them
+            // is the only sound option.
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS token_usage;
+                 DROP TABLE IF EXISTS thread_events;
+                 DROP TABLE IF EXISTS thread_data;
+                 DROP TABLE IF EXISTS threads;",
+            )
+            .context("drop legacy tables")?;
+        } else {
+            // v2 → v3: add the columns that v3's `create_table` expects but
+            // that `CREATE TABLE IF NOT EXISTS` can't add to an existing
+            // pre-v3 table. The new columns default to 0/OnRequest; any
+            // thread with `yolo = 1` is upgraded to Yolo by the read path
+            // in `threads.rs`.
+            tx.execute(
+                "ALTER TABLE threads ADD COLUMN approval_mode INTEGER NOT NULL DEFAULT 0;",
+                [],
+            )
+            .context("alter threads add approval_mode")?;
+            tx.execute(
+                "ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+                [],
+            )
+            .context("alter threads add pinned")?;
+        }
         threads::create_table(&tx)?;
         events::create_table(&tx)?;
         token_usage::create_table(&tx)?;
         terminals::create_table(&tx)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)
             .context("set user_version")?;
-        tx.commit().context("commit schema rebuild transaction")?;
+        tx.commit().context("commit schema migration transaction")?;
         Ok(())
     }
 }
@@ -140,9 +163,11 @@ mod tests {
             cwd: "/tmp".into(),
             project: "/tmp".into(),
             yolo: true,
+            approval_mode: 2,
             depth: 0,
             parent_id: None,
             archived: false,
+            pinned: false,
             created_at: 1_700_000_000,
             interacted_at: 1_700_000_100,
             updated_at: 1_700_000_200,
@@ -249,6 +274,173 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn schema_migration_v2_to_v3_preserves_yolo_rows() {
+        // Build a v2 database by hand: create the v2 `threads` table without
+        // `approval_mode`, insert a row with yolo = 1, and run `init_schema`
+        // again. The migration must (a) add the `approval_mode` column, (b)
+        // keep the row, and (c) bump `user_version` to the current target.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                title TEXT,
+                title_override TEXT,
+                model_id TEXT NOT NULL DEFAULT '',
+                provider_id TEXT,
+                cwd TEXT,
+                project TEXT,
+                yolo INTEGER NOT NULL DEFAULT 0,
+                depth INTEGER NOT NULL DEFAULT 0,
+                parent_id TEXT,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                interacted_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                session_started_at INTEGER NOT NULL DEFAULT 0,
+                cumulative_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_output_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE thread_data (
+                 thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+                 data_type TEXT NOT NULL DEFAULT 'zstd',
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE thread_events (
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 seq INTEGER NOT NULL,
+                 event_type TEXT NOT NULL,
+                 payload TEXT NOT NULL,
+                 created_at INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (thread_id, seq)
+             );
+             CREATE TABLE token_usage (
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 user_message_id TEXT NOT NULL,
+                 input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                 cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                 cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                 completed_at INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (thread_id, user_message_id)
+             );
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, summary, model_id, cwd, yolo, depth, archived, created_at, interacted_at, updated_at, session_started_at) VALUES ('yolo-row','','','/tmp',1,0,0,0,0,0,0)",
+            [],
+        )
+        .unwrap();
+        ThreadsDatabase::init_schema(&mut conn).unwrap();
+        let v: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let (yolo, mode): (i64, i64) = conn
+            .query_row(
+                "SELECT yolo, approval_mode FROM threads WHERE id = 'yolo-row'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(yolo, 1);
+        // After the ALTER, the new column defaults to 0 (OnRequest) for legacy
+        // rows. The promotion of `yolo=1` rows onto ApprovalMode::Yolo is
+        // verified end-to-end by `load_promotes_legacy_yolo_to_approval_mode_yolo`
+        // above — this test only guards the schema column itself.
+        assert_eq!(mode, 0);
+        // The v2→v3 migration also adds the `pinned` column (added to the
+        // v3 `create_table` by main; pre-existing v2 dbs don't have it, and
+        // `CREATE TABLE IF NOT EXISTS` is a no-op on those, so the migration
+        // has to do it explicitly).
+        let pinned: i64 = conn
+            .query_row(
+                "SELECT pinned FROM threads WHERE id = 'yolo-row'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pinned, 0);
+    }
+
+    #[test]
+    fn load_promotes_legacy_yolo_to_approval_mode_yolo() {
+        // Build a v2 db by hand with a row whose yolo = 1, run the migration,
+        // then load the record and verify the read path maps the legacy row
+        // onto ApprovalMode::Yolo (i64 == 2). The previous test only asserts
+        // the SQL column defaults to 0; the promotion happens in code at
+        // load time, so the only way to guard it is to call `load` end to end.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                title TEXT,
+                title_override TEXT,
+                model_id TEXT NOT NULL DEFAULT '',
+                provider_id TEXT,
+                cwd TEXT,
+                project TEXT,
+                yolo INTEGER NOT NULL DEFAULT 0,
+                depth INTEGER NOT NULL DEFAULT 0,
+                parent_id TEXT,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                interacted_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                session_started_at INTEGER NOT NULL DEFAULT 0,
+                cumulative_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_output_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE thread_data (
+                 thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
+                 data_type TEXT NOT NULL DEFAULT 'zstd',
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE thread_events (
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 seq INTEGER NOT NULL,
+                 event_type TEXT NOT NULL,
+                 payload TEXT NOT NULL,
+                 created_at INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (thread_id, seq)
+             );
+             CREATE TABLE token_usage (
+                 thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+                 user_message_id TEXT NOT NULL,
+                 input_tokens INTEGER NOT NULL DEFAULT 0,
+                 output_tokens INTEGER NOT NULL DEFAULT 0,
+                 cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                 cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                 completed_at INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (thread_id, user_message_id)
+             );
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, summary, model_id, cwd, project, yolo, depth, archived, created_at, interacted_at, updated_at, session_started_at) VALUES ('legacy-yolo','','','/tmp','',1,0,0,0,0,0,0)",
+            [],
+        )
+        .unwrap();
+        ThreadsDatabase::init_schema(&mut conn).unwrap();
+        let db = ThreadsDatabase {
+            conn: Mutex::new(conn),
+        };
+        let rec = db.load("legacy-yolo").unwrap().expect("row must exist");
+        assert!(rec.yolo, "legacy yolo flag preserved");
+        assert_eq!(
+            rec.approval_mode, 2,
+            "v2 yolo=1 row must promote to ApprovalMode::Yolo at load time"
+        );
     }
 
     #[test]

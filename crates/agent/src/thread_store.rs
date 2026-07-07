@@ -20,11 +20,21 @@ use crate::thread::{Thread, ThreadId};
 pub enum ThreadStoreEvent {
     /// The summary list changed (created / saved / deleted).
     SummariesUpdated,
+    /// The running thread changed (a turn started or ended). Carries the
+    /// thread id that is now running, or `None` when no thread is running.
+    /// Distinct from `SummariesUpdated` so the sidebar can re-render a single
+    /// row without re-querying the db.
+    RunningChanged(Option<String>),
 }
 
 pub struct ThreadStore {
     db: Arc<ThreadsDatabase>,
     summaries: Vec<ThreadSummary>,
+    /// The thread id currently running a turn, or `None` when idle. Set by the
+    /// workspace on `ThreadEvent::TurnStarted` and cleared on terminal
+    /// `Stop`/`Error`. Drives the sidebar's running indicator on the matching
+    /// thread item.
+    running: Option<String>,
 }
 
 impl EventEmitter<ThreadStoreEvent> for ThreadStore {}
@@ -47,6 +57,7 @@ pub fn init(cx: &mut App) {
     let entity = cx.new(|_cx| ThreadStore {
         db: Arc::new(db),
         summaries,
+        running: None,
     });
     let _ = GLOBAL.set(entity);
 }
@@ -62,6 +73,23 @@ pub fn global() -> Entity<ThreadStore> {
 impl ThreadStore {
     pub fn summaries(&self) -> &[ThreadSummary] {
         &self.summaries
+    }
+
+    /// The thread id currently running a turn, or `None` when idle.
+    pub fn running(&self) -> Option<&str> {
+        self.running.as_deref()
+    }
+
+    /// Set the running thread id (or clear it). Emits `RunningChanged` so the
+    /// sidebar re-renders the affected rows. Called by the workspace on
+    /// `ThreadEvent::TurnStarted` / terminal `Stop` / `Error`.
+    pub fn set_running(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if self.running == id {
+            return;
+        }
+        self.running = id;
+        cx.emit(ThreadStoreEvent::RunningChanged(self.running.clone()));
+        cx.notify();
     }
 
     /// Re-read the db, refresh the summary list, and emit. The `db.list()`
@@ -84,6 +112,21 @@ impl ThreadStore {
             .ok();
         })
         .detach();
+    }
+
+    /// Fetch distinct recent project paths from the db on the background
+    /// executor. Returns up to `limit` paths ordered by most recent activity.
+    pub fn fetch_recent_projects(
+        &self,
+        limit: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<Vec<String>> {
+        let db = self.db.clone();
+        cx.spawn(async move |_this, cx| {
+            cx.background_executor()
+                .spawn(async move { db.list_recent_projects(limit).unwrap_or_default() })
+                .await
+        })
     }
 
     /// Load and restore a `Thread` by id (model resolved from the registry by id; `None` if not found).
@@ -147,6 +190,28 @@ impl ThreadStore {
                 .await;
             if let Err(e) = res {
                 tracing::warn!(error = %e, "archive thread 失败");
+            }
+            this.update(cx, |s, cx| {
+                s.refresh(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Toggle the pinned flag on a thread. Pinned threads float to the top of
+    /// the sidebar list (SQL `ORDER BY pinned DESC, interacted_at DESC`).
+    /// Refreshes so the sidebar re-sorts after the toggle.
+    pub fn pin_thread(&self, id: &str, pinned: bool, cx: &mut Context<Self>) {
+        let db = self.db.clone();
+        let id = id.to_string();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { db.pin(&id, pinned) })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "pin thread 失败");
             }
             this.update(cx, |s, cx| {
                 s.refresh(cx);

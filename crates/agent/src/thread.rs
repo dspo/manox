@@ -20,6 +20,7 @@ use anyhow::Result;
 use futures::FutureExt as _;
 use futures::StreamExt as _;
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, WeakEntity};
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::ThreadRecord;
@@ -48,6 +49,46 @@ pub enum ToolCallStatus {
     Success,
     Error,
     Denied,
+}
+
+/// User-facing approval policy for tool calls. Drives both the access chip in
+/// the composer and the free / approval branch in `run_turn_loop`. Persisted on
+/// the thread so switching threads restores the mode the user last picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalMode {
+    /// Every approval-required tool call shows the authorization overlay.
+    #[serde(rename = "on-request")]
+    #[default]
+    OnRequest,
+    /// A built-in security-reviewer LLM agent vet each approval-required tool
+    /// call. Safe calls run without prompting; risky ones still raise the
+    /// overlay (with a one-line reason from the agent). Failures (timeout,
+    /// parse error, unsupported verdict) fall back to the overlay.
+    #[serde(rename = "auto-review")]
+    AutoReview,
+    /// All approvals are bypassed and `bash` runs unsandboxed
+    /// (DangerFullAccess equivalent). Inherited by sub-agents.
+    #[serde(rename = "yolo")]
+    Yolo,
+}
+
+impl ApprovalMode {
+    pub fn from_i64(v: i64) -> Self {
+        match v {
+            1 => Self::AutoReview,
+            2 => Self::Yolo,
+            _ => Self::OnRequest,
+        }
+    }
+
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::OnRequest => 0,
+            Self::AutoReview => 1,
+            Self::Yolo => 2,
+        }
+    }
 }
 
 /// Events emitted by `Thread` to the UI.
@@ -81,8 +122,14 @@ pub enum ThreadEvent {
         summary: String,
         input: serde_json::Value,
     },
-    /// YOLO mode toggled on/off. The UI refreshes its badge and access chip.
-    YoloToggled { on: bool },
+    /// Approval mode changed. The UI refreshes its badge, access chip, and
+    /// the popover's selected row.
+    ApprovalModeChanged { mode: ApprovalMode },
+    /// A completion turn started. Signals the UI (via `ThreadStore`) that this
+    /// thread is now running — covers the gap before the first `AgentText`/
+    /// `AgentThinking` delta arrives (model warming up, network latency) so
+    /// the running indicator is immediate. Terminal `Stop`/`Error` clear it.
+    TurnStarted,
     /// A completion turn ended.
     Stop(StopReason),
     /// An error during streaming.
@@ -91,9 +138,11 @@ pub enum ThreadEvent {
     /// approval overlay; resolution arrives via `respond_plan_approval`.
     PlanProposed { id: String, plan_text: String },
     /// The prefix-stability fingerprint for this turn vs. the previous one.
-    /// Emitted on every turn with the current stability ratio plus the drift
-    /// flags so the UI can render a `cache: NN%` chip; `system_changed` /
-    /// `tools_changed` are `true` only when that component drifted this turn.
+    /// Emitted every turn with the current stability ratio plus the drift
+    /// flags so subscribers (e.g. future telemetry or debug views) can
+    /// observe cache discipline without scraping internal state. The
+    /// composer chip that used to render this was removed in #62; the
+    /// event is still emitted for forward-compat subscribers.
     PrefixStability {
         stability_pct: u16,
         system_changed: bool,
@@ -113,11 +162,15 @@ pub struct Thread {
     model: Option<AnyLanguageModel>,
     tools: Arc<ToolRegistry>,
     permission: Arc<PermissionCache>,
-    /// YOLO mode: when true, all tool approvals are bypassed and `bash` runs
-    /// unsandboxed (DangerFullAccess equivalent). Session-scoped; inherited by
-    /// sub-agents. Distinct from the always-allow cache so disabling YOLO
+    /// Approval mode for this thread. Drives the access chip and the
+    /// free / approval branch in `run_turn_loop`. Thread-scoped; inherited by
+    /// sub-agents. Distinct from the always-allow cache so flipping modes
     /// returns to normal approval without leaving stale always-allow grants.
-    yolo: bool,
+    approval_mode: ApprovalMode,
+    /// Reasons the auto-review approval agent attached to `Ask` verdicts, keyed
+    /// by `tool_use.id`. Drained into the auth overlay as a one-line
+    /// justification. Cleared every turn with the rest of the per-turn state.
+    approval_ask_reasons: HashMap<String, String>,
     cwd: PathBuf,
     /// The project directory the thread is bound to, chosen on the first screen.
     /// `None` means no project was chosen; tools then resolve paths against the
@@ -188,10 +241,6 @@ pub struct Thread {
     /// is observable rather than silently busting the provider's prefix cache.
     /// See [`crate::prefix_stability`].
     prefix_stability: StablePrefix,
-    /// The most recent `TokenUsage` reported by the provider (cache read /
-    /// creation counts), surfaced alongside the stability chip so the user can
-    /// confirm cache hits by token count, not just by ratio.
-    last_usage: Option<TokenUsage>,
     /// User-supplied rename; takes display precedence over the LLM `title`.
     /// Setting it must NOT suppress `maybe_generate_title` (the LLM may still
     /// update `title` underneath); the sidebar reads `title_override` first.
@@ -202,6 +251,10 @@ pub struct Thread {
     parent_id: Option<String>,
     /// Whether the user archived this thread from the sidebar.
     archived: bool,
+    /// Whether the user pinned this thread from the title bar menu. Pinned
+    /// threads float to the top of the sidebar list. Persisted in the same
+    /// row as `archived` so the two boolean metadata flags stay co-located.
+    pinned: bool,
     /// Creation time (Unix seconds). Stable for the thread's life; persisted so
     /// the sidebar can show "created" separately from "last active".
     created_at: i64,
@@ -246,7 +299,8 @@ impl Thread {
                 model,
                 tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
-                yolo: false,
+                approval_mode: ApprovalMode::default(),
+                approval_ask_reasons: HashMap::new(),
                 cwd,
                 project: None,
                 pending_tool_uses: Vec::new(),
@@ -267,11 +321,11 @@ impl Thread {
                 title_in_flight: false,
                 title_last_eval_user_count: None,
                 prefix_stability: StablePrefix::default(),
-                last_usage: None,
                 title_override: None,
                 provider_id,
                 parent_id: None,
                 archived: false,
+                pinned: false,
                 created_at: now,
                 interacted_at: now,
                 cumulative_token_usage: TokenUsage::default(),
@@ -318,7 +372,8 @@ impl Thread {
                 model,
                 tools: Arc::new(tools::default_registry(cwd.clone(), weak)),
                 permission: Arc::new(PermissionCache::default()),
-                yolo: rec.yolo,
+                approval_mode: ApprovalMode::from_i64(rec.approval_mode),
+                approval_ask_reasons: HashMap::new(),
                 cwd,
                 project,
                 pending_tool_uses: Vec::new(),
@@ -339,11 +394,11 @@ impl Thread {
                 title_in_flight: false,
                 title_last_eval_user_count,
                 prefix_stability: StablePrefix::default(),
-                last_usage: None,
                 title_override: rec.title_override,
                 provider_id,
                 parent_id: rec.parent_id,
                 archived: rec.archived,
+                pinned: rec.pinned,
                 created_at: rec.created_at,
                 interacted_at: rec.interacted_at,
                 cumulative_token_usage: rec.cumulative_token_usage,
@@ -370,7 +425,7 @@ impl Thread {
         cwd: PathBuf,
         model: AnyLanguageModel,
         permission: Arc<PermissionCache>,
-        yolo: bool,
+        approval_mode: ApprovalMode,
         system: String,
         max_turns: u32,
         depth: u32,
@@ -385,7 +440,8 @@ impl Thread {
                 model: Some(model),
                 tools: Arc::new(tools_fn(weak)),
                 permission,
-                yolo,
+                approval_mode,
+                approval_ask_reasons: HashMap::new(),
                 cwd,
                 project: None,
                 pending_tool_uses: Vec::new(),
@@ -406,11 +462,11 @@ impl Thread {
                 title_in_flight: false,
                 title_last_eval_user_count: None,
                 prefix_stability: StablePrefix::default(),
-                last_usage: None,
                 title_override: None,
                 provider_id: None,
                 parent_id: None,
                 archived: false,
+                pinned: false,
                 created_at: chrono::Utc::now().timestamp(),
                 interacted_at: chrono::Utc::now().timestamp(),
                 cumulative_token_usage: TokenUsage::default(),
@@ -436,10 +492,12 @@ impl Thread {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            yolo: self.yolo,
+            yolo: self.approval_mode == ApprovalMode::Yolo,
+            approval_mode: self.approval_mode.as_i64(),
             depth: self.depth as i32,
             parent_id: self.parent_id.clone(),
             archived: self.archived,
+            pinned: self.pinned,
             created_at: self.created_at,
             interacted_at: self.interacted_at,
             updated_at: chrono::Utc::now().timestamp(),
@@ -459,6 +517,71 @@ impl Thread {
             return title;
         }
         self.mechanical_summary()
+    }
+
+    /// User-facing display title with precedence: user rename > LLM title >
+    /// mechanical summary. Mirrors [`crate::db::ThreadSummary::display_title`]
+    /// so the title bar (live thread) and sidebar (loaded summaries) agree.
+    pub fn display_title(&self) -> String {
+        self.title_override
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(self.title.as_deref().filter(|s| !s.trim().is_empty()))
+            .map(str::to_string)
+            .unwrap_or_else(|| self.summary())
+    }
+
+    /// Render the conversation as a Markdown transcript. Each message is a
+    /// `## User` / `## Assistant` heading followed by its text content. Image
+    /// blocks become a `(image)` placeholder; tool_use / tool_result blocks
+    /// become fenced code blocks. Used by the title bar menu's "Copy as
+    /// Markdown" entry.
+    pub fn to_markdown(&self) -> String {
+        use crate::language_model::MessageContent;
+        let mut out = String::new();
+        for m in &self.messages {
+            let heading = match m.role {
+                Role::User => "## User",
+                Role::Assistant => "## Assistant",
+                Role::System => "## System",
+            };
+            out.push_str(heading);
+            out.push('\n');
+            for c in &m.content {
+                match c {
+                    MessageContent::Text(t) => {
+                        out.push_str(t);
+                        out.push('\n');
+                    }
+                    MessageContent::Thinking { text, .. } => {
+                        out.push_str("> *thinking:* ");
+                        out.push_str(text);
+                        out.push('\n');
+                    }
+                    MessageContent::Image { .. } => {
+                        out.push_str("(image)\n");
+                    }
+                    MessageContent::ToolUse(u) => {
+                        let body = if u.raw_input.is_empty() {
+                            u.input.to_string()
+                        } else {
+                            u.raw_input.clone()
+                        };
+                        out.push_str(&format!("```tool_use: {}\n{}\n```\n", u.name, body));
+                    }
+                    MessageContent::ToolResult(r) => {
+                        let tag = if r.is_error {
+                            "tool_result (error)"
+                        } else {
+                            "tool_result"
+                        };
+                        out.push_str(&format!("```{tag}\n{}\n```\n", r.content));
+                    }
+                }
+            }
+            out.push('\n');
+        }
+        out
     }
 
     /// Mechanical fallback: first user message text, truncated to 60 chars;
@@ -661,21 +784,85 @@ impl Thread {
         self.permission.allowed_tools()
     }
 
-    /// Whether YOLO mode is active (approvals bypassed, bash unsandboxed).
+    /// Backward-compatible `Yolo` check. Equivalent to
+    /// `self.approval_mode() == ApprovalMode::Yolo`; kept because
+    /// `tools/bash.rs` and `tools/agent.rs` only need a yes/no on Yolo to
+    /// decide the seatbelt branch and the sub-agent inheritance.
     pub fn yolo(&self) -> bool {
-        self.yolo
+        self.approval_mode == ApprovalMode::Yolo
     }
 
-    /// Toggle YOLO mode. Emits [`ThreadEvent::YoloToggled`] so the UI refreshes
-    /// its badge and access chip. Bypasses approvals for all subsequent tool
-    /// calls in this thread (and any sub-agents spawned after the toggle).
+    /// Toggle Yolo mode. Thin wrapper around [`Self::set_approval_mode`] kept
+    /// for the call sites that predate the three-state model (slash command,
+    /// workspace toggles, and any leftover UI plumbing). New code should call
+    /// `set_approval_mode` directly.
     pub fn set_yolo(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.yolo == on {
+        self.set_approval_mode(
+            if on {
+                ApprovalMode::Yolo
+            } else {
+                ApprovalMode::OnRequest
+            },
+            cx,
+        );
+    }
+
+    /// Current approval mode. Drives the access chip, the popover, and the
+    /// free / approval branch in `run_turn_loop`.
+    pub fn approval_mode(&self) -> ApprovalMode {
+        self.approval_mode
+    }
+
+    /// Switch approval mode. Emits [`ThreadEvent::ApprovalModeChanged`] so the
+    /// UI refreshes the chip, the popover's selected row, and (for Yolo) the
+    /// seatbelt branch in the next tool call. No-op when the mode is unchanged.
+    pub fn set_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
+        if self.approval_mode == mode {
             return;
         }
-        self.yolo = on;
-        cx.emit(ThreadEvent::YoloToggled { on });
+        self.approval_mode = mode;
+        cx.emit(ThreadEvent::ApprovalModeChanged { mode });
         cx.notify();
+    }
+
+    /// Whether the user pinned this thread from the title bar menu. Pinned
+    /// threads float to the top of the sidebar list.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Whether the user archived this thread from the sidebar.
+    pub fn archived(&self) -> bool {
+        self.archived
+    }
+
+    /// Toggle the pinned flag. Persistence is the caller's responsibility
+    /// (the workspace calls `ThreadStore::pin_thread` which writes to the DB
+    /// and refreshes the sidebar list).
+    pub fn set_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        if self.pinned == pinned {
+            return;
+        }
+        self.pinned = pinned;
+        cx.notify();
+    }
+
+    /// Toggle the archived flag. Persistence is the caller's responsibility
+    /// (the workspace calls `ThreadStore::archive_thread` which writes to the
+    /// DB and refreshes the sidebar list).
+    pub fn set_archived(&mut self, archived: bool, cx: &mut Context<Self>) {
+        if self.archived == archived {
+            return;
+        }
+        self.archived = archived;
+        cx.notify();
+    }
+
+    /// Take a reason the auto-review agent attached to an `Ask` verdict,
+    /// removing it so a follow-up call with the same id is empty. Used by the
+    /// auth overlay to render the justification under the tool title.
+    pub fn take_approval_ask_reason(&mut self, id: &str) -> Option<String> {
+        self.approval_ask_reasons.remove(id)
     }
 
     pub fn model(&self) -> Option<&AnyLanguageModel> {
@@ -781,18 +968,6 @@ impl Thread {
         self.project.as_ref()
     }
 
-    /// Prefix-stability ratio as a whole-percent `u16` (0–100). 100 means the
-    /// system prompt + tool-spec prefix has never drifted across turns.
-    pub fn prefix_stability_pct(&self) -> u16 {
-        self.prefix_stability.stability_pct()
-    }
-
-    /// The most recent provider-reported token usage (cache read/creation
-    /// counts), or `None` if the provider has not reported any yet.
-    pub fn last_cache_usage(&self) -> Option<TokenUsage> {
-        self.last_usage
-    }
-
     pub fn turn_count(&self) -> u32 {
         self.turn_count
     }
@@ -862,6 +1037,12 @@ impl Thread {
             cx.emit(ThreadEvent::Error(anyhow::anyhow!("No model configured")));
             return;
         };
+
+        // Signal the UI immediately that a turn is in flight — before the
+        // first streaming delta arrives — so the sidebar running indicator
+        // lights up during the warm-up gap. `ThreadStore::set_running` (called
+        // by the workspace on this event) is the bridge to the sidebar.
+        cx.emit(ThreadEvent::TurnStarted);
 
         let cancel = CancellationToken::new();
         self.turn_cancel = Some(cancel.clone());
@@ -1049,39 +1230,123 @@ impl Thread {
                 break;
             }
 
-            let (tool_uses, free_tus, approval_tus) = this.update(cx, |this, _cx| {
+            // Categorize tool_uses into free / approval / auto-review queues.
+            // The auto-review queue is settled in a second pass below — we
+            // need a model handle and the cancel token, so it cannot be
+            // decided inside the borrow of `this`.
+            let (
+                tool_uses,
+                mut free_tus,
+                mut approval_tus,
+                auto_review_tus,
+                model,
+                cancel_for_review,
+                cwd,
+            ) = this.update(cx, |this, _cx| {
                 let tool_uses = std::mem::take(&mut this.pending_tool_uses);
                 let mut free = Vec::new();
                 let mut appr = Vec::new();
+                let mut review = Vec::new();
                 for tu in &tool_uses {
                     // `exit_plan_mode` is synthesized (not in `this.tools`), so
                     // the registry lookup below would default it to the free
                     // (parallel) path; it has its own plan-overlay routing.
                     let is_plan_exit = tu.name.as_ref() == "exit_plan_mode";
-                    // YOLO bypasses permission gates, but not tools whose
-                    // authorization flow IS their execution (AskUserQuestion):
-                    // bypassing those would drop the user's input and hit an
-                    // unreachable `run`.
+                    // YOLO/AutoReview bypass the permission gate, but not tools
+                    // whose authorization flow IS their execution
+                    // (AskUserQuestion): bypassing those would drop the user's
+                    // input and hit an unreachable `run`. AutoReview also
+                    // consults the security-reviewer agent before allowing.
                     let tool = this.tools.get(tu.name.as_ref());
                     let requires_approval = tool
                         .map(|t| t.requires_approval(&tu.input))
                         .unwrap_or(false);
                     let requires_user_input =
                         tool.map(|t| t.requires_user_input()).unwrap_or(false);
-                    let needs_approval = !is_plan_exit
-                        && (!this.yolo || requires_user_input)
-                        && requires_approval
-                        && !this.permission.is_always_allowed(tu.name.as_ref());
-                    if needs_approval || is_plan_exit {
+                    let always_allowed = this.permission.is_always_allowed(tu.name.as_ref());
+                    let bypassed = matches!(
+                        this.approval_mode,
+                        ApprovalMode::Yolo | ApprovalMode::AutoReview
+                    ) && !requires_user_input;
+
+                    if is_plan_exit {
                         appr.push(tu.clone());
-                    } else {
+                    } else if !requires_approval || always_allowed {
                         free.push(tu.clone());
+                    } else if bypassed && this.approval_mode == ApprovalMode::Yolo {
+                        // Yolo short-circuits; AutoReview must consult the
+                        // reviewer below.
+                        free.push(tu.clone());
+                    } else if bypassed {
+                        review.push(tu.clone());
+                    } else {
+                        appr.push(tu.clone());
                     }
                 }
-                (tool_uses, free, appr)
+                // Reset per-turn ask-reason map so a previous turn's
+                // reasons never bleed into the current one if a tool id
+                // collides across turns.
+                this.approval_ask_reasons.clear();
+                let model = this.model.clone();
+                let cancel = this
+                    .turn_cancel
+                    .clone()
+                    .unwrap_or_else(CancellationToken::new);
+                (
+                    tool_uses,
+                    free,
+                    appr,
+                    review,
+                    model,
+                    cancel,
+                    this.cwd.clone(),
+                )
             })?;
             if tool_uses.is_empty() {
                 break;
+            }
+
+            // AutoReview: ask the security-reviewer agent for each pending call.
+            // Allow verdicts flow into `free_tus`; Ask verdicts flow into
+            // `approval_tus` with a one-line reason surfaced in the overlay.
+            if !auto_review_tus.is_empty() {
+                match model.as_ref() {
+                    None => {
+                        // No model loaded — defer everything to the overlay so
+                        // the user is never silently auto-approved without a
+                        // model in the loop.
+                        approval_tus.extend(auto_review_tus);
+                    }
+                    Some(model) => {
+                        for tu in auto_review_tus {
+                            if cancel_for_review.is_cancelled() {
+                                approval_tus.push(tu);
+                                continue;
+                            }
+                            let title = tool_title(&tu.name, &tu.input);
+                            let verdict = crate::approval::review(
+                                model,
+                                &tu.name,
+                                &tu.input,
+                                &title,
+                                &cwd,
+                                cancel_for_review.clone(),
+                                cx,
+                            )
+                            .await;
+                            match verdict {
+                                crate::approval::ReviewVerdict::Allow => free_tus.push(tu),
+                                crate::approval::ReviewVerdict::Ask { reason } => {
+                                    let id = tu.id.clone();
+                                    let _ = this.update(cx, |this, _cx| {
+                                        this.approval_ask_reasons.insert(id, reason);
+                                    });
+                                    approval_tus.push(tu);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Approval-free tools run in parallel; approval-needed tools run
@@ -1236,16 +1501,21 @@ impl Thread {
             return Ok(());
         }
 
-        // YOLO mode bypasses permission approvals: skip the authorization
-        // prompt entirely so the tool runs immediately. This is the
-        // session-level equivalent of codex's `approval_policy = Never`. Tools
-        // whose authorization flow IS their execution (`AskUserQuestion`) are
-        // exempt: bypassing them would drop the user's input and hit an
-        // unreachable `run`.
+        // YOLO/AutoReview bypasses the permission gate: skip the authorization
+        // prompt entirely so the tool runs immediately. YOLO is the
+        // session-level equivalent of codex's `approval_policy = Never`;
+        // AutoReview additionally consults the security-reviewer agent before
+        // allowing. Tools whose authorization flow IS their execution
+        // (`AskUserQuestion`) are exempt: bypassing them would drop the user's
+        // input and hit an unreachable `run`.
         let requires_user_input = tool.requires_user_input();
         let needs_approval = tool.requires_approval(&tu.input)
             && !this.read_with(cx, |this, _| {
-                (this.yolo && !requires_user_input) || this.permission.is_always_allowed(&name)
+                (matches!(
+                    this.approval_mode,
+                    ApprovalMode::Yolo | ApprovalMode::AutoReview
+                ) && !requires_user_input)
+                    || this.permission.is_always_allowed(&name)
             })?;
         if needs_approval {
             this.update(cx, |_, cx| {
@@ -1569,7 +1839,6 @@ impl Thread {
                 cx.emit(ThreadEvent::AgentThinking(text));
             }
             Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) => {
-                self.last_usage = Some(usage);
                 self.accumulate_token_usage(usage);
                 cx.emit(ThreadEvent::TokenUsageUpdated(self.cumulative_token_usage));
             }
@@ -1822,7 +2091,7 @@ impl Thread {
             crate::system_prompt::build_main_system_prompt(
                 &self.cwd,
                 self.project.as_deref(),
-                self.yolo,
+                self.approval_mode,
             )
         });
         // Sub-agents carry their own system prompt from `agents/*.md`; the main
@@ -2452,6 +2721,7 @@ mod tests {
             let mut rec =
                 crate::db::ThreadRecord::for_test("reg-yolo-ask-user", "/tmp", Vec::new());
             rec.yolo = true;
+            rec.approval_mode = crate::thread::ApprovalMode::Yolo.as_i64();
             super::Thread::restore(rec, None, cx)
         });
         let tu = LanguageModelToolUse {

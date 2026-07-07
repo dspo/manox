@@ -307,6 +307,20 @@ struct EditFileInput {
     /// across hunks. Ranges cover only changed lines; pure additions use
     /// `INS`, never a widened `SWAP`. On a stale-TAG rejection, re-`read_file`
     /// before retrying.
+    ///
+    /// Format gotchas (common miswrites): the range separator is `.=` not `:`
+    /// — write `SWAP 37.=48:` not `SWAP 37:=48:`. The body starts on the NEXT
+    /// line as `+`-prefixed rows, never on the same line as the directive.
+    /// Complete example:
+    #[doc = r""]
+    #[doc = r"```text"]
+    #[doc = r"[/Users/me/proj/main.py#A557]"]
+    #[doc = r"SWAP 37.=48:"]
+    #[doc = r#"+    if args.command == "add":"#]
+    #[doc = r"+        handler.add(args.title)"]
+    #[doc = r"+    else:"]
+    #[doc = r"+        parser.print_help()"]
+    #[doc = r"```"]
     patch: String,
 }
 

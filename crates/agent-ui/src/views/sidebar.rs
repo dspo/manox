@@ -9,11 +9,12 @@
 //! menu and bottom account footer are static decoration mirroring Codex.app's layout.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use agent::{ThreadStore, ThreadStoreEvent, i18n};
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, Pixels, Render, SharedString, Subscription, Window,
-    prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, Entity, EventEmitter,
+    Pixels, Render, SharedString, Subscription, Window, ease_in_out, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
@@ -33,6 +34,8 @@ pub enum SidebarEvent {
     RenameThread(String),
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
+    /// User toggled the pin indicator. The bool is the new pinned state.
+    PinThread(String, bool),
     /// User clicked the Conversation / Terminal tab switcher.
     FocusConversation,
     FocusTerminal,
@@ -67,8 +70,15 @@ impl Sidebar {
     pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
         let store = agent::thread_store_global();
         let sub = cx.subscribe(&store, |_this, _store, ev: &ThreadStoreEvent, cx| {
-            if matches!(ev, ThreadStoreEvent::SummariesUpdated) {
-                cx.notify();
+            // `SummariesUpdated` re-renders the whole list (a thread was
+            // created/saved/deleted). `RunningChanged` only flips the running
+            // indicator on one row, but a `cx.notify()` here is enough — the
+            // per-row `running` bool is recomputed in `render` from the store's
+            // `running()` and the shimmer animation starts/stops accordingly.
+            match ev {
+                ThreadStoreEvent::SummariesUpdated | ThreadStoreEvent::RunningChanged(_) => {
+                    cx.notify();
+                }
             }
         });
         Self {
@@ -112,6 +122,7 @@ impl Sidebar {
         path: &str,
         group: &[agent::ThreadSummary],
         selected: Option<&str>,
+        running_id: Option<&str>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -166,11 +177,16 @@ impl Sidebar {
             }));
 
         let rows = expanded.then(|| {
-            v_flex()
-                .gap_0p5()
-                .children(group.iter().enumerate().map(|(ix, s)| {
-                    render_thread_item(ix, s, selected == Some(s.id.as_str()), px(16.), theme, cx)
-                }))
+            v_flex().gap_0p5().children(group.iter().map(|s| {
+                render_thread_item(
+                    s,
+                    selected == Some(s.id.as_str()),
+                    running_id == Some(s.id.as_str()),
+                    px(16.),
+                    theme,
+                    cx,
+                )
+            }))
         });
 
         v_flex()
@@ -186,6 +202,9 @@ impl Render for Sidebar {
         let theme = cx.theme().clone();
         let summaries = self.store.read(cx).summaries().to_vec();
         let selected = self.selected.clone();
+        // The thread id currently running a turn, if any. Drives the per-row
+        // shimmer: only the row whose id matches lights up.
+        let running_id = self.store.read(cx).running().map(|s| s.to_string());
 
         // Partition into project-bound groups (keyed by project path, first-seen
         // order preserved) and the projectless remainder. `summaries` is already
@@ -288,27 +307,30 @@ impl Render for Sidebar {
                             .then(|| section_header(i18n::t("sidebar-section-projects"), &theme)),
                     )
                     .children(projects.into_iter().map(|(path, group)| {
-                        self.render_project_group(&path, &group, selected.as_deref(), &theme, cx)
+                        self.render_project_group(
+                            &path,
+                            &group,
+                            selected.as_deref(),
+                            running_id.as_deref(),
+                            &theme,
+                            cx,
+                        )
                     }))
                     .children(
                         (!loose.is_empty()).then(|| {
                             section_header(i18n::t("sidebar-section-conversations"), &theme)
                         }),
                     )
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .children(loose.iter().enumerate().map(|(ix, s)| {
-                                render_thread_item(
-                                    ix,
-                                    s,
-                                    selected.as_deref() == Some(s.id.as_str()),
-                                    px(0.),
-                                    &theme,
-                                    cx,
-                                )
-                            })),
-                    ),
+                    .child(v_flex().gap_0p5().children(loose.iter().map(|s| {
+                        render_thread_item(
+                            s,
+                            selected.as_deref() == Some(s.id.as_str()),
+                            running_id.as_deref() == Some(s.id.as_str()),
+                            px(0.),
+                            &theme,
+                            cx,
+                        )
+                    }))),
             )
     }
 }
@@ -406,12 +428,17 @@ fn section_header(label: SharedString, theme: &Theme) -> AnyElement {
 /// Render one conversation row. `indent` adds left padding so rows nested under
 /// a project folder align below its label. Two-row layout: title on top, tag +
 /// total tokens + relative time + rename/archive/delete actions on bottom. The
-/// thread-id tag uses outline style matching the model-menu wire-api tags; the
-/// action group is revealed only on hover, taking the place of the time + tokens.
+/// thread-id tag is clickable to copy the full thread id (F1); while `running`
+/// is true a highlight band sweeps across the tag (F2).
+///
+/// Element ids and the hover `group` key are derived from the thread's UUID, not
+/// a per-list enumerate index — the project groups and the loose list each
+/// enumerate from 0, so an index-keyed id collided across groups and routed
+/// clicks to the wrong row. The UUID is unique by construction.
 fn render_thread_item(
-    ix: usize,
     summary: &agent::ThreadSummary,
     selected: bool,
+    running: bool,
     indent: gpui::Pixels,
     theme: &Theme,
     cx: &mut Context<Sidebar>,
@@ -421,7 +448,10 @@ fn render_thread_item(
     let id_del = id.clone();
     let id_rename = id.clone();
     let id_archive = id.clone();
+    let id_pin = id.clone();
+    let id_copy = id.clone();
     let archive_to = !summary.archived;
+    let pin_to = !summary.pinned;
     let display = summary.display_title();
     let title = if display.is_empty() {
         i18n::t("sidebar-empty-summary").to_string()
@@ -435,18 +465,76 @@ fn render_thread_item(
     } else {
         theme.transparent
     };
-    let group = gpui::SharedString::from(format!("thread-row-{ix}"));
+    let group = gpui::SharedString::from(format!("thread-row-{id}"));
     // Short thread ID: first 8 chars of the UUID. Char-based so a non-ASCII
     // id (defensive — ids are hex today) cannot panic on a char boundary.
     let short_id: String = summary.id.chars().take(8).collect();
-    let tag_variant = if selected {
+    // Running threads share the selected (Primary) tag tint so the indicator
+    // reads as "active" even before the sweep animation paints.
+    let tag_variant = if selected || running {
         TagVariant::Primary
     } else {
         TagVariant::Secondary
     };
 
+    // F1: the tag sits inside a ghost Button so gpui-component's managed
+    // tooltip (only exposed on its own components) is available, and the
+    // click copies the full thread id. `stop_propagation` keeps the click
+    // from bubbling into the row's `OpenThread` handler. The Tag remains the
+    // visual; the Button contributes no box of its own in ghost mode.
+    let tag_button = Button::new(format!("thread-id-tag-{id}"))
+        .ghost()
+        .xsmall()
+        .compact()
+        .tooltip(i18n::t("sidebar-copy-thread-id"))
+        .cursor_pointer()
+        .child(
+            Tag::new()
+                .with_variant(tag_variant)
+                .outline()
+                .small()
+                .child(short_id),
+        )
+        .on_click(move |_ev, _window, cx: &mut App| {
+            cx.stop_propagation();
+            cx.write_to_clipboard(ClipboardItem::new_string(id_copy.clone()));
+        });
+
+    // F2: a relative+overflow-hidden wrapper around the tag so a sweeping
+    // highlight band — clipped to the wrapper — reads as light passing over
+    // the tag while the turn is live. `Animation::repeat` loops forever; the
+    // band is only attached when `running`, so idle rows pay no animation cost.
+    let tag_wrapper = gpui::div().relative().overflow_hidden().child(tag_button);
+    let tag_element: AnyElement = if running {
+        // `accent` is `Copy` (`Hsla`); lift it out of the `&Theme` borrow so the
+        // `'static` animator closure (which rebuilds the band each frame) can
+        // own a copy instead of borrowing `theme` past the function body.
+        let accent = theme.accent;
+        tag_wrapper
+            .with_animation(
+                format!("thread-running-shimmer-{id}"),
+                Animation::new(Duration::from_millis(1400))
+                    .repeat()
+                    .with_easing(ease_in_out),
+                move |el, delta| {
+                    el.child(
+                        gpui::div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(12.))
+                            .bg(accent.opacity(0.55))
+                            .left(px(-20. + 120. * delta)),
+                    )
+                },
+            )
+            .into_any_element()
+    } else {
+        tag_wrapper.into_any_element()
+    };
+
     h_flex()
-        .id(("thread-item", ix))
+        .id(format!("thread-item-{id}"))
         .group(group.clone())
         .w_full()
         .pl(px(8.) + indent)
@@ -465,14 +553,25 @@ fn render_thread_item(
                 .gap_0p5()
                 .flex_1()
                 .min_w_0()
-                // Row 1: title (full width, no inline tag clutter).
+                // Row 1: title (full width, no inline tag clutter). A small
+                // pin star sits inline when the thread is pinned, so the
+                // floating-to-top ordering has a visible marker.
                 .child(
-                    gpui::div()
+                    h_flex()
+                        .gap_1()
+                        .items_center()
                         .min_w_0()
-                        .overflow_hidden()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(title),
+                        .when(summary.pinned, |this| {
+                            this.child(Icon::new(IconName::Star).xsmall().text_color(theme.accent))
+                        })
+                        .child(
+                            gpui::div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_sm()
+                                .text_color(theme.foreground)
+                                .child(title),
+                        ),
                 )
                 // Row 2: tag + tokens + relative time, with rename/archive/delete
                 // actions taking their place on hover.
@@ -480,13 +579,7 @@ fn render_thread_item(
                     h_flex()
                         .gap_1()
                         .items_center()
-                        .child(
-                            Tag::new()
-                                .with_variant(tag_variant)
-                                .outline()
-                                .small()
-                                .child(short_id),
-                        )
+                        .child(tag_element)
                         // Tokens + relative time, hidden on hover so the action
                         // buttons can take their place. `min_w_0` + overflow
                         // hidden so a narrow sidebar clips rather than overflows.
@@ -501,14 +594,14 @@ fn render_thread_item(
                                 .child(gpui::div().child(tokens))
                                 .child(gpui::div().child(updated)),
                         )
-                        // Action group (rename / archive / delete), revealed on hover.
+                        // Action group (rename / pin / archive / delete), revealed on hover.
                         .child(
                             h_flex()
                                 .gap_0p5()
                                 .invisible()
                                 .group_hover(group.clone(), |s| s.visible())
                                 .child(
-                                    Button::new(("rename-thread", ix))
+                                    Button::new(format!("rename-thread-{id_rename}"))
                                         .ghost()
                                         .xsmall()
                                         .icon(IconName::Replace)
@@ -517,7 +610,23 @@ fn render_thread_item(
                                         })),
                                 )
                                 .child(
-                                    Button::new(("archive-thread", ix))
+                                    Button::new(format!("pin-thread-{id_pin}"))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(if pin_to {
+                                            IconName::StarOff
+                                        } else {
+                                            IconName::Star
+                                        })
+                                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
+                                            cx.emit(SidebarEvent::PinThread(
+                                                id_pin.clone(),
+                                                pin_to,
+                                            ));
+                                        })),
+                                )
+                                .child(
+                                    Button::new(format!("archive-thread-{id_archive}"))
                                         .ghost()
                                         .xsmall()
                                         .icon(IconName::Inbox)
@@ -529,7 +638,7 @@ fn render_thread_item(
                                         })),
                                 )
                                 .child(
-                                    Button::new(("del-thread", ix))
+                                    Button::new(format!("del-thread-{id_del}"))
                                         .ghost()
                                         .xsmall()
                                         .icon(IconName::Close)

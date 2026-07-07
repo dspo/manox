@@ -205,6 +205,10 @@ impl ConversationState {
             ThreadEvent::TokenUsageUpdated(_) | ThreadEvent::ModelChanged { .. } => {
                 ApplyOutcome::None
             }
+            // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
+            // workspace to light the sidebar running indicator; it carries no
+            // conversation content.
+            ThreadEvent::TurnStarted => ApplyOutcome::None,
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
@@ -491,12 +495,13 @@ impl ConversationState {
                 }));
                 ApplyOutcome::Appended
             }
-            ThreadEvent::YoloToggled { .. } => {
+            ThreadEvent::ApprovalModeChanged { .. } => {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
                 ApplyOutcome::None
             }
             ThreadEvent::PrefixStability { .. } => {
-                // UI state (cache chip) handled by `Workspace`; not a conversation item.
+                // Cache discipline signal: no conversation item, the drift
+                // flags are only consumed by debug telemetry views (if at all).
                 ApplyOutcome::None
             }
         }

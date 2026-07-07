@@ -5,6 +5,7 @@
 //! `~/.config/cx/cx.providers.config.yaml`.
 
 pub mod agent_def;
+pub mod approval;
 pub mod command;
 pub mod db;
 pub mod frontmatter;

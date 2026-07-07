@@ -11,6 +11,7 @@ sidebar-plugins = 插件
 sidebar-section-projects = 项目
 sidebar-section-conversations = 对话
 sidebar-empty-summary = (新对话)
+sidebar-copy-thread-id = 复制 thread id
 sidebar-time-just-now = 刚刚
 sidebar-time-minutes = {$count} 分钟前
 sidebar-time-hours = {$count} 小时前
@@ -239,10 +240,33 @@ workspace-rename-title = 重命名对话
 workspace-rename-prompt = 输入新标题。留空则清除自定义名称，回退到生成的摘要。
 workspace-rename-confirm = 保存
 workspace-mode-normal = 普通
-workspace-mode-yolo = YOLO 模式
 workspace-mode-section = 模式
-workspace-yolo-on-notice = YOLO 模式已开启：工具调用免审批，bash 在沙箱外运行。
-workspace-yolo-off-notice = 已切换到普通模式：恢复审批与沙箱。
+workspace-mode-on-request-title = 请求审批
+workspace-mode-on-request-desc = 编辑外部文件或使用网络时总是询问
+workspace-mode-auto-review-title = 替我审批
+workspace-mode-auto-review-desc = 仅对检测到的风险操作请求审批
+workspace-mode-yolo-title = 完全访问
+workspace-mode-yolo-desc = 不受限制地访问互联网和电脑上的任何文件
+workspace-chip-mode-on-request = 请求审批
+workspace-chip-mode-auto-review = 替我审批
+workspace-chip-mode-yolo = 完全访问
+workspace-mode-title = 如何批准 Codex 操作？
+workspace-mode-learn-more = 了解更多
+workspace-mode-custom-title = 自定义 (config.toml)
+workspace-mode-custom-desc = 使用 config.toml 中定义的权限
+workspace-mode-notice = { $mode ->
+    [on-request] 已切换到请求审批模式。
+    [auto-review] 替我审批模式：安全工具调用免提示，风险操作仍会询问。
+   *[yolo] 完全访问：工具调用免审批，bash 在沙箱外运行。
+}
+workspace-approval-auto-review-note = 自动审核：{$reason}
+workspace-project-choose = 选择项目
+workspace-project-new = 新建项目
+workspace-project-blank = 新建空白项目
+workspace-project-select-folder = 选择文件夹
+workspace-project-name-prompt = 项目文件夹名称
+workspace-yolo-on-notice = 完全访问已开启：工具调用免审批，bash 在沙箱外运行。
+workspace-yolo-off-notice = 已切换到请求审批模式：恢复审批与沙箱。
 workspace-empty-prompt = 我们该做什么？
 
 ### views/composer_menu.rs
@@ -252,8 +276,6 @@ composer-commands-label = 命令
 composer-memory-label = 记忆
 composer-skills-label = 技能
 composer-add-files = 文件和文件夹
-composer-choose-project = 选择项目
-composer-choose-project-desc = 绑定项目目录
 composer-attach-zed = 附加 Zed
 composer-goal-name = 目标
 composer-goal-desc = 设置持续努力实现的目标
@@ -264,7 +286,7 @@ composer-tag-personal = 个人
 composer-tag-system = 系统
 
 ### slash_command.rs
-slash-yolo-desc = 切换 YOLO 模式（免审批 + bash 沙箱外）；带提示词则开启后直接开工
+slash-yolo-desc = 切换到完全访问（免审批 + bash 沙箱外）；带提示词则切换后直接开工
 slash-plan-desc = 进入计划模式：仅允许只读工具，研究后提交计划待批准（裸 `/plan` 切换；`/plan <提示>` 带提示进入）
 
 ### main.rs (system menus)
@@ -281,3 +303,31 @@ tab-terminal = 终端
 terminal-placeholder = 终端运行中… 输入以交互
 terminal-exited = 终端已退出，退出码 { $code }
 terminal-search-status = 搜索：{ $pattern }（{ $count } 处匹配）
+
+### views/title_menu.rs
+titlebar-menu-label = 对话
+titlebar-pin = 置顶会话
+titlebar-unpin = 取消置顶
+titlebar-rename = 重命名对话
+titlebar-archive = 归档对话
+titlebar-unarchive = 取消归档
+titlebar-sidebar-toggle = 打开侧边聊天
+titlebar-copy-label = 复制
+titlebar-copy-id = 复制会话 ID
+titlebar-copy-markdown = 复制为 Markdown
+titlebar-copy-cwd = 复制工作目录
+titlebar-copy-deeplink = 复制深度链接
+titlebar-branch-label = 分支
+titlebar-branch-from-here = 从当前消息分支
+titlebar-branch-from-start = 从对话起点分支
+titlebar-schedule = 添加计划任务...
+titlebar-new-window = 在新窗口中打开
+titlebar-copied-id = 会话 ID 已复制到剪贴板。
+titlebar-copied-cwd = 工作目录已复制到剪贴板。
+titlebar-copied-deeplink = 深度链接已复制到剪贴板（manox://thread/{ $id }）。
+titlebar-copied-markdown = 会话已复制为 Markdown 到剪贴板。
+titlebar-pinned-notice = 会话已置顶。
+titlebar-unpinned-notice = 会话已取消置顶。
+titlebar-archive-notice = 会话已归档。
+titlebar-not-implemented = 尚未实现。
+titlebar-rename-notice = 已打开重命名对话框。
