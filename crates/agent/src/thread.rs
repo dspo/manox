@@ -96,9 +96,11 @@ pub enum ThreadEvent {
     /// approval overlay; resolution arrives via `respond_plan_approval`.
     PlanProposed { id: String, plan_text: String },
     /// The prefix-stability fingerprint for this turn vs. the previous one.
-    /// Emitted on every turn with the current stability ratio plus the drift
-    /// flags so the UI can render a `cache: NN%` chip; `system_changed` /
-    /// `tools_changed` are `true` only when that component drifted this turn.
+    /// Emitted every turn with the current stability ratio plus the drift
+    /// flags so subscribers (e.g. future telemetry or debug views) can
+    /// observe cache discipline without scraping internal state. The
+    /// composer chip that used to render this was removed in #62; the
+    /// event is still emitted for forward-compat subscribers.
     PrefixStability {
         stability_pct: u16,
         system_changed: bool,
@@ -193,10 +195,6 @@ pub struct Thread {
     /// is observable rather than silently busting the provider's prefix cache.
     /// See [`crate::prefix_stability`].
     prefix_stability: StablePrefix,
-    /// The most recent `TokenUsage` reported by the provider (cache read /
-    /// creation counts), surfaced alongside the stability chip so the user can
-    /// confirm cache hits by token count, not just by ratio.
-    last_usage: Option<TokenUsage>,
     /// User-supplied rename; takes display precedence over the LLM `title`.
     /// Setting it must NOT suppress `maybe_generate_title` (the LLM may still
     /// update `title` underneath); the sidebar reads `title_override` first.
@@ -272,7 +270,6 @@ impl Thread {
                 title_in_flight: false,
                 title_last_eval_user_count: None,
                 prefix_stability: StablePrefix::default(),
-                last_usage: None,
                 title_override: None,
                 provider_id,
                 parent_id: None,
@@ -344,7 +341,6 @@ impl Thread {
                 title_in_flight: false,
                 title_last_eval_user_count,
                 prefix_stability: StablePrefix::default(),
-                last_usage: None,
                 title_override: rec.title_override,
                 provider_id,
                 parent_id: rec.parent_id,
@@ -411,7 +407,6 @@ impl Thread {
                 title_in_flight: false,
                 title_last_eval_user_count: None,
                 prefix_stability: StablePrefix::default(),
-                last_usage: None,
                 title_override: None,
                 provider_id: None,
                 parent_id: None,
@@ -784,18 +779,6 @@ impl Thread {
 
     pub fn project(&self) -> Option<&PathBuf> {
         self.project.as_ref()
-    }
-
-    /// Prefix-stability ratio as a whole-percent `u16` (0–100). 100 means the
-    /// system prompt + tool-spec prefix has never drifted across turns.
-    pub fn prefix_stability_pct(&self) -> u16 {
-        self.prefix_stability.stability_pct()
-    }
-
-    /// The most recent provider-reported token usage (cache read/creation
-    /// counts), or `None` if the provider has not reported any yet.
-    pub fn last_cache_usage(&self) -> Option<TokenUsage> {
-        self.last_usage
     }
 
     pub fn turn_count(&self) -> u32 {
@@ -1580,7 +1563,6 @@ impl Thread {
                 cx.emit(ThreadEvent::AgentThinking(text));
             }
             Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) => {
-                self.last_usage = Some(usage);
                 self.accumulate_token_usage(usage);
                 cx.emit(ThreadEvent::TokenUsageUpdated(self.cumulative_token_usage));
             }

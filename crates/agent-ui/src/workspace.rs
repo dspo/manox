@@ -416,7 +416,9 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::PrefixStability { .. } => {
-                    // Refresh the `cache: NN%` chip in the composer status row.
+                    // Per-turn cache stability signal. The composer chip that
+                    // used to render this was removed in #62; the event stays
+                    // emitted for any future telemetry/debug subscriber.
                     cx.notify();
                 }
                 _ => {
