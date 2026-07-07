@@ -439,22 +439,12 @@ impl Workspace {
                     // into the matching ToolCall item for markdown rendering.
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
-                    let outcome = this
+                    // The flat column self-measures, so the outcome no longer
+                    // drives list splices/remeasures — a plain notify re-lays
+                    // out the column and `on_prepaint` re-pins the tail.
+                    let _ = this
                         .conversation
                         .update(cx, |c, cx| c.apply(ev, &role, None, weak, cx));
-                    let count = this.conversation.read(cx).items().len();
-                    match outcome {
-                        ApplyOutcome::None => {}
-                        ApplyOutcome::Remeasure(ix) => {
-                            this.list_state.remeasure_items(ix..ix + 1);
-                        }
-                        ApplyOutcome::Appended => {
-                            this.list_state.splice(count - 1..count - 1, 1);
-                        }
-                        ApplyOutcome::All => {
-                            this.list_state.remeasure_items(0..count);
-                        }
-                    }
                     cx.notify();
                 }
                 ThreadEvent::ApprovalModeChanged { .. } => {
@@ -490,16 +480,13 @@ impl Workspace {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
-                    let outcome = this
+                    let _ = this
                         .conversation
                         .update(cx, |c, cx| c.apply(ev, &role, usage, weak, cx));
-                    // Stop flips every streaming flag off, so finalized bodies
-                    // switch to `TextView::markdown` and need their real height
-                    // measured across the whole list.
-                    if matches!(outcome, ApplyOutcome::All) {
-                        let count = this.conversation.read(cx).items().len();
-                        this.list_state.remeasure_items(0..count);
-                    }
+                    // Stop flips streaming flags off, so finalized bodies switch
+                    // to `TextView::markdown` and grow (async parse) a frame or
+                    // two later. The flat column re-lays out on notify and
+                    // `on_prepaint` keeps the tail pinned across that growth.
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
                         let thread_id = this.thread.read(cx).id.0.clone();
@@ -535,51 +522,26 @@ impl Workspace {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
-                    let outcome = this
+                    let _ = this
                         .conversation
                         .update(cx, |c, cx| c.apply(ev, &role, usage, weak, cx));
                     // Sub-agent tool results carry the child conversation in
                     // their JSON envelope; feed it into the matching AgentTask
                     // card's expandable panel. The envelope is the single
                     // source of truth (also used on reload).
-                    let remeasure_sub = if let ThreadEvent::ToolResult { id, output, .. } = ev
+                    if let ThreadEvent::ToolResult { id, output, .. } = ev
                         && let Some(msgs) = agent::tools::agent::agent_sub_messages(output)
                     {
                         this.conversation
-                            .update(cx, |c, cx| c.set_agent_sub_messages(id, msgs, cx))
-                    } else {
-                        None
-                    };
-                    let count = this.conversation.read(cx).items().len();
-                    match outcome {
-                        ApplyOutcome::None => {}
-                        ApplyOutcome::Remeasure(ix) => {
-                            this.list_state.remeasure_items(ix..ix + 1);
-                        }
-                        // A new item appended at the end; grow the list count.
-                        // FollowMode::Tail keeps the viewport pinned to the new
-                        // tail automatically when the user is at the bottom.
-                        ApplyOutcome::Appended if count > 0 => {
-                            this.list_state.splice(count - 1..count - 1, 1);
-                        }
-                        ApplyOutcome::All => {
-                            this.list_state.remeasure_items(0..count);
-                        }
-                        ApplyOutcome::Appended => {}
+                            .update(cx, |c, cx| c.set_agent_sub_messages(id, msgs, cx));
                     }
-                    if let Some(ix) = remeasure_sub {
-                        this.list_state.remeasure_items(ix..ix + 1);
-                    }
+                    // The flat column self-measures every frame, so no list
+                    // splice/remeasure is needed; `on_prepaint` re-pins the
+                    // tail while `stick_to_bottom` holds. Just re-render.
                     cx.notify();
                 }
             }
         })
-    }
-
-    /// `ListState` handle, shared with `AgentTask` cards so an expand/collapse
-    /// toggle can invalidate the cached per-item height.
-    pub(crate) fn list_state(&self) -> &ListState {
-        &self.list_state
     }
 
     /// The Codex-style outline rail: one equal-length tick per user turn,
