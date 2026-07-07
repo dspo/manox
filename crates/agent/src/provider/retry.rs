@@ -40,19 +40,40 @@ const CANCEL_POLL: Duration = Duration::from_millis(100);
 
 /// HTTP statuses whose failure is likely to resolve on retry. The unofficial
 /// 529 ("service overloaded") is included — Anthropic emits it in practice.
+/// 520–524 are Cloudflare gateway errors common to provider front-ends.
 fn should_retry_status(status: StatusCode) -> bool {
     matches!(
         status.as_u16(),
-        408 | 409 | 429 | 500 | 502 | 503 | 504 | 529
+        408 | 429 | 500 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524 | 529
     )
 }
 
-/// reqwest errors worth retrying: connection / timeout / excessive redirects.
-/// Builder-level errors (`is_builder`, `is_request`) are not retried — they
-/// reproduce on every attempt. Decode errors mean the server already answered
-/// and the body is unusable; retrying the same response is unlikely to help.
+/// reqwest errors worth retrying. `is_connect` covers only the connect phase,
+/// so a connection reset / broken pipe / HTTP-2 stream reset mid-request (the
+/// common transient-transport class) is caught via the source-chain io kind.
+/// Request-construction (`is_request`) and body-serialization (`is_body`)
+/// errors reproduce identically and are never retried.
 fn is_retryable_send_error(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout() || err.is_redirect()
+    if err.is_connect() || err.is_timeout() || err.is_redirect() {
+        return true;
+    }
+    let mut source: Option<&dyn std::error::Error> = Some(err);
+    while let Some(s) = source {
+        if let Some(io) = s.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        {
+            return true;
+        }
+        source = s.source();
+    }
+    false
 }
 
 /// Parse `Retry-After`-style headers. Supports the non-standard
@@ -70,7 +91,9 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     }
     let s = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
     s.parse::<u64>().ok().map(Duration::from_secs)
-}/// Exponential backoff for `attempt` (1-indexed): `BASE_DELAY * 2^(attempt-1)`,
+}
+
+/// Exponential backoff for `attempt` (1-indexed): `BASE_DELAY * 2^(attempt-1)`,
 /// ±20% jitter, capped at `MAX_DELAY`. The cap applies after jitter so a
 /// jittered value can never exceed `MAX_DELAY`.
 fn backoff(attempt: u32) -> Duration {
@@ -157,21 +180,22 @@ where
                         .await;
                     return Err(anyhow!("{label} returned {status}"));
                 }
+                let delay = retry_delay(attempt, retry_after);
                 tracing::warn!(
                     target: "provider",
                     attempt, max_attempts = MAX_ATTEMPTS,
                     status = %status,
-                    delay_secs = retry_delay(attempt, retry_after).as_secs(),
+                    delay_secs = delay.as_secs(),
                     "{label} transient status, retrying"
                 );
                 let _ = tx
                     .send(Ok(LanguageModelCompletionEvent::Retry {
                         attempt,
                         max_attempts: MAX_ATTEMPTS,
-                        delay_secs: retry_delay(attempt, retry_after).as_secs(),
+                        delay_secs: delay.as_secs(),
                     }))
                     .await;
-                if !wait_or_cancelled(retry_delay(attempt, retry_after), tx).await {
+                if !wait_or_cancelled(delay, tx).await {
                     return Err(anyhow!("stream receiver closed during retry"));
                 }
             }
@@ -182,21 +206,22 @@ where
                         .await;
                     return Err(anyhow!("{label} send failed: {err}"));
                 }
+                let delay = backoff(attempt);
                 tracing::warn!(
                     target: "provider",
                     attempt, max_attempts = MAX_ATTEMPTS,
                     error = %err,
-                    delay_secs = backoff(attempt).as_secs(),
+                    delay_secs = delay.as_secs(),
                     "{label} send error, retrying"
                 );
                 let _ = tx
                     .send(Ok(LanguageModelCompletionEvent::Retry {
                         attempt,
                         max_attempts: MAX_ATTEMPTS,
-                        delay_secs: backoff(attempt).as_secs(),
+                        delay_secs: delay.as_secs(),
                     }))
                     .await;
-                if !wait_or_cancelled(backoff(attempt), tx).await {
+                if !wait_or_cancelled(delay, tx).await {
                     return Err(anyhow!("stream receiver closed during retry"));
                 }
             }
@@ -210,10 +235,10 @@ mod tests {
 
     #[test]
     fn retryable_statuses() {
-        for s in [408, 409, 429, 500, 502, 503, 504, 529] {
+        for s in [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
             assert!(should_retry_status(StatusCode::from_u16(s).unwrap()), "{s}");
         }
-        for s in [400, 401, 403, 404, 422, 451] {
+        for s in [400, 401, 403, 404, 409, 422, 451] {
             assert!(!should_retry_status(StatusCode::from_u16(s).unwrap()), "{s}");
         }
     }
@@ -221,14 +246,15 @@ mod tests {
     #[test]
     fn backoff_is_bounded_and_nondecreasing_in_mean() {
         // Without jitter the base grows as 1,2,4,8,16,30 (capped). With ±20%
-        // jitter each sample stays in [0.8×base, 1.2×base] ∩ [0.05, 30].
+        // jitter each sample stays in [0.8×base, 1.2×base] ∩ [0.05, MAX_DELAY].
+        // The cap applies after jitter, so no sample exceeds MAX_DELAY.
         for attempt in 1..=MAX_ATTEMPTS {
             let d = backoff(attempt);
             assert!(d >= Duration::from_millis(40), "attempt {attempt}: {d:?}");
-            assert!(d <= MAX_DELAY + Duration::from_millis(100), "attempt {attempt}: {d:?}");
+            assert!(d <= MAX_DELAY, "attempt {attempt}: {d:?} exceeds cap");
         }
-        // Cap enforced.
-        assert!(backoff(100) <= MAX_DELAY + Duration::from_millis(100));
+        // Cap enforced even at extreme attempt counts.
+        assert!(backoff(100) <= MAX_DELAY);
     }
 
     #[test]
