@@ -214,6 +214,11 @@ pub fn render_item(
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx),
         ConvItem::Error(msg) => render_error(msg, ix, theme),
         ConvItem::Notice(msg) => render_notice(msg, ix, theme),
+        ConvItem::Retry {
+            attempt,
+            max_attempts,
+            delay_secs,
+        } => render_retry(*attempt, *max_attempts, *delay_secs, ix, theme),
     }
 }
 
@@ -532,6 +537,47 @@ pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .text_sm()
                 .text_color(theme.foreground)
                 .child(markdown_tv(("notice", ix), msg.to_string(), theme, false)),
+        )
+        .into_any_element()
+}
+
+/// Transient retry badge shown while the provider backs off after a 429 / 5xx
+/// / network error. Replaced in place by the first real content or terminal
+/// error event. Amber-toned to read as "waiting, not failed".
+pub fn render_retry(
+    attempt: u32,
+    max_attempts: u32,
+    delay_secs: u64,
+    ix: usize,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    let label = i18n::t_str(
+        "retry-badge",
+        &[
+            ("attempt", &attempt.to_string()),
+            ("max", &max_attempts.to_string()),
+            ("secs", &delay_secs.to_string()),
+        ],
+    );
+    h_flex()
+        .group(format!("retry-{ix}"))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded(theme.radius)
+        .bg(theme.warning.opacity(0.12))
+        .child(
+            Icon::new(IconName::LoaderCircle)
+                .small()
+                .text_color(theme.warning),
+        )
+        .child(
+            gpui::div()
+                .text_sm()
+                .text_color(theme.warning)
+                .child(label),
         )
         .into_any_element()
 }

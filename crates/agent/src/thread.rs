@@ -135,6 +135,14 @@ pub enum ThreadEvent {
     TurnStarted,
     /// A completion turn ended.
     Stop(StopReason),
+    /// The provider is retrying the HTTP handshake after a transient failure
+    /// (429 / 5xx / network error). The UI shows a retry badge; the next
+    /// non-`Retry` event resolves it.
+    Retry {
+        attempt: u32,
+        max_attempts: u32,
+        delay_secs: u64,
+    },
     /// An error during streaming.
     Error(anyhow::Error),
     /// The model called `exit_plan_mode` and submitted a plan. The UI shows an
@@ -1820,6 +1828,17 @@ impl Thread {
                     }),
                 );
                 cx.emit(ThreadEvent::Stop(reason));
+            }
+            Ok(LanguageModelCompletionEvent::Retry {
+                attempt,
+                max_attempts,
+                delay_secs,
+            }) => {
+                cx.emit(ThreadEvent::Retry {
+                    attempt,
+                    max_attempts,
+                    delay_secs,
+                });
             }
             Ok(LanguageModelCompletionEvent::ToolUse(tu)) => {
                 // Only persist/enqueue once the input is complete (ContentBlockStop).

@@ -250,6 +250,16 @@ pub enum LanguageModelCompletionEvent {
     /// are not silently lost.
     UsageUpdate(TokenUsage),
     Stop(StopReason),
+    /// Provider is retrying the HTTP handshake after a transient failure
+    /// (429 / 5xx / network error). Emitted before each backoff sleep so the
+    /// UI can surface a retry badge; the next non-`Retry` event resolves it.
+    /// Carries no error text — raw error strings stay in tracing logs and out
+    /// of user-facing UI.
+    Retry {
+        attempt: u32,
+        max_attempts: u32,
+        delay_secs: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]

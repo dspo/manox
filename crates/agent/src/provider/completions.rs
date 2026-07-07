@@ -152,20 +152,32 @@ pub async fn stream_completions(
         .build()
         .context("构建 reqwest client 失败")?;
 
-    let response = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .context("调用 Completions API 失败")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Completions API 返回 {status}: {body}"));
-    }
+    // Retry the handshake (429 / 5xx / network errors) before any SSE event is
+    // forwarded. The body is shared by reference so every attempt sends the
+    // byte-identical request — provider-side prompt caching is unaffected.
+    let url_owned = url.to_string();
+    let api_key_owned = api_key.to_string();
+    let response = match crate::provider::retry::send_with_retry(
+        || {
+            let client = client.clone();
+            client
+                .post(&url_owned)
+                .header("Content-Type", "application/json")
+                .bearer_auth(&api_key_owned)
+                .json(&body)
+                .send()
+        },
+        &tx,
+        "Completions API",
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        // Terminal failure or cancellation — the error has already been
+        // forwarded through `tx` (or the receiver was dropped). Stop the stream
+        // without emitting a second error.
+        Err(_) => return Ok(()),
+    };
 
     let mut mapper = CompletionsEventMapper::new();
     let mut stream = response.bytes_stream();
