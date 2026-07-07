@@ -236,9 +236,6 @@ workspace-ask-next = 下一步
 workspace-ask-response = 自由回复（覆盖所有选项）
 workspace-cancel = 取消
 workspace-submit = 提交
-workspace-rename-title = 重命名对话
-workspace-rename-prompt = 输入新标题。留空则清除自定义名称，回退到生成的摘要。
-workspace-rename-confirm = 保存
 workspace-mode-normal = 普通
 workspace-mode-section = 模式
 workspace-mode-on-request-title = 请求审批
@@ -310,9 +307,6 @@ terminal-search-status = 搜索：{ $pattern }（{ $count } 处匹配）
 
 ### views/title_menu.rs
 titlebar-menu-label = 对话
-titlebar-pin = 置顶会话
-titlebar-unpin = 取消置顶
-titlebar-rename = 重命名对话
 titlebar-archive = 归档对话
 titlebar-unarchive = 取消归档
 titlebar-sidebar-toggle = 打开侧边聊天
@@ -330,11 +324,8 @@ titlebar-copied-id = 会话 ID 已复制到剪贴板。
 titlebar-copied-cwd = 工作目录已复制到剪贴板。
 titlebar-copied-deeplink = 深度链接已复制到剪贴板（manox://thread/{ $id }）。
 titlebar-copied-markdown = 会话已复制为 Markdown 到剪贴板。
-titlebar-pinned-notice = 会话已置顶。
-titlebar-unpinned-notice = 会话已取消置顶。
 titlebar-archive-notice = 会话已归档。
 titlebar-not-implemented = 尚未实现。
-titlebar-rename-notice = 已打开重命名对话框。
 
 # ── 环境信息面板 ──────────────────────────────────────────────────────
 workspace-env-title = 环境信息

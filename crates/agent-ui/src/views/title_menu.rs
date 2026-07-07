@@ -20,8 +20,6 @@ type RowHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 /// into each row's `on_click` (and into the submenus, where they need to be
 /// shared across parent and child builders).
 pub struct TitleMenuCallbacks {
-    pub on_pin: RowHandler,
-    pub on_rename: RowHandler,
     pub on_archive: RowHandler,
     pub on_copy_id: RowHandler,
     pub on_copy_markdown: RowHandler,
@@ -29,9 +27,6 @@ pub struct TitleMenuCallbacks {
     pub on_copy_deeplink: RowHandler,
     pub on_schedule: RowHandler,
     pub on_new_window: RowHandler,
-    /// True when the active thread is already pinned — toggles the row label
-    /// between "Pin" and "Unpin".
-    pub is_pinned: bool,
     /// True when the active thread is already archived — toggles the row label
     /// between "Archive" and "Unarchive".
     pub is_archived: bool,
@@ -46,23 +41,6 @@ pub fn build_title_menu(
     cb: TitleMenuCallbacks,
 ) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(280.));
-
-    menu = menu.item(
-        PopupMenuItem::new(if cb.is_pinned {
-            i18n::t("titlebar-unpin")
-        } else {
-            i18n::t("titlebar-pin")
-        })
-        .on_click({
-            let on_pin = cb.on_pin.clone();
-            move |ev, window, cx| on_pin(ev, window, cx)
-        }),
-    );
-
-    menu = menu.item(PopupMenuItem::new(i18n::t("titlebar-rename")).on_click({
-        let on_rename = cb.on_rename.clone();
-        move |ev, window, cx| on_rename(ev, window, cx)
-    }));
 
     menu = menu.item(
         PopupMenuItem::new(if cb.is_archived {
