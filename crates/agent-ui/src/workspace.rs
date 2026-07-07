@@ -41,8 +41,13 @@ use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
 };
 use crate::views::settings::{SettingsEvent, SettingsView};
-use crate::views::sidebar::{Sidebar, SidebarEvent};
-use crate::{AskCancel, AskNext, AskPrev, OpenSettings};
+use crate::views::sidebar::{ActiveTab, Sidebar, SidebarEvent};
+use crate::{
+    AskCancel, AskNext, AskPrev, CloseTerminalTab, FocusConversation, FocusTerminal,
+    NewTerminalTab, OpenSettings,
+};
+use terminal::Terminal;
+use terminal_ui::TerminalView;
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
 struct PendingAuth {
@@ -180,16 +185,21 @@ pub struct Workspace {
     /// cost when the user never opens Settings.
     settings_view: Option<Entity<SettingsView>>,
     settings_sub: Option<Subscription>,
+    /// The terminal tab's view, lazily created on the first `FocusTerminal` /
+    /// `NewTerminalTab`. `None` until then. Dropped on `CloseTerminalTab`.
+    terminal_view: Option<Entity<TerminalView>>,
 }
 
-/// Top-level rendering mode of the Workspace window. The Settings overlay is
-/// the only non-default mode today; future overlays (e.g. About) can extend
-/// this enum rather than carrying parallel `bool` flags.
+/// Top-level rendering mode of the Workspace window. `Settings` and
+/// `Terminal` are full-pane switches off the default `Workspace` (conversation)
+/// mode; future overlays can extend this enum rather than carrying parallel
+/// `bool` flags.
 #[derive(Default)]
 enum ViewMode {
     #[default]
     Workspace,
     Settings,
+    Terminal,
 }
 
 /// Right-side composer width. Wide enough for rendered markdown
@@ -311,6 +321,7 @@ impl Workspace {
             settings_transition_gen: 0,
             settings_view: None,
             settings_sub: None,
+            terminal_view: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
@@ -470,6 +481,8 @@ impl Workspace {
                 let store = agent::thread_store_global();
                 store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
             }
+            SidebarEvent::FocusConversation => this.focus_conversation(cx),
+            SidebarEvent::FocusTerminal => this.focus_terminal(cx),
         })
     }
 
@@ -527,6 +540,48 @@ impl Workspace {
                 .detach();
             }
         })
+    }
+
+    /// Switch to the conversation pane. The sidebar highlight follows.
+    pub fn focus_conversation(&mut self, cx: &mut Context<Self>) {
+        self.view_mode = ViewMode::Workspace;
+        self.sidebar
+            .update(cx, |s, cx| s.set_active_tab(ActiveTab::Conversation, cx));
+        cx.notify();
+    }
+
+    /// Switch to the terminal pane, creating the terminal tab on first focus.
+    /// The terminal runs in the workspace's cwd with the user's shell.
+    pub fn focus_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_view.is_none() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let terminal = match Terminal::new(id, self.cwd.clone(), 80, 24, cx) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to spawn terminal");
+                    return;
+                }
+            };
+            self.terminal_view = Some(TerminalView::new(terminal, cx));
+        }
+        self.view_mode = ViewMode::Terminal;
+        self.sidebar
+            .update(cx, |s, cx| s.set_active_tab(ActiveTab::Terminal, cx));
+        cx.notify();
+    }
+
+    /// Open a fresh terminal tab (cmd-t). If one already exists it is reused
+    /// rather than replaced, so an in-flight session isn't killed.
+    pub fn open_terminal_tab(&mut self, cx: &mut Context<Self>) {
+        self.focus_terminal(cx);
+    }
+
+    /// Close the terminal tab and return to the conversation pane. Dropping
+    /// the `TerminalView` drops the underlying `Terminal`, whose `PtyHandle`
+    /// kills the child and joins the reader/waiter threads.
+    pub fn close_terminal_tab(&mut self, cx: &mut Context<Self>) {
+        self.terminal_view = None;
+        self.focus_conversation(cx);
     }
 
     fn subscribe_input(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
@@ -2399,6 +2454,62 @@ impl Render for Workspace {
             );
             return h_flex().size_full().child(anim_el);
         }
+        // Terminal pane: sidebar (for tab switching) + a full-bleed terminal
+        // view filling the main column. The terminal view owns its PTY and
+        // grid; this branch only mounts it. Resize/scrollback/selection are
+        // handled inside `TerminalView` / `TerminalElement`.
+        if matches!(self.view_mode, ViewMode::Terminal) {
+            let theme = cx.theme().clone();
+            let title_text = self
+                .thread
+                .read(cx)
+                .project()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("manox")
+                .to_string();
+            let terminal = self
+                .terminal_view
+                .clone()
+                .expect("view_mode == Terminal implies terminal_view is set");
+            return h_flex()
+                .size_full()
+                .bg(theme.background)
+                .text_color(theme.foreground)
+                .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
+                    this.focus_conversation(cx);
+                }))
+                .on_action(cx.listener(|this, _: &FocusTerminal, _window, cx| {
+                    this.focus_terminal(cx);
+                }))
+                .on_action(cx.listener(|this, _: &NewTerminalTab, _window, cx| {
+                    this.open_terminal_tab(cx);
+                }))
+                .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
+                    this.close_terminal_tab(cx);
+                }))
+                .child(self.sidebar.clone())
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .h_full()
+                        .relative()
+                        .child(
+                            TitleBar::new().child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(Icon::new(IconName::SquareTerminal).small())
+                                    .child(
+                                        gpui::div()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .child(title_text),
+                                    ),
+                            ),
+                        )
+                        .child(v_flex().flex_1().h_full().w_full().child(terminal)),
+                );
+        }
         let theme = cx.theme().clone();
         let running = self.thread.read(cx).is_running();
 
@@ -2668,6 +2779,18 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &crate::CloseEditor, window, cx| {
                 this.close_editor(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusTerminal, _window, cx| {
+                this.focus_terminal(cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
+                this.focus_conversation(cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewTerminalTab, _window, cx| {
+                this.open_terminal_tab(cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
+                this.close_terminal_tab(cx);
             }))
             // Left sidebar with a draggable divider on its right edge.
             .child(self.sidebar.clone())

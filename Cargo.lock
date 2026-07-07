@@ -180,6 +180,8 @@ dependencies = [
  "gpui-component-assets",
  "serde",
  "serde_json",
+ "terminal",
+ "terminal-ui",
  "tracing",
  "uuid",
 ]

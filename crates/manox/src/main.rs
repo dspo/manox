@@ -59,6 +59,21 @@ fn main() {
             gpui::KeyBinding::new("left", agent_ui::AskPrev, Some("AskDrawer")),
             gpui::KeyBinding::new("right", agent_ui::AskNext, Some("AskDrawer")),
             gpui::KeyBinding::new("escape", agent_ui::AskCancel, Some("AskDrawer")),
+            // Terminal tab: cmd-t opens, cmd-shift-t focuses, cmd-shift-c
+            // returns to the conversation pane. Handlers live on the active
+            // Workspace (see `Workspace::Render`).
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-t", agent_ui::NewTerminalTab, None),
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-shift-t", agent_ui::FocusTerminal, None),
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-shift-c", agent_ui::FocusConversation, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-t", agent_ui::NewTerminalTab, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-shift-t", agent_ui::FocusTerminal, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-shift-c", agent_ui::FocusConversation, None),
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &ToggleFullscreen, cx: &mut App| {
@@ -84,6 +99,61 @@ fn main() {
                 if let (Some(workspace), Some(handle)) = (workspace, handle) {
                     let _ = handle.update(cx, |_, window, cx| {
                         workspace.update(cx, |ws, cx| ws.enter_settings(window, cx));
+                    });
+                }
+            });
+        });
+        // Terminal actions share the same deferred-dispatch path as Settings:
+        // menu items fire App-level handlers, which reach the active window's
+        // Workspace via the stashed handles.
+        cx.on_action(|_: &agent_ui::NewTerminalTab, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, _window, cx| {
+                        workspace.update(cx, |ws, cx| ws.open_terminal_tab(cx));
+                    });
+                }
+            });
+        });
+        cx.on_action(|_: &agent_ui::FocusTerminal, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, _window, cx| {
+                        workspace.update(cx, |ws, cx| ws.focus_terminal(cx));
+                    });
+                }
+            });
+        });
+        cx.on_action(|_: &agent_ui::FocusConversation, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, _window, cx| {
+                        workspace.update(cx, |ws, cx| ws.focus_conversation(cx));
+                    });
+                }
+            });
+        });
+        cx.on_action(|_: &agent_ui::CloseTerminalTab, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, _window, cx| {
+                        workspace.update(cx, |ws, cx| ws.close_terminal_tab(cx));
                     });
                 }
             });
@@ -121,17 +191,38 @@ fn build_app_menus() -> Vec<Menu> {
     // are localized for the user's chosen UI language.
     #[cfg(target_os = "macos")]
     {
-        vec![Menu::new("manox").items([
-            MenuItem::separator(),
-            MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
-            MenuItem::separator(),
-            MenuItem::action(agent::i18n::t("menu-quit"), Quit),
-        ])]
+        vec![
+            Menu::new("manox").items([
+                MenuItem::separator(),
+                MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action(agent::i18n::t("menu-quit"), Quit),
+            ]),
+            Menu::new(agent::i18n::t("menu-terminal")).items([
+                MenuItem::action(
+                    agent::i18n::t("menu-new-terminal"),
+                    agent_ui::NewTerminalTab,
+                ),
+                MenuItem::action(
+                    agent::i18n::t("menu-close-terminal"),
+                    agent_ui::CloseTerminalTab,
+                ),
+            ]),
+        ]
     }
     #[cfg(not(target_os = "macos"))]
     {
         vec![Menu::new(agent::i18n::t("menu-file")).items([
             MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
+            MenuItem::separator(),
+            MenuItem::action(
+                agent::i18n::t("menu-new-terminal"),
+                agent_ui::NewTerminalTab,
+            ),
+            MenuItem::action(
+                agent::i18n::t("menu-close-terminal"),
+                agent_ui::CloseTerminalTab,
+            ),
             MenuItem::separator(),
             MenuItem::action(agent::i18n::t("menu-quit"), Quit),
         ])]

@@ -14,6 +14,8 @@ pub mod grid_renderer;
 pub mod terminal_view;
 pub mod theme;
 
+pub use terminal_view::TerminalView;
+
 /// Register terminal UI actions and workspace tab integration.
 /// Call at App startup, after `terminal::init`.
 pub fn init(_cx: &mut App) {}

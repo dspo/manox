@@ -25,6 +25,10 @@ gpui::actions!(
         OpenSettings,
         AskPrev,
         AskNext,
-        AskCancel
+        AskCancel,
+        NewTerminalTab,
+        CloseTerminalTab,
+        FocusTerminal,
+        FocusConversation
     ]
 );

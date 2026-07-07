@@ -24,6 +24,8 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 
 agent = { path = "../agent" }
+terminal = { path = "../terminal" }
+terminal-ui = { path = "../terminal-ui" }
 
 [lints.clippy]
 dbg_macro = "deny"
