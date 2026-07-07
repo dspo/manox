@@ -338,7 +338,6 @@ impl Workspace {
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
 
-
         let mut ws = Self {
             cwd,
             thread,
@@ -3632,6 +3631,7 @@ impl Render for Workspace {
             Some(
                 v_flex()
                     .w_full()
+                    .flex_shrink_0()
                     .py_2()
                     .relative()
                     .child(centered(self.render_ask_drawer(&theme, cx))),
@@ -3640,6 +3640,7 @@ impl Render for Workspace {
             Some(
                 v_flex()
                     .w_full()
+                    .flex_shrink_0()
                     .py_2()
                     .gap_2()
                     .relative()
@@ -3909,6 +3910,7 @@ impl Render for Workspace {
                             .flex_1()
                             .min_h_0()
                             .w_full()
+                            .overflow_hidden()
                             .pt(TITLE_BAR_HEIGHT)
                             .pr(content_inset)
                             .pb_2()
@@ -3983,7 +3985,6 @@ impl Render for Workspace {
                                 h_flex()
                                     .flex_1()
                                     .w_full()
-                                    .h_full()
                                     .min_h_0()
                                     .children(outline)
                                     .child(list_el)
