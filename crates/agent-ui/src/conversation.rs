@@ -38,6 +38,15 @@ pub enum ConvItem {
     /// An ephemeral system notice — status changes, slash-command acks, etc.
     /// Rendered with neutral tones, not danger colors.
     Notice(String),
+    /// Provider is retrying the HTTP handshake after a transient failure
+    /// (429 / 5xx / network). Transient: the first real content or terminal
+    /// error event replaces it in place. Carries no error text — raw provider
+    /// strings stay out of the UI.
+    Retry {
+        attempt: u32,
+        max_attempts: u32,
+        delay_secs: u64,
+    },
 }
 
 /// A tool-call item, tracking status/output by id.
@@ -92,6 +101,9 @@ pub enum ApplyOutcome {
     Appended,
     /// Every item may have changed (terminal `Stop`); remeasure all.
     All,
+    /// A trailing transient item (a `Retry` badge) was popped without a
+    /// replacement pushed. Splice the list count down by one at the tail.
+    RemovedTail,
 }
 
 #[derive(Debug, Default)]
@@ -183,7 +195,23 @@ impl ConversationState {
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> ApplyOutcome {
-        match event {
+        // A trailing `Retry` badge is stale the moment a real content or
+        // terminal-error event lands — that event means the retry either
+        // succeeded (assistant text / tool call) or exhausted the budget
+        // (Error). Pop the badge first; the arm below then pushes its own
+        // item, keeping the list length stable so `Appended` is rewritten to
+        // `Remeasure(tail)` at the bottom. Non-item events (usage, mode
+        // change, …) and the `Retry` event itself skip this.
+        let replaces_retry = matches!(
+            event,
+            ThreadEvent::AgentText(_)
+                | ThreadEvent::AgentThinking(_)
+                | ThreadEvent::ToolCall { .. }
+                | ThreadEvent::Error(_)
+        ) && self.pop_trailing_retry(cx);
+        let len_after_pop = self.items.len();
+
+        let outcome = match event {
             // Backfill plan text into the matching exit_plan_mode ToolCall
             // item so it renders as markdown in the chat view. The ToolCall
             // event (PendingApproval) always arrives before PlanProposed.
@@ -504,6 +532,85 @@ impl ConversationState {
                 // flags are only consumed by debug telemetry views (if at all).
                 ApplyOutcome::None
             }
+            ThreadEvent::Retry {
+                attempt,
+                max_attempts,
+                delay_secs,
+            } => {
+                // Coalesce consecutive retries into the same tail item so the
+                // badge counts up in place rather than stacking a row per
+                // attempt. The first retry after real content pushes a new item.
+                if let Some(last) = self.items.last() {
+                    let is_retry = matches!(last.read(cx).kind(), ConvItem::Retry { .. });
+                    if is_retry {
+                        let last = last.clone();
+                        let attempt = *attempt;
+                        let max_attempts = *max_attempts;
+                        let delay_secs = *delay_secs;
+                        last.update(cx, |item, cx| {
+                            if let ConvItem::Retry {
+                                attempt: a,
+                                max_attempts: m,
+                                delay_secs: d,
+                            } = item.kind_mut()
+                            {
+                                *a = attempt;
+                                *m = max_attempts;
+                                *d = delay_secs;
+                            }
+                            cx.notify();
+                        });
+                        return ApplyOutcome::Remeasure(self.items.len() - 1);
+                    }
+                }
+                let id = self.items.len();
+                self.items.push(cx.new(|_| {
+                    MessageItem::new(
+                        ConvItem::Retry {
+                            attempt: *attempt,
+                            max_attempts: *max_attempts,
+                            delay_secs: *delay_secs,
+                        },
+                        String::new(),
+                        id,
+                        weak.clone(),
+                    )
+                }));
+                ApplyOutcome::Appended
+            }
+        };
+
+        // Reconcile the list state with the stale `Retry` badge we popped at
+        // the top. The arm either pushed a new item into the freed slot (net
+        // zero — remeasure the tail) or updated an earlier item in place
+        // (net -1 — splice the dangling slot out). Detecting via length, not
+        // the arm's returned outcome, keeps this correct for arms like
+        // `ToolCall` whose Remeasure-vs-Appended branch depends on whether the
+        // tool id already existed.
+        if replaces_retry {
+            let len_after_arm = self.items.len();
+            if len_after_arm > len_after_pop {
+                return ApplyOutcome::Remeasure(len_after_arm.saturating_sub(1));
+            }
+            return ApplyOutcome::RemovedTail;
+        }
+        outcome
+    }
+
+    /// Drop the trailing item if it is a `Retry` badge. Returns whether it
+    /// popped. The list state is not notified here — the caller rewrites the
+    /// arm's `Appended` outcome to `Remeasure(tail)` to keep the logical
+    /// length stable.
+    fn pop_trailing_retry(&mut self, cx: &App) -> bool {
+        if self
+            .items
+            .last()
+            .is_some_and(|e| matches!(e.read(cx).kind(), ConvItem::Retry { .. }))
+        {
+            self.items.pop();
+            true
+        } else {
+            false
         }
     }
 

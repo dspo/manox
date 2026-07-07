@@ -172,6 +172,16 @@ impl Harness {
                     }),
                     ConvItem::Error(t) => json!({ "kind": "error", "text": t }),
                     ConvItem::Notice(t) => json!({ "kind": "notice", "text": t }),
+                    ConvItem::Retry {
+                        attempt,
+                        max_attempts,
+                        delay_secs,
+                    } => json!({
+                        "kind": "retry",
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "delay_secs": delay_secs,
+                    }),
                 }
             })
             .collect();
