@@ -16,9 +16,10 @@ use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures,
     FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, UTF16Selection, Window, black,
-    div, px, rgba,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, UTF16Selection, Window, div, px,
+    rgba,
 };
+use gpui_component::ActiveTheme as _;
 use terminal::Terminal;
 use terminal::alacritty_terminal::term::TermMode;
 use terminal::alacritty_terminal::vi_mode::ViMotion;
@@ -273,7 +274,7 @@ impl TerminalView {
         let probe = gpui::TextRun {
             len: 1,
             font: self.font.clone(),
-            color: black(),
+            color: gpui::Hsla::default(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -332,7 +333,7 @@ impl Render for TerminalView {
             .flex_1()
             .w_full()
             .h_full()
-            .bg(black())
+            .bg(cx.theme().background)
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -343,7 +344,7 @@ impl Render for TerminalView {
                 terminal: self.terminal.clone(),
                 view: cx.entity(),
                 focus_handle: self.focus_handle.clone(),
-                theme: TerminalTheme::default(),
+                theme: TerminalTheme::from_app_theme(cx.theme()),
                 font: self.font.clone(),
                 font_size: self.font_size,
                 line_height: self.line_height,

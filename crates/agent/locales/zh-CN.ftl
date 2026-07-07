@@ -337,3 +337,19 @@ titlebar-unpinned-notice = 会话已取消置顶。
 titlebar-archive-notice = 会话已归档。
 titlebar-not-implemented = 尚未实现。
 titlebar-rename-notice = 已打开重命名对话框。
+
+# ── 环境信息面板 ──────────────────────────────────────────────────────
+workspace-env-title = 环境信息
+workspace-env-changes = 变更
+workspace-env-local = 本地 {$name}
+workspace-env-no-project = 暂无项目
+workspace-env-model = 模型 {$name}
+workspace-env-modes = 模式
+workspace-env-plan-on = 计划模式
+workspace-env-plan-off = 普通规划
+workspace-env-yolo-on = 完全访问
+workspace-env-yolo-off = 审批模式
+workspace-env-auto-review = 自动审查
+workspace-env-tokens = 令牌
+workspace-env-sources = 来源
+workspace-env-no-sources = 暂无来源

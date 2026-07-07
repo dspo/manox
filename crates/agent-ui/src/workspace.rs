@@ -7,7 +7,7 @@
 //!
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -28,6 +28,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme, TitleBar,
+    animation::{Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -224,6 +225,12 @@ pub struct Workspace {
     /// spread apart, tapering off with distance. `None` when the cursor is off
     /// the rail.
     outline_hover: Option<usize>,
+    /// Bumped on every `TokenUsageUpdated` event so the environment panel's
+    /// per-model counters re-trigger their slide animation.
+    token_anim_gen: u64,
+    /// Previously displayed per-model token values, keyed by `(model, kind)`.
+    /// Used to detect value changes and animate from old → new.
+    token_prev: HashMap<(String, String), u64>,
 }
 
 /// Top-level rendering mode of the Workspace window. `Settings` and
@@ -254,6 +261,10 @@ const SIDEBAR_MAX_WIDTH: f32 = 480.;
 const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the main column width when the editor pane is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
+
+/// Environment info card floating at the top-right of the conversation area.
+const ENV_CARD_WIDTH: f32 = 300.;
+const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
 
 /// User-turn outline rail geometry. The rail is a fixed-width gutter between
 /// the sidebar divider and the message list; every tick is the same length so
@@ -387,6 +398,8 @@ impl Workspace {
             settings_sub: None,
             terminal_view: None,
             outline_hover: None,
+            token_anim_gen: 0,
+            token_prev: HashMap::new(),
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
@@ -465,6 +478,10 @@ impl Workspace {
                     store.update(cx, |s, cx| {
                         s.record_model_change(&thread_id, from.as_deref(), to, cx);
                     });
+                    cx.notify();
+                }
+                ThreadEvent::TokenUsageUpdated(_) => {
+                    this.token_anim_gen = this.token_anim_gen.wrapping_add(1);
                     cx.notify();
                 }
                 ThreadEvent::TurnStarted => {
@@ -2614,11 +2631,222 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Composer card: an auto-growing text area above a single toolbar row.
-    /// The card's fill matches the page background (`theme.background`) so only
-    /// the 1px border outlines it — the user-perceived "shading" disappears.
-    /// The `Input` renders bare (no appearance/border of its own) so there is
-    /// no double-layered fill.
+    /// Floating environment info card at the top-right of the conversation
+    /// area. Shows project, branch, model, per-model token usage (animated),
+    /// approval modes, and sources. Only rendered once the thread has been
+    /// interacted with and the editor pane is closed.
+    fn render_environment_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let model_label = self.model_label(cx);
+        let (project, approval_mode, per_model) = {
+            let thread = self.thread.read(cx);
+            (
+                thread.project().cloned(),
+                thread.approval_mode(),
+                thread.per_model_token_usage().clone(),
+            )
+        };
+        let local_label = self
+            .cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| self.cwd.to_str().unwrap_or("workspace"))
+            .to_string();
+        let branch_label = if project.is_some() {
+            "main".to_string()
+        } else {
+            i18n::t("workspace-env-no-project").to_string()
+        };
+        let muted = theme.muted_foreground;
+
+        // Build per-model token rows, sorted by total usage descending.
+        let mut model_rows: Vec<_> = per_model
+            .into_iter()
+            .filter(|(_, u)| u.input_tokens > 0 || u.output_tokens > 0)
+            .collect();
+        model_rows.sort_by(|a, b| {
+            let total_a = a.1.input_tokens + a.1.output_tokens;
+            let total_b = b.1.input_tokens + b.1.output_tokens;
+            total_b.cmp(&total_a)
+        });
+
+        let token_section = v_flex().gap_1().child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(i18n::t("workspace-env-tokens")),
+                ),
+        );
+        let token_model_rows: Vec<AnyElement> = model_rows
+            .into_iter()
+            .flat_map(|(model_name, usage)| {
+                let in_key = (model_name.clone(), "in".to_string());
+                let out_key = (model_name.clone(), "out".to_string());
+                let prev_in = self.token_prev.get(&in_key).copied().unwrap_or(0);
+                let prev_out = self.token_prev.get(&out_key).copied().unwrap_or(0);
+                // Only bump version for counters whose values actually changed.
+                let in_changed = prev_in != usage.input_tokens;
+                let out_changed = prev_out != usage.output_tokens;
+                self.token_prev.insert(in_key.clone(), usage.input_tokens);
+                self.token_prev.insert(out_key.clone(), usage.output_tokens);
+                let in_version = if in_changed { self.token_anim_gen } else { 0 };
+                let out_version = if out_changed { self.token_anim_gen } else { 0 };
+
+                let row: AnyElement = h_flex()
+                    .pl_6()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(
+                        gpui::div()
+                            .min_w(px(80.))
+                            .overflow_hidden()
+                            .child(model_name.clone()),
+                    )
+                    .child(animated_counter(
+                        "in",
+                        prev_in,
+                        usage.input_tokens,
+                        &model_name,
+                        in_version,
+                        "↑",
+                        muted,
+                    ))
+                    .child(animated_counter(
+                        "out",
+                        prev_out,
+                        usage.output_tokens,
+                        &model_name,
+                        out_version,
+                        "↓",
+                        muted,
+                    ))
+                    .into_any_element();
+                [row]
+            })
+            .collect();
+
+        // The env panel floats over the conversation area (absolute, top-right).
+        // `ENV_CONTENT_INSET` in the body wrapper's `pr()` prevents content from
+        // being hidden behind the card.
+        v_flex()
+            .absolute()
+            .top(px(16.))
+            .right(px(16.))
+            .w(px(ENV_CARD_WIDTH))
+            .occlude()
+            .child(
+                v_flex()
+                    .w_full()
+                    .p_4()
+                    .gap_3()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                gpui::div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(i18n::t("workspace-env-title")),
+                            )
+                            .child(Button::new("env-add").ghost().xsmall().icon(IconName::Plus)),
+                    )
+                    .child(env_row(
+                        IconName::Frame,
+                        i18n::t("workspace-env-changes"),
+                        Some(
+                            h_flex()
+                                .gap_1()
+                                .text_xs()
+                                .child(
+                                    gpui::div()
+                                        .text_color(theme.success)
+                                        .child(if project.is_some() { "+0" } else { "--" }),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .text_color(theme.danger)
+                                        .child(if project.is_some() { "-0" } else { "" }),
+                                )
+                                .into_any_element(),
+                        ),
+                        theme,
+                    ))
+                    .child(env_row(
+                        IconName::HardDrive,
+                        i18n::t_str("workspace-env-local", &[("name", local_label.as_str())]),
+                        None,
+                        theme,
+                    ))
+                    .child(env_row(IconName::Github, branch_label.into(), None, theme))
+                    .child(env_row(
+                        IconName::Cpu,
+                        i18n::t_str("workspace-env-model", &[("name", model_label.as_str())]),
+                        None,
+                        theme,
+                    ))
+                    .child(token_section)
+                    .children(token_model_rows)
+                    .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(i18n::t("workspace-env-modes")),
+                            )
+                            .child(h_flex().gap_1().flex_wrap().child(mode_tag(
+                                match approval_mode {
+                                    ApprovalMode::OnRequest => i18n::t("workspace-env-yolo-off"),
+                                    ApprovalMode::AutoReview => {
+                                        i18n::t("workspace-env-auto-review")
+                                    }
+                                    ApprovalMode::Yolo => i18n::t("workspace-env-yolo-on"),
+                                },
+                                true,
+                                theme,
+                            ))),
+                    )
+                    .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(i18n::t("workspace-env-sources")),
+                            )
+                            .child(
+                                gpui::div()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(i18n::t("workspace-env-no-sources")),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Composer: an auto-growing text area above a single toolbar row.
+    /// Rendered bare — no card border, fill, or rounding — so it shares the
+    /// page background with the message list and reads as the same layer.
+    /// The `Input` has no appearance of its own; the only visual separator
+    /// from the messages above is the hairline injected by the footer caller.
     fn render_composer(
         &mut self,
         running: bool,
@@ -2635,11 +2863,6 @@ impl Workspace {
         v_flex()
             .w_full()
             .gap_2()
-            .p_2()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.background)
             .child(
                 Input::new(&self.input_state)
                     .appearance(false)
@@ -3499,6 +3722,7 @@ impl Render for Workspace {
                     .gap_2()
                     .relative()
                     .children(self.render_slash_overlay())
+                    .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
                     .children(self.render_attachments(&theme, cx))
                     .child(centered(self.render_composer(running, &theme, cx))),
             )
@@ -3741,7 +3965,15 @@ impl Render for Workspace {
             .child(self.sidebar.clone())
             .child(sidebar_divider)
             // Main column
-            .child(
+            .child({
+                let show_env =
+                    !editor_open && !first_screen && self.thread.read(cx).has_interacted();
+                let env_panel = show_env.then(|| self.render_environment_panel(&theme, cx));
+                let content_inset = if show_env {
+                    px(ENV_CONTENT_INSET)
+                } else {
+                    px(0.)
+                };
                 v_flex()
                     .flex_1()
                     .h_full()
@@ -3765,14 +3997,15 @@ impl Render for Workspace {
                     )
                     // Body wrapper: hero / list / footer / overlay share a common
                     // horizontal inset so conversation content doesn't kiss the
-                    // panel edge.
+                    // environment panel edge.
                     .child(
                         v_flex()
                             .flex_1()
                             .min_h_0()
                             .w_full()
                             .px_4()
-                            .pb_8()
+                            .pr(content_inset)
+                            .pb_2()
                             // Empty first screen shows the centered hero in place of the
                             // (empty) message list; otherwise the virtualized, tail-
                             // following conversation list. Each item is its own
@@ -3825,8 +4058,10 @@ impl Render for Workspace {
                             .children(footer)
                             // Approval overlay (if any)
                             .children(overlay),
-                    ),
-            )
+                    )
+                    // Environment info card (floating, top-right)
+                    .children(env_panel)
+            })
             .when(editor_open, |this| {
                 this.child(editor_divider).child(editor_pane)
             })
@@ -4251,4 +4486,117 @@ fn reasoning_effort_label_key(effort: ReasoningEffort) -> &'static str {
         ReasoningEffort::Ultracode => "workspace-effort-ultracode",
         ReasoningEffort::Auto => "workspace-effort-auto",
     }
+}
+
+// ── Environment panel helpers ──────────────────────────────────────────────
+
+fn env_row(
+    icon: IconName,
+    label: SharedString,
+    trailing: Option<AnyElement>,
+    theme: &Theme,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
+        .child(
+            gpui::div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(label),
+        )
+        .children(trailing)
+        .into_any_element()
+}
+
+fn mode_tag(label: SharedString, active: bool, theme: &Theme) -> AnyElement {
+    gpui::div()
+        .px_2()
+        .py_1()
+        .rounded_full()
+        .bg(if active {
+            theme.accent.opacity(0.14)
+        } else {
+            theme.secondary.opacity(0.35)
+        })
+        .border_1()
+        .border_color(if active {
+            theme.accent.opacity(0.24)
+        } else {
+            theme.border
+        })
+        .text_xs()
+        .text_color(if active {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        })
+        .child(label)
+        .into_any_element()
+}
+
+/// Compact token count display: `1m,357k`, `168k,653`, `999`.
+fn format_tokens(n: u64) -> String {
+    const MILLION: u64 = 1_000_000;
+    const THOUSAND: u64 = 1_000;
+    if n >= MILLION {
+        let m = n / MILLION;
+        let r = (n % MILLION) / THOUSAND;
+        if r == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m,{r}k")
+        }
+    } else if n >= THOUSAND {
+        let k = n / THOUSAND;
+        let r = n % THOUSAND;
+        if r == 0 {
+            format!("{k}k")
+        } else {
+            format!("{k}k,{r}")
+        }
+    } else {
+        n.to_string()
+    }
+}
+
+/// Animated rolling counter for per-model token display. Renders old and new
+/// values stacked vertically inside a clip container; `Transition::slide_y`
+/// slides the stack up so the old value exits top and the new value enters
+/// from bottom — an odometer-style roll.
+fn animated_counter(
+    kind: &str,
+    prev: u64,
+    value: u64,
+    model: &str,
+    version: u64,
+    arrow: &str,
+    color: gpui::Hsla,
+) -> AnyElement {
+    let line_h = px(16.);
+    let text = format!("{arrow}{}", format_tokens(value));
+    let prev_text = format!("{arrow}{}", format_tokens(prev));
+
+    let inner = v_flex()
+        .child(gpui::div().h(line_h).child(prev_text))
+        .child(gpui::div().h(line_h).child(text));
+
+    let anim_id = gpui::SharedString::from(format!("token-counter-{model}-{kind}-{version}"));
+
+    gpui::div()
+        .h(line_h)
+        .overflow_hidden()
+        .child(
+            Transition::new(Duration::from_millis(400))
+                .ease(ease_out_cubic)
+                .slide_y(line_h, px(0.))
+                .apply(inner, anim_id),
+        )
+        .text_color(color)
+        .into_any_element()
 }
