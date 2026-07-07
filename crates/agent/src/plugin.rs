@@ -62,6 +62,34 @@ pub struct InstalledPlugin {
     pub marketplace: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MarketplaceRecord {
+    pub slug: String,
+    pub git_url: Option<String>,
+    pub root: PathBuf,
+    pub name: String,
+    pub description: Option<String>,
+    pub plugin_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketplacePluginRecord {
+    pub marketplace_slug: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub source: String,
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstalledPluginRecord {
+    pub name: String,
+    pub marketplace: String,
+    pub root: PathBuf,
+    pub description: Option<String>,
+    pub version: Option<String>,
+}
+
 /// Filesystem-backed plugin manager. State is stored under
 /// `~/.config/cx/manox/` (cloned marketplaces, installed plugin trees, the
 /// enabled-plugins list), so it survives across sessions without an in-process
@@ -159,6 +187,81 @@ impl PluginManager {
         out
     }
 
+    /// Rich view of cached marketplaces for UI surfaces. Reads the current
+    /// on-disk index and best-effort origin URL from each clone.
+    pub fn list_marketplace_records() -> Vec<MarketplaceRecord> {
+        let Ok(dir) = paths::marketplace_cache_dir() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let root = entry.path();
+            if !root.join(".git").exists() {
+                continue;
+            }
+            let Ok(slug) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(index) = Self::load_marketplace_index(&root) else {
+                continue;
+            };
+            out.push(MarketplaceRecord {
+                slug,
+                git_url: git_remote_origin(&root),
+                root,
+                name: index.name,
+                description: index.description,
+                plugin_count: index.plugins.len(),
+            });
+        }
+        out.sort_by(|a, b| a.slug.cmp(&b.slug));
+        out
+    }
+
+    /// Refresh a cached marketplace clone by slug.
+    pub fn refresh_marketplace(slug: &str) -> Result<MarketplaceIndex> {
+        let dir = paths::marketplace_cache_dir()?.join(slug);
+        refresh_marketplace_dir(&dir)?;
+        Self::load_marketplace_index(&dir)
+    }
+
+    /// Remove a cached marketplace clone by slug.
+    pub fn remove_marketplace_by_slug(slug: &str) -> Result<()> {
+        let dir = paths::marketplace_cache_dir()?.join(slug);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("removing marketplace {}", dir.display()))?;
+        }
+        Ok(())
+    }
+
+    /// List the plugins declared by one cached marketplace plus their current
+    /// installed status in the user's config dir.
+    pub fn list_marketplace_plugins(slug: &str) -> Result<Vec<MarketplacePluginRecord>> {
+        let repo_root = paths::marketplace_cache_dir()?.join(slug);
+        let index = Self::load_marketplace_index(&repo_root)?;
+        let installed: std::collections::HashSet<String> = Self::installed()
+            .into_iter()
+            .map(|plugin| plugin.name)
+            .collect();
+        let mut out: Vec<MarketplacePluginRecord> = index
+            .plugins
+            .into_iter()
+            .map(|plugin| MarketplacePluginRecord {
+                marketplace_slug: slug.to_string(),
+                installed: installed.contains(&plugin.name),
+                name: plugin.name,
+                description: plugin.description,
+                source: plugin.source,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
     /// Install a plugin from a marketplace: resolve its `source` path, copy the
     /// tree into `plugins_dir/<name>`, and record it as enabled.
     pub fn install(marketplace_slug: &str, plugin_name: &str) -> Result<()> {
@@ -232,6 +335,30 @@ impl PluginManager {
         out
     }
 
+    /// Installed plugins plus the parsed manifest fields used by the plugin
+    /// management UI.
+    pub fn installed_details() -> Vec<InstalledPluginRecord> {
+        let mut out = Vec::new();
+        for plugin in Self::installed() {
+            let manifest = load_plugin_manifest(&plugin.root);
+            out.push(InstalledPluginRecord {
+                name: plugin.name,
+                marketplace: plugin.marketplace,
+                root: plugin.root,
+                description: manifest
+                    .as_ref()
+                    .ok()
+                    .and_then(|manifest| manifest.description.clone()),
+                version: manifest
+                    .as_ref()
+                    .ok()
+                    .and_then(|manifest| manifest.version.clone()),
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
     fn set_enabled(name: &str, _root: &Path, marketplace: &str) -> Result<()> {
         let file = paths::enabled_plugins_file()?;
         if let Some(parent) = file.parent() {
@@ -265,6 +392,58 @@ impl PluginManager {
         .context("writing enabled_plugins")?;
         Ok(())
     }
+}
+
+fn refresh_marketplace_dir(dir: &Path) -> Result<()> {
+    if !dir.join(".git").exists() {
+        anyhow::bail!("marketplace clone missing at {}", dir.display());
+    }
+    let fetch = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["fetch", "--all"])
+        .status()
+        .with_context(|| format!("git fetch in {}", dir.display()))?;
+    if !fetch.success() {
+        anyhow::bail!("git fetch failed for {}", dir.display());
+    }
+    let reset = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["reset", "--hard", "FETCH_HEAD"])
+        .status()
+        .with_context(|| format!("git reset in {}", dir.display()))?;
+    if !reset.success() {
+        anyhow::bail!("git reset failed for {}", dir.display());
+    }
+    Ok(())
+}
+
+fn git_remote_origin(dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(out.stdout).ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn load_plugin_manifest(root: &Path) -> Result<PluginManifest> {
+    let path = root.join(".claude-plugin").join("plugin.json");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading plugin manifest {}", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parsing plugin manifest {}", path.display()))
 }
 
 /// Recursively copy a directory tree. `std::fs::copy` is per-file; a tree copy

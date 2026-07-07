@@ -17,8 +17,8 @@ use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::thread::ApprovalMode;
 use agent::{
-    PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId,
-    i18n, save_thread,
+    PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId, i18n,
+    save_thread,
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
@@ -45,6 +45,7 @@ use crate::views::centered;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
 };
+use crate::views::plugin_manager::{PluginManagerEvent, PluginManagerView};
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::{
@@ -205,6 +206,8 @@ pub struct Workspace {
     /// cost when the user never opens Settings.
     settings_view: Option<Entity<SettingsView>>,
     settings_sub: Option<Subscription>,
+    plugin_manager_view: Option<Entity<PluginManagerView>>,
+    plugin_manager_sub: Option<Subscription>,
     /// The terminal tab's view, lazily created on the first `FocusTerminal` /
     /// `NewTerminalTab`. `None` until then. Dropped on `CloseTerminalTab`.
     terminal_view: Option<Entity<TerminalView>>,
@@ -232,6 +235,7 @@ enum ViewMode {
     #[default]
     Workspace,
     Settings,
+    Plugins,
     Terminal,
 }
 
@@ -383,6 +387,8 @@ impl Workspace {
             settings_transition_gen: 0,
             settings_view: None,
             settings_sub: None,
+            plugin_manager_view: None,
+            plugin_manager_sub: None,
             terminal_view: None,
             outline_hover: None,
             token_anim_gen: 0,
@@ -745,6 +751,7 @@ impl Workspace {
         let sidebar = self.sidebar.clone();
         cx.subscribe(&sidebar, |this, _sidebar, ev: &SidebarEvent, cx| match ev {
             SidebarEvent::NewThread => this.start_new_thread(cx),
+            SidebarEvent::OpenPlugins => this.enter_plugins(cx),
             SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), cx),
             SidebarEvent::ArchiveThread(id, archived) => {
                 let store = agent::thread_store_global();
@@ -805,6 +812,35 @@ impl Workspace {
                     });
                 })
                 .detach();
+            }
+        })
+    }
+
+    /// Switch into the plugin/marketplace/skill/MCP management pane.
+    pub fn enter_plugins(&mut self, cx: &mut Context<Self>) {
+        self.view_mode = ViewMode::Plugins;
+        cx.notify();
+    }
+
+    fn ensure_plugins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plugin_manager_view.is_some() {
+            return;
+        }
+        let plugins = cx.new(|cx| PluginManagerView::new(window, cx));
+        let sub = self.subscribe_plugins(&plugins, cx);
+        self.plugin_manager_view = Some(plugins);
+        self.plugin_manager_sub = Some(sub);
+    }
+
+    fn subscribe_plugins(
+        &self,
+        plugins: &Entity<PluginManagerView>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe(plugins, |this, _plugins, ev: &PluginManagerEvent, cx| {
+            if matches!(ev, PluginManagerEvent::Exit) {
+                this.view_mode = ViewMode::default();
+                cx.notify();
             }
         })
     }
@@ -3429,7 +3465,7 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Settings overlay replaces the entire window content; the underlying
         // Workspace state (sidebar, conversation, composer) is preserved and
         // returns unchanged when the user clicks "Back to app".
@@ -3467,6 +3503,15 @@ impl Render for Workspace {
                 },
             );
             return h_flex().size_full().child(anim_el);
+        }
+        if matches!(self.view_mode, ViewMode::Plugins) {
+            self.ensure_plugins(window, cx);
+            let plugins = self
+                .plugin_manager_view
+                .as_ref()
+                .expect("view_mode == Plugins implies plugin manager view is set")
+                .clone();
+            return h_flex().size_full().child(plugins);
         }
         // Terminal pane: sidebar (for tab switching) + a full-bleed terminal
         // view filling the main column. The terminal view owns its PTY and
@@ -3527,13 +3572,13 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         let running = self.thread.read(cx).is_running();
 
-        self.ensure_ask_inputs(_window, cx);
-        self.ensure_blank_project_input(_window, cx);
+        self.ensure_ask_inputs(window, cx);
+        self.ensure_blank_project_input(window, cx);
 
         let overlay = self
             .render_auth_overlay(&theme, cx)
             .or_else(|| self.render_plan_approval_overlay(&theme, cx))
-            .or_else(|| self.render_blank_project_overlay(_window, &theme, cx));
+            .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
 
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
@@ -3917,7 +3962,7 @@ impl Render for Workspace {
                                             .child(self.render_title_menu_trigger(&theme, cx)),
                                     )
                                     .child(h_flex()),
-                            )
+                            ),
                     )
             })
             .when(editor_open, |this| {
