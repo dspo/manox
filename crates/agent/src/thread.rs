@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use futures::FutureExt as _;
@@ -271,6 +272,13 @@ pub struct Thread {
     /// Per-user-message usage keyed by `Message::id`. Mirrors zed's
     /// `request_token_usage`; persisted to the `token_usage` table for SQL queries.
     request_token_usage: HashMap<String, TokenUsage>,
+    /// Monotonic counter stamped into every `snapshot()` so the db `upsert`
+    /// can reject out-of-order writes. `save_thread` is fire-and-forget: an
+    /// older snapshot (e.g. taken at submit, before the turn produced assistant
+    /// content) can commit after a newer one if the background executor reorders
+    /// them. The revision lets `upsert` refuse the stale write instead of
+    /// clobbering the newer state — see `ThreadsDatabase::upsert`.
+    persist_revision: AtomicU64,
 }
 
 /// A forwarded authorization request from a sub-agent: which child thread holds
@@ -331,6 +339,7 @@ impl Thread {
                 cumulative_token_usage: TokenUsage::default(),
                 current_request_token_usage: TokenUsage::default(),
                 request_token_usage: HashMap::new(),
+                persist_revision: AtomicU64::new(0),
             }
         })
     }
@@ -404,6 +413,7 @@ impl Thread {
                 cumulative_token_usage: rec.cumulative_token_usage,
                 current_request_token_usage: TokenUsage::default(),
                 request_token_usage: rec.request_token_usage,
+                persist_revision: AtomicU64::new(rec.revision),
             }
         })
     }
@@ -472,6 +482,7 @@ impl Thread {
                 cumulative_token_usage: TokenUsage::default(),
                 current_request_token_usage: TokenUsage::default(),
                 request_token_usage: HashMap::new(),
+                persist_revision: AtomicU64::new(0),
             }
         })
     }
@@ -479,6 +490,10 @@ impl Thread {
     /// Build a persistable snapshot (with the first user message as summary). Returns `None` when there is no model (not persisted).
     pub fn snapshot(&self) -> Option<ThreadRecord> {
         let model_id = self.model.as_ref().map(|m| m.id())?;
+        // Stamp a fresh, strictly-monotonic revision so a stale fire-and-forget
+        // upsert (one whose snapshot predates a newer write already committed)
+        // is rejected by `ThreadsDatabase::upsert` instead of clobbering it.
+        let revision = self.persist_revision.fetch_add(1, Ordering::Relaxed) + 1;
         Some(ThreadRecord {
             id: self.id.0.clone(),
             summary: self.summary(),
@@ -503,6 +518,7 @@ impl Thread {
             updated_at: chrono::Utc::now().timestamp(),
             // No separate field; the session starts when the thread is created.
             session_started_at: self.created_at,
+            revision,
             cumulative_token_usage: self.cumulative_token_usage,
             messages: self.messages.clone(),
             request_token_usage: self.request_token_usage.clone(),
@@ -1069,6 +1085,20 @@ impl Thread {
                 cx.notify();
             })
             .ok();
+            // Persistence backstop: `Stop`/`Error` events are the workspace's
+            // signal to save, but a stream that ends without a `MessageStop`
+            // (provider hiccup, non-SSE response from a compatibility endpoint)
+            // makes run_turn_loop return Ok with no terminal event emitted, so
+            // the workspace never learns the turn ended and the assistant
+            // content accumulated in `messages` is lost on the next thread
+            // switch. Persist here unconditionally — the revision guard makes
+            // this safe alongside any overlapping event-driven saves, and a
+            // dropped entity (the workspace already switched away) just skips.
+            if let Some(entity) = this.upgrade() {
+                cx.update(|cx: &mut gpui::App| {
+                    crate::thread_store::save_thread(entity, true, cx);
+                });
+            }
         });
 
         self.running_turn = Some(task);
@@ -2291,7 +2321,10 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{model_facing_content, tool_title};
-    use crate::language_model::{LanguageModelToolResult, MessageContent, TokenUsage};
+    use crate::language_model::{
+        AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
+        LanguageModelToolResult, MessageContent, TokenUsage,
+    };
     use crate::message::Message;
     use serde_json::json;
     use std::sync::Arc;
@@ -2925,5 +2958,158 @@ mod tests {
             "assistant text: {}",
             assistant_text.chars().take(200).collect::<String>()
         );
+    }
+
+    /// A `LanguageModel` that replays a fixed event sequence and then closes the
+    /// stream — used to drive `run_turn` without a live provider. The sequence
+    /// is shared (via `Arc`) so a re-prompted outer loop yields the same events
+    /// again. Only `Ok` events are supported, which is enough for the
+    /// persistence regressions (the stream-close-without-`Stop` path is the
+    /// whole point).
+    struct ReplayMockModel {
+        id: String,
+        events: Arc<Vec<LanguageModelCompletionEvent>>,
+    }
+
+    impl crate::language_model::LanguageModel for ReplayMockModel {
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+        fn name(&self) -> String {
+            self.id.clone()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            let events = self.events.clone();
+            Box::pin(async move {
+                use futures::StreamExt as _;
+                let events: Vec<_> = events.iter().cloned().map(Ok).collect();
+                Ok(futures::stream::iter(events).boxed())
+            })
+        }
+    }
+
+    /// Regression for the switch-loses-assistant bug: a turn whose stream
+    /// produces text but ends WITHOUT a `MessageStop` (provider hiccup,
+    /// non-SSE compatibility response) leaves the assistant text only in
+    /// memory — no terminal `Stop` event reaches a subscriber, so without the
+    /// task-tail save the next thread switch reloads the stale db row and the
+    /// assistant content vanishes. The `run_turn` task tail calls
+    /// `save_thread` unconditionally for exactly this case.
+    #[test]
+    fn run_turn_persists_assistant_text_without_stop_event() {
+        use crate::db::ThreadsDatabase;
+        use std::sync::Arc;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        // Release the test ThreadStore entity before teardown — the gpui
+        // leaked-handle check trips on a process-global entity held alive past
+        // `TestAppContext` drop. Drop runs even on panic, so the assertion
+        // failure path stays clean too.
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        // Prime the process-global ThreadStore with an in-memory db so the
+        // task-tail save lands somewhere queryable instead of the real
+        // `~/.config/cx/manox/threads.db`.
+        let db =
+            Arc::new(ThreadsDatabase::open(std::path::Path::new(":memory:")).expect("open mem db"));
+        let db_handle = db.clone();
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db_handle, cx);
+        });
+
+        // Stream emits text and then closes with NO `Stop` — the bug scenario.
+        let model: AnyLanguageModel = Arc::new(ReplayMockModel {
+            id: "test/replay".into(),
+            events: Arc::new(vec![LanguageModelCompletionEvent::Text(
+                "hello world".into(),
+            )]),
+        });
+
+        let thread_id = "reg-persist-no-stop";
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("当前 thread id 是?".into())],
+            );
+            // Pin the title so `maybe_generate_title` short-circuits at the
+            // `title_last_eval_user_count` gate — otherwise it spawns a title
+            // stream task that outlives the test and trips gpui's leaked-handle
+            // check at teardown.
+            rec.title = Some("regression".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // The task-tail save is fire-and-forget on the background executor;
+        // `run_until_parked` drains it so the upsert has committed by here.
+        cx.run_until_parked();
+
+        let loaded = db.load(thread_id).expect("load db").expect("row present");
+        let assistant_text: String = loaded
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::language_model::Role::Assistant)
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| match c {
+                crate::language_model::MessageContent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistant_text, "hello world",
+            "assistant text was not persisted by the run_turn task-tail save"
+        );
+        // A successful persist must stamp a non-zero revision so later stale
+        // snapshots are rejected by the upsert guard.
+        assert!(loaded.revision > 0, "persisted revision must be non-zero");
     }
 }

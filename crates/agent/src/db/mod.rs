@@ -37,8 +37,9 @@ use crate::paths;
 /// Schema version. `open()` compares `PRAGMA user_version` against this; a
 /// version that *predates* the current one runs the incremental migration
 /// chain. A version that pre-dates v2 (i.e. unknown legacy) is still treated
-/// as legacy and dropped wholesale — only the v2 → v3 step is preserved.
-const SCHEMA_VERSION: i32 = 3;
+/// as legacy and dropped wholesale — only the v2 → v3 and v3 → v4 steps are
+/// preserved.
+const SCHEMA_VERSION: i32 = 4;
 
 /// Thread database handle.
 pub struct ThreadsDatabase {
@@ -62,9 +63,10 @@ impl ThreadsDatabase {
 
     /// Apply incremental migrations from `version` up to [`SCHEMA_VERSION`],
     /// or — if `version` is too old to be safely migrated — drop and recreate
-    /// the schema. The v2 → v3 step adds the `approval_mode` column to
-    /// `threads`; pre-v2 schemas are not understood and are wiped so a corrupt
-    /// or unrelated database never silently loads.
+    /// the schema. The v2 → v3 step adds the `approval_mode` and `pinned`
+    /// columns to `threads`; the v3 → v4 step adds the `revision` column used
+    /// by the stale-snapshot guard. Pre-v2 schemas are not understood and are
+    /// wiped so a corrupt or unrelated database never silently loads.
     fn init_schema(conn: &mut Connection) -> Result<()> {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -101,16 +103,29 @@ impl ThreadsDatabase {
             // pre-v3 table. The new columns default to 0/OnRequest; any
             // thread with `yolo = 1` is upgraded to Yolo by the read path
             // in `threads.rs`.
-            tx.execute(
-                "ALTER TABLE threads ADD COLUMN approval_mode INTEGER NOT NULL DEFAULT 0;",
-                [],
-            )
-            .context("alter threads add approval_mode")?;
-            tx.execute(
-                "ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
-                [],
-            )
-            .context("alter threads add pinned")?;
+            if version < 3 {
+                tx.execute(
+                    "ALTER TABLE threads ADD COLUMN approval_mode INTEGER NOT NULL DEFAULT 0;",
+                    [],
+                )
+                .context("alter threads add approval_mode")?;
+                tx.execute(
+                    "ALTER TABLE threads ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+                    [],
+                )
+                .context("alter threads add pinned")?;
+            }
+            // v3 → v4: add the monotonic `revision` column backing the
+            // stale-snapshot guard in `upsert`. Defaults to 0 so legacy rows
+            // are treated as the earliest revision and any newer snapshot
+            // supersedes them.
+            if version < 4 {
+                tx.execute(
+                    "ALTER TABLE threads ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;",
+                    [],
+                )
+                .context("alter threads add revision")?;
+            }
         }
         threads::create_table(&tx)?;
         events::create_table(&tx)?;
@@ -172,6 +187,7 @@ mod tests {
             interacted_at: 1_700_000_100,
             updated_at: 1_700_000_200,
             session_started_at: 1_700_000_000,
+            revision: 0,
             cumulative_token_usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
@@ -455,5 +471,54 @@ mod tests {
         assert_eq!(evs.len(), 3);
         assert_eq!(evs[0].seq, 1);
         assert_eq!(evs[2].seq, 3);
+    }
+
+    #[test]
+    fn upsert_rejects_stale_revision() {
+        // A fire-and-forget save carrying an older revision must not overwrite a
+        // newer row. This is the guard against the switch-then-return race:
+        // the older snapshot would clobber the assistant turn the user already
+        // sees after switching back.
+        let db = open_mem();
+
+        let mut v1 = sample_record("t1");
+        v1.revision = 1;
+        v1.summary = "first".into();
+        db.upsert(&v1, true).unwrap();
+
+        let mut v2 = sample_record("t1");
+        v2.revision = 5;
+        v2.summary = "fifth".into();
+        db.upsert(&v2, true).unwrap();
+        assert_eq!(db.load("t1").unwrap().unwrap().summary, "fifth");
+
+        // An older revision (e.g. a lingering background save from before v2)
+        // must be discarded, leaving the newer row intact.
+        let mut stale = sample_record("t1");
+        stale.revision = 2;
+        stale.summary = "stale-overwrite".into();
+        db.upsert(&stale, true).unwrap();
+
+        let loaded = db.load("t1").unwrap().unwrap();
+        assert_eq!(loaded.summary, "fifth");
+        assert_eq!(loaded.revision, 5);
+    }
+
+    #[test]
+    fn upsert_accepts_equal_revision() {
+        // Equal revision is allowed so that non-state edits (rename, archive)
+        // that don't bump persist_revision still take effect.
+        let db = open_mem();
+        let mut v1 = sample_record("t1");
+        v1.revision = 3;
+        db.upsert(&v1, true).unwrap();
+
+        let mut v2 = sample_record("t1");
+        v2.revision = 3;
+        v2.title_override = Some("renamed".into());
+        db.upsert(&v2, true).unwrap();
+
+        let loaded = db.load("t1").unwrap().unwrap();
+        assert_eq!(loaded.title_override.as_deref(), Some("renamed"));
     }
 }
