@@ -4,6 +4,7 @@ pub mod composer_menu;
 pub mod message;
 pub mod settings;
 pub mod sidebar;
+pub mod title_menu;
 
 use gpui::prelude::*;
 use gpui::{Div, px};

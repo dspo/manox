@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use agent::language_model::StopReason;
@@ -141,6 +142,12 @@ pub struct Workspace {
     slash_open: bool,
     slash_menu: Option<Entity<PopupMenu>>,
     slash_menu_sub: Option<Subscription>,
+    /// Title bar "..." dropdown (Codex-style conversation menu). Mirrors the
+    /// model selector pattern: a button toggles `title_menu_open`; the
+    /// `PopupMenu` entity and its dismiss subscription are created on open.
+    title_menu_open: bool,
+    title_menu: Option<Entity<PopupMenu>>,
+    title_menu_sub: Option<Subscription>,
     /// A pending plan approval (model called `exit_plan_mode`). The overlay
     /// takes precedence after the auth overlay.
     pending_plan: Option<PendingPlan>,
@@ -297,6 +304,9 @@ impl Workspace {
             slash_open: false,
             slash_menu: None,
             slash_menu_sub: None,
+            title_menu_open: false,
+            title_menu: None,
+            title_menu_sub: None,
             pending_plan: None,
             pending_attachments: Vec::new(),
             project_picker_pending: false,
@@ -492,6 +502,10 @@ impl Workspace {
                 let store = agent::thread_store_global();
                 store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
             }
+            SidebarEvent::PinThread(id, pinned) => {
+                let store = agent::thread_store_global();
+                store.update(cx, |s, cx| s.pin_thread(id, *pinned, cx));
+            }
         })
     }
 
@@ -622,6 +636,13 @@ impl Workspace {
         self.slash_open = false;
         self.slash_menu = None;
         self.slash_menu_sub = None;
+    }
+
+    /// Close the title bar "..." dropdown, dropping the menu entity + subscription.
+    fn close_title_menu(&mut self) {
+        self.title_menu_open = false;
+        self.title_menu = None;
+        self.title_menu_sub = None;
     }
 
     /// Close the access-chip dropdown, dropping the menu entity + subscription.
@@ -932,6 +953,44 @@ impl Workspace {
             .model()
             .map(|m| m.name().to_string())
             .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+    }
+
+    /// Pin / unpin the active thread. The DB write + sidebar refresh runs
+    /// through `ThreadStore::pin_thread`; the in-memory `Thread` mirror is
+    /// flipped first so the menu label updates immediately on the next
+    /// re-open. Notifies the workspace so the menu trigger re-renders.
+    fn title_menu_toggle_pin(&mut self, cx: &mut Context<Self>) {
+        let id = self.thread.read(cx).id.0.clone();
+        let next = !self.thread.read(cx).is_pinned();
+        self.thread.update(cx, |t, cx| t.set_pinned(next, cx));
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.pin_thread(&id, next, cx));
+        let msg = if next {
+            i18n::t("titlebar-pinned-notice")
+        } else {
+            i18n::t("titlebar-unpinned-notice")
+        };
+        self.add_info_message(msg.to_string(), cx);
+    }
+
+    /// Archive the active thread. Mirrors the sidebar archive action:
+    /// mark the thread archived, drop its row from the list (default
+    /// `include_archived=false`), and notice the user. Switching to a new
+    /// thread is left to the sidebar — the menu just persists the toggle.
+    fn title_menu_archive(&mut self, cx: &mut Context<Self>) {
+        let id = self.thread.read(cx).id.0.clone();
+        self.thread.update(cx, |t, cx| t.set_archived(true, cx));
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
+        self.add_info_message(i18n::t("titlebar-archive-notice").to_string(), cx);
+    }
+
+    /// Copy a string to the system clipboard, then push a localized notice
+    /// so the user sees what landed in the clipboard. Single funnel for all
+    /// `titlebar-copy-*` actions so the notice phrasing stays consistent.
+    fn title_menu_copy(&mut self, label_key: &str, value: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(value));
+        self.add_info_message(i18n::t(label_key).to_string(), cx);
     }
 
     /// Push a system-styled notice into the conversation (no thread message,
@@ -1909,6 +1968,169 @@ impl Workspace {
         menu
     }
 
+    /// Title bar "..." trigger + dropdown (Codex-style conversation menu).
+    ///
+    /// Closed: a small ghost icon button (horizontal ellipsis) next to the
+    /// session title. Open: an absolute-positioned PopupMenu anchored under
+    /// the button. Mirrors the model selector pattern: the menu entity and
+    /// its dismiss subscription are created lazily on open, dropped on close.
+    fn render_title_menu_trigger(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        use crate::views::title_menu::{TitleMenuCallbacks, build_title_menu};
+
+        let open = self.title_menu_open;
+        let is_pinned = self.thread.read(cx).is_pinned();
+        let is_archived = self.thread.read(cx).archived();
+
+        let trigger = Button::new("titlebar-trigger")
+            .ghost()
+            .small()
+            .icon(IconName::Ellipsis)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.title_menu_open {
+                    this.close_title_menu();
+                    cx.notify();
+                    return;
+                }
+                this.title_menu_open = true;
+                let workspace = cx.entity();
+                let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+                    let cb = TitleMenuCallbacks {
+                        on_pin: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
+                            })
+                        },
+                        on_rename: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let id = this.thread.read(cx).id.0.clone();
+                                    this.open_rename(id, cx);
+                                    this.add_info_message(
+                                        i18n::t("titlebar-rename-notice").to_string(),
+                                        cx,
+                                    );
+                                });
+                            })
+                        },
+                        on_archive: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| this.title_menu_archive(cx));
+                            })
+                        },
+                        on_copy_id: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let id = this.thread.read(cx).id.0.clone();
+                                    this.title_menu_copy("titlebar-copied-id", id, cx);
+                                });
+                            })
+                        },
+                        on_copy_markdown: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let md = this.thread.read(cx).to_markdown();
+                                    this.title_menu_copy("titlebar-copied-markdown", md, cx);
+                                });
+                            })
+                        },
+                        on_copy_cwd: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let cwd = this.thread.read(cx).cwd().display().to_string();
+                                    this.title_menu_copy("titlebar-copied-cwd", cwd, cx);
+                                });
+                            })
+                        },
+                        on_copy_deeplink: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    let id = this.thread.read(cx).id.0.clone();
+                                    let link = format!("manox://thread/{id}");
+                                    this.title_menu_copy("titlebar-copied-deeplink", link, cx);
+                                });
+                            })
+                        },
+                        on_schedule: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    this.add_info_message(
+                                        i18n::t("titlebar-not-implemented").to_string(),
+                                        cx,
+                                    );
+                                });
+                            })
+                        },
+                        on_new_window: {
+                            let ws = workspace.clone();
+                            Rc::new(move |_, _, cx| {
+                                ws.update(cx, |this, cx| {
+                                    this.add_info_message(
+                                        i18n::t("titlebar-not-implemented").to_string(),
+                                        cx,
+                                    );
+                                });
+                            })
+                        },
+                        is_pinned,
+                        is_archived,
+                    };
+                    build_title_menu(menu, window, cx, cb)
+                });
+                let sub = cx.subscribe(
+                    &menu,
+                    |this: &mut Workspace,
+                     _menu: Entity<PopupMenu>,
+                     _: &DismissEvent,
+                     cx: &mut Context<Workspace>| {
+                        this.close_title_menu();
+                        cx.notify();
+                    },
+                );
+                this.title_menu = Some(menu);
+                this.title_menu_sub = Some(sub);
+                cx.notify();
+            }));
+
+        // Color the trigger when open so the affordance matches the dropdown's
+        // presence (a clicked "..." otherwise looks identical to a hovered one).
+        let trigger = if open {
+            trigger.text_color(theme.accent)
+        } else {
+            trigger
+        };
+
+        if !open {
+            return trigger.into_any_element();
+        }
+
+        let menu = self
+            .title_menu
+            .clone()
+            .expect("title_menu exists when open");
+
+        gpui::div()
+            .relative()
+            .child(trigger)
+            .child(
+                gpui::div()
+                    .id("titlebar-dropdown")
+                    .absolute()
+                    .top_full()
+                    .left_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .into_any_element()
+    }
+
     /// Composer card: an auto-growing text area above a single toolbar row.
     /// The card's fill matches the page background (`theme.background`) so only
     /// the 1px border outlines it — the user-perceived "shading" disappears.
@@ -1953,13 +2175,7 @@ impl Workspace {
                             .child(cwd)
                             .child(access),
                     )
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(model)
-                            .child(send),
-                    ),
+                    .child(h_flex().items_center().gap_1().child(model).child(send)),
             )
             .into_any_element()
     }
@@ -2387,16 +2603,14 @@ impl Render for Workspace {
         let editor_open = self.editor_open;
         let editor_preview = self.editor_preview;
         let editor_width = self.editor_width;
-        // Title text reflects the chosen project once one is bound; falls back
-        // to the app name so an unselected first screen stays branded.
-        let title_text = self
-            .thread
-            .read(cx)
-            .project()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("manox")
-            .to_string();
+        // Title text is the active thread's display title (user rename > LLM
+        // title > mechanical summary). Falls back to "manox" so an unselected
+        // first screen stays branded before any title is generated.
+        let title_text: SharedString = {
+            let s = self.thread.read(cx).display_title();
+            if s.is_empty() { "manox".to_string() } else { s }
+        }
+        .into();
         // Empty first screen: no messages and nothing streaming. The composer is
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
@@ -2664,7 +2878,8 @@ impl Render for Workspace {
                                         gpui::div()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
                                             .child(title_text),
-                                    ),
+                                    )
+                                    .child(self.render_title_menu_trigger(&theme, cx)),
                             )
                             .child(h_flex()),
                     )

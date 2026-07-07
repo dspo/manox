@@ -33,7 +33,12 @@ use crate::paths;
 /// Schema version. `open()` compares `PRAGMA user_version` against this; a
 /// mismatch drops every table and recreates them. There is no incremental
 /// migration — per the upgrade design, legacy data is not carried forward.
-const SCHEMA_VERSION: i32 = 2;
+///
+/// Bump this whenever a column is added or a column's type/nullability
+/// changes. The `CREATE TABLE IF NOT EXISTS` is a no-op on existing tables,
+/// so the only way new columns reach a legacy DB is via the recreate path
+/// triggered by this version mismatch.
+const SCHEMA_VERSION: i32 = 3;
 
 /// Thread database handle.
 pub struct ThreadsDatabase {
@@ -136,6 +141,7 @@ mod tests {
             depth: 0,
             parent_id: None,
             archived: false,
+            pinned: false,
             created_at: 1_700_000_000,
             interacted_at: 1_700_000_100,
             updated_at: 1_700_000_200,

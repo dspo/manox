@@ -205,6 +205,10 @@ pub struct Thread {
     parent_id: Option<String>,
     /// Whether the user archived this thread from the sidebar.
     archived: bool,
+    /// Whether the user pinned this thread from the title bar menu. Pinned
+    /// threads float to the top of the sidebar list. Persisted in the same
+    /// row as `archived` so the two boolean metadata flags stay co-located.
+    pinned: bool,
     /// Creation time (Unix seconds). Stable for the thread's life; persisted so
     /// the sidebar can show "created" separately from "last active".
     created_at: i64,
@@ -274,6 +278,7 @@ impl Thread {
                 provider_id,
                 parent_id: None,
                 archived: false,
+                pinned: false,
                 created_at: now,
                 interacted_at: now,
                 cumulative_token_usage: TokenUsage::default(),
@@ -345,6 +350,7 @@ impl Thread {
                 provider_id,
                 parent_id: rec.parent_id,
                 archived: rec.archived,
+                pinned: rec.pinned,
                 created_at: rec.created_at,
                 interacted_at: rec.interacted_at,
                 cumulative_token_usage: rec.cumulative_token_usage,
@@ -411,6 +417,7 @@ impl Thread {
                 provider_id: None,
                 parent_id: None,
                 archived: false,
+                pinned: false,
                 created_at: chrono::Utc::now().timestamp(),
                 interacted_at: chrono::Utc::now().timestamp(),
                 cumulative_token_usage: TokenUsage::default(),
@@ -440,6 +447,7 @@ impl Thread {
             depth: self.depth as i32,
             parent_id: self.parent_id.clone(),
             archived: self.archived,
+            pinned: self.pinned,
             created_at: self.created_at,
             interacted_at: self.interacted_at,
             updated_at: chrono::Utc::now().timestamp(),
@@ -459,6 +467,71 @@ impl Thread {
             return title;
         }
         self.mechanical_summary()
+    }
+
+    /// User-facing display title with precedence: user rename > LLM title >
+    /// mechanical summary. Mirrors [`crate::db::ThreadSummary::display_title`]
+    /// so the title bar (live thread) and sidebar (loaded summaries) agree.
+    pub fn display_title(&self) -> String {
+        self.title_override
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(self.title.as_deref().filter(|s| !s.trim().is_empty()))
+            .map(str::to_string)
+            .unwrap_or_else(|| self.summary())
+    }
+
+    /// Render the conversation as a Markdown transcript. Each message is a
+    /// `## User` / `## Assistant` heading followed by its text content. Image
+    /// blocks become a `(image)` placeholder; tool_use / tool_result blocks
+    /// become fenced code blocks. Used by the title bar menu's "Copy as
+    /// Markdown" entry.
+    pub fn to_markdown(&self) -> String {
+        use crate::language_model::MessageContent;
+        let mut out = String::new();
+        for m in &self.messages {
+            let heading = match m.role {
+                Role::User => "## User",
+                Role::Assistant => "## Assistant",
+                Role::System => "## System",
+            };
+            out.push_str(heading);
+            out.push('\n');
+            for c in &m.content {
+                match c {
+                    MessageContent::Text(t) => {
+                        out.push_str(t);
+                        out.push('\n');
+                    }
+                    MessageContent::Thinking { text, .. } => {
+                        out.push_str("> *thinking:* ");
+                        out.push_str(text);
+                        out.push('\n');
+                    }
+                    MessageContent::Image { .. } => {
+                        out.push_str("(image)\n");
+                    }
+                    MessageContent::ToolUse(u) => {
+                        let body = if u.raw_input.is_empty() {
+                            u.input.to_string()
+                        } else {
+                            u.raw_input.clone()
+                        };
+                        out.push_str(&format!("```tool_use: {}\n{}\n```\n", u.name, body));
+                    }
+                    MessageContent::ToolResult(r) => {
+                        let tag = if r.is_error {
+                            "tool_result (error)"
+                        } else {
+                            "tool_result"
+                        };
+                        out.push_str(&format!("```{tag}\n{}\n```\n", r.content));
+                    }
+                }
+            }
+            out.push('\n');
+        }
+        out
     }
 
     /// Mechanical fallback: first user message text, truncated to 60 chars;
@@ -675,6 +748,39 @@ impl Thread {
         }
         self.yolo = on;
         cx.emit(ThreadEvent::YoloToggled { on });
+        cx.notify();
+    }
+
+    /// Whether the user pinned this thread from the title bar menu. Pinned
+    /// threads float to the top of the sidebar list.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Whether the user archived this thread from the sidebar.
+    pub fn archived(&self) -> bool {
+        self.archived
+    }
+
+    /// Toggle the pinned flag. Persistence is the caller's responsibility
+    /// (the workspace calls `ThreadStore::pin_thread` which writes to the DB
+    /// and refreshes the sidebar list).
+    pub fn set_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        if self.pinned == pinned {
+            return;
+        }
+        self.pinned = pinned;
+        cx.notify();
+    }
+
+    /// Toggle the archived flag. Persistence is the caller's responsibility
+    /// (the workspace calls `ThreadStore::archive_thread` which writes to the
+    /// DB and refreshes the sidebar list).
+    pub fn set_archived(&mut self, archived: bool, cx: &mut Context<Self>) {
+        if self.archived == archived {
+            return;
+        }
+        self.archived = archived;
         cx.notify();
     }
 
