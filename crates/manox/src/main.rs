@@ -19,11 +19,11 @@ actions!(manox, [Quit, ToggleFullscreen]);
 /// Minimum window width: sidebar (260) + divider (6) + a conversation column
 /// wide enough for the composer toolbar and a readable message line, with
 /// horizontal insets so content never kisses the edges.
-pub const MIN_WINDOW_W: f32 = 820.0;
+const MIN_WINDOW_W: f32 = 820.0;
 
 /// Minimum window height: title bar + several message lines + composer +
 /// footer hairline, with breathing room.
-pub const MIN_WINDOW_H: f32 = 520.0;
+const MIN_WINDOW_H: f32 = 520.0;
 
 fn main() {
     // Install a panic hook before anything else so a panic anywhere — main
