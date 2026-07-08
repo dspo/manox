@@ -4182,13 +4182,34 @@ impl Render for Workspace {
                                     .iter()
                                     .cloned()
                                     .map(|item| {
-                                        v_flex().pt_1().pb_4().child(item).into_any_element()
+                                        // `flex_shrink_0` keeps each row at its true
+                                        // content height so the column can overflow the
+                                        // viewport and `overflow_y_scroll` actually
+                                        // engages. With the default `flex_shrink: 1`
+                                        // the rows collapse to fit the container, the
+                                        // content never exceeds the viewport, and the
+                                        // list is non-scrollable — the root cause of
+                                        // both the earlier message-overlap (text
+                                        // spilling past the shrunk row bounds) and the
+                                        // "can't scroll with the mouse" symptom.
+                                        v_flex()
+                                            .pt_1()
+                                            .pb_4()
+                                            .flex_shrink_0()
+                                            .child(item)
+                                            .into_any_element()
                                     })
                                     .collect();
-                                // Completed history threads clear stickiness on attach, while
-                                // active turns keep it through post-stop markdown reflow.
-                                let sticky = self.stick_to_bottom;
+                                // Tail-follow: while `stick_to_bottom` holds, re-pin
+                                // to the bottom each prepaint. The flag is read live so
+                                // an upward wheel tick that clears stickiness takes
+                                // effect on this same frame's prepaint instead of
+                                // waiting a re-render. Pinning is skipped when already
+                                // at the bottom: that leaves no pending flag for the
+                                // next frame to consume, so the first upward scroll
+                                // from a steady bottom is not snapped back.
                                 let pin_handle = self.scroll_handle.clone();
+                                let weak = cx.weak_entity();
                                 let list_el = v_flex()
                                     .id("msg-scroll")
                                     .flex_1()
@@ -4197,10 +4218,19 @@ impl Render for Workspace {
                                     .overflow_y_scroll()
                                     .track_scroll(&self.scroll_handle)
                                     .children(items)
-                                    .on_prepaint(move |_bounds, _window, _cx| {
-                                        if sticky {
-                                            pin_handle.scroll_to_bottom();
+                                    .on_prepaint(move |_bounds, _window, cx| {
+                                        let Some(this) = weak.upgrade() else {
+                                            return;
+                                        };
+                                        if !this.read(cx).stick_to_bottom {
+                                            return;
                                         }
+                                        let off = pin_handle.offset().y;
+                                        let max = pin_handle.max_offset().y;
+                                        if (max + off).abs() < px(1.) {
+                                            return;
+                                        }
+                                        pin_handle.scroll_to_bottom();
                                     })
                                     .on_scroll_wheel(cx.listener(
                                         |this, event: &gpui::ScrollWheelEvent, window, cx| {
