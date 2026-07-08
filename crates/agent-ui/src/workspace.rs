@@ -3172,7 +3172,7 @@ impl Workspace {
                     });
                 },
                 move |window, cx| {
-                    ws_goal.update(cx, |this, cx| {
+                    let _ = ws_goal.update(cx, |this, cx| {
                         this.close_plus_menu();
                         // Insert `/goal ` so the user types the completion
                         // condition and submits — same pattern as the `⁄` menu
