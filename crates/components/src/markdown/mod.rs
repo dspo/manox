@@ -242,25 +242,26 @@ fn diff_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
 }
 
 /// Classify a unified-diff line into (background, left_bar, foreground).
-/// File-header and hunk-header lines are muted; context lines inherit the
-/// block background and the base foreground so the diff reads as code.
+///
+/// Metadata lines (file headers `+++ `/`--- `, `diff `/`index ` summaries,
+/// `@@` hunk markers, `\ No newline` sentinels) are muted. Content lines key
+/// on their first byte: a `+`/`-` content line whose text itself starts with
+/// `--`/`++` (e.g. a removed `--x` rendering as `---x`) must not be mistaken
+/// for a file header — hence the trailing-space anchor on `+++ `/`--- `.
 fn classify_diff_line(line: &str, styles: &MdStyles) -> (Hsla, Hsla, Hsla) {
-    if let Some(rest) = line.strip_prefix('+') {
-        // `+++`/`---` file headers start with three signs; treat a lone `+`
-        // (and `++ ` which is never a file header) as added content.
-        if rest.starts_with("++") {
-            (styles.secondary, styles.muted, styles.muted)
-        } else {
-            (styles.diff_add_bg, styles.diff_add_fg, styles.diff_add_fg)
-        }
-    } else if let Some(rest) = line.strip_prefix('-') {
-        if rest.starts_with("--") {
-            (styles.secondary, styles.muted, styles.muted)
-        } else {
-            (styles.diff_del_bg, styles.diff_del_fg, styles.diff_del_fg)
-        }
-    } else if line.starts_with("@@") || line.starts_with("diff ") || line.starts_with("index ") {
-        (styles.secondary, styles.muted, styles.muted)
+    if line.starts_with("diff ")
+        || line.starts_with("index ")
+        || line.starts_with("@@")
+        || line.starts_with("+++ ")
+        || line.starts_with("--- ")
+        || line.starts_with("\\ ")
+    {
+        return (styles.secondary, styles.muted, styles.muted);
+    }
+    if line.starts_with('+') {
+        (styles.diff_add_bg, styles.diff_add_fg, styles.diff_add_fg)
+    } else if line.starts_with('-') {
+        (styles.diff_del_bg, styles.diff_del_fg, styles.diff_del_fg)
     } else {
         (styles.secondary, styles.muted, styles.foreground)
     }
@@ -363,4 +364,51 @@ fn list_block(ordered: bool, items: Vec<ListItem>, styles: &MdStyles) -> AnyElem
         );
     }
     col.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_component::Theme;
+
+    fn styles() -> MdStyles {
+        MdStyles::from_theme(&Theme::default())
+    }
+
+    #[test]
+    fn diff_content_with_sign_prefix_not_header() {
+        let s = styles();
+        // A removed line whose content starts with `-` (whole line `---x`)
+        // must classify as removed, not as a `--- a/file` header; same for
+        // an added line whose content starts with `+` (`+++x`).
+        assert_eq!(classify_diff_line("---x", &s).2, s.diff_del_fg);
+        assert_eq!(classify_diff_line("+++x", &s).2, s.diff_add_fg);
+    }
+
+    #[test]
+    fn diff_metadata_lines_are_muted() {
+        let s = styles();
+        for line in [
+            "--- a/file",
+            "+++ b/file",
+            "diff --git a/x b/y",
+            "index 1234567..abcdefg 100644",
+            "@@ -1,2 +1,2 @@",
+            "\\ No newline at end of file",
+        ] {
+            assert_eq!(
+                classify_diff_line(line, &s).2,
+                s.muted,
+                "line {line:?} should be muted metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_content_lines_carry_accent() {
+        let s = styles();
+        assert_eq!(classify_diff_line("+added", &s).2, s.diff_add_fg);
+        assert_eq!(classify_diff_line("-removed", &s).2, s.diff_del_fg);
+        assert_eq!(classify_diff_line(" context", &s).2, s.foreground);
+    }
 }
