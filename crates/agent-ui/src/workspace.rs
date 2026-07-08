@@ -781,6 +781,12 @@ impl Workspace {
             SidebarEvent::ArchiveThread(id, archived) => {
                 let store = agent::thread_store_global();
                 store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
+                // Sync the in-memory flag so the title-bar menu label stays
+                // fresh when the sidebar archives the currently active thread.
+                if this.thread.read(cx).id.0 == *id {
+                    this.thread
+                        .update(cx, |t, cx| t.set_archived(*archived, cx));
+                }
             }
         })
     }
@@ -1371,16 +1377,25 @@ impl Workspace {
         self.add_info_message(msg.to_string(), cx);
     }
 
-    /// Archive the active thread. Mirrors the sidebar archive action:
-    /// mark the thread archived, drop its row from the list (default
-    /// `include_archived=false`), and notice the user. Switching to a new
-    /// thread is left to the sidebar — the menu just persists the toggle.
+    /// Archive / unarchive the active thread. Mirrors the sidebar archive
+    /// action: toggle the thread's archived flag, persist via
+    /// `ThreadStore::archive_thread` (which drops its row from the list when
+    /// archived, default `include_archived=false`), and notice the user.
+    /// The in-memory `Thread` mirror is flipped first so the menu label
+    /// updates immediately on the next re-open. Switching to a new thread
+    /// is left to the sidebar — the menu just persists the toggle.
     fn title_menu_archive(&mut self, cx: &mut Context<Self>) {
         let id = self.thread.read(cx).id.0.clone();
-        self.thread.update(cx, |t, cx| t.set_archived(true, cx));
+        let next = !self.thread.read(cx).archived();
+        self.thread.update(cx, |t, cx| t.set_archived(next, cx));
         let store = agent::thread_store_global();
-        store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
-        self.add_info_message(i18n::t("titlebar-archive-notice").to_string(), cx);
+        store.update(cx, |s, cx| s.archive_thread(&id, next, cx));
+        let msg = if next {
+            i18n::t("titlebar-archive-notice")
+        } else {
+            i18n::t("titlebar-unarchive-notice")
+        };
+        self.add_info_message(msg.to_string(), cx);
     }
 
     /// Copy a string to the system clipboard, then push a localized notice

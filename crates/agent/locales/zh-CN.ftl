@@ -391,6 +391,7 @@ titlebar-copied-markdown = 会话已复制为 Markdown 到剪贴板。
 titlebar-pinned-notice = 会话已置顶。
 titlebar-unpinned-notice = 会话已取消置顶。
 titlebar-archive-notice = 会话已归档。
+titlebar-unarchive-notice = 会话已取消归档。
 titlebar-not-implemented = 尚未实现。
 
 # ── 环境信息面板 ──────────────────────────────────────────────────────

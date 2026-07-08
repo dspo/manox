@@ -407,6 +407,7 @@ titlebar-copied-markdown = Conversation copied to clipboard as Markdown.
 titlebar-pinned-notice = Conversation pinned.
 titlebar-unpinned-notice = Conversation unpinned.
 titlebar-archive-notice = Conversation archived.
+titlebar-unarchive-notice = Conversation unarchived.
 titlebar-not-implemented = Not implemented yet.
 
 # ── Environment info panel ──────────────────────────────────────────────
