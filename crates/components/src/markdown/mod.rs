@@ -100,7 +100,15 @@ impl IntoElement for Markdown {
         }
 
         let blocks = ast::parse(&self.text, &styles);
-        let mut col = v_flex().id(id).w_full().min_w_0().gap_2();
+        // Root carries `text_sm` so the document is self-contained: every
+        // block that does not override the size itself (paragraph, list item
+        // bodies) inherits it, rather than depending on the caller's ancestor.
+        let mut col = v_flex()
+            .id(id)
+            .w_full()
+            .min_w_0()
+            .gap_2()
+            .text_sm();
         col = if self.scrollable {
             col.h_full().overflow_y_scroll()
         } else {
@@ -164,6 +172,10 @@ fn heading(text: &str, highlights: &[(Range<usize>, HighlightStyle)], depth: u8)
 /// horizontally-scrollable, non-wrapping code run with tree-sitter syntax
 /// highlighting via `SyntaxHighlighter`.
 fn code_block(value: &str, lang: Option<&str>, styles: &MdStyles, idx: usize) -> AnyElement {
+    // Fenced-code values carry a trailing `\n` (the closing fence sits on its
+    // own line); strip it so the gutter count and the painted run agree —
+    // `split('\n')` on `"a\n"` would otherwise count a phantom empty line.
+    let value = value.trim_end_matches('\n');
     let highlights = code_highlights(value, lang, styles);
     let line_count = value.split('\n').count().max(1);
     let gutter: String = (1..=line_count).map(|n| format!("{n:>3}\n")).collect();
