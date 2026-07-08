@@ -228,11 +228,11 @@ impl ConversationState {
                     ApplyOutcome::None
                 }
             }
-            // Token usage + model changes are surfaced elsewhere (sidebar /
-            // assistant footer / model-history overlay). No conversation item.
-            ThreadEvent::TokenUsageUpdated(_) | ThreadEvent::ModelChanged { .. } => {
-                ApplyOutcome::None
-            }
+            // Token usage + model/effort changes are surfaced elsewhere (sidebar /
+            // model-history overlay). No conversation item.
+            ThreadEvent::TokenUsageUpdated(_)
+            | ThreadEvent::ModelChanged { .. }
+            | ThreadEvent::ReasoningEffortChanged { .. } => ApplyOutcome::None,
             // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
             // workspace to light the sidebar running indicator; it carries no
             // conversation content.

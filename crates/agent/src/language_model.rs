@@ -140,8 +140,8 @@ pub enum LanguageModelToolChoice {
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Low,
-    #[default]
     Medium,
+    #[default]
     High,
     XHigh,
     Max,
@@ -216,7 +216,7 @@ impl ReasoningEffort {
             4 => Self::Max,
             5 => Self::Ultracode,
             6 => Self::Auto,
-            _ => Self::Medium,
+            _ => Self::High,
         }
     }
 
