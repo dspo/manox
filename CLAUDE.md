@@ -109,6 +109,8 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 - **禁止抄袭第三方 crate 代码**：不便规范引入的可参考架构思想，但禁止复制粘贴后修改。`git2` 即因此被禁（plugin marketplace shell out 系统 `git`）。
 - **注释一律英文，面向终态（描述不变量/意图）而非过程流水账，非必要不注释**。详见 `~/.claude/rules/code-comments.md`。
 - **迭代时不得破坏前缀缓存**：provider 侧前缀缓存是透明优化——命中时零成本，击穿时静默回退。任何对 `build_completion_request` 或消息组装管线的改动，必须保持跨 turn 的请求前缀字节一致；若需重写历史，须先接入 `AppendOnlyContextManager`（`prefix_stability.rs`）或显式禁用该路径的缓存。
+- **涉及 GPUI/UI 开发时，先 load skills**：任何与 GPUI 框架或 gpui-component 组件库相关的 UI 任务，应在开始实现前通过 Skill 工具加载 `.claude/skills/gpui` 和 `.claude/skills/gpui-component`（贡献新组件时额外加载 `gpui-component-dev`），确保遵循 GPUI Entity/Render/actions/keybindings/async/layout 惯用法和 gpui-component 组件 API。
+- **重构 UI 后，及时修订 UI-MAP.md**：任何对 UI 组件层级、命名、添加/移除/重组组件的变更，都必须在同一 PR 中更新 `UI-MAP.md`，保持组件名、层级关系和源码位置与代码一致。新增组件要在索引和对应章节各加一个 `####` 标题，移除组件要同步删索引条目。
 
 ## 激进开发纪律
 
