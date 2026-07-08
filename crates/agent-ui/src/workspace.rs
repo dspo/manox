@@ -4367,11 +4367,15 @@ impl Render for Workspace {
                                         },
                                     ));
                                 // Outer column fills the list region and bottom-
-                                // aligns the scroll column. Short content takes its
-                                // own height (`max_h_full` caps but does not stretch),
-                                // so `justify_end` drops it next to the composer with
-                                // no tail gap; overflowing content hits the cap and
-                                // scrolls within the region as before.
+                                // aligns the scroll column. `h_full()` is load-
+                                // bearing: the region is an `h_flex()` row
+                                // (items_center, not stretch), so without it the
+                                // wrapper shrinks to content height and justify_end
+                                // has no room to drop short content. Short content
+                                // takes its own height (`max_h_full` caps but does
+                                // not stretch), so `justify_end` drops it next to
+                                // the composer with no tail gap; overflowing content
+                                // hits the cap and scrolls within the region as before.
                                 let list_wrap = v_flex()
                                     .flex_1()
                                     .h_full()
