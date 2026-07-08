@@ -4287,14 +4287,11 @@ impl Render for Workspace {
                                     .iter()
                                     .cloned()
                                     .map(|item| {
-                                        // Pin each row to its true content height. The
-                                        // default `flex_shrink: 1` would let rows compress
-                                        // to fit the column, which (combined with losing
-                                        // the column's bounded height) was the original
-                                        // message-overlap failure. The scroll itself is
-                                        // owned by the column's `h_full()` + `overflow_y_scroll`;
-                                        // `flex_shrink_0` here keeps row bounds honest so
-                                        // markdown never paints outside its row.
+                                        // Pin each row to its true content height:
+                                        // `flex_shrink_0` keeps row bounds honest so
+                                        // markdown never paints outside its row, and
+                                        // the scroll column never compresses rows to
+                                        // fit the viewport.
                                         v_flex()
                                             .pt_1()
                                             .pb_4()
@@ -4316,9 +4313,8 @@ impl Render for Workspace {
                                 let weak = cx.weak_entity();
                                 let list_el = v_flex()
                                     .id("msg-scroll")
-                                    .flex_1()
                                     .w_full()
-                                    .h_full()
+                                    .max_h_full()
                                     .min_h_0()
                                     .min_w_0()
                                     .overflow_y_scroll()
@@ -4370,6 +4366,19 @@ impl Render for Workspace {
                                             }
                                         },
                                     ));
+                                // Outer column fills the list region and bottom-
+                                // aligns the scroll column. Short content takes its
+                                // own height (`max_h_full` caps but does not stretch),
+                                // so `justify_end` drops it next to the composer with
+                                // no tail gap; overflowing content hits the cap and
+                                // scrolls within the region as before.
+                                let list_wrap = v_flex()
+                                    .flex_1()
+                                    .h_full()
+                                    .min_h_0()
+                                    .min_w_0()
+                                    .justify_end()
+                                    .child(list_el);
                                 // Outline rail (left) + flat message column (right)
                                 // share the list region's height. The env-card
                                 // gutter is reserved here (not on the whole body)
@@ -4383,7 +4392,7 @@ impl Render for Workspace {
                                     .overflow_hidden()
                                     .when(show_env, |this| this.pr(px(ENV_CONTENT_INSET)))
                                     .children(outline)
-                                    .child(list_el)
+                                    .child(list_wrap)
                             }))
                             .children(footer)
                             // Approval overlay (if any)
