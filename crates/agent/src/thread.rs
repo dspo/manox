@@ -167,6 +167,8 @@ pub enum ThreadEvent {
     /// The user switched models mid-conversation. The store records a
     /// `model_change` event for the history timeline; emitted from `set_model`.
     ModelChanged { from: Option<String>, to: String },
+    /// Reasoning effort changed. The UI persists the new value to the thread record.
+    ReasoningEffortChanged { effort: ReasoningEffort },
     /// Goal mode toggled on/off. The UI shows or hides the `◎ /goal active`
     /// chip and, on activation, starts its elapsed-time ticker.
     GoalChanged { active: bool },
@@ -946,6 +948,7 @@ impl Thread {
             return;
         }
         self.reasoning_effort = effort;
+        cx.emit(ThreadEvent::ReasoningEffortChanged { effort });
         cx.notify();
     }
 

@@ -476,6 +476,11 @@ impl Workspace {
                     });
                     cx.notify();
                 }
+                ThreadEvent::ReasoningEffortChanged { .. } => {
+                    // Persist effort change to the thread record immediately.
+                    save_thread(this.thread.clone(), false, cx);
+                    cx.notify();
+                }
                 ThreadEvent::TokenUsageUpdated(_) => {
                     this.token_anim_gen = this.token_anim_gen.wrapping_add(1);
                     cx.notify();
@@ -2212,19 +2217,34 @@ impl Workspace {
     /// Open: an absolute-positioned PopupMenu; hovering a Provider row expands
     /// a flyout submenu listing its Models. PopupMenu handles all hover,
     /// click-outside, and keyboard-dismiss behavior internally.
-    fn render_model_selector(&mut self, _theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_model_selector(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let label = self.model_label(cx);
         let open = self.model_open;
 
-        let trigger = Button::new("model-trigger")
-            .ghost()
-            .small()
-            .label(label)
-            .icon(if open {
-                IconName::ChevronUp
-            } else {
-                IconName::ChevronDown
-            })
+        let trigger = h_flex()
+            .id("model-trigger")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+            .cursor_pointer()
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(theme.muted_foreground),
+            )
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.model_open {
                     this.model_open = false;
@@ -3012,9 +3032,7 @@ impl Workspace {
             .py_1()
             .min_w(px(96.))
             .rounded(theme.radius)
-            .bg(theme.secondary)
-            .border_1()
-            .border_color(theme.border)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
             .cursor_pointer()
             .child(Icon::new(chip_icon).xsmall().text_color(chip_color))
             .child(
@@ -3284,9 +3302,7 @@ impl Workspace {
             .px_2()
             .py_1()
             .rounded(theme.radius)
-            .bg(theme.secondary)
-            .border_1()
-            .border_color(theme.border)
+            .hover(|s| s.bg(theme.accent.opacity(0.08)))
             .cursor_pointer()
             .when_some(icon.clone(), |el, ic| {
                 el.child(Icon::new(ic).xsmall().text_color(theme.muted_foreground))
