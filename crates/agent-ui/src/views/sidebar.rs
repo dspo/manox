@@ -78,12 +78,18 @@ impl Sidebar {
     /// Update the rendered width. Called by the owning `Workspace` on every
     /// divider drag-move tick; the new value takes effect on the next render.
     pub fn set_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if self.width == width {
+            return;
+        }
         self.width = width;
         cx.notify();
     }
 
     /// Mark the currently selected thread id (back-filled by Workspace on switch/new, for highlight).
     pub fn set_selected(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if self.selected == id {
+            return;
+        }
         self.selected = id;
         cx.notify();
     }
