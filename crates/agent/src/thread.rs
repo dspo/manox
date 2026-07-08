@@ -2310,6 +2310,13 @@ impl Thread {
         if self.plan_mode {
             system.push_str(crate::system_prompt::PLAN_MODE_ADDENDUM);
         }
+        // Ultracode appends its multi-agent grant (model-facing standing
+        // permission to orchestrate sub-agents). The effort level itself is
+        // resolved to `XHigh` for the wire below; this addendum is the
+        // behavioral half of the Claude Code ultracode semantic.
+        if self.reasoning_effort == ReasoningEffort::Ultracode {
+            system.push_str(crate::system_prompt::ULTRACODE_GRANT);
+        }
         // The system prompt is the head of the cached prefix. `cache_control`
         // breakpoints are placed by `provider::anthropic_cache::apply_prompt_caching`
         // (single source of truth); the `cache` flag is advisory metadata, not
@@ -2370,7 +2377,7 @@ impl Thread {
         LanguageModelRequest {
             messages,
             tools,
-            reasoning_effort: Some(self.reasoning_effort),
+            reasoning_effort: Some(self.reasoning_effort.resolve_for_wire(self.depth)),
             ..Default::default()
         }
     }
@@ -2905,6 +2912,59 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// `build_completion_request` must fold `Auto` / `Ultracode` into concrete
+    /// wire levels before the request reaches a provider, and append the
+    /// Ultracode multi-agent grant to the system prompt. The raw enum never
+    /// reaches the wire — see `ReasoningEffort::resolve_for_wire`.
+    #[test]
+    fn build_completion_request_resolves_auto_and_ultracode_effort() {
+        use crate::language_model::{MessageContent, ReasoningEffort, Role};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-effort-resolve", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        // Auto on the main thread (depth 0) → High.
+        let req = cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.set_reasoning_effort(ReasoningEffort::Auto, cx)
+            });
+            thread.read(cx).build_completion_request()
+        });
+        assert_eq!(req.reasoning_effort, Some(ReasoningEffort::High));
+
+        // Ultracode → XHigh on the wire, and the grant lands in the system
+        // prompt (the behavioral half of the Claude Code ultracode semantic).
+        let req = cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.set_reasoning_effort(ReasoningEffort::Ultracode, cx)
+            });
+            thread.read(cx).build_completion_request()
+        });
+        assert_eq!(req.reasoning_effort, Some(ReasoningEffort::XHigh));
+        let sys_text = req
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .and_then(|m| {
+                m.content.iter().find_map(|c| match c {
+                    MessageContent::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })
+            })
+            .expect("system message with text");
+        assert!(
+            sys_text.contains("Ultracode mode"),
+            "ultracode grant must be in the system prompt, got: {sys_text}"
+        );
     }
 
     /// Regression guard for the YOLO + `AskUserQuestion` interaction.

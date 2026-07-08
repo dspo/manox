@@ -184,6 +184,17 @@ You are currently in plan mode: research the codebase and produce a plan, but do
 - When the plan is ready, call `exit_plan_mode` with a step-by-step implementation plan: what each step changes, which existing functions to reuse, the tools each step will use, and any risks. End the plan with a `### Critical Files for Implementation` section listing 3–5 paths.\n\
 - After you call `exit_plan_mode` the conversation pauses for user approval or rejection: approval exits plan mode and begins execution; rejection returns you to plan mode to revise the plan per the feedback — do not resubmit the same plan unchanged.\n";
 
+/// Mid-conversation grant appended when the user selects `Ultracode` effort.
+/// Mirrors Claude Code's ultracode semantic: `xhigh` effort on the wire (sent
+/// via `output_config.effort` / `reasoning.effort`) plus standing permission
+/// to launch multi-agent workflows. In manox the `agent` tool already runs
+/// without per-call approval, so this grant is model-facing — it shapes
+/// behavior, telling the model it may freely orchestrate sub-agents rather
+/// than narrating hesitation. Kept in code (not `system_prompt.md`) for the
+/// same reason as `PLAN_MODE_ADDENDUM`: a short, templated instruction.
+pub const ULTRACODE_GRANT: &str = "\n\n## Ultracode mode\n\
+You are running in ultracode mode at `xhigh` effort. You have standing permission to launch multi-agent workflows: spawn sub-agents freely via the `agent` tool to decompose the task, parallelize independent work, and isolate deep investigations, without asking for confirmation per spawn. Coordinate their results into a single coherent solution; do not narrate hesitation about delegating.\n";
+
 #[cfg(test)]
 mod tests {
     use super::*;
