@@ -1326,18 +1326,23 @@ impl Thread {
                 })
                 .ok()
                 .unwrap_or(true);
-            // Persistence backstop: `Stop`/`Error` events are the workspace's
-            // signal to save, but a stream that ends without a `MessageStop`
-            // (provider hiccup, non-SSE response from a compatibility endpoint)
-            // makes run_turn_loop return Ok with no terminal event emitted, so
-            // the workspace never learns the turn ended and the assistant
-            // content accumulated in `messages` is lost on the next thread
-            // switch. Persist here unconditionally — the revision guard makes
-            // this safe alongside any overlapping event-driven saves, and a
-            // dropped entity (the workspace already switched away) just skips.
+            // Persistence + running-indicator backstop: `Stop`/`Error` events
+            // are the workspace's signal to save the thread and clear the
+            // sidebar running indicator, but a stream that ends without a
+            // `MessageStop` (provider hiccup, non-SSE response from a
+            // compatibility endpoint) makes run_turn_loop return Ok with no
+            // terminal event emitted, so the workspace never learns the turn
+            // ended — the assistant content is lost on the next thread switch
+            // and the sidebar shimmer stays lit on the row. Persist and clear
+            // the indicator here unconditionally; both are idempotent alongside
+            // any overlapping event-driven save/clear, and a dropped entity
+            // (the workspace already switched away) just skips.
             if let Some(entity) = this.upgrade() {
                 cx.update(|cx: &mut gpui::App| {
+                    let thread_id = entity.read(cx).id.0.clone();
                     crate::thread_store::save_thread(entity, true, cx);
+                    let store = crate::thread_store::global();
+                    store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
                 });
             }
             // Goal auto-continuation: on a natural (non-cancelled) turn end
@@ -2767,6 +2772,13 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    /// Serializes tests that touch the process-global `ThreadStore`
+    /// (`init_for_test`/`global()`). Two such tests running in parallel
+    /// stomp each other's `TEST_OVERRIDE` entity and crash gpui's entity
+    /// map, so they must not overlap. Acquire at the top of each test that
+    /// calls `init_for_test`.
+    static THREAD_STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn edit_file_title_extracts_path_not_tag() {
         // The `[PATH#TAG]` header must surface the path, not the 4-hex tag.
@@ -3443,6 +3455,7 @@ mod tests {
         use crate::db::ThreadsDatabase;
         use std::sync::Arc;
 
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
         crate::agent_def::init();
         let cx = gpui::TestAppContext::single();
         cx.update(|cx| {
@@ -3533,5 +3546,98 @@ mod tests {
         // A successful persist must stamp a non-zero revision so later stale
         // snapshots are rejected by the upsert guard.
         assert!(loaded.revision > 0, "persisted revision must be non-zero");
+    }
+
+    /// Regression for the stuck-sidebar-indicator bug: a turn whose stream
+    /// ends WITHOUT a `MessageStop` (provider hiccup, non-SSE compatibility
+    /// response) emits no terminal `Stop`/`Error` event, so the workspace —
+    /// which clears the running indicator on those events — never learns the
+    /// turn ended and the sidebar shimmer stays lit on the row forever. The
+    /// `run_turn` task tail clears the indicator unconditionally as a backstop.
+    #[test]
+    fn run_turn_clears_running_indicator_without_stop_event() {
+        use std::sync::Arc;
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open mem db"),
+        );
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db, cx);
+        });
+
+        // Stream emits text and then closes with NO `Stop` — the bug scenario.
+        let model: AnyLanguageModel = Arc::new(ReplayMockModel {
+            id: "test/replay".into(),
+            events: Arc::new(vec![LanguageModelCompletionEvent::Text(
+                "hello world".into(),
+            )]),
+        });
+
+        let thread_id = "reg-running-no-stop";
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("ping".into())],
+            );
+            // Pin the title so `maybe_generate_title` short-circuits and does
+            // not spawn a title stream task that outlives the test.
+            rec.title = Some("regression".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+
+        // Simulate the workspace lighting the indicator on `TurnStarted` —
+        // the state the bug leaves stuck when no terminal event follows.
+        let store = crate::thread_store::global();
+        cx.update(|cx| {
+            store.update(cx, |s, cx| s.mark_running(thread_id, cx));
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.update(|cx| store.read_with(cx, |s, _| s.is_running(thread_id))),
+            "indicator should be lit while the turn is in flight"
+        );
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The task-tail backstop runs in the same synchronous span as
+        // `running_turn = None`; drain once more to be certain it has applied.
+        cx.run_until_parked();
+
+        assert!(
+            !cx.update(|cx| store.read_with(cx, |s, _| s.is_running(thread_id))),
+            "indicator must be cleared by the run_turn task-tail backstop when \
+             the stream ends without a Stop event"
+        );
     }
 }
