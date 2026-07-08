@@ -35,9 +35,9 @@ use gpui_component::{
     menu::{PopupMenu, PopupMenuItem},
     tab::TabBar,
     tag::{Tag, TagVariant},
-    text::TextView,
     v_flex,
 };
+use manox_components::markdown::Markdown;
 
 use composer::{ComposerEvent, ComposerInput};
 
@@ -4166,13 +4166,15 @@ impl Render for Workspace {
                             .p_4()
                             .text_sm()
                             .child(
-                                TextView::markdown(
-                                    preview_id,
-                                    self.editor_state.read(cx).value().to_string(),
-                                )
-                                .selectable(true)
-                                .scrollable(true)
-                                .h_full(),
+                                gpui::div().h_full().child(
+                                    Markdown::new(
+                                        preview_id,
+                                        self.editor_state.read(cx).value().to_string(),
+                                    )
+                                    .theme(cx.theme())
+                                    .selectable(true)
+                                    .scrollable(true),
+                                ),
                             )
                             .into_any_element()
                     } else {

@@ -16,6 +16,7 @@ members = [
     "crates/manox",
     "crates/terminal",
     "crates/terminal-ui",
+    "crates/components",
 ]
 resolver = "2"
 
@@ -33,6 +34,7 @@ composer = { path = "crates/composer" }
 manox = { path = "crates/manox" }
 terminal = { path = "crates/terminal" }
 terminal-ui = { path = "crates/terminal-ui" }
+manox-components = { path = "crates/components" }
 
 anyhow = "1"
 async-channel = "2"
@@ -60,6 +62,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
+# markdown-rs (mdast) — markdown 解析。经 gpui-component 已在 Cargo.lock,workspace 声明复用同一版本。
+markdown = "1"
+# ropey — SyntaxHighlighter::update 接收 &Rope;版本对齐 gpui-component 在 Cargo.lock 锁定的 2.0.0-beta.1。
+ropey = "2.0.0-beta.1"
 base64 = "0.22"
 # image —— clipboard image resize + PNG re-encode before sending to the provider
 # (Anthropic long-edge cap 1568px / 5MB). CPU-bound work runs on the background executor.

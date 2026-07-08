@@ -22,12 +22,12 @@ use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
-use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
+use manox_components::markdown::Markdown;
 
 use crate::Workspace;
 use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage};
@@ -53,16 +53,7 @@ pub struct ToolCallCtx {
     pub weak: WeakEntity<Workspace>,
 }
 
-/// Build a `TextViewStyle` that matches the current theme's highlight palette.
-fn text_view_style(theme: &Theme) -> TextViewStyle {
-    TextViewStyle {
-        highlight_theme: theme.highlight_theme.clone(),
-        is_dark: theme.is_dark(),
-        ..TextViewStyle::default()
-    }
-}
-
-/// Markdown `TextView` with theme-aware syntax highlighting.
+/// Markdown renderer with theme-aware syntax highlighting.
 ///
 /// `scrollable = true` mounts an internal vertical scrollbar. In that mode the
 /// TextView sizes to its parent's box, so the parent must have a defined
@@ -82,19 +73,11 @@ fn markdown_tv(
     theme: &Theme,
     scrollable: bool,
 ) -> gpui::AnyElement {
-    let tv = TextView::markdown(id, text)
+    Markdown::new(id, text)
+        .theme(theme)
         .selectable(true)
-        .style(text_view_style(theme));
-    if scrollable {
-        tv.scrollable(true).into_any_element()
-    } else {
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .child(tv)
-            .into_any_element()
-    }
+        .scrollable(scrollable)
+        .into_any_element()
 }
 
 /// One renderable conversation item, owned by its own gpui `Entity` so a
@@ -354,36 +337,16 @@ pub fn render_assistant(
 fn render_text_body(
     text: &str,
     streaming: bool,
-    id: impl Into<gpui::ElementId> + Clone,
+    id: impl Into<gpui::ElementId>,
     theme: &Theme,
 ) -> gpui::AnyElement {
-    if streaming {
-        // Plain text while streaming — no Tree-sitter involved, so the cursor
-        // can stay inline without corrupting any parser. Column + `w_full` so
-        // the text wraps at the column edge (a Row `div` would run it at
-        // max-content, flickering as the stream grows); `min_w_0` +
-        // `overflow_hidden` keep a long unbreakable run from breaking the cap.
-        let shown = format!("{text}▌");
-        v_flex()
-            .id(id.clone())
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .text_sm()
-            .whitespace_normal()
-            .text_color(theme.foreground)
-            .child(shown)
-            .into_any_element()
-    } else {
-        v_flex()
-            .id(id.clone())
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .text_sm()
-            .child(markdown_tv(id, text.to_string(), theme, false))
-            .into_any_element()
-    }
+    // Streaming bodies paint plain + cursor inside the renderer (no mdast
+    // re-parse per token); the full layout mounts once when the stream ends.
+    Markdown::new(id, text.to_string())
+        .theme(theme)
+        .selectable(true)
+        .streaming(streaming)
+        .into_any_element()
 }
 
 /// Render a reasoning (thinking) block: expanded while streaming, collapsed when done, with a copy button.
