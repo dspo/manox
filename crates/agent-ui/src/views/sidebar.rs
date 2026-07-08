@@ -396,9 +396,25 @@ fn render_thread_item(
     let updated = format_relative(summary.interacted_at);
     let tokens = format_tokens(summary.cumulative_total_tokens);
     let bg = if selected {
-        theme.accent.opacity(0.12)
+        theme.accent.opacity(0.18)
     } else {
         theme.transparent
+    };
+    // Left accent bar reads as the active-row indicator even when the wash is
+    // subtle on a high-contrast theme; transparent (not absent) keeps the 2px
+    // footprint so the row contents never shift on selection.
+    let bar = if selected {
+        theme.accent
+    } else {
+        theme.transparent
+    };
+    // Selected title takes the accent color so the active row reads at a glance
+    // even when the wash is faint — the bar + tinted title together are a
+    // stronger signal than either alone.
+    let title_color = if selected {
+        theme.accent
+    } else {
+        theme.foreground
     };
     let group = gpui::SharedString::from(format!("thread-row-{id}"));
     // Short thread ID: first 8 chars of the UUID. Char-based so a non-ASCII
@@ -476,6 +492,8 @@ fn render_thread_item(
         .pr_2()
         .py_1()
         .rounded(theme.radius)
+        .border_l_2()
+        .border_color(bar)
         .bg(bg)
         .hover(|s| s.bg(theme.accent.opacity(0.08)))
         .active(|s| s.bg(theme.accent.opacity(0.18)))
@@ -509,7 +527,7 @@ fn render_thread_item(
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_sm()
-                                .text_color(theme.foreground)
+                                .text_color(title_color)
                                 .child(title),
                         ),
                 )

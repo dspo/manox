@@ -15,7 +15,12 @@
 pub mod ast;
 pub mod theme;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -27,6 +32,20 @@ use ropey::Rope;
 
 use crate::markdown::ast::{Block, InlineRuns, ListItem, TableAlign};
 use crate::markdown::theme::MdStyles;
+
+// Per-(language, content, highlight theme) highlight cache. The message list
+// re-renders every dirty frame (a streaming delta dirties the workspace, and
+// every frozen block re-paints with it); without this cache each frame would
+// rebuild a `SyntaxHighlighter`, re-parse, and re-query styles for *every*
+// code block — including completed ones whose content never changes. The
+// highlight theme pointer is part of the key so a theme swap invalidates the
+// cache automatically; manox has no runtime theme switch today, so in
+// practice the key reduces to `(lang, content_hash)`.
+type HighlightCache = HashMap<(String, u64, usize), Vec<(Range<usize>, HighlightStyle)>>;
+
+thread_local! {
+    static CODE_HL_CACHE: RefCell<HighlightCache> = RefCell::new(HashMap::new());
+}
 
 /// Markdown document renderer.
 pub struct Markdown {
@@ -103,12 +122,11 @@ impl IntoElement for Markdown {
         // Root carries `text_sm` so the document is self-contained: every
         // block that does not override the size itself (paragraph, list item
         // bodies) inherits it, rather than depending on the caller's ancestor.
-        let mut col = v_flex()
-            .id(id)
-            .w_full()
-            .min_w_0()
-            .gap_2()
-            .text_sm();
+        // No `w_full`: the column is a flex item that stretches to its parent's
+        // width (or shrinks to its children's intrinsic width inside a
+        // max-content bubble, e.g. the user-message card) — `w_full` would zero
+        // the intrinsic width and collapse a max-content parent to min-content.
+        let mut col = v_flex().id(id).min_w_0().gap_2().text_sm();
         col = if self.scrollable {
             col.h_full().overflow_y_scroll()
         } else {
@@ -140,7 +158,6 @@ fn render_block(block: Block, styles: &MdStyles, idx: usize) -> AnyElement {
 
 fn paragraph(text: &str, highlights: &[(Range<usize>, HighlightStyle)]) -> AnyElement {
     div()
-        .w_full()
         .min_w_0()
         .text_sm()
         .child(
@@ -155,7 +172,7 @@ fn paragraph(text: &str, highlights: &[(Range<usize>, HighlightStyle)]) -> AnyEl
 /// parent div — same contract as `paragraph`, so streaming→finalized never
 /// recolors.
 fn heading(text: &str, highlights: &[(Range<usize>, HighlightStyle)], depth: u8) -> AnyElement {
-    let mut d = div().w_full().min_w_0().child(
+    let mut d = div().min_w_0().child(
         StyledText::new(SharedString::from(text.to_string()))
             .with_highlights(highlights.iter().cloned()),
     );
@@ -215,19 +232,35 @@ fn code_block(value: &str, lang: Option<&str>, styles: &MdStyles, idx: usize) ->
         .into_any_element()
 }
 
-/// Per-frame syntax highlighting for a code run. The highlighter is built and
-/// parsed fresh each render; tree-sitter parses a few KB in well under a
-/// millisecond, so this is correct before it is cached. Lives on the render
-/// thread — `SyntaxHighlighter` owns a thread-local `Parser` and is not `Send`.
+/// Syntax highlighting for a code run, memoized by `(lang, content, theme)`.
+/// Frozen code blocks have stable content, so after the first frame every
+/// subsequent render of a completed block is a zero-work cache hit — the
+/// message list re-renders every dirty frame, so this cache is what keeps a
+/// long conversation from re-highlighting every block on each streaming
+/// delta. Lives on the render thread — `SyntaxHighlighter` owns a thread-local
+/// `Parser` and is not `Send`.
 fn code_highlights(
     value: &str,
     lang: Option<&str>,
     styles: &MdStyles,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
+    let lang = lang.unwrap_or("text").to_string();
+    let theme_ptr = Arc::as_ptr(&styles.highlight_theme) as usize;
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    let content_hash = hasher.finish();
+    let key = (lang.clone(), content_hash, theme_ptr);
+    if let Some(hit) = CODE_HL_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
     let rope = Rope::from_str(value);
-    let mut hl = SyntaxHighlighter::new(lang.unwrap_or("text"));
+    let mut hl = SyntaxHighlighter::new(&lang);
     let _ = hl.update(None, &rope, None);
-    hl.styles(&(0..value.len()), styles.highlight_theme.as_ref())
+    let result = hl
+        .styles(&(0..value.len()), styles.highlight_theme.as_ref())
+        .clone();
+    CODE_HL_CACHE.with(|c| c.borrow_mut().insert(key, result.clone()));
+    result
 }
 
 /// Unified-diff block. Each line carries its own wash + a 2px left bar in the
@@ -310,11 +343,11 @@ fn blockquote(inner: Vec<Block>, styles: &MdStyles) -> AnyElement {
     col.into_any_element()
 }
 
-/// GFM table. The header row carries a secondary wash + muted text; each cell
-/// follows its column's `TableAlign`. A per-column `min_w` floor keeps wide
-/// tables from collapsing into wrap-chaos; `items_start` defeats cross-axis
-/// stretch so rows keep their natural width and overflow horizontally into
-/// the scroll viewport — mirroring the code-block contract, never clipping.
+/// GFM table. Rows stretch to the scroll width so `flex_1` cells land in
+/// equal-width columns and align row-to-row; a per-cell `min_w` floor keeps
+/// wide tables from collapsing, overflowing horizontally into the scroll
+/// viewport instead of clipping. Every cell carries right + bottom borders so
+/// the grid is visible even on the transparent body rows.
 fn table_block(
     rows: Vec<Vec<InlineRuns>>,
     align: Vec<TableAlign>,
@@ -325,11 +358,10 @@ fn table_block(
         .id(("table", idx))
         .w_full()
         .min_w_0()
-        .items_start()
         .overflow_x_scroll();
     for (r, row) in rows.into_iter().enumerate() {
         let is_header = r == 0;
-        let mut row_flex = h_flex().min_w_0();
+        let mut row_flex = h_flex().min_w_0().w_full();
         for (c, cell) in row.into_iter().enumerate() {
             let mut cell_div = div()
                 .flex_1()
@@ -337,6 +369,9 @@ fn table_block(
                 .px_3()
                 .py_2()
                 .text_xs()
+                .border_r_1()
+                .border_b_1()
+                .border_color(styles.border)
                 .child(
                     StyledText::new(SharedString::from(cell.text))
                         .with_highlights(cell.highlights.iter().cloned()),
