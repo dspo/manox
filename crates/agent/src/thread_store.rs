@@ -50,16 +50,16 @@ static TEST_OVERRIDE: std::sync::Mutex<Option<Entity<ThreadStore>>> = std::sync:
 
 /// Open the db, load the summary list, and register the global `Entity`. Call at App startup.
 pub fn init(cx: &mut App) {
-    let path = default_db_path().expect("解析 threads.db 路径失败");
+    let path = default_db_path().expect("Failed to resolve threads.db path");
     let db = ThreadsDatabase::open(&path)
-        .unwrap_or_else(|e| panic!("打开 threads db 失败 ({}): {e}", path.display()));
+        .unwrap_or_else(|e| panic!("Failed to open threads db ({}): {e}", path.display()));
     let summaries = db.list(false).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "加载历史 threads 列表失败，以空列表启动");
+        tracing::warn!(error = %e, "Failed to load thread summaries, starting with empty list");
         Vec::new()
     });
     tracing::info!(
         count = summaries.len(),
-        "ThreadStore 初始化，加载历史 threads"
+        "ThreadStore initialized, loaded thread summaries"
     );
     let entity = cx.new(|_cx| ThreadStore {
         db: Arc::new(db),
@@ -77,7 +77,7 @@ pub fn global() -> Entity<ThreadStore> {
     }
     GLOBAL
         .get()
-        .expect("ThreadStore 未初始化，请先调用 agent::init")
+        .expect("ThreadStore not initialized; call agent::init first")
         .clone()
 }
 
@@ -168,7 +168,7 @@ impl ThreadStore {
                 .spawn(async move { db.archive(&id, archived) })
                 .await;
             if let Err(e) = res {
-                tracing::warn!(error = %e, "archive thread 失败");
+                tracing::warn!(error = %e, "Failed to archive thread");
             }
             this.update(cx, |s, cx| {
                 s.refresh(cx);
@@ -190,7 +190,7 @@ impl ThreadStore {
                 .spawn(async move { db.pin(&id, pinned) })
                 .await;
             if let Err(e) = res {
-                tracing::warn!(error = %e, "pin thread 失败");
+                tracing::warn!(error = %e, "Failed to pin thread");
             }
             this.update(cx, |s, cx| {
                 s.refresh(cx);
@@ -220,7 +220,7 @@ impl ThreadStore {
                 })
                 .await;
             if let Err(e) = res {
-                tracing::warn!(error = %e, "record model_change 失败");
+                tracing::warn!(error = %e, "Failed to record model_change");
             }
         })
         .detach();
@@ -230,7 +230,7 @@ impl ThreadStore {
 /// Persist a `Thread` snapshot (upsert) asynchronously, then refresh the global list.
 /// Called by `Workspace` on user message submit / turn end. No-ops when there is no
 /// snapshot (no model) or when the thread has had no real interaction (empty new
-/// conversation screen — avoids creating phantom "(新对话)" sidebar entries).
+/// conversation screen — avoids creating phantom "(New Conversation)" sidebar entries).
 /// `touch`: when true, `updated_at` is bumped to now (real user activity); when false,
 /// the existing timestamp is preserved (e.g. saving state on thread switch without
 /// implying the user interacted with it).
@@ -250,7 +250,7 @@ pub fn save_thread(thread: Entity<Thread>, touch: bool, cx: &mut App) {
             .spawn(async move { db.upsert(&rec, touch) })
             .await;
         if let Err(e) = res {
-            tracing::warn!(error = %e, "保存 thread 失败");
+            tracing::warn!(error = %e, "Failed to save thread");
         }
         if touch {
             store.update(cx, |s, cx| {

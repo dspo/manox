@@ -342,7 +342,7 @@ fn setup_child(
     let ptu_cb = ptu.to_string();
     // Capture the sub-agent type so bubbled authorization prompts can be
     // prefixed with it — otherwise two parallel sub-agents each running bash
-    // produce identical "工具：bash" overlays the user can't tell apart.
+    // produce identical "Tool: bash" overlays the user can't tell apart.
     let subagent_type_cb = def.name.clone();
     let child_weak = child.downgrade();
     let errored_cb = child_errored.clone();

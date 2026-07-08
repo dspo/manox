@@ -96,7 +96,7 @@ impl SettingsItem {
 }
 
 /// Work mode preference in the General panel. Two-card selector mirrors the
-/// "适用于编程 / 适用于日常工作" pair in the Codex screenshot. Persisted to
+/// "For Programming / For Daily Work" pair in the Codex screenshot. Persisted to
 /// `Settings` only conceptually — the field is read by the panel on render
 /// and any in-memory edit stays local until a follow-up wires it through.
 #[derive(Clone, Copy, PartialEq, Default)]

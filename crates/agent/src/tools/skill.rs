@@ -19,7 +19,7 @@ pub struct SkillTool;
 
 #[derive(Deserialize, JsonSchema)]
 struct SkillInput {
-    /// Skill name exactly as it appears in the system prompt's "可用技能" list.
+    /// Skill name exactly as it appears in the system prompt's available-skills list.
     /// Plugin skills use the `plugin:skill` form (e.g. `gitwork:review`).
     name: String,
 }

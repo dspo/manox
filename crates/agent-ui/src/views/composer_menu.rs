@@ -1,7 +1,7 @@
 //! Composer `+` and `⁄` menus plus pending-attachment support.
 //!
-//! The `+` menu mirrors Codex.app's "add / plugins" popover; "文件和文件夹" opens
-//! a real file picker and "计划模式" toggles the thread's plan mode. The remaining
+//! The `+` menu mirrors Codex.app's "add / plugins" popover; "Files and Folders" opens
+//! a real file picker and "Plan Mode" toggles the thread's plan mode. The remaining
 //! rows are static decoration. The `⁄` menu's top section lists
 //! registered slash commands dynamically (from the `SlashCommandRegistry`); the rest
 //! (memory / skills) remains static decoration. Clicking a registered command inserts
@@ -93,7 +93,7 @@ const PLUS_PLUGIN_ROWS: &[MenuRow] = &[
     },
 ];
 
-/// `⁄` menu skills group. The `bool` is whether the skill is "个人" (personal) vs "系统" (system).
+/// `⁄` menu skills group. The `bool` is whether the skill is "personal" vs "system".
 const SLASH_SKILL_ROWS: &[(&str, &str, bool)] = &[
     (
         "Browser",

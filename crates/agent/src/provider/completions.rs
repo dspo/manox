@@ -150,7 +150,7 @@ pub async fn stream_completions(
     let body = build_request_body(model, max_tokens, &request, prompt_cache_key, long_ttl);
     let client = reqwest::Client::builder()
         .build()
-        .context("构建 reqwest client 失败")?;
+        .context("Failed to build reqwest client")?;
 
     // Retry the handshake (429 / 5xx / network errors) before any SSE event is
     // forwarded. The body is shared by reference so every attempt sends the
@@ -184,7 +184,7 @@ pub async fn stream_completions(
     let mut buf = String::new();
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("读取 SSE chunk 失败")?;
+        let chunk = chunk.context("Failed to read SSE chunk")?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(nl) = buf.find('\n') {
             let line = buf[..nl].trim_end_matches('\r').to_string();
@@ -199,7 +199,9 @@ pub async fn stream_completions(
             let value: Value = match serde_json::from_str(data) {
                 Ok(v) => v,
                 Err(e) => {
-                    let _ = tx.send(Err(anyhow!("解析 SSE 事件失败: {e}"))).await;
+                    let _ = tx
+                        .send(Err(anyhow!("Failed to parse SSE event: {e}")))
+                        .await;
                     continue;
                 }
             };

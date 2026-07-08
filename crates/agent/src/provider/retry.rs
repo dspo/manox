@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_channel::Sender;
 use futures::Future;
 use http::StatusCode;
@@ -89,7 +89,11 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     {
         return Some(Duration::from_millis(ms));
     }
-    let s = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    let s = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
     s.parse::<u64>().ok().map(Duration::from_secs)
 }
 
@@ -176,7 +180,7 @@ where
                 let body = resp.text().await.unwrap_or_default();
                 if !should_retry_status(status) || attempt >= MAX_ATTEMPTS {
                     let _ = tx
-                        .send(Err(anyhow!("{label} 返回 {status}: {body}")))
+                        .send(Err(anyhow!("{label} returned {status}: {body}")))
                         .await;
                     return Err(anyhow!("{label} returned {status}"));
                 }
@@ -201,9 +205,7 @@ where
             }
             Err(err) => {
                 if !is_retryable_send_error(&err) || attempt >= MAX_ATTEMPTS {
-                    let _ = tx
-                        .send(Err(anyhow!("{label} 调用失败: {err}")))
-                        .await;
+                    let _ = tx.send(Err(anyhow!("{label} call failed: {err}"))).await;
                     return Err(anyhow!("{label} send failed: {err}"));
                 }
                 let delay = backoff(attempt);
@@ -239,7 +241,10 @@ mod tests {
             assert!(should_retry_status(StatusCode::from_u16(s).unwrap()), "{s}");
         }
         for s in [400, 401, 403, 404, 409, 422, 451] {
-            assert!(!should_retry_status(StatusCode::from_u16(s).unwrap()), "{s}");
+            assert!(
+                !should_retry_status(StatusCode::from_u16(s).unwrap()),
+                "{s}"
+            );
         }
     }
 
@@ -285,7 +290,10 @@ mod tests {
 
         // Unparseable (HTTP-date form) falls back to None → caller uses backoff.
         let mut h = reqwest::header::HeaderMap::new();
-        h.insert("retry-after", "Wed, 01 Jan 2099 00:00:00 GMT".parse().unwrap());
+        h.insert(
+            "retry-after",
+            "Wed, 01 Jan 2099 00:00:00 GMT".parse().unwrap(),
+        );
         assert_eq!(parse_retry_after(&h), None);
     }
 }

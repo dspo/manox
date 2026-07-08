@@ -289,8 +289,8 @@ async fn run_bash(
         let resolved = super::resolve_path(cwd, base_cwd);
         if !policy.is_write_allowed(&resolved) {
             return Err(anyhow::anyhow!(
-                "工作目录越出沙箱可写范围或落入受保护路径（`.git`）：{}。\
-                 如需在项目根外或受保护路径运行命令，请在 bash 工具中显式设 `unsandboxed: true` 并经用户审批。",
+                "Working directory is outside the sandbox writable area or falls into a protected path (`.git`): {}.\
+                 To run commands outside the project root or in protected paths, set `unsandboxed: true` on the bash tool and get user approval.",
                 resolved.display()
             ));
         }

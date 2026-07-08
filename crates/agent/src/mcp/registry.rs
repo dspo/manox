@@ -40,11 +40,11 @@ impl McpRegistry {
 pub fn init(_cx: &mut App) {
     let mut config = match crate::paths::manox_config_dir() {
         Ok(dir) => McpConfig::load(&dir).unwrap_or_else(|e| {
-            tracing::warn!("MCP 配置加载失败，已跳过: {e:#}");
+            tracing::warn!("Failed to load MCP config, skipped: {e:#}");
             McpConfig::default()
         }),
         Err(e) => {
-            tracing::warn!("无法定位 manox 配置目录，MCP 已禁用: {e:#}");
+            tracing::warn!("Cannot locate manox config dir, MCP disabled: {e:#}");
             McpConfig::default()
         }
     };
@@ -221,7 +221,7 @@ async fn connect_transport(
 pub fn global() -> &'static McpRegistry {
     REGISTRY
         .get()
-        .expect("McpRegistry 未初始化，请先调用 agent::init")
+        .expect("McpRegistry not initialized; call agent::init first")
 }
 
 /// Non-panicking accessor for callers that may run before `agent::init`
