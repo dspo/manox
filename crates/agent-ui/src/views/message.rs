@@ -502,7 +502,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
 }
 
 /// Render an ephemeral system notice — status toggles, slash-command acks.
-/// Neutral tones so positive state changes (e.g. "YOLO 模式已开启") do not
+/// Neutral tones so positive state changes (e.g. "YOLO mode is on") do not
 /// read as a runtime error.
 pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
     v_flex()
@@ -572,12 +572,7 @@ pub fn render_retry(
                 .small()
                 .text_color(theme.warning),
         )
-        .child(
-            gpui::div()
-                .text_sm()
-                .text_color(theme.warning)
-                .child(label),
-        )
+        .child(gpui::div().text_sm().text_color(theme.warning).child(label))
         .into_any_element()
 }
 

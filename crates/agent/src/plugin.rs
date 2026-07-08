@@ -142,7 +142,7 @@ impl PluginManager {
                 .status()
                 .with_context(|| format!("git clone {}", git_url))?;
             if !status.success() {
-                anyhow::bail!("git clone 失败: {} (exit {:?})", git_url, status.code());
+                anyhow::bail!("git clone failed: {} (exit {:?})", git_url, status.code());
             }
         }
         Self::load_marketplace_index(&dir)

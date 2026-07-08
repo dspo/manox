@@ -224,7 +224,12 @@ mod tests {
         let rec = db.load("t1").unwrap().unwrap();
         assert!(rec.archived);
         assert!(!db.list(false).unwrap().iter().any(|s| s.id == "t1"));
-        assert!(db.list(true).unwrap().iter().any(|s| s.id == "t1" && s.archived));
+        assert!(
+            db.list(true)
+                .unwrap()
+                .iter()
+                .any(|s| s.id == "t1" && s.archived)
+        );
 
         // Unarchive: row comes back into the active list.
         db.archive("t1", false).unwrap();

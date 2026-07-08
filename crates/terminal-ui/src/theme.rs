@@ -56,22 +56,22 @@ impl TerminalTheme {
                 default_bg: bg,
                 cursor: fg,
                 ansi: [
-                    bg,                                        // Black → theme bg
-                    hsla(0.0, 0.78, 0.47, 1.0),               // Red
-                    hsla(0.33, 0.70, 0.40, 1.0),              // Green
-                    hsla(0.08, 0.78, 0.47, 1.0),              // Yellow
-                    hsla(0.58, 0.70, 0.45, 1.0),              // Blue
-                    hsla(0.83, 0.70, 0.45, 1.0),              // Magenta
-                    hsla(0.50, 0.70, 0.45, 1.0),              // Cyan
-                    fg,                                        // White → theme fg
-                    hsla(0.0, 0.0, 0.40, 1.0),                // BrightBlack
-                    hsla(0.0, 0.81, 0.57, 1.0),               // BrightRed
-                    hsla(0.33, 0.75, 0.50, 1.0),              // BrightGreen
-                    hsla(0.08, 0.81, 0.57, 1.0),              // BrightYellow
-                    hsla(0.58, 0.75, 0.55, 1.0),              // BrightBlue
-                    hsla(0.83, 0.75, 0.55, 1.0),              // BrightMagenta
-                    hsla(0.50, 0.75, 0.55, 1.0),              // BrightCyan
-                    hsla(0.0, 0.0, 0.97, 1.0),                // BrightWhite
+                    bg,                          // Black → theme bg
+                    hsla(0.0, 0.78, 0.47, 1.0),  // Red
+                    hsla(0.33, 0.70, 0.40, 1.0), // Green
+                    hsla(0.08, 0.78, 0.47, 1.0), // Yellow
+                    hsla(0.58, 0.70, 0.45, 1.0), // Blue
+                    hsla(0.83, 0.70, 0.45, 1.0), // Magenta
+                    hsla(0.50, 0.70, 0.45, 1.0), // Cyan
+                    fg,                          // White → theme fg
+                    hsla(0.0, 0.0, 0.40, 1.0),   // BrightBlack
+                    hsla(0.0, 0.81, 0.57, 1.0),  // BrightRed
+                    hsla(0.33, 0.75, 0.50, 1.0), // BrightGreen
+                    hsla(0.08, 0.81, 0.57, 1.0), // BrightYellow
+                    hsla(0.58, 0.75, 0.55, 1.0), // BrightBlue
+                    hsla(0.83, 0.75, 0.55, 1.0), // BrightMagenta
+                    hsla(0.50, 0.75, 0.55, 1.0), // BrightCyan
+                    hsla(0.0, 0.0, 0.97, 1.0),   // BrightWhite
                 ],
             }
         } else {
@@ -80,22 +80,22 @@ impl TerminalTheme {
                 default_bg: bg,
                 cursor: fg,
                 ansi: [
-                    bg,                                        // Black → theme bg
-                    hsla(0.0, 0.78, 0.35, 1.0),               // Red
-                    hsla(0.33, 0.70, 0.30, 1.0),              // Green
-                    hsla(0.08, 0.78, 0.35, 1.0),              // Yellow
-                    hsla(0.58, 0.70, 0.35, 1.0),              // Blue
-                    hsla(0.83, 0.70, 0.35, 1.0),              // Magenta
-                    hsla(0.50, 0.70, 0.35, 1.0),              // Cyan
-                    fg,                                        // White → theme fg
-                    hsla(0.0, 0.0, 0.50, 1.0),                // BrightBlack
-                    hsla(0.0, 0.81, 0.45, 1.0),               // BrightRed
-                    hsla(0.33, 0.75, 0.40, 1.0),              // BrightGreen
-                    hsla(0.08, 0.81, 0.45, 1.0),              // BrightYellow
-                    hsla(0.58, 0.75, 0.45, 1.0),              // BrightBlue
-                    hsla(0.83, 0.75, 0.45, 1.0),              // BrightMagenta
-                    hsla(0.50, 0.75, 0.45, 1.0),              // BrightCyan
-                    fg,                                        // BrightWhite → theme fg
+                    bg,                          // Black → theme bg
+                    hsla(0.0, 0.78, 0.35, 1.0),  // Red
+                    hsla(0.33, 0.70, 0.30, 1.0), // Green
+                    hsla(0.08, 0.78, 0.35, 1.0), // Yellow
+                    hsla(0.58, 0.70, 0.35, 1.0), // Blue
+                    hsla(0.83, 0.70, 0.35, 1.0), // Magenta
+                    hsla(0.50, 0.70, 0.35, 1.0), // Cyan
+                    fg,                          // White → theme fg
+                    hsla(0.0, 0.0, 0.50, 1.0),   // BrightBlack
+                    hsla(0.0, 0.81, 0.45, 1.0),  // BrightRed
+                    hsla(0.33, 0.75, 0.40, 1.0), // BrightGreen
+                    hsla(0.08, 0.81, 0.45, 1.0), // BrightYellow
+                    hsla(0.58, 0.75, 0.45, 1.0), // BrightBlue
+                    hsla(0.83, 0.75, 0.45, 1.0), // BrightMagenta
+                    hsla(0.50, 0.75, 0.45, 1.0), // BrightCyan
+                    fg,                          // BrightWhite → theme fg
                 ],
             }
         }

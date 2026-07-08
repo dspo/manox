@@ -338,7 +338,6 @@ impl Workspace {
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
 
-
         let mut ws = Self {
             cwd,
             thread,

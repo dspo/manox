@@ -25,7 +25,7 @@ pub fn init(_cx: &mut App) {
 pub fn handle() -> &'static tokio::runtime::Handle {
     HANDLE
         .get()
-        .expect("tokio runtime 未初始化，请先调用 agent::init")
+        .expect("tokio runtime not initialized; call agent::init first")
 }
 
 /// Returns the global tokio `Handle`, or `None` before `init` / after process

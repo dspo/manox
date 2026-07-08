@@ -34,7 +34,7 @@ impl ProviderRegistry {
                     provider = resolved.provider_name.as_str(),
                     model = resolved.id.as_str(),
                     error = %e,
-                    "跳过无法解析的模型"
+                    "Skipping unresolvable model"
                 ),
             }
         }
@@ -54,7 +54,10 @@ impl ProviderRegistry {
 /// Build a concrete `LanguageModel` from a `ResolvedModel` by `wire_api`. Requires resolving the api_key.
 fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
     let api_key = resolve_apikey(resolved.apikey_source.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("provider {} 未配置 apikey_source", resolved.provider_name)
+        anyhow::anyhow!(
+            "provider {} has no apikey_source configured",
+            resolved.provider_name
+        )
     })?)?;
     let max_tokens = parse_max_tokens(&resolved.context);
 
@@ -87,7 +90,7 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             max_tokens,
         )),
         WireApi::Unavailable => {
-            anyhow::bail!("wire_api {:?} 不可用", resolved.wire_api)
+            anyhow::bail!("wire_api {:?} is unavailable", resolved.wire_api)
         }
     };
     Ok(model)
@@ -118,11 +121,11 @@ fn parse_max_tokens(context: &str) -> u64 {
 /// Read the cx config, build the registry, and register it globally. Call at App startup.
 /// Panics on failure — manox is unusable without an LLM.
 pub fn init(_cx: &mut App) {
-    let config =
-        CxConfig::load_default().unwrap_or_else(|e| panic!("加载 cx providers 配置失败: {e}"));
+    let config = CxConfig::load_default()
+        .unwrap_or_else(|e| panic!("Failed to load cx providers config: {e}"));
     let registry = ProviderRegistry::from_config(config);
     if registry.models().is_empty() {
-        tracing::error!("ProviderRegistry 初始化后无可用模型");
+        tracing::error!("ProviderRegistry initialized with no available models");
     }
     let _ = REGISTRY.set(registry);
 }
@@ -131,7 +134,7 @@ pub fn init(_cx: &mut App) {
 pub fn global() -> &'static ProviderRegistry {
     REGISTRY
         .get()
-        .expect("ProviderRegistry 未初始化，请先调用 agent::init")
+        .expect("ProviderRegistry not initialized; call agent::init first")
 }
 
 #[cfg(test)]
