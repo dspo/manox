@@ -195,6 +195,14 @@ You are currently in plan mode: research the codebase and produce a plan, but do
 pub const ULTRACODE_GRANT: &str = "\n\n## Ultracode mode\n\
 You are running in ultracode mode at `xhigh` effort. You have standing permission to launch multi-agent workflows: spawn sub-agents freely via the `agent` tool to decompose the task, parallelize independent work, and isolate deep investigations, without asking for confirmation per spawn. Coordinate their results into a single coherent solution; do not narrate hesitation about delegating.\n";
 
+/// Appended to the system prompt while the thread has an active goal. Tells
+/// the model each turn must make concrete, verifiable progress toward the
+/// condition and that it will be auto-continued — there is no need to ask
+/// whether to keep going. Kept in code (not `system_prompt.md`) for the same
+/// reason as `PLAN_MODE_ADDENDUM`: a short, templated instruction, not prose.
+pub const GOAL_MODE_ADDENDUM: &str = "\n\n## Goal mode\n\
+You are working toward a user-defined completion condition. Each turn must make concrete, verifiable progress toward it — do not ask whether to continue, do not pause for confirmation, do not summarize and stop. Use the full tool set and the current approval mode. When you believe the condition is met, state so explicitly with the evidence (e.g. the passing test command output); an external evaluator will verify and either continue you or end the goal loop.\n";
+
 #[cfg(test)]
 mod tests {
     use super::*;

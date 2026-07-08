@@ -351,6 +351,15 @@ composer-tag-system = 系统
 ### slash_command.rs
 slash-yolo-desc = 切换到完全访问（免审批 + bash 沙箱外）；带提示词则切换后直接开工
 slash-plan-desc = 进入计划模式：仅允许只读工具，研究后提交计划待批准（裸 `/plan` 切换；`/plan <提示>` 带提示进入）
+slash-goal-desc = 设置完成条件，agent 持续工作直到满足（裸 `/goal` 显示状态，`/goal <条件>` 设置，`/goal clear` 停止）
+workspace-chip-plan-mode = 计划模式
+workspace-chip-goal-active = 目标进行中
+goal-popover-title = 目标进行中
+goal-popover-condition = 条件
+goal-popover-elapsed = 已运行
+goal-popover-evaluations = 评估轮数
+goal-popover-last-reason = 最新评估理由
+goal-popover-clear = 清除目标
 
 ### main.rs (system menus)
 menu-settings = Settings…

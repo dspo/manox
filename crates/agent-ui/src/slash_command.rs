@@ -113,6 +113,7 @@ pub fn init(_cx: &mut App) {
         // bash unsandboxed for the session.
         Box::new(YoloCommand),
         Box::new(PlanCommand),
+        Box::new(GoalCommand),
     ];
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
@@ -286,6 +287,52 @@ impl SlashCommand for PlanCommand {
             }
             cx.notify();
             SlashResult::InjectUserTurn(args.to_string())
+        }
+    }
+}
+
+/// `/goal` — set a completion condition the agent works toward until met.
+///
+/// - Bare `/goal`: open the goal status popover (condition / elapsed /
+///   evaluations / last reason / Clear). Does not send a turn.
+/// - `/goal <condition>`: enter goal mode and immediately run `condition` as
+///   the first user turn. `set_goal` runs before `InjectUserTurn` returns, so
+///   the turn's `build_completion_request` already carries the goal addendum.
+/// - `/goal clear` (aliases `stop`/`off`/`reset`/`none`/`cancel`): clear the
+///   active goal and abort any in-flight evaluator.
+struct GoalCommand;
+
+impl SlashCommand for GoalCommand {
+    fn name(&self) -> &str {
+        "goal"
+    }
+    fn description(&self) -> SharedString {
+        i18n::t("slash-goal-desc")
+    }
+    fn execute(
+        &self,
+        args: &str,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        let thread = workspace.thread.clone();
+        let trimmed = args.trim();
+        match trimmed.to_lowercase().as_str() {
+            "" => {
+                workspace.open_goal_popover(cx);
+                SlashResult::Handled
+            }
+            "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
+                thread.update(cx, |t, cx| t.clear_goal(cx));
+                cx.notify();
+                SlashResult::Handled
+            }
+            _ => {
+                thread.update(cx, |t, cx| t.set_goal(trimmed.to_string(), cx));
+                cx.notify();
+                SlashResult::InjectUserTurn(trimmed.to_string())
+            }
         }
     }
 }

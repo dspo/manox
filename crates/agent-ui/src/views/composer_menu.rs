@@ -186,17 +186,25 @@ pub fn build_plus_menu(
     theme: &Theme,
     on_files: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
     on_plan: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+    on_goal: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(360.)).scrollable(true);
     menu = menu.label(i18n::t("composer-add-label"));
     let on_files = std::rc::Rc::new(on_files);
     let on_plan = std::rc::Rc::new(on_plan);
+    let on_goal = std::rc::Rc::new(on_goal);
     for (ix, row) in PLUS_ADD_ROWS.iter().enumerate() {
         match ix {
             0 => {
                 let on_files = on_files.clone();
                 menu = menu.item(
                     menu_row_item(row, theme).on_click(move |_, window, cx| on_files(window, cx)),
+                );
+            }
+            2 => {
+                let on_goal = on_goal.clone();
+                menu = menu.item(
+                    menu_row_item(row, theme).on_click(move |_, window, cx| on_goal(window, cx)),
                 );
             }
             3 => {
