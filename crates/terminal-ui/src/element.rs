@@ -4,22 +4,23 @@
 //!   - `request_layout`: fill the parent (width/height = relative 1).
 //!   - `prepaint`: measure cell size from the font, derive cols/rows from
 //!     bounds, resize the Terminal, run `layout_grid` over
-//!     `renderable_content().display_iter`, stash the plan.
+//!     `renderable_content().display_iter`, then shape every text run (and
+//!     the IME preedit line) so paint stays allocation-free.
 //!   - `paint`: fill the default background, paint merged background regions,
-//!     shape+paint each batched text run, then the cursor block.
+//!     paint the pre-shaped text runs, then the cursor block.
 //!
 //! No `InteractiveElement`/hitbox here — mouse and keyboard are routed by
 //! `TerminalView`'s wrapping `div`, keeping this element paint-only.
 
 use gpui::{
     App, Bounds, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
-    FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, SharedString,
-    StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, point, px,
-    relative, rgba, size,
+    FontWeight, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Pixels, Point,
+    ShapedLine, SharedString, Size, StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle,
+    Window, fill, point, px, relative, rgba, size,
 };
 use terminal::{Cell, Flags, Terminal};
 
-use crate::grid_renderer::layout_grid;
+use crate::grid_renderer::{BackgroundRegion, GridPlan, layout_grid};
 use crate::terminal_view::{TerminalInputHandler, TerminalView};
 use crate::theme::TerminalTheme;
 
@@ -41,14 +42,35 @@ pub struct TerminalElement {
 }
 
 /// Computed during prepaint, consumed during paint.
+///
+/// All `ShapedLine`s are shaped in prepaint so `paint` only emits quads and
+/// painted lines — no per-frame shaping or string allocation in the paint
+/// phase.
 pub struct PrepaintState {
-    plan: crate::grid_renderer::GridPlan,
+    bounds: Bounds<Pixels>,
     cell_width: Pixels,
     line_height_px: Pixels,
-    bounds: Bounds<Pixels>,
-    cursor: Option<(i32, i32)>,
+    background: Vec<BackgroundRegion>,
     /// Pixel rects for search matches; `true` = the active match.
     search_rects: Vec<(Bounds<Pixels>, bool)>,
+    /// Pre-shaped text runs with their paint origin.
+    shaped_runs: Vec<(Point<Pixels>, ShapedLine)>,
+    /// Cursor block, plus a pre-shaped preedit line when IME marked text is
+    /// active. `None` when the terminal reports no cursor.
+    cursor: Option<CursorPrepaint>,
+}
+
+/// Cursor paint data: the block bounds, and a pre-shaped preedit line when
+/// IME marked text is non-empty (`None` paints a plain cursor block).
+pub struct CursorPrepaint {
+    bounds: Bounds<Pixels>,
+    marked: Option<MarkedPrepaint>,
+}
+
+/// Pre-shaped IME preedit (marked) text painted over the cursor block.
+pub struct MarkedPrepaint {
+    shaped: ShapedLine,
+    bg_size: Size<Pixels>,
 }
 
 impl TerminalElement {
@@ -187,45 +209,115 @@ impl Element for TerminalElement {
         let cols = (bounds.size.width / cell_width).floor() as usize;
         let rows = (bounds.size.height / line_height_px).floor() as usize;
         if cols > 0 && rows > 0 {
+            // Resize is a same-frame mutation so the renderable snapshot below
+            // reflects the new grid size; TerminalView holds no `observe` on
+            // the Terminal, so the inner `cx.notify()` cannot re-enter this
+            // render pass.
             self.terminal.update(cx, |t, cx| t.resize(cols, rows, cx));
         }
 
-        // Build the paint plan from the terminal's renderable snapshot.
-        let (plan, cursor, offset) = self.terminal.read_with(cx, |t, _cx| {
-            t.with_term(|term| {
-                let content = term.renderable_content();
-                let cursor_pt = content.cursor.point;
-                let offset = term.grid().display_offset() as i32;
-                let cells = Self::display_cells(content);
-                let plan = layout_grid(cells.into_iter(), &self.theme);
-                // Cursor grid line → display row via the same offset the cells
-                // are painted with, so the block tracks the caret when scrolled.
-                let cursor_display_line = cursor_pt.line.0 + offset;
-                (
-                    plan,
-                    Some((cursor_display_line, cursor_pt.column.0 as i32)),
-                    offset,
-                )
-            })
-        });
-        let rows = self.terminal.read_with(cx, |t, _| t.rows as i32);
+        // Build the paint plan from the terminal's renderable snapshot, then
+        // shape every text run here so paint stays allocation-free.
+        let origin = bounds.origin;
+        let (background, runs, cursor_grid, offset, term_rows) =
+            self.terminal.read_with(cx, |t, _cx| {
+                t.with_term(|term| {
+                    let content = term.renderable_content();
+                    let cursor_pt = content.cursor.point;
+                    let offset = term.grid().display_offset() as i32;
+                    let cells = Self::display_cells(content);
+                    let GridPlan { background, runs } = layout_grid(cells.into_iter(), &self.theme);
+                    let cursor_display_line = cursor_pt.line.0 + offset;
+                    (
+                        background,
+                        runs,
+                        Some((cursor_display_line, cursor_pt.column.0 as i32)),
+                        offset,
+                        t.rows as i32,
+                    )
+                })
+            });
+
+        let mut shaped_runs: Vec<(Point<Pixels>, ShapedLine)> = Vec::with_capacity(runs.len());
+        for run in &runs {
+            let pos = point(
+                origin.x + run.start_col as f32 * cell_width,
+                origin.y + run.start_line as f32 * line_height_px,
+            );
+            let text_run = TextRun {
+                len: run.text.len(),
+                font: self.font.clone(),
+                color: run.fg,
+                background_color: None,
+                underline: run
+                    .flags
+                    .contains(Flags::UNDERLINE)
+                    .then(UnderlineStyle::default),
+                strikethrough: run
+                    .flags
+                    .contains(Flags::STRIKEOUT)
+                    .then(StrikethroughStyle::default),
+            };
+            let shaped = window.text_system().shape_line(
+                SharedString::from(run.text.as_str()),
+                self.font_size,
+                std::slice::from_ref(&text_run),
+                Some(cell_width),
+            );
+            shaped_runs.push((pos, shaped));
+        }
+
         let search_rects = Self::match_rects(
             &self.search_matches,
             self.active_match,
             offset,
-            rows,
+            term_rows,
             bounds,
             cell_width,
             line_height_px,
         );
 
+        // Shape the IME preedit line here too; paint only emits the quads.
+        let cursor = cursor_grid.map(|(line, col)| {
+            let pos = point(
+                origin.x + col as f32 * cell_width,
+                origin.y + line as f32 * line_height_px,
+            );
+            let block = size(cell_width, line_height_px);
+            let bounds = Bounds::new(pos, block);
+            let marked = if !self.marked_text.is_empty() {
+                let probe = TextRun {
+                    len: self.marked_text.len(),
+                    font: self.font.clone(),
+                    color: self.theme.default_bg,
+                    background_color: Some(self.theme.cursor),
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window.text_system().shape_line(
+                    self.marked_text.clone(),
+                    self.font_size,
+                    std::slice::from_ref(&probe),
+                    Some(cell_width),
+                );
+                Some(MarkedPrepaint {
+                    bg_size: size(shaped.width().max(cell_width), line_height_px),
+                    shaped,
+                })
+            } else {
+                None
+            };
+            CursorPrepaint { bounds, marked }
+        });
+
         PrepaintState {
-            plan,
+            bounds,
             cell_width,
             line_height_px,
-            bounds,
-            cursor,
+            background,
             search_rects,
+            shaped_runs,
+            cursor,
         }
     }
 
@@ -247,7 +339,7 @@ impl Element for TerminalElement {
         window.paint_quad(fill(prepaint.bounds, self.theme.default_bg));
 
         // Merged non-default background regions.
-        for region in &prepaint.plan.background {
+        for region in &prepaint.background {
             let x = origin.x + region.start_col as f32 * cell_w;
             let y = origin.y + region.start_line as f32 * lh;
             let w = (region.end_col - region.start_col + 1) as f32 * cell_w;
@@ -267,65 +359,29 @@ impl Element for TerminalElement {
             window.paint_quad(fill(*rect, color));
         }
 
-        // Text runs.
-        for run in &prepaint.plan.runs {
-            let x = origin.x + run.start_col as f32 * cell_w;
-            let y = origin.y + run.start_line as f32 * lh;
-            let pos = point(x, y);
-            let text_run = TextRun {
-                len: run.text.len(),
-                font: self.font.clone(),
-                color: run.fg,
-                background_color: None,
-                underline: if run.flags.contains(Flags::UNDERLINE) {
-                    Some(UnderlineStyle::default())
-                } else {
-                    None
-                },
-                strikethrough: if run.flags.contains(Flags::STRIKEOUT) {
-                    Some(StrikethroughStyle::default())
-                } else {
-                    None
-                },
-            };
-            let shaped = window.text_system().shape_line(
-                SharedString::from(run.text.clone()),
-                self.font_size,
-                std::slice::from_ref(&text_run),
-                Some(cell_w),
-            );
-            let _ = shaped.paint(pos, lh, TextAlign::Left, None, window, cx);
+        // Pre-shaped text runs — paint only, no shaping or allocation here.
+        for (pos, shaped) in &prepaint.shaped_runs {
+            let _ = shaped.paint(*pos, lh, TextAlign::Left, None, window, cx);
         }
 
         // Cursor block + inline IME marked (preedit) text.
-        if let Some((line, col)) = prepaint.cursor {
-            let x = origin.x + col as f32 * cell_w;
-            let y = origin.y + line as f32 * lh;
-            let pos = point(x, y);
-            let sz = size(cell_w, lh);
-            let cursor_bounds = Bounds::new(pos, sz);
-
-            if !self.marked_text.is_empty() {
-                // Paint the preedit text over the cursor with a highlight bg.
-                let probe = TextRun {
-                    len: self.marked_text.len(),
-                    font: self.font.clone(),
-                    color: self.theme.default_bg,
-                    background_color: Some(self.theme.cursor),
-                    underline: None,
-                    strikethrough: None,
-                };
-                let shaped = window.text_system().shape_line(
-                    self.marked_text.clone(),
-                    self.font_size,
-                    std::slice::from_ref(&probe),
-                    Some(cell_w),
+        if let Some(cursor) = &prepaint.cursor {
+            if let Some(marked) = &cursor.marked {
+                // Paint the preedit highlight bg, then the shaped preedit line.
+                window.paint_quad(fill(
+                    Bounds::new(cursor.bounds.origin, marked.bg_size),
+                    self.theme.cursor,
+                ));
+                let _ = marked.shaped.paint(
+                    cursor.bounds.origin,
+                    lh,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
                 );
-                let bg = size(shaped.width().max(cell_w), lh);
-                window.paint_quad(fill(Bounds::new(pos, bg), self.theme.cursor));
-                let _ = shaped.paint(pos, lh, TextAlign::Left, None, window, cx);
             } else {
-                window.paint_quad(fill(cursor_bounds, self.theme.cursor));
+                window.paint_quad(fill(cursor.bounds, self.theme.cursor));
             }
 
             // Register the IME input handler for this frame so the platform
@@ -335,7 +391,7 @@ impl Element for TerminalElement {
                 &self.focus_handle,
                 TerminalInputHandler {
                     view: self.view.clone(),
-                    cursor_bounds: Some(cursor_bounds),
+                    cursor_bounds: Some(cursor.bounds),
                 },
                 cx,
             );

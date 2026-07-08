@@ -313,17 +313,14 @@ impl Render for TerminalView {
                     .right_0()
                     .px_2()
                     .py_1()
-                    .bg(gpui::rgba(0x000000cc))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(gpui::hsla(0., 0., 0.9, 1.))
-                            .child(agent::i18n::t_str_count(
-                                "terminal-search-status",
-                                &[("pattern", pattern.as_str())],
-                                count as i64,
-                            )),
-                    ),
+                    .bg(cx.theme().background)
+                    .child(div().text_xs().text_color(cx.theme().foreground).child(
+                        agent::i18n::t_str_count(
+                            "terminal-search-status",
+                            &[("pattern", pattern.as_str())],
+                            count as i64,
+                        ),
+                    )),
             )
         } else {
             None

@@ -23,7 +23,7 @@ use agent::{
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
     DragMoveEvent, Entity, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle, SharedString,
-    Subscription, Window, deferred, ease_out_quint, prelude::*, px,
+    Subscription, WeakEntity, Window, deferred, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
@@ -2103,7 +2103,7 @@ impl Workspace {
     ) -> AnyElement {
         let open = self.effort_open;
         let selected = self.thread.read(cx).reasoning_effort();
-        let workspace = cx.entity();
+        let workspace = cx.entity().downgrade();
         let label = i18n::t(reasoning_effort_label_key(selected));
 
         let trigger = h_flex()
@@ -2155,7 +2155,7 @@ impl Workspace {
                             PopupMenuItem::new(i18n::t(reasoning_effort_label_key(effort)))
                                 .checked(effort == current)
                                 .on_click(move |_, _window, cx| {
-                                    ws.update(cx, |this, cx| {
+                                    let _ = ws.update(cx, |this, cx| {
                                         this.thread
                                             .update(cx, |t, cx| t.set_reasoning_effort(effort, cx));
                                         this.close_effort_menu();
@@ -2230,7 +2230,7 @@ impl Workspace {
                     this.model_menu_sub = None;
                 } else {
                     this.model_open = true;
-                    let workspace = cx.entity();
+                    let workspace = cx.entity().downgrade();
                     let menu = PopupMenu::build(window, cx, |menu, window, cx| {
                         Self::build_model_popup_menu(menu, workspace, window, cx)
                     });
@@ -2292,7 +2292,7 @@ impl Workspace {
     /// Cascading model menu grouped by provider; each model row shows a wire-api Tag.
     fn build_model_popup_menu(
         menu: PopupMenu,
-        workspace: Entity<Workspace>,
+        workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
@@ -2337,7 +2337,7 @@ impl Workspace {
                                 .child(model_name.clone())
                         })
                         .on_click(move |_, _, cx: &mut gpui::App| {
-                            ws.update(cx, |this, cx| {
+                            let _ = ws.update(cx, |this, cx| {
                                 if let Some(m) = registry::global().get_model(model_id.as_ref()) {
                                     this.thread.update(cx, |t, cx| t.set_model(m, cx));
                                 }
@@ -2375,25 +2375,25 @@ impl Workspace {
                     return;
                 }
                 this.title_menu_open = true;
-                let workspace = cx.entity();
+                let workspace = cx.entity().downgrade();
                 let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
                     let cb = TitleMenuCallbacks {
                         on_pin: {
                             let ws = workspace.clone();
                             Rc::new(move |_, _, cx| {
-                                ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
+                                let _ = ws.update(cx, |this, cx| this.title_menu_toggle_pin(cx));
                             })
                         },
                         on_archive: {
                             let ws = workspace.clone();
                             Rc::new(move |_, _, cx| {
-                                ws.update(cx, |this, cx| this.title_menu_archive(cx));
+                                let _ = ws.update(cx, |this, cx| this.title_menu_archive(cx));
                             })
                         },
                         on_copy_id: {
                             let ws = workspace.clone();
                             Rc::new(move |_, _, cx| {
-                                ws.update(cx, |this, cx| {
+                                let _ = ws.update(cx, |this, cx| {
                                     let id = this.thread.read(cx).id.0.clone();
                                     this.title_menu_copy("titlebar-copied-id", id, cx);
                                 });
@@ -2402,7 +2402,7 @@ impl Workspace {
                         on_copy_markdown: {
                             let ws = workspace.clone();
                             Rc::new(move |_, _, cx| {
-                                ws.update(cx, |this, cx| {
+                                let _ = ws.update(cx, |this, cx| {
                                     let md = this.thread.read(cx).to_markdown();
                                     this.title_menu_copy("titlebar-copied-markdown", md, cx);
                                 });
@@ -2411,7 +2411,7 @@ impl Workspace {
                         on_copy_cwd: {
                             let ws = workspace.clone();
                             Rc::new(move |_, _, cx| {
-                                ws.update(cx, |this, cx| {
+                                let _ = ws.update(cx, |this, cx| {
                                     let cwd = this.thread.read(cx).cwd().display().to_string();
                                     this.title_menu_copy("titlebar-copied-cwd", cwd, cx);
                                 });
@@ -2420,7 +2420,7 @@ impl Workspace {
                         on_copy_deeplink: {
                             let ws = workspace.clone();
                             Rc::new(move |_, _, cx| {
-                                ws.update(cx, |this, cx| {
+                                let _ = ws.update(cx, |this, cx| {
                                     let id = this.thread.read(cx).id.0.clone();
                                     let link = format!("manox://thread/{id}");
                                     this.title_menu_copy("titlebar-copied-deeplink", link, cx);
@@ -2430,7 +2430,7 @@ impl Workspace {
                         on_schedule: {
                             let ws = workspace.clone();
                             Rc::new(move |_, _, cx| {
-                                ws.update(cx, |this, cx| {
+                                let _ = ws.update(cx, |this, cx| {
                                     this.add_info_message(
                                         i18n::t("titlebar-not-implemented").to_string(),
                                         cx,
@@ -2441,7 +2441,7 @@ impl Workspace {
                         on_new_window: {
                             let ws = workspace.clone();
                             Rc::new(move |_, _, cx| {
-                                ws.update(cx, |this, cx| {
+                                let _ = ws.update(cx, |this, cx| {
                                     this.add_info_message(
                                         i18n::t("titlebar-not-implemented").to_string(),
                                         cx,
@@ -3000,7 +3000,7 @@ impl Workspace {
         // capture `theme` (which only lives for the method body) — closures
         // passed to `cx.listener` must be `'static`.
         let (chip_label, chip_color, chip_icon) = mode_chip_visual(mode, theme);
-        let workspace = cx.entity();
+        let workspace = cx.entity().downgrade();
 
         let trigger = h_flex()
             .id("access-chip")
@@ -3115,7 +3115,7 @@ impl Workspace {
 
     fn open_plus_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let theme = cx.theme().clone();
-        let ws = cx.entity();
+        let ws = cx.entity().downgrade();
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
             let ws_files = ws.clone();
             let ws_plan = ws.clone();
@@ -3124,14 +3124,14 @@ impl Workspace {
                 menu,
                 &theme,
                 move |window, cx| {
-                    ws_files.update(cx, |this, cx| {
+                    let _ = ws_files.update(cx, |this, cx| {
                         this.close_plus_menu();
                         this.pick_files(window, cx);
                         cx.notify();
                     });
                 },
                 move |_window, cx| {
-                    ws_plan.update(cx, |this, cx| {
+                    let _ = ws_plan.update(cx, |this, cx| {
                         this.close_plus_menu();
                         let on = this.thread.read(cx).plan_mode();
                         this.thread.update(cx, |t, cx| t.set_plan_mode(!on, cx));
@@ -3258,7 +3258,7 @@ impl Workspace {
     fn render_project_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let project = self.thread.read(cx).project().cloned();
         let open = self.project_chip_open;
-        let workspace = cx.entity();
+        let workspace = cx.entity().downgrade();
 
         let (icon, label): (Option<IconName>, SharedString) = match &project {
             Some(dir) => {
@@ -3388,7 +3388,7 @@ impl Workspace {
                             .on_click(
                                 move |_, _, cx: &mut gpui::App| {
                                     let p = std::path::PathBuf::from(&click_path);
-                                    ws_sel.update(cx, |this, cx| {
+                                    let _ = ws_sel.update(cx, |this, cx| {
                                         this.close_project_chip_menu();
                                         this.thread.update(cx, |t, cx| t.set_project(p, cx));
                                         cx.notify();
@@ -3425,7 +3425,7 @@ impl Workspace {
                                 )
                         })
                         .on_click(move |_, _, cx: &mut gpui::App| {
-                            ws_blank.update(cx, |this, cx| {
+                            let _ = ws_blank.update(cx, |this, cx| {
                                 this.close_project_chip_menu();
                                 this.open_blank_project(cx);
                             });
@@ -3451,7 +3451,7 @@ impl Workspace {
                                 )
                         })
                         .on_click(move |_, _, cx: &mut gpui::App| {
-                            ws_folder.update(cx, |this, cx| {
+                            let _ = ws_folder.update(cx, |this, cx| {
                                 this.close_project_chip_menu();
                                 this.choose_project_inner(cx);
                             });
@@ -4443,7 +4443,7 @@ fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla)
 /// at all, sidestepping the per-`ElementItem` `flex_1`/`min_h(26)` wrapper
 /// that was producing both the height-leak bug and the clip-to-26 bug.
 fn build_approval_content(
-    workspace: Entity<Workspace>,
+    workspace: WeakEntity<Workspace>,
     current: ApprovalMode,
     cx: &mut gpui::App,
 ) -> gpui::Div {
@@ -4491,7 +4491,7 @@ fn build_approval_content(
                 el.child(Icon::new(IconName::Check).small().text_color(accent))
             })
             .on_click(move |_event, _window, cx| {
-                ws.update(cx, |this, cx| this.apply_approval_mode(mode, cx));
+                let _ = ws.update(cx, |this, cx| this.apply_approval_mode(mode, cx));
             })
     };
 
