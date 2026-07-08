@@ -219,6 +219,7 @@ impl Render for Sidebar {
                 v_flex()
                     .id("sidebar-body")
                     .flex_1()
+                    .w_full()
                     // `min_h_0` lets the body shrink below its content height so
                     // `overflow_y_scroll` actually engages; without it the flex
                     // item's min-height defaults to content and the list grows
@@ -230,6 +231,7 @@ impl Render for Sidebar {
                     .pb_2()
                     .child(
                         v_flex()
+                            .w_full()
                             .gap_0p5()
                             .child(menu_item(
                                 "new-thread",
@@ -281,7 +283,7 @@ impl Render for Sidebar {
                             section_header(i18n::t("sidebar-section-conversations"), &theme)
                         }),
                     )
-                    .child(v_flex().gap_0p5().children(loose.iter().map(|s| {
+                    .child(v_flex().w_full().gap_0p5().children(loose.iter().map(|s| {
                         render_thread_item(
                             s,
                             selected.as_deref() == Some(s.id.as_str()),
@@ -479,6 +481,7 @@ fn render_thread_item(
         // the tag/token row below.
         .child(
             v_flex()
+                .w_full()
                 .gap_1()
                 .flex_1()
                 .min_w_0()
@@ -487,6 +490,7 @@ fn render_thread_item(
                 // floating-to-top ordering has a visible marker.
                 .child(
                     h_flex()
+                        .w_full()
                         .gap_1()
                         .items_center()
                         .min_w_0()
@@ -495,6 +499,7 @@ fn render_thread_item(
                         })
                         .child(
                             gpui::div()
+                                .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_sm()
@@ -506,6 +511,7 @@ fn render_thread_item(
                 // action taking their place on hover.
                 .child(
                     h_flex()
+                        .w_full()
                         .gap_1()
                         .items_center()
                         .child(tag_element)
@@ -515,6 +521,7 @@ fn render_thread_item(
                         .child(
                             h_flex()
                                 .gap_1()
+                                .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_xs()
