@@ -135,7 +135,7 @@ impl Harness {
             .map(|e| {
                 let item = e.read(cx);
                 match item.kind() {
-                    ConvItem::User(t) => json!({ "kind": "user", "text": t }),
+                    ConvItem::User { text, .. } => json!({ "kind": "user", "text": text }),
                     ConvItem::Assistant {
                         text, streaming, ..
                     } => {

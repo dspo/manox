@@ -12,6 +12,7 @@
 members = [
     "crates/agent",
     "crates/agent-ui",
+    "crates/composer",
     "crates/manox",
     "crates/terminal",
     "crates/terminal-ui",
@@ -28,6 +29,7 @@ publish = false
 # `foo.workspace = true` instead of relative `path = "../foo"`.
 agent = { path = "crates/agent" }
 agent-ui = { path = "crates/agent-ui" }
+composer = { path = "crates/composer" }
 manox = { path = "crates/manox" }
 terminal = { path = "crates/terminal" }
 terminal-ui = { path = "crates/terminal-ui" }
@@ -59,6 +61,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
 base64 = "0.22"
+# image —— clipboard image resize + PNG re-encode before sending to the provider
+# (Anthropic long-edge cap 1568px / 5MB). CPU-bound work runs on the background executor.
+image = "0.25"
 
 rmcp = { version = "1.8", default-features = false }
 toml = "0.8"

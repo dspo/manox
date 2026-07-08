@@ -281,25 +281,40 @@ pub fn build_slash_menu(
     menu
 }
 
-/// A file the user picked in the `+` menu but has not yet submitted.
+/// An attachment staged in the composer but not yet submitted. Either a file
+/// picked from the `+` menu, or an image pasted straight from the clipboard
+/// (resized off-thread on submit).
 #[derive(Debug, Clone)]
-pub struct PendingAttachment {
-    pub path: PathBuf,
-    pub is_image: bool,
+pub enum PendingAttachment {
+    File { path: PathBuf, is_image: bool },
+    ClipboardImage(gpui::Image),
 }
 
 impl PendingAttachment {
     pub fn new(path: PathBuf) -> Self {
-        let is_image = is_image_path(&path);
-        Self { path, is_image }
+        Self::File {
+            is_image: is_image_path(&path),
+            path,
+        }
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(
+            self,
+            Self::ClipboardImage(_) | Self::File { is_image: true, .. }
+        )
     }
 
     pub fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file")
-            .to_string()
+        match self {
+            Self::File { path, .. } => path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file")
+                .to_string(),
+            // No filename on the clipboard; surface a localized label instead.
+            Self::ClipboardImage(_) => i18n::t("composer-pasted-image").to_string(),
+        }
     }
 }
 
@@ -329,22 +344,26 @@ fn mime_for(path: &Path) -> &'static str {
     }
 }
 
-/// Read one attachment from disk into a [`MessageContent`]. Images become base64 image blocks;
-/// text files are inlined into `text_out` wrapped in `<file>` tags. Blocking file IO — call from a
-/// background executor.
+/// Read one on-disk attachment into a [`MessageContent`]. Images become base64
+/// image blocks; text files are inlined into `text_out` wrapped in `<file>`
+/// tags. Clipboard images are handled separately by the caller (resize) and
+/// yield `None` here. Blocking file IO — call from a background executor.
 pub fn load_attachment(att: &PendingAttachment, text_out: &mut String) -> Option<MessageContent> {
-    if att.is_image {
-        let bytes = std::fs::read(&att.path).ok()?;
+    let PendingAttachment::File { path, is_image } = att else {
+        return None;
+    };
+    if *is_image {
+        let bytes = std::fs::read(path).ok()?;
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
         Some(MessageContent::Image {
             data,
-            mime_type: mime_for(&att.path).to_string(),
+            mime_type: mime_for(path).to_string(),
         })
     } else {
-        let content = std::fs::read_to_string(&att.path).ok()?;
+        let content = std::fs::read_to_string(path).ok()?;
         text_out.push_str(&format!(
             "\n<file path=\"{}\">\n{content}\n</file>",
-            att.path.display()
+            path.display()
         ));
         None
     }
@@ -360,7 +379,7 @@ pub fn render_attachment_chips(
     let mut row = h_flex().w_full().flex_wrap().gap_1();
     for (ix, att) in attachments.iter().enumerate() {
         let on_remove = on_remove.clone();
-        let icon = if att.is_image {
+        let icon = if att.is_image() {
             IconName::Palette
         } else {
             IconName::File

@@ -7,16 +7,27 @@
 //! streaming delta notifies (and re-renders) only that item, leaving already-
 //! finished items' markdown untouched.
 
+use std::sync::Arc;
+
 use agent::{Message, ThreadEvent, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, WeakEntity};
 
 use crate::Workspace;
 use crate::views::message::{MessageItem, build_items};
 
+/// A decoded image attached to a user message, kept only for UI preview. The
+/// canonical bytes live in the `Thread`'s `MessageContent::Image`; this holds
+/// a gpui image so the user bubble can render a thumbnail without re-decoding.
+#[derive(Debug, Clone)]
+pub struct UserImage(pub Arc<gpui::Image>);
+
 /// A single renderable conversation item.
 #[derive(Debug, Clone)]
 pub enum ConvItem {
-    User(String),
+    User {
+        text: String,
+        images: Vec<UserImage>,
+    },
     Assistant {
         text: String,
         streaming: bool,
@@ -131,17 +142,19 @@ impl ConversationState {
             .all(|e| matches!(e.read(cx).kind(), ConvItem::Error(_) | ConvItem::Notice(_)))
     }
 
-    /// Append a user message.
+    /// Append a user message with any pasted/image attachments.
     pub fn push_user(
         &mut self,
         text: String,
+        images: Vec<UserImage>,
         role: &str,
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) {
         let id = self.items.len();
-        self.items
-            .push(cx.new(|_| MessageItem::new(ConvItem::User(text), role.to_string(), id, weak)));
+        self.items.push(cx.new(|_| {
+            MessageItem::new(ConvItem::User { text, images }, role.to_string(), id, weak)
+        }));
     }
 
     /// Append a system-styled notice. Does not touch the canonical `Thread`
@@ -688,7 +701,7 @@ mod tests {
         assert!(
             !items
                 .iter()
-                .any(|i| matches!(i, ConvItem::User(t) if t.is_empty()))
+                .any(|i| matches!(i, ConvItem::User { text, .. } if text.is_empty()))
         );
     }
 

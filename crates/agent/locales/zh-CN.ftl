@@ -409,3 +409,5 @@ workspace-env-auto-review = 自动审查
 workspace-env-tokens = 词元
 workspace-env-sources = 来源
 workspace-env-no-sources = 暂无来源
+composer-pasted-image = 粘贴的图片
+composer-image-process-failed = 部分粘贴的图片无法发送（格式不支持或过大）

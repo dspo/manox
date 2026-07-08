@@ -14,10 +14,12 @@
 //! syntax-highlighted `TextView::markdown` once the final `ToolResult` lands.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::tools::agent::{agent_final_text, agent_sub_messages};
 use agent::{Message, TokenUsage, ToolCallStatus, i18n};
+use base64::Engine as _;
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
 use gpui_component::text::{TextView, TextViewStyle};
@@ -28,7 +30,7 @@ use gpui_component::{
 };
 
 use crate::Workspace;
-use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem};
+use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage};
 use crate::views::centered;
 
 /// Render-time context for sub-agent task cards: which task ids are currently
@@ -202,7 +204,7 @@ pub fn render_item(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     match item {
-        ConvItem::User(text) => render_user(text, ix, theme),
+        ConvItem::User { text, images } => render_user(text, images, ix, theme),
         ConvItem::Assistant {
             text,
             streaming,
@@ -267,7 +269,7 @@ fn copy_button_hoverable(
 }
 
 /// Render a user message: a right-aligned rounded card + copy button.
-pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
+pub fn render_user(text: &str, images: &[UserImage], ix: usize, theme: &Theme) -> gpui::AnyElement {
     h_flex()
         .w_full()
         .justify_end()
@@ -282,6 +284,13 @@ pub fn render_user(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .bg(theme.secondary)
                 .border_1()
                 .border_color(theme.border)
+                .children(images.iter().map(|ui| {
+                    gpui::img(ui.0.clone())
+                        .max_w(px(280.))
+                        .max_h(px(280.))
+                        .rounded(theme.radius)
+                        .object_fit(gpui::ObjectFit::ScaleDown)
+                }))
                 .child(h_flex().w_full().justify_end().child(copy_button_hoverable(
                     ix,
                     "copy-user",
@@ -1084,8 +1093,22 @@ pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) ->
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                if !text.is_empty() {
-                    items.push(ConvItem::User(text));
+                let images: Vec<UserImage> = m
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        MessageContent::Image { data, mime_type } => {
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(data.as_bytes())
+                                .ok()?;
+                            let fmt = gpui::ImageFormat::from_mime_type(mime_type.as_str())?;
+                            Some(UserImage(Arc::new(gpui::Image::from_bytes(fmt, bytes))))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !text.is_empty() || !images.is_empty() {
+                    items.push(ConvItem::User { text, images });
                 }
                 for c in &m.content {
                     if let MessageContent::ToolResult(tr) = c {
