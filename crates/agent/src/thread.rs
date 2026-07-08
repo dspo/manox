@@ -1440,10 +1440,16 @@ impl Thread {
             GoalAction::Continue => {
                 // Inject the condition as the next turn's directive and start
                 // the turn in a separate task so we do not re-enter `run_turn`
-                // while still inside this callback's `this.update` callers.
+                // while still inside this callback's `this.update` callers. The
+                // goal may have been cleared in the window between the verdict
+                // decision and this spawned task running — re-check so a late
+                // `/goal clear` does not kick off a spurious continuation turn.
                 let this = this.clone();
                 cx.spawn(async move |cx: &mut AsyncApp| {
                     let _ = this.update(cx, |this, cx| {
+                        if this.goal.is_none() {
+                            return;
+                        }
                         let directive = format!(
                             "[goal continuation] Continue working toward this \
                              completion condition. Do not ask for confirmation; \

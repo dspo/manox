@@ -392,7 +392,20 @@ mod tests {
         let r = REGISTRY.get().unwrap();
         assert!(r.get("yolo").is_some());
         assert!(r.get("plan").is_some());
+        assert!(r.get("goal").is_some());
         assert!(r.get("nope").is_none());
+    }
+
+    #[test]
+    fn parse_goal_command() {
+        // `/goal` bare, `/goal clear`, and `/goal <condition>` all parse.
+        register_for_tests();
+        let p = parse("/goal").unwrap();
+        assert_eq!(p.name, "goal");
+        assert_eq!(p.args, "");
+        let p = parse("/goal tests pass").unwrap();
+        assert_eq!(p.name, "goal");
+        assert_eq!(p.args, "tests pass");
     }
 
     #[test]
@@ -415,6 +428,7 @@ mod tests {
         let _ = REGISTRY.set(SlashCommandRegistry::new(vec![
             Box::new(YoloCommand),
             Box::new(PlanCommand),
+            Box::new(GoalCommand),
         ]));
     }
 }
