@@ -42,7 +42,7 @@ use crate::paths;
 /// changes. `CREATE TABLE IF NOT EXISTS` is a no-op on existing tables, so the
 /// only way a new column reaches a legacy DB is via the recreate path triggered
 /// by this version mismatch.
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// Thread database handle.
 pub struct ThreadsDatabase {

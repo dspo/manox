@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter};
 
-use crate::db::{ThreadRecord, ThreadSummary, ThreadsDatabase, default_db_path};
+use crate::db::{ThreadSummary, ThreadsDatabase, default_db_path};
 use crate::language_model::AnyLanguageModel;
 use crate::provider::registry;
 use crate::thread::{Thread, ThreadId};
@@ -148,7 +148,17 @@ impl ThreadStore {
 
     /// Load and restore a `Thread` by id (model resolved from the registry by id; `None` if not found).
     pub fn load_thread(&self, id: &str, cx: &mut App) -> Option<Entity<Thread>> {
-        let rec: ThreadRecord = self.db.load(id).ok()??;
+        let rec = match self.db.load(id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                tracing::warn!(thread_id = id, "load_thread: thread not in db");
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(thread_id = id, error = ?e, "load_thread: db load failed");
+                return None;
+            }
+        };
         let model: Option<AnyLanguageModel> = registry::global().get_model(&rec.model_id);
         Some(Thread::restore(rec, model, cx))
     }
