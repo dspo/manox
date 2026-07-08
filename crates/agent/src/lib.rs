@@ -9,6 +9,7 @@ pub mod approval;
 pub mod command;
 pub mod db;
 pub mod frontmatter;
+pub mod goal;
 pub mod hashline;
 pub mod hook;
 pub mod i18n;

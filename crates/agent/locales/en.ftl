@@ -364,6 +364,15 @@ composer-tag-system = System
 ### slash_command.rs
 slash-yolo-desc = Switch to Full access (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
 slash-plan-desc = Enter plan mode: read-only tools only, research then submit a plan for approval (bare `/plan` toggles; `/plan <prompt>` enters with a prompt)
+slash-goal-desc = Set a completion condition the agent works toward until met (bare `/goal` shows status, `/goal <condition>` sets it, `/goal clear` stops)
+workspace-chip-plan-mode = Plan mode
+workspace-chip-goal-active = Goal active
+goal-popover-title = Goal active
+goal-popover-condition = Condition
+goal-popover-elapsed = Elapsed
+goal-popover-evaluations = Evaluations
+goal-popover-last-reason = Last reason
+goal-popover-clear = Clear goal
 
 ### main.rs (system menus)
 menu-settings = Settings…

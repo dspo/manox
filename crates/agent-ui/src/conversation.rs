@@ -237,6 +237,11 @@ impl ConversationState {
             // workspace to light the sidebar running indicator; it carries no
             // conversation content.
             ThreadEvent::TurnStarted => ApplyOutcome::None,
+            // Goal lifecycle is surfaced by the composer chip + status popover,
+            // not as a conversation item.
+            ThreadEvent::GoalChanged { .. } | ThreadEvent::GoalEvaluated { .. } => {
+                ApplyOutcome::None
+            }
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(

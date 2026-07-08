@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::Result;
 use futures::FutureExt as _;
@@ -25,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::db::ThreadRecord;
+use crate::goal::{self, GoalVerdict};
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
@@ -165,6 +167,19 @@ pub enum ThreadEvent {
     /// The user switched models mid-conversation. The store records a
     /// `model_change` event for the history timeline; emitted from `set_model`.
     ModelChanged { from: Option<String>, to: String },
+    /// Goal mode toggled on/off. The UI shows or hides the `◎ /goal active`
+    /// chip and, on activation, starts its elapsed-time ticker.
+    GoalChanged { active: bool },
+    /// A goal evaluator run completed. Carries the verdict + reason + the
+    /// evaluation count so the UI can refresh the status popover without
+    /// re-reading thread state. Emitted on both satisfied and unsatisfied
+    /// outcomes; a satisfied outcome is immediately followed by
+    /// `GoalChanged { active: false }` from `clear_goal`.
+    GoalEvaluated {
+        satisfied: bool,
+        reason: String,
+        evaluations: u32,
+    },
 }
 
 /// UI metadata for a pending tool-call authorization. Stored alongside the
@@ -174,6 +189,34 @@ pub struct PendingAuthMeta {
     pub tool_name: String,
     pub summary: String,
     pub input: serde_json::Value,
+}
+
+/// Session-scoped goal-mode state. Not persisted — a goal is an ephemeral
+/// autonomy directive tied to the live session, so a reloaded thread always
+/// starts with no goal (mirrors the `worktree` session-scoped pattern, and
+/// `Instant` is not `Serialize` in any case).
+pub struct GoalState {
+    /// The completion condition the agent works toward, in the user's words.
+    pub condition: String,
+    /// Wall-clock start instant for the elapsed-time chip. Monotonic so the
+    /// chip is unaffected by system-clock changes.
+    pub started_at: Instant,
+    /// Monotonic evaluation counter, incremented before each evaluator call.
+    pub evaluations: u32,
+    /// The last evaluator reason (satisfied or not), shown in the status
+    /// popover so the user can see why the loop is or is not continuing.
+    pub last_reason: String,
+}
+
+/// Outcome of a goal evaluation, deciding what `maybe_continue_goal` does next.
+enum GoalAction {
+    /// Condition not yet met — inject the condition and start another turn.
+    Continue,
+    /// Condition met — clear the goal and exit goal mode.
+    Satisfied,
+    /// Goal cleared mid-evaluation (cancel / `/goal clear`) or the evaluation
+    /// cap was hit — drop the result and clear without continuing.
+    Abort,
 }
 
 pub struct Thread {
@@ -256,6 +299,18 @@ pub struct Thread {
     /// Pending plan-approval oneshots, keyed by the `exit_plan_mode` tool_use
     /// id. Mirrors `pending_authorizations` exactly.
     pending_plan_approval: HashMap<String, tokio::sync::oneshot::Sender<PlanApprovalResponse>>,
+    /// Active goal state. `None` unless the user set a completion condition via
+    /// `/goal <condition>`. While `Some`, after each natural turn end the
+    /// thread runs a lightweight evaluator; an unsatisfied goal auto-continues
+    /// the turn (condition as directive), a satisfied goal clears itself and
+    /// exits goal mode. Session-scoped — never persisted. Main-thread only —
+    /// sub-agents never carry a goal (`set_goal` no-ops at depth > 0).
+    goal: Option<GoalState>,
+    /// Cancellation token for an in-flight goal evaluator. `None` when no
+    /// evaluation is running. Cancelled by `cancel()`, `clear_goal`, and on
+    /// satisfaction so a stray late evaluator result does not trigger a
+    /// continuation. Mirrors `turn_cancel`'s role for the main turn.
+    goal_cancel: Option<CancellationToken>,
     /// LLM title + re-eval cadence + user rename. The spawn that drives a
     /// title turn lives in [`TitleState::maybe_generate`]; `Thread` passes in
     /// depth / model / messages each call. `pub(crate)` so the spawn callback
@@ -445,6 +500,8 @@ impl Thread {
                 plan_mode: false,
                 reasoning_effort: ReasoningEffort::default(),
                 pending_plan_approval: HashMap::new(),
+                goal: None,
+                goal_cancel: None,
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
                 provider_id,
@@ -518,6 +575,8 @@ impl Thread {
                 plan_mode: false,
                 reasoning_effort: ReasoningEffort::from_i64(rec.reasoning_effort),
                 pending_plan_approval: HashMap::new(),
+                goal: None,
+                goal_cancel: None,
                 title_state: TitleState::restore(
                     rec.title,
                     rec.title_override,
@@ -593,6 +652,8 @@ impl Thread {
                 plan_mode: false,
                 reasoning_effort,
                 pending_plan_approval: HashMap::new(),
+                goal: None,
+                goal_cancel: None,
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
                 provider_id: None,
@@ -822,10 +883,58 @@ impl Thread {
 
     /// Toggle plan mode. Called by the UI (slash `/plan` or the `+` menu row).
     /// Only sets the flag; the next `build_completion_request` filters tools and
-    /// appends the plan-mode addendum. Does not start a turn.
+    /// appends the plan-mode addendum. Does not start a turn. Goal mode and
+    /// plan mode are mutually exclusive — entering plan mode clears an active
+    /// goal so the next turn advertises write tools rather than the read-only
+    /// plan-mode set.
     pub fn set_plan_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if on && self.goal.is_some() {
+            self.clear_goal(cx);
+        }
         self.plan_mode = on;
         cx.notify();
+    }
+
+    /// Active goal state, if any. Drives the composer's `◎ /goal active` chip.
+    pub fn goal(&self) -> Option<&GoalState> {
+        self.goal.as_ref()
+    }
+
+    /// Set a completion condition and enter goal mode. Main-thread only — a
+    /// sub-agent (depth > 0) no-ops. Exits plan mode (the two are mutually
+    /// exclusive) so the next turn advertises write tools. Does NOT start a
+    /// turn — the caller owns turn initiation, exactly like `set_plan_mode`.
+    pub fn set_goal(&mut self, condition: String, cx: &mut Context<Self>) {
+        if self.depth != 0 {
+            return;
+        }
+        if self.plan_mode {
+            self.plan_mode = false;
+        }
+        self.goal = Some(GoalState {
+            condition,
+            started_at: Instant::now(),
+            evaluations: 0,
+            last_reason: String::new(),
+        });
+        cx.emit(ThreadEvent::GoalChanged { active: true });
+        cx.notify();
+    }
+
+    /// Clear the active goal and abort any in-flight evaluator. Called by
+    /// `/goal clear`, on satisfaction, from `set_plan_mode` (mutual exclusion),
+    /// and as a backstop from `cancel()`. Emits `GoalChanged { active: false }`
+    /// when a goal was actually active so the chip disappears.
+    pub fn clear_goal(&mut self, cx: &mut Context<Self>) {
+        let was_active = self.goal.is_some();
+        if let Some(c) = self.goal_cancel.take() {
+            c.cancel();
+        }
+        self.goal = None;
+        if was_active {
+            cx.emit(ThreadEvent::GoalChanged { active: false });
+            cx.notify();
+        }
     }
 
     pub fn reasoning_effort(&self) -> ReasoningEffort {
@@ -1194,21 +1303,24 @@ impl Thread {
                     cx.emit(ThreadEvent::Error(e));
                 });
             }
-            this.update(cx, |this, cx| {
-                this.running_turn = None;
-                this.turn_cancel = None;
-                // A slash command's tool filter lasts only for its turn; clear it
-                // so a subsequent free-form message inherits the full tool set.
-                this.turn_tool_filter = None;
-                // A natural (non-cancelled) turn end is the trigger point for
-                // title re-evaluation. `maybe_generate_title` self-gates on
-                // depth, cadence, and dedup; cancelled turns skip it.
-                if !cancel.is_cancelled() {
-                    this.maybe_generate_title(cx);
-                }
-                cx.notify();
-            })
-            .ok();
+            let turn_cancelled = this
+                .update(cx, |this, cx| {
+                    this.running_turn = None;
+                    this.turn_cancel = None;
+                    // A slash command's tool filter lasts only for its turn; clear it
+                    // so a subsequent free-form message inherits the full tool set.
+                    this.turn_tool_filter = None;
+                    // A natural (non-cancelled) turn end is the trigger point for
+                    // title re-evaluation. `maybe_generate_title` self-gates on
+                    // depth, cadence, and dedup; cancelled turns skip it.
+                    if !cancel.is_cancelled() {
+                        this.maybe_generate_title(cx);
+                    }
+                    cx.notify();
+                    cancel.is_cancelled()
+                })
+                .ok()
+                .unwrap_or(true);
             // Persistence backstop: `Stop`/`Error` events are the workspace's
             // signal to save, but a stream that ends without a `MessageStop`
             // (provider hiccup, non-SSE response from a compatibility endpoint)
@@ -1223,10 +1335,133 @@ impl Thread {
                     crate::thread_store::save_thread(entity, true, cx);
                 });
             }
+            // Goal auto-continuation: on a natural (non-cancelled) turn end
+            // with an active goal, run the evaluator and either continue or
+            // clear. A cancelled turn (user stop / `/goal clear` during a turn)
+            // skips this so cancel is terminal. Sub-agents never carry a goal.
+            if !turn_cancelled {
+                Self::maybe_continue_goal(&this, &model, cx).await;
+            }
         });
 
         self.running_turn = Some(task);
         cx.notify();
+    }
+
+    /// Hard cap on goal evaluations. Bounds the auto-continue loop when a
+    /// condition is genuinely unmeetable or the evaluator keeps failing. 50
+    /// evaluations ≈ a long but bounded work session; the user can re-issue
+    /// `/goal <condition>` to restart with a fresh count.
+    const GOAL_MAX_EVALUATIONS: u32 = 50;
+
+    /// After a natural turn end, if a goal is active, run the evaluator. On
+    /// "satisfied" → clear the goal (exits mode). On "unsatisfied" → inject
+    /// the condition as a directive and start a new turn. No-op when no goal
+    /// is active, on a sub-agent, or when an evaluator is somehow already in
+    /// flight. The continuation runs in a separate spawned task so it does
+    /// not hold `this`'s write lease across the call to `run_turn` (re-entrancy
+    /// safety — `run_turn`'s `running_turn.is_some()` guard is the backstop).
+    async fn maybe_continue_goal(
+        this: &WeakEntity<Self>,
+        model: &AnyLanguageModel,
+        cx: &mut AsyncApp,
+    ) {
+        // Claim the evaluator slot and capture the condition. Bails when there
+        // is no goal, this is a sub-agent, or an evaluator is already running.
+        let claimed = this.update(cx, |this, cx| {
+            if this.depth != 0 {
+                return None;
+            }
+            let g = this.goal.as_mut()?;
+            if this.goal_cancel.is_some() {
+                return None;
+            }
+            let cancel = CancellationToken::new();
+            this.goal_cancel = Some(cancel.clone());
+            g.evaluations += 1;
+            let n = g.evaluations;
+            cx.notify();
+            Some((g.condition.clone(), n, cancel))
+        });
+        let Ok(Some((condition, eval_count, cancel))) = claimed else {
+            return;
+        };
+
+        // Snapshot the message list for the evaluator under a short lease.
+        let messages = this
+            .read_with(cx, |this, _| this.messages.clone())
+            .unwrap_or_default();
+
+        let verdict: GoalVerdict = goal::evaluate(model, &condition, &messages, cancel, cx).await;
+
+        // Write the verdict back and decide continue vs. clear vs. abort.
+        let action = this
+            .update(cx, |this, cx| {
+                this.goal_cancel = None;
+                // The goal was cleared while the evaluator was in flight (user
+                // hit `/goal clear` or cancel) — drop the result silently.
+                let Some(g) = this.goal.as_mut() else {
+                    return GoalAction::Abort;
+                };
+                g.last_reason = verdict.reason.clone();
+                cx.emit(ThreadEvent::GoalEvaluated {
+                    satisfied: verdict.satisfied,
+                    reason: verdict.reason,
+                    evaluations: eval_count,
+                });
+                // Cap: too many evaluations without satisfaction → clear and
+                // surface the abort in the last reason, rather than looping
+                // forever.
+                if eval_count >= Self::GOAL_MAX_EVALUATIONS {
+                    g.last_reason = format!(
+                        "goal aborted after {} evaluations: {}",
+                        eval_count, g.last_reason
+                    );
+                    return GoalAction::Abort;
+                }
+                if verdict.satisfied {
+                    GoalAction::Satisfied
+                } else {
+                    GoalAction::Continue
+                }
+            })
+            .ok();
+        let Some(action) = action else {
+            return;
+        };
+
+        match action {
+            GoalAction::Abort | GoalAction::Satisfied => {
+                // Satisfied → clear goal (exits mode, emits GoalChanged{false}).
+                // Abort (cap hit or goal cleared mid-eval) → clear too; if the
+                // goal was already cleared this is a no-op.
+                let _ = this.update(cx, |this, cx| this.clear_goal(cx));
+            }
+            GoalAction::Continue => {
+                // Inject the condition as the next turn's directive and start
+                // the turn in a separate task so we do not re-enter `run_turn`
+                // while still inside this callback's `this.update` callers. The
+                // goal may have been cleared in the window between the verdict
+                // decision and this spawned task running — re-check so a late
+                // `/goal clear` does not kick off a spurious continuation turn.
+                let this = this.clone();
+                cx.spawn(async move |cx: &mut AsyncApp| {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.goal.is_none() {
+                            return;
+                        }
+                        let directive = format!(
+                            "[goal continuation] Continue working toward this \
+                             completion condition. Do not ask for confirmation; \
+                             keep going until it is met.\n\nCondition: {condition}"
+                        );
+                        this.insert_user_message(directive, cx);
+                        this.run_turn(cx);
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     /// Abort the current turn. Cancels the turn token so an in-flight tool (e.g.
@@ -1254,6 +1489,16 @@ impl Thread {
             // response no-ops at the parent instead of traversing to a child
             // whose own pending map is already empty.
             self.pending_child_auth.clear();
+            // Abort any in-flight goal evaluator so a late verdict does not
+            // trigger an auto-continuation after the user cancelled. The goal
+            // itself is left in place — cancel stops the current turn, it does
+            // not discard the condition (the user can `/goal` to inspect or
+            // re-submit). `maybe_continue_goal` is gated on
+            // `cancel.is_cancelled()`, so a cancelled turn never reaches the
+            // evaluator entry point either.
+            if let Some(c) = self.goal_cancel.take() {
+                c.cancel();
+            }
             // Attribute partial usage from the cancelled turn and reset the
             // per-request counter so the next turn's delta starts from zero.
             self.finalize_request_usage();
@@ -2309,6 +2554,13 @@ impl Thread {
         // knows it must submit a plan via `exit_plan_mode` rather than act.
         if self.plan_mode {
             system.push_str(crate::system_prompt::PLAN_MODE_ADDENDUM);
+        }
+        // Goal mode appends its autonomy directive. Plan and goal are mutually
+        // exclusive (`set_goal` exits plan mode), so at most one addendum
+        // lands here; both are compile-time constants, so the prefix stays
+        // byte-stable across turns regardless of which mode is active.
+        if self.goal.is_some() {
+            system.push_str(crate::system_prompt::GOAL_MODE_ADDENDUM);
         }
         // Ultracode appends its multi-agent grant (model-facing standing
         // permission to orchestrate sub-agents). The effort level itself is

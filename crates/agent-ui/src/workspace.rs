@@ -207,6 +207,14 @@ pub struct Workspace {
     /// jump), and into the exit spawn so a stale unmount can be no-op'd
     /// when a new enter supersedes it.
     settings_transition_gen: u64,
+    /// Whether the goal status popover is open (toggled by the `◎ /goal active`
+    /// chip or the bare `/goal` command).
+    goal_popover_open: bool,
+    /// Generation counter for the goal elapsed-time ticker. Incremented when a
+    /// goal is cleared or the active thread changes so the prior ticker
+    /// self-terminates instead of notifying a stale chip. Mirrors
+    /// `settings_transition_gen`.
+    goal_ticker_gen: u64,
     /// Lazily created on the first `enter_settings` call so we don't pay the
     /// cost when the user never opens Settings.
     settings_view: Option<Entity<SettingsView>>,
@@ -388,6 +396,8 @@ impl Workspace {
             view_mode: ViewMode::default(),
             exiting_settings: false,
             settings_transition_gen: 0,
+            goal_popover_open: false,
+            goal_ticker_gen: 0,
             settings_view: None,
             settings_sub: None,
             plugin_manager_view: None,
@@ -509,6 +519,37 @@ impl Workspace {
                     // Per-turn cache stability signal. The composer chip that
                     // used to render this was removed in #62; the event stays
                     // emitted for any future telemetry/debug subscriber.
+                    cx.notify();
+                }
+                ThreadEvent::GoalChanged { active } => {
+                    // Bump the ticker generation so any prior ticker
+                    // self-terminates; start a fresh ticker only on activation.
+                    this.goal_ticker_gen = this.goal_ticker_gen.wrapping_add(1);
+                    if *active {
+                        let entity = cx.entity().clone();
+                        let ticker_gen = this.goal_ticker_gen;
+                        cx.spawn(async move |_this, cx| {
+                            loop {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_secs(1))
+                                    .await;
+                                let still = entity.read_with(cx, |this, cx| {
+                                    this.goal_ticker_gen == ticker_gen
+                                        && this.thread.read(cx).goal().is_some()
+                                });
+                                if !still {
+                                    break;
+                                }
+                                entity.update(cx, |_, cx| cx.notify());
+                            }
+                        })
+                        .detach();
+                    }
+                    cx.notify();
+                }
+                ThreadEvent::GoalEvaluated { .. } => {
+                    // Refresh the status popover's last-reason / evaluations
+                    // rows; no conversation item is produced.
                     cx.notify();
                 }
                 _ => {
@@ -2690,6 +2731,8 @@ impl Workspace {
         let plus = self.render_plus_button(cx);
         let project_chip = self.render_project_chip(theme, cx);
         let worktree_chip = self.render_worktree_chip(theme, cx);
+        let plan_chip = self.render_plan_chip(theme, cx);
+        let goal_chip = self.render_goal_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
         let effort = self.render_reasoning_effort_selector(theme, cx);
         let model = self.render_model_selector(theme, cx);
@@ -2716,6 +2759,8 @@ impl Workspace {
                             .child(plus)
                             .child(project_chip)
                             .when_some(worktree_chip, |el, chip| el.child(chip))
+                            .when_some(plan_chip, |el, chip| el.child(chip))
+                            .when_some(goal_chip, |el, chip| el.child(chip))
                             .child(access),
                     )
                     // Effort lives next to the model selector — both describe
@@ -2785,6 +2830,167 @@ impl Workspace {
                 }))
                 .into_any_element(),
         )
+    }
+
+    /// Plan-mode chip — shown only while the thread is in plan mode. A
+    /// highlighted accent pill next to the access chip so the read-only
+    /// research posture is legible at a glance. Clicking exits plan mode
+    /// (mirrors the `+` menu toggle).
+    fn render_plan_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.thread.read(cx).plan_mode() {
+            return None;
+        }
+        let accent = theme.accent;
+        let label: SharedString = i18n::t("workspace-chip-plan-mode");
+        Some(
+            h_flex()
+                .id("plan-chip")
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .rounded(theme.radius)
+                .bg(theme.secondary)
+                .border_1()
+                .border_color(accent)
+                .cursor_pointer()
+                .child(
+                    Icon::new(IconName::LayoutDashboard)
+                        .xsmall()
+                        .text_color(accent),
+                )
+                .child(gpui::div().text_xs().text_color(accent).child(label))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.thread.update(cx, |t, cx| t.set_plan_mode(false, cx));
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// Goal-mode chip — shown only while the thread has an active goal. Renders
+    /// `◎ Goal active · {elapsed}` in accent colors so the autonomous-loop
+    /// posture is legible at a glance. Clicking toggles the status popover
+    /// (condition / elapsed / evaluations / last reason / Clear).
+    fn render_goal_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let g = self.thread.read(cx).goal()?;
+        let accent = theme.accent;
+        let muted = theme.muted_foreground;
+        let fg = theme.foreground;
+        let elapsed = format_elapsed(g.started_at.elapsed());
+        let label: SharedString =
+            format!("◎ {} · {}", i18n::t("workspace-chip-goal-active"), elapsed).into();
+        let open = self.goal_popover_open;
+
+        let trigger = h_flex()
+            .id("goal-chip")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(accent)
+            .cursor_pointer()
+            .child(gpui::div().text_xs().text_color(accent).child(label))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(muted),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                this.goal_popover_open = !this.goal_popover_open;
+                cx.notify();
+            }));
+
+        if !open {
+            return Some(trigger.into_any_element());
+        }
+
+        // Status popover: condition / elapsed / evaluations / last reason /
+        // Clear. Mirrors the access chip's `popover_style` dropdown pattern.
+        let condition = g.condition.clone();
+        let evaluations = g.evaluations;
+        let last_reason = g.last_reason.clone();
+        let condition_label = i18n::t("goal-popover-condition");
+        let elapsed_label = i18n::t("goal-popover-elapsed");
+        let evals_label = i18n::t("goal-popover-evaluations");
+        let reason_label = i18n::t("goal-popover-last-reason");
+        let clear_label = i18n::t("goal-popover-clear");
+        let title_label = i18n::t("goal-popover-title");
+        let popover = v_flex()
+            .w_full()
+            .gap_1()
+            .p_3()
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(accent)
+                    .child(format!("◎ {title_label}")),
+            )
+            .child(goal_popover_row(&condition_label, &condition, fg, muted))
+            .child(goal_popover_row(&elapsed_label, &elapsed, fg, muted))
+            .child(goal_popover_row(
+                &evals_label,
+                &evaluations.to_string(),
+                fg,
+                muted,
+            ))
+            .child(goal_popover_row(
+                &reason_label,
+                if last_reason.is_empty() {
+                    "—"
+                } else {
+                    &last_reason
+                },
+                fg,
+                muted,
+            ))
+            .child(
+                h_flex().justify_end().child(
+                    Button::new("goal-clear")
+                        .small()
+                        .label(clear_label)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.thread.update(cx, |t, cx| t.clear_goal(cx));
+                            this.goal_popover_open = false;
+                            cx.notify();
+                        })),
+                ),
+            );
+
+        Some(
+            gpui::div()
+                .relative()
+                .child(trigger)
+                .child(
+                    gpui::div()
+                        .id("goal-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .left_0()
+                        .occlude()
+                        .w(gpui::px(360.))
+                        .popover_style(cx)
+                        .child(popover)
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.goal_popover_open = false;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Open the goal status popover (from the bare `/goal` command).
+    pub fn open_goal_popover(&mut self, cx: &mut Context<Self>) {
+        self.goal_popover_open = true;
+        cx.notify();
     }
 
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -2913,6 +3119,7 @@ impl Workspace {
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
             let ws_files = ws.clone();
             let ws_plan = ws.clone();
+            let ws_goal = ws.clone();
             build_plus_menu(
                 menu,
                 &theme,
@@ -2928,6 +3135,18 @@ impl Workspace {
                         this.close_plus_menu();
                         let on = this.thread.read(cx).plan_mode();
                         this.thread.update(cx, |t, cx| t.set_plan_mode(!on, cx));
+                        cx.notify();
+                    });
+                },
+                move |window, cx| {
+                    ws_goal.update(cx, |this, cx| {
+                        this.close_plus_menu();
+                        // Insert `/goal ` so the user types the completion
+                        // condition and submits — same pattern as the `⁄` menu
+                        // inserting `/name ` for a slash command.
+                        this.input_state.update(cx, |state, cx| {
+                            state.set_value("/goal ".to_string(), window, cx);
+                        });
                         cx.notify();
                     });
                 },
@@ -4164,6 +4383,44 @@ fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::H
     }
 }
 
+/// Format a `Duration` as a compact elapsed-time string for the goal chip
+/// (`42s`, `3m 42s`, `1h 5m`). Not localized — the format is universal.
+fn format_elapsed(d: std::time::Duration) -> String {
+    let total_secs = d.as_secs();
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// One label/value row in the goal status popover.
+fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla) -> gpui::Div {
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap_2()
+        .child(
+            gpui::div()
+                .min_w(px(96.))
+                .text_xs()
+                .text_color(muted)
+                .child(label.to_string()),
+        )
+        .child(
+            gpui::div()
+                .min_w_0()
+                .flex_1()
+                .text_xs()
+                .text_color(fg)
+                .child(value.to_string()),
+        )
+}
 /// Build the 3-tier approval `PopupMenu`. Mirrors the Codex layout:
 ///   - title row: localized question + a "Learn more" link on the right
 ///   - three selectable rows (icon + title + subtitle, check on the right)
