@@ -111,6 +111,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 - **迭代时不得破坏前缀缓存**：provider 侧前缀缓存是透明优化——命中时零成本，击穿时静默回退。任何对 `build_completion_request` 或消息组装管线的改动，必须保持跨 turn 的请求前缀字节一致；若需重写历史，须先接入 `AppendOnlyContextManager`（`prefix_stability.rs`）或显式禁用该路径的缓存。
 - **涉及 GPUI/UI 开发时，先 load skills**：任何与 GPUI 框架或 gpui-component 组件库相关的 UI 任务，应在开始实现前通过 Skill 工具加载 `.claude/skills/gpui` 和 `.claude/skills/gpui-component`（贡献新组件时额外加载 `gpui-component-dev`），确保遵循 GPUI Entity/Render/actions/keybindings/async/layout 惯用法和 gpui-component 组件 API。
 - **重构 UI 后，及时修订 UI-MAP.md**：任何对 UI 组件层级、命名、添加/移除/重组组件的变更，都必须在同一 PR 中更新 `UI-MAP.md`，保持组件名、层级关系和源码位置与代码一致。新增组件要在索引和对应章节各加一个 `####` 标题，移除组件要同步删索引条目。
+- **零构建告警**：CI 以 `-D warnings` 编译，任何 error 或 warning 都会让 CI 红灯。提交前必须本地跑 `cargo clippy --all-targets -- -D warnings` 全绿，`cargo build` 无 warning。新增 `#[allow(...)]` 视为逃避而非修复，除非该 lint 本身与项目既有设计冲突（如 GPUI 派生宏触发的假阳性），且必须在 `#[allow]` 处用英文注释说明为何该 lint 不适用。`Result` 必须 `let _ =` 或 `?` 处理，禁止裸丢弃；test 模块必须在文件末尾。
 
 ## 激进开发纪律
 
