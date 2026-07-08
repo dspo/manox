@@ -133,8 +133,9 @@ pub enum LanguageModelToolChoice {
 }
 
 /// User-facing reasoning effort knob for providers that expose an effort
-/// parameter (Anthropic `thinking.type`, OpenAI `reasoning.effort`, etc.).
-/// `Auto` lets the provider decide; the rest map to explicit effort levels.
+/// parameter (Anthropic `output_config.effort`, OpenAI `reasoning.effort`).
+/// `Auto` and `Ultracode` are not API values — `resolve_for_wire` folds them
+/// into a concrete level before the request reaches any provider.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
@@ -172,10 +173,33 @@ impl ReasoningEffort {
         }
     }
 
+    /// Resolve `Auto` / `Ultracode` into a concrete level the wire accepts.
+    /// Providers only ever receive the resolved value: `Auto` picks the
+    /// per-context default (main thread, depth 0 → `High`; sub-agent →
+    /// `Medium`, floored so it never drops below `Medium`), and `Ultracode`
+    /// resolves to `XHigh` for the wire while its multi-agent grant is a
+    /// separate system-message side effect handled in `build_completion_request`.
+    pub fn resolve_for_wire(self, depth: u32) -> Self {
+        match self {
+            Self::Auto => {
+                if depth == 0 {
+                    Self::High
+                } else {
+                    Self::Medium
+                }
+            }
+            Self::Ultracode => Self::XHigh,
+            other => other,
+        }
+    }
+
     /// Wire value for official OpenAI endpoints, which only accept
-    /// `low` / `medium` / `high`. Everything above `high` is clamped.
+    /// `low` / `medium` / `high`. Everything above `high` is clamped. `Auto`
+    /// never reaches a provider — `resolve_for_wire` folds it away first —
+    /// so it is absent from the non-clamp set and would clamp to `high` if
+    /// it ever did reach this call.
     pub fn openai_wire_value(self, official_openai: bool) -> &'static str {
-        if official_openai && !matches!(self, Self::Low | Self::Medium | Self::High | Self::Auto) {
+        if official_openai && !matches!(self, Self::Low | Self::Medium | Self::High) {
             "high"
         } else {
             self.wire_value()
@@ -348,3 +372,59 @@ pub trait LanguageModel: Send + Sync {
 }
 
 pub type AnyLanguageModel = Arc<dyn LanguageModel>;
+
+#[cfg(test)]
+mod tests {
+    use super::ReasoningEffort;
+
+    #[test]
+    fn resolve_for_wire_auto_uses_high_for_main_thread() {
+        // Main thread (depth 0) → High; the floor is Medium, but the main
+        // agent default is High.
+        assert_eq!(
+            ReasoningEffort::Auto.resolve_for_wire(0),
+            ReasoningEffort::High
+        );
+    }
+
+    #[test]
+    fn resolve_for_wire_auto_uses_medium_for_subagent() {
+        // Sub-agents step down to Medium and never drop below it.
+        assert_eq!(
+            ReasoningEffort::Auto.resolve_for_wire(1),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::Auto.resolve_for_wire(5),
+            ReasoningEffort::Medium
+        );
+    }
+
+    #[test]
+    fn resolve_for_wire_ultracode_folds_to_xhigh() {
+        // Ultracode's wire value is xhigh; the multi-agent grant is a separate
+        // system-message side effect, not a wire value.
+        assert_eq!(
+            ReasoningEffort::Ultracode.resolve_for_wire(0),
+            ReasoningEffort::XHigh
+        );
+        assert_eq!(
+            ReasoningEffort::Ultracode.resolve_for_wire(3),
+            ReasoningEffort::XHigh
+        );
+    }
+
+    #[test]
+    fn resolve_for_wire_passes_concrete_levels_through() {
+        for level in [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(level.resolve_for_wire(0), level);
+            assert_eq!(level.resolve_for_wire(2), level);
+        }
+    }
+}

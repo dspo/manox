@@ -683,14 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn build_request_body_passes_auto_effort_to_official_openai() {
-        let mut req = req_with_tool();
-        req.reasoning_effort = Some(ReasoningEffort::Auto);
-        let body = build_request_body("m", 64, &req, "test-key", true);
-        assert_eq!(body["reasoning_effort"], "auto");
-    }
-
-    #[test]
     fn messages_to_openai_emits_tool_calls_and_tool_role() {
         let tu = LanguageModelToolUse {
             id: "call_1".to_string(),

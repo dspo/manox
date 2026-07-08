@@ -33,6 +33,11 @@ pub struct AnthropicModel {
     /// Whether the endpoint is real Anthropic (api.anthropic.com) and thus
     /// eligible for the long (1h) cache TTL + the extended-cache-ttl beta header.
     long_ttl: bool,
+    /// Whether the model accepts `output_config.effort` (Opus 4.5+ / Sonnet
+    /// 4.6+ / Fable 5 / Mythos 5). Older Claude and non-Claude models on an
+    /// Anthropic-compatible wire do not — gating avoids a 400 and keeps the
+    /// effort selector a no-op for them (same as today).
+    supports_effort: bool,
 }
 
 impl AnthropicModel {
@@ -53,6 +58,7 @@ impl AnthropicModel {
             ),
             Some(&endpoint_url),
         );
+        let supports_effort = crate::provider::anthropic_supports_effort(&api_model_id);
         Self {
             id,
             name,
@@ -63,6 +69,7 @@ impl AnthropicModel {
             max_output_tokens: max_token_count.min(8192),
             max_token_count,
             long_ttl,
+            supports_effort,
         }
     }
 }
@@ -101,13 +108,22 @@ impl LanguageModel for AnthropicModel {
             Some(&self.endpoint_url),
         );
         let long_ttl = self.long_ttl;
+        let supports_effort = self.supports_effort;
 
         Box::pin(async move {
             let (tx, rx) = async_channel::bounded::<Result<LanguageModelCompletionEvent>>(64);
             let tx_clone = tx.clone();
             crate::runtime::handle().spawn(async move {
                 if let Err(e) = stream_anthropic(
-                    &url, &api_key, &model, max_tokens, request, tx_clone, policy, long_ttl,
+                    &url,
+                    &api_key,
+                    &model,
+                    max_tokens,
+                    request,
+                    tx_clone,
+                    policy,
+                    long_ttl,
+                    supports_effort,
                 )
                 .await
                 {
@@ -140,8 +156,16 @@ pub async fn stream_anthropic(
     tx: async_channel::Sender<Result<LanguageModelCompletionEvent>>,
     policy: crate::provider::anthropic_cache::PromptCachingPolicy,
     long_ttl: bool,
+    supports_effort: bool,
 ) -> Result<()> {
-    let body = build_request_body(model, max_tokens, &request, policy, long_ttl)?;
+    let body = build_request_body(
+        model,
+        max_tokens,
+        &request,
+        policy,
+        long_ttl,
+        supports_effort,
+    )?;
     let client = reqwest::Client::builder()
         .build()
         .context("Failed to build reqwest client")?;
@@ -234,6 +258,7 @@ fn build_request_body(
     request: &LanguageModelRequest,
     policy: crate::provider::anthropic_cache::PromptCachingPolicy,
     long_ttl: bool,
+    supports_effort: bool,
 ) -> Result<serde_json::Value> {
     use serde_json::{Value, json};
 
@@ -286,6 +311,14 @@ fn build_request_body(
                 })
                 .collect(),
         );
+    }
+    // `output_config.effort` is a top-level field (not part of the cached
+    // message prefix, so toggling it does not break prefix caching). The value
+    // is already resolved to a concrete level by `build_completion_request` —
+    // `Auto` / `Ultracode` never reach here. Gated on `supports_effort` so
+    // older Claude and non-Claude Anthropic-wire models do not 400.
+    if supports_effort && let Some(effort) = request.reasoning_effort {
+        body["output_config"] = json!({ "effort": effort.wire_value() });
     }
 
     // Place cache_control breakpoints according to the resolved policy. Done
@@ -605,7 +638,7 @@ fn update_usage(usage: &mut TokenUsage, new: &AnthropicUsage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::language_model::{LanguageModelRequestMessage, MessageContent};
+    use crate::language_model::{LanguageModelRequestMessage, MessageContent, ReasoningEffort};
     use crate::provider::WireApi;
 
     fn simple_request(text: &str) -> LanguageModelRequest {
@@ -657,6 +690,7 @@ mod tests {
                 policy,
                 Some(&model.endpoint_url),
             );
+            let supports_effort = crate::provider::anthropic_supports_effort(&api_model);
             if let Err(e) = stream_anthropic(
                 &url,
                 &api_key,
@@ -666,6 +700,7 @@ mod tests {
                 tx_clone,
                 policy,
                 long_ttl,
+                supports_effort,
             )
             .await
             {
@@ -719,5 +754,56 @@ mod tests {
         // `MessageStop` is the only event that sets the flag.
         mapper.map_event(AnthropicEvent::MessageStop);
         assert!(mapper.saw_message_stop);
+    }
+
+    fn request_with_effort(effort: ReasoningEffort) -> LanguageModelRequest {
+        let mut req = simple_request("hi");
+        req.reasoning_effort = Some(effort);
+        req
+    }
+
+    #[test]
+    fn build_request_body_emits_output_config_effort_when_supported() {
+        let req = request_with_effort(ReasoningEffort::High);
+        let body = build_request_body(
+            "claude-opus-4-8",
+            64,
+            &req,
+            crate::provider::anthropic_cache::PromptCachingPolicy::None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn build_request_body_omits_output_config_when_unsupported_model() {
+        let req = request_with_effort(ReasoningEffort::High);
+        let body = build_request_body(
+            "claude-3-7-sonnet",
+            64,
+            &req,
+            crate::provider::anthropic_cache::PromptCachingPolicy::None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn build_request_body_omits_output_config_when_effort_none() {
+        let req = simple_request("hi");
+        let body = build_request_body(
+            "claude-opus-4-8",
+            64,
+            &req,
+            crate::provider::anthropic_cache::PromptCachingPolicy::None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(body.get("output_config").is_none());
     }
 }
