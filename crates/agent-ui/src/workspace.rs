@@ -1039,10 +1039,11 @@ impl Workspace {
         let new_conv = cx
             .new(|cx| ConversationState::rebuild_from_messages(&messages, &usage, &role, weak, cx));
         self.conversation = new_conv;
-        // A freshly loaded thread starts pinned to the bottom (most recent
-        // turn), matching the tail-follow default. `on_prepaint` snaps the flat
-        // column there once its children have laid out.
-        self.stick_to_bottom = true;
+        // A freshly loaded thread should reveal its latest turn once, but a
+        // completed history thread must not keep snapping back while the user
+        // scrolls upward.
+        self.scroll_handle.scroll_to_bottom();
+        self.stick_to_bottom = self.thread.read(cx).is_running();
         // Hover is tied to the old thread's tick ordinals; drop it. The
         // visible-turn highlight needs no reset — it is queried live from the
         // list each frame.
@@ -3869,6 +3870,7 @@ impl Render for Workspace {
                 v_flex()
                     .w_full()
                     .flex_shrink_0()
+                    .bg(theme.background)
                     .py_2()
                     .relative()
                     .child(centered(self.render_ask_drawer(&theme, cx))),
@@ -3878,6 +3880,7 @@ impl Render for Workspace {
                 v_flex()
                     .w_full()
                     .flex_shrink_0()
+                    .bg(theme.background)
                     .py_2()
                     .gap_2()
                     .relative()
@@ -4182,13 +4185,8 @@ impl Render for Workspace {
                                         v_flex().pt_1().pb_4().child(item).into_any_element()
                                     })
                                     .collect();
-                                // Tail-follow: while `stick_to_bottom` holds, re-pin the
-                                // viewport to the current bottom every prepaint. This
-                                // survives async content growth (a reply that grows a
-                                // frame later when its markdown parse lands) that a
-                                // one-shot scroll-on-append would miss. `scroll_to_bottom`
-                                // only sets a flag consumed in the scroll element's own
-                                // prepaint against that frame's fresh content height.
+                                // Completed history threads clear stickiness on attach, while
+                                // active turns keep it through post-stop markdown reflow.
                                 let sticky = self.stick_to_bottom;
                                 let pin_handle = self.scroll_handle.clone();
                                 let list_el = v_flex()
@@ -4204,25 +4202,43 @@ impl Render for Workspace {
                                             pin_handle.scroll_to_bottom();
                                         }
                                     })
-                                    .on_scroll_wheel(cx.listener(|this, _, _window, cx| {
-                                        // The built-in scroll handler applies the wheel
-                                        // delta before this (registered later ⇒ runs
-                                        // first in the reverse-order bubble phase), so
-                                        // `offset` is fresh here. `offset.y <= 0`, most
-                                        // negative at the bottom where it equals
-                                        // `-max_offset.y`; re-arm stick only within an
-                                        // 8px threshold of the bottom, disengage above.
-                                        let off = this.scroll_handle.offset().y;
-                                        let max = this.scroll_handle.max_offset().y;
-                                        this.stick_to_bottom = (max + off) < px(8.);
-                                        cx.notify();
-                                    }));
+                                    .on_scroll_wheel(cx.listener(
+                                        |this, event: &gpui::ScrollWheelEvent, window, cx| {
+                                            // The built-in scroll handler applies the wheel
+                                            // delta before this (registered later ⇒ runs
+                                            // first in the reverse-order bubble phase), so
+                                            // `offset` is fresh here. A tiny upward wheel
+                                            // delta must still break tail-follow immediately;
+                                            // otherwise the next prepaint snaps back to the
+                                            // bottom before small deltas accumulate.
+                                            let delta_y =
+                                                event.delta.pixel_delta(window.line_height()).y;
+                                            if delta_y > Pixels::ZERO {
+                                                if this.stick_to_bottom {
+                                                    this.stick_to_bottom = false;
+                                                    cx.notify();
+                                                }
+                                                return;
+                                            }
+                                            // `offset.y <= 0`, most negative at the bottom where
+                                            // it equals `-max_offset.y`; re-arm stick only when a
+                                            // downward scroll lands back within an 8px threshold.
+                                            let off = this.scroll_handle.offset().y;
+                                            let max = this.scroll_handle.max_offset().y;
+                                            let new_sticky = (max + off) < px(8.);
+                                            if this.stick_to_bottom != new_sticky {
+                                                this.stick_to_bottom = new_sticky;
+                                                cx.notify();
+                                            }
+                                        },
+                                    ));
                                 // Outline rail (left) + flat message column (right)
                                 // share the list region's height.
                                 h_flex()
                                     .flex_1()
                                     .w_full()
                                     .min_h_0()
+                                    .overflow_hidden()
                                     .children(outline)
                                     .child(list_el)
                             }))
