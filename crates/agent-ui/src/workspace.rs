@@ -234,8 +234,7 @@ pub struct Workspace {
     token_anim_gen: u64,
     /// Previously displayed per-model token values, keyed by `(model, kind)`.
     /// Used to detect value changes and animate from old → new. Read/written
-    /// by `render_environment_panel` (not yet wired into `Render`).
-    #[allow(dead_code)]
+    /// by `render_environment_panel`.
     token_prev: HashMap<(String, String), u64>,
 }
 
@@ -270,8 +269,20 @@ const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 const MAIN_MIN_WIDTH: f32 = 160.;
 
 /// Environment info card floating at the top-right of the conversation area.
-const ENV_CARD_WIDTH: f32 = 300.;
+/// Wide enough to hold a one-line token row of "MiniMax/MiniMax-M3[1m]
+/// ↑1b,441m ↓9m,833k" (model id at the cap + in/out counters).
+const ENV_CARD_WIDTH: f32 = 340.;
 const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
+/// Minimum message-area width the env card must coexist with. The card is
+/// shown only when the main-column body exceeds `MESSAGE_MIN_W +
+/// ENV_CONTENT_INSET`; below that the card hides and the messages + composer
+/// take the full body width.
+const MESSAGE_MIN_W: f32 = 360.;
+/// Longest model id rendered in full, calibrated to "MiniMax/MiniMax-M3[1m]"
+/// (22 chars). Longer ids are cut to this width then trimmed by 3 and given a
+/// "..." suffix, so the result stays one line at `ENV_MODEL_ID_MAX` chars
+/// (e.g. "MiniMax/MiniMax-M3[...").
+const ENV_MODEL_ID_MAX: usize = 22;
 
 /// User-turn outline rail geometry. The rail is a fixed-width gutter between
 /// the sidebar divider and the message list; every tick is the same length so
@@ -2528,13 +2539,8 @@ impl Workspace {
     /// area. Shows project, branch, model, per-model token usage (animated),
     /// approval modes, and sources. Only rendered once the thread has been
     /// interacted with and the editor pane is closed.
-    ///
-    /// Not yet wired into the main `Render` impl — left in place so the
-    /// panel logic doesn't get rewritten. CI uses `-D warnings`, so
-    /// `dead_code` must be locally allowed here.
-    #[allow(dead_code)]
     fn render_environment_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let model_label = self.model_label(cx);
+        let model_label = truncate_env_model_id(self.model_label(cx));
         let (project, approval_mode, per_model) = {
             let thread = self.thread.read(cx);
             (
@@ -2596,17 +2602,16 @@ impl Workspace {
                 let in_version = if in_changed { self.token_anim_gen } else { 0 };
                 let out_version = if out_changed { self.token_anim_gen } else { 0 };
 
+                // Display name is clamped so the row stays one line; the full
+                // name is still used for the counter anim ids and `token_prev`
+                // keys so they don't shift when truncation kicks in.
+                let model_display = truncate_env_model_id(model_name.clone());
                 let row: AnyElement = h_flex()
                     .pl_6()
                     .gap_2()
                     .text_xs()
                     .text_color(muted)
-                    .child(
-                        gpui::div()
-                            .min_w(px(80.))
-                            .overflow_hidden()
-                            .child(model_name.clone()),
-                    )
+                    .child(gpui::div().min_w(px(80.)).truncate().child(model_display))
                     .child(animated_counter(
                         "in",
                         prev_in,
@@ -2630,12 +2635,12 @@ impl Workspace {
             })
             .collect();
 
-        // The env panel floats over the conversation area (absolute, top-right).
-        // `ENV_CONTENT_INSET` in the body wrapper's `pr()` prevents content from
-        // being hidden behind the card.
+        // The env panel floats over the conversation area (absolute, top-right),
+        // sitting below the title-bar overlay. `ENV_CONTENT_INSET` in the body
+        // wrapper's `pr()` prevents content from being hidden behind the card.
         v_flex()
             .absolute()
-            .top(px(16.))
+            .top(TITLE_BAR_HEIGHT + px(16.))
             .right(px(16.))
             .w(px(ENV_CARD_WIDTH))
             .occlude()
@@ -2776,9 +2781,15 @@ impl Workspace {
                     .items_center()
                     .justify_between()
                     .child(
+                        // `min_w_0` lets this group flex-shrink when the row is
+                        // narrow; `overflow_hidden` is deliberately NOT set so
+                        // the chips' popovers (project picker, approval menu, `+`
+                        // menu) can overflow upward. `MIN_WINDOW_W` keeps the row
+                        // wide enough that the chips themselves never overflow.
                         h_flex()
                             .items_center()
                             .gap_1()
+                            .min_w_0()
                             .child(plus)
                             .child(project_chip)
                             .when_some(worktree_chip, |el, chip| el.child(chip))
@@ -2792,6 +2803,7 @@ impl Workspace {
                         h_flex()
                             .items_center()
                             .gap_1()
+                            .flex_shrink_0()
                             .child(effort)
                             .child(model)
                             .child(send),
@@ -4129,30 +4141,46 @@ impl Render for Workspace {
             .child(sidebar_divider)
             // Main column
             .child({
-                let show_env =
-                    !editor_open && !first_screen && self.thread.read(cx).has_interacted();
-                let content_inset = if show_env {
-                    px(ENV_CONTENT_INSET)
-                } else {
-                    px(0.)
-                };
+                // The env card floats across the top-right of the conversation
+                // area and reserves `ENV_CONTENT_INSET` of right gutter on the
+                // message list when shown. Only show it when the main-column
+                // body is wide enough to also leave `MESSAGE_MIN_W` for the
+                // messages beside it — otherwise hide the card and let the
+                // messages + composer use the full width. The body width is
+                // derived from the live window size (sidebar + its divider are
+                // the only siblings when the editor pane is closed, which the
+                // `!editor_open` term already guarantees).
+                let main_body_w =
+                    window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
+                let show_env = !editor_open
+                    && !first_screen
+                    && self.thread.read(cx).has_interacted()
+                    && main_body_w > px(MESSAGE_MIN_W + ENV_CONTENT_INSET);
                 v_flex()
                     .flex_1()
                     .h_full()
+                    .min_w_0()
                     .relative()
                     // Body wrapper: hero / list / footer / overlay share a common
                     // horizontal inset so conversation content doesn't kiss the
                     // panel edge. `pt` reserves space for the title-bar overlay
                     // (last child below); the overlay paints after the body so
                     // the "..." menu isn't covered by the conversation list.
+                    //
+                    // The env-card gutter is NOT applied here. The card floats
+                    // only across the top of the conversation area and never
+                    // reaches the composer at the bottom, so reserving its width
+                    // on the whole body would needlessly starve the composer.
+                    // The gutter is applied to the message-list region only,
+                    // where the card actually overlaps.
                     .child(
                         v_flex()
                             .flex_1()
                             .min_h_0()
+                            .min_w_0()
                             .w_full()
                             .overflow_hidden()
                             .pt(TITLE_BAR_HEIGHT)
-                            .pr(content_inset)
                             .pb_2()
                             // Empty first screen shows the centered hero in place of
                             // the (empty) message list; otherwise a flat, tail-
@@ -4182,20 +4210,19 @@ impl Render for Workspace {
                                     .iter()
                                     .cloned()
                                     .map(|item| {
-                                        // `flex_shrink_0` keeps each row at its true
-                                        // content height so the column can overflow the
-                                        // viewport and `overflow_y_scroll` actually
-                                        // engages. With the default `flex_shrink: 1`
-                                        // the rows collapse to fit the container, the
-                                        // content never exceeds the viewport, and the
-                                        // list is non-scrollable — the root cause of
-                                        // both the earlier message-overlap (text
-                                        // spilling past the shrunk row bounds) and the
-                                        // "can't scroll with the mouse" symptom.
+                                        // Pin each row to its true content height. The
+                                        // default `flex_shrink: 1` would let rows compress
+                                        // to fit the column, which (combined with losing
+                                        // the column's bounded height) was the original
+                                        // message-overlap failure. The scroll itself is
+                                        // owned by the column's `h_full()` + `overflow_y_scroll`;
+                                        // `flex_shrink_0` here keeps row bounds honest so
+                                        // markdown never paints outside its row.
                                         v_flex()
                                             .pt_1()
                                             .pb_4()
                                             .flex_shrink_0()
+                                            .min_w_0()
                                             .child(item)
                                             .into_any_element()
                                     })
@@ -4214,8 +4241,11 @@ impl Render for Workspace {
                                     .id("msg-scroll")
                                     .flex_1()
                                     .w_full()
+                                    .h_full()
                                     .min_h_0()
+                                    .min_w_0()
                                     .overflow_y_scroll()
+                                    .overflow_x_hidden()
                                     .track_scroll(&self.scroll_handle)
                                     .children(items)
                                     .on_prepaint(move |_bounds, _window, cx| {
@@ -4250,9 +4280,10 @@ impl Render for Workspace {
                                                 }
                                                 return;
                                             }
-                                            // `offset.y <= 0`, most negative at the bottom where
-                                            // it equals `-max_offset.y`; re-arm stick only when a
-                                            // downward scroll lands back within an 8px threshold.
+                                            // `offset.y <= 0`, most negative at the bottom
+                                            // where it equals `-max_offset.y`; re-arm stick
+                                            // only when a downward scroll lands back within
+                                            // an 8px threshold.
                                             let off = this.scroll_handle.offset().y;
                                             let max = this.scroll_handle.max_offset().y;
                                             let new_sticky = (max + off) < px(8.);
@@ -4263,12 +4294,17 @@ impl Render for Workspace {
                                         },
                                     ));
                                 // Outline rail (left) + flat message column (right)
-                                // share the list region's height.
+                                // share the list region's height. The env-card
+                                // gutter is reserved here (not on the whole body)
+                                // so the top messages don't hide behind the card
+                                // while the composer below keeps the full width.
                                 h_flex()
                                     .flex_1()
                                     .w_full()
                                     .min_h_0()
+                                    .min_w_0()
                                     .overflow_hidden()
+                                    .when(show_env, |this| this.pr(px(ENV_CONTENT_INSET)))
                                     .children(outline)
                                     .child(list_el)
                             }))
@@ -4309,6 +4345,10 @@ impl Render for Workspace {
                                     .child(h_flex()),
                             ),
                     )
+                    // Environment info card: floats absolute, top-right of the
+                    // conversation area. Hidden on the empty first screen, while
+                    // the editor pane is open, and until the thread has interacted.
+                    .children(show_env.then(|| self.render_environment_panel(&theme, cx)))
             })
             .when(editor_open, |this| {
                 this.child(editor_divider).child(editor_pane)
@@ -4690,12 +4730,8 @@ impl Workspace {
 
 // ── Environment panel helpers ──────────────────────────────────────────────
 //
-// Helpers for `Workspace::render_environment_panel`, which is not yet wired
-// into `Render for Workspace`; the panel sits dormant until its render
-// call site lands. `#[allow(dead_code)]` keeps CI's `-D warnings` happy
-// in the meantime.
+// Helpers for `Workspace::render_environment_panel`.
 
-#[allow(dead_code)]
 fn env_row(
     icon: IconName,
     label: SharedString,
@@ -4711,7 +4747,7 @@ fn env_row(
             gpui::div()
                 .flex_1()
                 .min_w_0()
-                .overflow_hidden()
+                .truncate()
                 .text_sm()
                 .text_color(theme.foreground)
                 .child(label),
@@ -4720,7 +4756,19 @@ fn env_row(
         .into_any_element()
 }
 
-#[allow(dead_code)]
+/// Clamp a model id so the env card never wraps it. Ids up to
+/// `ENV_MODEL_ID_MAX` ("MiniMax/MiniMax-M3[1m]") render in full; longer ones
+/// are cut to the cap, trimmed by 3 chars, then suffixed with "..." — so the
+/// result is exactly `ENV_MODEL_ID_MAX` chars (e.g. "MiniMax/MiniMax-M3[...").
+fn truncate_env_model_id(id: String) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= ENV_MODEL_ID_MAX {
+        return id;
+    }
+    let head: String = chars.into_iter().take(ENV_MODEL_ID_MAX - 3).collect();
+    format!("{head}...")
+}
+
 fn mode_tag(label: SharedString, active: bool, theme: &Theme) -> AnyElement {
     gpui::div()
         .px_2()
@@ -4748,7 +4796,6 @@ fn mode_tag(label: SharedString, active: bool, theme: &Theme) -> AnyElement {
 }
 
 /// Compact token count display: `1m,357k`, `168k,653`, `999`.
-#[allow(dead_code)]
 fn format_tokens(n: u64) -> String {
     const MILLION: u64 = 1_000_000;
     const THOUSAND: u64 = 1_000;
@@ -4777,7 +4824,6 @@ fn format_tokens(n: u64) -> String {
 /// values stacked vertically inside a clip container; `Transition::slide_y`
 /// slides the stack up so the old value exits top and the new value enters
 /// from bottom — an odometer-style roll.
-#[allow(dead_code)]
 fn animated_counter(
     kind: &str,
     prev: u64,

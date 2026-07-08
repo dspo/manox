@@ -405,6 +405,6 @@ workspace-env-plan-off = 普通规划
 workspace-env-yolo-on = 完全访问
 workspace-env-yolo-off = 审批模式
 workspace-env-auto-review = 自动审查
-workspace-env-tokens = 令牌
+workspace-env-tokens = 词元
 workspace-env-sources = 来源
 workspace-env-no-sources = 暂无来源
