@@ -594,6 +594,7 @@ impl Thread {
                 token_meter: TokenMeter::restore(
                     rec.cumulative_token_usage,
                     rec.request_token_usage,
+                    rec.per_model_token_usage,
                 ),
                 persist_revision: AtomicU64::new(rec.revision),
             }
@@ -705,6 +706,7 @@ impl Thread {
             cumulative_token_usage: self.token_meter.cumulative(),
             messages: self.messages.clone(),
             request_token_usage: self.token_meter.per_request().clone(),
+            per_model_token_usage: self.token_meter.per_model().clone(),
         })
     }
 
