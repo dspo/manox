@@ -27,13 +27,19 @@ pub struct TokenMeter {
 
 impl TokenMeter {
     /// Seed from a persisted `ThreadRecord` on restore: cumulative carries over,
-    /// the in-flight counter starts at zero, and per-message history is reloaded.
-    pub fn restore(cumulative: TokenUsage, per_request: HashMap<String, TokenUsage>) -> Self {
+    /// the in-flight counter starts at zero, per-message history is reloaded, and
+    /// the per-model breakdown is rehydrated so the env card shows token totals
+    /// for a thread the instant it opens — not only after the next stream.
+    pub fn restore(
+        cumulative: TokenUsage,
+        per_request: HashMap<String, TokenUsage>,
+        per_model: HashMap<String, TokenUsage>,
+    ) -> Self {
         Self {
             cumulative,
             current_request: TokenUsage::default(),
             per_request,
-            per_model: HashMap::new(),
+            per_model,
         }
     }
 

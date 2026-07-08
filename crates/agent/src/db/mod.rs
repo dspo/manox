@@ -42,7 +42,7 @@ use crate::paths;
 /// changes. `CREATE TABLE IF NOT EXISTS` is a no-op on existing tables, so the
 /// only way a new column reaches a legacy DB is via the recreate path triggered
 /// by this version mismatch.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Thread database handle.
 pub struct ThreadsDatabase {
@@ -139,6 +139,15 @@ mod tests {
                 ..Default::default()
             },
         );
+        let mut per_model = HashMap::new();
+        per_model.insert(
+            "百炼/glm-5.2[1m]".to_string(),
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                ..Default::default()
+            },
+        );
         ThreadRecord {
             id: id.into(),
             summary: "你好".into(),
@@ -170,6 +179,7 @@ mod tests {
                 Message::assistant(vec![MessageContent::Text("hi".into())]),
             ],
             request_token_usage: usage,
+            per_model_token_usage: per_model,
         }
     }
 
@@ -192,6 +202,12 @@ mod tests {
         assert_eq!(loaded.cumulative_token_usage.cache_read_input_tokens, 20);
         let u = loaded.request_token_usage.get("u1").unwrap();
         assert_eq!(u.output_tokens, 50);
+        let pm = loaded
+            .per_model_token_usage
+            .get("百炼/glm-5.2[1m]")
+            .unwrap();
+        assert_eq!(pm.input_tokens, 100);
+        assert_eq!(pm.output_tokens, 50);
     }
 
     #[test]

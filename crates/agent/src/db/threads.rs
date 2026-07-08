@@ -88,6 +88,10 @@ pub struct ThreadRecord {
     /// `token_usage` table for SQL queries; kept here as a whole-thread snapshot
     /// so a single `load` restores everything the in-memory `Thread` needs.
     pub request_token_usage: std::collections::HashMap<String, TokenUsage>,
+    /// Per-model cumulative usage keyed by model display name. Restored into
+    /// `TokenMeter::per_model` so the env card shows per-model totals for a
+    /// thread the moment it opens, without waiting for a fresh stream.
+    pub per_model_token_usage: std::collections::HashMap<String, TokenUsage>,
 }
 
 /// Decompressed payload of the `thread_data` BLOB.
@@ -95,6 +99,7 @@ pub struct ThreadRecord {
 struct ThreadData {
     messages: Vec<Message>,
     request_token_usage: std::collections::HashMap<String, TokenUsage>,
+    per_model_token_usage: std::collections::HashMap<String, TokenUsage>,
 }
 
 const COMPRESSION_LEVEL: i32 = 3;
@@ -149,6 +154,7 @@ impl ThreadsDatabase {
         let data = ThreadData {
             messages: rec.messages.clone(),
             request_token_usage: rec.request_token_usage.clone(),
+            per_model_token_usage: rec.per_model_token_usage.clone(),
         };
         let json = serde_json::to_vec(&data).context("serialize thread data")?;
         let compressed =
@@ -320,6 +326,7 @@ impl ThreadsDatabase {
                     // Filled from the BLOB below.
                     messages: Vec::new(),
                     request_token_usage: std::collections::HashMap::new(),
+                    per_model_token_usage: std::collections::HashMap::new(),
                 })
             },
         );
@@ -346,6 +353,7 @@ impl ThreadsDatabase {
             serde_json::from_slice(&decompressed).context("deserialize thread data")?;
         rec.messages = data.messages;
         rec.request_token_usage = data.request_token_usage;
+        rec.per_model_token_usage = data.per_model_token_usage;
         Ok(Some(rec))
     }
 
@@ -465,6 +473,7 @@ impl ThreadRecord {
             cumulative_token_usage: TokenUsage::default(),
             messages,
             request_token_usage: std::collections::HashMap::new(),
+            per_model_token_usage: std::collections::HashMap::new(),
         }
     }
 }

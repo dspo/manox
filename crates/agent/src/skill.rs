@@ -277,26 +277,6 @@ pub fn summary_block_or_empty() -> String {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_skill_frontmatter_and_body() {
-        let raw = "---\nname: exam\ndescription: 生成试卷\n---\n# Exam\n工作流...\n";
-        let f = crate::frontmatter::parse::<SkillMeta>(raw).unwrap();
-        assert_eq!(f.front.name, "exam");
-        assert_eq!(f.front.description, "生成试卷");
-        assert!(f.body.contains("工作流"));
-    }
-
-    #[test]
-    fn summary_block_empty_when_no_skills() {
-        let r = SkillRegistry::default();
-        assert!(r.summary_block().is_empty());
-    }
-}
-
 fn classify_origin(key: &str, source: &Path, user_root: Option<&Path>) -> SkillOrigin {
     if let Some(root) = user_root
         && source.starts_with(root)
@@ -326,4 +306,24 @@ fn validate_user_skill_name(name: &str) -> Result<String> {
         anyhow::bail!("skill name contains an invalid path segment");
     }
     Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_skill_frontmatter_and_body() {
+        let raw = "---\nname: exam\ndescription: 生成试卷\n---\n# Exam\n工作流...\n";
+        let f = crate::frontmatter::parse::<SkillMeta>(raw).unwrap();
+        assert_eq!(f.front.name, "exam");
+        assert_eq!(f.front.description, "生成试卷");
+        assert!(f.body.contains("工作流"));
+    }
+
+    #[test]
+    fn summary_block_empty_when_no_skills() {
+        let r = SkillRegistry::default();
+        assert!(r.summary_block().is_empty());
+    }
 }

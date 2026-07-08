@@ -65,16 +65,34 @@ fn text_view_style(theme: &Theme) -> TextViewStyle {
 /// `scrollable = true` mounts an internal vertical scrollbar. In that mode the
 /// TextView sizes to its parent's box, so the parent must have a defined
 /// height (use `h(...)` rather than `max_h(...)`).
+///
+/// `scrollable = false` wraps the TextView in a column flex pinned to its
+/// parent's width. A bare TextView in a default Row `div` sizes to its
+/// max-content width, which flickers as streamed lines change length and can
+/// push the centered column past its cap. The column makes the TextView a
+/// cross-axis item that stretches to the column width, so the text wraps
+/// there; `min_w_0` + `overflow_hidden` zero the flex item's automatic
+/// minimum size, so a long unbreakable run can neither block the column's
+/// elastic shrink nor spill past it into the env-card gutter.
 fn markdown_tv(
     id: impl Into<gpui::ElementId>,
     text: impl Into<gpui::SharedString>,
     theme: &Theme,
     scrollable: bool,
-) -> TextView {
+) -> gpui::AnyElement {
     let tv = TextView::markdown(id, text)
         .selectable(true)
         .style(text_view_style(theme));
-    if scrollable { tv.scrollable(true) } else { tv }
+    if scrollable {
+        tv.scrollable(true).into_any_element()
+    } else {
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .child(tv)
+            .into_any_element()
+    }
 }
 
 /// One renderable conversation item, owned by its own gpui `Entity` so a
@@ -331,19 +349,28 @@ fn render_text_body(
     theme: &Theme,
 ) -> gpui::AnyElement {
     if streaming {
-        // Plain text div while streaming — no Tree-sitter involved, so cursor
-        // can stay inline without corrupting any parser.
+        // Plain text while streaming — no Tree-sitter involved, so the cursor
+        // can stay inline without corrupting any parser. Column + `w_full` so
+        // the text wraps at the column edge (a Row `div` would run it at
+        // max-content, flickering as the stream grows); `min_w_0` +
+        // `overflow_hidden` keep a long unbreakable run from breaking the cap.
         let shown = format!("{text}▌");
-        gpui::div()
+        v_flex()
             .id(id.clone())
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
             .text_sm()
             .whitespace_normal()
             .text_color(theme.foreground)
             .child(shown)
             .into_any_element()
     } else {
-        gpui::div()
+        v_flex()
             .id(id.clone())
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
             .text_sm()
             .child(markdown_tv(id, text.to_string(), theme, false))
             .into_any_element()

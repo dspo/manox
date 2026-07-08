@@ -16,10 +16,14 @@ use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 
 actions!(manox, [Quit, ToggleFullscreen]);
 
-/// Minimum window width: sidebar (260) + divider (6) + a conversation column
-/// wide enough for the composer toolbar and a readable message line, with
-/// horizontal insets so content never kisses the edges.
-const MIN_WINDOW_W: f32 = 820.0;
+/// Minimum window width budget, left to right:
+/// sidebar (260) + sidebar divider (6) + env-card gutter (376, reserved on
+/// the message-list region only — see `ENV_CONTENT_INSET` in agent-ui) + a
+/// readable message column (~218). The composer sits below the env card and
+/// uses the full main-column width, so it is not constrained by the gutter;
+/// between this floor and the `CONTENT_MAX_W` cap the composer adapts (input
+/// narrows, chip-row gap closes) and only the floor resists further shrink.
+const MIN_WINDOW_W: f32 = 860.0;
 
 /// Minimum window height: title bar + several message lines + composer +
 /// footer hairline, with breathing room.
