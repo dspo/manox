@@ -95,7 +95,6 @@ impl IntoElement for Markdown {
                 .min_w_0()
                 .overflow_hidden()
                 .text_sm()
-                .text_color(styles.foreground)
                 .child(SharedString::from(shown))
                 .into_any_element();
         }
@@ -117,7 +116,7 @@ impl IntoElement for Markdown {
 fn render_block(block: Block, styles: &MdStyles, idx: usize) -> AnyElement {
     match block {
         Block::Paragraph(runs) => paragraph(&runs.text, &runs.highlights),
-        Block::Heading { runs, .. } => paragraph(&runs.text, &runs.highlights),
+        Block::Heading { runs, depth } => heading(&runs.text, &runs.highlights, depth),
         Block::Code { lang, value } => code_block(&value, lang.as_deref(), styles, idx),
         Block::Diff { value } => diff_block(&value, styles, idx),
         Block::Blockquote(inner) => blockquote(inner, styles),
@@ -143,12 +142,30 @@ fn paragraph(text: &str, highlights: &[(Range<usize>, HighlightStyle)]) -> AnyEl
         .into_any_element()
 }
 
+/// Heading: bold (set in `ast::inline_of`) scaled by depth so H1–H3 grow and
+/// H4–H6 fall back to body size + bold. The base color is inherited from the
+/// parent div — same contract as `paragraph`, so streaming→finalized never
+/// recolors.
+fn heading(text: &str, highlights: &[(Range<usize>, HighlightStyle)], depth: u8) -> AnyElement {
+    let mut d = div().w_full().min_w_0().child(
+        StyledText::new(SharedString::from(text.to_string()))
+            .with_highlights(highlights.iter().cloned()),
+    );
+    d = match depth {
+        1 => d.text_xl(),
+        2 => d.text_lg(),
+        3 => d.text_base(),
+        _ => d.text_sm(),
+    };
+    d.into_any_element()
+}
+
 /// Code block: line-number gutter (fixed during horizontal scroll) + a
 /// horizontally-scrollable, non-wrapping code run with tree-sitter syntax
 /// highlighting via `SyntaxHighlighter`.
 fn code_block(value: &str, lang: Option<&str>, styles: &MdStyles, idx: usize) -> AnyElement {
     let highlights = code_highlights(value, lang, styles);
-    let line_count = value.lines().count().max(1);
+    let line_count = value.split('\n').count().max(1);
     let gutter: String = (1..=line_count).map(|n| format!("{n:>3}\n")).collect();
     let gutter = gutter.trim_end_matches('\n');
 
@@ -283,25 +300,24 @@ fn blockquote(inner: Vec<Block>, styles: &MdStyles) -> AnyElement {
 
 /// GFM table. The header row carries a secondary wash + muted text; each cell
 /// follows its column's `TableAlign`. A per-column `min_w` floor keeps wide
-/// tables from collapsing into wrap-chaos — they overflow horizontally
-/// instead, mirroring the code-block scroll contract.
+/// tables from collapsing into wrap-chaos; `items_start` defeats cross-axis
+/// stretch so rows keep their natural width and overflow horizontally into
+/// the scroll viewport — mirroring the code-block contract, never clipping.
 fn table_block(
     rows: Vec<Vec<InlineRuns>>,
     align: Vec<TableAlign>,
     styles: &MdStyles,
     idx: usize,
 ) -> AnyElement {
-    let mut col = v_flex()
+    let mut scroll = v_flex()
         .id(("table", idx))
         .w_full()
         .min_w_0()
-        .rounded_md()
-        .overflow_hidden()
-        .border_1()
-        .border_color(styles.border);
+        .items_start()
+        .overflow_x_scroll();
     for (r, row) in rows.into_iter().enumerate() {
         let is_header = r == 0;
-        let mut row_flex = h_flex().w_full().min_w_0();
+        let mut row_flex = h_flex().min_w_0();
         for (c, cell) in row.into_iter().enumerate() {
             let mut cell_div = div()
                 .flex_1()
@@ -325,9 +341,17 @@ fn table_block(
             };
             row_flex = row_flex.child(cell_div);
         }
-        col = col.child(row_flex);
+        scroll = scroll.child(row_flex);
     }
-    col.into_any_element()
+    div()
+        .w_full()
+        .min_w_0()
+        .rounded_md()
+        .overflow_hidden()
+        .border_1()
+        .border_color(styles.border)
+        .child(scroll)
+        .into_any_element()
 }
 
 fn list_block(ordered: bool, items: Vec<ListItem>, styles: &MdStyles) -> AnyElement {

@@ -67,7 +67,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Shared Primitives
 
-- [Button](#shared-primitives) · [Input](#shared-primitives) · [PopupMenu](#shared-primitives) · [PopupMenuItem](#shared-primitives) · [TabBar](#shared-primitives) · [Tag](#shared-primitives) · [TextView](#shared-primitives) · [Icon](#shared-primitives) · [ScrollHandle](#shared-primitives) · [TitleBar](#shared-primitives) · [ContextMenu](#shared-primitives) · [Tooltip](#shared-primitives)
+- [Button](#shared-primitives) · [Input](#shared-primitives) · [PopupMenu](#shared-primitives) · [PopupMenuItem](#shared-primitives) · [TabBar](#shared-primitives) · [Tag](#shared-primitives) · [Markdown](#markdown) · [Icon](#shared-primitives) · [ScrollHandle](#shared-primitives) · [TitleBar](#shared-primitives) · [ContextMenu](#shared-primitives) · [Tooltip](#shared-primitives)
 
 ### 状态
 
@@ -556,7 +556,7 @@ Plain-text multi-line [InputField](#inputfield) for markdown editing.
 
 #### EditorPreviewTab
 
-Rendered markdown view (`TextView::markdown`).
+Rendered markdown view (`Markdown`).
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -762,7 +762,7 @@ Monospace grid renderer, `flex_1`.
 
 ## 7. Shared Primitives
 
-Reusable UI elements from `gpui_component` used across all views.
+Reusable UI elements from `gpui_component` and `manox-components` used across all views.
 
 #### Button
 
@@ -788,9 +788,9 @@ Horizontal tab bar with selectable tabs.
 
 Small colored chip/badge with variant colors.
 
-#### TextView
+#### Markdown
 
-Markdown renderer with syntax highlighting and selection.
+Self-built markdown renderer (`manox-components::markdown::Markdown`) replacing `gpui_component::TextView::markdown`. Per-block layout: paragraphs/headings via `StyledText::with_highlights`; code blocks with line-number gutter + `overflow_x_scroll` + tree-sitter highlighting; unified-diff blocks with accent wash + left bar; GFM tables with column alignment + horizontal scroll; task-list checkboxes. Streaming bodies paint plain text + cursor and mount the full layout once the stream ends. Cross-block selection is a follow-up; per-block copy buttons remain.
 
 #### Icon
 

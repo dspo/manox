@@ -1,17 +1,18 @@
 //! Rendering of a single conversation message.
 //!
-//! - Text blocks use `TextView::markdown(...).selectable(true)` for selection + Cmd+C copy.
-//! - Each block carries a copy button in its top-right corner that writes the whole block to the clipboard.
+//! - Text blocks render via `Markdown` with per-block copy buttons (cross-block
+//!   selection + Cmd+C copy lands in a follow-up).
 //! - User: a right-aligned rounded card within the block.
 //! - Assistant: a full-width block with a role label + markdown body.
 //! - Reasoning: a collapsible block, indented secondary text with a left border.
 //! - ToolCall: a card with title + status icon + monospace output.
 //!
-//! Streaming assistant / reasoning bodies render as plain `div` (no markdown
-//! re-parse on every token) and only switch to `TextView::markdown` once the
-//! stream ends. The same rule applies to streaming tool output: while lines
-//! are still arriving we paint a plain monospace run and only mount the
-//! syntax-highlighted `TextView::markdown` once the final `ToolResult` lands.
+//! Streaming assistant / reasoning bodies go through `Markdown::streaming(true)`,
+//! which paints plain text + a trailing cursor without re-parsing mdast per
+//! token and mounts the full layout once the stream ends. Streaming tool output
+//! is stricter: while lines are still arriving we paint a plain monospace run
+//! and only mount the syntax-highlighted `Markdown` once the final `ToolResult`
+//! lands.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -55,18 +56,13 @@ pub struct ToolCallCtx {
 
 /// Markdown renderer with theme-aware syntax highlighting.
 ///
-/// `scrollable = true` mounts an internal vertical scrollbar. In that mode the
-/// TextView sizes to its parent's box, so the parent must have a defined
-/// height (use `h(...)` rather than `max_h(...)`).
+/// `scrollable = true` mounts an internal vertical scrollbar; the renderer
+/// sizes to its parent's box, so the parent must carry a fixed height (use
+/// `h(...)` rather than `max_h(...)`).
 ///
-/// `scrollable = false` wraps the TextView in a column flex pinned to its
-/// parent's width. A bare TextView in a default Row `div` sizes to its
-/// max-content width, which flickers as streamed lines change length and can
-/// push the centered column past its cap. The column makes the TextView a
-/// cross-axis item that stretches to the column width, so the text wraps
-/// there; `min_w_0` + `overflow_hidden` zero the flex item's automatic
-/// minimum size, so a long unbreakable run can neither block the column's
-/// elastic shrink nor spill past it into the env-card gutter.
+/// `scrollable = false` clips overflow horizontally — the renderer itself is a
+/// `w_full` + `min_w_0` column, so a long unbreakable run cannot push past the
+/// env-card gutter.
 fn markdown_tv(
     id: impl Into<gpui::ElementId>,
     text: impl Into<gpui::SharedString>,
@@ -173,7 +169,7 @@ impl Render for MessageItem {
     }
 }
 
-/// Render a `ConvItem` as an element. `ix` is the entry index (stable key for collapsibles/TextView).
+/// Render a `ConvItem` as an element. `ix` is the entry index (stable key for collapsibles and text-block element ids).
 /// `agent_ctx` supplies expansion state for `AgentTask` cards; `tool_ctx` carries
 /// the workspace weak handle for `ToolCall` cards to flip their own collapse flag.
 /// `None` renders them in a static state with no-op clicks (used when the owning
@@ -329,11 +325,12 @@ pub fn render_assistant(
         .into_any_element()
 }
 
-/// Render the assistant / reasoning body. While the stream is live we paint a
-/// plain text run — markdown re-parse and shaped text layout on every token
-/// delta was the source of the visible item overlap and the scroll-jank.
-/// When the stream ends we mount `TextView::markdown` once for selection +
-/// rendering of headings, lists, and code blocks with syntax highlighting.
+/// Render the assistant / reasoning body. While the stream is live the
+/// renderer paints plain text + a trailing cursor — markdown re-parse and
+/// shaped text layout on every token delta was the source of the visible item
+/// overlap and the scroll-jank. When the stream ends the same `Markdown`
+/// mounts the full layout: headings, lists, and code blocks with syntax
+/// highlighting.
 fn render_text_body(
     text: &str,
     streaming: bool,
@@ -667,9 +664,9 @@ pub fn render_tool_call(
 }
 
 /// Render an `exit_plan_mode` tool-call as a plan card. The body uses
-/// `TextView::markdown` (assistant-style, no code-block wrapping, no height
-/// cap) instead of the monospace scrollable container. PendingApproval forces
-/// the body open; terminal status auto-collapses like a regular ToolCall.
+/// `Markdown` (assistant-style, no code-block wrapping, no height cap) instead
+/// of the monospace scrollable container. PendingApproval forces the body open;
+/// terminal status auto-collapses like a regular ToolCall.
 fn render_plan_card(
     item: &ToolCallItem,
     ix: usize,
@@ -808,9 +805,9 @@ fn render_plan_card(
 
 /// Fixed-height container with the tool's output. While streaming we paint a
 /// plain monospace run (no markdown re-parse per chunk); once the final
-/// `ToolResult` lands we mount the syntax-highlighted, scrollable
-/// `TextView::markdown`. The container keeps a deterministic height either way
-/// so the parent card (and the list) reports a stable layout.
+/// `ToolResult` lands we mount the syntax-highlighted, scrollable `Markdown`.
+/// The container keeps a deterministic height either way so the parent card
+/// (and the list) reports a stable layout.
 fn render_tool_output(
     output: &str,
     tool_name: &str,

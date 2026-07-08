@@ -115,7 +115,7 @@ pub struct Workspace {
     pub(crate) input_state: Entity<ComposerInput>,
     /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
     /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
-    /// rendered markdown preview (gpui-component `TextView::markdown`).
+    /// rendered markdown preview (`Markdown`).
     editor_state: Entity<InputState>,
     editor_open: bool,
     editor_preview: bool,
@@ -519,9 +519,9 @@ impl Workspace {
                         .conversation
                         .update(cx, |c, cx| c.apply(ev, &role, usage, weak, cx));
                     // Stop flips streaming flags off, so finalized bodies switch
-                    // to `TextView::markdown` and grow (async parse) a frame or
-                    // two later. The flat column re-lays out on notify and
-                    // `on_prepaint` keeps the tail pinned across that growth.
+                    // to full `Markdown` layout and grow a frame or two later.
+                    // The flat column re-lays out on notify and `on_prepaint`
+                    // keeps the tail pinned across that growth.
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
                         let thread_id = this.thread.read(cx).id.0.clone();
@@ -4155,12 +4155,10 @@ impl Render for Workspace {
                     .min_h_0()
                     .overflow_hidden()
                     .child(if editor_preview {
-                        // The TextView caches its parsed document per element id and early-returns
-                        // in set_text when the source is unchanged, so resizing the pane would leave
-                        // the laid-out tree stale. Derive the id from the quantized pane width so a
-                        // width change mounts a fresh state and re-parses at the new wrap width.
-                        let preview_id =
-                            format!("editor-preview-{}", (f32::from(editor_width) as i32) / 8);
+                        // Markdown re-parses mdast and re-lays-out every frame,
+                        // so a pane resize re-wraps at the new width with no
+                        // cached tree to go stale; a stable id keeps the scroll
+                        // position across the resize.
                         v_flex()
                             .h_full()
                             .p_4()
@@ -4168,7 +4166,7 @@ impl Render for Workspace {
                             .child(
                                 gpui::div().h_full().child(
                                     Markdown::new(
-                                        preview_id,
+                                        "editor-preview",
                                         self.editor_state.read(cx).value().to_string(),
                                     )
                                     .theme(cx.theme())
