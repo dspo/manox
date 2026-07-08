@@ -117,7 +117,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 
 manox 处于开发早期，不维护 v0→v1 升级路径，不背历史负债。
 
-- **不写升级脚本 / migration**：schema 变更靠 `DROP TABLE + CREATE TABLE` 全量重建（`db/mod.rs`），不写 `ALTER TABLE`/多步迁移链。
+- **运行时禁止 schema migration**：运行时永远不改 DDL、不删除/重建用户机器上的 db。`db/mod.rs` 的 `open()` 仅对全新 db 执行 `CREATE TABLE IF NOT EXISTS`（初始化），对已有 db 是 no-op。开发过程中涉及 schema 迁移，agent 直接手动改开发者机器上的 db（`sqlite3` CLI / `ALTER TABLE` / 手动重建）。碰到 db schema 不对，该报错报错、该 panic panic。
 - **不保留兼容字段 / 不写 fallback 兼容读**：字段失去存在理由时直接删，不要 `#[serde(rename)]`/双写/`Option::unwrap_or(default)` 续命。读不到 key 就报错，不静默回退。
 - **不写 `v0`/`legacy_`/`backward_compat` 模块**：任何以向后兼容为名的子模块/helper/trait/wrapper 直接拒。新枚举/新 schema 直接上，原地替换。删代码时同步删测试。
 > 当不确定要不要保留兼容层时，问：当前有没有外部用户的数据会因此被破坏？答案是"没有 / 用户可以接受丢"——就按激进方向走。

@@ -34,16 +34,6 @@ pub use token_usage::TokenUsageRecord;
 
 use crate::paths;
 
-/// Schema version. `open()` compares `PRAGMA user_version` against this; any
-/// mismatch drops every table and recreates them. There is no incremental
-/// migration — legacy data is not carried forward.
-///
-/// Bump this whenever a column is added, removed, or its type/nullability
-/// changes. `CREATE TABLE IF NOT EXISTS` is a no-op on existing tables, so the
-/// only way a new column reaches a legacy DB is via the recreate path triggered
-/// by this version mismatch.
-const SCHEMA_VERSION: i32 = 6;
-
 /// Thread database handle.
 pub struct ThreadsDatabase {
     conn: Mutex<Connection>,
@@ -56,55 +46,28 @@ impl ThreadsDatabase {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create db directory: {}", parent.display()))?;
         }
-        let mut conn = Connection::open(path)
+        let conn = Connection::open(path)
             .with_context(|| format!("open threads db: {}", path.display()))?;
-        Self::init_schema(&mut conn)?;
+        Self::init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Recreate the schema when `user_version` does not match `SCHEMA_VERSION`.
-    /// Legacy data is dropped wholesale — no migration path, by design. The
-    /// drop + recreate + version bump runs in one transaction so a crash mid-way
-    /// cannot leave a half-dropped database that the next open would mis-read.
-    fn init_schema(conn: &mut Connection) -> Result<()> {
-        let version: i32 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .context("read user_version")?;
-        if version == SCHEMA_VERSION {
-            // DB is already on the current shape; `CREATE TABLE IF NOT EXISTS`
-            // is a no-op here, but the call still has to run so a partially-
-            // initialized database (e.g. commit() failed after create_table
-            // but before `user_version` was bumped) recovers cleanly.
-            threads::create_table(conn)?;
-            events::create_table(conn)?;
-            token_usage::create_table(conn)?;
-            terminals::create_table(conn)?;
-            return Ok(());
-        }
-        let tx = conn
-            .transaction()
-            .context("begin schema reset transaction")?;
-        // Any version mismatch is a schema reset: drop every table and let
-        // `create_table` rebuild the current shape. No incremental migration —
-        // legacy data is not carried forward (early development; threads are
-        // re-created, not upgraded).
-        tx.execute_batch(
-            "DROP TABLE IF EXISTS token_usage;
-             DROP TABLE IF EXISTS terminal_sessions;
-             DROP TABLE IF EXISTS thread_events;
-             DROP TABLE IF EXISTS thread_data;
-             DROP TABLE IF EXISTS threads;",
-        )
-        .context("drop legacy tables")?;
-        threads::create_table(&tx)?;
-        events::create_table(&tx)?;
-        token_usage::create_table(&tx)?;
-        terminals::create_table(&tx)?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .context("set user_version")?;
-        tx.commit().context("commit schema reset transaction")?;
+    /// Initialize the schema for a fresh database. Each `create_table` uses
+    /// `CREATE TABLE IF NOT EXISTS`, so this is a no-op on an existing database
+    /// whose tables already exist.
+    ///
+    /// Runtime never performs schema migration: no version comparison, no
+    /// `ALTER TABLE`, no `DROP TABLE`. If the on-disk schema is stale, queries
+    /// referencing missing columns will fail at first use — by design. Schema
+    /// changes during development are applied manually to the developer's own
+    /// database (sqlite3 CLI / `ALTER TABLE` / manual rebuild).
+    fn init_schema(conn: &Connection) -> Result<()> {
+        threads::create_table(conn)?;
+        events::create_table(conn)?;
+        token_usage::create_table(conn)?;
+        terminals::create_table(conn)?;
         Ok(())
     }
 }
@@ -122,8 +85,8 @@ mod tests {
     use std::collections::HashMap;
 
     fn open_mem() -> ThreadsDatabase {
-        let mut conn = Connection::open_in_memory().unwrap();
-        ThreadsDatabase::init_schema(&mut conn).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        ThreadsDatabase::init_schema(&conn).unwrap();
         ThreadsDatabase {
             conn: Mutex::new(conn),
         }
@@ -251,39 +214,6 @@ mod tests {
         db.archive("t1", false).unwrap();
         assert!(!db.load("t1").unwrap().unwrap().archived);
         assert!(db.list(false).unwrap().iter().any(|s| s.id == "t1"));
-    }
-
-    #[test]
-    fn schema_rebuild_on_version_mismatch() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        ThreadsDatabase::init_schema(&mut conn).unwrap();
-        conn.execute(
-            "INSERT INTO threads (id, summary, model_id, cwd, created_at, interacted_at, updated_at, session_started_at) VALUES ('x','','','/tmp',0,0,0,0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO terminal_sessions (id, cwd, created_at, updated_at) VALUES ('t1', '/tmp', 0, 0)",
-            [],
-        )
-        .unwrap();
-        // A lower user_version triggers a wholesale rebuild that must wipe
-        // every table — including terminal_sessions, which the drop batch must
-        // not forget just because it was added after the others.
-        conn.pragma_update(None, "user_version", 1).unwrap();
-        ThreadsDatabase::init_schema(&mut conn).unwrap();
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 0);
-        let n_term: i64 = conn
-            .query_row("SELECT COUNT(*) FROM terminal_sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n_term, 0, "terminal_sessions must be wiped on rebuild");
-        let v: i32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap();
-        assert_eq!(v, SCHEMA_VERSION);
     }
 
     #[test]
