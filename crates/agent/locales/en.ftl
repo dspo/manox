@@ -424,3 +424,5 @@ workspace-env-auto-review = Auto review
 workspace-env-tokens = Tokens
 workspace-env-sources = Sources
 workspace-env-no-sources = No sources yet
+composer-pasted-image = Pasted image
+composer-image-process-failed = Some pasted images could not be sent (unsupported format or too large)

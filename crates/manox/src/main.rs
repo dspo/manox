@@ -71,6 +71,7 @@ fn main() {
         terminal::init(cx);
         terminal_ui::init(cx);
         agent_ui::slash_command::init(cx);
+        composer::init(cx);
 
         cx.bind_keys([
             #[cfg(target_os = "macos")]

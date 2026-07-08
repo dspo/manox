@@ -39,7 +39,9 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::conversation::{ConvItem, ConversationState};
+use composer::{ComposerEvent, ComposerInput};
+
+use crate::conversation::{ConvItem, ConversationState, UserImage};
 use crate::views::centered;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
@@ -110,7 +112,7 @@ pub struct Workspace {
     background_threads: Vec<Entity<Thread>>,
     sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
-    pub(crate) input_state: Entity<InputState>,
+    pub(crate) input_state: Entity<ComposerInput>,
     /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
     /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
     /// rendered markdown preview (gpui-component `TextView::markdown`).
@@ -327,7 +329,7 @@ impl Workspace {
         };
 
         let input_state = cx.new(|cx| {
-            InputState::new(window, cx)
+            ComposerInput::new(window, cx)
                 .multi_line(true)
                 .auto_grow(4, 12)
                 .submit_on_enter(true)
@@ -411,6 +413,8 @@ impl Workspace {
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
         ws.editor_sub = Some(ws.subscribe_editor(window, cx));
+        // Focus the composer so typing works immediately on the hero screen.
+        ws.input_state.update(cx, |s, cx| s.focus(window, cx));
         let id = ws.thread.read(cx).id.0.clone();
         ws.sidebar.update(cx, |s, cx| s.set_selected(Some(id), cx));
         ws
@@ -913,10 +917,13 @@ impl Workspace {
         cx.subscribe_in(
             &input,
             window,
-            |this, _, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { shift, .. } if !shift => this.submit_input(window, cx),
-                InputEvent::Change => this.sync_slash_menu(window, cx),
-                _ => {}
+            |this, _, ev: &ComposerEvent, window, cx| match ev {
+                ComposerEvent::PressEnter => this.submit_input(window, cx),
+                ComposerEvent::Change => this.sync_slash_menu(window, cx),
+                ComposerEvent::PastedImage(image) => {
+                    this.handle_pasted_image(image.clone(), cx);
+                }
+                ComposerEvent::Focus | ComposerEvent::Blur => {}
             },
         )
     }
@@ -1164,22 +1171,55 @@ impl Workspace {
 
         // Reading attachment bytes is blocking IO; do it off the UI thread, then start the turn.
         cx.spawn(async move |this, cx| {
-            let (text, extra) = cx
+            let (text, extra, failed) = cx
                 .background_spawn(async move {
                     let mut text = text;
                     let mut extra = Vec::new();
+                    let mut failed = 0usize;
                     for att in &attachments {
-                        if let Some(content) = load_attachment(att, &mut text) {
-                            extra.push(content);
+                        match att {
+                            PendingAttachment::ClipboardImage(img) => {
+                                match agent::image::gpui_image_to_message_content(
+                                    std::sync::Arc::new(img.clone()),
+                                ) {
+                                    Some(content) => extra.push(content),
+                                    None => failed += 1,
+                                }
+                            }
+                            PendingAttachment::File { .. } => {
+                                if let Some(content) = load_attachment(att, &mut text) {
+                                    extra.push(content);
+                                }
+                            }
                         }
                     }
-                    (text, extra)
+                    (text, extra, failed)
                 })
                 .await;
-            this.update(cx, |this, cx| this.send_user_turn(text, extra, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                this.send_user_turn(text, extra, cx);
+                if failed > 0 {
+                    let weak = cx.weak_entity();
+                    this.conversation.update(cx, |c, cx| {
+                        c.push_notice(
+                            i18n::t("composer-image-process-failed").to_string(),
+                            weak,
+                            cx,
+                        );
+                    });
+                }
+            })
+            .ok();
         })
         .detach();
+    }
+
+    /// Stage a clipboard image as a pending attachment chip. Resize happens
+    /// off-thread on submit; here we only record the image and re-render.
+    fn handle_pasted_image(&mut self, image: gpui::Image, cx: &mut Context<Self>) {
+        self.pending_attachments
+            .push(PendingAttachment::ClipboardImage(image));
+        cx.notify();
     }
 
     /// Run a markdown prompt-macro slash command turn. The display text
@@ -1196,8 +1236,9 @@ impl Workspace {
         };
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
-        self.conversation
-            .update(cx, |c, cx| c.push_user(display_text, &role, weak, cx));
+        self.conversation.update(cx, |c, cx| {
+            c.push_user(display_text, Vec::new(), &role, weak, cx)
+        });
         // Submitting a command turn re-engages tail-follow (see send_user_turn).
         self.stick_to_bottom = true;
         let hit = self
@@ -1226,8 +1267,10 @@ impl Workspace {
         use agent::language_model::MessageContent;
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
-        self.conversation
-            .update(cx, |c, cx| c.push_user(text.clone(), &role, weak, cx));
+        let user_images = Self::decode_user_images(&images);
+        self.conversation.update(cx, |c, cx| {
+            c.push_user(text.clone(), user_images, &role, weak, cx)
+        });
         // Submitting a turn re-engages tail-follow so the new bubble and the
         // streaming reply stay in view; `on_prepaint` re-pins each frame as
         // the reply grows (including the async markdown-parse height bump).
@@ -1248,6 +1291,29 @@ impl Workspace {
         // Persist on submit so the sidebar shows the new entry immediately.
         save_thread(self.thread.clone(), true, cx);
         cx.notify();
+    }
+
+    /// Decode provider-bound image contents into UI-preview `UserImage`s. The
+    /// canonical `MessageContent::Image` bytes still go to the thread; this
+    /// only rebuilds a gpui image for the user bubble.
+    fn decode_user_images(images: &[agent::language_model::MessageContent]) -> Vec<UserImage> {
+        use agent::language_model::MessageContent;
+        use base64::Engine as _;
+        images
+            .iter()
+            .filter_map(|c| match c {
+                MessageContent::Image { data, mime_type } => {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data.as_bytes())
+                        .ok()?;
+                    let fmt = gpui::ImageFormat::from_mime_type(mime_type.as_str())?;
+                    Some(UserImage(std::sync::Arc::new(gpui::Image::from_bytes(
+                        fmt, bytes,
+                    ))))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1327,8 +1393,9 @@ impl Workspace {
         }
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
-        self.conversation
-            .update(cx, |c, cx| c.push_user(text.clone(), &role, weak, cx));
+        self.conversation.update(cx, |c, cx| {
+            c.push_user(text.clone(), Vec::new(), &role, weak, cx)
+        });
         // Submitting from the editor re-engages tail-follow (see send_user_turn).
         self.stick_to_bottom = true;
         self.thread.update(cx, |thread, cx| {
@@ -2763,12 +2830,7 @@ impl Workspace {
         v_flex()
             .w_full()
             .gap_2()
-            .child(
-                Input::new(&self.input_state)
-                    .appearance(false)
-                    .bordered(false)
-                    .focus_bordered(false),
-            )
+            .child(self.input_state.clone())
             .child(
                 h_flex()
                     .w_full()

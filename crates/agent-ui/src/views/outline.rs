@@ -34,7 +34,7 @@ pub fn user_turns_from<'a>(items: impl Iterator<Item = &'a ConvItem>) -> Vec<Use
     items
         .enumerate()
         .filter_map(|(item_ix, kind)| match kind {
-            ConvItem::User(text) => Some((item_ix, text)),
+            ConvItem::User { text, .. } => Some((item_ix, text)),
             _ => None,
         })
         .enumerate()
@@ -137,10 +137,16 @@ mod tests {
     #[test]
     fn user_turns_pick_user_items_with_ordinals_and_indices() {
         let items = [
-            ConvItem::User("first".to_string()),
+            ConvItem::User {
+                text: "first".to_string(),
+                images: Vec::new(),
+            },
             assistant("reply"),
             tool("t1"),
-            ConvItem::User("second".to_string()),
+            ConvItem::User {
+                text: "second".to_string(),
+                images: Vec::new(),
+            },
             assistant("reply2"),
         ];
         let turns = user_turns_from(items.iter());

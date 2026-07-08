@@ -16,6 +16,7 @@ gpui-component-assets.workspace = true
 
 agent-ui.workspace = true
 agent.workspace = true
+composer.workspace = true
 terminal.workspace = true
 terminal-ui.workspace = true
 

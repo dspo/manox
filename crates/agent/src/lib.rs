@@ -13,6 +13,7 @@ pub mod goal;
 pub mod hashline;
 pub mod hook;
 pub mod i18n;
+pub mod image;
 pub mod language_model;
 pub mod mcp;
 pub mod message;
