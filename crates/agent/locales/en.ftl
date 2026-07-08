@@ -337,13 +337,6 @@ workspace-yolo-on-notice = Full access on: tool calls need no approval, bash run
 workspace-yolo-off-notice = Switched to request-approval mode: approvals and sandbox restored.
 workspace-empty-prompt = What should we do?
 workspace-effort-section = Reasoning effort
-workspace-effort-low = Low
-workspace-effort-medium = Medium
-workspace-effort-high = High
-workspace-effort-xhigh = XHigh
-workspace-effort-max = Max
-workspace-effort-ultracode = Ultracode
-workspace-effort-auto = Auto
 
 ### views/composer_menu.rs
 composer-add-label = Add

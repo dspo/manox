@@ -2103,8 +2103,10 @@ impl Workspace {
     ) -> AnyElement {
         let open = self.effort_open;
         let selected = self.thread.read(cx).reasoning_effort();
-        let workspace = cx.entity().downgrade();
-        let label = i18n::t(reasoning_effort_label_key(selected));
+let workspace = cx.entity().downgrade();
+        // Effort enum values are provider wire literals (low/medium/high/...),
+        // not UI chrome — they are not localized.
+        let label = selected.wire_value();
 
         let trigger = h_flex()
             .id("reasoning-effort-chip")
@@ -2152,7 +2154,7 @@ impl Workspace {
                     for effort in ReasoningEffort::ALL {
                         let ws = menu_workspace.clone();
                         menu = menu.item(
-                            PopupMenuItem::new(i18n::t(reasoning_effort_label_key(effort)))
+                            PopupMenuItem::new(effort.wire_value())
                                 .checked(effort == current)
                                 .on_click(move |_, _window, cx| {
                                     let _ = ws.update(cx, |this, cx| {
@@ -4621,18 +4623,6 @@ impl Workspace {
         };
         self.attach_thread(loaded, cx);
         true
-    }
-}
-
-fn reasoning_effort_label_key(effort: ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::Low => "workspace-effort-low",
-        ReasoningEffort::Medium => "workspace-effort-medium",
-        ReasoningEffort::High => "workspace-effort-high",
-        ReasoningEffort::XHigh => "workspace-effort-xhigh",
-        ReasoningEffort::Max => "workspace-effort-max",
-        ReasoningEffort::Ultracode => "workspace-effort-ultracode",
-        ReasoningEffort::Auto => "workspace-effort-auto",
     }
 }
 
