@@ -2103,7 +2103,7 @@ impl Workspace {
     ) -> AnyElement {
         let open = self.effort_open;
         let selected = self.thread.read(cx).reasoning_effort();
-let workspace = cx.entity().downgrade();
+        let workspace = cx.entity().downgrade();
         // Effort enum values are provider wire literals (low/medium/high/...),
         // not UI chrome — they are not localized.
         let label = selected.wire_value();
