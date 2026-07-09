@@ -4,3 +4,4 @@
 //! components (banners, tooltips, …) live alongside it under a flat namespace.
 
 pub mod markdown;
+pub mod turn_frame;

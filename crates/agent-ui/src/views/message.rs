@@ -26,11 +26,12 @@ use base64::Engine as _;
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
 use gpui_component::{
-    ActiveTheme as _, Colorize, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex, pink_500, v_flex,
 };
 use manox_components::markdown::{HeadingMode, Markdown};
+use manox_components::turn_frame::TurnFrame;
 
 use crate::Workspace;
 use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage};
@@ -280,15 +281,9 @@ fn copy_button_hoverable(
         .child(copy_button(ix, prefix, text))
 }
 
-/// Render a user message as a full-width bordered turn block with a muted
-/// metadata header — the Claude Code TUI turn-block look, not a chat bubble.
-///
-/// The block carries a 1px accent border + a faint accent tint and a small
-/// (4px) radius. A header row sits inside the top border: the role label
-/// ("You"), the active model, and the project (cwd basename), joined by `·`
-/// separators, in small muted text so it does not compete with the body. The
-/// body is plain horizontal markdown on `foreground`, full-width, wrapping
-/// normally. `min_w_0` end to end keeps long CJK / unbreakable runs from
+/// Render a user message as one full-width turn frame. The frame itself owns
+/// the accent border; the bottom edge keeps only the two corners so the center
+/// stays open. `min_w_0` end to end keeps long CJK / unbreakable runs from
 /// collapsing the block to min-content (the failure mode of the old bubble).
 pub fn render_user(
     text: &str,
@@ -315,83 +310,30 @@ pub fn render_user(
         header.push_str(" > ");
         header.push_str(project);
     }
-    let frame = if theme.is_dark() {
-        pink_500().lighten(0.12)
-    } else {
-        pink_500()
-    };
-    let rail = px(2.);
+    let group = format!("user-{ix}");
 
-    v_flex()
-        .group(format!("user-{ix}"))
-        .w_full()
-        .min_w_0()
-        .text_color(theme.foreground)
-        // Top frame: rounded "door" lintel with the metadata embedded in the
-        // line. The body below has only left/right rails, keeping the bottom
-        // open rather than drawing a card.
-        .child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .items_start()
-                .gap_1()
-                .text_xs()
-                .text_color(frame)
-                .child(
-                    gpui::div()
-                        .w(px(24.))
-                        .h(px(16.))
-                        .border_t(rail)
-                        .border_l(rail)
-                        .rounded_tl(px(12.))
-                        .border_color(frame),
-                )
-                .child(
-                    gpui::div()
-                        .max_w(px(460.))
-                        .min_w_0()
-                        .flex_shrink_0()
-                        .truncate()
-                        .px_2()
-                        .py(px(2.))
-                        .rounded(px(10.))
-                        .bg(theme.background)
-                        .border_1()
-                        .border_color(frame)
-                        .child(SharedString::from(header)),
-                )
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .h(px(16.))
-                        .border_t(rail)
-                        .border_r(rail)
-                        .rounded_tr(px(12.))
-                        .border_color(frame),
-                )
-                .child(copy_button_hoverable(
-                    ix,
-                    "copy-user",
-                    format!("user-{ix}"),
-                    text.to_string(),
-                )),
+    TurnFrame::new(theme)
+        .group(group.clone())
+        .accent(pink_500())
+        .header(
+            gpui::div()
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(header)),
         )
+        .trailing(copy_button_hoverable(
+            ix,
+            "copy-user",
+            group,
+            text.to_string(),
+        ))
         .child(
             v_flex()
                 .w_full()
                 .min_w_0()
                 .overflow_hidden()
-                .border_l(rail)
-                .border_r(rail)
-                .border_color(frame)
-                .bg(frame.opacity(0.045))
-                .px_4()
-                .pt_2()
-                .pb_3()
                 .gap_2()
                 .text_sm()
+                .text_color(theme.foreground)
                 .children(images.iter().map(|ui| {
                     gpui::img(ui.0.clone())
                         .max_w(px(280.))
