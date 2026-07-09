@@ -4,15 +4,15 @@ use gpui_component::{Theme, h_flex, v_flex};
 
 /// A full-width message frame with an open center on the bottom edge.
 ///
-/// The frame owns the top, side rails, and bottom corner strokes so callers can
-/// treat it as a single text container instead of assembling border fragments.
+/// The frame draws one rounded border, then masks the bottom center so callers
+/// can treat the open-bottom treatment as a single text container.
 pub struct TurnFrame {
     group: Option<SharedString>,
     header: Option<AnyElement>,
     trailing: Option<AnyElement>,
     children: Vec<AnyElement>,
     accent: Hsla,
-    tint: Hsla,
+    gap_fill: Hsla,
 }
 
 impl TurnFrame {
@@ -23,7 +23,7 @@ impl TurnFrame {
             trailing: None,
             children: Vec::new(),
             accent: theme.accent,
-            tint: theme.accent.opacity(0.035),
+            gap_fill: theme.background,
         }
     }
 
@@ -34,7 +34,11 @@ impl TurnFrame {
 
     pub fn accent(mut self, accent: Hsla) -> Self {
         self.accent = accent;
-        self.tint = accent.opacity(0.035);
+        self
+    }
+
+    pub fn gap_fill(mut self, fill: Hsla) -> Self {
+        self.gap_fill = fill;
         self
     }
 
@@ -61,7 +65,6 @@ impl IntoElement for TurnFrame {
         let rail = px(2.);
         let radius = px(12.);
         let corner_w = px(34.);
-        let corner_h = px(12.);
 
         let mut shell = v_flex().w_full().min_w_0();
         if let Some(group) = self.group {
@@ -78,47 +81,29 @@ impl IntoElement for TurnFrame {
             header_row = header_row.child(trailing);
         }
 
-        let body = v_flex()
+        shell
             .w_full()
             .min_w_0()
+            .relative()
             .overflow_hidden()
-            .border_t(rail)
-            .border_l(rail)
-            .border_r(rail)
-            .rounded_t(radius)
+            .border(rail)
+            .rounded(radius)
             .border_color(self.accent)
-            .bg(self.tint)
             .px_4()
             .pt_3()
-            .pb_1()
+            .pb_3()
             .gap_2()
             .child(header_row)
-            .children(self.children);
-
-        let bottom_corners = h_flex()
-            .w_full()
-            .min_w_0()
-            .h(corner_h)
+            .children(self.children)
             .child(
                 gpui::div()
-                    .w(corner_w)
-                    .h_full()
-                    .border_l(rail)
-                    .border_b(rail)
-                    .rounded_bl(radius)
-                    .border_color(self.accent),
+                    .absolute()
+                    .bottom_0()
+                    .left(corner_w)
+                    .right(corner_w)
+                    .h(rail)
+                    .bg(self.gap_fill),
             )
-            .child(gpui::div().flex_1().min_w_0())
-            .child(
-                gpui::div()
-                    .w(corner_w)
-                    .h_full()
-                    .border_r(rail)
-                    .border_b(rail)
-                    .rounded_br(radius)
-                    .border_color(self.accent),
-            );
-
-        shell.child(body).child(bottom_corners).into_any_element()
+            .into_any_element()
     }
 }

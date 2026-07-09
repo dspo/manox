@@ -42,7 +42,7 @@ use manox_components::markdown::Markdown;
 
 use composer::{ComposerEvent, ComposerInput};
 
-use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage};
+use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
 use crate::views::centered;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
@@ -1318,10 +1318,10 @@ impl Workspace {
         } else {
             format!("/{name} {args}")
         };
-        let role = self.model_label(cx);
+        let meta = self.user_turn_meta(cx);
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
-            c.push_user(display_text, Vec::new(), &role, weak, cx)
+            c.push_user(display_text, Vec::new(), meta, weak, cx)
         });
         // Splice the new user item into the list, then re-engage tail-follow so
         // the streaming reply stays in view.
@@ -1351,11 +1351,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         use agent::language_model::MessageContent;
-        let role = self.model_label(cx);
+        let meta = self.user_turn_meta(cx);
+        let ui = Self::message_ui_metadata(&meta);
         let weak = cx.weak_entity();
         let user_images = Self::decode_user_images(&images);
         self.conversation.update(cx, |c, cx| {
-            c.push_user(text.clone(), user_images, &role, weak, cx)
+            c.push_user(text.clone(), user_images, meta, weak, cx)
         });
         // Splice the new user item in and re-engage tail-follow so the streaming
         // reply stays pinned as it grows.
@@ -1363,14 +1364,14 @@ impl Workspace {
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.thread.update(cx, |thread, cx| {
             if images.is_empty() {
-                thread.insert_user_message(text, cx);
+                thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
             } else {
                 let mut content = Vec::with_capacity(images.len() + 1);
                 if !text.trim().is_empty() {
                     content.push(MessageContent::Text(text));
                 }
                 content.extend(images);
-                thread.insert_user_message_with_content(content, cx);
+                thread.insert_user_message_with_content_and_ui_metadata(content, Some(ui), cx);
             }
             thread.run_turn(cx);
         });
@@ -1477,15 +1478,16 @@ impl Workspace {
         if text.trim().is_empty() || self.thread.read(cx).is_running() {
             return;
         }
-        let role = self.model_label(cx);
+        let meta = self.user_turn_meta(cx);
+        let ui = Self::message_ui_metadata(&meta);
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
-            c.push_user(text.clone(), Vec::new(), &role, weak, cx)
+            c.push_user(text.clone(), Vec::new(), meta, weak, cx)
         });
         self.sync_list_count(cx);
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.thread.update(cx, |thread, cx| {
-            thread.insert_user_message(text, cx);
+            thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
             thread.run_turn(cx);
         });
         save_thread(self.thread.clone(), true, cx);
@@ -1496,6 +1498,22 @@ impl Workspace {
         self.editor_preview = false;
         self.input_state.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
+    }
+
+    fn user_turn_meta(&self, cx: &mut Context<Self>) -> UserTurnMeta {
+        let approval_mode = self.thread.read(cx).approval_mode();
+        UserTurnMeta::new(
+            chrono::Utc::now().timestamp(),
+            self.model_label(cx),
+            Some(approval_mode),
+        )
+    }
+
+    fn message_ui_metadata(meta: &UserTurnMeta) -> agent::MessageUiMetadata {
+        agent::MessageUiMetadata {
+            model_id: (!meta.model_id.is_empty()).then(|| meta.model_id.clone()),
+            approval_mode: meta.approval_mode.map(|mode| mode.as_i64()),
+        }
     }
 
     pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {

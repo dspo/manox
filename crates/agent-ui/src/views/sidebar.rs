@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use agent::{ThreadStore, ThreadStoreEvent, i18n};
+use agent::{ThreadStore, ThreadStoreEvent, i18n, thread::ApprovalMode};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, Entity, EventEmitter,
     Pixels, Render, SharedString, Subscription, Window, ease_in_out, prelude::*, px,
@@ -505,7 +505,7 @@ fn render_thread_item(
         SlideDir::Up => -1.0,
         SlideDir::None => 0.0,
     };
-    let wash = theme.selection;
+    let wash = approval_mode_color(summary.approval_mode, theme);
     let slide_gen = slide.gen_id;
     // The wash overlay is attached only to rows participating in the transition.
     // Idle rows (AnimRole::None) carry no overlay and pay no animation cost.
@@ -534,7 +534,9 @@ fn render_thread_item(
                         // top+bottom shifted by equal-and-opposite offsets moves
                         // the rect without resizing it; overflow_hidden on the
                         // row clips the wash as it enters and exits.
-                        el.bg(wash.opacity(opacity)).top(px(ty)).bottom(px(-ty))
+                        el.bg(wash.opacity(0.18 * opacity))
+                            .top(px(ty))
+                            .bottom(px(-ty))
                     },
                 )
                 .into_any_element(),
@@ -625,8 +627,8 @@ fn render_thread_item(
         .py_1()
         .rounded(theme.radius)
         .when(!selected, |this| {
-            this.hover(|s| s.bg(theme.accent.opacity(0.08)))
-                .active(|s| s.bg(theme.accent.opacity(0.18)))
+            this.hover(move |s| s.bg(wash.opacity(0.08)))
+                .active(move |s| s.bg(wash.opacity(0.18)))
         })
         .on_click(cx.listener(move |_this, _ev, _window, cx| {
             cx.emit(SidebarEvent::OpenThread(id_open.clone()));
@@ -720,6 +722,14 @@ fn format_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+fn approval_mode_color(mode: i64, theme: &Theme) -> gpui::Hsla {
+    match ApprovalMode::from_i64(mode) {
+        ApprovalMode::OnRequest => theme.success,
+        ApprovalMode::AutoReview => theme.info,
+        ApprovalMode::Yolo => theme.danger,
     }
 }
 

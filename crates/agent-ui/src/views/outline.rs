@@ -140,12 +140,14 @@ mod tests {
             ConvItem::User {
                 text: "first".to_string(),
                 images: Vec::new(),
+                meta: None,
             },
             assistant("reply"),
             tool("t1"),
             ConvItem::User {
                 text: "second".to_string(),
                 images: Vec::new(),
+                meta: None,
             },
             assistant("reply2"),
         ];
