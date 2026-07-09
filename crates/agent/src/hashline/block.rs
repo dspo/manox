@@ -109,7 +109,7 @@ pub fn block_post_insertion_line(lines: &[&str], start_line: usize) -> Result<us
 /// Net `()`/`[]`/`{}` balance of a line, scanning char by char while skipping
 /// single-line `//` comments and string literals. Multi-line block comments and
 /// raw strings are not fully tokenized — this matches the simplified scan used
-/// by oh-my-pi's boundary repair, which is sufficient for block-range heuristics.
+/// by the boundary repair scanner, which is sufficient for block-range heuristics.
 fn net_balance(line: &str) -> i32 {
     let mut balance: i32 = 0;
     let mut in_string = false;

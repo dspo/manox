@@ -1,11 +1,11 @@
 //! Composer `+` and `⁄` menus plus pending-attachment support.
 //!
-//! The `+` menu mirrors Codex.app's "add / plugins" popover; "Files and Folders" opens
-//! a real file picker and "Plan Mode" toggles the thread's plan mode. The remaining
-//! rows are static decoration. The `⁄` menu's top section lists
-//! registered slash commands dynamically (from the `SlashCommandRegistry`); the rest
-//! (memory / skills) remains static decoration. Clicking a registered command inserts
-//! `/name ` into the composer for the user to complete and submit.
+//! The `+` menu offers "add / plugins" rows; "Files and Folders" opens a real
+//! file picker and "Plan Mode" toggles the thread's plan mode. The remaining
+//! rows are static decoration. The `⁄` menu's top section lists registered
+//! slash commands dynamically (from the `SlashCommandRegistry`); the rest
+//! (memory / skills) remains static decoration. Clicking a registered command
+//! inserts `/name ` into the composer for the user to complete and submit.
 //!
 //! A [`PendingAttachment`] is a file the user picked but has not yet sent. On submit the workspace
 //! turns each into message content: images become base64 [`MessageContent::Image`] blocks, text
@@ -27,7 +27,7 @@ use gpui_component::{
 
 /// Static row for the `+` and `⁄` menus: an icon, a name, and a description.
 /// `name`/`desc` are fluent message ids for localized rows, or literal English
-/// text for the decorative placeholder rows that mimic Codex.app (resolved
+/// text for the decorative placeholder rows (resolved identically via
 /// identically via [`menu_row_item`]).
 struct MenuRow {
     icon: IconName,
@@ -37,7 +37,7 @@ struct MenuRow {
 
 /// `+` menu "Add" group. "Files and folders" (index 0) opens the file picker,
 /// and "Plan mode" (index 3) toggles plan mode, both wired by the caller; the
-/// rest are static decoration mirroring Codex.app. Names/descs are fluent keys
+/// rest are static decoration. Names/descs are fluent keys
 /// resolved at render time.
 const PLUS_ADD_ROWS: &[MenuRow] = &[
     MenuRow {
@@ -47,7 +47,7 @@ const PLUS_ADD_ROWS: &[MenuRow] = &[
     },
     MenuRow {
         icon: IconName::SquareTerminal,
-        name: "composer-attach-zed",
+        name: "composer-attach-editor",
         desc: "",
     },
     MenuRow {
@@ -97,7 +97,7 @@ const PLUS_PLUGIN_ROWS: &[MenuRow] = &[
 const SLASH_SKILL_ROWS: &[(&str, &str, bool)] = &[
     (
         "Browser",
-        "Browser lets Codex open and control the in-app browser",
+        "Browser lets manox open and control the in-app browser",
         true,
     ),
     ("CI Debug", "Debug failing GitHub Actions checks", true),

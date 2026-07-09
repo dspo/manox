@@ -119,9 +119,8 @@ pub(crate) fn resolve_path_for_write<P: AsRef<Path>>(
 /// [`truncate_output`], which cuts on a UTF-8 boundary. Both produce a
 /// `TruncatedText` so the rendered notice — `⚠ Output too long (N bytes total,
 /// showing first M)` plus a per-tool narrow hint plus `do not speculate about
-/// the truncated content` — is identical across tools, mirroring zed's
-/// `Command output too long. The first N bytes:` and codex's
-/// `Warning: truncated output (original token count: N)`.
+/// the truncated content` — is identical across tools, matching the
+/// `Command output too long. The first N bytes:` format.
 pub(crate) struct TruncatedText<'a> {
     text: &'a str,
     truncated: bool,

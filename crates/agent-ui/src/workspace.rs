@@ -7,7 +7,7 @@
 //!
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -29,7 +29,6 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
     TITLE_BAR_HEIGHT, Theme, TitleBar,
-    animation::{Transition, ease_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -159,7 +158,7 @@ pub struct Workspace {
     slash_open: bool,
     slash_menu: Option<Entity<PopupMenu>>,
     slash_menu_sub: Option<Subscription>,
-    /// Title bar "..." dropdown (Codex-style conversation menu). Mirrors the
+    /// Title bar "..." dropdown (conversation menu). Mirrors the
     /// model selector pattern: a button toggles `title_menu_open`; the
     /// `PopupMenu` entity and its dismiss subscription are created on open.
     title_menu_open: bool,
@@ -234,13 +233,6 @@ pub struct Workspace {
     /// spread apart, tapering off with distance. `None` when the cursor is off
     /// the rail.
     outline_hover: Option<usize>,
-    /// Bumped on every `TokenUsageUpdated` event so the environment panel's
-    /// per-model counters re-trigger their slide animation.
-    token_anim_gen: u64,
-    /// Previously displayed per-model token values, keyed by `(model, kind)`.
-    /// Used to detect value changes and animate from old → new. Read/written
-    /// by `render_environment_panel`.
-    token_prev: HashMap<(String, String), u64>,
 }
 
 /// Top-level rendering mode of the Workspace window. `Settings` and
@@ -274,9 +266,10 @@ const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 const MAIN_MIN_WIDTH: f32 = 160.;
 
 /// Environment info card floating at the top-right of the conversation area.
-/// Wide enough to hold a one-line token row of "MiniMax/MiniMax-M3[1m]
-/// ↑1b,441m ↓9m,833k" (model id at the cap + in/out counters).
-const ENV_CARD_WIDTH: f32 = 340.;
+/// Wide enough to hold the two-line per-model usage block: model id + in/out
+/// on line one, cache read/cache creation on line two, each with `↑↓ cached`
+/// markers.
+const ENV_CARD_WIDTH: f32 = 380.;
 const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
 /// Minimum main-column width for the env card to mount at all. Below this the
 /// card stays hidden and the messages + composer take the full body width, so
@@ -301,7 +294,7 @@ const OUTLINE_TICK_GAP: f32 = 8.;
 const OUTLINE_CARD_WIDTH: f32 = 260.;
 /// Wave hover displacement: at the crest a tick grows this much wider and its
 /// row this much taller, tapering to zero at the wave's edge. Neighbors bulge
-/// out around the cursor like the Codex rail.
+/// out around the cursor like the outline rail.
 const OUTLINE_WAVE_EXTRA_WIDTH: f32 = 12.;
 const OUTLINE_WAVE_EXTRA_GAP: f32 = 6.;
 
@@ -319,7 +312,7 @@ const SLIDE_MS: u64 = 180;
 const SLIDE_OUT_MS: u64 = 200;
 
 /// Drag payload for the editor pane divider. Doubles as the invisible drag
-/// ghost view, mirroring Zed's `DraggedDock` pattern.
+/// ghost view, mirroring the `DraggedDock` drag-ghost pattern.
 struct DraggedEditorDivider;
 
 impl Render for DraggedEditorDivider {
@@ -425,8 +418,6 @@ impl Workspace {
             plugin_manager_sub: None,
             terminal_view: None,
             outline_hover: None,
-            token_anim_gen: 0,
-            token_prev: HashMap::new(),
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
@@ -503,7 +494,6 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::TokenUsageUpdated(_) => {
-                    this.token_anim_gen = this.token_anim_gen.wrapping_add(1);
                     cx.notify();
                 }
                 ThreadEvent::TurnStarted => {
@@ -622,7 +612,7 @@ impl Workspace {
         })
     }
 
-    /// The Codex-style outline rail: one equal-length tick per user turn,
+    /// The outline rail: one equal-length tick per user turn,
     /// mounted between the sidebar divider and the message list. Ticks for the
     /// turns currently on screen are highlighted; hovering a tick reveals a
     /// summary card and clicking it scrolls that turn into view.
@@ -2554,7 +2544,7 @@ impl Workspace {
         menu
     }
 
-    /// Title bar "..." trigger + dropdown (Codex-style conversation menu).
+    /// Title bar "..." trigger + dropdown (conversation menu).
     ///
     /// Closed: a small ghost icon button (horizontal ellipsis) next to the
     /// session title. Open: an absolute-positioned PopupMenu anchored under
@@ -2734,13 +2724,9 @@ impl Workspace {
         // Build per-model token rows, sorted by total usage descending.
         let mut model_rows: Vec<_> = per_model
             .into_iter()
-            .filter(|(_, u)| u.input_tokens > 0 || u.output_tokens > 0)
+            .filter(|(_, u)| u.total_tokens() > 0)
             .collect();
-        model_rows.sort_by(|a, b| {
-            let total_a = a.1.input_tokens + a.1.output_tokens;
-            let total_b = b.1.input_tokens + b.1.output_tokens;
-            total_b.cmp(&total_a)
-        });
+        model_rows.sort_by_key(|b| std::cmp::Reverse(b.1.total_tokens()));
 
         let token_section = v_flex().gap_1().child(
             h_flex()
@@ -2753,54 +2739,35 @@ impl Workspace {
                         .min_w_0()
                         .text_sm()
                         .text_color(theme.foreground)
-                        .child(i18n::t("workspace-env-tokens")),
+                        .child(i18n::t("workspace-env-usage")),
                 ),
         );
+        // Each model renders as two rows: input/output on line one, cache
+        // read/cache creation on line two (indented under the model id). Static
+        // text keeps the four-column layout readable without an odometer fight.
         let token_model_rows: Vec<AnyElement> = model_rows
             .into_iter()
-            .flat_map(|(model_name, usage)| {
-                let in_key = (model_name.clone(), "in".to_string());
-                let out_key = (model_name.clone(), "out".to_string());
-                let prev_in = self.token_prev.get(&in_key).copied().unwrap_or(0);
-                let prev_out = self.token_prev.get(&out_key).copied().unwrap_or(0);
-                // Only bump version for counters whose values actually changed.
-                let in_changed = prev_in != usage.input_tokens;
-                let out_changed = prev_out != usage.output_tokens;
-                self.token_prev.insert(in_key.clone(), usage.input_tokens);
-                self.token_prev.insert(out_key.clone(), usage.output_tokens);
-                let in_version = if in_changed { self.token_anim_gen } else { 0 };
-                let out_version = if out_changed { self.token_anim_gen } else { 0 };
-
-                // Display name is clamped so the row stays one line; the full
-                // name is still used for the counter anim ids and `token_prev`
-                // keys so they don't shift when truncation kicks in.
-                let model_display = truncate_env_model_id(model_name.clone());
-                let row: AnyElement = h_flex()
-                    .pl_6()
+            .map(|(model_name, usage)| {
+                let model_display = truncate_env_model_id(model_name);
+                let line_one = h_flex()
                     .gap_2()
                     .text_xs()
                     .text_color(muted)
-                    .child(gpui::div().min_w(px(80.)).truncate().child(model_display))
-                    .child(animated_counter(
-                        "in",
-                        prev_in,
-                        usage.input_tokens,
-                        &model_name,
-                        in_version,
-                        "↑",
-                        muted,
-                    ))
-                    .child(animated_counter(
-                        "out",
-                        prev_out,
-                        usage.output_tokens,
-                        &model_name,
-                        out_version,
-                        "↓",
-                        muted,
-                    ))
-                    .into_any_element();
-                [row]
+                    .child(gpui::div().w(px(80.)).truncate().child(model_display))
+                    .child(counter_text("↑", usage.input_tokens))
+                    .child(counter_text("↓", usage.output_tokens));
+                let line_two = h_flex()
+                    .pl(px(80. + 8.))
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(counter_text_cached("↑", usage.cache_read_input_tokens))
+                    .child(counter_text_cached("↓", usage.cache_creation_input_tokens));
+                v_flex()
+                    .gap_0p5()
+                    .child(line_one)
+                    .child(line_two)
+                    .into_any_element()
             })
             .collect();
 
@@ -2992,7 +2959,7 @@ impl Workspace {
     /// current permission posture is legible at a glance — a 1-line summary of
     /// what the model is allowed to do without prompting.
     ///
-    /// Clicking the chip opens a `PopupMenu` mirroring the Codex-style header:
+    /// Clicking the chip opens a `PopupMenu` mirroring the header:
     /// a question row with a "Learn more" link, three selectable rows (icon +
     /// title + subtitle, check on the right), a hairline, and a 4th non-clickable
     /// row pointing at `config.toml` for users who want a fully custom policy.
@@ -3283,7 +3250,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The composer `+` button and its popup menu (Codex-style "add / plugins").
+    /// The composer `+` button and its popup menu ("add / plugins").
     fn render_plus_button(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let trigger = Button::new("composer-plus")
             .ghost()
@@ -4651,7 +4618,7 @@ fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla)
                 .child(value.to_string()),
         )
 }
-/// Build the 3-tier approval `PopupMenu`. Mirrors the Codex layout:
+/// Build the 3-tier approval `PopupMenu`:
 ///   - title row: localized question + a "Learn more" link on the right
 ///   - three selectable rows (icon + title + subtitle, check on the right)
 ///   - hairline separator
@@ -4946,38 +4913,26 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Animated rolling counter for per-model token display. Renders old and new
-/// values stacked vertically inside a clip container; `Transition::slide_y`
-/// slides the stack up so the old value exits top and the new value enters
-/// from bottom — an odometer-style roll.
-fn animated_counter(
-    kind: &str,
-    prev: u64,
-    value: u64,
-    model: &str,
-    version: u64,
-    arrow: &str,
-    color: gpui::Hsla,
-) -> AnyElement {
-    let line_h = px(16.);
-    let text = format!("{arrow}{}", format_tokens(value));
-    let prev_text = format!("{arrow}{}", format_tokens(prev));
-
-    let inner = v_flex()
-        .child(gpui::div().h(line_h).child(prev_text))
-        .child(gpui::div().h(line_h).child(text));
-
-    let anim_id = gpui::SharedString::from(format!("token-counter-{model}-{kind}-{version}"));
-
+/// Static token counter: `{arrow}{formatted}` (e.g. `↑1m,357k`).
+fn counter_text(arrow: &str, value: u64) -> AnyElement {
     gpui::div()
-        .h(line_h)
-        .overflow_hidden()
-        .child(
-            Transition::new(Duration::from_millis(400))
-                .ease(ease_out_cubic)
-                .slide_y(line_h, px(0.))
-                .apply(inner, anim_id),
-        )
-        .text_color(color)
+        .child(SharedString::from(format!(
+            "{arrow}{}",
+            format_tokens(value)
+        )))
+        .into_any_element()
+}
+
+/// Cached token counter: `{arrow}{formatted} {cached}` — the `cached`
+/// marker is localized so the card doesn't mix languages under non-English
+/// locales.
+fn counter_text_cached(arrow: &str, value: u64) -> AnyElement {
+    h_flex()
+        .gap_0p5()
+        .child(SharedString::from(format!(
+            "{arrow}{}",
+            format_tokens(value)
+        )))
+        .child(i18n::t("workspace-env-cached"))
         .into_any_element()
 }

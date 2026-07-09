@@ -219,18 +219,36 @@ impl ThreadStore {
         to: &str,
         cx: &mut Context<Self>,
     ) {
+        let data = serde_json::json!({ "from": from, "to": to });
+        self.record_event(
+            thread_id,
+            crate::db::ThreadEventType::ModelChange,
+            &data,
+            cx,
+        );
+    }
+
+    /// Append a typed event to the thread's event stream. Used for `compaction`
+    /// (and any future non-model event the workspace needs on the timeline).
+    /// Fire-and-forget on the background executor; a db failure warns and does
+    /// not surface to the caller — event recording is best-effort.
+    pub fn record_event(
+        &self,
+        thread_id: &str,
+        event_type: crate::db::ThreadEventType,
+        data: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
         let db = self.db.clone();
         let thread_id = thread_id.to_string();
-        let data = serde_json::json!({ "from": from, "to": to });
+        let data = data.clone();
         cx.spawn(async move |_, cx| {
             let res = cx
                 .background_executor()
-                .spawn(async move {
-                    db.record_event(&thread_id, crate::db::ThreadEventType::ModelChange, &data)
-                })
+                .spawn(async move { db.record_event(&thread_id, event_type, &data) })
                 .await;
             if let Err(e) = res {
-                tracing::warn!(error = %e, "Failed to record model_change");
+                tracing::warn!(error = %e, "Failed to record thread event");
             }
         })
         .detach();

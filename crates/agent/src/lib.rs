@@ -7,6 +7,7 @@
 pub mod agent_def;
 pub mod approval;
 pub mod command;
+pub mod compact;
 pub mod db;
 pub mod frontmatter;
 pub mod goal;
@@ -47,7 +48,7 @@ pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_glo
 pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
 pub use tool::{
     AgentTool, AnyAgentTool, PlanApprovalResponse, ToolOutputSink, ToolRegistry,
-    exit_plan_mode_request_tool,
+    enter_plan_mode_request_tool, exit_plan_mode_request_tool,
 };
 
 /// Register the tokio runtime, `ProviderRegistry`, `McpRegistry`,

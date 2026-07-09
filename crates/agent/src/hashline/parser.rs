@@ -1,7 +1,7 @@
 //! Hashline patch parser.
 //!
 //! Parses a patch text into a list of `FilePatch` sections. The grammar is a
-//! line-oriented state machine mirroring oh-my-pi's `grammar.lark`:
+//! line-oriented state machine:
 //!
 //! ```text
 //! *** Begin Patch            (optional envelope open)

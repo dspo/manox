@@ -1,4 +1,4 @@
-//! User-turn outline: the render-agnostic model behind the Codex-style left
+//! User-turn outline: the render-agnostic model behind the left
 //! navigation rail.
 //!
 //! The rail draws one tick per user turn. This module owns everything that is
@@ -95,7 +95,7 @@ pub const WAVE_RADIUS: usize = 3;
 /// `0.0..=1.0` weight that is 1 on the hovered tick, tapers linearly to 0 at
 /// `WAVE_RADIUS`, and is 0 everywhere when nothing is hovered. The renderer
 /// maps this onto extra tick length and spacing so the rail bulges around the
-/// cursor like the Codex rail.
+/// cursor like the outline rail.
 pub fn wave_weight(ordinal: usize, hovered: Option<usize>) -> f32 {
     let Some(h) = hovered else { return 0.0 };
     let dist = ordinal.abs_diff(h);

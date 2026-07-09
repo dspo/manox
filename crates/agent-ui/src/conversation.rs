@@ -77,6 +77,16 @@ pub enum ConvItem {
     /// An ephemeral system notice — status changes, slash-command acks, etc.
     /// Rendered with neutral tones, not danger colors.
     Notice(String),
+    /// A context-compaction summary: older history was folded into this handoff
+    /// note. The summary is model-generated text (rendered as markdown, not
+    /// localized); only the card title goes through i18n. Collapsible like a
+    /// reasoning block — collapsed by default so the recap stays out of the
+    /// way until the user wants to inspect what was dropped.
+    Recap {
+        summary: String,
+        collapsed: bool,
+        user_toggled: bool,
+    },
     /// Provider is retrying the HTTP handshake after a transient failure
     /// (429 / 5xx / network). Transient: the first real content or terminal
     /// error event replaces it in place. Carries no error text — raw provider
@@ -259,10 +269,30 @@ impl ConversationState {
                 | ThreadEvent::AgentThinking(_)
                 | ThreadEvent::ToolCall { .. }
                 | ThreadEvent::Error(_)
+                | ThreadEvent::Compaction { .. }
         ) && self.pop_trailing_retry(cx);
         let len_after_pop = self.items.len();
 
         let outcome = match event {
+            // A compaction landed — render the handoff summary as a Recap card.
+            // The card is appended (never updated in place): a compaction is a
+            // one-time boundary marker, and the summary text is final.
+            ThreadEvent::Compaction { summary, .. } => {
+                let id = self.items.len();
+                self.items.push(cx.new(|_| {
+                    MessageItem::new(
+                        ConvItem::Recap {
+                            summary: summary.clone(),
+                            collapsed: true,
+                            user_toggled: false,
+                        },
+                        role.to_string(),
+                        id,
+                        weak,
+                    )
+                }));
+                ApplyOutcome::Appended
+            }
             // Backfill plan text into the matching exit_plan_mode ToolCall
             // item so it renders as markdown in the chat view. The ToolCall
             // event (PendingApproval) always arrives before PlanProposed.

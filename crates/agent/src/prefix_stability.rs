@@ -20,8 +20,8 @@
 //! ids/names/error flags, and assistant `id` — so an in-place rewrite of *any*
 //! of these fields is visible to [`AppendOnlyContextManager::sync_messages`].
 //!
-//! Modeled on oh-my-pi's `append-only-context.ts` (the `StablePrefix` +
-//! `AppendOnlyLog` + per-message digest design), adapted to manox's
+//! The `StablePrefix` + `AppendOnlyLog` + per-message digest design,
+//! adapted to manox's
 //! `LanguageModelRequestMessage`.
 
 #![allow(dead_code)]
@@ -341,6 +341,7 @@ fn message_content_digest_bytes(c: &MessageContent) -> Vec<u8> {
         MessageContent::Image { data, mime_type } => {
             format!("image:{mime_type}:{}", data.len()).into_bytes()
         }
+        MessageContent::Compaction(t) => format!("compaction:{t}").into_bytes(),
     }
 }
 

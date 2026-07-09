@@ -33,7 +33,7 @@ const BASE_DELAY: Duration = Duration::from_secs(1);
 const BACKOFF_FACTOR: f64 = 2.0;
 const MAX_DELAY: Duration = Duration::from_secs(30);
 /// Upper bound on a server-advertised `Retry-After`, so a misbehaving upstream
-/// cannot stall a turn indefinitely. Matches codex's cap.
+/// cannot stall a turn indefinitely.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Poll cadence for cancel-during-sleep detection.
 const CANCEL_POLL: Duration = Duration::from_millis(100);

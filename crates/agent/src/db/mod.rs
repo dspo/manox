@@ -7,7 +7,7 @@
 //! - `thread_data`: a single zstd-compressed JSON BLOB per thread holding the
 //!   full `messages` array and the `request_token_usage` map (the heavy state).
 //! - `thread_events`: an append-only event stream (model_change / compaction /
-//!   branch_summary / custom) mirroring pi's JSONL entry types as rows.
+//!   branch_summary / custom) as queryable rows.
 //! - `token_usage`: per-user-message token breakdown, queryable without
 //!   decompressing the message BLOB.
 //! - `terminal_sessions`: per-terminal metadata (cwd/env/title) for tab

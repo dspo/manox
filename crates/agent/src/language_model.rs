@@ -37,6 +37,13 @@ pub enum MessageContent {
     },
     ToolUse(LanguageModelToolUse),
     ToolResult(LanguageModelToolResult),
+    /// A context-compaction summary replacing older history. Carried by a
+    /// `Role::User` message; never sent to the provider verbatim —
+    /// `model_facing_content` rewrites it into a `Text` block wrapped with an
+    /// explanatory preamble so the model treats it as user-supplied context.
+    /// The full summary survives in `Thread::messages` for persistence and UI
+    /// rebuild; only one is inserted per compaction pass.
+    Compaction(String),
 }
 
 impl MessageContent {
@@ -45,18 +52,27 @@ impl MessageContent {
             Self::Text(text) => Some(text.as_str()),
             Self::Thinking { text, .. } => Some(text.as_str()),
             Self::ToolResult(result) => Some(result.content.as_str()),
+            Self::Compaction(text) => Some(text.as_str()),
             Self::Image { .. } | Self::ToolUse(_) => None,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
-            Self::Text(text) | Self::Thinking { text, .. } => {
+            Self::Text(text) | Self::Thinking { text, .. } | Self::Compaction(text) => {
                 text.chars().all(|c| c.is_whitespace())
             }
             Self::ToolResult(result) => result.content.chars().all(|c| c.is_whitespace()),
             Self::Image { data, .. } => data.is_empty(),
             Self::ToolUse(_) => false,
+        }
+    }
+
+    /// The compaction summary text, if this is a `Compaction` block.
+    pub fn compaction_summary(&self) -> Option<&str> {
+        match self {
+            Self::Compaction(text) => Some(text.as_str()),
+            _ => None,
         }
     }
 }

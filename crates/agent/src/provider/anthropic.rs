@@ -339,6 +339,10 @@ fn content_to_anthropic(c: &MessageContent) -> Option<serde_json::Value> {
     use serde_json::json;
     match c {
         MessageContent::Text(t) => Some(json!({"type": "text", "text": t})),
+        // Compaction is rewritten to Text by `model_facing_content` before the
+        // request reaches the provider; reached here only if that transform was
+        // skipped, so emit the summary as plain text rather than dropping it.
+        MessageContent::Compaction(t) => Some(json!({"type": "text", "text": t})),
         MessageContent::Thinking { text, signature } => {
             let mut v = json!({"type": "thinking", "thinking": text});
             if let Some(sig) = signature {

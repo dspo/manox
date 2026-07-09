@@ -38,7 +38,7 @@ use crate::title_state::TitleState;
 use crate::token_meter::TokenMeter;
 use crate::tool::{
     PermissionCache, PermissionDecision, PlanApprovalResponse, ToolAuthorizationResponse,
-    ToolRegistry, exit_plan_mode_request_tool,
+    ToolRegistry, enter_plan_mode_request_tool, exit_plan_mode_request_tool,
 };
 use crate::tools;
 
@@ -172,6 +172,16 @@ pub enum ThreadEvent {
     /// Goal mode toggled on/off. The UI shows or hides the `◎ /goal active`
     /// chip and, on activation, starts its elapsed-time ticker.
     GoalChanged { active: bool },
+    /// A compaction pass landed: older history was replaced by a handoff
+    /// summary message. `messages_compacted` is the count of messages folded
+    /// into the summary; `tokens_before` is the active-token total that
+    /// triggered the pass. The UI renders a Recap card; the store records a
+    /// `compaction` event in the timeline.
+    Compaction {
+        summary: String,
+        messages_compacted: usize,
+        tokens_before: u64,
+    },
     /// A goal evaluator run completed. Carries the verdict + reason + the
     /// evaluation count so the UI can refresh the status popover without
     /// re-reading thread state. Emitted on both satisfied and unsatisfied
@@ -767,6 +777,11 @@ impl Thread {
                             u.raw_input.clone()
                         };
                         out.push_str(&format!("```tool_use: {}\n{}\n```\n", u.name, body));
+                    }
+                    MessageContent::Compaction(summary) => {
+                        out.push_str("> *compacted summary:* ");
+                        out.push_str(summary);
+                        out.push('\n');
                     }
                     MessageContent::ToolResult(r) => {
                         let tag = if r.is_error {
@@ -1496,6 +1511,144 @@ impl Thread {
         }
     }
 
+    /// The index at which a compaction should be inserted right now under
+    /// auto-trigger rules, or `None` when auto-compaction is off, the window is
+    /// too small, no usage has been reported, a compaction already covers the
+    /// region, or the threshold has not been crossed. Sub-agents never
+    /// auto-compact — a delegated sub-thread should not silently rewrite its
+    /// own context under the parent's nose.
+    fn auto_compaction_target(&self) -> Option<usize> {
+        if self.depth != 0 {
+            return None;
+        }
+        let model = self.model.as_ref()?;
+        let max_input = model.max_token_count();
+        let settings = crate::settings::load();
+        crate::compact::auto_compaction_target_ix(
+            &self.messages,
+            self.token_meter.per_request(),
+            settings.auto_compact.enabled,
+            max_input,
+            settings.auto_compact.threshold,
+        )
+    }
+
+    /// Manually trigger a compaction (`/compact`). No-op when a turn is in
+    /// flight (the turn owns the message list), when there is no model, or when
+    /// there is nothing to summarize. Runs the side LLM call in a spawned task
+    /// so the call site returns immediately.
+    pub fn compact(&mut self, cx: &mut Context<Self>) {
+        if self.running_turn.is_some() {
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            cx.emit(ThreadEvent::Error(anyhow::anyhow!("No model configured")));
+            return;
+        };
+        let Some(insertion_ix) = crate::compact::forced_compaction_target_ix(&self.messages) else {
+            return;
+        };
+        // A manual compaction is a fresh side call, not bound to the turn
+        // lifecycle; a fresh (never-cancelled) token suffices. A stuck call is
+        // cleared by closing the thread for now — wiring it into `cancel()` is
+        // left for a follow-up.
+        let cancel = CancellationToken::new();
+        cx.notify();
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let outcome = Self::perform_compaction(&this, &model, insertion_ix, &cancel, cx).await;
+            if let Err(e) = outcome {
+                let _ = this.update(cx, |_, cx| {
+                    cx.emit(ThreadEvent::Error(e));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Run the side LLM call that summarizes `messages[0..insertion_ix]` into a
+    /// handoff summary, then insert a `Compaction` message at `insertion_ix`,
+    /// emit `ThreadEvent::Compaction`, persist, record the event, and bust the
+    /// prefix-cache fingerprint. The summary request is built and streamed
+    /// outside any `this` write lease; only the final insert + bookkeeping hold
+    /// the lease. Returns the summary text on success.
+    async fn perform_compaction(
+        this: &WeakEntity<Self>,
+        model: &AnyLanguageModel,
+        insertion_ix: usize,
+        cancel: &CancellationToken,
+        cx: &mut AsyncApp,
+    ) -> Result<String> {
+        let tokens_before = this
+            .read_with(cx, |this, _| {
+                this.token_meter
+                    .per_request()
+                    .values()
+                    .map(|u| crate::compact::active_tokens(*u))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let request = this.read_with(cx, |this, _| {
+            crate::compact::build_compaction_request(&this.messages, insertion_ix)
+        })?;
+        let (summary, usage) =
+            crate::compact::stream_summary(model, request, cancel.clone(), cx).await?;
+
+        let messages_compacted = this
+            .read_with(cx, |this, _| insertion_ix.min(this.messages.len()))
+            .unwrap_or(insertion_ix);
+        this.update(cx, |this, cx| {
+            // Attribute the side call's tokens to the cumulative meter (no
+            // per-user-message attribution — the call has no triggering user
+            // message). Emitted so the UI counter reflects the spend.
+            if let Some(u) = usage {
+                this.accumulate_token_usage(u);
+                cx.emit(ThreadEvent::TokenUsageUpdated(
+                    this.cumulative_token_usage(),
+                ));
+            }
+            let compaction_msg =
+                Message::user_with_content(vec![MessageContent::Compaction(summary.clone())]);
+            this.messages.insert(insertion_ix, compaction_msg);
+            // A compaction rewrites the message prefix, so the provider's KV
+            // cache misses once on the next request. That is the unavoidable
+            // cost of reclaiming context; invalidate the fingerprint so the
+            // stability diagnostic reports a deliberate reset rather than a
+            // silent drift.
+            this.prefix_stability.invalidate();
+            cx.emit(ThreadEvent::Compaction {
+                summary: summary.clone(),
+                messages_compacted,
+                tokens_before,
+            });
+            cx.notify();
+        })?;
+
+        // Persist the compacted thread and record a `compaction` event in the
+        // timeline, mirroring the model-change persistence pattern.
+        if let Some(entity) = this.upgrade() {
+            cx.update(|cx: &mut gpui::App| {
+                let thread_id = entity.read(cx).id.0.clone();
+                crate::thread_store::save_thread(entity, true, cx);
+                let store = crate::thread_store::global();
+                let data = serde_json::json!({
+                    "messages_compacted": messages_compacted,
+                    "tokens_before": tokens_before,
+                });
+                store.update(cx, |s, cx| {
+                    s.record_event(
+                        &thread_id,
+                        crate::db::ThreadEventType::Compaction,
+                        &data,
+                        cx,
+                    );
+                });
+            });
+        }
+        Ok(summary)
+    }
+
     /// Abort the current turn. Cancels the turn token so an in-flight tool (e.g.
     /// `bash`) can kill its process group and append a clean "aborted" result;
     /// the turn task then winds down on its own and clears `running_turn`.
@@ -1574,6 +1727,21 @@ impl Thread {
             // round-trip about to run — `self_info` mid-batch reads the current
             // index, not the previous batch's count.
             this.update(cx, |this, _| this.turn_count += 1)?;
+
+            // Auto-compaction: if the previous request's token usage crossed
+            // the threshold, summarize the old history into a handoff message
+            // before building this turn's request. Sub-agents never auto-
+            // compact (`auto_compaction_target` enforces depth 0). Runs inline
+            // so the compaction is in place before `build_completion_request`
+            // assembles the request; a failure here surfaces as a turn error
+            // rather than a silent skip.
+            let target = this
+                .read_with(cx, |this, _| this.auto_compaction_target())
+                .unwrap_or(None);
+            if let Some(insertion_ix) = target {
+                Self::perform_compaction(this, model, insertion_ix, cancel, cx).await?;
+            }
+
             let request = this.update(cx, |this, cx| {
                 this.pending_tool_uses.clear();
                 this.reconcile_tool_uses(cx);
@@ -1680,9 +1848,13 @@ impl Thread {
                 let mut appr = Vec::new();
                 let mut review = Vec::new();
                 for tu in &tool_uses {
-                    // `exit_plan_mode` is synthesized (not in `this.tools`), so
-                    // the registry lookup below would default it to the free
-                    // (parallel) path; it has its own plan-overlay routing.
+                    // `exit_plan_mode` and `enter_plan_mode` are synthesized
+                    // (not in `this.tools`), so the registry lookup below
+                    // would default them to the free (parallel) path.
+                    // `exit_plan_mode` has its own plan-overlay routing below;
+                    // `enter_plan_mode` is a free, no-approval mode transition
+                    // (intercepted in `run_tool_inner`), so the free path is
+                    // correct for it.
                     let is_plan_exit = tu.name.as_ref() == "exit_plan_mode";
                     // YOLO/AutoReview bypass the permission gate, but not tools
                     // whose authorization flow IS their execution
@@ -1905,6 +2077,19 @@ impl Thread {
         let name = tu.name.to_string();
         let title = tool_title(&name, &tu.input);
 
+        // Plan-mode entry: the model asked to transition into plan mode.
+        // Intercept before the registry lookup (`enter_plan_mode` is
+        // synthesized in `build_completion_request`, not registered) and flip
+        // `plan_mode` on. Only the main thread (depth 0) and only when not
+        // already in plan mode — sub-agents and an already-planning thread
+        // never see the tool, so this guards against a stray/hallucinated
+        // call. No approval: it is a mode transition, not a write.
+        if name == "enter_plan_mode"
+            && this.read_with(cx, |this, _| !this.plan_mode && this.depth == 0)?
+        {
+            return Self::run_enter_plan_mode(this, tu, cx).await;
+        }
+
         // Plan-mode exit handshake: the model submitted a plan. Intercept before
         // the registry lookup (`exit_plan_mode` is synthesized in
         // `build_completion_request`, not registered) and run the approval flow.
@@ -1935,7 +2120,7 @@ impl Thread {
 
         // YOLO/AutoReview bypasses the permission gate: skip the authorization
         // prompt entirely so the tool runs immediately. YOLO is the
-        // session-level equivalent of codex's `approval_policy = Never`;
+        // session-level "never ask" policy;
         // AutoReview additionally consults the security-reviewer agent before
         // allowing. Tools whose authorization flow IS their execution
         // (`AskUserQuestion`) are exempt: bypassing them would drop the user's
@@ -2121,6 +2306,41 @@ impl Thread {
                 "is_error": is_error,
             }),
         );
+        Ok(())
+    }
+
+    /// Handle an `enter_plan_mode` tool call: flip `plan_mode` on (clearing any
+    /// active goal — the two are mutually exclusive) and append a tool result
+    /// steering the model toward read-only research. No approval handshake: it
+    /// is a mode transition the model initiates, not a write. The turn loop
+    /// then continues naturally; the next `build_completion_request` sees
+    /// `plan_mode == true` and advertises the read-only tool set plus
+    /// `exit_plan_mode`, so the model researches and eventually submits a plan.
+    async fn run_enter_plan_mode(
+        this: gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let name = "enter_plan_mode".to_string();
+        let title = "Enter plan mode".to_string();
+
+        this.update(cx, |this, cx| {
+            this.set_plan_mode(true, cx);
+        })?;
+
+        let msg = "Entered plan mode. Research the codebase with read-only tools and the `agent` tool (delegate to the `plan`/`explore` sub-agents for isolated-context exploration). Do not implement. When the plan is ready, call `exit_plan_mode` with it.".to_string();
+
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: ToolCallStatus::Success,
+            });
+        })?;
+        Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
+        Self::append_tool_result(&this, tu, msg, false, cx)?;
         Ok(())
     }
 
@@ -2617,21 +2837,61 @@ impl Thread {
         // tool call, tool result, and reasoning block leaks into the parent's
         // context, defeating the point of spawning an isolated sub-agent.
         //
+        // When a compaction message sits in the history, the request is
+        // assembled as `[retained recent user messages][compaction summary]
+        // [everything after the compaction]` instead of the full transcript —
+        // the older pre-compaction history is dropped (it lives on only inside
+        // the summary). The retained tail keeps recent user prompts verbatim so
+        // the active request + its tool results stay grounded; see `compact`.
+        // Adjacent same-role runs that the assembly can produce
+        // (retained-user → compaction-user → …) are coalesced so Anthropic's
+        // wire, which rejects consecutive same-role messages, accepts the
+        // request.
+        //
         // The `cache` flag marks the trailing two user/assistant messages as
         // cache-anchor candidates. It is advisory metadata today — the actual
         // `cache_control` breakpoints are placed by `apply_prompt_caching`
         // against messages[-2]/messages[-1] — but keeping the flag aligned with
         // that intent documents the contract for a future wire mapper that
         // reads it.
-        let mapped: Vec<LanguageModelRequestMessage> = self
-            .messages
-            .iter()
-            .map(|m| LanguageModelRequestMessage {
-                role: m.role,
-                content: m.content.iter().map(model_facing_content).collect(),
-                cache: false,
-            })
-            .collect();
+        let mapped: Vec<LanguageModelRequestMessage> =
+            match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
+                Some(c_ix) => {
+                    let mut rebuilt =
+                        crate::compact::retained_user_messages_before(&self.messages, c_ix);
+                    // The compaction message itself (mapped to its preamble-wrapped
+                    // text form). Always included — it is the boundary marker.
+                    let compaction_content: Vec<MessageContent> = self.messages[c_ix]
+                        .content
+                        .iter()
+                        .map(model_facing_content)
+                        .collect();
+                    rebuilt.push(LanguageModelRequestMessage {
+                        role: self.messages[c_ix].role,
+                        content: compaction_content,
+                        cache: false,
+                    });
+                    // Everything after the compaction verbatim (mapped), including
+                    // the active tool-result turn.
+                    rebuilt.extend(self.messages[c_ix + 1..].iter().map(|m| {
+                        LanguageModelRequestMessage {
+                            role: m.role,
+                            content: m.content.iter().map(model_facing_content).collect(),
+                            cache: false,
+                        }
+                    }));
+                    crate::compact::coalesce_same_role(rebuilt)
+                }
+                None => self
+                    .messages
+                    .iter()
+                    .map(|m| LanguageModelRequestMessage {
+                        role: m.role,
+                        content: m.content.iter().map(model_facing_content).collect(),
+                        cache: false,
+                    })
+                    .collect(),
+            };
         let len = mapped.len();
         for (i, mut m) in mapped.into_iter().enumerate() {
             if i + 2 >= len {
@@ -2653,9 +2913,28 @@ impl Thread {
             list.push(exit_plan_mode_request_tool());
             list
         } else {
+            // A slash command's `allowed-tools` whitelist is an intentional
+            // narrowing of this turn's tool set. Respect it: do not append
+            // `enter_plan_mode` to a filtered turn, since entering plan mode
+            // would (once `plan_mode` is on) let the plan-state branch take
+            // precedence over the whitelist and expand the model back to the
+            // full read-only set. The model can still plan on an unrestricted
+            // turn, and the user can always `/plan` manually.
             match self.turn_tool_filter.as_deref() {
                 Some(f) if !f.is_empty() => self.tools.to_request_tools_filtered(f),
-                _ => self.tools.to_request_tools(),
+                _ => {
+                    let mut list = self.tools.to_request_tools();
+                    // Advertise `enter_plan_mode` only on the main thread, so
+                    // the model can proactively transition to plan mode when it
+                    // judges the task non-trivial. Sub-agents (`depth > 0`)
+                    // never see it — plan mode is a main-thread concept
+                    // (`run_enter_plan_mode` no-ops them too). Synthesized, not
+                    // registered, mirroring `exit_plan_mode`.
+                    if self.depth == 0 {
+                        list.push(enter_plan_mode_request_tool());
+                    }
+                    list
+                }
             }
         };
         LanguageModelRequest {
@@ -2672,7 +2951,12 @@ impl Thread {
 /// envelope (for persistence and UI rebuild); this mapping is applied only when
 /// building a request, so the sub-conversation never leaks into the parent's
 /// context. Non-`agent` content passes through unchanged.
-fn model_facing_content(c: &MessageContent) -> MessageContent {
+///
+/// `Compaction` blocks are rewritten into a `Text` block wrapped with a preamble
+/// so the model reads the summary as user-supplied context rather than a raw
+/// opaque blob — the `Compaction` variant itself never reaches a provider wire
+/// mapper.
+pub(crate) fn model_facing_content(c: &MessageContent) -> MessageContent {
     match c {
         MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == "agent" => {
             MessageContent::ToolResult(LanguageModelToolResult {
@@ -2682,6 +2966,9 @@ fn model_facing_content(c: &MessageContent) -> MessageContent {
                 content: crate::tools::agent::agent_final_text(&tr.content),
             })
         }
+        MessageContent::Compaction(summary) => MessageContent::Text(format!(
+            "The previous conversation was compacted. Use this summary as context:\n\n{summary}"
+        )),
         other => other.clone(),
     }
 }
@@ -2924,6 +3211,23 @@ mod tests {
             panic!("expected ToolResult");
         };
         assert_eq!(out.content, "plain summary");
+    }
+
+    /// A `Compaction` block never reaches a provider wire mapper as-is;
+    /// `model_facing_content` rewrites it into a `Text` block carrying the
+    /// summary prefixed with a preamble so the model treats it as user-supplied
+    /// context. The original `Compaction` is untouched (canonical storage).
+    #[test]
+    fn model_facing_content_rewrites_compaction_to_text() {
+        let block = MessageContent::Compaction("Goal: ship recaps.".to_string());
+        let facing = model_facing_content(&block);
+        let MessageContent::Text(text) = facing else {
+            panic!("expected Text, got {facing:?}");
+        };
+        assert!(text.starts_with("The previous conversation was compacted."));
+        assert!(text.contains("Goal: ship recaps."));
+        // Original stays a Compaction for persistence / UI rebuild.
+        assert!(matches!(block, MessageContent::Compaction(_)));
     }
 
     /// True regression guard for the `run_tool_inner` double-lease fix: it
@@ -3660,6 +3964,169 @@ mod tests {
             !cx.update(|cx| store.read_with(cx, |s, _| s.is_running(thread_id))),
             "indicator must be cleared by the run_turn task-tail backstop when \
              the stream ends without a Stop event"
+        );
+    }
+
+    /// `run_enter_plan_mode` flips `plan_mode` on, emits a success ToolCall,
+    /// and appends a non-error ToolResult steering the model toward read-only
+    /// research. No approval handshake — the turn loop continues and the next
+    /// `build_completion_request` advertises the plan-mode tool set.
+    #[test]
+    fn enter_plan_mode_sets_flag_and_appends_result() {
+        use crate::language_model::{LanguageModelToolUse, MessageContent};
+        use std::sync::{Arc, Mutex};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-enter-plan", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        let tu = LanguageModelToolUse {
+            id: "tu_enter_1".to_string(),
+            name: Arc::from("enter_plan_mode"),
+            raw_input: "{}".to_string(),
+            input: serde_json::json!({}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        assert!(
+            !cx.update(|cx| thread.read_with(cx, |t, _| t.plan_mode)),
+            "plan_mode must start off"
+        );
+
+        let weak = thread.downgrade();
+        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let r = result.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *r.lock().unwrap() =
+                    Some(super::Thread::run_enter_plan_mode(weak, tu, &mut cx).await);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+
+        let res = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("run_enter_plan_mode did not complete");
+        assert!(res.is_ok(), "run_enter_plan_mode failed: {:?}", res.err());
+
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                assert!(
+                    t.plan_mode,
+                    "plan_mode should be true after enter_plan_mode"
+                );
+                let last = t.messages.last().expect("no message after enter_plan_mode");
+                let tr = last
+                    .content
+                    .iter()
+                    .find_map(|c| match c {
+                        MessageContent::ToolResult(tr) => Some(tr),
+                        _ => None,
+                    })
+                    .expect("no ToolResult in last message");
+                assert_eq!(tr.tool_use_id.as_str(), "tu_enter_1");
+                assert!(
+                    !tr.is_error,
+                    "enter_plan_mode ToolResult must not be an error"
+                );
+                assert!(
+                    tr.content.contains("Entered plan mode"),
+                    "expected plan-mode steering message, got: {}",
+                    tr.content
+                );
+            });
+        });
+    }
+
+    /// `build_completion_request` advertises `enter_plan_mode` only on the main
+    /// thread (depth 0) while not in plan mode, and `exit_plan_mode` only while
+    /// in plan mode. The two are mutually exclusive by state, mirroring the
+    /// synthesized-tool contract.
+    #[test]
+    fn build_completion_request_advertises_plan_tools_by_state() {
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-plan-tools", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        // Main thread, not in plan mode: enter_plan_mode advertised,
+        // exit_plan_mode not.
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"enter_plan_mode"),
+            "main thread should see enter_plan_mode, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"exit_plan_mode"),
+            "non-plan request should not advertise exit_plan_mode, got: {names:?}"
+        );
+
+        // Enter plan mode: exit_plan_mode advertised, enter_plan_mode not.
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.set_plan_mode(true, cx));
+        });
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"exit_plan_mode"),
+            "plan-mode request should advertise exit_plan_mode, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"enter_plan_mode"),
+            "plan-mode request should not advertise enter_plan_mode, got: {names:?}"
+        );
+
+        // Sub-agent (depth > 0), not in plan mode: enter_plan_mode NOT
+        // advertised — plan mode is a main-thread concept.
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.set_plan_mode(false, cx);
+                t.depth = 1;
+            });
+        });
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"enter_plan_mode"),
+            "sub-agent should not see enter_plan_mode, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"exit_plan_mode"),
+            "sub-agent non-plan request should not advertise exit_plan_mode, got: {names:?}"
+        );
+
+        // Back to main thread, but with a slash-command `allowed-tools`
+        // whitelist active: enter_plan_mode must NOT be appended — entering
+        // plan mode would override the whitelist via the plan-state precedence,
+        // expanding the model back to the full read-only set.
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.depth = 0;
+                t.turn_tool_filter = Some(vec!["read_file".to_string()]);
+            });
+        });
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"enter_plan_mode"),
+            "a whitelisted turn must not advertise enter_plan_mode, got: {names:?}"
         );
     }
 }

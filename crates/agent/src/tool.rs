@@ -21,7 +21,10 @@ use tokio_util::sync::CancellationToken;
 use crate::language_model::{AnyLanguageModel, LanguageModelRequestTool};
 
 pub use permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
-pub use plan_mode::{ExitPlanModeTool, PlanApprovalResponse, exit_plan_mode_request_tool};
+pub use plan_mode::{
+    EnterPlanModeTool, ExitPlanModeTool, PlanApprovalResponse, enter_plan_mode_request_tool,
+    exit_plan_mode_request_tool,
+};
 
 /// Read-only runtime identity a tool reads from its owning `Thread`, passed
 /// into [`AgentTool::run`] / [`AgentTool::run_streaming`] per invocation.

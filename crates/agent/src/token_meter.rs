@@ -139,7 +139,7 @@ impl TokenMeter {
 mod tests {
     use super::*;
 
-    /// `accumulate` mirrors zed's max+saturating_sub: the API sends running
+    /// `accumulate` uses max+saturating_sub: the API sends running
     /// totals, the per-request counter takes the high-water, and the delta
     /// accrues to cumulative. `finalize_request` stamps the in-flight request
     /// onto its triggering user message and resets the counter so the next turn
