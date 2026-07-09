@@ -88,16 +88,15 @@ impl AgentTool for EditFileTool {
                 // Hold the write lock across read+patch+write so the TAG check
                 // and the write are a single critical section — a concurrent
                 // writer between read and write would stale the TAG and clobber.
-                let _lock =
-                    match crate::tools::file_lock::try_acquire(&path, &owner) {
-                        Ok(g) => g,
-                        Err(held) => {
-                            return Err(format!(
-                                "edit_file blocked: {} is being written by {}; re-read and retry",
-                                path_display, held.owner
-                            ));
-                        }
-                    };
+                let _lock = match crate::tools::file_lock::try_acquire(&path, &owner) {
+                    Ok(g) => g,
+                    Err(held) => {
+                        return Err(format!(
+                            "edit_file blocked: {} is being written by {}; re-read and retry",
+                            path_display, held.owner
+                        ));
+                    }
+                };
                 let raw = std::fs::read_to_string(&path)
                     .map_err(|e| format!("edit_file read failed {path_display}: {e}"))?;
                 let had_bom = crate::hashline::has_bom(&raw);

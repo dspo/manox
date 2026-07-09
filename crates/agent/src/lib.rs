@@ -28,6 +28,7 @@ pub mod sandbox;
 pub mod settings;
 pub mod skill;
 pub mod system_prompt;
+pub mod team;
 pub mod thread;
 pub mod thread_store;
 pub mod title;
