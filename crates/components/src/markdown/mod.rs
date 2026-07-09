@@ -6,13 +6,15 @@
 //! plain + cursor without re-parsing completed blocks.
 //!
 //! Architecture: `Markdown::into_element` parses mdast once, maps it to manox
-//! `Block`s, and renders each as a `div` + `StyledText::with_highlights`
-//! composition. `with_highlights` overlays `(Range, HighlightStyle)` on top of
-//! the base font/color that `StyledText` inherits from `window.text_style()`
-//! (set by the parent `div`'s `.text_sm()`/`.text_color()`/…) at layout time,
-//! so the renderer never constructs a `TextStyle` or `impl`s `Element`.
+//! `Block`s, and renders each as a `div` + `RichText` composition. `RichText`
+//! composes `StyledText` for shaping/glyph-painting and overlays rounded
+//! inline-code washes + (for code/diff blocks) mouse selection + Cmd/Ctrl+C
+//! copy. The base font/color is inherited from `window.text_style()` (set by
+//! the parent `div`'s `.text_sm()`/`.text_color()`/…) at layout time, so the
+//! renderer never constructs a `TextStyle`.
 
 pub mod ast;
+pub mod rich_text;
 pub mod theme;
 
 use std::cell::RefCell;
@@ -24,14 +26,19 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, ElementId, FontWeight, HighlightStyle, Hsla, IntoElement, SharedString, StyledText,
-    div, px,
+    AnyElement, App, ClipboardItem, ElementId, FontWeight, HighlightStyle, Hsla, IntoElement,
+    Pixels, SharedString, div, px,
 };
 use gpui_component::highlighter::SyntaxHighlighter;
-use gpui_component::{Theme, h_flex, v_flex};
+use gpui_component::{
+    IconName, Sizable, Theme,
+    button::{Button, ButtonVariants},
+    h_flex, v_flex,
+};
 use ropey::Rope;
 
 use crate::markdown::ast::{Block, InlineRuns, ListItem, TableAlign};
+use crate::markdown::rich_text::{CodeSpan, RichText};
 use crate::markdown::theme::MdStyles;
 
 // Per-(language, content, highlight theme) highlight cache. The message list
@@ -84,9 +91,21 @@ impl Markdown {
         self
     }
 
-    /// Cross-block text selection + Cmd+C copy. Currently a no-op — the
-    /// selection layer lands in a follow-up; per-block copy buttons remain.
+    /// Cross-block text selection + Cmd+C copy. Currently a no-op at the
+    /// document level — per-block selection lives inside `RichText` mounts
+    /// (code/diff blocks are selectable by default); this toggle is reserved
+    /// for a future cross-block selection layer.
     pub fn selectable(self, _selectable: bool) -> Self {
+        self
+    }
+
+    /// Override the inline-code pill wash + corner radius. Without this the
+    /// renderer falls back to `theme.secondary` / `theme.radius`.
+    pub fn inline_code(mut self, bg: Hsla, radius: Pixels) -> Self {
+        if let Some(styles) = &mut self.styles {
+            styles.inline_code_bg = bg;
+            styles.inline_code_radius = radius;
+        }
         self
     }
 
@@ -130,7 +149,7 @@ impl IntoElement for Markdown {
                 .into_any_element();
         }
 
-        let blocks = ast::parse(&self.text, &styles);
+        let blocks = ast::parse(&self.text);
         // Root carries `text_sm` so the document is self-contained: every
         // block that does not override the size itself (paragraph, list item
         // bodies) inherits it, rather than depending on the caller's ancestor.
@@ -158,8 +177,8 @@ impl IntoElement for Markdown {
 
 fn render_block(block: Block, styles: &MdStyles, mode: HeadingMode, idx: usize) -> AnyElement {
     match block {
-        Block::Paragraph(runs) => paragraph(&runs.text, &runs.highlights),
-        Block::Heading { runs, depth } => heading(&runs, mode, depth),
+        Block::Paragraph(runs) => paragraph(&runs, styles),
+        Block::Heading { runs, depth } => heading(&runs, mode, depth, styles),
         Block::Code { lang, value } => code_block(&value, lang.as_deref(), styles, idx),
         Block::Diff { value } => diff_block(&value, styles, idx),
         Block::Conflict { value } => conflict_block(&value, styles, idx),
@@ -174,15 +193,30 @@ fn render_block(block: Block, styles: &MdStyles, mode: HeadingMode, idx: usize) 
     }
 }
 
-fn paragraph(text: &str, highlights: &[(Range<usize>, HighlightStyle)]) -> AnyElement {
+/// Map `InlineRuns::code_ranges` onto `CodeSpan` overlays carrying the
+/// caller-customized wash + radius. Shared by every inline mount (paragraph,
+/// heading, table cell) so the inline-code pill is consistent across them.
+fn code_spans(runs: &InlineRuns, styles: &MdStyles) -> Vec<CodeSpan> {
+    runs.code_ranges
+        .iter()
+        .map(|range| CodeSpan {
+            range: range.clone(),
+            bg: styles.inline_code_bg,
+            radius: styles.inline_code_radius,
+        })
+        .collect()
+}
+
+fn paragraph(runs: &InlineRuns, styles: &MdStyles) -> AnyElement {
     div()
         .w_full()
         .min_w_0()
         .overflow_hidden()
         .text_sm()
         .child(
-            StyledText::new(SharedString::from(text.to_string()))
-                .with_highlights(highlights.iter().cloned()),
+            RichText::anonymous(runs.text.clone())
+                .highlights(runs.highlights.clone())
+                .code_spans(code_spans(runs, styles)),
         )
         .into_any_element()
 }
@@ -289,19 +323,22 @@ impl HeadingSpec {
 /// the renderer applies), so this function is mode-agnostic. The base color is
 /// inherited from the parent div — same contract as `paragraph`, so
 /// streaming→finalized never recolors.
-fn heading(runs: &InlineRuns, mode: HeadingMode, depth: u8) -> AnyElement {
+fn heading(runs: &InlineRuns, mode: HeadingMode, depth: u8, styles: &MdStyles) -> AnyElement {
     mode.spec(depth)
         .apply(div().w_full().min_w_0().overflow_hidden())
         .child(
-            StyledText::new(SharedString::from(runs.text.clone()))
-                .with_highlights(runs.highlights.iter().cloned()),
+            RichText::anonymous(runs.text.clone())
+                .highlights(runs.highlights.clone())
+                .code_spans(code_spans(runs, styles)),
         )
         .into_any_element()
 }
 
 /// Code block: line-number gutter (fixed during horizontal scroll) + a
 /// horizontally-scrollable, non-wrapping code run with tree-sitter syntax
-/// highlighting via `SyntaxHighlighter`.
+/// highlighting via `SyntaxHighlighter`. The run is a selectable `RichText`
+/// (drag-select + Cmd/Ctrl+C copy); a hover-revealed button copies the whole
+/// block for one-click capture.
 fn code_block(value: &str, lang: Option<&str>, styles: &MdStyles, idx: usize) -> AnyElement {
     // Fenced-code values carry a trailing `\n` (the closing fence sits on its
     // own line); strip it so the gutter count and the painted run agree —
@@ -311,10 +348,13 @@ fn code_block(value: &str, lang: Option<&str>, styles: &MdStyles, idx: usize) ->
     let line_count = value.split('\n').count().max(1);
     let gutter: String = (1..=line_count).map(|n| format!("{n:>3}\n")).collect();
     let gutter = gutter.trim_end_matches('\n');
+    let group = format!("code-{idx}");
 
     h_flex()
+        .group(group.clone())
         .w_full()
         .min_w_0()
+        .relative()
         .rounded_md()
         .bg(styles.secondary)
         .overflow_hidden()
@@ -339,11 +379,33 @@ fn code_block(value: &str, lang: Option<&str>, styles: &MdStyles, idx: usize) ->
                 .text_color(styles.foreground)
                 .whitespace_nowrap()
                 .child(
-                    StyledText::new(SharedString::from(value.to_string()))
-                        .with_highlights(highlights.iter().cloned()),
+                    RichText::new(("code-run", idx), SharedString::from(value.to_string()))
+                        .highlights(highlights)
+                        .selectable(styles.selection_bg),
                 ),
         )
+        .child(
+            div()
+                .absolute()
+                .top_1()
+                .right_1()
+                .opacity(0.)
+                .group_hover(group, |s| s.opacity(1.))
+                .child(copy_button(idx, value.to_string())),
+        )
         .into_any_element()
+}
+
+/// Copy-the-whole-block button: writes `text` to the clipboard on click.
+/// Revealed only while the enclosing `.group` is hovered.
+fn copy_button(idx: usize, text: String) -> Button {
+    Button::new(("code-copy", idx))
+        .ghost()
+        .xsmall()
+        .icon(IconName::Copy)
+        .on_click(move |_, _, cx: &mut App| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        })
 }
 
 /// Syntax highlighting for a code run, memoized by `(lang, content, theme)`.
@@ -383,7 +445,7 @@ fn code_highlights(
 /// numbers misleading. Horizontal scroll keeps long added/removed runs aligned.
 fn diff_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
     let mut inner = v_flex().min_w_0();
-    for line in value.lines() {
+    for (i, line) in value.lines().enumerate() {
         let (bg, bar, fg) = classify_diff_line(line, styles);
         inner = inner.child(
             div()
@@ -395,7 +457,14 @@ fn diff_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
                 .text_xs()
                 .text_color(fg)
                 .whitespace_nowrap()
-                .child(SharedString::from(line.to_string())),
+                // Per-line selectable run: selection does not cross lines
+                // (acceptable for diff — each hunk line is read in isolation).
+                // The id is unique within the block via the ancestor
+                // `("diff-scroll", idx)` id in the element-id stack.
+                .child(
+                    RichText::new(("line", i), SharedString::from(line.to_string()))
+                        .selectable(styles.selection_bg),
+                ),
         );
     }
     div()
@@ -553,7 +622,7 @@ fn conflict_style(kind: ConflictLineKind, styles: &MdStyles) -> (Hsla, Hsla, Hsl
 fn conflict_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
     let value = value.trim_end_matches('\n');
     let mut inner = v_flex().min_w_0();
-    for (line, kind) in parse_conflict(value) {
+    for (i, (line, kind)) in parse_conflict(value).into_iter().enumerate() {
         let (bar, bg, fg, bold) = conflict_style(kind, styles);
         let mut row = div()
             .border_l_2()
@@ -564,7 +633,10 @@ fn conflict_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
             .text_xs()
             .text_color(fg)
             .whitespace_nowrap()
-            .child(SharedString::from(line.to_string()));
+            .child(
+                RichText::new(("line", i), SharedString::from(line.to_string()))
+                    .selectable(styles.selection_bg),
+            );
         if bold {
             row = row.font_weight(FontWeight::BOLD);
         }
@@ -633,8 +705,9 @@ fn table_block(
                 .border_b_1()
                 .border_color(styles.border)
                 .child(
-                    StyledText::new(SharedString::from(cell.text))
-                        .with_highlights(cell.highlights.iter().cloned()),
+                    RichText::anonymous(cell.text.clone())
+                        .highlights(cell.highlights.clone())
+                        .code_spans(code_spans(&cell, styles)),
                 );
             cell_div = match align.get(c).copied().unwrap_or_default() {
                 TableAlign::Center => cell_div.text_center(),

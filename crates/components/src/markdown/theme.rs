@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui::{Hsla, hsla};
+use gpui::{Hsla, Pixels, hsla};
 use gpui_component::Theme;
 use gpui_component::highlighter::HighlightTheme;
 
@@ -27,6 +27,13 @@ pub struct MdStyles {
     pub diff_add_bg: Hsla,
     pub diff_del_fg: Hsla,
     pub diff_del_bg: Hsla,
+    /// Inline-code pill: the wash behind `` `code` `` spans and the corner
+    /// radius. Carried here so callers can override via `Markdown::inline_code`
+    /// without touching the theme.
+    pub inline_code_bg: Hsla,
+    pub inline_code_radius: Pixels,
+    /// Flat wash behind selected glyphs in selectable code/diff blocks.
+    pub selection_bg: Hsla,
 }
 
 impl MdStyles {
@@ -44,6 +51,9 @@ impl MdStyles {
             diff_add_bg: hsla(success.h, success.s, success.l, 0.15),
             diff_del_fg: danger,
             diff_del_bg: hsla(danger.h, danger.s, danger.l, 0.15),
+            inline_code_bg: theme.secondary,
+            inline_code_radius: theme.radius,
+            selection_bg: theme.accent.opacity(0.25),
         }
     }
 }

@@ -1,8 +1,10 @@
 //! mdast → manox `Block` model. The sole file that touches the `markdown` crate.
 //!
 //! Inline children are flattened to a single `String` + a list of
-//! `(Range<usize>, HighlightStyle)` overlays at parse time, so per-frame
-//! rendering is just `StyledText::with_highlights` — no re-walking the AST.
+//! `(Range<usize>, HighlightStyle)` overlays + a list of code-span byte ranges
+//! at parse time, so per-frame rendering is just `RichText` — no re-walking
+//! the AST. The model is purely structural: colors and radii are applied at
+//! render time from `MdStyles`, so parsing needs no theme.
 
 use std::ops::Range;
 
@@ -10,14 +12,16 @@ use gpui::{FontStyle, FontWeight, HighlightStyle};
 use markdown::mdast::{AlignKind, Node};
 use markdown::{ParseOptions, to_mdast};
 
-use crate::markdown::theme::MdStyles;
-
 /// A contiguous run of inline text with style overlays on top of the base
-/// font/color (which `StyledText` inherits from `window.text_style()`).
+/// font/color (which `RichText` inherits from `window.text_style()`).
+/// `code_ranges` marks inline-code segments that get a rounded wash behind the
+/// glyphs — the wash is painted by the renderer, not carried as a run
+/// `background_color`, so it can be rounded and caller-customized.
 #[derive(Clone, Default)]
 pub struct InlineRuns {
     pub text: String,
     pub highlights: Vec<(Range<usize>, HighlightStyle)>,
+    pub code_ranges: Vec<Range<usize>>,
 }
 
 /// Column alignment for table cells. The manox-owned mirror of mdast's
@@ -78,24 +82,20 @@ pub enum Block {
 
 /// Parse markdown source into manox blocks. GFM parse options so tables /
 /// strikethrough round-trip through the AST even before they are rendered.
-pub fn parse(src: &str, styles: &MdStyles) -> Vec<Block> {
+pub fn parse(src: &str) -> Vec<Block> {
     let opts = ParseOptions::gfm();
     match to_mdast(src, &opts) {
-        Ok(Node::Root(root)) => root
-            .children
-            .iter()
-            .filter_map(|n| block_of(n, styles))
-            .collect(),
+        Ok(Node::Root(root)) => root.children.iter().filter_map(block_of).collect(),
         _ => Vec::new(),
     }
 }
 
-fn block_of(node: &Node, styles: &MdStyles) -> Option<Block> {
+fn block_of(node: &Node) -> Option<Block> {
     match node {
-        Node::Paragraph(p) => Some(Block::Paragraph(inline_of(&p.children, styles))),
+        Node::Paragraph(p) => Some(Block::Paragraph(inline_of(&p.children))),
         Node::Heading(h) => Some(Block::Heading {
             depth: h.depth,
-            runs: inline_of(&h.children, styles),
+            runs: inline_of(&h.children),
         }),
         Node::Code(c) => {
             if is_conflict(&c.value) {
@@ -114,10 +114,7 @@ fn block_of(node: &Node, styles: &MdStyles) -> Option<Block> {
             }
         }
         Node::Blockquote(b) => Some(Block::Blockquote(
-            b.children
-                .iter()
-                .filter_map(|n| block_of(n, styles))
-                .collect(),
+            b.children.iter().filter_map(block_of).collect(),
         )),
         Node::List(l) => {
             let items = l
@@ -126,11 +123,7 @@ fn block_of(node: &Node, styles: &MdStyles) -> Option<Block> {
                 .filter_map(|n| match n {
                     Node::ListItem(li) => Some(ListItem {
                         checked: li.checked,
-                        blocks: li
-                            .children
-                            .iter()
-                            .filter_map(|n| block_of(n, styles))
-                            .collect(),
+                        blocks: li.children.iter().filter_map(block_of).collect(),
                     }),
                     _ => None,
                 })
@@ -150,7 +143,7 @@ fn block_of(node: &Node, styles: &MdStyles) -> Option<Block> {
                         tr.children
                             .iter()
                             .map(|cell| match cell {
-                                Node::TableCell(tc) => inline_of(&tc.children, styles),
+                                Node::TableCell(tc) => inline_of(&tc.children),
                                 _ => InlineRuns::default(),
                             })
                             .collect(),
@@ -198,33 +191,34 @@ fn is_conflict(value: &str) -> bool {
 /// into the segment highlights here; the heading's own weight/italic/underline
 /// is applied by the renderer on the heading's div, so this collector stays
 /// emphasis-only and never bakes a base weight into a heading's plain text.
-fn inline_of(children: &[Node], styles: &MdStyles) -> InlineRuns {
+fn inline_of(children: &[Node]) -> InlineRuns {
     let mut runs = InlineRuns::default();
-    collect_inline(children, styles, ActiveStyle::default(), &mut runs);
+    collect_inline(children, ActiveStyle::default(), &mut runs);
     runs
 }
 
 /// Cumulative inline formatting at the current recursion depth. One range is
 /// emitted per `Text`/`InlineCode` segment carrying the *combined* style of
 /// every active overlay, so the resulting ranges are non-overlapping and
-/// sorted — `StyledText::compute_runs` requires both, and overlapping ranges
-/// (one per formatting node) misalign run lengths and slice mid-codepoint.
+/// sorted — the run builder requires both, and overlapping ranges (one per
+/// formatting node) misalign run lengths and slice mid-codepoint.
 #[derive(Clone, Copy, Default)]
 struct ActiveStyle {
     bold: bool,
     italic: bool,
     strikethrough: bool,
-    code: bool,
 }
 
 impl ActiveStyle {
     /// Build the highlight for the current segment. Returns `None` when no
-    /// overlay is active so plain text stays a single base-style run.
-    fn highlight(&self, styles: &MdStyles) -> Option<HighlightStyle> {
+    /// overlay is active so plain text stays a single base-style run. Inline
+    /// code contributes no highlight here — its wash is painted separately by
+    /// the renderer from `InlineRuns::code_ranges`, so it can be rounded and
+    /// caller-customized rather than a flat run background.
+    fn highlight(&self) -> Option<HighlightStyle> {
         let hs = HighlightStyle {
             font_weight: self.bold.then_some(FontWeight::BOLD),
             font_style: self.italic.then_some(FontStyle::Italic),
-            background_color: self.code.then_some(styles.secondary),
             strikethrough: self
                 .strikethrough
                 .then_some(gpui::StrikethroughStyle::default()),
@@ -234,53 +228,48 @@ impl ActiveStyle {
     }
 }
 
-fn collect_inline(
-    children: &[Node],
-    styles: &MdStyles,
-    active: ActiveStyle,
-    runs: &mut InlineRuns,
-) {
+fn collect_inline(children: &[Node], active: ActiveStyle, runs: &mut InlineRuns) {
     for node in children {
         match node {
             Node::Text(t) => {
                 let start = runs.text.len();
                 runs.text.push_str(&t.value);
                 let end = runs.text.len();
-                if let Some(hs) = active.highlight(styles) {
+                if let Some(hs) = active.highlight() {
                     runs.highlights.push((start..end, hs));
                 }
             }
             Node::Strong(s) => {
                 let mut a = active;
                 a.bold = true;
-                collect_inline(&s.children, styles, a, runs);
+                collect_inline(&s.children, a, runs);
             }
             Node::Emphasis(e) => {
                 let mut a = active;
                 a.italic = true;
-                collect_inline(&e.children, styles, a, runs);
+                collect_inline(&e.children, a, runs);
             }
             Node::InlineCode(c) => {
                 // `InlineCode.value` is literal text, not inline children; it
-                // carries the code wash and inherits any surrounding emphasis.
-                let mut a = active;
-                a.code = true;
+                // inherits any surrounding emphasis and records its byte range
+                // for the rounded wash the renderer paints behind the glyphs.
                 let start = runs.text.len();
                 runs.text.push_str(&c.value);
                 let end = runs.text.len();
-                if let Some(hs) = a.highlight(styles) {
+                runs.code_ranges.push(start..end);
+                if let Some(hs) = active.highlight() {
                     runs.highlights.push((start..end, hs));
                 }
             }
             Node::Delete(d) => {
                 let mut a = active;
                 a.strikethrough = true;
-                collect_inline(&d.children, styles, a, runs);
+                collect_inline(&d.children, a, runs);
             }
             Node::Link(l) => {
                 // Link text inherits surrounding style; underline/color arrives
                 // with the selection layer (which owns hovered-link state).
-                collect_inline(&l.children, styles, active, runs);
+                collect_inline(&l.children, active, runs);
             }
             Node::Image(i) => {
                 runs.text.push_str(&i.alt);
@@ -293,16 +282,10 @@ fn collect_inline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_component::Theme;
-
-    fn styles() -> MdStyles {
-        MdStyles::from_theme(&Theme::default())
-    }
 
     #[test]
     fn parses_paragraph_and_heading() {
-        let s = styles();
-        let blocks = parse("# Title\n\nbody text", &s);
+        let blocks = parse("# Title\n\nbody text");
         assert!(matches!(
             blocks.first(),
             Some(Block::Heading { depth: 1, .. })
@@ -312,8 +295,7 @@ mod tests {
 
     #[test]
     fn parses_code_block_with_lang() {
-        let s = styles();
-        let blocks = parse("```rust\nfn main() {}\n```", &s);
+        let blocks = parse("```rust\nfn main() {}\n```");
         let (lang, value) = match blocks.first() {
             Some(Block::Code { lang, value }) => (lang.clone(), value.clone()),
             _ => panic!("expected code block"),
@@ -324,21 +306,19 @@ mod tests {
 
     #[test]
     fn parses_list_ordered_and_unordered() {
-        let s = styles();
         assert!(matches!(
-            parse("- a\n- b", &s).first(),
+            parse("- a\n- b").first(),
             Some(Block::List { ordered: false, .. })
         ));
         assert!(matches!(
-            parse("1. a\n2. b", &s).first(),
+            parse("1. a\n2. b").first(),
             Some(Block::List { ordered: true, .. })
         ));
     }
 
     #[test]
     fn inline_collects_bold_italic_code_overlays() {
-        let s = styles();
-        let blocks = parse("plain **bold** *it* `code`", &s);
+        let blocks = parse("plain **bold** *it* `code`");
         let runs = match blocks.first() {
             Some(Block::Paragraph(r)) => r.clone(),
             _ => panic!("expected paragraph"),
@@ -346,12 +326,13 @@ mod tests {
         assert!(runs.text.contains("bold"));
         assert!(runs.text.contains("code"));
         assert!(!runs.highlights.is_empty());
+        // The `code` segment is recorded as a code range, not a highlight bg.
+        assert_eq!(runs.code_ranges.len(), 1);
     }
 
     #[test]
     fn blockquote_nests_children() {
-        let s = styles();
-        let blocks = parse("> quoted\n> more", &s);
+        let blocks = parse("> quoted\n> more");
         match blocks.first() {
             Some(Block::Blockquote(inner)) => assert!(!inner.is_empty()),
             _ => panic!("expected blockquote"),
@@ -360,8 +341,7 @@ mod tests {
 
     #[test]
     fn diff_lang_routes_to_diff_block() {
-        let s = styles();
-        let blocks = parse("```diff\n+added\n-removed\n```", &s);
+        let blocks = parse("```diff\n+added\n-removed\n```");
         match blocks.first() {
             Some(Block::Diff { value }) => {
                 assert!(value.contains("+added"));
@@ -373,10 +353,9 @@ mod tests {
 
     #[test]
     fn conflict_markers_route_to_conflict_block() {
-        let s = styles();
         let src =
             "```text\n<<<<<<< HEAD\nfn a() {}\n=======\nfn a() -> u32 { 0 }\n>>>>>>> main\n```";
-        let blocks = parse(src, &s);
+        let blocks = parse(src);
         match blocks.first() {
             Some(Block::Conflict { value }) => {
                 assert!(value.contains("<<<<<<< HEAD"));
@@ -389,29 +368,23 @@ mod tests {
 
     #[test]
     fn conflict_takes_precedence_over_diff_lang() {
-        let s = styles();
         // A ```diff block that actually contains conflict markers routes to
         // Conflict, not Diff — the conflict structure is more specific.
         let src = "```diff\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> main\n```";
-        assert!(matches!(
-            parse(src, &s).first(),
-            Some(Block::Conflict { .. })
-        ));
+        assert!(matches!(parse(src).first(), Some(Block::Conflict { .. })));
     }
 
     #[test]
     fn lone_marker_does_not_misroute_plain_code() {
-        let s = styles();
         // A single stray `>>>>>>>` in commentary must not route a real code
         // block into the conflict renderer — both markers are required.
         let src = "```rust\n// >>>>>>> nothing here\nfn main() {}\n```";
-        assert!(matches!(parse(src, &s).first(), Some(Block::Code { .. })));
+        assert!(matches!(parse(src).first(), Some(Block::Code { .. })));
     }
 
     #[test]
     fn parses_table_rows() {
-        let s = styles();
-        let blocks = parse("| a | b |\n| --- | --- |\n| 1 | 2 |\n", &s);
+        let blocks = parse("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
         match blocks.first() {
             // mdast consumes the delimiter row as alignment metadata, so
             // children are header + one body row.
@@ -422,8 +395,7 @@ mod tests {
 
     #[test]
     fn task_list_carries_checked_state() {
-        let s = styles();
-        let blocks = parse("- [x] done\n- [ ] todo\n", &s);
+        let blocks = parse("- [x] done\n- [ ] todo\n");
         match blocks.first() {
             Some(Block::List { items, .. }) => {
                 assert_eq!(items.len(), 2);
@@ -435,13 +407,11 @@ mod tests {
     }
 
     /// Nested inline formatting (bold + strikethrough) must emit one combined,
-    /// non-overlapping range per text segment. Overlapping ranges misalign
-    /// `StyledText::compute_runs` run lengths and slice mid-codepoint — the
-    /// ` 粗体中的删除` panic.
+    /// non-overlapping range per text segment. Overlapping ranges misalign run
+    /// lengths and slice mid-codepoint — the `粗体中的删除` panic.
     #[test]
     fn nested_inline_formats_emit_non_overlapping_ranges() {
-        let s = styles();
-        let blocks = parse("**~~粗体中的删除~~**", &s);
+        let blocks = parse("**~~粗体中的删除~~**");
         let runs = match blocks.first() {
             Some(Block::Paragraph(r)) => r.clone(),
             _ => panic!("expected paragraph"),
