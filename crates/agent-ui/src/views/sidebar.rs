@@ -399,7 +399,7 @@ fn render_thread_item(
     // title tinting. Hover is suppressed on the selected row so mousing over
     // the active thread cannot lighten its wash.
     let bg = if selected {
-        theme.accent.opacity(0.18)
+        theme.accent.opacity(0.28)
     } else {
         theme.transparent
     };
