@@ -82,7 +82,11 @@ async fn pattern_anchors_short_content_to_bottom(cx: &mut TestAppContext) {
     let top = handle.bounds_for_item(0).map(|b| b.top()).unwrap_or(px(0.));
     let max = handle.max_offset().y;
     assert_eq!(top, px(20.), "short content must be pushed to the bottom");
-    assert_eq!(max, px(0.), "no scroll range when content fits the viewport");
+    assert_eq!(
+        max,
+        px(0.),
+        "no scroll range when content fits the viewport"
+    );
 }
 
 #[gpui::test]
@@ -96,7 +100,11 @@ async fn pattern_scrolls_long_content_without_inverting_offset(cx: &mut TestAppC
     let max = handle.max_offset().y;
     assert_eq!(max, px(60.), "overflow range = content - viewport = 60");
     assert_eq!(off, px(0.), "initial offset is 0 (top)");
-    assert_eq!(top, px(0.), "item 0 at the top, not shifted past the viewport");
+    assert_eq!(
+        top,
+        px(0.),
+        "item 0 at the top, not shifted past the viewport"
+    );
 }
 
 #[gpui::test]
@@ -124,7 +132,10 @@ async fn pattern_scroll_to_bottom_pins_tail(cx: &mut TestAppContext) {
     assert_eq!(max, px(60.));
     assert_eq!(off, px(-60.), "scroll_to_bottom pins to -max_offset");
     // Last item's painted bottom = bounds.bottom() + offset.y = 160 + (-60) = 100 = viewport bottom.
-    let last = handle.bounds_for_item(3).map(|b| b.bottom()).unwrap_or(px(0.));
+    let last = handle
+        .bounds_for_item(3)
+        .map(|b| b.bottom())
+        .unwrap_or(px(0.));
     assert_eq!(
         last + off,
         px(100.),
