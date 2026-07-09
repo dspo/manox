@@ -174,15 +174,48 @@ fn map_align(a: &AlignKind) -> TableAlign {
 
 fn inline_of(children: &[Node], styles: &MdStyles, bold: bool, italic: bool) -> InlineRuns {
     let mut runs = InlineRuns::default();
-    collect_inline(children, styles, bold, italic, &mut runs);
+    let active = ActiveStyle {
+        bold,
+        italic,
+        strikethrough: false,
+        code: false,
+    };
+    collect_inline(children, styles, active, &mut runs);
     runs
+}
+
+/// Cumulative inline formatting at the current recursion depth. One range is
+/// emitted per `Text`/`InlineCode` segment carrying the *combined* style of
+/// every active overlay, so the resulting ranges are non-overlapping and
+/// sorted — `StyledText::compute_runs` requires both, and overlapping ranges
+/// (one per formatting node) misalign run lengths and slice mid-codepoint.
+#[derive(Clone, Copy, Default)]
+struct ActiveStyle {
+    bold: bool,
+    italic: bool,
+    strikethrough: bool,
+    code: bool,
+}
+
+impl ActiveStyle {
+    /// Build the highlight for the current segment. Returns `None` when no
+    /// overlay is active so plain text stays a single base-style run.
+    fn highlight(&self, styles: &MdStyles) -> Option<HighlightStyle> {
+        let hs = HighlightStyle {
+            font_weight: self.bold.then_some(FontWeight::BOLD),
+            font_style: self.italic.then_some(FontStyle::Italic),
+            background_color: self.code.then_some(styles.secondary),
+            strikethrough: self.strikethrough.then_some(gpui::StrikethroughStyle::default()),
+            ..Default::default()
+        };
+        (hs != HighlightStyle::default()).then_some(hs)
+    }
 }
 
 fn collect_inline(
     children: &[Node],
     styles: &MdStyles,
-    bold: bool,
-    italic: bool,
+    active: ActiveStyle,
     runs: &mut InlineRuns,
 ) {
     for node in children {
@@ -191,47 +224,41 @@ fn collect_inline(
                 let start = runs.text.len();
                 runs.text.push_str(&t.value);
                 let end = runs.text.len();
-                if bold || italic {
-                    runs.highlights.push((
-                        start..end,
-                        HighlightStyle {
-                            font_weight: bold.then_some(FontWeight::BOLD),
-                            font_style: italic.then_some(FontStyle::Italic),
-                            ..Default::default()
-                        },
-                    ));
+                if let Some(hs) = active.highlight(styles) {
+                    runs.highlights.push((start..end, hs));
                 }
             }
-            Node::Strong(s) => collect_inline(&s.children, styles, true, italic, runs),
-            Node::Emphasis(e) => collect_inline(&e.children, styles, bold, true, runs),
+            Node::Strong(s) => {
+                let mut a = active;
+                a.bold = true;
+                collect_inline(&s.children, styles, a, runs);
+            }
+            Node::Emphasis(e) => {
+                let mut a = active;
+                a.italic = true;
+                collect_inline(&e.children, styles, a, runs);
+            }
             Node::InlineCode(c) => {
+                // `InlineCode.value` is literal text, not inline children; it
+                // carries the code wash and inherits any surrounding emphasis.
+                let mut a = active;
+                a.code = true;
                 let start = runs.text.len();
                 runs.text.push_str(&c.value);
                 let end = runs.text.len();
-                runs.highlights.push((
-                    start..end,
-                    HighlightStyle {
-                        background_color: Some(styles.secondary),
-                        ..Default::default()
-                    },
-                ));
+                if let Some(hs) = a.highlight(styles) {
+                    runs.highlights.push((start..end, hs));
+                }
             }
             Node::Delete(d) => {
-                let start = runs.text.len();
-                collect_inline(&d.children, styles, bold, italic, runs);
-                let end = runs.text.len();
-                runs.highlights.push((
-                    start..end,
-                    HighlightStyle {
-                        strikethrough: Some(gpui::StrikethroughStyle::default()),
-                        ..Default::default()
-                    },
-                ));
+                let mut a = active;
+                a.strikethrough = true;
+                collect_inline(&d.children, styles, a, runs);
             }
             Node::Link(l) => {
                 // Link text inherits surrounding style; underline/color arrives
                 // with the selection layer (which owns hovered-link state).
-                collect_inline(&l.children, styles, bold, italic, runs);
+                collect_inline(&l.children, styles, active, runs);
             }
             Node::Image(i) => {
                 runs.text.push_str(&i.alt);
@@ -345,6 +372,41 @@ mod tests {
                 assert_eq!(items[1].checked, Some(false));
             }
             _ => panic!("expected list"),
+        }
+    }
+
+    /// Nested inline formatting (bold + strikethrough) must emit one combined,
+    /// non-overlapping range per text segment. Overlapping ranges misalign
+    /// `StyledText::compute_runs` run lengths and slice mid-codepoint — the
+    /// ` 粗体中的删除` panic.
+    #[test]
+    fn nested_inline_formats_emit_non_overlapping_ranges() {
+        let s = styles();
+        let blocks = parse("**~~粗体中的删除~~**", &s);
+        let runs = match blocks.first() {
+            Some(Block::Paragraph(r)) => r.clone(),
+            _ => panic!("expected paragraph"),
+        };
+        assert_eq!(runs.text, "粗体中的删除");
+        // Every range end must land on a UTF-8 boundary of the rendered text.
+        for (range, _) in &runs.highlights {
+            assert!(
+                runs.text.is_char_boundary(range.start),
+                "start {range:?} not a char boundary"
+            );
+            assert!(
+                runs.text.is_char_boundary(range.end),
+                "end {range:?} not a char boundary"
+            );
+        }
+        // Ranges are sorted by start and strictly non-overlapping.
+        let mut prev_end = 0;
+        for (range, _) in &runs.highlights {
+            assert!(
+                range.start >= prev_end,
+                "range {range:?} overlaps or is unsorted (prev_end={prev_end})"
+            );
+            prev_end = range.end;
         }
     }
 }

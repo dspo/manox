@@ -122,16 +122,17 @@ impl IntoElement for Markdown {
         // Root carries `text_sm` so the document is self-contained: every
         // block that does not override the size itself (paragraph, list item
         // bodies) inherits it, rather than depending on the caller's ancestor.
-        // No `w_full`: the column is a flex item that stretches to its parent's
-        // width (or shrinks to its children's intrinsic width inside a
-        // max-content bubble, e.g. the user-message card) — `w_full` would zero
-        // the intrinsic width and collapse a max-content parent to min-content.
-        let mut col = v_flex().id(id).min_w_0().gap_2().text_sm();
-        col = if self.scrollable {
-            col.h_full().overflow_y_scroll()
-        } else {
-            col.overflow_hidden()
-        };
+        // No `w_full` / `min_w_0` / `overflow_hidden` on the root: in a
+        // max-content parent (the user-message bubble) `min_w_0` + clip would
+        // collapse the column's intrinsic width to min-content and the bubble
+        // to a one-character column. Width clipping and shrink-resistance are
+        // pushed down to the leaves that actually need them (code/diff/table
+        // carry their own `overflow_x_scroll` + `min_w_0`; paragraphs carry
+        // `min_w_0`), so the column root stays a plain content-sized stack.
+        let mut col = v_flex().id(id).gap_2().text_sm();
+        if self.scrollable {
+            col = col.h_full().overflow_y_scroll();
+        }
         for (i, block) in blocks.into_iter().enumerate() {
             col = col.child(render_block(block, &styles, i));
         }
