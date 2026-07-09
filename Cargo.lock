@@ -181,6 +181,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "manox-components",
  "serde",
  "serde_json",
  "terminal",
@@ -4449,6 +4450,16 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "manox-components"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "markdown",
+ "ropey",
 ]
 
 [[package]]

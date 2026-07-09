@@ -296,6 +296,9 @@ fn build_input(messages: &[LanguageModelRequestMessage]) -> (Vec<Value>, String)
         for c in &m.content {
             match c {
                 MessageContent::Text(t) => text_buf.push_str(t),
+                // See anthropic.rs: rewritten to Text upstream, but emit the
+                // summary as text if reached untransformed.
+                MessageContent::Compaction(t) => text_buf.push_str(t),
                 MessageContent::Thinking { text, .. } => text_buf.push_str(text),
                 MessageContent::ToolUse(tu) => tool_uses.push(tu),
                 MessageContent::ToolResult(tr) => tool_results.push(tr),

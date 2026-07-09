@@ -25,6 +25,32 @@ pub struct Settings {
     /// surface via `system_prompt::build_main_system_prompt`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
+
+    /// Auto-compaction: summarize older history into a handoff message when the
+    /// live context window fills, so long sessions keep going. The trigger
+    /// threshold is a fraction of the model's `max_token_count`; 0.9 leaves a
+    /// 10% headroom for the output turn that follows. See `compact`.
+    #[serde(default)]
+    pub auto_compact: AutoCompactSettings,
+}
+
+/// Auto-compaction knobs. Read at the top of each turn loop iteration; a flip
+/// takes effect on the next turn.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AutoCompactSettings {
+    pub enabled: bool,
+    /// Fraction of `max_token_count` at which a compaction pass fires.
+    pub threshold: f64,
+}
+
+impl Default for AutoCompactSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: 0.9,
+        }
+    }
 }
 
 /// Load settings from `settings.toml`. Always returns a usable [`Settings`] —

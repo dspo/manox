@@ -1,36 +1,42 @@
 //! Rendering of a single conversation message.
 //!
-//! - Text blocks use `TextView::markdown(...).selectable(true)` for selection + Cmd+C copy.
-//! - Each block carries a copy button in its top-right corner that writes the whole block to the clipboard.
-//! - User: a right-aligned rounded card within the block.
+//! - Text blocks render via `Markdown` with per-block copy buttons (cross-block
+//!   selection + Cmd+C copy lands in a follow-up).
+//! - User: a full-width bordered turn block with a muted metadata header
+//!   (role · model · project) — the Claude Code TUI turn-block look, not a
+//!   chat bubble.
 //! - Assistant: a full-width block with a role label + markdown body.
 //! - Reasoning: a collapsible block, indented secondary text with a left border.
 //! - ToolCall: a card with title + status icon + monospace output.
 //!
-//! Streaming assistant / reasoning bodies render as plain `div` (no markdown
-//! re-parse on every token) and only switch to `TextView::markdown` once the
-//! stream ends. The same rule applies to streaming tool output: while lines
-//! are still arriving we paint a plain monospace run and only mount the
-//! syntax-highlighted `TextView::markdown` once the final `ToolResult` lands.
+//! Streaming assistant / reasoning bodies go through `Markdown::streaming(true)`,
+//! which paints plain text + a trailing cursor without re-parsing mdast per
+//! token and mounts the full layout once the stream ends. Streaming tool output
+//! is stricter: while lines are still arriving we paint a plain monospace run
+//! and only mount the syntax-highlighted `Markdown` once the final `ToolResult`
+//! lands.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
+use agent::thread::ApprovalMode;
 use agent::tools::agent::{agent_final_text, agent_sub_messages};
 use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
+use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
-use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
+use manox_components::markdown::{HeadingMode, Markdown};
+use manox_components::turn_frame::TurnFrame;
 
 use crate::Workspace;
-use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage};
+use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage, UserTurnMeta};
 use crate::views::centered;
 
 /// Render-time context for sub-agent task cards: which task ids are currently
@@ -53,48 +59,27 @@ pub struct ToolCallCtx {
     pub weak: WeakEntity<Workspace>,
 }
 
-/// Build a `TextViewStyle` that matches the current theme's highlight palette.
-fn text_view_style(theme: &Theme) -> TextViewStyle {
-    TextViewStyle {
-        highlight_theme: theme.highlight_theme.clone(),
-        is_dark: theme.is_dark(),
-        ..TextViewStyle::default()
-    }
-}
-
-/// Markdown `TextView` with theme-aware syntax highlighting.
+/// Markdown renderer with theme-aware syntax highlighting.
 ///
-/// `scrollable = true` mounts an internal vertical scrollbar. In that mode the
-/// TextView sizes to its parent's box, so the parent must have a defined
-/// height (use `h(...)` rather than `max_h(...)`).
+/// `scrollable = true` mounts an internal vertical scrollbar; the renderer
+/// sizes to its parent's box, so the parent must carry a fixed height (use
+/// `h(...)` rather than `max_h(...)`).
 ///
-/// `scrollable = false` wraps the TextView in a column flex pinned to its
-/// parent's width. A bare TextView in a default Row `div` sizes to its
-/// max-content width, which flickers as streamed lines change length and can
-/// push the centered column past its cap. The column makes the TextView a
-/// cross-axis item that stretches to the column width, so the text wraps
-/// there; `min_w_0` + `overflow_hidden` zero the flex item's automatic
-/// minimum size, so a long unbreakable run can neither block the column's
-/// elastic shrink nor spill past it into the env-card gutter.
+/// `scrollable = false` clips overflow horizontally — the renderer itself is a
+/// `w_full` + `min_w_0` column, so a long unbreakable run cannot push past the
+/// env-card gutter.
 fn markdown_tv(
     id: impl Into<gpui::ElementId>,
     text: impl Into<gpui::SharedString>,
     theme: &Theme,
     scrollable: bool,
 ) -> gpui::AnyElement {
-    let tv = TextView::markdown(id, text)
+    Markdown::new(id, text)
+        .theme(theme)
         .selectable(true)
-        .style(text_view_style(theme));
-    if scrollable {
-        tv.scrollable(true).into_any_element()
-    } else {
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .child(tv)
-            .into_any_element()
-    }
+        .scrollable(scrollable)
+        .heading_mode(HeadingMode::Uniform)
+        .into_any_element()
 }
 
 /// One renderable conversation item, owned by its own gpui `Entity` so a
@@ -190,7 +175,7 @@ impl Render for MessageItem {
     }
 }
 
-/// Render a `ConvItem` as an element. `ix` is the entry index (stable key for collapsibles/TextView).
+/// Render a `ConvItem` as an element. `ix` is the entry index (stable key for collapsibles and text-block element ids).
 /// `agent_ctx` supplies expansion state for `AgentTask` cards; `tool_ctx` carries
 /// the workspace weak handle for `ToolCall` cards to flip their own collapse flag.
 /// `None` renders them in a static state with no-op clicks (used when the owning
@@ -204,7 +189,9 @@ pub fn render_item(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     match item {
-        ConvItem::User { text, images } => render_user(text, images, ix, theme),
+        ConvItem::User { text, images, meta } => {
+            render_user(text, images, meta.as_ref(), ix, role, theme)
+        }
         ConvItem::Assistant {
             text,
             streaming,
@@ -235,6 +222,11 @@ pub fn render_item(
         ConvItem::Error(msg) => render_error(msg, ix, theme),
         ConvItem::Notice(msg) => render_notice(msg, ix, theme),
         ConvItem::TeamMessage { from, content } => render_team_message(from, content, ix, theme),
+        ConvItem::Recap {
+            summary,
+            collapsed,
+            user_toggled: _,
+        } => render_recap(summary, *collapsed, ix, theme, tool_ctx),
         ConvItem::Retry {
             attempt,
             max_attempts,
@@ -269,22 +261,58 @@ fn copy_button_hoverable(
         .child(copy_button(ix, prefix, text))
 }
 
-/// Render a user message: a right-aligned rounded card + copy button.
-pub fn render_user(text: &str, images: &[UserImage], ix: usize, theme: &Theme) -> gpui::AnyElement {
-    h_flex()
-        .w_full()
-        .justify_end()
+/// Render a user message as one full-width turn frame. The frame itself owns
+/// the accent border; the bottom edge keeps only the two corners so the center
+/// stays open. `min_w_0` end to end keeps long CJK / unbreakable runs from
+/// collapsing the block to min-content (the failure mode of the old bubble).
+pub fn render_user(
+    text: &str,
+    images: &[UserImage],
+    meta: Option<&UserTurnMeta>,
+    ix: usize,
+    model: &str,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    let model_id = meta
+        .map(|m| m.model_id.as_str())
+        .filter(|m| !m.is_empty())
+        .unwrap_or(model);
+    let mut header_parts = vec![i18n::t("message-user-role").to_string()];
+    if let Some(meta) = meta {
+        header_parts.push(format_user_turn_time(meta.timestamp));
+    }
+    if !model_id.is_empty() {
+        header_parts.push(model_id.to_string());
+    }
+    let header = header_parts.join(" > ");
+    let group = format!("user-{ix}");
+    let accent = meta
+        .and_then(|m| m.approval_mode)
+        .map(|mode| approval_mode_color(mode, theme))
+        .unwrap_or(theme.accent);
+
+    TurnFrame::new(theme)
+        .group(group.clone())
+        .accent(accent)
+        .header(
+            gpui::div()
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(header)),
+        )
+        .trailing(copy_button_hoverable(
+            ix,
+            "copy-user",
+            group,
+            text.to_string(),
+        ))
         .child(
             v_flex()
-                .group(format!("user-{ix}"))
-                .max_w(px(560.))
-                .gap_1()
-                .px_3()
-                .py_2()
-                .rounded(theme.radius)
-                .bg(theme.secondary)
-                .border_1()
-                .border_color(theme.border)
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .gap_2()
+                .text_sm()
+                .text_color(theme.foreground)
                 .children(images.iter().map(|ui| {
                     gpui::img(ui.0.clone())
                         .max_w(px(280.))
@@ -292,25 +320,36 @@ pub fn render_user(text: &str, images: &[UserImage], ix: usize, theme: &Theme) -
                         .rounded(theme.radius)
                         .object_fit(gpui::ObjectFit::ScaleDown)
                 }))
-                .child(h_flex().w_full().justify_end().child(copy_button_hoverable(
-                    ix,
-                    "copy-user",
-                    format!("user-{ix}"),
+                .child(markdown_tv(
+                    ("user-text", ix),
                     text.to_string(),
-                )))
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .text_color(theme.secondary_foreground)
-                        .child(markdown_tv(
-                            ("user-text", ix),
-                            text.to_string(),
-                            theme,
-                            false,
-                        )),
-                ),
+                    theme,
+                    false,
+                )),
         )
         .into_any_element()
+}
+
+fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> gpui::Hsla {
+    match mode {
+        ApprovalMode::OnRequest => theme.success,
+        ApprovalMode::AutoReview => theme.info,
+        ApprovalMode::Yolo => theme.danger,
+    }
+}
+
+fn format_user_turn_time(timestamp: i64) -> String {
+    let Some(sent) = Local.timestamp_opt(timestamp, 0).single() else {
+        return String::new();
+    };
+    let now = Local::now();
+    if sent.date_naive() == now.date_naive() {
+        sent.format("%H:%M").to_string()
+    } else if sent.year() == now.year() {
+        sent.format("%m-%d %H:%M").to_string()
+    } else {
+        sent.format("%Y-%m-%d %H:%M").to_string()
+    }
 }
 
 /// Render an assistant message: role label + copy button + markdown body. `role` is the model display name (dynamic).
@@ -347,44 +386,26 @@ pub fn render_assistant(
         .into_any_element()
 }
 
-/// Render the assistant / reasoning body. While the stream is live we paint a
-/// plain text run — markdown re-parse and shaped text layout on every token
-/// delta was the source of the visible item overlap and the scroll-jank.
-/// When the stream ends we mount `TextView::markdown` once for selection +
-/// rendering of headings, lists, and code blocks with syntax highlighting.
+/// Render the assistant / reasoning body. While the stream is live the
+/// renderer paints plain text + a trailing cursor — markdown re-parse and
+/// shaped text layout on every token delta was the source of the visible item
+/// overlap and the scroll-jank. When the stream ends the same `Markdown`
+/// mounts the full layout: headings, lists, and code blocks with syntax
+/// highlighting.
 fn render_text_body(
     text: &str,
     streaming: bool,
-    id: impl Into<gpui::ElementId> + Clone,
+    id: impl Into<gpui::ElementId>,
     theme: &Theme,
 ) -> gpui::AnyElement {
-    if streaming {
-        // Plain text while streaming — no Tree-sitter involved, so the cursor
-        // can stay inline without corrupting any parser. Column + `w_full` so
-        // the text wraps at the column edge (a Row `div` would run it at
-        // max-content, flickering as the stream grows); `min_w_0` +
-        // `overflow_hidden` keep a long unbreakable run from breaking the cap.
-        let shown = format!("{text}▌");
-        v_flex()
-            .id(id.clone())
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .text_sm()
-            .whitespace_normal()
-            .text_color(theme.foreground)
-            .child(shown)
-            .into_any_element()
-    } else {
-        v_flex()
-            .id(id.clone())
-            .w_full()
-            .min_w_0()
-            .overflow_hidden()
-            .text_sm()
-            .child(markdown_tv(id, text.to_string(), theme, false))
-            .into_any_element()
-    }
+    // Streaming bodies paint plain + cursor inside the renderer (no mdast
+    // re-parse per token); the full layout mounts once when the stream ends.
+    Markdown::new(id, text.to_string())
+        .theme(theme)
+        .selectable(true)
+        .streaming(streaming)
+        .heading_mode(HeadingMode::Uniform)
+        .into_any_element()
 }
 
 /// Render a reasoning (thinking) block: expanded while streaming, collapsed when done, with a copy button.
@@ -605,6 +626,92 @@ pub fn render_team_message(
         .into_any_element()
 }
 
+/// Render a compaction Recap card: a collapsible summary of the history that
+/// was folded into a handoff note. Collapsed by default; the summary body is
+/// model-generated markdown (not localized), only the title is. Toggling
+/// follows the same `user_toggled`-stamped pattern as reasoning blocks.
+pub fn render_recap(
+    summary: &str,
+    collapsed: bool,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
+    let chevron = if collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    };
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+    let mut block = v_flex()
+        .group(format!("recap-{ix}"))
+        .w_full()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .rounded(theme.radius)
+        .bg(theme.secondary.opacity(0.15))
+        .child(
+            h_flex()
+                .id(("recap-header", ix))
+                .gap_1p5()
+                .items_center()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .on_click(move |_, _window, cx: &mut App| {
+                    let Some(weak) = weak_workspace.clone() else {
+                        return;
+                    };
+                    let ix_click = ix;
+                    let _ = weak.update(cx, |w, cx| {
+                        let conv = w.conversation.clone();
+                        conv.update(cx, |c, cx| {
+                            if let Some(item) = c.items().get(ix_click) {
+                                item.update(cx, |item, cx| {
+                                    if let ConvItem::Recap {
+                                        collapsed,
+                                        user_toggled,
+                                        ..
+                                    } = item.kind_mut()
+                                    {
+                                        *collapsed = !*collapsed;
+                                        *user_toggled = true;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        cx.notify();
+                    });
+                })
+                .child(Icon::new(chevron).xsmall())
+                .child(Icon::new(IconName::BookOpen).xsmall())
+                .child(i18n::t("recap-card-title"))
+                .child(gpui::div().flex_1())
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-recap",
+                    format!("recap-{ix}"),
+                    summary.to_string(),
+                )),
+        );
+    if !collapsed {
+        block = block.child(
+            gpui::div()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(markdown_tv(
+                    ("recap", ix),
+                    summary.to_string(),
+                    theme,
+                    false,
+                )),
+        );
+    }
+    block.into_any_element()
+}
+
 /// Transient retry badge shown while the provider backs off after a 429 / 5xx
 /// / network error. Replaced in place by the first real content or terminal
 /// error event. Amber-toned to read as "waiting, not failed".
@@ -766,9 +873,9 @@ pub fn render_tool_call(
 }
 
 /// Render an `exit_plan_mode` tool-call as a plan card. The body uses
-/// `TextView::markdown` (assistant-style, no code-block wrapping, no height
-/// cap) instead of the monospace scrollable container. PendingApproval forces
-/// the body open; terminal status auto-collapses like a regular ToolCall.
+/// `Markdown` (assistant-style, no code-block wrapping, no height cap) instead
+/// of the monospace scrollable container. PendingApproval forces the body open;
+/// terminal status auto-collapses like a regular ToolCall.
 fn render_plan_card(
     item: &ToolCallItem,
     ix: usize,
@@ -907,9 +1014,9 @@ fn render_plan_card(
 
 /// Fixed-height container with the tool's output. While streaming we paint a
 /// plain monospace run (no markdown re-parse per chunk); once the final
-/// `ToolResult` lands we mount the syntax-highlighted, scrollable
-/// `TextView::markdown`. The container keeps a deterministic height either way
-/// so the parent card (and the list) reports a stable layout.
+/// `ToolResult` lands we mount the syntax-highlighted, scrollable `Markdown`.
+/// The container keeps a deterministic height either way so the parent card
+/// (and the list) reports a stable layout.
 fn render_tool_output(
     output: &str,
     tool_name: &str,
@@ -1170,11 +1277,28 @@ pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) ->
                     })
                     .collect();
                 if !text.is_empty() || !images.is_empty() {
-                    items.push(ConvItem::User { text, images });
+                    items.push(ConvItem::User {
+                        text,
+                        images,
+                        meta: Some(crate::conversation::UserTurnMeta::from_message(m)),
+                    });
                 }
                 for c in &m.content {
-                    if let MessageContent::ToolResult(tr) = c {
-                        pair_tool_result(&mut items, tr);
+                    match c {
+                        MessageContent::ToolResult(tr) => {
+                            pair_tool_result(&mut items, tr);
+                        }
+                        MessageContent::Compaction(summary) => {
+                            // A compaction message is role User but carries no
+                            // prompt text — render it as a Recap card instead of
+                            // an empty user bubble.
+                            items.push(ConvItem::Recap {
+                                summary: summary.clone(),
+                                collapsed: true,
+                                user_toggled: false,
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1229,6 +1353,16 @@ pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) ->
                             pair_tool_result(&mut items, tr);
                         }
                         MessageContent::Image { .. } => {}
+                        // Compaction messages are `Role::User` by construction;
+                        // they cannot appear in an assistant turn. Reachable
+                        // here only if a future caller mis-assigns the role.
+                        MessageContent::Compaction(summary) => {
+                            items.push(ConvItem::Recap {
+                                summary: summary.clone(),
+                                collapsed: true,
+                                user_toggled: false,
+                            });
+                        }
                     }
                 }
             }

@@ -31,7 +31,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### MessageItem 变体
 
-- [UserMessage](#usermessage) · [AssistantMessage](#assistantmessage) · [ReasoningBlock](#reasoningblock) · [ToolCallCard](#toolcallcard) · [AgentTaskCard](#agenttaskcard) · [ErrorMessage](#errormessage) · [NoticeMessage](#noticemessage) · [RetryBadge](#retrybadge)
+- [UserMessage](#usermessage) · [AssistantMessage](#assistantmessage) · [ReasoningBlock](#reasoningblock) · [ToolCallCard](#toolcallcard) · [AgentTaskCard](#agenttaskcard) · [ErrorMessage](#errormessage) · [NoticeMessage](#noticemessage) · [RecapCard](#recapcard) · [RetryBadge](#retrybadge)
 
 ### Footer / Composer
 
@@ -71,7 +71,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Shared Primitives
 
-- [Button](#shared-primitives) · [Input](#shared-primitives) · [PopupMenu](#shared-primitives) · [PopupMenuItem](#shared-primitives) · [TabBar](#shared-primitives) · [Tag](#shared-primitives) · [TextView](#shared-primitives) · [Icon](#shared-primitives) · [ScrollHandle](#shared-primitives) · [TitleBar](#shared-primitives) · [ContextMenu](#shared-primitives) · [Tooltip](#shared-primitives)
+- [Button](#shared-primitives) · [Input](#shared-primitives) · [PopupMenu](#shared-primitives) · [PopupMenuItem](#shared-primitives) · [TabBar](#shared-primitives) · [Tag](#shared-primitives) · [Markdown](#markdown) · [TurnFrame](#turnframe) · [Icon](#shared-primitives) · [ScrollHandle](#shared-primitives) · [TitleBar](#shared-primitives) · [ContextMenu](#shared-primitives) · [Tooltip](#shared-primitives)
 
 ### 状态
 
@@ -174,7 +174,7 @@ Bottom section: loose (non-project) threads.
 
 #### SidebarThreadItem
 
-Single thread row: title, short-id tag (shimmer if running), token count, time, archive btn.
+Single thread row: title, short-id tag (shimmer if running), token count, time, archive btn. Hover/active/selected wash uses the thread's last saved approval-mode color.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -264,7 +264,7 @@ Horizontal flex: [OutlineRail](#outlinerail) + [MessageList](#messagelist).
 
 #### MessageList
 
-Vertical flex, `overflow_y_scroll`, tail-follow via `stick_to_bottom`.
+Virtualized variable-height `list` (`gpui::list` + `ListState`); only viewport + overdraw items lay out. Tail-follow via `FollowMode::Tail`; count/height reconciled via `splice`/`remeasure_items` from the `ThreadEvent` handler.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -278,7 +278,7 @@ Single rendered conversation item, centered, max-width 760px. Each `MessageItem`
 
 #### UserMessage
 
-Right-aligned rounded card, `bg:secondary`, border, selectable markdown, copy btn (hover).
+Full-width user turn block rendered inside [TurnFrame](#turnframe): `You > Time/DateTime > ModelID` metadata header, selectable markdown body, copy btn (hover), and an approval-mode-colored frame captured at send time.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -317,6 +317,12 @@ Rounded card, `bg:danger/0.06`, red text, "Error" label + copy btn.
 #### NoticeMessage
 
 Rounded card, `bg:secondary/0.15`, muted text, "Notice" label + copy btn.
+
+> Source: `agent-ui/src/views/message.rs`
+
+#### RecapCard
+
+Collapsible compaction summary card: chevron + book icon + "Context compacted" label + copy btn. Body is the model-generated handoff summary (markdown, not localized). Collapsed by default; emitted on `ThreadEvent::Compaction` and rebuilt from `MessageContent::Compaction` on thread reload.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -560,7 +566,7 @@ Plain-text multi-line [InputField](#inputfield) for markdown editing. A second-l
 
 #### EditorPreviewTab
 
-Rendered markdown view (`TextView::markdown`).
+Rendered markdown view (`Markdown`).
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -790,7 +796,7 @@ Monospace grid renderer, `flex_1`.
 
 ## 7. Shared Primitives
 
-Reusable UI elements from `gpui_component` used across all views.
+Reusable UI elements from `gpui_component` and `manox-components` used across all views.
 
 #### Button
 
@@ -816,9 +822,15 @@ Horizontal tab bar with selectable tabs.
 
 Small colored chip/badge with variant colors.
 
-#### TextView
+#### Markdown
 
-Markdown renderer with syntax highlighting and selection.
+Self-built markdown renderer (`manox-components::markdown::Markdown`) replacing `gpui_component::TextView::markdown`. Per-block layout: paragraphs/headings via `StyledText::with_highlights`; code blocks with line-number gutter + `overflow_x_scroll` + tree-sitter highlighting; unified-diff blocks with accent wash + left bar; GFM tables with column alignment + horizontal scroll; task-list checkboxes. Streaming bodies paint plain text + cursor and mount the full layout once the stream ends. Cross-block selection is a follow-up; per-block copy buttons remain.
+
+#### TurnFrame
+
+Shared framed text container (`manox-components::turn_frame::TurnFrame`) used for user turns. It paints one continuous accent-colored stroke path for the door-shaped frame, leaving the bottom center open while preserving rounded `╰─` / `─╯` corners. The lower stroke is lifted slightly into the bottom padding so the open edge visually hugs the final text line without letting markdown content overflow its layout box. The component does not fill the content background, does not rely on masking a complete border, and avoids assembling the frame from independent rail nodes. Callers provide header, trailing controls, and body content.
+
+> Source: `components/src/turn_frame.rs`
 
 #### Icon
 

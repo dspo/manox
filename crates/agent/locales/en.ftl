@@ -53,6 +53,8 @@ team-drawer-tasks = { $count ->
     [one] { $count } task
    *[other] { $count } tasks
 }
+message-user-role = You
+recap-card-title = Context compacted
 retry-badge = Retrying… { $attempt }/{ $max } · { $secs }s
 message-omitted-prefix = …(earlier omitted)
 status-pending = Pending approval
@@ -376,6 +378,7 @@ composer-tag-system = System
 slash-yolo-desc = Switch to Full access (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
 slash-plan-desc = Enter plan mode: read-only tools only, research then submit a plan for approval (bare `/plan` toggles; `/plan <prompt>` enters with a prompt)
 slash-goal-desc = Set a completion condition the agent works toward until met (bare `/goal` shows status, `/goal <condition>` sets it, `/goal clear` stops)
+slash-compact-desc = Compact the conversation: summarize older history into a handoff note so the thread can keep going past the context limit
 workspace-chip-plan-mode = Plan mode
 workspace-chip-goal-active = Goal active
 goal-popover-title = Goal active

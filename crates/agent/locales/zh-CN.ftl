@@ -40,6 +40,8 @@ team-drawer-tasks = { $count ->
     [one] { $count } 个任务
    *[other] { $count } 个任务
 }
+message-user-role = 你
+recap-card-title = 上下文已压缩
 retry-badge = 重试中… { $attempt }/{ $max } · { $secs }秒
 message-omitted-prefix = …（已省略前面部分）
 status-pending = 待审批
@@ -363,6 +365,7 @@ composer-tag-system = 系统
 slash-yolo-desc = 切换到完全访问（免审批 + bash 沙箱外）；带提示词则切换后直接开工
 slash-plan-desc = 进入计划模式：仅允许只读工具，研究后提交计划待批准（裸 `/plan` 切换；`/plan <提示>` 带提示进入）
 slash-goal-desc = 设置完成条件，agent 持续工作直到满足（裸 `/goal` 显示状态，`/goal <条件>` 设置，`/goal clear` 停止）
+slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行
 workspace-chip-plan-mode = 计划模式
 workspace-chip-goal-active = 目标进行中
 goal-popover-title = 目标进行中

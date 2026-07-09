@@ -142,7 +142,15 @@ impl Element for TextElement {
         let rows: usize = lines.iter().map(|l| l.wrap_boundaries().len() + 1).sum();
 
         let (selection, cursor) = if is_empty {
-            (Vec::new(), None)
+            // Empty input still paints a caret at the start so a focused but
+            // empty composer reads as ready-to-type — without this the blink
+            // toggle has nothing to draw and the field looks dead.
+            let p = point(bounds.left(), bounds.top());
+            let cursor = fill(
+                Bounds::new(point(p.x - px(0.5), p.y), gpui::size(CURSOR_WIDTH, lh)),
+                gpui::blue(),
+            );
+            (Vec::new(), Some(cursor))
         } else if selected_range.is_empty() {
             let p = point_for_byte(&lines, cursor_byte, bounds.origin, lh)
                 .unwrap_or_else(|| point(bounds.left(), bounds.top()));

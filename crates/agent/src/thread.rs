@@ -172,6 +172,16 @@ pub enum ThreadEvent {
     /// Goal mode toggled on/off. The UI shows or hides the `◎ /goal active`
     /// chip and, on activation, starts its elapsed-time ticker.
     GoalChanged { active: bool },
+    /// A compaction pass landed: older history was replaced by a handoff
+    /// summary message. `messages_compacted` is the count of messages folded
+    /// into the summary; `tokens_before` is the active-token total that
+    /// triggered the pass. The UI renders a Recap card; the store records a
+    /// `compaction` event in the timeline.
+    Compaction {
+        summary: String,
+        messages_compacted: usize,
+        tokens_before: u64,
+    },
     /// A goal evaluator run completed. Carries the verdict + reason + the
     /// evaluation count so the UI can refresh the status popover without
     /// re-reading thread state. Emitted on both satisfied and unsatisfied
@@ -791,6 +801,11 @@ impl Thread {
                         };
                         out.push_str(&format!("```tool_use: {}\n{}\n```\n", u.name, body));
                     }
+                    MessageContent::Compaction(summary) => {
+                        out.push_str("> *compacted summary:* ");
+                        out.push_str(summary);
+                        out.push('\n');
+                    }
                     MessageContent::ToolResult(r) => {
                         let tag = if r.is_error {
                             "tool_result (error)"
@@ -1327,7 +1342,18 @@ impl Thread {
 
     /// Append a user message.
     pub fn insert_user_message(&mut self, text: String, cx: &mut Context<Self>) {
-        self.messages.push(Message::user(text));
+        self.insert_user_message_with_ui_metadata(text, None, cx);
+    }
+
+    pub fn insert_user_message_with_ui_metadata(
+        &mut self,
+        text: String,
+        ui: Option<crate::MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut message = Message::user(text);
+        message.ui = ui;
+        self.messages.push(message);
         cx.notify();
     }
 
@@ -1337,7 +1363,18 @@ impl Thread {
         content: Vec<MessageContent>,
         cx: &mut Context<Self>,
     ) {
-        self.messages.push(Message::user_with_content(content));
+        self.insert_user_message_with_content_and_ui_metadata(content, None, cx);
+    }
+
+    pub fn insert_user_message_with_content_and_ui_metadata(
+        &mut self,
+        content: Vec<MessageContent>,
+        ui: Option<crate::MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut message = Message::user_with_content(content);
+        message.ui = ui;
+        self.messages.push(message);
         cx.notify();
     }
 
@@ -1552,6 +1589,144 @@ impl Thread {
         }
     }
 
+    /// The index at which a compaction should be inserted right now under
+    /// auto-trigger rules, or `None` when auto-compaction is off, the window is
+    /// too small, no usage has been reported, a compaction already covers the
+    /// region, or the threshold has not been crossed. Sub-agents never
+    /// auto-compact — a delegated sub-thread should not silently rewrite its
+    /// own context under the parent's nose.
+    fn auto_compaction_target(&self) -> Option<usize> {
+        if self.depth != 0 {
+            return None;
+        }
+        let model = self.model.as_ref()?;
+        let max_input = model.max_token_count();
+        let settings = crate::settings::load();
+        crate::compact::auto_compaction_target_ix(
+            &self.messages,
+            self.token_meter.per_request(),
+            settings.auto_compact.enabled,
+            max_input,
+            settings.auto_compact.threshold,
+        )
+    }
+
+    /// Manually trigger a compaction (`/compact`). No-op when a turn is in
+    /// flight (the turn owns the message list), when there is no model, or when
+    /// there is nothing to summarize. Runs the side LLM call in a spawned task
+    /// so the call site returns immediately.
+    pub fn compact(&mut self, cx: &mut Context<Self>) {
+        if self.running_turn.is_some() {
+            return;
+        }
+        let Some(model) = self.model.clone() else {
+            cx.emit(ThreadEvent::Error(anyhow::anyhow!("No model configured")));
+            return;
+        };
+        let Some(insertion_ix) = crate::compact::forced_compaction_target_ix(&self.messages) else {
+            return;
+        };
+        // A manual compaction is a fresh side call, not bound to the turn
+        // lifecycle; a fresh (never-cancelled) token suffices. A stuck call is
+        // cleared by closing the thread for now — wiring it into `cancel()` is
+        // left for a follow-up.
+        let cancel = CancellationToken::new();
+        cx.notify();
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let outcome = Self::perform_compaction(&this, &model, insertion_ix, &cancel, cx).await;
+            if let Err(e) = outcome {
+                let _ = this.update(cx, |_, cx| {
+                    cx.emit(ThreadEvent::Error(e));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Run the side LLM call that summarizes `messages[0..insertion_ix]` into a
+    /// handoff summary, then insert a `Compaction` message at `insertion_ix`,
+    /// emit `ThreadEvent::Compaction`, persist, record the event, and bust the
+    /// prefix-cache fingerprint. The summary request is built and streamed
+    /// outside any `this` write lease; only the final insert + bookkeeping hold
+    /// the lease. Returns the summary text on success.
+    async fn perform_compaction(
+        this: &WeakEntity<Self>,
+        model: &AnyLanguageModel,
+        insertion_ix: usize,
+        cancel: &CancellationToken,
+        cx: &mut AsyncApp,
+    ) -> Result<String> {
+        let tokens_before = this
+            .read_with(cx, |this, _| {
+                this.token_meter
+                    .per_request()
+                    .values()
+                    .map(|u| crate::compact::active_tokens(*u))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let request = this.read_with(cx, |this, _| {
+            crate::compact::build_compaction_request(&this.messages, insertion_ix)
+        })?;
+        let (summary, usage) =
+            crate::compact::stream_summary(model, request, cancel.clone(), cx).await?;
+
+        let messages_compacted = this
+            .read_with(cx, |this, _| insertion_ix.min(this.messages.len()))
+            .unwrap_or(insertion_ix);
+        this.update(cx, |this, cx| {
+            // Attribute the side call's tokens to the cumulative meter (no
+            // per-user-message attribution — the call has no triggering user
+            // message). Emitted so the UI counter reflects the spend.
+            if let Some(u) = usage {
+                this.accumulate_token_usage(u);
+                cx.emit(ThreadEvent::TokenUsageUpdated(
+                    this.cumulative_token_usage(),
+                ));
+            }
+            let compaction_msg =
+                Message::user_with_content(vec![MessageContent::Compaction(summary.clone())]);
+            this.messages.insert(insertion_ix, compaction_msg);
+            // A compaction rewrites the message prefix, so the provider's KV
+            // cache misses once on the next request. That is the unavoidable
+            // cost of reclaiming context; invalidate the fingerprint so the
+            // stability diagnostic reports a deliberate reset rather than a
+            // silent drift.
+            this.prefix_stability.invalidate();
+            cx.emit(ThreadEvent::Compaction {
+                summary: summary.clone(),
+                messages_compacted,
+                tokens_before,
+            });
+            cx.notify();
+        })?;
+
+        // Persist the compacted thread and record a `compaction` event in the
+        // timeline, mirroring the model-change persistence pattern.
+        if let Some(entity) = this.upgrade() {
+            cx.update(|cx: &mut gpui::App| {
+                let thread_id = entity.read(cx).id.0.clone();
+                crate::thread_store::save_thread(entity, true, cx);
+                let store = crate::thread_store::global();
+                let data = serde_json::json!({
+                    "messages_compacted": messages_compacted,
+                    "tokens_before": tokens_before,
+                });
+                store.update(cx, |s, cx| {
+                    s.record_event(
+                        &thread_id,
+                        crate::db::ThreadEventType::Compaction,
+                        &data,
+                        cx,
+                    );
+                });
+            });
+        }
+        Ok(summary)
+    }
+
     /// Abort the current turn. Cancels the turn token so an in-flight tool (e.g.
     /// `bash`) can kill its process group and append a clean "aborted" result;
     /// the turn task then winds down on its own and clears `running_turn`.
@@ -1630,6 +1805,21 @@ impl Thread {
             // round-trip about to run — `self_info` mid-batch reads the current
             // index, not the previous batch's count.
             this.update(cx, |this, _| this.turn_count += 1)?;
+
+            // Auto-compaction: if the previous request's token usage crossed
+            // the threshold, summarize the old history into a handoff message
+            // before building this turn's request. Sub-agents never auto-
+            // compact (`auto_compaction_target` enforces depth 0). Runs inline
+            // so the compaction is in place before `build_completion_request`
+            // assembles the request; a failure here surfaces as a turn error
+            // rather than a silent skip.
+            let target = this
+                .read_with(cx, |this, _| this.auto_compaction_target())
+                .unwrap_or(None);
+            if let Some(insertion_ix) = target {
+                Self::perform_compaction(this, model, insertion_ix, cancel, cx).await?;
+            }
+
             let request = this.update(cx, |this, cx| {
                 this.pending_tool_uses.clear();
                 this.reconcile_tool_uses(cx);
@@ -2725,21 +2915,61 @@ impl Thread {
         // tool call, tool result, and reasoning block leaks into the parent's
         // context, defeating the point of spawning an isolated sub-agent.
         //
+        // When a compaction message sits in the history, the request is
+        // assembled as `[retained recent user messages][compaction summary]
+        // [everything after the compaction]` instead of the full transcript —
+        // the older pre-compaction history is dropped (it lives on only inside
+        // the summary). The retained tail keeps recent user prompts verbatim so
+        // the active request + its tool results stay grounded; see `compact`.
+        // Adjacent same-role runs that the assembly can produce
+        // (retained-user → compaction-user → …) are coalesced so Anthropic's
+        // wire, which rejects consecutive same-role messages, accepts the
+        // request.
+        //
         // The `cache` flag marks the trailing two user/assistant messages as
         // cache-anchor candidates. It is advisory metadata today — the actual
         // `cache_control` breakpoints are placed by `apply_prompt_caching`
         // against messages[-2]/messages[-1] — but keeping the flag aligned with
         // that intent documents the contract for a future wire mapper that
         // reads it.
-        let mapped: Vec<LanguageModelRequestMessage> = self
-            .messages
-            .iter()
-            .map(|m| LanguageModelRequestMessage {
-                role: m.role,
-                content: m.content.iter().map(model_facing_content).collect(),
-                cache: false,
-            })
-            .collect();
+        let mapped: Vec<LanguageModelRequestMessage> =
+            match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
+                Some(c_ix) => {
+                    let mut rebuilt =
+                        crate::compact::retained_user_messages_before(&self.messages, c_ix);
+                    // The compaction message itself (mapped to its preamble-wrapped
+                    // text form). Always included — it is the boundary marker.
+                    let compaction_content: Vec<MessageContent> = self.messages[c_ix]
+                        .content
+                        .iter()
+                        .map(model_facing_content)
+                        .collect();
+                    rebuilt.push(LanguageModelRequestMessage {
+                        role: self.messages[c_ix].role,
+                        content: compaction_content,
+                        cache: false,
+                    });
+                    // Everything after the compaction verbatim (mapped), including
+                    // the active tool-result turn.
+                    rebuilt.extend(self.messages[c_ix + 1..].iter().map(|m| {
+                        LanguageModelRequestMessage {
+                            role: m.role,
+                            content: m.content.iter().map(model_facing_content).collect(),
+                            cache: false,
+                        }
+                    }));
+                    crate::compact::coalesce_same_role(rebuilt)
+                }
+                None => self
+                    .messages
+                    .iter()
+                    .map(|m| LanguageModelRequestMessage {
+                        role: m.role,
+                        content: m.content.iter().map(model_facing_content).collect(),
+                        cache: false,
+                    })
+                    .collect(),
+            };
         let len = mapped.len();
         for (i, mut m) in mapped.into_iter().enumerate() {
             if i + 2 >= len {
@@ -2799,7 +3029,12 @@ impl Thread {
 /// envelope (for persistence and UI rebuild); this mapping is applied only when
 /// building a request, so the sub-conversation never leaks into the parent's
 /// context. Non-`agent` content passes through unchanged.
-fn model_facing_content(c: &MessageContent) -> MessageContent {
+///
+/// `Compaction` blocks are rewritten into a `Text` block wrapped with a preamble
+/// so the model reads the summary as user-supplied context rather than a raw
+/// opaque blob — the `Compaction` variant itself never reaches a provider wire
+/// mapper.
+pub(crate) fn model_facing_content(c: &MessageContent) -> MessageContent {
     match c {
         MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == "agent" => {
             MessageContent::ToolResult(LanguageModelToolResult {
@@ -2809,6 +3044,9 @@ fn model_facing_content(c: &MessageContent) -> MessageContent {
                 content: crate::tools::agent::agent_final_text(&tr.content),
             })
         }
+        MessageContent::Compaction(summary) => MessageContent::Text(format!(
+            "The previous conversation was compacted. Use this summary as context:\n\n{summary}"
+        )),
         other => other.clone(),
     }
 }
@@ -3051,6 +3289,23 @@ mod tests {
             panic!("expected ToolResult");
         };
         assert_eq!(out.content, "plain summary");
+    }
+
+    /// A `Compaction` block never reaches a provider wire mapper as-is;
+    /// `model_facing_content` rewrites it into a `Text` block carrying the
+    /// summary prefixed with a preamble so the model treats it as user-supplied
+    /// context. The original `Compaction` is untouched (canonical storage).
+    #[test]
+    fn model_facing_content_rewrites_compaction_to_text() {
+        let block = MessageContent::Compaction("Goal: ship recaps.".to_string());
+        let facing = model_facing_content(&block);
+        let MessageContent::Text(text) = facing else {
+            panic!("expected Text, got {facing:?}");
+        };
+        assert!(text.starts_with("The previous conversation was compacted."));
+        assert!(text.contains("Goal: ship recaps."));
+        // Original stays a Compaction for persistence / UI rebuild.
+        assert!(matches!(block, MessageContent::Compaction(_)));
     }
 
     /// True regression guard for the `run_tool_inner` double-lease fix: it
