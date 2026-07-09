@@ -28,7 +28,7 @@ use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
-    h_flex, pink_500, v_flex,
+    h_flex, v_flex,
 };
 use manox_components::markdown::{HeadingMode, Markdown};
 use manox_components::turn_frame::TurnFrame;
@@ -178,19 +178,10 @@ impl Render for MessageItem {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        let effort = self
-            .weak_workspace
-            .upgrade()
-            .map(|ws| {
-                let thread = ws.read(cx).thread.clone();
-                thread.read(cx).reasoning_effort().wire_value().to_string()
-            })
-            .unwrap_or_default();
         centered(render_item(
             &self.kind,
             self.id,
             &self.role,
-            &effort,
             &project,
             &theme,
             agent_ctx.as_ref(),
@@ -208,16 +199,13 @@ pub fn render_item(
     item: &ConvItem,
     ix: usize,
     role: &str,
-    effort: &str,
     project: &str,
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     match item {
-        ConvItem::User { text, images } => {
-            render_user(text, images, ix, role, effort, project, theme)
-        }
+        ConvItem::User { text, images } => render_user(text, images, ix, role, project, theme),
         ConvItem::Assistant {
             text,
             streaming,
@@ -290,31 +278,24 @@ pub fn render_user(
     images: &[UserImage],
     ix: usize,
     model: &str,
-    effort: &str,
     project: &str,
     theme: &Theme,
 ) -> gpui::AnyElement {
-    // Header label: role, then the model/effort/project metadata available at
-    // render time. Canonical messages do not currently carry per-message
-    // timestamps, so the frame only shows real metadata rather than placeholders.
+    // Canonical messages do not currently carry per-message timestamps, so the
+    // frame only shows stable per-thread metadata rather than placeholders.
     let mut header = i18n::t("message-user-role").to_string();
     if !model.is_empty() {
-        header.push_str(" > ");
+        header.push_str(" · ");
         header.push_str(model);
     }
-    if !effort.is_empty() {
-        header.push_str(" · ");
-        header.push_str(effort);
-    }
     if !project.is_empty() {
-        header.push_str(" > ");
+        header.push_str(" · ");
         header.push_str(project);
     }
     let group = format!("user-{ix}");
 
     TurnFrame::new(theme)
         .group(group.clone())
-        .accent(pink_500())
         .header(
             gpui::div()
                 .text_color(theme.muted_foreground)
@@ -1023,7 +1004,7 @@ pub fn render_agent_task(
                     .py_2()
                     .gap_1()
                     .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                        render_item(sitem, six, "agent", "", "", theme, agent_ctx, tool_ctx)
+                        render_item(sitem, six, "agent", "", theme, agent_ctx, tool_ctx)
                     })),
             );
         }
