@@ -2,7 +2,7 @@
 //! preferences window. Mounts inline over the Workspace via
 //! `Workspace::view_mode`; clicks on sidebar items update a local
 //! `selected` highlight and the right pane dispatches to one of five
-//! Codex-style panels (General / Config / Personalization / MCP /
+//! panels (General / Config / Personalization / MCP /
 //! Environment). Items with no matching panel fall back to a "Coming soon…"
 //! placeholder, matching the pre-panels behavior.
 
@@ -95,8 +95,8 @@ impl SettingsItem {
     }
 }
 
-/// Work mode preference in the General panel. Two-card selector mirrors the
-/// "For Programming / For Daily Work" pair in the Codex screenshot. Persisted to
+/// Work mode preference in the General panel. Two-card selector for the
+/// "For Programming / For Daily Work" pair. Persisted to
 /// `Settings` only conceptually — the field is read by the panel on render
 /// and any in-memory edit stays local until a follow-up wires it through.
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -174,7 +174,7 @@ pub struct SettingsView {
     config_user_target: SharedString,
     config_approval_policy: SharedString,
     config_sandbox: SharedString,
-    config_codex_deps: bool,
+    config_builtin_deps: bool,
 
     // --- Personalization panel state ---
     personality: SharedString,
@@ -264,7 +264,7 @@ impl SettingsView {
             config_user_target: i18n::t("settings-value-on"),
             config_approval_policy: i18n::t("settings-value-on-request"),
             config_sandbox: i18n::t("settings-value-read-only"),
-            config_codex_deps: true,
+            config_builtin_deps: true,
             personality: i18n::t("settings-value-friendly"),
             memory_enabled: false,
             memory_skip_tool: false,

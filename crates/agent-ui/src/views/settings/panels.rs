@@ -3,7 +3,7 @@
 //! the various controls can update view state directly through the
 //! `Entity<Self>` handle captured at render time.
 //!
-//! Visual style mirrors the Codex settings page: a vertical stack of section
+//! Visual style: a vertical stack of section
 //! cards. Each card is a rounded rectangle with a subtle secondary background
 //! and a single-column list of rows. A row is title (left) + control (right),
 //! with an optional muted description line below the title. Rows are separated
@@ -918,16 +918,16 @@ pub fn render_config(view: &mut SettingsView, cx: &mut Context<SettingsView>) ->
             ),
             hairline(theme.border.opacity(0.6)),
             row_with_control(
-                i18n::t("settings-row-config-codex-deps"),
+                i18n::t("settings-row-config-builtin-deps"),
                 Some(muted_text(
-                    i18n::t("settings-desc-config-codex-deps"),
+                    i18n::t("settings-desc-config-builtin-deps"),
                     muted,
                 )),
                 mock_switch(
-                    "codex-deps",
-                    view.config_codex_deps,
+                    "builtin-deps",
+                    view.config_builtin_deps,
                     entity.clone(),
-                    Arc::new(|this, v| this.config_codex_deps = v),
+                    Arc::new(|this, v| this.config_builtin_deps = v),
                 ),
             ),
             hairline(theme.border.opacity(0.6)),
@@ -1216,7 +1216,7 @@ pub fn render_mcp(view: &mut SettingsView, cx: &mut Context<SettingsView>) -> An
                             .child(i18n::t("settings-row-mcp-plugin-name")),
                     )
                     .child(mock_switch(
-                        "mcp-plugin-codex-apps",
+                        "mcp-plugin-manox-apps",
                         false,
                         entity,
                         Arc::new(|_this, _v| {}),

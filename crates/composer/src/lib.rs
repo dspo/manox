@@ -6,7 +6,7 @@
 //! implementing `EntityInputHandler` plus a custom `TextElement` that registers
 //! the IME handler during paint — extended with multi-line wrap (via
 //! `shape_text`/`WrappedLine`) and image paste. Written from scratch; no code
-//! copied from gpui-component or zed.
+//! copied from gpui-component.
 
 mod blink_cursor;
 mod element;

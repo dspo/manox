@@ -7,8 +7,8 @@
 //!
 //! The static body (working discipline + sandbox boundary) lives in
 //! [`system_prompt.md`] next to this file, embedded via `include_str!` so the
-//! prose reads as plain markdown and edits don't touch Rust — mirroring codex's
-//! split (static `base_instructions/default.md` + dynamic environment block).
+//! prose reads as plain markdown and edits don't touch Rust — matching the
+//! split (static prompt file + dynamic environment block).
 //! No template engine crate — string concatenation is enough.
 //!
 //! **Static-first layering for prefix-cache stability.** The prompt is
@@ -19,7 +19,7 @@
 //! the identity block, session-stable rows (cwd/project/os/shell) come before
 //! daily-volatile `today` and toggle-volatile `yolo`. Thread id is deliberately
 //! NOT injected — the model fetches it on demand via the `self_info` tool
-//! (codex and zed likewise do not inject session/thread id into the prompt).
+//! (session/thread id injection is not needed in the prompt).
 //!
 //! The prompt prose is fixed English regardless of the UI locale (the model's
 //! context stays in one language). The user's preferred reply language is
@@ -161,7 +161,7 @@ pub fn language_directive() -> &'static str {
 /// The user message injected when a sub-agent hits its `max_turns` cap.
 ///
 /// Kept here rather than in `system_prompt.md` because it is a one-line
-/// template, not prose — codex and zed likewise keep short turn-cap templates
+/// template, not prose — short turn-cap templates are kept in code. The first
 /// in code. The first cap hit asks for a coherent final summary; a second cap
 /// hit (the sub-agent keeps calling tools) is what actually hard-stops the turn
 /// in `Thread::run_turn_loop`.

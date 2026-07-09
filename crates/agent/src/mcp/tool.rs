@@ -63,7 +63,7 @@ impl AgentTool for McpTool {
     fn input_schema(&self) -> serde_json::Value {
         // rmcp stores input_schema as Arc<JsonObject>. Convert to a Value::Object;
         // if `properties` is missing or null, insert an empty object so
-        // OpenAI-style models accept the schema (mirrors codex's mcp_tool.rs).
+        // OpenAI-style models accept the schema (properties must not be null).
         let map = (*self.tool.input_schema).clone();
         let mut value = serde_json::Value::Object(map);
         if let serde_json::Value::Object(ref mut obj) = value

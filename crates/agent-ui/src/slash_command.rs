@@ -136,7 +136,7 @@ pub fn init(_cx: &mut App) {
 
 /// Parse a raw composer input into a slash command invocation.
 ///
-/// Rules (matching codex/zed conventions):
+/// Rules:
 /// - The command must be at the very start of the (trimmed) input, preceded
 ///   only by whitespace.
 /// - The name is the first whitespace-delimited token, with the leading `/`

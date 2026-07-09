@@ -73,7 +73,7 @@ settings-coming-soon-label = Coming soon… {$label}
 ### views/settings.rs — General panel
 settings-panel-general = General
 settings-section-work-mode = Work mode
-settings-desc-work-mode = How much technical detail Codex shows
+settings-desc-work-mode = How much technical detail manox shows
 settings-row-work-mode-programming = For programming
 settings-desc-work-mode-programming = More technical responses and controls
 settings-row-work-mode-workday = For daily work
@@ -81,11 +81,11 @@ settings-desc-work-mode-workday = Just as capable, with less technical detail
 
 settings-section-permissions = Permissions
 settings-row-permission-default = Default permissions
-settings-desc-permission-default = By default, Codex can read and edit files in its workspace. When needed, it can request additional access permissions
+settings-desc-permission-default = By default, manox can read and edit files in its workspace. When needed, it can request additional access permissions
 settings-row-permission-auto-review = Automatic review
-settings-desc-permission-auto-review = Codex can read and edit files in its workspace. Codex automatically reviews additional access requests. Automatic review can make mistakes.
+settings-desc-permission-auto-review = manox can read and edit files in its workspace. manox automatically reviews additional access requests. Automatic review can make mistakes.
 settings-row-permission-full = Full access permissions
-settings-desc-permission-full = When Codex runs with full access, it can edit any file on your computer and run internet commands without your approval. This significantly increases the risk of data loss, leaks, or unintended actions.
+settings-desc-permission-full = When manox runs with full access, it can edit any file on your computer and run internet commands without your approval. This significantly increases the risk of data loss, leaks, or unintended actions.
 settings-link-learn-more = Learn more
 
 settings-section-general-misc = General
@@ -94,13 +94,13 @@ settings-desc-file-target = Where files and folders open by default
 settings-row-language = Language
 settings-desc-language = Application UI language
 settings-row-menu-bar = Show in menu bar
-settings-desc-menu-bar = Keep Codex in the macOS menu bar after the main window closes
+settings-desc-menu-bar = Keep manox in the macOS menu bar after the main window closes
 settings-row-bottom-panel = Bottom panel
 settings-desc-bottom-panel = Show bottom panel controls in the application title bar
 settings-row-terminal-location = Default terminal location
 settings-desc-terminal-location = Choose where terminal shortcut and environment actions open the terminal tab
 settings-row-keep-awake = Prevent sleep while running
-settings-desc-keep-awake = Keep your computer awake while Codex is running a chat
+settings-desc-keep-awake = Keep your computer awake while manox is running a chat
 settings-row-code-review = Code review
 settings-desc-code-review = Start /review in the current chat whenever possible, or open a dedicated review chat
 settings-row-import = Import work from other AI apps
@@ -123,7 +123,7 @@ settings-row-send-shortcut = Send shortcut
 settings-desc-send-shortcut = Choose when Enter sends a prompt or inserts a new line
 settings-value-enter-shift = ⌘ + Enter for multiline prompts
 settings-row-follow-up = Follow-up behavior
-settings-desc-follow-up = Queue follow-up operations while Codex is running, or steer the current run. Press "⌘ + ⌥ + /" to undo the last queued message
+settings-desc-follow-up = Queue follow-up operations while manox is running, or steer the current run. Press "⌘ + ⌥ + /" to undo the last queued message
 settings-value-queue = Queue
 settings-value-steer = Steer
 
@@ -155,7 +155,7 @@ settings-value-on = On
 
 settings-section-notifications = Notifications
 settings-row-turn-completion = Turn completion notifications
-settings-desc-turn-completion = Configure when Codex notifies you that a task is complete
+settings-desc-turn-completion = Configure when manox notifies you that a task is complete
 settings-value-focus-only = Only when app loses focus
 settings-row-permission-notify = Enable permission notifications
 settings-desc-permission-notify = Show a notification when a permission is needed
@@ -170,18 +170,18 @@ settings-row-config-user = User config
 settings-btn-open = Open
 settings-link-open-config = Open config.toml
 settings-row-config-approval = Approval policy
-settings-desc-config-approval = Choose when Codex asks for approval
+settings-desc-config-approval = Choose when manox asks for approval
 settings-value-on-request = On request
 settings-row-config-sandbox = Sandbox settings
-settings-desc-config-sandbox = Choose what command execution permissions Codex has
+settings-desc-config-sandbox = Choose what command execution permissions manox has
 settings-value-read-only = Read-only
 
 settings-section-workspace-deps = Workspace dependencies
 settings-row-config-version = Current version
 settings-btn-diagnose = 🔍 Diagnose
 settings-desc-config-diagnose = Check the current bundle and record diagnostic logs
-settings-row-config-codex-deps = Codex dependencies
-settings-desc-config-codex-deps = Allow Codex to install and provide the bundled Node.js and Python tools
+settings-row-config-builtin-deps = Built-in dependencies
+settings-desc-config-builtin-deps = Allow manox to install and provide the bundled Node.js and Python tools
 settings-row-config-reinstall = Reset and reinstall workspace
 settings-desc-config-reinstall = Remove the local bundle, redownload, and reload the tools
 settings-btn-reinstall = Reinstall
@@ -190,25 +190,25 @@ settings-btn-reinstall = Reinstall
 settings-panel-personalization = Personalization
 settings-section-personality = Personality
 settings-row-personality = Personality
-settings-desc-personality = Choose the default tone of Codex's replies
+settings-desc-personality = Choose the default tone of manox's replies
 settings-value-friendly = Friendly
 
 settings-section-custom-instructions = Custom instructions
-settings-desc-custom-instructions = Provide additional instructions and context for all tasks on this machine to Codex
+settings-desc-custom-instructions = Provide additional instructions and context for all tasks on this machine to manox
 settings-input-custom-instructions = Add custom instructions…
 settings-btn-save = Save
 settings-btn-saved = Saved
 
 settings-section-memory = Memory
 settings-tag-experimental = Experimental
-settings-desc-memory = Configure how Codex collects, retains, and consolidates memory
+settings-desc-memory = Configure how manox collects, retains, and consolidates memory
 settings-row-memory-enabled = Enable memory
 settings-desc-memory-enabled = Generate new memories from chats and bring them into new chats
 settings-row-memory-skip-tool = Skip tool-assisted conversations
 settings-desc-memory-skip-tool = Do not generate memories from conversations that used MCP tools or web search
 settings-btn-reset = Reset
 settings-row-memory-reset = Reset memory
-settings-desc-memory-reset = Delete all Codex memories
+settings-desc-memory-reset = Delete all manox memories
 
 ### views/settings.rs — MCP panel
 settings-panel-mcp = MCP servers
@@ -217,7 +217,7 @@ settings-empty-mcp = No MCP servers configured. Click "Add server" to register o
 settings-section-mcp-servers = Servers
 settings-btn-add-server = + Add server
 settings-section-mcp-plugins = From plugins
-settings-row-mcp-plugin-name = codex_apps
+settings-row-mcp-plugin-name = manox_apps
 
 ### views/plugin_manager.rs
 plugins-title = Plugins
@@ -280,7 +280,7 @@ plugins-notice-mcp-removed = MCP server removed from mcp.toml. Restart manox to 
 
 ### views/settings.rs — Environment panel
 settings-panel-environment = Environment
-settings-desc-environment = Local environment for indicating how Codex should set up a worktree for a project
+settings-desc-environment = Local environment for indicating how manox should set up a worktree for a project
 settings-section-projects = Select a project
 settings-btn-add-project = Add project
 settings-row-project = {$name}
@@ -320,7 +320,7 @@ workspace-mode-yolo-desc = Unrestricted access to the internet and any file on y
 workspace-chip-mode-on-request = Request approval
 workspace-chip-mode-auto-review = Approve for me
 workspace-chip-mode-yolo = Full access
-workspace-mode-title = How should Codex actions be approved?
+workspace-mode-title = How should manox actions be approved?
 workspace-mode-learn-more = Learn more
 workspace-mode-notice = { $mode ->
     [on-request] Switched to request-approval mode.
@@ -345,7 +345,7 @@ composer-commands-label = Commands
 composer-memory-label = Memory
 composer-skills-label = Skills
 composer-add-files = Files and folders
-composer-attach-zed = Attach Zed
+composer-attach-editor = Attach editor
 composer-goal-name = Goal
 composer-goal-desc = Set a goal for sustained effort
 composer-plan-mode-name = Plan mode

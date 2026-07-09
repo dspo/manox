@@ -3,7 +3,7 @@
 //! Thread id, cwd, project, model, turn count, and depth are facts the model
 //! occasionally needs (e.g. the user asks "what's the current thread id?").
 //! Injecting them into the system prompt every request is wasteful and — for
-//! thread id — unusual: codex routes it through MCP request meta, zed does not
+//! thread id — unusual: other agents route it through MCP request meta or do not
 //! expose it at all. manox persists threads in SQLite and surfaces them in the
 //! sidebar, so users do ask; the tool lets the model answer without digging
 //! into `threads.db` (the failure mode behind thread `c5aefe4d`, where the
