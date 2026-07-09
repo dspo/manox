@@ -205,7 +205,9 @@ impl ActiveStyle {
             font_weight: self.bold.then_some(FontWeight::BOLD),
             font_style: self.italic.then_some(FontStyle::Italic),
             background_color: self.code.then_some(styles.secondary),
-            strikethrough: self.strikethrough.then_some(gpui::StrikethroughStyle::default()),
+            strikethrough: self
+                .strikethrough
+                .then_some(gpui::StrikethroughStyle::default()),
             ..Default::default()
         };
         (hs != HighlightStyle::default()).then_some(hs)

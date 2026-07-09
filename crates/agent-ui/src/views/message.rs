@@ -2,7 +2,8 @@
 //!
 //! - Text blocks render via `Markdown` with per-block copy buttons (cross-block
 //!   selection + Cmd+C copy lands in a follow-up).
-//! - User: a right-aligned rounded card within the block.
+//! - User: a full-width turn block marked by a left accent bar — no chat-bubble
+//!   background, no right alignment, no content-sized width.
 //! - Assistant: a full-width block with a role label + markdown body.
 //! - Reasoning: a collapsible block, indented secondary text with a left border.
 //! - ToolCall: a card with title + status icon + monospace output.
@@ -247,22 +248,29 @@ fn copy_button_hoverable(
         .child(copy_button(ix, prefix, text))
 }
 
-/// Render a user message: a right-aligned rounded card + copy button.
+/// Render a user message: a full-width turn block marked by a left accent bar.
+///
+/// No chat-bubble background, no right alignment, no content-sized `max_w` —
+/// the row stretches to the message-list width and the text wraps like any
+/// other block. The accent bar is the single marker separating a user turn
+/// from the assistant's markdown body. `items_stretch` makes the bar span the
+/// block's full content height; the content column carries `flex_1` +
+/// `min_w_0` so long CJK / unbreakable runs wrap instead of collapsing the
+/// row to min-content (the failure mode of the old right-aligned bubble).
 pub fn render_user(text: &str, images: &[UserImage], ix: usize, theme: &Theme) -> gpui::AnyElement {
     h_flex()
         .w_full()
-        .justify_end()
+        .min_w_0()
+        .items_stretch()
+        .child(gpui::div().w(px(3.)).bg(theme.accent))
         .child(
             v_flex()
                 .group(format!("user-{ix}"))
-                .max_w(px(560.))
+                .flex_1()
+                .min_w_0()
+                .pl_3()
+                .py_1()
                 .gap_1()
-                .px_3()
-                .py_2()
-                .rounded(theme.radius)
-                .bg(theme.secondary)
-                .border_1()
-                .border_color(theme.border)
                 .children(images.iter().map(|ui| {
                     gpui::img(ui.0.clone())
                         .max_w(px(280.))
@@ -279,7 +287,7 @@ pub fn render_user(text: &str, images: &[UserImage], ix: usize, theme: &Theme) -
                 .child(
                     gpui::div()
                         .text_sm()
-                        .text_color(theme.secondary_foreground)
+                        .text_color(theme.foreground)
                         .child(markdown_tv(
                             ("user-text", ix),
                             text.to_string(),
