@@ -35,7 +35,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Footer / Composer
 
-- [Footer](#footer) · [Composer](#composer) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [EffortChip](#effortchip) · [ProjectChip](#projectchip) · [PlusBtn](#plusbtn)
+- [Footer](#footer) · [Composer](#composer) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [EffortChip](#effortchip) · [ProjectChip](#projectchip) · [PlusBtn](#plusbtn) · [TeamChip](#teamchip)
 
 ### AskDrawer
 
@@ -51,7 +51,11 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### EditorPane
 
-- [EditorDivider](#editordivider) · [EditorPane](#editorpane) · [EditorTabBar](#editortabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab)
+- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [MemberTab](#membertab) · [MemberPanel](#memberpanel)
+
+### Composer (team)
+
+- [TeamChip](#teamchip) · [TeamDrawer](#teamdrawer)
 
 ### Settings
 
@@ -532,31 +536,55 @@ Right-side panel, shown when `editor_open` is true. 640px default (320–960 dra
 
 #### EditorDivider
 
-6px drag handle between MainColumn and EditorPane (conditional).
+6px drag handle between MainColumn and the right pane (conditional — shown while any right-pane tab is open).
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### EditorPane
+#### RightPane
 
-Vertical flex, right panel.
+Vertical flex, right panel. A tab container holding one Editor slot (the markdown scratchpad) plus one slot per team worker member. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### EditorTabBar
+#### RightTabBar
 
-Two tabs: Write / Preview.
+Top-level underline tab bar over `right_tabs`: `[Editor] [member:plan] [member:expl] …`. Selecting a tab switches `active_right_tab`. Member tabs carry a `×` suffix that closes the tab (click stops propagation so it does not also select). The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
 
 > Source: `agent-ui/src/workspace.rs`
 
 #### EditorWriteTab
 
-Plain-text multi-line [InputField](#inputfield) for markdown editing.
+Plain-text multi-line [InputField](#inputfield) for markdown editing. A second-level Write/Preview toggle lives inside the Editor tab's content area.
 
 > Source: `agent-ui/src/workspace.rs`
 
 #### EditorPreviewTab
 
 Rendered markdown view (`TextView::markdown`).
+
+> Source: `agent-ui/src/workspace.rs`
+
+#### MemberTab
+
+A right-pane tab observing one team worker member. Content is the [MemberPanel](#memberpanel) view.
+
+> Source: `agent-ui/src/workspace.rs`
+
+#### MemberPanel
+
+Read-only observation panel for a single team worker member. Subscribes to the member `Thread`'s events and feeds them into a private [ConversationState](#conversation-state), reusing the full [message](#message) rendering pipeline (agent text, reasoning folds, tool-call cards, peer-message bubbles). Header: member name + status dot (idle/running/gone) + role. A compact task board shows this member's owned tasks plus the unassigned pool, read from the shared team `TaskList`. No composer — the leader is the sole input face.
+
+> Source: `agent-ui/src/views/member_panel.rs`
+
+#### TeamChip
+
+`👥 team · N` accent pill in the composer chip row, shown only while the leader has formed a team. `N` is the worker count (leader excluded). Click toggles the [TeamDrawer](#teamdrawer).
+
+> Source: `agent-ui/src/workspace.rs`
+
+#### TeamDrawer
+
+Popover above the composer: a thin roster of worker members (name / role / status dot / task count). Clicking a row opens (or focuses) that member's [MemberTab](#membertab) in the right pane and closes the drawer. The leader is not listed — it is the main conversation.
 
 > Source: `agent-ui/src/workspace.rs`
 

@@ -44,6 +44,15 @@ member-tasks-mine = Mine
 member-tasks-unassigned = Unassigned
 member-no-tasks = No tasks
 member-tab = { $name }
+member-editor-tab = Editor
+member-close-tab = Close tab
+team-chip = team · { $count }
+team-drawer-title = Team
+team-drawer-empty = No members
+team-drawer-tasks = { $count ->
+    [one] { $count } task
+   *[other] { $count } tasks
+}
 retry-badge = Retrying… { $attempt }/{ $max } · { $secs }s
 message-omitted-prefix = …(earlier omitted)
 status-pending = Pending approval

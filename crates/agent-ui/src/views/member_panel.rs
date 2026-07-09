@@ -309,8 +309,8 @@ impl Render for MemberPanel {
                     }
                     scroll.scroll_to_bottom();
                 })
-                .on_scroll_wheel(cx.listener(
-                    |this, ev: &gpui::ScrollWheelEvent, window, cx| {
+                .on_scroll_wheel(
+                    cx.listener(|this, ev: &gpui::ScrollWheelEvent, window, cx| {
                         // An upward wheel breaks tail-follow so the user can
                         // scroll back through history; re-arm by scrolling back
                         // to the bottom.
@@ -319,8 +319,8 @@ impl Render for MemberPanel {
                             this.stick_to_bottom = false;
                             cx.notify();
                         }
-                    },
-                )),
+                    }),
+                ),
         );
         col
     }

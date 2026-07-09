@@ -811,6 +811,9 @@ mod tests {
 
     #[test]
     fn leader_tools_exposes_three_management_tools() {
+        // `Thread::restore` builds `main_registry`, whose `SpawnAgentTool::new`
+        // reads the agent-definition registry; initialize it first.
+        crate::agent_def::init();
         let cx = TestAppContext::single();
         let leader = cx.update(|cx| {
             Thread::restore(ThreadRecord::for_test("lead", "/tmp", Vec::new()), None, cx)

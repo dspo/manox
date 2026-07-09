@@ -31,6 +31,15 @@ member-tasks-mine = 我的
 member-tasks-unassigned = 未分配
 member-no-tasks = 暂无任务
 member-tab = { $name }
+member-editor-tab = 编辑器
+member-close-tab = 关闭标签页
+team-chip = 团队 · { $count }
+team-drawer-title = 团队
+team-drawer-empty = 暂无成员
+team-drawer-tasks = { $count ->
+    [one] { $count } 个任务
+   *[other] { $count } 个任务
+}
 retry-badge = 重试中… { $attempt }/{ $max } · { $secs }秒
 message-omitted-prefix = …（已省略前面部分）
 status-pending = 待审批
