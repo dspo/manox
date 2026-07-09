@@ -248,12 +248,14 @@ fn copy_button_hoverable(
         .child(copy_button(ix, prefix, text))
 }
 
-/// Render a user message: a full-width turn block marked by a left accent bar.
+/// Render a user message: a full-width turn block marked by a left accent bar
+/// over a faint accent tint.
 ///
 /// No chat-bubble background, no right alignment, no content-sized `max_w` —
 /// the row stretches to the message-list width and the text wraps like any
-/// other block. The accent bar is the single marker separating a user turn
-/// from the assistant's markdown body. `items_stretch` makes the bar span the
+/// other block. The 3px accent bar + 6% accent tint together form a block-
+/// level anchor that survives scrolling past dense assistant output, while
+/// staying flat (no rounded bubble). `items_stretch` makes the bar span the
 /// block's full content height; the content column carries `flex_1` +
 /// `min_w_0` so long CJK / unbreakable runs wrap instead of collapsing the
 /// row to min-content (the failure mode of the old right-aligned bubble).
@@ -268,9 +270,11 @@ pub fn render_user(text: &str, images: &[UserImage], ix: usize, theme: &Theme) -
                 .group(format!("user-{ix}"))
                 .flex_1()
                 .min_w_0()
-                .pl_3()
-                .py_1()
+                .pl_4()
+                .pr_3()
+                .py_2()
                 .gap_1()
+                .bg(theme.accent.opacity(0.06))
                 .children(images.iter().map(|ui| {
                     gpui::img(ui.0.clone())
                         .max_w(px(280.))

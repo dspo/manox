@@ -408,14 +408,10 @@ fn render_thread_item(
     } else {
         theme.transparent
     };
-    // Selected title takes the accent color so the active row reads at a glance
-    // even when the wash is faint — the bar + tinted title together are a
-    // stronger signal than either alone.
-    let title_color = if selected {
-        theme.accent
-    } else {
-        theme.foreground
-    };
+    // Selected title stays foreground (strong, full contrast) — the wash +
+    // left bar already carry the active signal. Tinting the title accent-on-
+    // accent crushed contrast and made the active row read as disabled.
+    let title_color = theme.foreground;
     let group = gpui::SharedString::from(format!("thread-row-{id}"));
     // Short thread ID: first 8 chars of the UUID. Char-based so a non-ASCII
     // id (defensive — ids are hex today) cannot panic on a char boundary.
