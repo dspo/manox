@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::{App, Task};
+use gpui::{App, Entity, Task};
 use tokio_util::sync::CancellationToken;
 
 use crate::language_model::{AnyLanguageModel, LanguageModelRequestTool};
@@ -48,6 +48,10 @@ pub trait ToolContext {
     /// a team member. Used as the write-lock owner so conflict errors name the
     /// agent holding the file.
     fn agent_label(&self) -> &str;
+    /// The active team this thread leads or belongs to, if any. `None` for
+    /// non-team threads. Team tools reach the shared task list and the message
+    /// router through this.
+    fn team(&self) -> Option<&Entity<crate::team::Team>>;
     /// Whether the owning thread is in YOLO / AutoReview mode (bash uses this
     /// to force the unsandboxed branch without a per-call escalation flag).
     fn yolo(&self) -> bool;
@@ -66,6 +70,7 @@ pub struct ToolContextSnapshot {
     turn_count: u32,
     depth: u32,
     agent_label: String,
+    team: Option<Entity<crate::team::Team>>,
     yolo: bool,
 }
 
@@ -82,6 +87,7 @@ impl ToolContextSnapshot {
             turn_count: t.turn_count(),
             depth: t.depth(),
             agent_label: t.agent_label().to_string(),
+            team: t.team().cloned(),
             yolo: t.approval_mode() == crate::thread::ApprovalMode::Yolo,
         }
     }
@@ -111,6 +117,9 @@ impl ToolContext for ToolContextSnapshot {
     }
     fn agent_label(&self) -> &str {
         &self.agent_label
+    }
+    fn team(&self) -> Option<&Entity<crate::team::Team>> {
+        self.team.as_ref()
     }
     fn yolo(&self) -> bool {
         self.yolo

@@ -182,6 +182,11 @@ pub enum ThreadEvent {
         reason: String,
         evaluations: u32,
     },
+    /// A peer message was delivered to this thread from another team member.
+    /// Rendered as a `💬 from {name}` bubble, distinct from user/assistant
+    /// turns. The thread also received a user-role message carrying the same
+    /// content (so the model sees it); this event is the UI-side mirror.
+    PeerMessage { from: String, content: String },
 }
 
 /// UI metadata for a pending tool-call authorization. Stored alongside the
@@ -248,6 +253,12 @@ pub struct Thread {
     /// persisted: a worktree is an ephemeral isolation context, not part of
     /// the thread record.
     worktree: Option<WorktreeState>,
+    /// Active agents team, if this thread leads one. `None` for plain main
+    /// threads without a team and for `agent`-spawned sub-agents. The leader
+    /// thread owns the `Entity<Team>`; worker members are tracked inside it.
+    /// Not persisted — a team is session-scoped coordination, not a recoverable
+    /// conversation, so a reloaded thread always starts teamless.
+    team: Option<Entity<crate::team::Team>>,
     /// tool_uses collected during the current turn, processed after the stream ends.
     pending_tool_uses: Vec<LanguageModelToolUse>,
     /// Pending authorizations for THIS thread's own tool calls, keyed by
@@ -491,6 +502,7 @@ impl Thread {
                 cwd,
                 project: None,
                 worktree: None,
+                team: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
@@ -567,6 +579,7 @@ impl Thread {
                 cwd,
                 project,
                 worktree: None,
+                team: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
@@ -647,6 +660,7 @@ impl Thread {
                 cwd,
                 project: None,
                 worktree: None,
+                team: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
@@ -891,6 +905,50 @@ impl Thread {
 
     pub fn agent_label(&self) -> &str {
         &self.agent_label
+    }
+
+    /// The active team this thread leads, if any. `None` for non-team threads.
+    pub fn team(&self) -> Option<&Entity<crate::team::Team>> {
+        self.team.as_ref()
+    }
+
+    /// Attach a team this thread leads. Called by `team_create`. Does not
+    /// touch the tool registry — team tools are advertised from the start and
+    /// no-op until a team exists, so the request-tool prefix is unaffected.
+    pub fn set_team(&mut self, team: Entity<crate::team::Team>, cx: &mut Context<Self>) {
+        self.team = Some(team);
+        cx.notify();
+    }
+
+    /// Deliver peer messages: append each as a user-role message, emit a
+    /// `PeerMessage` event per message (UI mirror), then start one turn so the
+    /// model sees them together. An empty slice is a no-op so unrelated
+    /// callers don't synthesize a turn. The `[from {name}]:` prefix is
+    /// append-only, so per-thread prefix-cache stability holds.
+    pub fn deliver_peer_messages(
+        &mut self,
+        msgs: Vec<crate::team::PeerMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        if msgs.is_empty() {
+            return;
+        }
+        for msg in &msgs {
+            self.insert_user_message(format!("[from {}]: {}", msg.from, msg.content), cx);
+            cx.emit(ThreadEvent::PeerMessage {
+                from: msg.from.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        self.run_turn(cx);
+    }
+
+    /// Test-only: occupy or clear the `running_turn` slot to simulate a busy
+    /// vs idle thread in routing tests (the team router branches on
+    /// `is_running`, which reads this field).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_running_turn_for_test(&mut self, t: Option<Task<()>>) {
+        self.running_turn = t;
     }
 
     /// Whether this thread is currently in plan mode.
