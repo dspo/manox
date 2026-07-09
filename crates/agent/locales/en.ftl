@@ -35,6 +35,7 @@ sidebar-time-weeks = { $count ->
 message-reasoning = Reasoning
 message-error = Error
 message-notice = Notice
+message-user-role = You
 retry-badge = Retrying… { $attempt }/{ $max } · { $secs }s
 message-omitted-prefix = …(earlier omitted)
 status-pending = Pending approval

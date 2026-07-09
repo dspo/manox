@@ -2,8 +2,9 @@
 //!
 //! - Text blocks render via `Markdown` with per-block copy buttons (cross-block
 //!   selection + Cmd+C copy lands in a follow-up).
-//! - User: a full-width turn block marked by a left accent bar — no chat-bubble
-//!   background, no right alignment, no content-sized width.
+//! - User: a full-width bordered turn block with a muted metadata header
+//!   (role · model · project) — the Claude Code TUI turn-block look, not a
+//!   chat bubble.
 //! - Assistant: a full-width block with a role label + markdown body.
 //! - Reasoning: a collapsible block, indented secondary text with a left border.
 //! - ToolCall: a card with title + status icon + monospace output.
@@ -159,10 +160,27 @@ impl Render for MessageItem {
         let tool_ctx = self.weak_workspace.upgrade().map(|ws| ToolCallCtx {
             weak: ws.downgrade(),
         });
+        // Project = cwd basename, shown in the user-turn header. Same for every
+        // item in a thread; computed per-item because `render_item` is per-item
+        // and the cost is a couple of entity reads.
+        let project = self
+            .weak_workspace
+            .upgrade()
+            .map(|ws| {
+                let thread = ws.read(cx).thread.clone();
+                thread
+                    .read(cx)
+                    .cwd()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         centered(render_item(
             &self.kind,
             self.id,
             &self.role,
+            &project,
             &theme,
             agent_ctx.as_ref(),
             tool_ctx.as_ref(),
@@ -179,12 +197,13 @@ pub fn render_item(
     item: &ConvItem,
     ix: usize,
     role: &str,
+    project: &str,
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     match item {
-        ConvItem::User { text, images } => render_user(text, images, ix, theme),
+        ConvItem::User { text, images } => render_user(text, images, ix, role, project, theme),
         ConvItem::Assistant {
             text,
             streaming,
@@ -248,57 +267,89 @@ fn copy_button_hoverable(
         .child(copy_button(ix, prefix, text))
 }
 
-/// Render a user message: a full-width turn block marked by a left accent bar
-/// over a faint accent tint.
+/// Render a user message as a full-width bordered turn block with a muted
+/// metadata header — the Claude Code TUI turn-block look, not a chat bubble.
 ///
-/// No chat-bubble background, no right alignment, no content-sized `max_w` —
-/// the row stretches to the message-list width and the text wraps like any
-/// other block. The 3px accent bar + 6% accent tint together form a block-
-/// level anchor that survives scrolling past dense assistant output, while
-/// staying flat (no rounded bubble). `items_stretch` makes the bar span the
-/// block's full content height; the content column carries `flex_1` +
-/// `min_w_0` so long CJK / unbreakable runs wrap instead of collapsing the
-/// row to min-content (the failure mode of the old right-aligned bubble).
-pub fn render_user(text: &str, images: &[UserImage], ix: usize, theme: &Theme) -> gpui::AnyElement {
-    h_flex()
+/// The block carries a 1px accent border + a faint accent tint and a small
+/// (4px) radius. A header row sits inside the top border: the role label
+/// ("You"), the active model, and the project (cwd basename), joined by `·`
+/// separators, in small muted text so it does not compete with the body. The
+/// body is plain horizontal markdown on `foreground`, full-width, wrapping
+/// normally. `min_w_0` end to end keeps long CJK / unbreakable runs from
+/// collapsing the block to min-content (the failure mode of the old bubble).
+pub fn render_user(
+    text: &str,
+    images: &[UserImage],
+    ix: usize,
+    model: &str,
+    project: &str,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    // Header label: "You", then " · {model}" / " · {project}" only when the
+    // field is non-empty — no placeholder text for missing metadata.
+    let mut header = i18n::t("message-user-role").to_string();
+    if !model.is_empty() {
+        header.push_str(" · ");
+        header.push_str(model);
+    }
+    if !project.is_empty() {
+        header.push_str(" · ");
+        header.push_str(project);
+    }
+
+    v_flex()
+        .group(format!("user-{ix}"))
         .w_full()
         .min_w_0()
-        .items_stretch()
-        .child(gpui::div().w(px(3.)).bg(theme.accent))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(theme.accent.opacity(0.5))
+        .bg(theme.accent.opacity(0.05))
+        .overflow_hidden()
+        // Header row — sits inside the top border as a metadata breadcrumb.
         .child(
-            v_flex()
-                .group(format!("user-{ix}"))
-                .flex_1()
+            h_flex()
+                .w_full()
                 .min_w_0()
-                .pl_4()
-                .pr_3()
-                .py_2()
-                .gap_1()
-                .bg(theme.accent.opacity(0.06))
-                .children(images.iter().map(|ui| {
-                    gpui::img(ui.0.clone())
-                        .max_w(px(280.))
-                        .max_h(px(280.))
-                        .rounded(theme.radius)
-                        .object_fit(gpui::ObjectFit::ScaleDown)
-                }))
-                .child(h_flex().w_full().justify_end().child(copy_button_hoverable(
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(theme.accent.opacity(0.25))
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(gpui::div().min_w_0().child(SharedString::from(header)))
+                .child(gpui::div().flex_1())
+                .child(copy_button_hoverable(
                     ix,
                     "copy-user",
                     format!("user-{ix}"),
                     text.to_string(),
-                )))
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(markdown_tv(
-                            ("user-text", ix),
-                            text.to_string(),
-                            theme,
-                            false,
-                        )),
-                ),
+                )),
+        )
+        .children(images.iter().map(|ui| {
+            gpui::img(ui.0.clone())
+                .max_w(px(280.))
+                .max_h(px(280.))
+                .rounded(theme.radius)
+                .object_fit(gpui::ObjectFit::ScaleDown)
+                .px_3()
+        }))
+        .child(
+            gpui::div()
+                .w_full()
+                .min_w_0()
+                .px_3()
+                .py_2()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(markdown_tv(
+                    ("user-text", ix),
+                    text.to_string(),
+                    theme,
+                    false,
+                )),
         )
         .into_any_element()
 }
@@ -974,7 +1025,7 @@ pub fn render_agent_task(
                     .py_2()
                     .gap_1()
                     .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                        render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx)
+                        render_item(sitem, six, "agent", "", theme, agent_ctx, tool_ctx)
                     })),
             );
         }

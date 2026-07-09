@@ -395,11 +395,12 @@ fn render_thread_item(
     };
     let updated = format_relative(summary.interacted_at);
     let tokens = format_tokens(summary.cumulative_total_tokens);
-    // Active row is a single subtle rounded accent wash — no left bar, no
-    // title tinting. Hover is suppressed on the selected row so mousing over
-    // the active thread cannot lighten its wash.
+    // Active row uses the semantic `selection` surface — purpose-built for
+    // selected list rows, so it reads clearly across light/dark themes without
+    // hand-tuning an accent alpha. Hover is suppressed on the selected row so
+    // mousing over the active thread cannot lighten its surface.
     let bg = if selected {
-        theme.accent.opacity(0.28)
+        theme.selection
     } else {
         theme.transparent
     };
