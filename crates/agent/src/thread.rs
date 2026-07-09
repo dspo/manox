@@ -38,7 +38,7 @@ use crate::title_state::TitleState;
 use crate::token_meter::TokenMeter;
 use crate::tool::{
     PermissionCache, PermissionDecision, PlanApprovalResponse, ToolAuthorizationResponse,
-    ToolRegistry, exit_plan_mode_request_tool,
+    ToolRegistry, enter_plan_mode_request_tool, exit_plan_mode_request_tool,
 };
 use crate::tools;
 
@@ -1658,9 +1658,13 @@ impl Thread {
                 let mut appr = Vec::new();
                 let mut review = Vec::new();
                 for tu in &tool_uses {
-                    // `exit_plan_mode` is synthesized (not in `this.tools`), so
-                    // the registry lookup below would default it to the free
-                    // (parallel) path; it has its own plan-overlay routing.
+                    // `exit_plan_mode` and `enter_plan_mode` are synthesized
+                    // (not in `this.tools`), so the registry lookup below
+                    // would default them to the free (parallel) path.
+                    // `exit_plan_mode` has its own plan-overlay routing below;
+                    // `enter_plan_mode` is a free, no-approval mode transition
+                    // (intercepted in `run_tool_inner`), so the free path is
+                    // correct for it.
                     let is_plan_exit = tu.name.as_ref() == "exit_plan_mode";
                     // YOLO/AutoReview bypass the permission gate, but not tools
                     // whose authorization flow IS their execution
@@ -1883,6 +1887,19 @@ impl Thread {
         let name = tu.name.to_string();
         let title = tool_title(&name, &tu.input);
 
+        // Plan-mode entry: the model asked to transition into plan mode.
+        // Intercept before the registry lookup (`enter_plan_mode` is
+        // synthesized in `build_completion_request`, not registered) and flip
+        // `plan_mode` on. Only the main thread (depth 0) and only when not
+        // already in plan mode — sub-agents and an already-planning thread
+        // never see the tool, so this guards against a stray/hallucinated
+        // call. No approval: it is a mode transition, not a write.
+        if name == "enter_plan_mode"
+            && this.read_with(cx, |this, _| !this.plan_mode && this.depth == 0)?
+        {
+            return Self::run_enter_plan_mode(this, tu, cx).await;
+        }
+
         // Plan-mode exit handshake: the model submitted a plan. Intercept before
         // the registry lookup (`exit_plan_mode` is synthesized in
         // `build_completion_request`, not registered) and run the approval flow.
@@ -2099,6 +2116,41 @@ impl Thread {
                 "is_error": is_error,
             }),
         );
+        Ok(())
+    }
+
+    /// Handle an `enter_plan_mode` tool call: flip `plan_mode` on (clearing any
+    /// active goal — the two are mutually exclusive) and append a tool result
+    /// steering the model toward read-only research. No approval handshake: it
+    /// is a mode transition the model initiates, not a write. The turn loop
+    /// then continues naturally; the next `build_completion_request` sees
+    /// `plan_mode == true` and advertises the read-only tool set plus
+    /// `exit_plan_mode`, so the model researches and eventually submits a plan.
+    async fn run_enter_plan_mode(
+        this: gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let name = "enter_plan_mode".to_string();
+        let title = "Enter plan mode".to_string();
+
+        this.update(cx, |this, cx| {
+            this.set_plan_mode(true, cx);
+        })?;
+
+        let msg = "Entered plan mode. Research the codebase with read-only tools and the `agent` tool (delegate to the `plan`/`explore` sub-agents for isolated-context exploration). Do not implement. When the plan is ready, call `exit_plan_mode` with it.".to_string();
+
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: ToolCallStatus::Success,
+            });
+        })?;
+        Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
+        Self::append_tool_result(&this, tu, msg, false, cx)?;
         Ok(())
     }
 
@@ -2631,9 +2683,28 @@ impl Thread {
             list.push(exit_plan_mode_request_tool());
             list
         } else {
+            // A slash command's `allowed-tools` whitelist is an intentional
+            // narrowing of this turn's tool set. Respect it: do not append
+            // `enter_plan_mode` to a filtered turn, since entering plan mode
+            // would (once `plan_mode` is on) let the plan-state branch take
+            // precedence over the whitelist and expand the model back to the
+            // full read-only set. The model can still plan on an unrestricted
+            // turn, and the user can always `/plan` manually.
             match self.turn_tool_filter.as_deref() {
                 Some(f) if !f.is_empty() => self.tools.to_request_tools_filtered(f),
-                _ => self.tools.to_request_tools(),
+                _ => {
+                    let mut list = self.tools.to_request_tools();
+                    // Advertise `enter_plan_mode` only on the main thread, so
+                    // the model can proactively transition to plan mode when it
+                    // judges the task non-trivial. Sub-agents (`depth > 0`)
+                    // never see it — plan mode is a main-thread concept
+                    // (`run_enter_plan_mode` no-ops them too). Synthesized, not
+                    // registered, mirroring `exit_plan_mode`.
+                    if self.depth == 0 {
+                        list.push(enter_plan_mode_request_tool());
+                    }
+                    list
+                }
             }
         };
         LanguageModelRequest {
@@ -3638,6 +3709,169 @@ mod tests {
             !cx.update(|cx| store.read_with(cx, |s, _| s.is_running(thread_id))),
             "indicator must be cleared by the run_turn task-tail backstop when \
              the stream ends without a Stop event"
+        );
+    }
+
+    /// `run_enter_plan_mode` flips `plan_mode` on, emits a success ToolCall,
+    /// and appends a non-error ToolResult steering the model toward read-only
+    /// research. No approval handshake — the turn loop continues and the next
+    /// `build_completion_request` advertises the plan-mode tool set.
+    #[test]
+    fn enter_plan_mode_sets_flag_and_appends_result() {
+        use crate::language_model::{LanguageModelToolUse, MessageContent};
+        use std::sync::{Arc, Mutex};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-enter-plan", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        let tu = LanguageModelToolUse {
+            id: "tu_enter_1".to_string(),
+            name: Arc::from("enter_plan_mode"),
+            raw_input: "{}".to_string(),
+            input: serde_json::json!({}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        assert!(
+            !cx.update(|cx| thread.read_with(cx, |t, _| t.plan_mode)),
+            "plan_mode must start off"
+        );
+
+        let weak = thread.downgrade();
+        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let r = result.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *r.lock().unwrap() =
+                    Some(super::Thread::run_enter_plan_mode(weak, tu, &mut cx).await);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+
+        let res = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("run_enter_plan_mode did not complete");
+        assert!(res.is_ok(), "run_enter_plan_mode failed: {:?}", res.err());
+
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                assert!(
+                    t.plan_mode,
+                    "plan_mode should be true after enter_plan_mode"
+                );
+                let last = t.messages.last().expect("no message after enter_plan_mode");
+                let tr = last
+                    .content
+                    .iter()
+                    .find_map(|c| match c {
+                        MessageContent::ToolResult(tr) => Some(tr),
+                        _ => None,
+                    })
+                    .expect("no ToolResult in last message");
+                assert_eq!(tr.tool_use_id.as_str(), "tu_enter_1");
+                assert!(
+                    !tr.is_error,
+                    "enter_plan_mode ToolResult must not be an error"
+                );
+                assert!(
+                    tr.content.contains("Entered plan mode"),
+                    "expected plan-mode steering message, got: {}",
+                    tr.content
+                );
+            });
+        });
+    }
+
+    /// `build_completion_request` advertises `enter_plan_mode` only on the main
+    /// thread (depth 0) while not in plan mode, and `exit_plan_mode` only while
+    /// in plan mode. The two are mutually exclusive by state, mirroring the
+    /// synthesized-tool contract.
+    #[test]
+    fn build_completion_request_advertises_plan_tools_by_state() {
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-plan-tools", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        // Main thread, not in plan mode: enter_plan_mode advertised,
+        // exit_plan_mode not.
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"enter_plan_mode"),
+            "main thread should see enter_plan_mode, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"exit_plan_mode"),
+            "non-plan request should not advertise exit_plan_mode, got: {names:?}"
+        );
+
+        // Enter plan mode: exit_plan_mode advertised, enter_plan_mode not.
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.set_plan_mode(true, cx));
+        });
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"exit_plan_mode"),
+            "plan-mode request should advertise exit_plan_mode, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"enter_plan_mode"),
+            "plan-mode request should not advertise enter_plan_mode, got: {names:?}"
+        );
+
+        // Sub-agent (depth > 0), not in plan mode: enter_plan_mode NOT
+        // advertised — plan mode is a main-thread concept.
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.set_plan_mode(false, cx);
+                t.depth = 1;
+            });
+        });
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"enter_plan_mode"),
+            "sub-agent should not see enter_plan_mode, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"exit_plan_mode"),
+            "sub-agent non-plan request should not advertise exit_plan_mode, got: {names:?}"
+        );
+
+        // Back to main thread, but with a slash-command `allowed-tools`
+        // whitelist active: enter_plan_mode must NOT be appended — entering
+        // plan mode would override the whitelist via the plan-state precedence,
+        // expanding the model back to the full read-only set.
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.depth = 0;
+                t.turn_tool_filter = Some(vec!["read_file".to_string()]);
+            });
+        });
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"enter_plan_mode"),
+            "a whitelisted turn must not advertise enter_plan_mode, got: {names:?}"
         );
     }
 }
