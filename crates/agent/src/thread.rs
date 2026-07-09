@@ -1768,6 +1768,28 @@ impl Thread {
             cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
             cx.notify();
         }
+
+        // A leader cancel propagates to every worker member: their in-flight
+        // turns are part of the same coordinated effort, so stopping the leader
+        // must not leave members running. Only the main thread (depth 0) is a
+        // team leader — a worker's own Stop must not cascade to siblings.
+        // Collect the handles first, then update — `Entity::update` needs
+        // `&mut App`, which a live `team.read` guard would block. A member's own
+        // `cancel` unwinds its nested sub-agent turns via its `turn_cancel`
+        // select! arms, so one level suffices.
+        if self.depth == 0
+            && let Some(team) = self.team.clone()
+        {
+            let members: Vec<gpui::Entity<Thread>> = team
+                .read(cx)
+                .members()
+                .values()
+                .map(|m| m.thread().clone())
+                .collect();
+            for m in members {
+                m.update(cx, |t, cx| t.cancel(cx));
+            }
+        }
     }
 
     async fn run_turn_loop(
@@ -3483,7 +3505,59 @@ mod tests {
         });
     }
 
-    /// Regression: `run_plan_approval` Approve branch must append the
+    /// A leader `cancel` propagates to every worker member: their in-flight
+    /// turns are part of the same coordinated effort, so stopping the leader
+    /// must not leave members running. A worker's own `cancel` does NOT
+    /// cascade to siblings (only depth-0 threads propagate).
+    #[test]
+    fn leader_cancel_propagates_to_team_members() {
+        use crate::team::{Member, Team};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+
+        let (leader, member, team, member_token) = cx.update(|cx| {
+            let leader = super::Thread::restore(
+                crate::db::ThreadRecord::for_test("lead", "/tmp", Vec::new()),
+                None,
+                cx,
+            );
+            let mut member_rec = crate::db::ThreadRecord::for_test("plan", "/tmp", Vec::new());
+            member_rec.depth = 1;
+            let member = super::Thread::restore(member_rec, None, cx);
+            let team = Team::new("squad".into(), leader.downgrade(), cx);
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member.clone()),
+                    cx,
+                )
+            })
+            .unwrap();
+            leader.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            let token = tokio_util::sync::CancellationToken::new();
+            let clone = token.clone();
+            member.update(cx, |t, _| {
+                t.turn_cancel = Some(clone);
+            });
+            (leader, member, team, token)
+        });
+
+        // Cancel the leader. Its depth-0 gate trips the propagation path, which
+        // calls `cancel` on every member thread.
+        cx.update(|cx| {
+            leader.update(cx, |t, cx| t.cancel(cx));
+        });
+        cx.run_until_parked();
+
+        assert!(member_token.is_cancelled(), "member turn token cancelled");
+        assert!(
+            cx.update(|cx| member.read(cx).turn_cancel.is_none()),
+            "member turn_cancel taken"
+        );
+        // `_team` is held for the assertion lifetime; drop after.
+        drop(team);
+    }
+
     /// ToolResult to the message list BEFORE clearing `plan_mode`. The old
     /// code set `plan_mode = false` first; if `append_tool_result` then
     /// failed (entity gone, infra error), the thread would exit plan mode
