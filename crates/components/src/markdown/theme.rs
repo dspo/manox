@@ -19,6 +19,7 @@ pub struct MdStyles {
     pub muted: Hsla,
     pub secondary: Hsla,
     pub border: Hsla,
+    pub transparent: Hsla,
     pub highlight_theme: Arc<HighlightTheme>,
     /// Diff `+`/`-` accents — foreground is the saturated accent, background
     /// is the same hue faded to a wash so long runs stay readable.
@@ -37,6 +38,7 @@ impl MdStyles {
             muted: theme.muted_foreground,
             secondary: theme.secondary,
             border: theme.border,
+            transparent: hsla(0., 0., 0., 0.),
             highlight_theme: theme.highlight_theme.clone(),
             diff_add_fg: success,
             diff_add_bg: hsla(success.h, success.s, success.l, 0.15),

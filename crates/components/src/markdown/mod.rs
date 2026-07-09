@@ -24,7 +24,8 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, ElementId, HighlightStyle, Hsla, IntoElement, SharedString, StyledText, div, px,
+    AnyElement, ElementId, FontWeight, HighlightStyle, Hsla, IntoElement, SharedString, StyledText,
+    div, px,
 };
 use gpui_component::highlighter::SyntaxHighlighter;
 use gpui_component::{Theme, h_flex, v_flex};
@@ -146,6 +147,7 @@ fn render_block(block: Block, styles: &MdStyles, idx: usize) -> AnyElement {
         Block::Heading { runs, depth } => heading(&runs.text, &runs.highlights, depth),
         Block::Code { lang, value } => code_block(&value, lang.as_deref(), styles, idx),
         Block::Diff { value } => diff_block(&value, styles, idx),
+        Block::Conflict { value } => conflict_block(&value, styles, idx),
         Block::Blockquote(inner) => blockquote(inner, styles),
         Block::List { ordered, items } => list_block(ordered, items, styles),
         Block::Table { rows, align } => table_block(rows, align, styles, idx),
@@ -330,6 +332,152 @@ fn classify_diff_line(line: &str, styles: &MdStyles) -> (Hsla, Hsla, Hsla) {
     }
 }
 
+/// Per-line role within a git merge-conflict blob. The four marker lines
+/// become section headers; content lines carry the wash + bar of the section
+/// they belong to (ours / base / theirs), and `Context` covers any lines
+/// outside the marker region.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConflictLineKind {
+    Context,
+    Ours,
+    Base,
+    Theirs,
+    MarkerOurs,
+    MarkerBase,
+    MarkerSep,
+    MarkerTheirsEnd,
+}
+
+/// State carried between lines while classifying a conflict blob: which side
+/// content lines belong to until the next marker flips it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConflictSection {
+    Context,
+    Ours,
+    Base,
+    Theirs,
+}
+
+/// Split a conflict blob into per-line roles. `<<<<<<<`/`=======`/`|||||||`/
+/// `>>>>>>>` are recognized at line start; the `=======` separator is matched
+/// exactly (git emits precisely seven `=` with nothing else on the line) so a
+/// content line beginning with `=` is not mistaken for it.
+fn parse_conflict(value: &str) -> Vec<(&str, ConflictLineKind)> {
+    let mut state = ConflictSection::Context;
+    let mut out = Vec::new();
+    for line in value.lines() {
+        let kind = if line.starts_with("<<<<<<<") {
+            state = ConflictSection::Ours;
+            ConflictLineKind::MarkerOurs
+        } else if line.starts_with("|||||||") {
+            state = ConflictSection::Base;
+            ConflictLineKind::MarkerBase
+        } else if line == "=======" {
+            state = ConflictSection::Theirs;
+            ConflictLineKind::MarkerSep
+        } else if line.starts_with(">>>>>>>") {
+            state = ConflictSection::Context;
+            ConflictLineKind::MarkerTheirsEnd
+        } else {
+            match state {
+                ConflictSection::Context => ConflictLineKind::Context,
+                ConflictSection::Ours => ConflictLineKind::Ours,
+                ConflictSection::Base => ConflictLineKind::Base,
+                ConflictSection::Theirs => ConflictLineKind::Theirs,
+            }
+        };
+        out.push((line, kind));
+    }
+    out
+}
+
+/// (left bar, background, foreground, bold) for one conflict line.
+fn conflict_style(kind: ConflictLineKind, styles: &MdStyles) -> (Hsla, Hsla, Hsla, bool) {
+    use ConflictLineKind::*;
+    match kind {
+        Context => (
+            styles.transparent,
+            styles.transparent,
+            styles.foreground,
+            false,
+        ),
+        Ours => (
+            styles.diff_add_fg,
+            styles.diff_add_bg,
+            styles.foreground,
+            false,
+        ),
+        MarkerOurs => (
+            styles.diff_add_fg,
+            styles.diff_add_fg.opacity(0.22),
+            styles.diff_add_fg,
+            true,
+        ),
+        Base => (styles.muted, styles.secondary, styles.foreground, false),
+        MarkerBase => (styles.muted, styles.muted.opacity(0.18), styles.muted, true),
+        Theirs => (
+            styles.diff_del_fg,
+            styles.diff_del_bg,
+            styles.foreground,
+            false,
+        ),
+        // The `=======` separator is the boundary between sides, so it stays
+        // neutral rather than taking either side's color.
+        MarkerSep => (styles.muted, styles.secondary, styles.muted, true),
+        MarkerTheirsEnd => (
+            styles.diff_del_fg,
+            styles.diff_del_fg.opacity(0.22),
+            styles.diff_del_fg,
+            true,
+        ),
+    }
+}
+
+/// git merge-conflict block. Each line carries its section's wash + a 2px left
+/// bar; the `<<<<<<<`/`|||||||`/`=======`/`>>>>>>>` marker lines become bold
+/// section headers tinted in their side's accent (green ours, red theirs,
+/// muted base/separator), so the two sides read at a glance. Horizontal scroll
+/// keeps long content rows aligned; no line-number gutter — conflict markers
+/// are section-based, not line-numbered.
+fn conflict_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
+    let value = value.trim_end_matches('\n');
+    let mut inner = v_flex().min_w_0();
+    for (line, kind) in parse_conflict(value) {
+        let (bar, bg, fg, bold) = conflict_style(kind, styles);
+        let mut row = div()
+            .border_l_2()
+            .border_color(bar)
+            .bg(bg)
+            .px_3()
+            .py(px(1.))
+            .text_xs()
+            .text_color(fg)
+            .whitespace_nowrap()
+            .child(SharedString::from(line.to_string()));
+        if bold {
+            row = row.font_weight(FontWeight::BOLD);
+        }
+        inner = inner.child(row);
+    }
+    div()
+        .w_full()
+        .min_w_0()
+        .rounded_md()
+        .overflow_hidden()
+        .border_1()
+        .border_color(styles.border)
+        .bg(styles.secondary)
+        .child(
+            div()
+                .id(("conflict-scroll", idx))
+                .w_full()
+                .min_w_0()
+                .overflow_x_scroll()
+                .child(inner),
+        )
+        .into_any_element()
+}
+
 fn blockquote(inner: Vec<Block>, styles: &MdStyles) -> AnyElement {
     let mut col = v_flex()
         .w_full()
@@ -482,5 +630,92 @@ mod tests {
         assert_eq!(classify_diff_line("+added", &s).2, s.diff_add_fg);
         assert_eq!(classify_diff_line("-removed", &s).2, s.diff_del_fg);
         assert_eq!(classify_diff_line(" context", &s).2, s.foreground);
+    }
+
+    #[test]
+    fn conflict_parser_assigns_sections() {
+        let blob = "\
+<<<<<<< HEAD
+fn a() {}
+=======
+fn a() -> u32 { 0 }
+>>>>>>> main";
+        let parsed = parse_conflict(blob);
+        use ConflictLineKind::*;
+        let kinds: Vec<_> = parsed.iter().map(|(_, k)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![MarkerOurs, Ours, MarkerSep, Theirs, MarkerTheirsEnd]
+        );
+    }
+
+    #[test]
+    fn conflict_parser_handles_diff3_base_section() {
+        let blob = "\
+<<<<<<< HEAD
+ours
+||||||| base
+base
+=======
+theirs
+>>>>>>> main";
+        let parsed = parse_conflict(blob);
+        use ConflictLineKind::*;
+        let kinds: Vec<_> = parsed.iter().map(|(_, k)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                MarkerOurs,
+                Ours,
+                MarkerBase,
+                Base,
+                MarkerSep,
+                Theirs,
+                MarkerTheirsEnd
+            ]
+        );
+    }
+
+    #[test]
+    fn conflict_separator_is_exact_seven_equals() {
+        // A content line beginning with `=` (even seven of them, if followed
+        // by more) must not be mistaken for the `=======` separator.
+        let blob = "\
+<<<<<<< HEAD
+=======x not a separator
+=======
+real theirs
+>>>>>>> main";
+        let parsed = parse_conflict(blob);
+        use ConflictLineKind::*;
+        // The `=======x` line is ours content (only an exact `=======` flips
+        // to theirs), so the second `=======` is the real separator.
+        assert_eq!(parsed[1].1, Ours);
+        assert_eq!(parsed[2].1, MarkerSep);
+        assert_eq!(parsed[3].1, Theirs);
+    }
+
+    #[test]
+    fn conflict_context_lines_outside_markers() {
+        // Lines before the opening and after the closing marker are context.
+        let blob = "\
+prefix line
+<<<<<<< HEAD
+ours
+>>>>>>> main
+suffix line";
+        let parsed = parse_conflict(blob);
+        assert_eq!(parsed[0].1, ConflictLineKind::Context);
+        assert_eq!(parsed[4].1, ConflictLineKind::Context);
+    }
+
+    #[test]
+    fn conflict_style_marks_separator_neutral() {
+        let s = styles();
+        // The `=======` separator must take the muted palette, not either
+        // side's accent — it is the boundary, not part of a side.
+        let (bar, _, fg, _) = conflict_style(ConflictLineKind::MarkerSep, &s);
+        assert_eq!(bar, s.muted);
+        assert_eq!(fg, s.muted);
     }
 }

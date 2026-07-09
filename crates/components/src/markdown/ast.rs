@@ -56,6 +56,14 @@ pub enum Block {
     Diff {
         value: String,
     },
+    /// git merge-conflict blob routed by `<<<<<<<`/`>>>>>>>` markers in a fenced
+    /// code run, regardless of declared language — the conflict structure is
+    /// more specific than a diff or plain code, so it takes precedence over
+    /// the `diff` language route. Rendered with per-section ours/base/theirs
+    /// washes + colored left bars.
+    Conflict {
+        value: String,
+    },
     Blockquote(Vec<Block>),
     List {
         ordered: bool,
@@ -95,7 +103,11 @@ fn block_of(node: &Node, styles: &MdStyles) -> Option<Block> {
             runs: inline_of(&h.children, styles, true, false),
         }),
         Node::Code(c) => {
-            if c.lang.as_deref() == Some("diff") {
+            if is_conflict(&c.value) {
+                Some(Block::Conflict {
+                    value: c.value.clone(),
+                })
+            } else if c.lang.as_deref() == Some("diff") {
                 Some(Block::Diff {
                     value: c.value.clone(),
                 })
@@ -170,6 +182,23 @@ fn map_align(a: &AlignKind) -> TableAlign {
         AlignKind::Center => TableAlign::Center,
         AlignKind::None => TableAlign::None,
     }
+}
+
+/// A fenced code run is a git merge conflict when it carries both the opening
+/// `<<<<<<<` and closing `>>>>>>>` markers. The pair (rather than just one) is
+/// required so a stray `>>>>>>>` in commentary does not mis-route a real code
+/// block into the conflict renderer.
+fn is_conflict(value: &str) -> bool {
+    let mut open = false;
+    let mut close = false;
+    for line in value.lines() {
+        if line.starts_with("<<<<<<<") {
+            open = true;
+        } else if line.starts_with(">>>>>>>") {
+            close = true;
+        }
+    }
+    open && close
 }
 
 fn inline_of(children: &[Node], styles: &MdStyles, bold: bool, italic: bool) -> InlineRuns {
@@ -349,6 +378,43 @@ mod tests {
             }
             _ => panic!("expected diff block"),
         }
+    }
+
+    #[test]
+    fn conflict_markers_route_to_conflict_block() {
+        let s = styles();
+        let src =
+            "```text\n<<<<<<< HEAD\nfn a() {}\n=======\nfn a() -> u32 { 0 }\n>>>>>>> main\n```";
+        let blocks = parse(src, &s);
+        match blocks.first() {
+            Some(Block::Conflict { value }) => {
+                assert!(value.contains("<<<<<<< HEAD"));
+                assert!(value.contains(">>>>>>> main"));
+                assert!(value.contains("======="));
+            }
+            _ => panic!("expected conflict block"),
+        }
+    }
+
+    #[test]
+    fn conflict_takes_precedence_over_diff_lang() {
+        let s = styles();
+        // A ```diff block that actually contains conflict markers routes to
+        // Conflict, not Diff — the conflict structure is more specific.
+        let src = "```diff\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> main\n```";
+        assert!(matches!(
+            parse(src, &s).first(),
+            Some(Block::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn lone_marker_does_not_misroute_plain_code() {
+        let s = styles();
+        // A single stray `>>>>>>>` in commentary must not route a real code
+        // block into the conflict renderer — both markers are required.
+        let src = "```rust\n// >>>>>>> nothing here\nfn main() {}\n```";
+        assert!(matches!(parse(src, &s).first(), Some(Block::Code { .. })));
     }
 
     #[test]
