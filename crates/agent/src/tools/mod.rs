@@ -259,6 +259,15 @@ pub fn main_registry_with_policy(
     reg.register(Arc::new(worktree::EnterWorktreeTool::new(parent.clone())) as AnyAgentTool);
     reg.register(Arc::new(worktree::ExitWorktreeTool::new(parent)) as AnyAgentTool);
 
+    // Team coordination tools (shared by the leader and every worker member).
+    // Registering here is a one-time tool-spec fingerprint change — stable
+    // across turns thereafter, so the provider prefix cache settles once.
+    // The leader-only team-management tools (team_create / team_spawn /
+    // team_disband) are appended in a later commit.
+    for tool in crate::team::tools::shared_tools() {
+        reg.register(tool);
+    }
+
     // Append MCP tools discovered at startup from `mcp.toml` plus each
     // installed plugin's `.mcp.json`. The registry is process-global; `try_global`
     // is `None` only before `agent::init` (e.g. unit tests that build a registry

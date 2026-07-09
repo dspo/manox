@@ -8,11 +8,14 @@
 //! never recycled so a stale id held in flight never aliases a recreated task.
 
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter};
+use schemars::JsonSchema;
+use serde::Deserialize;
 
 /// Lifecycle of a task. Three states only: each is wired into the `task_update`
 /// tool and rendered on the board; adding a state without that wiring would be
 /// a half-built field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
     InProgress,

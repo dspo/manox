@@ -946,7 +946,7 @@ impl Thread {
     /// Test-only: occupy or clear the `running_turn` slot to simulate a busy
     /// vs idle thread in routing tests (the team router branches on
     /// `is_running`, which reads this field).
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub(crate) fn set_running_turn_for_test(&mut self, t: Option<Task<()>>) {
         self.running_turn = t;
     }

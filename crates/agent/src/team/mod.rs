@@ -25,6 +25,7 @@ use crate::thread::Thread;
 use crate::tool::ToolContext;
 
 pub mod task_list;
+pub mod tools;
 
 pub use task_list::{Task, TaskList, TaskListEvent, TaskStatus};
 
@@ -137,10 +138,7 @@ impl Team {
     /// refreshes.
     pub fn insert_member(&mut self, member: Member, cx: &mut Context<Self>) -> Result<(), String> {
         if !self.has_room() {
-            return Err(format!(
-                "team is full ({} workers max)",
-                MAX_WORKERS
-            ));
+            return Err(format!("team is full ({} workers max)", MAX_WORKERS));
         }
         if self.members.contains_key(&member.name) {
             return Err(format!("member '{}' already exists", member.name));
@@ -245,7 +243,10 @@ impl Team {
     /// inbox is empty.
     pub fn flush_inbox(&mut self, who: &str, cx: &mut App) {
         let (thread, msgs) = if who == LEADER_NAME {
-            (self.leader.clone(), self.leader_inbox.drain(..).collect::<Vec<_>>())
+            (
+                self.leader.clone(),
+                self.leader_inbox.drain(..).collect::<Vec<_>>(),
+            )
         } else {
             let Some(m) = self.members.get_mut(who) else {
                 return;
@@ -280,11 +281,7 @@ mod tests {
     /// only touches `insert_user_message` / `run_turn` / `is_running`, all of
     /// which behave safely without a provider.
     fn bare_thread(id: &str, cx: &mut App) -> Entity<Thread> {
-        Thread::restore(
-            ThreadRecord::for_test(id, "/tmp", Vec::new()),
-            None,
-            cx,
-        )
+        Thread::restore(ThreadRecord::for_test(id, "/tmp", Vec::new()), None, cx)
     }
 
     /// Capture `ThreadEvent::PeerMessage` emissions on a thread. The returned
@@ -318,10 +315,8 @@ mod tests {
         });
         let events = cx.update(|cx| capture_peer_events(&member_thread, cx));
 
-        cx.update(|cx| {
-            team.update(cx, |t, cx| t.deliver("lead", "plan", "hello".into(), cx))
-        })
-        .unwrap();
+        cx.update(|cx| team.update(cx, |t, cx| t.deliver("lead", "plan", "hello".into(), cx)))
+            .unwrap();
         cx.run_until_parked();
 
         let msgs = cx.update(|cx| member_thread.read(cx).messages().to_vec());
@@ -363,12 +358,13 @@ mod tests {
         });
 
         // Deliver while busy → enqueues, does not emit, does not inject.
-        cx.update(|cx| {
-            team.update(cx, |t, cx| t.deliver("lead", "plan", "queued".into(), cx))
-        })
-        .unwrap();
+        cx.update(|cx| team.update(cx, |t, cx| t.deliver("lead", "plan", "queued".into(), cx)))
+            .unwrap();
         cx.run_until_parked();
-        assert!(events.lock().unwrap().is_empty(), "no PeerMessage while busy");
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no PeerMessage while busy"
+        );
         assert!(
             cx.update(|cx| member_thread.read(cx).messages().is_empty()),
             "no user message injected while busy"
@@ -401,14 +397,10 @@ mod tests {
             let task = cx.background_spawn(async {});
             member_thread.update(cx, |t, _| t.set_running_turn_for_test(Some(task)));
         });
-        cx.update(|cx| {
-            team.update(cx, |t, cx| t.deliver("lead", "plan", "one".into(), cx))
-        })
-        .unwrap();
-        cx.update(|cx| {
-            team.update(cx, |t, cx| t.deliver("lead", "plan", "two".into(), cx))
-        })
-        .unwrap();
+        cx.update(|cx| team.update(cx, |t, cx| t.deliver("lead", "plan", "one".into(), cx)))
+            .unwrap();
+        cx.update(|cx| team.update(cx, |t, cx| t.deliver("lead", "plan", "two".into(), cx)))
+            .unwrap();
         cx.update(|cx| {
             member_thread.update(cx, |t, _| t.set_running_turn_for_test(None));
         });
@@ -427,9 +419,7 @@ mod tests {
             (Team::new("squad".into(), leader.downgrade(), cx), leader)
         });
         let err = cx
-            .update(|cx| {
-                team.update(cx, |t, cx| t.deliver("lead", "ghost", "x".into(), cx))
-            })
+            .update(|cx| team.update(cx, |t, cx| t.deliver("lead", "ghost", "x".into(), cx)))
             .unwrap_err();
         assert!(err.contains("ghost"), "error names the target: {err}");
     }
@@ -456,10 +446,8 @@ mod tests {
         let expl_ev = cx.update(|cx| capture_peer_events(&expl_thread, cx));
 
         // plan broadcasts: leader + expl get it; plan (sender) does not.
-        cx.update(|cx| {
-            team.update(cx, |t, cx| t.deliver("plan", "all", "standup".into(), cx))
-        })
-        .unwrap();
+        cx.update(|cx| team.update(cx, |t, cx| t.deliver("plan", "all", "standup".into(), cx)))
+            .unwrap();
         cx.run_until_parked();
         assert_eq!(leader_ev.lock().unwrap().len(), 1, "leader got broadcast");
         assert!(plan_ev.lock().unwrap().is_empty(), "sender excluded");
@@ -478,11 +466,8 @@ mod tests {
             team.update(cx, |t, cx| {
                 for i in 0..MAX_WORKERS {
                     let th = bare_thread(&format!("m{i}"), cx);
-                    t.insert_member(
-                        Member::new(format!("m{i}"), "r".into(), th.downgrade()),
-                        cx,
-                    )
-                    .unwrap();
+                    t.insert_member(Member::new(format!("m{i}"), "r".into(), th.downgrade()), cx)
+                        .unwrap();
                 }
             })
         });

@@ -234,6 +234,7 @@ pub fn render_item(
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx),
         ConvItem::Error(msg) => render_error(msg, ix, theme),
         ConvItem::Notice(msg) => render_notice(msg, ix, theme),
+        ConvItem::TeamMessage { from, content } => render_team_message(from, content, ix, theme),
         ConvItem::Retry {
             attempt,
             max_attempts,
@@ -539,6 +540,67 @@ pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .text_sm()
                 .text_color(theme.foreground)
                 .child(markdown_tv(("notice", ix), msg.to_string(), theme, false)),
+        )
+        .into_any_element()
+}
+
+/// A peer message from a teammate (or the leader) within a team. The `from`
+/// name is rendered as a bold label; `content` is the peer's own body,
+/// rendered as markdown the way notice text is. Accent-tinted to read apart
+/// from user / assistant turns without the danger tone of an error.
+pub fn render_team_message(
+    from: &str,
+    content: &str,
+    ix: usize,
+    theme: &Theme,
+) -> gpui::AnyElement {
+    v_flex()
+        .group(format!("team-msg-{ix}"))
+        .w_full()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .rounded(theme.radius)
+        .bg(theme.primary.opacity(0.08))
+        .child(
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_color(theme.primary)
+                                .child(from.to_string()),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(i18n::t("message-team")),
+                        ),
+                )
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-team-msg",
+                    format!("team-msg-{ix}"),
+                    content.to_string(),
+                )),
+        )
+        .child(
+            gpui::div()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(markdown_tv(
+                    ("team-msg", ix),
+                    content.to_string(),
+                    theme,
+                    false,
+                )),
         )
         .into_any_element()
 }
