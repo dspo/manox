@@ -4388,6 +4388,7 @@ impl Render for Workspace {
                                         // height so the list's per-item height cache stays
                                         // honest and markdown never paints outside its row.
                                         Some(item) => v_flex()
+                                            .w_full()
                                             .pt_1()
                                             .pb_4()
                                             .flex_shrink_0()
