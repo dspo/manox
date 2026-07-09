@@ -4,7 +4,7 @@ Guidance for Claude Code working in this repo.
 
 ## 项目概述
 
-manox 是进程内 native agent 工作台，按 Zed 的 agent / agent_ui / zed 三层架构复刻。基于 GPUI（Zed 的 GPU 加速 UI 框架）+ gpui-component（longbridge 组件库），LLM 通过 `~/.config/cx/cx.providers.config.yaml` 直连 provider。**单二进制、单进程**。
+manox 是进程内 native agent 工作台，三层架构（核心逻辑 / UI 层 / 薄 bin）。基于 GPUI（GPU 加速 UI 框架）+ gpui-component（longbridge 组件库），LLM 通过 `~/.config/cx/cx.providers.config.yaml` 直连 provider。**单二进制、单进程**。
 
 ## 构建与开发命令
 

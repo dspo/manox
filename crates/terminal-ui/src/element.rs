@@ -1,6 +1,6 @@
 //! `TerminalElement` — manox's first gpui `Element`.
 //!
-//! Three phases mirror zed's `terminal_element`:
+//! Three phases:
 //!   - `request_layout`: fill the parent (width/height = relative 1).
 //!   - `prepaint`: measure cell size from the font, derive cols/rows from
 //!     bounds, resize the Terminal, run `layout_grid` over

@@ -1,4 +1,4 @@
-//! Title bar "..." popup menu (Codex.app parity).
+//! Title bar "..." popup menu.
 //!
 //! Built lazily by the workspace; each row wires either to a real
 //! thread-store op (pin / rename / archive) or to an info-message stub for
@@ -73,7 +73,7 @@ pub fn build_title_menu(
     menu = menu.separator();
 
     // The sidebar is always visible; the "Open side chat" row stays as a
-    // disabled placeholder so the menu shape matches Codex's layout without
+    // disabled placeholder so the menu shape stays consistent without
     // implying the feature is implemented.
     menu = menu.item(PopupMenuItem::new(i18n::t("titlebar-sidebar-toggle")).disabled(true));
 
@@ -111,7 +111,7 @@ pub fn build_title_menu(
         cx,
         move |sub, _window, _cx| {
             // Branching a conversation is not implemented. Rows stay visible
-            // (matching Codex's menu shape) but disabled so the user can see
+            // (preserving the menu shape) but disabled so the user can see
             // the entry without invoking an action.
             sub.item(PopupMenuItem::new(i18n::t("titlebar-branch-from-here")).disabled(true))
                 .item(PopupMenuItem::new(i18n::t("titlebar-branch-from-start")).disabled(true))

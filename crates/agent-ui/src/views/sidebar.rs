@@ -6,7 +6,7 @@
 //!
 //! Threads bound to a project (chosen on the first screen) are grouped under a collapsible folder
 //! in the "Projects" section, keyed by project path; the rest fall under "Conversations". The top
-//! menu and bottom account footer are static decoration mirroring Codex.app's layout.
+//! menu and bottom account footer are static decoration.
 
 use std::collections::HashSet;
 use std::time::Duration;

@@ -23,7 +23,6 @@ pub fn normalize(text: &str) -> String {
     }
     // The split above always produces a trailing empty segment for text ending
     // in `\n`; remove the single trailing newline we added to match the
-    // oh-my-pi regex semantics (`(?=\n|$)` trims before each newline and at EOF,
     // leaving the body without an extra trailing newline).
     if out.ends_with('\n') {
         out.pop();

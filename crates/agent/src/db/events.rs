@@ -1,6 +1,5 @@
-//! `thread_events` table: an append-only event stream per thread, mirroring
-//! pi's JSONL entry types (model_change / compaction / branch_summary / custom)
-//! as queryable rows.
+//! `thread_events` table: an append-only event stream per thread. Event types
+//! (model_change / compaction / branch_summary / custom) map to queryable rows.
 
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, params};

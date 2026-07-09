@@ -1913,7 +1913,7 @@ impl Thread {
 
         // YOLO/AutoReview bypasses the permission gate: skip the authorization
         // prompt entirely so the tool runs immediately. YOLO is the
-        // session-level equivalent of codex's `approval_policy = Never`;
+        // session-level "never ask" policy;
         // AutoReview additionally consults the security-reviewer agent before
         // allowing. Tools whose authorization flow IS their execution
         // (`AskUserQuestion`) are exempt: bypassing them would drop the user's

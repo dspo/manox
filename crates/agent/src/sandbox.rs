@@ -8,7 +8,7 @@
 //! confinement. The sandbox blocks exactly that class: writes outside the
 //! project root + temp dir, writes to `.git`, and all network. Reads and
 //! process execution stay unrestricted (the model legitimately reads system
-//! files and runs binaries); matching zed/codex which confine writes + network
+//! files and runs binaries); the sandbox confines writes + network
 //! but not reads.
 //!
 //! ## Backend

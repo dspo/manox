@@ -5,7 +5,7 @@
 //! first) so a later op's line numbers are untouched by earlier edits. Two ops
 //! that target overlapping or identical ranges are rejected.
 //!
-//! Boundary repair (subset of oh-my-pi's `apply.ts`): a `SWAP` body that
+//! Boundary repair: a `SWAP` body that
 //! restates lines immediately above or below the range — the common model
 //! mistake of echoing context — is trimmed of those duplicated rows so the
 //! repair never silently shreds a keeper line. A suffix echo is dropped only

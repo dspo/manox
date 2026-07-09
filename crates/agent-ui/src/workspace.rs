@@ -158,7 +158,7 @@ pub struct Workspace {
     slash_open: bool,
     slash_menu: Option<Entity<PopupMenu>>,
     slash_menu_sub: Option<Subscription>,
-    /// Title bar "..." dropdown (Codex-style conversation menu). Mirrors the
+    /// Title bar "..." dropdown (conversation menu). Mirrors the
     /// model selector pattern: a button toggles `title_menu_open`; the
     /// `PopupMenu` entity and its dismiss subscription are created on open.
     title_menu_open: bool,
@@ -298,7 +298,7 @@ const OUTLINE_TICK_GAP: f32 = 8.;
 const OUTLINE_CARD_WIDTH: f32 = 260.;
 /// Wave hover displacement: at the crest a tick grows this much wider and its
 /// row this much taller, tapering to zero at the wave's edge. Neighbors bulge
-/// out around the cursor like the Codex rail.
+/// out around the cursor like the outline rail.
 const OUTLINE_WAVE_EXTRA_WIDTH: f32 = 12.;
 const OUTLINE_WAVE_EXTRA_GAP: f32 = 6.;
 
@@ -311,7 +311,7 @@ const SLIDE_MS: u64 = 180;
 const SLIDE_OUT_MS: u64 = 200;
 
 /// Drag payload for the editor pane divider. Doubles as the invisible drag
-/// ghost view, mirroring Zed's `DraggedDock` pattern.
+/// ghost view, mirroring the `DraggedDock` drag-ghost pattern.
 struct DraggedEditorDivider;
 
 impl Render for DraggedEditorDivider {
@@ -610,7 +610,7 @@ impl Workspace {
         })
     }
 
-    /// The Codex-style outline rail: one equal-length tick per user turn,
+    /// The outline rail: one equal-length tick per user turn,
     /// mounted between the sidebar divider and the message list. Ticks for the
     /// turns currently on screen are highlighted; hovering a tick reveals a
     /// summary card and clicking it scrolls that turn into view.
@@ -2467,7 +2467,7 @@ impl Workspace {
         menu
     }
 
-    /// Title bar "..." trigger + dropdown (Codex-style conversation menu).
+    /// Title bar "..." trigger + dropdown (conversation menu).
     ///
     /// Closed: a small ghost icon button (horizontal ellipsis) next to the
     /// session title. Open: an absolute-positioned PopupMenu anchored under
@@ -2897,7 +2897,7 @@ impl Workspace {
     /// current permission posture is legible at a glance — a 1-line summary of
     /// what the model is allowed to do without prompting.
     ///
-    /// Clicking the chip opens a `PopupMenu` mirroring the Codex-style header:
+    /// Clicking the chip opens a `PopupMenu` mirroring the header:
     /// a question row with a "Learn more" link, three selectable rows (icon +
     /// title + subtitle, check on the right), a hairline, and a 4th non-clickable
     /// row pointing at `config.toml` for users who want a fully custom policy.
@@ -3188,7 +3188,7 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The composer `+` button and its popup menu (Codex-style "add / plugins").
+    /// The composer `+` button and its popup menu ("add / plugins").
     fn render_plus_button(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let trigger = Button::new("composer-plus")
             .ghost()
@@ -4615,7 +4615,7 @@ fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla)
                 .child(value.to_string()),
         )
 }
-/// Build the 3-tier approval `PopupMenu`. Mirrors the Codex layout:
+/// Build the 3-tier approval `PopupMenu`:
 ///   - title row: localized question + a "Learn more" link on the right
 ///   - three selectable rows (icon + title + subtitle, check on the right)
 ///   - hairline separator

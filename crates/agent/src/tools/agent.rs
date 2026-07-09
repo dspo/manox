@@ -1,6 +1,6 @@
 //! The `agent` tool: spawn a sub-agent with its own context, restricted tools,
 //! and system prompt, then return its final assistant message as the tool
-//! result. Mirrors Claude Code's `Agent` tool and Codex's `spawn_agent`.
+//! result. Mirrors Claude Code's `Agent` tool pattern.
 //!
 //! Design:
 //! - Each sub-agent is an independent `Entity<Thread>` with a fresh message

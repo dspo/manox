@@ -15,7 +15,7 @@
 //! endpoint host: an explicit `prompt_caching` config value wins; otherwise
 //! `api.anthropic.com` → Full, anything else → LastBreakpointOnly (conservative;
 //! third-party anthropic-compatible endpoints often have breakpoint
-//! restrictions). This mirrors oh-my-pi's philosophy of "full config for the
+//! restrictions). This mirrors the philosophy of "full config for the
 //! official endpoint, conservative for third parties".
 
 use serde_json::{Value, json};

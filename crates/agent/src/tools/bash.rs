@@ -44,7 +44,7 @@ const BASH_DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// and does not flood the model's context. Above this the capture keeps a
 /// running byte total (for the truncation notice) but drops the overflowing
 /// text. 64 KiB mirrors the order of magnitude used by other native agents
-/// (zed 16 KiB, pi/oh-my-pi 50 KiB) — enough for typical `git`/`cargo` output,
+/// — enough for typical `git`/`cargo` output,
 /// small enough that the model can act on it.
 const BASH_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 /// Narrow-the-command hint folded into the truncation advisory. Lives here

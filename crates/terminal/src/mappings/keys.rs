@@ -1,6 +1,5 @@
 //! `Keystroke` → terminal byte sequence, with `APP_CURSOR` / `APP_KEYPAD`
-//! mode branches. Mirrors zed's `crates/terminal/src/mappings/keys.rs` but
-//! is hand-written for the manox subset.
+//! mode branches. Hand-written for the manox subset.
 //!
 //! Coverage: enter/backspace/tab/escape/space, arrows + home/end with
 //! xterm modifier suffixes, page up/down/insert/delete, F1–F12, and the
