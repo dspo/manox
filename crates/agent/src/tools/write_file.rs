@@ -43,7 +43,7 @@ impl AgentTool for WriteFileTool {
         &self,
         input: serde_json::Value,
         _cancel: CancellationToken,
-        _ctx: &dyn crate::tool::ToolContext,
+        ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<WriteFileInput>(input) else {
@@ -53,8 +53,19 @@ impl AgentTool for WriteFileTool {
             Ok(p) => p,
             Err(e) => return cx.background_spawn(async move { Err(e) }),
         };
+        let owner = ctx.agent_label().to_string();
         let content_len = parsed.content.len();
         cx.background_spawn(async move {
+            let _lock = match crate::tools::file_lock::try_acquire(&path, &owner) {
+                Ok(g) => g,
+                Err(held) => {
+                    return Err(format!(
+                        "write_file blocked: {} is being written by {}; coordinate write ranges or retry shortly",
+                        path.display(),
+                        held.owner
+                    ));
+                }
+            };
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }

@@ -7,7 +7,7 @@
 //!
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -33,7 +33,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{PopupMenu, PopupMenuItem},
-    tab::TabBar,
+    tab::{Tab, TabBar},
     tag::{Tag, TagVariant},
     v_flex,
 };
@@ -46,6 +46,7 @@ use crate::views::centered;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
 };
+use crate::views::member_panel::MemberPanel;
 use crate::views::plugin_manager::{PluginManagerEvent, PluginManagerView};
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
@@ -55,6 +56,15 @@ use crate::{
 };
 use terminal::Terminal;
 use terminal_ui::TerminalView;
+
+/// A tab in the right observation pane. `Editor` is the markdown composer
+/// (Write/Preview); `Member(name)` is a read-only [`MemberPanel`] over a team
+/// worker's conversation + tasks.
+#[derive(Clone, Debug)]
+enum RightTab {
+    Editor,
+    Member(String),
+}
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
 ///
@@ -117,8 +127,20 @@ pub struct Workspace {
     /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
     /// rendered markdown preview (`Markdown`).
     editor_state: Entity<InputState>,
+    /// Whether the Editor tab is the active right-pane tab. Drives the inline
+    /// composer hide (writing happens in the side panel) and the env/hero
+    /// gates. A member tab being active leaves this `false` so the inline
+    /// composer stays usable for talking to the leader.
     editor_open: bool,
     editor_preview: bool,
+    /// Right-pane tabs: the markdown Editor plus one Member tab per observed
+    /// worker. The pane renders while non-empty; `editor_open` tracks whether
+    /// the Editor tab specifically is active.
+    right_tabs: Vec<RightTab>,
+    active_right_tab: usize,
+    /// Lazily-built MemberPanel entities, keyed by member name. A member tab
+    /// keeps its panel across tab switches; dropped when the tab closes.
+    member_panels: BTreeMap<String, Entity<MemberPanel>>,
     /// Editor pane width, driven by dragging the divider. In-memory only.
     editor_width: Pixels,
     /// Sidebar width, driven by dragging the divider on its right edge.
@@ -214,6 +236,10 @@ pub struct Workspace {
     /// Whether the goal status popover is open (toggled by the `◎ /goal active`
     /// chip or the bare `/goal` command).
     goal_popover_open: bool,
+    /// Whether the team roster drawer is open (toggled by the `👥 team · N`
+    /// chip when the leader has formed a team). Each row opens that member's
+    /// observation tab in the right pane.
+    team_chip_open: bool,
     /// Generation counter for the goal elapsed-time ticker. Incremented when a
     /// goal is cleared or the active thread changes so the prior ticker
     /// self-terminates instead of notifying a stale chip. Mirrors
@@ -370,6 +396,9 @@ impl Workspace {
             editor_state,
             editor_open: false,
             editor_preview: false,
+            right_tabs: Vec::new(),
+            active_right_tab: 0,
+            member_panels: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
             pending_auths: Vec::new(),
@@ -411,6 +440,7 @@ impl Workspace {
             exiting_settings: false,
             settings_transition_gen: 0,
             goal_popover_open: false,
+            team_chip_open: false,
             goal_ticker_gen: 0,
             settings_view: None,
             settings_sub: None,
@@ -1394,25 +1424,54 @@ impl Workspace {
     }
 
     fn toggle_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.editor_open {
-            self.open_editor(window, cx);
-        } else {
+        if self.editor_open {
             self.close_editor(window, cx);
+        } else {
+            self.open_editor(window, cx);
         }
     }
 
-    /// Open the markdown editor: hide the inline composer and transfer its draft
-    /// text into the editor so writing continues there. Submit from the editor
-    /// with Cmd-Enter; close with Ctrl-G / Cmd-W to move the draft back.
-    fn open_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor_open {
-            return;
+    /// Whether the right pane has any tab (Editor or Member) showing.
+    fn right_pane_open(&self) -> bool {
+        !self.right_tabs.is_empty()
+    }
+
+    /// Index of the Editor tab, if present.
+    fn editor_tab_ix(&self) -> Option<usize> {
+        self.right_tabs
+            .iter()
+            .position(|t| matches!(t, RightTab::Editor))
+    }
+
+    /// Make `ix` the active right-pane tab and sync `editor_open` to whether it
+    /// is the Editor tab (the Editor tab hides the inline composer; a Member
+    /// tab leaves it usable).
+    fn set_active_right_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.right_tabs.len() {
+            self.active_right_tab = ix;
         }
+        self.editor_open = self
+            .right_tabs
+            .get(self.active_right_tab)
+            .is_some_and(|t| matches!(t, RightTab::Editor));
+        cx.notify();
+    }
+
+    /// Open the markdown editor: hide the inline composer and transfer its draft
+    /// into the editor so writing continues there. If an Editor tab is already
+    /// present, just focus it. Submit from the editor with Cmd-Enter; close with
+    /// Ctrl-G / Cmd-W to move the draft back.
+    fn open_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Close any open inline menus so they don't linger behind the hidden footer.
         self.close_slash_menu();
         self.close_plus_menu();
+        if let Some(ix) = self.editor_tab_ix() {
+            self.set_active_right_tab(ix, cx);
+            return;
+        }
         let draft = self.input_state.read(cx).value().to_string();
-        self.editor_open = true;
+        self.right_tabs.push(RightTab::Editor);
+        let ix = self.right_tabs.len() - 1;
         self.editor_preview = false;
         self.editor_state.update(cx, |s, cx| {
             s.set_value(draft, window, cx);
@@ -1420,17 +1479,17 @@ impl Workspace {
         });
         self.input_state
             .update(cx, |s, cx| s.set_value("", window, cx));
-        cx.notify();
+        self.set_active_right_tab(ix, cx);
     }
 
-    /// Close the markdown editor without submitting: move the draft back into the
-    /// inline composer and reveal it again.
+    /// Close the Editor tab without submitting: move the draft back into the
+    /// inline composer and reveal it again. No-op when no Editor tab is present.
     fn close_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.editor_open {
+        let Some(ix) = self.editor_tab_ix() else {
             return;
-        }
+        };
         let draft = self.editor_state.read(cx).value().to_string();
-        self.editor_open = false;
+        self.right_tabs.remove(ix);
         self.editor_preview = false;
         self.input_state.update(cx, |s, cx| {
             s.set_value(draft, window, cx);
@@ -1438,7 +1497,75 @@ impl Workspace {
         });
         self.editor_state
             .update(cx, |s, cx| s.set_value("", window, cx));
+        if self.active_right_tab >= self.right_tabs.len() {
+            self.active_right_tab = self.right_tabs.len().saturating_sub(1);
+        }
+        self.editor_open = self
+            .right_tabs
+            .get(self.active_right_tab)
+            .is_some_and(|t| matches!(t, RightTab::Editor));
         cx.notify();
+    }
+
+    /// Focus a member's observation tab, creating it if absent. The panel is
+    /// built from the member's `Thread` + role, read off the leader's active
+    /// team; no-op if no team or no such member.
+    fn open_member_tab(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self
+            .right_tabs
+            .iter()
+            .position(|t| matches!(t, RightTab::Member(n) if n == name))
+        {
+            self.set_active_right_tab(ix, cx);
+            return;
+        }
+        let Some(team) = self.thread.read(cx).team().cloned() else {
+            return;
+        };
+        let Some(member_thread) = team.read(cx).thread_for(name).cloned() else {
+            return;
+        };
+        let role = team
+            .read(cx)
+            .members()
+            .get(name)
+            .map(|m| m.role().to_string())
+            .unwrap_or_else(|| name.to_string());
+        let weak = cx.weak_entity();
+        let panel = MemberPanel::new(
+            member_thread,
+            name.to_string(),
+            role,
+            team.downgrade(),
+            weak,
+            cx,
+        );
+        self.member_panels.insert(name.to_string(), panel);
+        self.right_tabs.push(RightTab::Member(name.to_string()));
+        let ix = self.right_tabs.len() - 1;
+        self.set_active_right_tab(ix, cx);
+    }
+
+    /// Close a right-pane tab by index. The Editor tab routes through
+    /// `close_editor` to preserve draft-transfer semantics; a Member tab drops
+    /// its panel.
+    fn close_right_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.right_tabs.get(ix), Some(RightTab::Editor)) {
+            self.close_editor(window, cx);
+            return;
+        }
+        if let Some(RightTab::Member(name)) = self.right_tabs.get(ix).cloned() {
+            self.right_tabs.remove(ix);
+            self.member_panels.remove(&name);
+            if self.active_right_tab >= self.right_tabs.len() {
+                self.active_right_tab = self.right_tabs.len().saturating_sub(1);
+            }
+            self.editor_open = self
+                .right_tabs
+                .get(self.active_right_tab)
+                .is_some_and(|t| matches!(t, RightTab::Editor));
+            cx.notify();
+        }
     }
 
     /// Toggle the right-side composer between plain-text edit and rendered
@@ -1484,7 +1611,18 @@ impl Workspace {
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
-        self.editor_open = false;
+        // Drop the Editor tab (the turn is submitted); re-anchor to any
+        // surviving Member tab and clear the draft-backed editor state.
+        if let Some(ix) = self.editor_tab_ix() {
+            self.right_tabs.remove(ix);
+        }
+        if self.active_right_tab >= self.right_tabs.len() {
+            self.active_right_tab = self.right_tabs.len().saturating_sub(1);
+        }
+        self.editor_open = self
+            .right_tabs
+            .get(self.active_right_tab)
+            .is_some_and(|t| matches!(t, RightTab::Editor));
         self.editor_preview = false;
         self.input_state.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
@@ -2905,6 +3043,7 @@ impl Workspace {
         let worktree_chip = self.render_worktree_chip(theme, cx);
         let plan_chip = self.render_plan_chip(theme, cx);
         let goal_chip = self.render_goal_chip(theme, cx);
+        let team_chip = self.render_team_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
         let effort = self.render_reasoning_effort_selector(theme, cx);
         let model = self.render_model_selector(theme, cx);
@@ -2934,6 +3073,7 @@ impl Workspace {
                             .when_some(worktree_chip, |el, chip| el.child(chip))
                             .when_some(plan_chip, |el, chip| el.child(chip))
                             .when_some(goal_chip, |el, chip| el.child(chip))
+                            .when_some(team_chip, |el, chip| el.child(chip))
                             .child(access),
                     )
                     // Effort lives next to the model selector — both describe
@@ -3165,6 +3305,162 @@ impl Workspace {
     pub fn open_goal_popover(&mut self, cx: &mut Context<Self>) {
         self.goal_popover_open = true;
         cx.notify();
+    }
+
+    /// Team roster chip — shown only while the leader has formed a team. Renders
+    /// `👥 team · N` in accent colors; clicking opens a thin drawer listing
+    /// each worker member (name / role / status dot / task count). Clicking a
+    /// row opens that member's observation tab in the right pane. The leader is
+    /// not listed (it is the main conversation).
+    fn render_team_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let team = self.thread.read(cx).team().cloned()?;
+        // Collect member roster metadata in one pass so we never hold a borrow
+        // on the `Team` entity across the render closures below. `Member` is not
+        // `Clone`, so we lift only the cheap, 'static fields the rows need.
+        let (count, rows): (usize, Vec<(String, String, bool, usize)>) = {
+            let t = team.read(cx);
+            let members = t.members();
+            let tasks = t.tasks().read(cx).tasks();
+            let rows = members
+                .iter()
+                .map(|(name, m)| {
+                    let running = m.thread().read(cx).is_running();
+                    let owned = tasks
+                        .iter()
+                        .filter(|tk| tk.owner.as_deref() == Some(name.as_str()))
+                        .count();
+                    (name.clone(), m.role().to_string(), running, owned)
+                })
+                .collect();
+            (members.len(), rows)
+        };
+        let accent = theme.accent;
+        let muted = theme.muted_foreground;
+        let fg = theme.foreground;
+        let open = self.team_chip_open;
+        let label: SharedString = i18n::t_str("team-chip", &[("count", &count.to_string())]);
+
+        let trigger = h_flex()
+            .id("team-chip")
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .border_1()
+            .border_color(accent)
+            .cursor_pointer()
+            .child(Icon::new(IconName::User).xsmall().text_color(accent))
+            .child(gpui::div().text_xs().text_color(accent).child(label))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(muted),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                this.team_chip_open = !this.team_chip_open;
+                cx.notify();
+            }));
+
+        if !open {
+            return Some(trigger.into_any_element());
+        }
+
+        let title = i18n::t("team-drawer-title");
+        let empty = i18n::t("team-drawer-empty");
+
+        // Build a row per worker. The on_click opens (or focuses) that member's
+        // tab and closes the drawer. The row data is pre-collected above so the
+        // render closures only capture cheap, 'static data plus the workspace
+        // handle.
+        let roster = if rows.is_empty() {
+            v_flex()
+                .w_full()
+                .p_3()
+                .child(gpui::div().text_xs().text_color(muted).child(empty))
+        } else {
+            v_flex().w_full().gap_1().p_2().children(
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(ix, (name, role, running, owned))| {
+                        let dot_color = if running {
+                            theme.accent
+                        } else {
+                            theme.muted_foreground
+                        };
+                        let tasks_label =
+                            i18n::t_str("team-drawer-tasks", &[("count", &owned.to_string())]);
+                        let name_for_click = name.clone();
+                        h_flex()
+                            .id(("team-member-row", ix))
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded(theme.radius)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme.accent.opacity(0.08)))
+                            .child(gpui::div().w(px(8.)).h(px(8.)).rounded_full().bg(dot_color))
+                            .child(
+                                gpui::div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(fg)
+                                    .child(name),
+                            )
+                            .child(gpui::div().text_xs().text_color(muted).child(role))
+                            .child(gpui::div().flex_1())
+                            .child(gpui::div().text_xs().text_color(muted).child(tasks_label))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                                this.open_member_tab(&name_for_click, cx);
+                                this.team_chip_open = false;
+                                cx.notify();
+                            }))
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let popover = v_flex()
+            .w_full()
+            .gap_1()
+            .p_2()
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(accent)
+                    .child(title),
+            )
+            .child(roster);
+
+        Some(
+            gpui::div()
+                .relative()
+                .child(trigger)
+                .child(
+                    gpui::div()
+                        .id("team-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .left_0()
+                        .occlude()
+                        .w(px(320.))
+                        .popover_style(cx)
+                        .child(popover)
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.team_chip_open = false;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -3997,6 +4293,7 @@ impl Render for Workspace {
             .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
 
         let editor_open = self.editor_open;
+        let right_pane_open = !self.right_tabs.is_empty();
         let editor_preview = self.editor_preview;
         let editor_width = self.editor_width;
         // Title text is the active thread's display title (user rename > LLM
@@ -4191,6 +4488,47 @@ impl Render for Workspace {
                     }
                 }),
             );
+        // Right pane is a tab container: one Editor slot (the markdown
+        // scratchpad) plus one slot per team member (a MemberPanel). The
+        // top-level TabBar is built from `right_tabs`; the content below
+        // dispatches on the active tab.
+        let active_tab = self.right_tabs.get(self.active_right_tab).cloned();
+        let right_tab_children: Vec<Tab> = self
+            .right_tabs
+            .iter()
+            .enumerate()
+            .map(|(ix, tab)| {
+                let base = match tab {
+                    RightTab::Editor => Tab::new().label(i18n::t("member-editor-tab")),
+                    RightTab::Member(name) => {
+                        Tab::new().label(i18n::t_str("member-tab", &[("name", name)]))
+                    }
+                };
+                // Only member tabs carry a close affordance; the Editor tab
+                // keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
+                match tab {
+                    RightTab::Member(_) => base.suffix(
+                        gpui::div()
+                            .id(("right-tab-close", ix))
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(IconName::Close)
+                                    .xsmall()
+                                    .text_color(theme.muted_foreground),
+                            )
+                            // Stop the click from also selecting the tab
+                            // underneath the ×.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_right_tab(ix, window, cx);
+                            })),
+                    ),
+                    RightTab::Editor => base,
+                }
+            })
+            .collect();
         let editor_pane = v_flex()
             .w(editor_width)
             .h_full()
@@ -4198,50 +4536,78 @@ impl Render for Workspace {
             .bg(theme.background)
             .child(
                 h_flex().w_full().px_2().pt_1().child(
-                    TabBar::new("editor-tabs")
+                    TabBar::new("right-tabs")
                         .underline()
                         .small()
-                        .selected_index(if editor_preview { 1 } else { 0 })
-                        .on_click(cx.listener(|this, ix: &usize, window, cx| {
-                            this.set_editor_preview(*ix == 1, window, cx);
+                        .selected_index(self.active_right_tab)
+                        .on_click(cx.listener(|this, ix: &usize, _window, cx| {
+                            this.set_active_right_tab(*ix, cx);
                         }))
-                        .child("Write")
-                        .child("Preview"),
+                        .children(right_tab_children),
                 ),
             )
             .child(
                 gpui::div()
-                    .id("editor-content")
+                    .id("right-pane-content")
                     .w_full()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(if editor_preview {
-                        // Markdown re-parses mdast and re-lays-out every frame,
-                        // so a pane resize re-wraps at the new width with no
-                        // cached tree to go stale; a stable id keeps the scroll
-                        // position across the resize.
-                        v_flex()
+                    .child(match active_tab {
+                        Some(RightTab::Editor) => v_flex()
                             .h_full()
-                            .p_4()
-                            .text_sm()
                             .child(
-                                gpui::div().h_full().child(
-                                    Markdown::new(
-                                        "editor-preview",
-                                        self.editor_state.read(cx).value().to_string(),
-                                    )
-                                    .theme(cx.theme())
-                                    .selectable(true)
-                                    .scrollable(true),
+                                h_flex().w_full().px_2().child(
+                                    TabBar::new("editor-write-preview")
+                                        .underline()
+                                        .small()
+                                        .selected_index(if editor_preview { 1 } else { 0 })
+                                        .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                                            this.set_editor_preview(*ix == 1, window, cx);
+                                        }))
+                                        .child("Write")
+                                        .child("Preview"),
                                 ),
                             )
-                            .into_any_element()
-                    } else {
-                        Input::new(&self.editor_state)
-                            .size_full()
-                            .appearance(false)
-                            .into_any_element()
+                            .child(
+                                gpui::div()
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_hidden()
+                                    .child(if editor_preview {
+                                        // Markdown re-parses mdast and re-lays-out every
+                                        // frame, so a pane resize re-wraps at the new width
+                                        // with no cached tree to go stale; a stable id keeps
+                                        // the scroll position across the resize.
+                                        gpui::div()
+                                            .h_full()
+                                            .p_4()
+                                            .text_sm()
+                                            .child(
+                                                Markdown::new(
+                                                    "editor-preview",
+                                                    self.editor_state.read(cx).value().to_string(),
+                                                )
+                                                .theme(cx.theme())
+                                                .selectable(true)
+                                                .scrollable(true),
+                                            )
+                                            .into_any_element()
+                                    } else {
+                                        Input::new(&self.editor_state)
+                                            .size_full()
+                                            .appearance(false)
+                                            .into_any_element()
+                                    }),
+                            )
+                            .into_any_element(),
+                        Some(RightTab::Member(name)) => self
+                            .member_panels
+                            .get(&name)
+                            .map(|p| p.clone().into_any_element())
+                            .unwrap_or_else(|| gpui::div().into_any_element()),
+                        None => gpui::div().into_any_element(),
                     }),
             );
 
@@ -4443,7 +4809,7 @@ impl Render for Workspace {
                     // the editor pane is open, and until the thread has interacted.
                     .children(show_env.then(|| self.render_environment_panel(&theme, cx)))
             })
-            .when(editor_open, |this| {
+            .when(right_pane_open, |this| {
                 this.child(editor_divider).child(editor_pane)
             })
             .on_drag_move(cx.listener(
@@ -4476,7 +4842,7 @@ impl Render for Workspace {
                     // Clamp so the main column (and the editor pane when
                     // open) always retain at least `MAIN_MIN_WIDTH`.
                     let new_w = e.event.position.x - e.bounds.left();
-                    let editor_reserve = if this.editor_open {
+                    let editor_reserve = if this.right_pane_open() {
                         this.editor_width + px(EDITOR_DIVIDER_WIDTH)
                     } else {
                         px(0.)

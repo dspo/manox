@@ -192,6 +192,11 @@ pub enum ThreadEvent {
         reason: String,
         evaluations: u32,
     },
+    /// A peer message was delivered to this thread from another team member.
+    /// Rendered as a `💬 from {name}` bubble, distinct from user/assistant
+    /// turns. The thread also received a user-role message carrying the same
+    /// content (so the model sees it); this event is the UI-side mirror.
+    PeerMessage { from: String, content: String },
 }
 
 /// UI metadata for a pending tool-call authorization. Stored alongside the
@@ -258,6 +263,12 @@ pub struct Thread {
     /// persisted: a worktree is an ephemeral isolation context, not part of
     /// the thread record.
     worktree: Option<WorktreeState>,
+    /// Active agents team, if this thread leads one. `None` for plain main
+    /// threads without a team and for `agent`-spawned sub-agents. The leader
+    /// thread owns the `Entity<Team>`; worker members are tracked inside it.
+    /// Not persisted — a team is session-scoped coordination, not a recoverable
+    /// conversation, so a reloaded thread always starts teamless.
+    team: Option<Entity<crate::team::Team>>,
     /// tool_uses collected during the current turn, processed after the stream ends.
     pending_tool_uses: Vec<LanguageModelToolUse>,
     /// Pending authorizations for THIS thread's own tool calls, keyed by
@@ -277,6 +288,11 @@ pub struct Thread {
     system: Option<String>,
     /// Nesting depth. Main thread = 0; a sub-agent = parent depth + 1.
     depth: u32,
+    /// Human-readable owner label: "lead" for the main thread, the
+    /// subagent_type for an `agent`-spawned sub-agent, the member name for a
+    /// team member. Surfaces as the write-lock owner so conflict errors name
+    /// the agent holding a file.
+    agent_label: String,
     /// Max agentic turns before a sub-agent is force-stopped. `None` = unlimited.
     max_turns: Option<u32>,
     /// Completed round-trips in the current turn, for `max_turns` enforcement.
@@ -496,12 +512,14 @@ impl Thread {
                 cwd,
                 project: None,
                 worktree: None,
+                team: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
                 depth: 0,
+                agent_label: "lead".to_string(),
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
@@ -571,12 +589,14 @@ impl Thread {
                 cwd,
                 project,
                 worktree: None,
+                team: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
                 depth: rec.depth as u32,
+                agent_label: "lead".to_string(),
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
@@ -633,6 +653,7 @@ impl Thread {
         system: String,
         max_turns: u32,
         depth: u32,
+        agent_label: String,
         tools_fn: impl FnOnce(WeakEntity<Self>) -> ToolRegistry,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -649,12 +670,14 @@ impl Thread {
                 cwd,
                 project: None,
                 worktree: None,
+                team: None,
                 pending_tool_uses: Vec::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: Some(system),
                 depth,
+                agent_label,
                 max_turns: Some(max_turns),
                 turn_count: 0,
                 cap_summary_injected: false,
@@ -893,6 +916,61 @@ impl Thread {
 
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    pub fn agent_label(&self) -> &str {
+        &self.agent_label
+    }
+
+    /// The active team this thread leads, if any. `None` for non-team threads.
+    pub fn team(&self) -> Option<&Entity<crate::team::Team>> {
+        self.team.as_ref()
+    }
+
+    /// Attach a team this thread leads. Called by `team_create`. Does not
+    /// touch the tool registry — team tools are advertised from the start and
+    /// no-op until a team exists, so the request-tool prefix is unaffected.
+    pub fn set_team(&mut self, team: Entity<crate::team::Team>, cx: &mut Context<Self>) {
+        self.team = Some(team);
+        cx.notify();
+    }
+
+    /// Detach the team. `team_disband` calls this on the leader and on every
+    /// member to break the team↔member strong cycle before the roster drops.
+    pub fn clear_team(&mut self, cx: &mut Context<Self>) {
+        self.team = None;
+        cx.notify();
+    }
+
+    /// Deliver peer messages: append each as a user-role message, emit a
+    /// `PeerMessage` event per message (UI mirror), then start one turn so the
+    /// model sees them together. An empty slice is a no-op so unrelated
+    /// callers don't synthesize a turn. The `[from {name}]:` prefix is
+    /// append-only, so per-thread prefix-cache stability holds.
+    pub fn deliver_peer_messages(
+        &mut self,
+        msgs: Vec<crate::team::PeerMessage>,
+        cx: &mut Context<Self>,
+    ) {
+        if msgs.is_empty() {
+            return;
+        }
+        for msg in &msgs {
+            self.insert_user_message(format!("[from {}]: {}", msg.from, msg.content), cx);
+            cx.emit(ThreadEvent::PeerMessage {
+                from: msg.from.clone(),
+                content: msg.content.clone(),
+            });
+        }
+        self.run_turn(cx);
+    }
+
+    /// Test-only: occupy or clear the `running_turn` slot to simulate a busy
+    /// vs idle thread in routing tests (the team router branches on
+    /// `is_running`, which reads this field).
+    #[cfg(test)]
+    pub(crate) fn set_running_turn_for_test(&mut self, t: Option<Task<()>>) {
+        self.running_turn = t;
     }
 
     /// Whether this thread is currently in plan mode.
@@ -1689,6 +1767,28 @@ impl Thread {
             self.finalize_request_usage();
             cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
             cx.notify();
+        }
+
+        // A leader cancel propagates to every worker member: their in-flight
+        // turns are part of the same coordinated effort, so stopping the leader
+        // must not leave members running. Only the main thread (depth 0) is a
+        // team leader — a worker's own Stop must not cascade to siblings.
+        // Collect the handles first, then update — `Entity::update` needs
+        // `&mut App`, which a live `team.read` guard would block. A member's own
+        // `cancel` unwinds its nested sub-agent turns via its `turn_cancel`
+        // select! arms, so one level suffices.
+        if self.depth == 0
+            && let Some(team) = self.team.clone()
+        {
+            let members: Vec<gpui::Entity<Thread>> = team
+                .read(cx)
+                .members()
+                .values()
+                .map(|m| m.thread().clone())
+                .collect();
+            for m in members {
+                m.update(cx, |t, cx| t.cancel(cx));
+            }
         }
     }
 
@@ -3405,7 +3505,59 @@ mod tests {
         });
     }
 
-    /// Regression: `run_plan_approval` Approve branch must append the
+    /// A leader `cancel` propagates to every worker member: their in-flight
+    /// turns are part of the same coordinated effort, so stopping the leader
+    /// must not leave members running. A worker's own `cancel` does NOT
+    /// cascade to siblings (only depth-0 threads propagate).
+    #[test]
+    fn leader_cancel_propagates_to_team_members() {
+        use crate::team::{Member, Team};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+
+        let (leader, member, team, member_token) = cx.update(|cx| {
+            let leader = super::Thread::restore(
+                crate::db::ThreadRecord::for_test("lead", "/tmp", Vec::new()),
+                None,
+                cx,
+            );
+            let mut member_rec = crate::db::ThreadRecord::for_test("plan", "/tmp", Vec::new());
+            member_rec.depth = 1;
+            let member = super::Thread::restore(member_rec, None, cx);
+            let team = Team::new("squad".into(), leader.downgrade(), cx);
+            team.update(cx, |t, cx| {
+                t.insert_member(
+                    Member::new("plan".into(), "explorer".into(), member.clone()),
+                    cx,
+                )
+            })
+            .unwrap();
+            leader.update(cx, |t, cx| t.set_team(team.clone(), cx));
+            let token = tokio_util::sync::CancellationToken::new();
+            let clone = token.clone();
+            member.update(cx, |t, _| {
+                t.turn_cancel = Some(clone);
+            });
+            (leader, member, team, token)
+        });
+
+        // Cancel the leader. Its depth-0 gate trips the propagation path, which
+        // calls `cancel` on every member thread.
+        cx.update(|cx| {
+            leader.update(cx, |t, cx| t.cancel(cx));
+        });
+        cx.run_until_parked();
+
+        assert!(member_token.is_cancelled(), "member turn token cancelled");
+        assert!(
+            cx.update(|cx| member.read(cx).turn_cancel.is_none()),
+            "member turn_cancel taken"
+        );
+        // `_team` is held for the assertion lifetime; drop after.
+        drop(team);
+    }
+
     /// ToolResult to the message list BEFORE clearing `plan_mode`. The old
     /// code set `plan_mode = false` first; if `append_tool_result` then
     /// failed (entity gone, infra error), the thread would exit plan mode

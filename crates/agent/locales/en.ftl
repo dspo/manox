@@ -35,6 +35,24 @@ sidebar-time-weeks = { $count ->
 message-reasoning = Reasoning
 message-error = Error
 message-notice = Notice
+message-team = Team message
+member-running = running
+member-idle = idle
+member-disbanded = gone
+member-tasks = Tasks
+member-tasks-mine = Mine
+member-tasks-unassigned = Unassigned
+member-no-tasks = No tasks
+member-tab = { $name }
+member-editor-tab = Editor
+member-close-tab = Close tab
+team-chip = team · { $count }
+team-drawer-title = Team
+team-drawer-empty = No members
+team-drawer-tasks = { $count ->
+    [one] { $count } task
+   *[other] { $count } tasks
+}
 message-user-role = You
 recap-card-title = Context compacted
 retry-badge = Retrying… { $attempt }/{ $max } · { $secs }s

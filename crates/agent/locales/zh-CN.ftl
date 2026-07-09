@@ -22,6 +22,24 @@ sidebar-time-weeks = {$count} 周前
 message-reasoning = 思考
 message-error = 错误
 message-notice = 通知
+message-team = 团队消息
+member-running = 运行中
+member-idle = 空闲
+member-disbanded = 已离线
+member-tasks = 任务
+member-tasks-mine = 我的
+member-tasks-unassigned = 未分配
+member-no-tasks = 暂无任务
+member-tab = { $name }
+member-editor-tab = 编辑器
+member-close-tab = 关闭标签页
+team-chip = 团队 · { $count }
+team-drawer-title = 团队
+team-drawer-empty = 暂无成员
+team-drawer-tasks = { $count ->
+    [one] { $count } 个任务
+   *[other] { $count } 个任务
+}
 message-user-role = 你
 recap-card-title = 上下文已压缩
 retry-badge = 重试中… { $attempt }/{ $max } · { $secs }秒

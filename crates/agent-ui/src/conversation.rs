@@ -96,6 +96,15 @@ pub enum ConvItem {
         max_attempts: u32,
         delay_secs: u64,
     },
+    /// A peer message from a team member (or the leader) — `send_message` /
+    /// broadcast delivery routed through `ThreadEvent::PeerMessage`. The `from`
+    /// is a member name (data); `content` is the peer's own message body
+    /// (model-generated, left verbatim). Rendered as a distinct bubble so team
+    /// chatter reads apart from the user/assistant thread.
+    TeamMessage {
+        from: String,
+        content: String,
+    },
 }
 
 /// A tool-call item, tracking status/output by id.
@@ -606,6 +615,21 @@ impl ConversationState {
                 let ix = self.items.len();
                 self.items.push(cx.new(|_| {
                     MessageItem::new(ConvItem::Error(e.to_string()), role.to_string(), ix, weak)
+                }));
+                ApplyOutcome::Appended
+            }
+            ThreadEvent::PeerMessage { from, content } => {
+                let ix = self.items.len();
+                self.items.push(cx.new(|_| {
+                    MessageItem::new(
+                        ConvItem::TeamMessage {
+                            from: from.clone(),
+                            content: content.clone(),
+                        },
+                        role.to_string(),
+                        ix,
+                        weak,
+                    )
                 }));
                 ApplyOutcome::Appended
             }
