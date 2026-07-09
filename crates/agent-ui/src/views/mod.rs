@@ -1,6 +1,7 @@
 //! View rendering layer for the conversation.
 
 pub mod composer_menu;
+pub mod member_panel;
 pub mod message;
 pub mod outline;
 pub mod plugin_manager;
