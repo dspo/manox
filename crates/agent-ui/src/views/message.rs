@@ -30,7 +30,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
-use manox_components::markdown::Markdown;
+use manox_components::markdown::{HeadingMode, Markdown};
 
 use crate::Workspace;
 use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage};
@@ -75,6 +75,7 @@ fn markdown_tv(
         .theme(theme)
         .selectable(true)
         .scrollable(scrollable)
+        .heading_mode(HeadingMode::Uniform)
         .into_any_element()
 }
 
@@ -406,6 +407,7 @@ fn render_text_body(
         .theme(theme)
         .selectable(true)
         .streaming(streaming)
+        .heading_mode(HeadingMode::Uniform)
         .into_any_element()
 }
 

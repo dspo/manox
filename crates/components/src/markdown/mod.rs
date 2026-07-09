@@ -55,6 +55,7 @@ pub struct Markdown {
     styles: Option<MdStyles>,
     scrollable: bool,
     streaming: bool,
+    heading_mode: HeadingMode,
 }
 
 impl Markdown {
@@ -65,6 +66,7 @@ impl Markdown {
             styles: None,
             scrollable: false,
             streaming: false,
+            heading_mode: HeadingMode::default(),
         }
     }
 
@@ -92,6 +94,15 @@ impl Markdown {
     /// cursor, and the full markdown layout mounts once when the stream ends.
     pub fn streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
+        self
+    }
+
+    /// How headings map depth to style. `Scaled` (default) grows the font with
+    /// depth; `Uniform` holds every heading at body size and discriminates
+    /// levels by weight + decoration, for dense mounts like the message list
+    /// where enlarged heading text would drown the body.
+    pub fn heading_mode(mut self, mode: HeadingMode) -> Self {
+        self.heading_mode = mode;
         self
     }
 }
@@ -135,21 +146,21 @@ impl IntoElement for Markdown {
             col = col.h_full().overflow_y_scroll();
         }
         for (i, block) in blocks.into_iter().enumerate() {
-            col = col.child(render_block(block, &styles, i));
+            col = col.child(render_block(block, &styles, self.heading_mode, i));
         }
         col.into_any_element()
     }
 }
 
-fn render_block(block: Block, styles: &MdStyles, idx: usize) -> AnyElement {
+fn render_block(block: Block, styles: &MdStyles, mode: HeadingMode, idx: usize) -> AnyElement {
     match block {
         Block::Paragraph(runs) => paragraph(&runs.text, &runs.highlights),
-        Block::Heading { runs, depth } => heading(&runs.text, &runs.highlights, depth),
+        Block::Heading { runs, depth } => heading(&runs, mode, depth),
         Block::Code { lang, value } => code_block(&value, lang.as_deref(), styles, idx),
         Block::Diff { value } => diff_block(&value, styles, idx),
         Block::Conflict { value } => conflict_block(&value, styles, idx),
-        Block::Blockquote(inner) => blockquote(inner, styles),
-        Block::List { ordered, items } => list_block(ordered, items, styles),
+        Block::Blockquote(inner) => blockquote(inner, styles, mode),
+        Block::List { ordered, items } => list_block(ordered, items, styles, mode),
         Block::Table { rows, align } => table_block(rows, align, styles, idx),
         Block::ThematicBreak => div()
             .w_full()
@@ -170,22 +181,116 @@ fn paragraph(text: &str, highlights: &[(Range<usize>, HighlightStyle)]) -> AnyEl
         .into_any_element()
 }
 
-/// Heading: bold (set in `ast::inline_of`) scaled by depth so H1–H3 grow and
-/// H4–H6 fall back to body size + bold. The base color is inherited from the
-/// parent div — same contract as `paragraph`, so streaming→finalized never
-/// recolors.
-fn heading(text: &str, highlights: &[(Range<usize>, HighlightStyle)], depth: u8) -> AnyElement {
-    let mut d = div().min_w_0().child(
-        StyledText::new(SharedString::from(text.to_string()))
-            .with_highlights(highlights.iter().cloned()),
-    );
-    d = match depth {
-        1 => d.text_xl(),
-        2 => d.text_lg(),
-        3 => d.text_base(),
-        _ => d.text_sm(),
+/// How a heading maps its depth to a renderable style. `Scaled` (default)
+/// grows the font with depth; `Uniform` holds every heading at body size and
+/// discriminates levels by weight + decoration, for dense mounts like the
+/// message list where enlarged heading text would drown the body.
+#[derive(Clone, Copy, Default)]
+pub enum HeadingMode {
+    #[default]
+    Scaled,
+    Uniform,
+}
+
+/// Per-depth heading style, mode-derived. Pure data the renderer applies
+/// uniformly — the renderer holds no per-depth branching, so a new mode is a
+/// new `spec` function rather than a parallel render path.
+#[derive(Clone, Copy)]
+struct HeadingSpec {
+    weight: FontWeight,
+    italic: bool,
+    underline: bool,
+    space_after: bool,
+    size: HeadingSize,
+}
+
+#[derive(Clone, Copy)]
+enum HeadingSize {
+    Xl,
+    Lg,
+    Base,
+    Sm,
+}
+
+impl HeadingSize {
+    fn apply<S: Styled>(self, s: S) -> S {
+        match self {
+            Self::Xl => s.text_xl(),
+            Self::Lg => s.text_lg(),
+            Self::Base => s.text_base(),
+            Self::Sm => s.text_sm(),
+        }
+    }
+}
+
+impl HeadingMode {
+    fn spec(self, depth: u8) -> HeadingSpec {
+        match self {
+            Self::Scaled => scaled_heading(depth),
+            Self::Uniform => uniform_heading(depth),
+        }
+    }
+}
+
+/// `Scaled`: H1–H3 step the font down from extra-large to base; H4+ fall back
+/// to body size. Every level is bold — weight does not discriminate depth.
+fn scaled_heading(depth: u8) -> HeadingSpec {
+    let size = match depth {
+        1 => HeadingSize::Xl,
+        2 => HeadingSize::Lg,
+        3 => HeadingSize::Base,
+        _ => HeadingSize::Sm,
     };
-    d.into_any_element()
+    HeadingSpec {
+        weight: FontWeight::BOLD,
+        italic: false,
+        underline: false,
+        space_after: false,
+        size,
+    }
+}
+
+/// `Uniform`: every heading stays at body size. Weight splits H1/H2 (black,
+/// 900) from H3+ (bold, 700); italic + underline mark H1 alone; space-after
+/// separates the three supported levels from the deeper ones that collapse to
+/// plain bold. So the six-level ladder compresses to three distinguishable
+/// levels without any line growing taller than the body.
+fn uniform_heading(depth: u8) -> HeadingSpec {
+    HeadingSpec {
+        weight: if depth <= 2 {
+            FontWeight::BLACK
+        } else {
+            FontWeight::BOLD
+        },
+        italic: depth == 1,
+        underline: depth == 1,
+        space_after: depth <= 3,
+        size: HeadingSize::Sm,
+    }
+}
+
+impl HeadingSpec {
+    fn apply<S: Styled>(self, s: S) -> S {
+        let s = self.size.apply(s);
+        let s = s.font_weight(self.weight);
+        let s = if self.italic { s.italic() } else { s };
+        let s = if self.underline { s.underline() } else { s };
+        if self.space_after { s.mb_2() } else { s }
+    }
+}
+
+/// Heading: the depth-to-style mapping lives in `HeadingMode::spec` (pure data
+/// the renderer applies), so this function is mode-agnostic. The base color is
+/// inherited from the parent div — same contract as `paragraph`, so
+/// streaming→finalized never recolors.
+fn heading(runs: &InlineRuns, mode: HeadingMode, depth: u8) -> AnyElement {
+    mode.spec(depth)
+        .apply(div().min_w_0())
+        .child(
+            StyledText::new(SharedString::from(runs.text.clone()))
+                .with_highlights(runs.highlights.iter().cloned()),
+        )
+        .into_any_element()
 }
 
 /// Code block: line-number gutter (fixed during horizontal scroll) + a
@@ -478,7 +583,7 @@ fn conflict_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
         .into_any_element()
 }
 
-fn blockquote(inner: Vec<Block>, styles: &MdStyles) -> AnyElement {
+fn blockquote(inner: Vec<Block>, styles: &MdStyles, mode: HeadingMode) -> AnyElement {
     let mut col = v_flex()
         .w_full()
         .min_w_0()
@@ -487,7 +592,7 @@ fn blockquote(inner: Vec<Block>, styles: &MdStyles) -> AnyElement {
         .pl_3()
         .gap_2();
     for (i, block) in inner.into_iter().enumerate() {
-        col = col.child(render_block(block, styles, i));
+        col = col.child(render_block(block, styles, mode, i));
     }
     col.into_any_element()
 }
@@ -550,12 +655,17 @@ fn table_block(
         .into_any_element()
 }
 
-fn list_block(ordered: bool, items: Vec<ListItem>, styles: &MdStyles) -> AnyElement {
+fn list_block(
+    ordered: bool,
+    items: Vec<ListItem>,
+    styles: &MdStyles,
+    mode: HeadingMode,
+) -> AnyElement {
     let mut col = v_flex().w_full().min_w_0().gap_1();
     for (i, item) in items.into_iter().enumerate() {
         let mut item_col = v_flex().flex_1().min_w_0().gap_1();
         for (j, b) in item.blocks.into_iter().enumerate() {
-            item_col = item_col.child(render_block(b, styles, j));
+            item_col = item_col.child(render_block(b, styles, mode, j));
         }
         col = col.child(
             h_flex()
@@ -593,6 +703,51 @@ mod tests {
 
     fn styles() -> MdStyles {
         MdStyles::from_theme(&Theme::default())
+    }
+
+    #[test]
+    fn uniform_heading_compresses_six_levels_to_three() {
+        // H1: black weight + italic + underline + space-after, body size.
+        let h1 = HeadingMode::Uniform.spec(1);
+        assert_eq!(h1.weight, FontWeight::BLACK);
+        assert!(h1.italic && h1.underline && h1.space_after);
+        assert!(matches!(h1.size, HeadingSize::Sm));
+
+        // H2: black weight, no italic/underline, space-after.
+        let h2 = HeadingMode::Uniform.spec(2);
+        assert_eq!(h2.weight, FontWeight::BLACK);
+        assert!(!h2.italic && !h2.underline && h2.space_after);
+
+        // H3: bold weight, space-after.
+        let h3 = HeadingMode::Uniform.spec(3);
+        assert_eq!(h3.weight, FontWeight::BOLD);
+        assert!(!h3.italic && !h3.underline && h3.space_after);
+
+        // H4–H6 collapse to plain bold, no space-after — indistinguishable.
+        for depth in 4..=6 {
+            let h = HeadingMode::Uniform.spec(depth);
+            assert_eq!(h.weight, FontWeight::BOLD, "depth {depth}");
+            assert!(!h.italic && !h.underline && !h.space_after, "depth {depth}");
+            assert!(matches!(h.size, HeadingSize::Sm), "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn scaled_heading_steps_font_down_with_depth() {
+        assert!(matches!(HeadingMode::Scaled.spec(1).size, HeadingSize::Xl));
+        assert!(matches!(HeadingMode::Scaled.spec(2).size, HeadingSize::Lg));
+        assert!(matches!(
+            HeadingMode::Scaled.spec(3).size,
+            HeadingSize::Base
+        ));
+        // H4+ fall back to body size; every level is bold, none carries
+        // space-after (the gap-based layout already separates blocks).
+        for depth in 4..=6 {
+            let h = HeadingMode::Scaled.spec(depth);
+            assert!(matches!(h.size, HeadingSize::Sm), "depth {depth}");
+            assert_eq!(h.weight, FontWeight::BOLD, "depth {depth}");
+            assert!(!h.space_after, "depth {depth}");
+        }
     }
 
     #[test]

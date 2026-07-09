@@ -92,15 +92,10 @@ pub fn parse(src: &str, styles: &MdStyles) -> Vec<Block> {
 
 fn block_of(node: &Node, styles: &MdStyles) -> Option<Block> {
     match node {
-        Node::Paragraph(p) => Some(Block::Paragraph(inline_of(
-            &p.children,
-            styles,
-            false,
-            false,
-        ))),
+        Node::Paragraph(p) => Some(Block::Paragraph(inline_of(&p.children, styles))),
         Node::Heading(h) => Some(Block::Heading {
             depth: h.depth,
-            runs: inline_of(&h.children, styles, true, false),
+            runs: inline_of(&h.children, styles),
         }),
         Node::Code(c) => {
             if is_conflict(&c.value) {
@@ -155,9 +150,7 @@ fn block_of(node: &Node, styles: &MdStyles) -> Option<Block> {
                         tr.children
                             .iter()
                             .map(|cell| match cell {
-                                Node::TableCell(tc) => {
-                                    inline_of(&tc.children, styles, false, false)
-                                }
+                                Node::TableCell(tc) => inline_of(&tc.children, styles),
                                 _ => InlineRuns::default(),
                             })
                             .collect(),
@@ -201,15 +194,13 @@ fn is_conflict(value: &str) -> bool {
     open && close
 }
 
-fn inline_of(children: &[Node], styles: &MdStyles, bold: bool, italic: bool) -> InlineRuns {
+/// Inline emphasis (`**strong**`, `*em*`, `~~del~~`, `` `code` ``) is folded
+/// into the segment highlights here; the heading's own weight/italic/underline
+/// is applied by the renderer on the heading's div, so this collector stays
+/// emphasis-only and never bakes a base weight into a heading's plain text.
+fn inline_of(children: &[Node], styles: &MdStyles) -> InlineRuns {
     let mut runs = InlineRuns::default();
-    let active = ActiveStyle {
-        bold,
-        italic,
-        strikethrough: false,
-        code: false,
-    };
-    collect_inline(children, styles, active, &mut runs);
+    collect_inline(children, styles, ActiveStyle::default(), &mut runs);
     runs
 }
 
