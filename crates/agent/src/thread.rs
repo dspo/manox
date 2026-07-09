@@ -267,6 +267,11 @@ pub struct Thread {
     system: Option<String>,
     /// Nesting depth. Main thread = 0; a sub-agent = parent depth + 1.
     depth: u32,
+    /// Human-readable owner label: "lead" for the main thread, the
+    /// subagent_type for an `agent`-spawned sub-agent, the member name for a
+    /// team member. Surfaces as the write-lock owner so conflict errors name
+    /// the agent holding a file.
+    agent_label: String,
     /// Max agentic turns before a sub-agent is force-stopped. `None` = unlimited.
     max_turns: Option<u32>,
     /// Completed round-trips in the current turn, for `max_turns` enforcement.
@@ -492,6 +497,7 @@ impl Thread {
                 pending_child_auth: HashMap::new(),
                 system: None,
                 depth: 0,
+                agent_label: "lead".to_string(),
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
@@ -567,6 +573,7 @@ impl Thread {
                 pending_child_auth: HashMap::new(),
                 system: None,
                 depth: rec.depth as u32,
+                agent_label: "lead".to_string(),
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
@@ -623,6 +630,7 @@ impl Thread {
         system: String,
         max_turns: u32,
         depth: u32,
+        agent_label: String,
         tools_fn: impl FnOnce(WeakEntity<Self>) -> ToolRegistry,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -645,6 +653,7 @@ impl Thread {
                 pending_child_auth: HashMap::new(),
                 system: Some(system),
                 depth,
+                agent_label,
                 max_turns: Some(max_turns),
                 turn_count: 0,
                 cap_summary_injected: false,
@@ -878,6 +887,10 @@ impl Thread {
 
     pub fn depth(&self) -> u32 {
         self.depth
+    }
+
+    pub fn agent_label(&self) -> &str {
+        &self.agent_label
     }
 
     /// Whether this thread is currently in plan mode.

@@ -303,6 +303,7 @@ fn setup_child(
         system_prompt,
         max_turns,
         child_depth,
+        parsed.subagent_type.clone(),
         |weak| {
             build_child_registry_with_policy(
                 Arc::new(cwd_path.clone()),

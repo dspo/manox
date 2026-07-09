@@ -43,6 +43,11 @@ pub trait ToolContext {
     fn max_turns(&self) -> Option<u32>;
     fn turn_count(&self) -> u32;
     fn depth(&self) -> u32;
+    /// Human-readable label of the owning agent: "lead" for the main thread,
+    /// the subagent_type for an `agent`-spawned sub-agent, the member name for
+    /// a team member. Used as the write-lock owner so conflict errors name the
+    /// agent holding the file.
+    fn agent_label(&self) -> &str;
     /// Whether the owning thread is in YOLO / AutoReview mode (bash uses this
     /// to force the unsandboxed branch without a per-call escalation flag).
     fn yolo(&self) -> bool;
@@ -60,6 +65,7 @@ pub struct ToolContextSnapshot {
     max_turns: Option<u32>,
     turn_count: u32,
     depth: u32,
+    agent_label: String,
     yolo: bool,
 }
 
@@ -75,6 +81,7 @@ impl ToolContextSnapshot {
             max_turns: t.max_turns(),
             turn_count: t.turn_count(),
             depth: t.depth(),
+            agent_label: t.agent_label().to_string(),
             yolo: t.approval_mode() == crate::thread::ApprovalMode::Yolo,
         }
     }
@@ -101,6 +108,9 @@ impl ToolContext for ToolContextSnapshot {
     }
     fn depth(&self) -> u32 {
         self.depth
+    }
+    fn agent_label(&self) -> &str {
+        &self.agent_label
     }
     fn yolo(&self) -> bool {
         self.yolo

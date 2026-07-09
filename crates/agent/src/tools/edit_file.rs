@@ -70,7 +70,7 @@ impl AgentTool for EditFileTool {
         &self,
         input: serde_json::Value,
         _cancel: CancellationToken,
-        _ctx: &dyn crate::tool::ToolContext,
+        ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(parsed) = serde_json::from_value::<EditFileInput>(input) else {
@@ -78,12 +78,26 @@ impl AgentTool for EditFileTool {
         };
         let cwd = self.cwd.clone();
         let sandbox = self.sandbox.clone();
+        let owner = ctx.agent_label().to_string();
         cx.background_spawn(async move {
             let patches = crate::hashline::parse_patch(&parsed.patch).map_err(|e| e.to_string())?;
             let mut results: Vec<String> = Vec::new();
             for fp in patches {
                 let path = resolve_path_for_write(&fp.path, &cwd, &sandbox)?;
                 let path_display = path.display().to_string();
+                // Hold the write lock across read+patch+write so the TAG check
+                // and the write are a single critical section — a concurrent
+                // writer between read and write would stale the TAG and clobber.
+                let _lock =
+                    match crate::tools::file_lock::try_acquire(&path, &owner) {
+                        Ok(g) => g,
+                        Err(held) => {
+                            return Err(format!(
+                                "edit_file blocked: {} is being written by {}; re-read and retry",
+                                path_display, held.owner
+                            ));
+                        }
+                    };
                 let raw = std::fs::read_to_string(&path)
                     .map_err(|e| format!("edit_file read failed {path_display}: {e}"))?;
                 let had_bom = crate::hashline::has_bom(&raw);
