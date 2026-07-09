@@ -134,14 +134,18 @@ impl IntoElement for Markdown {
         // Root carries `text_sm` so the document is self-contained: every
         // block that does not override the size itself (paragraph, list item
         // bodies) inherits it, rather than depending on the caller's ancestor.
-        // No `w_full` / `min_w_0` / `overflow_hidden` on the root: in a
-        // max-content parent (the user-message bubble) `min_w_0` + clip would
-        // collapse the column's intrinsic width to min-content and the bubble
-        // to a one-character column. Width clipping and shrink-resistance are
-        // pushed down to the leaves that actually need them (code/diff/table
-        // carry their own `overflow_x_scroll` + `min_w_0`; paragraphs carry
-        // `min_w_0`), so the column root stays a plain content-sized stack.
-        let mut col = v_flex().id(id).gap_2().text_sm();
+        // The renderer is mounted inside full-width message blocks, so its root
+        // must participate in the same shrink-safe width chain. Otherwise GPUI
+        // may measure the content at min-content width and wrap ordinary text
+        // one glyph per line. Code, diff, and table blocks still own their
+        // horizontal overflow locally.
+        let mut col = v_flex()
+            .id(id)
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .gap_2()
+            .text_sm();
         if self.scrollable {
             col = col.h_full().overflow_y_scroll();
         }
@@ -172,7 +176,9 @@ fn render_block(block: Block, styles: &MdStyles, mode: HeadingMode, idx: usize) 
 
 fn paragraph(text: &str, highlights: &[(Range<usize>, HighlightStyle)]) -> AnyElement {
     div()
+        .w_full()
         .min_w_0()
+        .overflow_hidden()
         .text_sm()
         .child(
             StyledText::new(SharedString::from(text.to_string()))
@@ -285,7 +291,7 @@ impl HeadingSpec {
 /// streaming→finalized never recolors.
 fn heading(runs: &InlineRuns, mode: HeadingMode, depth: u8) -> AnyElement {
     mode.spec(depth)
-        .apply(div().min_w_0())
+        .apply(div().w_full().min_w_0().overflow_hidden())
         .child(
             StyledText::new(SharedString::from(runs.text.clone()))
                 .with_highlights(runs.highlights.iter().cloned()),

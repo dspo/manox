@@ -320,8 +320,13 @@ pub fn render_user(
                 .border_color(theme.accent.opacity(0.25))
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(gpui::div().min_w_0().child(SharedString::from(header)))
-                .child(gpui::div().flex_1())
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(SharedString::from(header)),
+                )
                 .child(copy_button_hoverable(
                     ix,
                     "copy-user",
@@ -341,6 +346,7 @@ pub fn render_user(
             gpui::div()
                 .w_full()
                 .min_w_0()
+                .overflow_hidden()
                 .px_3()
                 .py_2()
                 .text_sm()
