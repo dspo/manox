@@ -177,10 +177,19 @@ impl Render for MessageItem {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
+        let effort = self
+            .weak_workspace
+            .upgrade()
+            .map(|ws| {
+                let thread = ws.read(cx).thread.clone();
+                thread.read(cx).reasoning_effort().wire_value().to_string()
+            })
+            .unwrap_or_default();
         centered(render_item(
             &self.kind,
             self.id,
             &self.role,
+            &effort,
             &project,
             &theme,
             agent_ctx.as_ref(),
@@ -198,13 +207,16 @@ pub fn render_item(
     item: &ConvItem,
     ix: usize,
     role: &str,
+    effort: &str,
     project: &str,
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     match item {
-        ConvItem::User { text, images } => render_user(text, images, ix, role, project, theme),
+        ConvItem::User { text, images } => {
+            render_user(text, images, ix, role, effort, project, theme)
+        }
         ConvItem::Assistant {
             text,
             streaming,
@@ -283,52 +295,77 @@ pub fn render_user(
     images: &[UserImage],
     ix: usize,
     model: &str,
+    effort: &str,
     project: &str,
     theme: &Theme,
 ) -> gpui::AnyElement {
-    // Header label: "You", then " · {model}" / " · {project}" only when the
-    // field is non-empty — no placeholder text for missing metadata.
+    // Header label: role, then the model/effort/project metadata available at
+    // render time. Canonical messages do not currently carry per-message
+    // timestamps, so the frame only shows real metadata rather than placeholders.
     let mut header = i18n::t("message-user-role").to_string();
     if !model.is_empty() {
-        header.push_str(" · ");
+        header.push_str(" > ");
         header.push_str(model);
     }
-    if !project.is_empty() {
+    if !effort.is_empty() {
         header.push_str(" · ");
+        header.push_str(effort);
+    }
+    if !project.is_empty() {
+        header.push_str(" > ");
         header.push_str(project);
     }
-    let frame = theme.accent.opacity(0.85);
+    let frame = theme.accent;
+    let rail = px(2.);
 
     v_flex()
         .group(format!("user-{ix}"))
         .w_full()
         .min_w_0()
         .text_color(theme.foreground)
-        // Top frame: a metadata label embedded in the border line, matching a
-        // TUI turn frame rather than a generic card header.
+        // Top frame: rounded "door" lintel with the metadata embedded in the
+        // line. The body below has only left/right rails, keeping the bottom
+        // open rather than drawing a card.
         .child(
             h_flex()
                 .w_full()
                 .min_w_0()
-                .items_center()
+                .items_start()
                 .gap_1()
                 .text_xs()
                 .text_color(frame)
-                .child(gpui::div().w(px(14.)).h(px(1.)).bg(frame))
                 .child(
                     gpui::div()
-                        .max_w(px(360.))
+                        .w(px(18.))
+                        .h(px(13.))
+                        .border_t(rail)
+                        .border_l(rail)
+                        .rounded_tl(px(9.))
+                        .border_color(frame),
+                )
+                .child(
+                    gpui::div()
+                        .max_w(px(460.))
                         .min_w_0()
                         .truncate()
-                        .px_1p5()
-                        .py(px(1.))
-                        .rounded(px(3.))
+                        .px_2()
+                        .py(px(2.))
+                        .rounded(px(8.))
                         .bg(theme.background)
                         .border_1()
                         .border_color(frame)
                         .child(SharedString::from(header)),
                 )
-                .child(gpui::div().flex_1().min_w_0().h(px(1.)).bg(frame))
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(13.))
+                        .border_t(rail)
+                        .border_r(rail)
+                        .rounded_tr(px(9.))
+                        .border_color(frame),
+                )
                 .child(copy_button_hoverable(
                     ix,
                     "copy-user",
@@ -336,27 +373,27 @@ pub fn render_user(
                     text.to_string(),
                 )),
         )
-        .children(images.iter().map(|ui| {
-            gpui::img(ui.0.clone())
-                .max_w(px(280.))
-                .max_h(px(280.))
-                .rounded(theme.radius)
-                .object_fit(gpui::ObjectFit::ScaleDown)
-                .mx_3()
-        }))
         .child(
-            gpui::div()
+            v_flex()
                 .w_full()
                 .min_w_0()
                 .overflow_hidden()
-                .border_l_1()
-                .border_r_1()
-                .border_b_1()
+                .border_l(rail)
+                .border_r(rail)
                 .border_color(frame)
-                .bg(theme.accent.opacity(0.035))
-                .px_3()
-                .py_2()
+                .bg(theme.accent.opacity(0.045))
+                .px_4()
+                .pt_2()
+                .pb_3()
+                .gap_2()
                 .text_sm()
+                .children(images.iter().map(|ui| {
+                    gpui::img(ui.0.clone())
+                        .max_w(px(280.))
+                        .max_h(px(280.))
+                        .rounded(theme.radius)
+                        .object_fit(gpui::ObjectFit::ScaleDown)
+                }))
                 .child(markdown_tv(
                     ("user-text", ix),
                     text.to_string(),
@@ -1039,7 +1076,7 @@ pub fn render_agent_task(
                     .py_2()
                     .gap_1()
                     .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                        render_item(sitem, six, "agent", "", theme, agent_ctx, tool_ctx)
+                        render_item(sitem, six, "agent", "", "", theme, agent_ctx, tool_ctx)
                     })),
             );
         }
