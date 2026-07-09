@@ -24,6 +24,7 @@ pub struct ThreadSummary {
     pub title_override: Option<String>,
     pub model_id: String,
     pub provider_id: Option<String>,
+    pub approval_mode: i64,
     pub project: String,
     pub depth: i32,
     pub parent_id: Option<String>,
@@ -363,13 +364,13 @@ impl ThreadsDatabase {
     pub fn list(&self, include_archived: bool) -> Result<Vec<ThreadSummary>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let sql = if include_archived {
-            "SELECT id, summary, title, title_override, model_id, provider_id, project, depth,
+            "SELECT id, summary, title, title_override, model_id, provider_id, approval_mode, project, depth,
                     parent_id, archived, pinned, created_at, interacted_at, updated_at,
                     cumulative_input_tokens + cumulative_output_tokens
                         + cumulative_cache_creation_input_tokens + cumulative_cache_read_input_tokens
                     FROM threads ORDER BY pinned DESC, interacted_at DESC"
         } else {
-            "SELECT id, summary, title, title_override, model_id, provider_id, project, depth,
+            "SELECT id, summary, title, title_override, model_id, provider_id, approval_mode, project, depth,
                     parent_id, archived, pinned, created_at, interacted_at, updated_at,
                     cumulative_input_tokens + cumulative_output_tokens
                         + cumulative_cache_creation_input_tokens + cumulative_cache_read_input_tokens
@@ -384,15 +385,16 @@ impl ThreadsDatabase {
                 title_override: row.get(3)?,
                 model_id: row.get(4)?,
                 provider_id: row.get(5)?,
-                project: row.get(6)?,
-                depth: row.get(7)?,
-                parent_id: row.get(8)?,
-                archived: row.get::<_, i64>(9)? != 0,
-                pinned: row.get::<_, i64>(10)? != 0,
-                created_at: row.get(11)?,
-                interacted_at: row.get(12)?,
-                updated_at: row.get(13)?,
-                cumulative_total_tokens: row.get::<_, i64>(14)? as u64,
+                approval_mode: row.get(6)?,
+                project: row.get(7)?,
+                depth: row.get(8)?,
+                parent_id: row.get(9)?,
+                archived: row.get::<_, i64>(10)? != 0,
+                pinned: row.get::<_, i64>(11)? != 0,
+                created_at: row.get(12)?,
+                interacted_at: row.get(13)?,
+                updated_at: row.get(14)?,
+                cumulative_total_tokens: row.get::<_, i64>(15)? as u64,
             })
         })?;
         let mut out = Vec::new();

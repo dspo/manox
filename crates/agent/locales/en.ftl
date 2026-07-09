@@ -35,6 +35,7 @@ sidebar-time-weeks = { $count ->
 message-reasoning = Reasoning
 message-error = Error
 message-notice = Notice
+message-user-role = You
 recap-card-title = Context compacted
 retry-badge = Retrying… { $attempt }/{ $max } · { $secs }s
 message-omitted-prefix = …(earlier omitted)

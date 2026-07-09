@@ -1264,7 +1264,18 @@ impl Thread {
 
     /// Append a user message.
     pub fn insert_user_message(&mut self, text: String, cx: &mut Context<Self>) {
-        self.messages.push(Message::user(text));
+        self.insert_user_message_with_ui_metadata(text, None, cx);
+    }
+
+    pub fn insert_user_message_with_ui_metadata(
+        &mut self,
+        text: String,
+        ui: Option<crate::MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut message = Message::user(text);
+        message.ui = ui;
+        self.messages.push(message);
         cx.notify();
     }
 
@@ -1274,7 +1285,18 @@ impl Thread {
         content: Vec<MessageContent>,
         cx: &mut Context<Self>,
     ) {
-        self.messages.push(Message::user_with_content(content));
+        self.insert_user_message_with_content_and_ui_metadata(content, None, cx);
+    }
+
+    pub fn insert_user_message_with_content_and_ui_metadata(
+        &mut self,
+        content: Vec<MessageContent>,
+        ui: Option<crate::MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut message = Message::user_with_content(content);
+        message.ui = ui;
+        self.messages.push(message);
         cx.notify();
     }
 

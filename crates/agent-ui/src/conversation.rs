@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use agent::thread::ApprovalMode;
 use agent::{Message, ThreadEvent, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, WeakEntity};
 
@@ -21,12 +22,39 @@ use crate::views::message::{MessageItem, build_items};
 #[derive(Debug, Clone)]
 pub struct UserImage(pub Arc<gpui::Image>);
 
+#[derive(Debug, Clone)]
+pub struct UserTurnMeta {
+    pub timestamp: i64,
+    pub model_id: String,
+    pub approval_mode: Option<ApprovalMode>,
+}
+
+impl UserTurnMeta {
+    pub fn new(timestamp: i64, model_id: String, approval_mode: Option<ApprovalMode>) -> Self {
+        Self {
+            timestamp,
+            model_id,
+            approval_mode,
+        }
+    }
+
+    pub(crate) fn from_message(message: &Message) -> Self {
+        let ui = message.ui.as_ref();
+        Self {
+            timestamp: message.timestamp,
+            model_id: ui.and_then(|m| m.model_id.clone()).unwrap_or_default(),
+            approval_mode: ui.and_then(|m| m.approval_mode).map(ApprovalMode::from_i64),
+        }
+    }
+}
+
 /// A single renderable conversation item.
 #[derive(Debug, Clone)]
 pub enum ConvItem {
     User {
         text: String,
         images: Vec<UserImage>,
+        meta: Option<UserTurnMeta>,
     },
     Assistant {
         text: String,
@@ -157,13 +185,23 @@ impl ConversationState {
         &mut self,
         text: String,
         images: Vec<UserImage>,
-        role: &str,
+        meta: UserTurnMeta,
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) {
         let id = self.items.len();
+        let role = meta.model_id.clone();
         self.items.push(cx.new(|_| {
-            MessageItem::new(ConvItem::User { text, images }, role.to_string(), id, weak)
+            MessageItem::new(
+                ConvItem::User {
+                    text,
+                    images,
+                    meta: Some(meta),
+                },
+                role,
+                id,
+                weak,
+            )
         }));
     }
 

@@ -8,6 +8,20 @@
 use crate::language_model::{MessageContent, Role};
 use serde::{Deserialize, Serialize};
 
+/// UI-only metadata captured when a user message is submitted.
+///
+/// The model request path ignores this data; it is persisted with the message
+/// so historical user turns can keep their send-time chrome stable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MessageUiMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// `ApprovalMode::as_i64`, stored as an integer to avoid coupling the
+    /// message schema to enum names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<i64>,
+}
+
 /// A single conversation message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -21,6 +35,8 @@ pub struct Message {
     pub parent_id: Option<String>,
     pub role: Role,
     pub content: Vec<MessageContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<MessageUiMetadata>,
 }
 
 impl Message {
@@ -43,6 +59,7 @@ impl Message {
             parent_id: None,
             role,
             content,
+            ui: None,
         }
     }
 

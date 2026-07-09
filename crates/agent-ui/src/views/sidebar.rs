@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use agent::{ThreadStore, ThreadStoreEvent, i18n};
+use agent::{ThreadStore, ThreadStoreEvent, i18n, thread::ApprovalMode};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, Entity, EventEmitter,
     Pixels, Render, SharedString, Subscription, Window, ease_in_out, prelude::*, px,
@@ -23,6 +23,42 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
+
+/// How far the row wash translates (in pixels, clipped to the row) during the
+/// selection-slide. The two adjacent rows animate in opposite directions so
+/// the wash reads as moving from the old row to the new one.
+const SELECT_SLIDE_PX: f32 = 28.;
+
+/// Vertical direction from the previously-selected row to the newly-selected
+/// one, used to angle the slide. `None` (e.g. the two rows are in different
+/// sections, or one is off-screen) falls back to a plain fade.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlideDir {
+    Up,
+    Down,
+    None,
+}
+
+/// Per-frame snapshot of the selection transition, shared with every row so
+/// each can decide whether it is the incoming or outgoing end of the slide.
+#[derive(Clone)]
+struct SlideCtx {
+    selecting_id: Option<String>,
+    deselecting_id: Option<String>,
+    dir: SlideDir,
+    gen_id: u64,
+}
+
+/// Which end of the slide a row is playing this frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnimRole {
+    /// The newly-selected row: wash fades in, settling toward its resting spot.
+    Selecting,
+    /// The previously-selected row: wash fades out, drifting toward the new row.
+    Deselecting,
+    /// Neither — no wash overlay (hover handles non-selected feedback).
+    None,
+}
 
 /// Events the sidebar emits to the Workspace.
 #[derive(Debug, Clone)]
@@ -37,6 +73,14 @@ pub enum SidebarEvent {
 pub struct Sidebar {
     store: Entity<ThreadStore>,
     selected: Option<String>,
+    /// The thread that was selected immediately before `selected`; its row
+    /// plays a fade-out wash while the new row's wash fades in, so selection
+    /// reads as the wash sliding from the old row to the new one.
+    prev_selected: Option<String>,
+    /// Bumped on every selection change. Embedded in each row's animation id
+    /// so gpui treats it as a fresh animation and replays 0→1 (its element
+    /// state is keyed by id).
+    select_gen: u64,
     /// Project paths whose folder group is collapsed; absent means expanded.
     collapsed: HashSet<String>,
     /// Live width driven by dragging the divider on the right edge. Updated
@@ -66,6 +110,8 @@ impl Sidebar {
             store,
             selected: None,
             collapsed: HashSet::new(),
+            prev_selected: None,
+            select_gen: 0,
             width,
             _sub: sub,
         }
@@ -90,7 +136,12 @@ impl Sidebar {
         if self.selected == id {
             return;
         }
+        // The outgoing selection becomes the previous one so its row can play
+        // the fade-out half of the slide; bump the generation so both rows'
+        // wash animations retrigger.
+        self.prev_selected = self.selected.take();
         self.selected = id;
+        self.select_gen = self.select_gen.wrapping_add(1);
         cx.notify();
     }
 
@@ -102,9 +153,14 @@ impl Sidebar {
         group: &[agent::ThreadSummary],
         selected: Option<&str>,
         store: &Entity<ThreadStore>,
-        theme: &Theme,
+        slide: &SlideCtx,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Owned clone so the row-mapping closure can borrow `theme` without
+        // holding an immutable borrow of `*cx` (which would clash with the
+        // `&mut cx` the closure also passes into each row). Cheap: Theme's
+        // heavy fields are Arc/Rc refcount bumps.
+        let theme = cx.theme().clone();
         let expanded = !self.collapsed.contains(path);
         let name = std::path::Path::new(path)
             .file_name()
@@ -168,7 +224,8 @@ impl Sidebar {
                     selected == Some(s.id.as_str()),
                     store.read(cx).is_running(&s.id),
                     px(16.),
-                    theme,
+                    slide,
+                    &theme,
                     cx,
                 )
             }))
@@ -204,6 +261,37 @@ impl Render for Sidebar {
                 projects.push((s.project.clone(), vec![s.clone()]));
             }
         }
+
+        // Build the flat, render-order list of visible thread ids to derive the
+        // slide direction between the previous and the new selection. Collapsed
+        // project groups contribute nothing; their rows aren't on screen.
+        let mut flat_ids: Vec<String> = Vec::new();
+        for (path, group) in &projects {
+            if !self.collapsed.contains(path.as_str()) {
+                flat_ids.extend(group.iter().map(|s| s.id.clone()));
+            }
+        }
+        flat_ids.extend(loose.iter().map(|s| s.id.clone()));
+        let dir = match (&self.prev_selected, &self.selected) {
+            (Some(prev), Some(cur)) => match (
+                flat_ids.iter().position(|id| id == prev),
+                flat_ids.iter().position(|id| id == cur),
+            ) {
+                (Some(p), Some(c)) => match c.cmp(&p) {
+                    std::cmp::Ordering::Greater => SlideDir::Down,
+                    std::cmp::Ordering::Less => SlideDir::Up,
+                    std::cmp::Ordering::Equal => SlideDir::None,
+                },
+                _ => SlideDir::None,
+            },
+            _ => SlideDir::None,
+        };
+        let slide = SlideCtx {
+            selecting_id: self.selected.clone(),
+            deselecting_id: self.prev_selected.clone(),
+            dir,
+            gen_id: self.select_gen,
+        };
 
         // Leave room for the macOS traffic-light buttons that float over the transparent titlebar.
         let top_inset = if cfg!(target_os = "macos") {
@@ -280,7 +368,7 @@ impl Render for Sidebar {
                             &group,
                             selected.as_deref(),
                             &store,
-                            &theme,
+                            &slide,
                             cx,
                         )
                     }))
@@ -295,6 +383,7 @@ impl Render for Sidebar {
                             selected.as_deref() == Some(s.id.as_str()),
                             store.read(cx).is_running(&s.id),
                             px(0.),
+                            &slide,
                             &theme,
                             cx,
                         )
@@ -379,6 +468,7 @@ fn render_thread_item(
     selected: bool,
     running: bool,
     indent: gpui::Pixels,
+    slide: &SlideCtx,
     theme: &Theme,
     cx: &mut Context<Sidebar>,
 ) -> AnyElement {
@@ -395,11 +485,69 @@ fn render_thread_item(
     };
     let updated = format_relative(summary.interacted_at);
     let tokens = format_tokens(summary.cumulative_total_tokens);
-    let bg = if selected {
-        theme.accent.opacity(0.12)
+    // The active row's surface is painted by the sliding wash overlay below,
+    // not by a static row background. Keeping the row itself transparent lets
+    // the wash cross-fade between the deselecting and selecting rows without a
+    // double-fill, and leaves hover/active free to tint only non-selected rows.
+    let role = if slide.selecting_id.as_deref() == Some(id.as_str()) {
+        AnimRole::Selecting
+    } else if slide.deselecting_id.as_deref() == Some(id.as_str()) {
+        AnimRole::Deselecting
     } else {
-        theme.transparent
+        AnimRole::None
     };
+    // dir_sign orients the slide along the selection's travel direction: Down
+    // (new row below the old) moves the wash downward, Up moves it upward. None
+    // (initial load, no prior row) zeroes the translation so the wash simply
+    // fades in place.
+    let dir_sign: f32 = match slide.dir {
+        SlideDir::Down => 1.0,
+        SlideDir::Up => -1.0,
+        SlideDir::None => 0.0,
+    };
+    let wash = approval_mode_color(summary.approval_mode, theme);
+    let slide_gen = slide.gen_id;
+    // The wash overlay is attached only to rows participating in the transition.
+    // Idle rows (AnimRole::None) carry no overlay and pay no animation cost.
+    let wash_overlay: Option<AnyElement> = if role != AnimRole::None {
+        let anim_role = role;
+        let anim_id = format!("thread-sel-wash-{id}-{slide_gen}");
+        Some(
+            gpui::div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .rounded(theme.radius)
+                .with_animation(
+                    anim_id,
+                    Animation::new(Duration::from_millis(160)).with_easing(ease_in_out),
+                    move |el, t| {
+                        // Selecting: wash fades in (0->1) while settling into
+                        // place from the prior row's direction. Deselecting:
+                        // wash fades out (1->0) while continuing past this row
+                        // off the opposite edge.
+                        let (opacity, ty) = if anim_role == AnimRole::Selecting {
+                            (t, -dir_sign * SELECT_SLIDE_PX * (1.0 - t))
+                        } else {
+                            (1.0 - t, dir_sign * SELECT_SLIDE_PX * t)
+                        };
+                        // top+bottom shifted by equal-and-opposite offsets moves
+                        // the rect without resizing it; overflow_hidden on the
+                        // row clips the wash as it enters and exits.
+                        el.bg(wash.opacity(0.18 * opacity))
+                            .top(px(ty))
+                            .bottom(px(-ty))
+                    },
+                )
+                .into_any_element(),
+        )
+    } else {
+        None
+    };
+    // Selected title stays foreground (strong, full contrast) — the wash alone
+    // carries the active signal; tinting the title accent-on-accent crushed
+    // contrast and made the active row read as disabled.
+    let title_color = theme.foreground;
     let group = gpui::SharedString::from(format!("thread-row-{id}"));
     // Short thread ID: first 8 chars of the UUID. Char-based so a non-ASCII
     // id (defensive — ids are hex today) cannot panic on a char boundary.
@@ -472,16 +620,22 @@ fn render_thread_item(
         .id(format!("thread-item-{id}"))
         .group(group.clone())
         .w_full()
+        .relative()
+        .overflow_hidden()
         .pl(px(8.) + indent)
         .pr_2()
         .py_1()
         .rounded(theme.radius)
-        .bg(bg)
-        .hover(|s| s.bg(theme.accent.opacity(0.08)))
-        .active(|s| s.bg(theme.accent.opacity(0.18)))
+        .when(!selected, |this| {
+            this.hover(move |s| s.bg(wash.opacity(0.08)))
+                .active(move |s| s.bg(wash.opacity(0.18)))
+        })
         .on_click(cx.listener(move |_this, _ev, _window, cx| {
             cx.emit(SidebarEvent::OpenThread(id_open.clone()));
         }))
+        // The wash sits behind the content (painted first, clipped to the row)
+        // so the selection surface slides between rows without covering text.
+        .when_some(wash_overlay, |this, overlay| this.child(overlay))
         // Two-row layout: title on top, metadata on bottom. `gap_1` separates
         // the two rows clearly so a multi-line title doesn't visually run into
         // the tag/token row below.
@@ -509,7 +663,7 @@ fn render_thread_item(
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_sm()
-                                .text_color(theme.foreground)
+                                .text_color(title_color)
                                 .child(title),
                         ),
                 )
@@ -568,6 +722,14 @@ fn format_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}
+
+fn approval_mode_color(mode: i64, theme: &Theme) -> gpui::Hsla {
+    match ApprovalMode::from_i64(mode) {
+        ApprovalMode::OnRequest => theme.success,
+        ApprovalMode::AutoReview => theme.info,
+        ApprovalMode::Yolo => theme.danger,
     }
 }
 

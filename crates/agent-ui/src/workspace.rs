@@ -21,26 +21,27 @@ use agent::{
     save_thread,
 };
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, DismissEvent,
-    DragMoveEvent, Entity, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle, SharedString,
-    Subscription, WeakEntity, Window, deferred, ease_out_quint, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle, DismissEvent,
+    DragMoveEvent, Entity, FollowMode, ListAlignment, ListOffset, ListState, MouseButton,
+    MouseUpEvent, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
+    ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, ElementExt as _, Icon, IconName, Sizable as _,
-    StyledExt as _, TITLE_BAR_HEIGHT, Theme, TitleBar,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
+    TITLE_BAR_HEIGHT, Theme, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{PopupMenu, PopupMenuItem},
     tab::TabBar,
     tag::{Tag, TagVariant},
-    text::TextView,
     v_flex,
 };
+use manox_components::markdown::Markdown;
 
 use composer::{ComposerEvent, ComposerInput};
 
-use crate::conversation::{ConvItem, ConversationState, UserImage};
+use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
 use crate::views::centered;
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
@@ -114,7 +115,7 @@ pub struct Workspace {
     pub(crate) input_state: Entity<ComposerInput>,
     /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
     /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
-    /// rendered markdown preview (gpui-component `TextView::markdown`).
+    /// rendered markdown preview (`Markdown`).
     editor_state: Entity<InputState>,
     editor_open: bool,
     editor_preview: bool,
@@ -180,17 +181,19 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
-    /// Scroll state for the flat (non-virtualized) message column. Each
-    /// `MessageItem` lays out at its true height, so there is no per-item
-    /// height cache to fall out of sync with async markdown parsing (the old
-    /// virtualized `list` + `FollowMode::Tail` did, which is what produced the
-    /// message-overlap bug). `stick_to_bottom` hand-rolls tail-follow: while
-    /// true, every prepaint re-pins the viewport to the current bottom, so a
-    /// reply that grows taller a frame later (markdown parse landing) stays
-    /// pinned. A wheel scroll away from the bottom clears it; scrolling back
-    /// within a small threshold re-arms it.
-    scroll_handle: ScrollHandle,
-    stick_to_bottom: bool,
+    /// Scroll/virtualization state for the message column. The gpui `list`
+    /// element only lays out (and only syntax-highlights, via the synchronous
+    /// renderer) the items in the viewport plus `MSG_LIST_OVERDRAW` — so a long
+    /// thread's first frame pays only for the visible turn, not every block.
+    /// `FollowMode::Tail` replaces the hand-rolled stick-to-bottom: it re-pins
+    /// to the end each layout while following and re-arms when the user scrolls
+    /// back to the bottom. Item heights are deterministic per-frame (sync
+    /// markdown), so the per-item height cache the list maintains never falls
+    /// out of sync with async parsing — the root cause of the old overlap bug.
+    list_state: ListState,
+    /// Cached `items().len()`; the event handler reconciles the list count via
+    /// `splice` whenever the conversation grows or shrinks.
+    list_count: usize,
     /// Sub-agent task ids whose cards are expanded to show the child
     /// conversation. Toggled by clicking the card header; shared across all
     /// nesting levels so nested agent tasks expand in place.
@@ -268,11 +271,11 @@ const MAIN_MIN_WIDTH: f32 = 160.;
 /// markers.
 const ENV_CARD_WIDTH: f32 = 380.;
 const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
-/// Minimum message-area width the env card must coexist with. The card is
-/// shown only when the main-column body exceeds `MESSAGE_MIN_W +
-/// ENV_CONTENT_INSET`; below that the card hides and the messages + composer
-/// take the full body width.
-const MESSAGE_MIN_W: f32 = 360.;
+/// Minimum main-column width for the env card to mount at all. Below this the
+/// card stays hidden and the messages + composer take the full body width, so
+/// a narrow window never crowds the conversation. The card is otherwise
+/// default-off (editor closed, thread interacted with, past first screen).
+const ENV_CARD_MIN_MAIN_W: f32 = 900.;
 /// Longest model id rendered in full, calibrated to "MiniMax/MiniMax-M3[1m]"
 /// (22 chars). Longer ids are cut to this width then trimmed by 3 and given a
 /// "..." suffix, so the result stays one line at `ENV_MODEL_ID_MAX` chars
@@ -294,6 +297,11 @@ const OUTLINE_CARD_WIDTH: f32 = 260.;
 /// out around the cursor like the outline rail.
 const OUTLINE_WAVE_EXTRA_WIDTH: f32 = 12.;
 const OUTLINE_WAVE_EXTRA_GAP: f32 = 6.;
+
+/// How far above/below the viewport the message `list` still measures items.
+/// Larger = smoother fast-scroll at the cost of less virtualization; one extra
+/// screenful is enough that a normal wheel flick never shows an unmeasured gap.
+const MSG_LIST_OVERDRAW: f32 = 800.;
 
 /// Settings overlay slide duration. The enter animation glides the panel in
 /// from the left edge, the exit animation glides it out to the right.
@@ -396,8 +404,8 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
-            scroll_handle: ScrollHandle::new(),
-            stick_to_bottom: true,
+            list_state: ListState::new(0, ListAlignment::Top, px(MSG_LIST_OVERDRAW)),
+            list_count: 0,
             expanded_tasks: HashSet::new(),
             view_mode: ViewMode::default(),
             exiting_settings: false,
@@ -460,12 +468,10 @@ impl Workspace {
                     // into the matching ToolCall item for markdown rendering.
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
-                    // The flat column self-measures, so the outcome no longer
-                    // drives list splices/remeasures — a plain notify re-lays
-                    // out the column and `on_prepaint` re-pins the tail.
-                    let _ = this
+                    let outcome = this
                         .conversation
                         .update(cx, |c, cx| c.apply(ev, &role, None, weak, cx));
+                    this.apply_list_outcome(outcome, cx);
                     cx.notify();
                 }
                 ThreadEvent::ApprovalModeChanged { .. } => {
@@ -505,13 +511,15 @@ impl Workspace {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
-                    let _ = this
+                    let outcome = this
                         .conversation
                         .update(cx, |c, cx| c.apply(ev, &role, usage, weak, cx));
                     // Stop flips streaming flags off, so finalized bodies switch
-                    // to `TextView::markdown` and grow (async parse) a frame or
-                    // two later. The flat column re-lays out on notify and
-                    // `on_prepaint` keeps the tail pinned across that growth.
+                    // to full `Markdown` layout and may grow a frame or two later;
+                    // `apply_list_outcome` remeasures every item (Absolute anchor)
+                    // so the growth doesn't overlap. Tail-follow, if still engaged,
+                    // re-pins to the end across that growth.
+                    this.apply_list_outcome(outcome, cx);
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
                         let thread_id = this.thread.read(cx).id.0.clone();
@@ -578,22 +586,26 @@ impl Workspace {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
-                    let _ = this
+                    let outcome = this
                         .conversation
                         .update(cx, |c, cx| c.apply(ev, &role, usage, weak, cx));
                     // Sub-agent tool results carry the child conversation in
                     // their JSON envelope; feed it into the matching AgentTask
                     // card's expandable panel. The envelope is the single
-                    // source of truth (also used on reload).
+                    // source of truth (also used on reload). The card's height
+                    // may grow, so remeasure its index.
                     if let ThreadEvent::ToolResult { id, output, .. } = ev
                         && let Some(msgs) = agent::tools::agent::agent_sub_messages(output)
+                        && let Some(ix) = this
+                            .conversation
+                            .update(cx, |c, cx| c.set_agent_sub_messages(id, msgs, cx))
                     {
-                        this.conversation
-                            .update(cx, |c, cx| c.set_agent_sub_messages(id, msgs, cx));
+                        this.list_state.remeasure_items(ix..ix + 1);
                     }
-                    // The flat column self-measures every frame, so no list
-                    // splice/remeasure is needed; `on_prepaint` re-pins the
-                    // tail while `stick_to_bottom` holds. Just re-render.
+                    // Splice on count change, remeasure the mutated index on
+                    // in-place mutation, so the per-item height cache never goes
+                    // stale (the old overlap bug under async markdown).
+                    this.apply_list_outcome(outcome, cx);
                     cx.notify();
                 }
             }
@@ -629,40 +641,37 @@ impl Workspace {
         // forces its scroll top past the last item, which makes the positional
         // queries below meaningless. The viewport then shows the end of the
         // conversation, so the last turn is the visible one.
-        let following = self.stick_to_bottom;
+        let following = self.list_state.is_following_tail();
         let last_ordinal = turns.len() - 1;
-        // Fallback for the pre-layout frame, before the scroll handle has
-        // captured child bounds to answer positional queries.
-        let fallback_top = self.scroll_handle.top_item();
-        // Viewport box + scroll offset, read once for all ticks. A child's
-        // painted position is its layout bounds shifted by `offset_y` (<= 0 as
-        // you scroll down), so a span is off-screen when its last item's
-        // painted bottom is above the viewport top, or its first item's painted
-        // top is below the viewport bottom.
-        let vp = self.scroll_handle.bounds();
-        let offset_y = self.scroll_handle.offset().y;
+        // Fallback for the pre-layout frame, before the list has captured item
+        // bounds to answer positional queries.
+        let fallback_top = self.list_state.logical_scroll_top().item_ix;
+        // Viewport box in window coordinates. `bounds_for_item` already returns
+        // window-coordinate (scroll-adjusted) bounds, so a span is off-screen
+        // when its last item's bottom is above the viewport top, or its first
+        // item's top is below the viewport bottom — no manual offset needed.
+        let vp = self.list_state.viewport_bounds();
 
         let hovered = self.outline_hover;
         let ticks = turns.iter().map(|turn| {
             let span = outline::turn_span(&turns, turn.ordinal, total);
             // A turn is visible unless its whole span sits above or below the
-            // viewport. `item_is_*_viewport` returns `None` before layout; then
+            // viewport. `bounds_for_item` returns `None` before layout; then
             // fall back to the logical scroll top intersecting the span.
             let last = span.end.saturating_sub(1);
             let active = if following {
                 turn.ordinal == last_ordinal
             } else {
                 match (
-                    self.scroll_handle.bounds_for_item(last),
-                    self.scroll_handle.bounds_for_item(span.start),
+                    self.list_state.bounds_for_item(last),
+                    self.list_state.bounds_for_item(span.start),
                 ) {
-                    // `last`'s painted bottom above the viewport top ⇒ the whole
-                    // span sits above; `span.start`'s painted top at/below the
-                    // viewport bottom ⇒ the whole span sits below. Visible
-                    // otherwise.
+                    // `last`'s bottom above the viewport top ⇒ the whole span
+                    // sits above; `span.start`'s top at/below the viewport
+                    // bottom ⇒ the whole span sits below. Visible otherwise.
                     (Some(lb), Some(sb)) => {
-                        let above = lb.bottom() + offset_y <= vp.top();
-                        let below = sb.top() + offset_y >= vp.bottom();
+                        let above = lb.bottom() <= vp.top();
+                        let below = sb.top() >= vp.bottom();
                         !above && !below
                     }
                     // Pre-layout (bounds not captured yet): fall back to the
@@ -749,11 +758,14 @@ impl Workspace {
                 }))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                     // Pin the turn to the top of the viewport. Disengage
-                    // tail-follow first, otherwise `on_prepaint` would re-pin
-                    // to the bottom on the next frame and the reveal would be
+                    // tail-follow first, otherwise the list would re-pin to the
+                    // bottom on the next layout and the reveal would be
                     // overwritten (the click would appear to do nothing).
-                    this.stick_to_bottom = false;
-                    this.scroll_handle.scroll_to_top_of_item(target);
+                    this.list_state.set_follow_mode(FollowMode::Normal);
+                    this.list_state.scroll_to(ListOffset {
+                        item_ix: target,
+                        offset_in_item: px(0.),
+                    });
                     cx.notify();
                 }))
         });
@@ -1020,6 +1032,49 @@ impl Workspace {
         self.project_chip_menu_sub = None;
     }
 
+    /// Reconcile the `list_state` item count with the live conversation length
+    /// via `splice`, which preserves scroll position. Append (the common case,
+    /// every user/assistant/tool item) splices new tail items in as Unmeasured;
+    /// a tail removal (a `Retry` badge popped without replacement) splices the
+    /// dangling slot out. Call after any direct conversation mutation that the
+    /// `ApplyOutcome` path does not already cover (e.g. `push_user`/`push_notice`,
+    /// which bypass `apply`).
+    fn sync_list_count(&mut self, cx: &App) {
+        let new_count = self.conversation.read(cx).items().len();
+        if new_count == self.list_count {
+            return;
+        }
+        if new_count > self.list_count {
+            self.list_state.splice(
+                self.list_count..self.list_count,
+                new_count - self.list_count,
+            );
+        } else {
+            self.list_state.splice(new_count..self.list_count, 0);
+        }
+        self.list_count = new_count;
+    }
+
+    /// Reconcile the `list_state` with a conversation mutation: splice the
+    /// count (append/remove) and remeasure the affected index/indices. Call
+    /// after any `ConversationState::apply` (the outcome tells which path) so
+    /// the virtualized list's per-item height cache never goes stale.
+    fn apply_list_outcome(&mut self, outcome: ApplyOutcome, cx: &App) {
+        self.sync_list_count(cx);
+        match outcome {
+            ApplyOutcome::Remeasure(ix) => self.list_state.remeasure_items(ix..ix + 1),
+            ApplyOutcome::All => {
+                let n = self.conversation.read(cx).items().len();
+                if n > 0 {
+                    self.list_state.remeasure_items(0..n);
+                }
+            }
+            // `None` touched no item; `Appended`/`RemovedTail` only changed the
+            // count, which `sync_list_count` already spliced.
+            ApplyOutcome::None | ApplyOutcome::Appended | ApplyOutcome::RemovedTail => {}
+        }
+    }
+
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
     fn attach_thread(&mut self, new_thread: Entity<Thread>, cx: &mut Context<Self>) {
         let old_thread = self.thread.clone();
@@ -1053,11 +1108,21 @@ impl Workspace {
         let new_conv = cx
             .new(|cx| ConversationState::rebuild_from_messages(&messages, &usage, &role, weak, cx));
         self.conversation = new_conv;
-        // A freshly loaded thread should reveal its latest turn once, but a
-        // completed history thread must not keep snapping back while the user
-        // scrolls upward.
-        self.scroll_handle.scroll_to_bottom();
-        self.stick_to_bottom = self.thread.read(cx).is_running();
+        // Rebuild the list state for the new thread: `reset` drops the old
+        // thread's measured heights and scroll position, then reveal the latest
+        // turn once. A running thread keeps following the tail; a completed
+        // history thread stays put once revealed so scrolling up is not snapped
+        // back (the list auto-disengages tail on any upward scroll anyway).
+        let count = self.conversation.read(cx).items().len();
+        self.list_state.reset(count);
+        self.list_count = count;
+        self.list_state.scroll_to_end();
+        self.list_state
+            .set_follow_mode(if self.thread.read(cx).is_running() {
+                FollowMode::Tail
+            } else {
+                FollowMode::Normal
+            });
         // Hover is tied to the old thread's tick ordinals; drop it. The
         // visible-turn highlight needs no reset — it is queried live from the
         // list each frame.
@@ -1215,6 +1280,7 @@ impl Workspace {
                             cx,
                         );
                     });
+                    this.sync_list_count(cx);
                 }
             })
             .ok();
@@ -1242,13 +1308,15 @@ impl Workspace {
         } else {
             format!("/{name} {args}")
         };
-        let role = self.model_label(cx);
+        let meta = self.user_turn_meta(cx);
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
-            c.push_user(display_text, Vec::new(), &role, weak, cx)
+            c.push_user(display_text, Vec::new(), meta, weak, cx)
         });
-        // Submitting a command turn re-engages tail-follow (see send_user_turn).
-        self.stick_to_bottom = true;
+        // Splice the new user item into the list, then re-engage tail-follow so
+        // the streaming reply stays in view.
+        self.sync_list_count(cx);
+        self.list_state.set_follow_mode(FollowMode::Tail);
         let hit = self
             .thread
             .update(cx, |thread, cx| thread.submit_command(name, args, cx));
@@ -1273,26 +1341,27 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         use agent::language_model::MessageContent;
-        let role = self.model_label(cx);
+        let meta = self.user_turn_meta(cx);
+        let ui = Self::message_ui_metadata(&meta);
         let weak = cx.weak_entity();
         let user_images = Self::decode_user_images(&images);
         self.conversation.update(cx, |c, cx| {
-            c.push_user(text.clone(), user_images, &role, weak, cx)
+            c.push_user(text.clone(), user_images, meta, weak, cx)
         });
-        // Submitting a turn re-engages tail-follow so the new bubble and the
-        // streaming reply stay in view; `on_prepaint` re-pins each frame as
-        // the reply grows (including the async markdown-parse height bump).
-        self.stick_to_bottom = true;
+        // Splice the new user item in and re-engage tail-follow so the streaming
+        // reply stays pinned as it grows.
+        self.sync_list_count(cx);
+        self.list_state.set_follow_mode(FollowMode::Tail);
         self.thread.update(cx, |thread, cx| {
             if images.is_empty() {
-                thread.insert_user_message(text, cx);
+                thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
             } else {
                 let mut content = Vec::with_capacity(images.len() + 1);
                 if !text.trim().is_empty() {
                     content.push(MessageContent::Text(text));
                 }
                 content.extend(images);
-                thread.insert_user_message_with_content(content, cx);
+                thread.insert_user_message_with_content_and_ui_metadata(content, Some(ui), cx);
             }
             thread.run_turn(cx);
         });
@@ -1399,15 +1468,16 @@ impl Workspace {
         if text.trim().is_empty() || self.thread.read(cx).is_running() {
             return;
         }
-        let role = self.model_label(cx);
+        let meta = self.user_turn_meta(cx);
+        let ui = Self::message_ui_metadata(&meta);
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
-            c.push_user(text.clone(), Vec::new(), &role, weak, cx)
+            c.push_user(text.clone(), Vec::new(), meta, weak, cx)
         });
-        // Submitting from the editor re-engages tail-follow (see send_user_turn).
-        self.stick_to_bottom = true;
+        self.sync_list_count(cx);
+        self.list_state.set_follow_mode(FollowMode::Tail);
         self.thread.update(cx, |thread, cx| {
-            thread.insert_user_message(text, cx);
+            thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
             thread.run_turn(cx);
         });
         save_thread(self.thread.clone(), true, cx);
@@ -1418,6 +1488,22 @@ impl Workspace {
         self.editor_preview = false;
         self.input_state.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
+    }
+
+    fn user_turn_meta(&self, cx: &mut Context<Self>) -> UserTurnMeta {
+        let approval_mode = self.thread.read(cx).approval_mode();
+        UserTurnMeta::new(
+            chrono::Utc::now().timestamp(),
+            self.model_label(cx),
+            Some(approval_mode),
+        )
+    }
+
+    fn message_ui_metadata(meta: &UserTurnMeta) -> agent::MessageUiMetadata {
+        agent::MessageUiMetadata {
+            model_id: (!meta.model_id.is_empty()).then(|| meta.model_id.clone()),
+            approval_mode: meta.approval_mode.map(|mode| mode.as_i64()),
+        }
     }
 
     pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {
@@ -1484,9 +1570,10 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_notice(text, weak, cx);
         });
-        // The flat column self-measures; a plain notify re-lays out. If the
-        // user is pinned to the bottom, `on_prepaint` reveals the notice; if
-        // they've scrolled up, it stays put rather than yanking the viewport.
+        // Splice the notice item in. If tail-follow is engaged the list reveals
+        // it; if the user scrolled up, `FollowMode::Tail` has already
+        // disengaged so the viewport stays put.
+        self.sync_list_count(cx);
         cx.notify();
     }
 
@@ -2698,6 +2785,14 @@ impl Workspace {
                     .w_full()
                     .p_4()
                     .gap_3()
+                    // Directional drop shadow (offset down-left) so the card
+                    // reads as floating above the conversation — the offset
+                    // pushes the shadow to the left and bottom edges, leaving
+                    // the top/right lit, like a card lifted from the top-right.
+                    .shadow(std::vec![
+                        gpui::BoxShadow::new(px(-3.), px(6.), gpui::hsla(0., 0., 0., 0.22))
+                            .blur_radius(px(10.))
+                    ])
                     .rounded(theme.radius)
                     .border_1()
                     .border_color(theme.border)
@@ -4122,24 +4217,24 @@ impl Render for Workspace {
                     .min_h_0()
                     .overflow_hidden()
                     .child(if editor_preview {
-                        // The TextView caches its parsed document per element id and early-returns
-                        // in set_text when the source is unchanged, so resizing the pane would leave
-                        // the laid-out tree stale. Derive the id from the quantized pane width so a
-                        // width change mounts a fresh state and re-parses at the new wrap width.
-                        let preview_id =
-                            format!("editor-preview-{}", (f32::from(editor_width) as i32) / 8);
+                        // Markdown re-parses mdast and re-lays-out every frame,
+                        // so a pane resize re-wraps at the new width with no
+                        // cached tree to go stale; a stable id keeps the scroll
+                        // position across the resize.
                         v_flex()
                             .h_full()
                             .p_4()
                             .text_sm()
                             .child(
-                                TextView::markdown(
-                                    preview_id,
-                                    self.editor_state.read(cx).value().to_string(),
-                                )
-                                .selectable(true)
-                                .scrollable(true)
-                                .h_full(),
+                                gpui::div().h_full().child(
+                                    Markdown::new(
+                                        "editor-preview",
+                                        self.editor_state.read(cx).value().to_string(),
+                                    )
+                                    .theme(cx.theme())
+                                    .selectable(true)
+                                    .scrollable(true),
+                                ),
                             )
                             .into_any_element()
                     } else {
@@ -4187,19 +4282,19 @@ impl Render for Workspace {
             .child({
                 // The env card floats across the top-right of the conversation
                 // area and reserves `ENV_CONTENT_INSET` of right gutter on the
-                // message list when shown. Only show it when the main-column
-                // body is wide enough to also leave `MESSAGE_MIN_W` for the
-                // messages beside it — otherwise hide the card and let the
-                // messages + composer use the full width. The body width is
-                // derived from the live window size (sidebar + its divider are
-                // the only siblings when the editor pane is closed, which the
+                // message list when shown. It is default-off and mounts only
+                // once the main-column body is at least `ENV_CARD_MIN_MAIN_W`
+                // wide — below that the card stays hidden and the messages +
+                // composer use the full width. The body width is derived from
+                // the live window size (sidebar + its divider are the only
+                // siblings when the editor pane is closed, which the
                 // `!editor_open` term already guarantees).
                 let main_body_w =
                     window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
                 let show_env = !editor_open
                     && !first_screen
                     && self.thread.read(cx).has_interacted()
-                    && main_body_w > px(MESSAGE_MIN_W + ENV_CONTENT_INSET);
+                    && main_body_w >= px(ENV_CARD_MIN_MAIN_W);
                 v_flex()
                     .flex_1()
                     .h_full()
@@ -4227,128 +4322,69 @@ impl Render for Workspace {
                             .pt(TITLE_BAR_HEIGHT)
                             .pb_2()
                             // Empty first screen shows the centered hero in place of
-                            // the (empty) message list; otherwise a flat, tail-
+                            // the (empty) message list; otherwise a virtualized, tail-
                             // following conversation column. Each item is its own
                             // `Entity<MessageItem>`, so a streaming delta only marks
-                            // that item's entity dirty. The column is NOT virtualized:
-                            // every item lays out at its true height each frame, so
-                            // there is no per-item height cache to fall out of sync
-                            // with async markdown parsing — the root cause of the old
-                            // message-overlap bug under the virtualized `list`.
+                            // that item's entity dirty; the `list` reconciles its
+                            // per-item height cache via `remeasure_items` so the
+                            // synchronous renderer's deterministic heights never
+                            // desync.
                             .children(hero)
                             .children((!first_screen).then(|| {
                                 let conv = self.conversation.clone();
-                                // A flat, non-virtualized scroll column. `track_scroll`
-                                // wires the wheel/offset to `scroll_handle`; each
-                                // `MessageItem` renders at its true height so nothing
-                                // overlaps. NOTE: without `.cached()` these items are
-                                // not paint-cached — every item re-renders, re-lays
-                                // out, and re-paints on each frame the workspace is
-                                // dirty (no virtualization culling either). Acceptable
-                                // for the conversation lengths manox handles; revisit
-                                // with `.cached()` or virtualization if long threads
-                                // drop frames during streaming.
-                                let items: Vec<_> = conv
-                                    .read(cx)
-                                    .items()
-                                    .iter()
-                                    .cloned()
-                                    .map(|item| {
-                                        // Pin each row to its true content height:
-                                        // `flex_shrink_0` keeps row bounds honest so
-                                        // markdown never paints outside its row, and
-                                        // the scroll column never compresses rows to
-                                        // fit the viewport.
-                                        v_flex()
+                                // Virtualized variable-height message list. The gpui
+                                // `list` only lays out — and only syntax-highlights, via
+                                // the synchronous renderer — the items in the viewport
+                                // plus `MSG_LIST_OVERDRAW`, so a long thread's first frame
+                                // pays only for the visible turn, not every code block.
+                                // `FollowMode::Tail` on the ListState replaces the
+                                // hand-rolled stick-to-bottom: it re-pins to the end each
+                                // layout while following, disengages on upward scroll, and
+                                // re-arms at the bottom. Item heights are deterministic
+                                // per-frame (sync markdown), so the per-item height cache
+                                // the list maintains never falls out of sync with async
+                                // parsing — the root cause of the old overlap bug. Count
+                                // and height changes are reconciled from the ThreadEvent
+                                // handler and the `push_*` sites via `splice`/
+                                // `remeasure_items`.
+                                let list_state = self.list_state.clone();
+                                let list_el = gpui::list(list_state, move |ix, _window, cx| {
+                                    let item = conv.read(cx).items().get(ix).cloned();
+                                    match item {
+                                        // `flex_shrink_0` pins each row to its true content
+                                        // height so the list's per-item height cache stays
+                                        // honest and markdown never paints outside its row.
+                                        Some(item) => v_flex()
+                                            .w_full()
                                             .pt_1()
                                             .pb_4()
                                             .flex_shrink_0()
                                             .min_w_0()
                                             .child(item)
-                                            .into_any_element()
-                                    })
-                                    .collect();
-                                // Tail-follow: while `stick_to_bottom` holds, re-pin
-                                // to the bottom each prepaint. The flag is read live so
-                                // an upward wheel tick that clears stickiness takes
-                                // effect on this same frame's prepaint instead of
-                                // waiting a re-render. Pinning is skipped when already
-                                // at the bottom: that leaves no pending flag for the
-                                // next frame to consume, so the first upward scroll
-                                // from a steady bottom is not snapped back.
-                                let pin_handle = self.scroll_handle.clone();
-                                let weak = cx.weak_entity();
-                                let list_el = v_flex()
-                                    .id("msg-scroll")
-                                    .w_full()
-                                    .max_h_full()
-                                    .min_h_0()
-                                    .min_w_0()
-                                    .overflow_y_scroll()
-                                    .overflow_x_hidden()
-                                    .track_scroll(&self.scroll_handle)
-                                    .children(items)
-                                    .on_prepaint(move |_bounds, _window, cx| {
-                                        let Some(this) = weak.upgrade() else {
-                                            return;
-                                        };
-                                        if !this.read(cx).stick_to_bottom {
-                                            return;
-                                        }
-                                        let off = pin_handle.offset().y;
-                                        let max = pin_handle.max_offset().y;
-                                        if (max + off).abs() < px(1.) {
-                                            return;
-                                        }
-                                        pin_handle.scroll_to_bottom();
-                                    })
-                                    .on_scroll_wheel(cx.listener(
-                                        |this, event: &gpui::ScrollWheelEvent, window, cx| {
-                                            // The built-in scroll handler applies the wheel
-                                            // delta before this (registered later ⇒ runs
-                                            // first in the reverse-order bubble phase), so
-                                            // `offset` is fresh here. A tiny upward wheel
-                                            // delta must still break tail-follow immediately;
-                                            // otherwise the next prepaint snaps back to the
-                                            // bottom before small deltas accumulate.
-                                            let delta_y =
-                                                event.delta.pixel_delta(window.line_height()).y;
-                                            if delta_y > Pixels::ZERO {
-                                                if this.stick_to_bottom {
-                                                    this.stick_to_bottom = false;
-                                                    cx.notify();
-                                                }
-                                                return;
-                                            }
-                                            // `offset.y <= 0`, most negative at the bottom
-                                            // where it equals `-max_offset.y`; re-arm stick
-                                            // only when a downward scroll lands back within
-                                            // an 8px threshold.
-                                            let off = this.scroll_handle.offset().y;
-                                            let max = this.scroll_handle.max_offset().y;
-                                            let new_sticky = (max + off) < px(8.);
-                                            if this.stick_to_bottom != new_sticky {
-                                                this.stick_to_bottom = new_sticky;
-                                                cx.notify();
-                                            }
-                                        },
-                                    ));
-                                // Outer column fills the list region and bottom-
-                                // aligns the scroll column. `h_full()` is load-
-                                // bearing: the region is an `h_flex()` row
-                                // (items_center, not stretch), so without it the
-                                // wrapper shrinks to content height and justify_end
-                                // has no room to drop short content. Short content
-                                // takes its own height (`max_h_full` caps but does
-                                // not stretch), so `justify_end` drops it next to
-                                // the composer with no tail gap; overflowing content
-                                // hits the cap and scrolls within the region as before.
+                                            .into_any_element(),
+                                        // Index out of range mid-splice (count changed
+                                        // between a layout pass and the render closure):
+                                        // render an empty row rather than panic.
+                                        None => gpui::div().into_any_element(),
+                                    }
+                                })
+                                .w_full()
+                                .h_full()
+                                .min_h_0()
+                                .min_w_0();
+                                // Outer column fills the list region. `h_full()` is load-
+                                // bearing: the region is an `h_flex()` row (items_center,
+                                // not stretch), so without it the wrapper shrinks to
+                                // content height and the list has no room to fill. The
+                                // list fills the region; short conversations top-align
+                                // (standard virtualized-list behavior) instead of the old
+                                // bottom-justify — the trade-off for not measuring every
+                                // item up front.
                                 let list_wrap = v_flex()
                                     .flex_1()
                                     .h_full()
                                     .min_h_0()
                                     .min_w_0()
-                                    .justify_end()
                                     .child(list_el);
                                 // Outline rail (left) + flat message column (right)
                                 // share the list region's height. The env-card

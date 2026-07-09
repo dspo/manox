@@ -22,6 +22,7 @@ sidebar-time-weeks = {$count} 周前
 message-reasoning = 思考
 message-error = 错误
 message-notice = 通知
+message-user-role = 你
 recap-card-title = 上下文已压缩
 retry-badge = 重试中… { $attempt }/{ $max } · { $secs }秒
 message-omitted-prefix = …（已省略前面部分）
