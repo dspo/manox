@@ -114,6 +114,7 @@ pub fn init(_cx: &mut App) {
         Box::new(YoloCommand),
         Box::new(PlanCommand),
         Box::new(GoalCommand),
+        Box::new(CompactCommand),
     ];
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
@@ -337,6 +338,34 @@ impl SlashCommand for GoalCommand {
     }
 }
 
+/// `/compact` — manually trigger a context-compaction pass on the current
+/// thread. Summarizes older history into a handoff message, keeping a recent
+/// user-message tail verbatim. No-op when a turn is in flight or there is
+/// nothing to summarize; the side LLM call runs in a spawned task and the
+/// result lands as a Recap card.
+struct CompactCommand;
+
+impl SlashCommand for CompactCommand {
+    fn name(&self) -> &str {
+        "compact"
+    }
+    fn description(&self) -> SharedString {
+        i18n::t("slash-compact-desc")
+    }
+    fn execute(
+        &self,
+        _args: &str,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        let thread = workspace.thread.clone();
+        thread.update(cx, |t, cx| t.compact(cx));
+        cx.notify();
+        SlashResult::Handled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +422,7 @@ mod tests {
         assert!(r.get("yolo").is_some());
         assert!(r.get("plan").is_some());
         assert!(r.get("goal").is_some());
+        assert!(r.get("compact").is_some());
         assert!(r.get("nope").is_none());
     }
 
@@ -420,6 +450,15 @@ mod tests {
         assert_eq!(p.args, "fix the auth flow");
     }
 
+    #[test]
+    fn parse_compact_command() {
+        // `/compact` is a bare toggle (no args).
+        register_for_tests();
+        let p = parse("/compact").unwrap();
+        assert_eq!(p.name, "compact");
+        assert_eq!(p.args, "");
+    }
+
     /// Ensure the registry is populated for tests (idempotent).
     fn register_for_tests() {
         if REGISTRY.get().is_some() {
@@ -429,6 +468,7 @@ mod tests {
             Box::new(YoloCommand),
             Box::new(PlanCommand),
             Box::new(GoalCommand),
+            Box::new(CompactCommand),
         ]));
     }
 }

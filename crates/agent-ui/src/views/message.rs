@@ -234,6 +234,11 @@ pub fn render_item(
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx),
         ConvItem::Error(msg) => render_error(msg, ix, theme),
         ConvItem::Notice(msg) => render_notice(msg, ix, theme),
+        ConvItem::Recap {
+            summary,
+            collapsed,
+            user_toggled: _,
+        } => render_recap(summary, *collapsed, ix, theme, tool_ctx),
         ConvItem::Retry {
             attempt,
             max_attempts,
@@ -541,6 +546,92 @@ pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
                 .child(markdown_tv(("notice", ix), msg.to_string(), theme, false)),
         )
         .into_any_element()
+}
+
+/// Render a compaction Recap card: a collapsible summary of the history that
+/// was folded into a handoff note. Collapsed by default; the summary body is
+/// model-generated markdown (not localized), only the title is. Toggling
+/// follows the same `user_toggled`-stamped pattern as reasoning blocks.
+pub fn render_recap(
+    summary: &str,
+    collapsed: bool,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
+    let chevron = if collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    };
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+    let mut block = v_flex()
+        .group(format!("recap-{ix}"))
+        .w_full()
+        .gap_1()
+        .px_3()
+        .py_2()
+        .rounded(theme.radius)
+        .bg(theme.secondary.opacity(0.15))
+        .child(
+            h_flex()
+                .id(("recap-header", ix))
+                .gap_1p5()
+                .items_center()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .on_click(move |_, _window, cx: &mut App| {
+                    let Some(weak) = weak_workspace.clone() else {
+                        return;
+                    };
+                    let ix_click = ix;
+                    let _ = weak.update(cx, |w, cx| {
+                        let conv = w.conversation.clone();
+                        conv.update(cx, |c, cx| {
+                            if let Some(item) = c.items().get(ix_click) {
+                                item.update(cx, |item, cx| {
+                                    if let ConvItem::Recap {
+                                        collapsed,
+                                        user_toggled,
+                                        ..
+                                    } = item.kind_mut()
+                                    {
+                                        *collapsed = !*collapsed;
+                                        *user_toggled = true;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        cx.notify();
+                    });
+                })
+                .child(Icon::new(chevron).xsmall())
+                .child(Icon::new(IconName::BookOpen).xsmall())
+                .child(i18n::t("recap-card-title"))
+                .child(gpui::div().flex_1())
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-recap",
+                    format!("recap-{ix}"),
+                    summary.to_string(),
+                )),
+        );
+    if !collapsed {
+        block = block.child(
+            gpui::div()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(markdown_tv(
+                    ("recap", ix),
+                    summary.to_string(),
+                    theme,
+                    false,
+                )),
+        );
+    }
+    block.into_any_element()
 }
 
 /// Transient retry badge shown while the provider backs off after a 429 / 5xx
@@ -1111,8 +1202,21 @@ pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) ->
                     items.push(ConvItem::User { text, images });
                 }
                 for c in &m.content {
-                    if let MessageContent::ToolResult(tr) = c {
-                        pair_tool_result(&mut items, tr);
+                    match c {
+                        MessageContent::ToolResult(tr) => {
+                            pair_tool_result(&mut items, tr);
+                        }
+                        MessageContent::Compaction(summary) => {
+                            // A compaction message is role User but carries no
+                            // prompt text — render it as a Recap card instead of
+                            // an empty user bubble.
+                            items.push(ConvItem::Recap {
+                                summary: summary.clone(),
+                                collapsed: true,
+                                user_toggled: false,
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1167,6 +1271,16 @@ pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) ->
                             pair_tool_result(&mut items, tr);
                         }
                         MessageContent::Image { .. } => {}
+                        // Compaction messages are `Role::User` by construction;
+                        // they cannot appear in an assistant turn. Reachable
+                        // here only if a future caller mis-assigns the role.
+                        MessageContent::Compaction(summary) => {
+                            items.push(ConvItem::Recap {
+                                summary: summary.clone(),
+                                collapsed: true,
+                                user_toggled: false,
+                            });
+                        }
                     }
                 }
             }
