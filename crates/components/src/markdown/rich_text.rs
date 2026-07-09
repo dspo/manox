@@ -286,21 +286,27 @@ fn register_selection_listeners(
         }
     });
 
-    // Cmd/Ctrl+C: copy the active (non-empty) selection. Fires globally for
-    // the frame; only mounts with a live selection register, so the copy lands
-    // on the block the user is interacting with.
+    // Cmd/Ctrl+C: copy the active (non-empty) selection. Fires only for blocks
+    // with a live selection, and only while the cursor rests over this block's
+    // hitbox — so a selection that persists after mouse-up doesn't steal Cmd+C
+    // from the composer input, whose `Copy` action travels a separate dispatch
+    // channel and would otherwise be overwritten by a stray clipboard write.
     let has_selection = (*state.selection.borrow())
         .map(|(a, b)| a != b)
         .unwrap_or(false);
     if has_selection {
         window.on_key_event::<KeyDownEvent>({
             let selection = state.selection.clone();
-            move |event: &KeyDownEvent, phase, _window, cx| {
+            let hitbox = hitbox.clone();
+            move |event: &KeyDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
                 let k = &event.keystroke;
                 if !((k.modifiers.platform || k.modifiers.control) && k.key == "c") {
+                    return;
+                }
+                if !hitbox.is_hovered(window) {
                     return;
                 }
                 if let Some((a, b)) = *selection.borrow() {
