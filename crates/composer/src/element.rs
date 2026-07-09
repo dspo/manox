@@ -224,10 +224,11 @@ impl Element for TextElement {
 
         let focused = focus_handle.is_focused(window);
         let blink_visible = self.input.read(cx).blink_cursor.read(cx).visible();
-        if focused && blink_visible {
-            if let Some(c) = prepaint.cursor.take() {
-                window.paint_quad(c);
-            }
+        if focused
+            && blink_visible
+            && let Some(c) = prepaint.cursor.take()
+        {
+            window.paint_quad(c);
         }
 
         // Put the layout back; IME may query it before the next paint.

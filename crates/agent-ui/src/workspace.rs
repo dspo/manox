@@ -4893,7 +4893,10 @@ fn counter_text(arrow: &str, value: u64) -> AnyElement {
 fn counter_text_cached(arrow: &str, value: u64) -> AnyElement {
     h_flex()
         .gap_0p5()
-        .child(SharedString::from(format!("{arrow}{}", format_tokens(value))))
+        .child(SharedString::from(format!(
+            "{arrow}{}",
+            format_tokens(value)
+        )))
         .child(i18n::t("workspace-env-cached"))
         .into_any_element()
 }
