@@ -297,36 +297,38 @@ pub fn render_user(
         header.push_str(" · ");
         header.push_str(project);
     }
+    let frame = theme.accent.opacity(0.85);
 
     v_flex()
         .group(format!("user-{ix}"))
         .w_full()
         .min_w_0()
-        .rounded(px(4.))
-        .border_1()
-        .border_color(theme.accent.opacity(0.5))
-        .bg(theme.accent.opacity(0.05))
-        .overflow_hidden()
-        // Header row — sits inside the top border as a metadata breadcrumb.
+        .text_color(theme.foreground)
+        // Top frame: a metadata label embedded in the border line, matching a
+        // TUI turn frame rather than a generic card header.
         .child(
             h_flex()
                 .w_full()
                 .min_w_0()
                 .items_center()
-                .gap_2()
-                .px_3()
-                .py_1()
-                .border_b_1()
-                .border_color(theme.accent.opacity(0.25))
+                .gap_1()
                 .text_xs()
-                .text_color(theme.muted_foreground)
+                .text_color(frame)
+                .child(gpui::div().w(px(14.)).h(px(1.)).bg(frame))
                 .child(
                     gpui::div()
-                        .flex_1()
+                        .max_w(px(360.))
                         .min_w_0()
                         .truncate()
+                        .px_1p5()
+                        .py(px(1.))
+                        .rounded(px(3.))
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(frame)
                         .child(SharedString::from(header)),
                 )
+                .child(gpui::div().flex_1().min_w_0().h(px(1.)).bg(frame))
                 .child(copy_button_hoverable(
                     ix,
                     "copy-user",
@@ -340,17 +342,21 @@ pub fn render_user(
                 .max_h(px(280.))
                 .rounded(theme.radius)
                 .object_fit(gpui::ObjectFit::ScaleDown)
-                .px_3()
+                .mx_3()
         }))
         .child(
             gpui::div()
                 .w_full()
                 .min_w_0()
                 .overflow_hidden()
+                .border_l_1()
+                .border_r_1()
+                .border_b_1()
+                .border_color(frame)
+                .bg(theme.accent.opacity(0.035))
                 .px_3()
                 .py_2()
                 .text_sm()
-                .text_color(theme.foreground)
                 .child(markdown_tv(
                     ("user-text", ix),
                     text.to_string(),
