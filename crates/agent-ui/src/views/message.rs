@@ -164,27 +164,10 @@ impl Render for MessageItem {
         let tool_ctx = self.weak_workspace.upgrade().map(|ws| ToolCallCtx {
             weak: ws.downgrade(),
         });
-        // Project = cwd basename, shown in the user-turn header. Same for every
-        // item in a thread; computed per-item because `render_item` is per-item
-        // and the cost is a couple of entity reads.
-        let project = self
-            .weak_workspace
-            .upgrade()
-            .map(|ws| {
-                let thread = ws.read(cx).thread.clone();
-                thread
-                    .read(cx)
-                    .cwd()
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
         centered(render_item(
             &self.kind,
             self.id,
             &self.role,
-            &project,
             &theme,
             agent_ctx.as_ref(),
             tool_ctx.as_ref(),
@@ -201,14 +184,13 @@ pub fn render_item(
     item: &ConvItem,
     ix: usize,
     role: &str,
-    project: &str,
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     match item {
         ConvItem::User { text, images, meta } => {
-            render_user(text, images, meta.as_ref(), ix, role, project, theme)
+            render_user(text, images, meta.as_ref(), ix, role, theme)
         }
         ConvItem::Assistant {
             text,
@@ -288,7 +270,6 @@ pub fn render_user(
     meta: Option<&UserTurnMeta>,
     ix: usize,
     model: &str,
-    _project: &str,
     theme: &Theme,
 ) -> gpui::AnyElement {
     let model_id = meta
@@ -1128,7 +1109,7 @@ pub fn render_agent_task(
                     .py_2()
                     .gap_1()
                     .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                        render_item(sitem, six, "agent", "", theme, agent_ctx, tool_ctx)
+                        render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx)
                     })),
             );
         }
