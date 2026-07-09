@@ -20,9 +20,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
+use agent::thread::ApprovalMode;
 use agent::tools::agent::{agent_final_text, agent_sub_messages};
 use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
+use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
 use gpui_component::{
@@ -31,9 +33,10 @@ use gpui_component::{
     h_flex, v_flex,
 };
 use manox_components::markdown::{HeadingMode, Markdown};
+use manox_components::turn_frame::TurnFrame;
 
 use crate::Workspace;
-use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage};
+use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage, UserTurnMeta};
 use crate::views::centered;
 
 /// Render-time context for sub-agent task cards: which task ids are currently
@@ -204,7 +207,9 @@ pub fn render_item(
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
     match item {
-        ConvItem::User { text, images } => render_user(text, images, ix, role, project, theme),
+        ConvItem::User { text, images, meta } => {
+            render_user(text, images, meta.as_ref(), ix, role, project, theme)
+        }
         ConvItem::Assistant {
             text,
             streaming,
@@ -268,83 +273,66 @@ fn copy_button_hoverable(
         .child(copy_button(ix, prefix, text))
 }
 
-/// Render a user message as a full-width bordered turn block with a muted
-/// metadata header — the Claude Code TUI turn-block look, not a chat bubble.
-///
-/// The block carries a 1px accent border + a faint accent tint and a small
-/// (4px) radius. A header row sits inside the top border: the role label
-/// ("You"), the active model, and the project (cwd basename), joined by `·`
-/// separators, in small muted text so it does not compete with the body. The
-/// body is plain horizontal markdown on `foreground`, full-width, wrapping
-/// normally. `min_w_0` end to end keeps long CJK / unbreakable runs from
+/// Render a user message as one full-width turn frame. The frame itself owns
+/// the accent border; the bottom edge keeps only the two corners so the center
+/// stays open. `min_w_0` end to end keeps long CJK / unbreakable runs from
 /// collapsing the block to min-content (the failure mode of the old bubble).
 pub fn render_user(
     text: &str,
     images: &[UserImage],
+    meta: Option<&UserTurnMeta>,
     ix: usize,
     model: &str,
-    project: &str,
+    _project: &str,
     theme: &Theme,
 ) -> gpui::AnyElement {
-    // Header label: "You", then " · {model}" / " · {project}" only when the
-    // field is non-empty — no placeholder text for missing metadata.
-    let mut header = i18n::t("message-user-role").to_string();
-    if !model.is_empty() {
-        header.push_str(" · ");
-        header.push_str(model);
+    let model_id = meta
+        .map(|m| m.model_id.as_str())
+        .filter(|m| !m.is_empty())
+        .unwrap_or(model);
+    let mut header_parts = vec![i18n::t("message-user-role").to_string()];
+    if let Some(meta) = meta {
+        header_parts.push(format_user_turn_time(meta.timestamp));
     }
-    if !project.is_empty() {
-        header.push_str(" · ");
-        header.push_str(project);
+    if !model_id.is_empty() {
+        header_parts.push(model_id.to_string());
     }
+    let header = header_parts.join(" > ");
+    let group = format!("user-{ix}");
+    let accent = meta
+        .and_then(|m| m.approval_mode)
+        .map(|mode| approval_mode_color(mode, theme))
+        .unwrap_or(theme.accent);
 
-    v_flex()
-        .group(format!("user-{ix}"))
-        .w_full()
-        .min_w_0()
-        .rounded(px(4.))
-        .border_1()
-        .border_color(theme.accent.opacity(0.5))
-        .bg(theme.accent.opacity(0.05))
-        .overflow_hidden()
-        // Header row — sits inside the top border as a metadata breadcrumb.
-        .child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1()
-                .border_b_1()
-                .border_color(theme.accent.opacity(0.25))
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(gpui::div().min_w_0().child(SharedString::from(header)))
-                .child(gpui::div().flex_1())
-                .child(copy_button_hoverable(
-                    ix,
-                    "copy-user",
-                    format!("user-{ix}"),
-                    text.to_string(),
-                )),
-        )
-        .children(images.iter().map(|ui| {
-            gpui::img(ui.0.clone())
-                .max_w(px(280.))
-                .max_h(px(280.))
-                .rounded(theme.radius)
-                .object_fit(gpui::ObjectFit::ScaleDown)
-                .px_3()
-        }))
-        .child(
+    TurnFrame::new(theme)
+        .group(group.clone())
+        .accent(accent)
+        .header(
             gpui::div()
+                .text_color(theme.muted_foreground)
+                .child(SharedString::from(header)),
+        )
+        .trailing(copy_button_hoverable(
+            ix,
+            "copy-user",
+            group,
+            text.to_string(),
+        ))
+        .child(
+            v_flex()
                 .w_full()
                 .min_w_0()
-                .px_3()
-                .py_2()
+                .overflow_hidden()
+                .gap_2()
                 .text_sm()
                 .text_color(theme.foreground)
+                .children(images.iter().map(|ui| {
+                    gpui::img(ui.0.clone())
+                        .max_w(px(280.))
+                        .max_h(px(280.))
+                        .rounded(theme.radius)
+                        .object_fit(gpui::ObjectFit::ScaleDown)
+                }))
                 .child(markdown_tv(
                     ("user-text", ix),
                     text.to_string(),
@@ -353,6 +341,28 @@ pub fn render_user(
                 )),
         )
         .into_any_element()
+}
+
+fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> gpui::Hsla {
+    match mode {
+        ApprovalMode::OnRequest => theme.success,
+        ApprovalMode::AutoReview => theme.info,
+        ApprovalMode::Yolo => theme.danger,
+    }
+}
+
+fn format_user_turn_time(timestamp: i64) -> String {
+    let Some(sent) = Local.timestamp_opt(timestamp, 0).single() else {
+        return String::new();
+    };
+    let now = Local::now();
+    if sent.date_naive() == now.date_naive() {
+        sent.format("%H:%M").to_string()
+    } else if sent.year() == now.year() {
+        sent.format("%m-%d %H:%M").to_string()
+    } else {
+        sent.format("%Y-%m-%d %H:%M").to_string()
+    }
 }
 
 /// Render an assistant message: role label + copy button + markdown body. `role` is the model display name (dynamic).
@@ -1133,7 +1143,11 @@ pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) ->
                     })
                     .collect();
                 if !text.is_empty() || !images.is_empty() {
-                    items.push(ConvItem::User { text, images });
+                    items.push(ConvItem::User {
+                        text,
+                        images,
+                        meta: Some(crate::conversation::UserTurnMeta::from_message(m)),
+                    });
                 }
                 for c in &m.content {
                     if let MessageContent::ToolResult(tr) = c {

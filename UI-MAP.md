@@ -67,7 +67,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Shared Primitives
 
-- [Button](#shared-primitives) · [Input](#shared-primitives) · [PopupMenu](#shared-primitives) · [PopupMenuItem](#shared-primitives) · [TabBar](#shared-primitives) · [Tag](#shared-primitives) · [Markdown](#markdown) · [Icon](#shared-primitives) · [ScrollHandle](#shared-primitives) · [TitleBar](#shared-primitives) · [ContextMenu](#shared-primitives) · [Tooltip](#shared-primitives)
+- [Button](#shared-primitives) · [Input](#shared-primitives) · [PopupMenu](#shared-primitives) · [PopupMenuItem](#shared-primitives) · [TabBar](#shared-primitives) · [Tag](#shared-primitives) · [Markdown](#markdown) · [TurnFrame](#turnframe) · [Icon](#shared-primitives) · [ScrollHandle](#shared-primitives) · [TitleBar](#shared-primitives) · [ContextMenu](#shared-primitives) · [Tooltip](#shared-primitives)
 
 ### 状态
 
@@ -170,7 +170,7 @@ Bottom section: loose (non-project) threads.
 
 #### SidebarThreadItem
 
-Single thread row: title, short-id tag (shimmer if running), token count, time, archive btn.
+Single thread row: title, short-id tag (shimmer if running), token count, time, archive btn. Hover/active/selected wash uses the thread's last saved approval-mode color.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -274,7 +274,7 @@ Single rendered conversation item, centered, max-width 760px. Each `MessageItem`
 
 #### UserMessage
 
-Right-aligned rounded card, `bg:secondary`, border, selectable markdown, copy btn (hover).
+Full-width user turn block rendered inside [TurnFrame](#turnframe): `You > Time/DateTime > ModelID` metadata header, selectable markdown body, copy btn (hover), and an approval-mode-colored frame captured at send time.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -791,6 +791,12 @@ Small colored chip/badge with variant colors.
 #### Markdown
 
 Self-built markdown renderer (`manox-components::markdown::Markdown`) replacing `gpui_component::TextView::markdown`. Per-block layout: paragraphs/headings via `StyledText::with_highlights`; code blocks with line-number gutter + `overflow_x_scroll` + tree-sitter highlighting; unified-diff blocks with accent wash + left bar; GFM tables with column alignment + horizontal scroll; task-list checkboxes. Streaming bodies paint plain text + cursor and mount the full layout once the stream ends. Cross-block selection is a follow-up; per-block copy buttons remain.
+
+#### TurnFrame
+
+Shared framed text container (`manox-components::turn_frame::TurnFrame`) used for user turns. It draws one accent-colored rounded border without filling the content background, then masks the bottom center so the top and bottom corner radii stay consistent while preserving the open-bottom `╰─` / `─╯` treatment. Callers provide header, trailing controls, and body content without assembling border fragments.
+
+> Source: `components/src/turn_frame.rs`
 
 #### Icon
 
