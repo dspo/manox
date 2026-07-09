@@ -423,6 +423,7 @@ workspace-env-yolo-on = Full access
 workspace-env-yolo-off = Approval mode
 workspace-env-auto-review = Auto review
 workspace-env-usage = Usage
+workspace-env-cached = cached
 workspace-env-sources = Sources
 workspace-env-no-sources = No sources yet
 composer-pasted-image = Pasted image

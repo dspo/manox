@@ -407,6 +407,7 @@ workspace-env-yolo-on = 完全访问
 workspace-env-yolo-off = 审批模式
 workspace-env-auto-review = 自动审查
 workspace-env-usage = 消费
+workspace-env-cached = 缓存
 workspace-env-sources = 来源
 workspace-env-no-sources = 暂无来源
 composer-pasted-image = 粘贴的图片

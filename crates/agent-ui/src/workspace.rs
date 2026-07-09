@@ -2666,7 +2666,7 @@ impl Workspace {
                     .gap_2()
                     .text_xs()
                     .text_color(muted)
-                    .child(gpui::div().min_w(px(80.)).truncate().child(model_display))
+                    .child(gpui::div().w(px(80.)).truncate().child(model_display))
                     .child(counter_text("↑", usage.input_tokens))
                     .child(counter_text("↓", usage.output_tokens));
                 let line_two = h_flex()
@@ -4887,12 +4887,13 @@ fn counter_text(arrow: &str, value: u64) -> AnyElement {
         .into_any_element()
 }
 
-/// Cached token counter: `{arrow}{formatted} cached` (e.g. `↑82.2m cached`).
+/// Cached token counter: `{arrow}{formatted} {cached}` — the `cached`
+/// marker is localized so the card doesn't mix languages under non-English
+/// locales.
 fn counter_text_cached(arrow: &str, value: u64) -> AnyElement {
-    gpui::div()
-        .child(SharedString::from(format!(
-            "{arrow}{} cached",
-            format_tokens(value)
-        )))
+    h_flex()
+        .gap_0p5()
+        .child(SharedString::from(format!("{arrow}{}", format_tokens(value))))
+        .child(i18n::t("workspace-env-cached"))
         .into_any_element()
 }
