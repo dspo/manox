@@ -341,6 +341,7 @@ fn message_content_digest_bytes(c: &MessageContent) -> Vec<u8> {
         MessageContent::Image { data, mime_type } => {
             format!("image:{mime_type}:{}", data.len()).into_bytes()
         }
+        MessageContent::Compaction(t) => format!("compaction:{t}").into_bytes(),
     }
 }
 

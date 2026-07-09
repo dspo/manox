@@ -7,6 +7,7 @@
 pub mod agent_def;
 pub mod approval;
 pub mod command;
+pub mod compact;
 pub mod db;
 pub mod frontmatter;
 pub mod goal;
