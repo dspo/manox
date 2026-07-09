@@ -26,9 +26,9 @@ use base64::Engine as _;
 use gpui::prelude::*;
 use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Colorize, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex, pink_500, v_flex,
 };
 use manox_components::markdown::{HeadingMode, Markdown};
 
@@ -315,7 +315,11 @@ pub fn render_user(
         header.push_str(" > ");
         header.push_str(project);
     }
-    let frame = theme.accent;
+    let frame = if theme.is_dark() {
+        pink_500().lighten(0.12)
+    } else {
+        pink_500()
+    };
     let rail = px(2.);
 
     v_flex()
@@ -336,21 +340,22 @@ pub fn render_user(
                 .text_color(frame)
                 .child(
                     gpui::div()
-                        .w(px(18.))
-                        .h(px(13.))
+                        .w(px(24.))
+                        .h(px(16.))
                         .border_t(rail)
                         .border_l(rail)
-                        .rounded_tl(px(9.))
+                        .rounded_tl(px(12.))
                         .border_color(frame),
                 )
                 .child(
                     gpui::div()
                         .max_w(px(460.))
                         .min_w_0()
+                        .flex_shrink_0()
                         .truncate()
                         .px_2()
                         .py(px(2.))
-                        .rounded(px(8.))
+                        .rounded(px(10.))
                         .bg(theme.background)
                         .border_1()
                         .border_color(frame)
@@ -360,10 +365,10 @@ pub fn render_user(
                     gpui::div()
                         .flex_1()
                         .min_w_0()
-                        .h(px(13.))
+                        .h(px(16.))
                         .border_t(rail)
                         .border_r(rail)
-                        .rounded_tr(px(9.))
+                        .rounded_tr(px(12.))
                         .border_color(frame),
                 )
                 .child(copy_button_hoverable(
@@ -381,7 +386,7 @@ pub fn render_user(
                 .border_l(rail)
                 .border_r(rail)
                 .border_color(frame)
-                .bg(theme.accent.opacity(0.045))
+                .bg(frame.opacity(0.045))
                 .px_4()
                 .pt_2()
                 .pb_3()
