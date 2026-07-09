@@ -395,22 +395,17 @@ fn render_thread_item(
     };
     let updated = format_relative(summary.interacted_at);
     let tokens = format_tokens(summary.cumulative_total_tokens);
+    // Active row is a single subtle rounded accent wash — no left bar, no
+    // title tinting. Hover is suppressed on the selected row so mousing over
+    // the active thread cannot lighten its wash.
     let bg = if selected {
         theme.accent.opacity(0.18)
     } else {
         theme.transparent
     };
-    // Left accent bar reads as the active-row indicator even when the wash is
-    // subtle on a high-contrast theme; transparent (not absent) keeps the 2px
-    // footprint so the row contents never shift on selection.
-    let bar = if selected {
-        theme.accent
-    } else {
-        theme.transparent
-    };
-    // Selected title stays foreground (strong, full contrast) — the wash +
-    // left bar already carry the active signal. Tinting the title accent-on-
-    // accent crushed contrast and made the active row read as disabled.
+    // Selected title stays foreground (strong, full contrast) — the wash alone
+    // carries the active signal; tinting the title accent-on-accent crushed
+    // contrast and made the active row read as disabled.
     let title_color = theme.foreground;
     let group = gpui::SharedString::from(format!("thread-row-{id}"));
     // Short thread ID: first 8 chars of the UUID. Char-based so a non-ASCII
@@ -488,11 +483,11 @@ fn render_thread_item(
         .pr_2()
         .py_1()
         .rounded(theme.radius)
-        .border_l_2()
-        .border_color(bar)
         .bg(bg)
-        .hover(|s| s.bg(theme.accent.opacity(0.08)))
-        .active(|s| s.bg(theme.accent.opacity(0.18)))
+        .when(!selected, |this| {
+            this.hover(|s| s.bg(theme.accent.opacity(0.08)))
+                .active(|s| s.bg(theme.accent.opacity(0.18)))
+        })
         .on_click(cx.listener(move |_this, _ev, _window, cx| {
             cx.emit(SidebarEvent::OpenThread(id_open.clone()));
         }))
