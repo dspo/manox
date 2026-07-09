@@ -548,6 +548,143 @@ fn build_child_registry_with_policy(
     reg
 }
 
+/// Spec for spawning a long-lived team worker member. `team_create` /
+/// `team_spawn` tools build these from their input; [`spawn_team_member`] does
+/// the actual `Thread` construction.
+pub(crate) struct MemberSpec {
+    pub name: String,
+    pub subagent_type: String,
+    pub prompt: String,
+}
+
+/// Spawn a long-lived team worker: an independent `Entity<Thread>` at depth 1
+/// sharing the leader's cwd, inheriting the leader's model / approval mode /
+/// reasoning effort / always-allow permission grants, with the sub-agent
+/// definition's tool allowlist PLUS the shared team coordination tools
+/// (`task_*`, `send_message`). The member's `team` back-reference is set so
+/// those tools reach the shared [`crate::team::TaskList`] and the message
+/// router.
+///
+/// Unlike a one-shot `agent` sub-agent, a member is fire-and-forget: it runs to
+/// self-completion or `max_turns`, reporting back via `send_message`. Its
+/// `AgentText`/`AgentThinking` are NOT streamed to the leader — the member
+/// panel subscribes to the member `Thread` directly. `ToolCallAuthorization`
+/// bubbles to the leader as `<name>::<auth>` (reusing the composite-id route);
+/// a terminal `Stop` flushes the member's queued inbox. The returned
+/// [`gpui::Subscription`] keeps those routes alive for the member's tenure.
+pub(crate) fn spawn_team_member(
+    leader: &WeakEntity<Thread>,
+    team: gpui::Entity<crate::team::Team>,
+    spec: MemberSpec,
+    cx: &mut App,
+) -> Result<(gpui::Entity<Thread>, gpui::Subscription), String> {
+    let def_file: Arc<AgentDefinitionFile> = agent_def::global()
+        .get(&spec.subagent_type)
+        .cloned()
+        .ok_or_else(|| format!("unknown subagent type: {}", spec.subagent_type))?;
+    let def = &def_file.def;
+
+    let leader_ent = leader
+        .upgrade()
+        .ok_or_else(|| "leader thread dropped during team_spawn".to_string())?;
+
+    let cwd = leader_ent.read_with(cx, |t, _| t.cwd().to_path_buf());
+    let model = resolve_model(&def.model, leader, cx)?;
+    let parent_snapshot = leader_ent.read_with(cx, |t, _| t.permission_snapshot());
+    let permission = Arc::new(PermissionCache::from_snapshot(parent_snapshot));
+    let parent_mode = leader_ent.read_with(cx, |t, _| t.approval_mode());
+    let parent_effort = leader_ent.read_with(cx, |t, _| t.reasoning_effort());
+    let max_turns = def.max_turns.unwrap_or(10);
+    let system_prompt = def_file.system_prompt.clone();
+    let depth = 1u32;
+    let sandbox = crate::sandbox::SandboxPolicy::for_project(&cwd);
+    let sandbox_for_registry = sandbox.clone();
+
+    let member = Thread::new_subagent(
+        cwd.clone(),
+        model,
+        permission,
+        parent_mode,
+        parent_effort,
+        system_prompt,
+        max_turns,
+        depth,
+        spec.name.clone(),
+        |weak| {
+            let mut reg = build_child_registry_with_policy(
+                Arc::new(cwd.clone()),
+                sandbox_for_registry.clone(),
+                def,
+                depth,
+                weak,
+            );
+            for tool in crate::team::tools::shared_tools() {
+                reg.register(tool);
+            }
+            reg
+        },
+        cx,
+    );
+
+    // Attach the team so the member's task_*/send_message reach the shared
+    // list + router. This is the member→team strong edge; `Team::disband`
+    // clears it before dropping the roster.
+    member.update(cx, |t, cx| t.set_team(team.clone(), cx));
+    member.update(cx, |t, cx| {
+        t.insert_user_message(spec.prompt.clone(), cx);
+    });
+
+    let leader_cb = leader.clone();
+    let team_weak = team.downgrade();
+    let name_cb = spec.name.clone();
+    let sub = cx.subscribe(
+        &member,
+        move |_member, ev: &ThreadEvent, cx: &mut App| match ev {
+            ThreadEvent::ToolCallAuthorization {
+                id: child_id,
+                tool_name,
+                summary,
+                input,
+            } => {
+                let composite = format!("{name_cb}::{child_id}");
+                let prefixed = format!("[{name_cb}] {summary}");
+                if let Some(p) = leader_cb.upgrade() {
+                    p.update(cx, |t, cx| {
+                        t.register_child_auth(
+                            composite,
+                            _member.downgrade(),
+                            child_id.clone(),
+                            tool_name.clone(),
+                            prefixed,
+                            input.clone(),
+                            cx,
+                        );
+                    });
+                }
+            }
+            ThreadEvent::Stop(StopReason::EndTurn)
+            | ThreadEvent::Stop(StopReason::MaxTokens)
+            | ThreadEvent::Stop(StopReason::Refusal) => {
+                let tw = team_weak.clone();
+                let n = name_cb.clone();
+                cx.defer(move |cx| {
+                    if let Some(t) = tw.upgrade() {
+                        t.update(cx, |tm, cx| tm.flush_inbox(&n, cx));
+                    }
+                });
+            }
+            ThreadEvent::Stop(StopReason::ToolUse) => {}
+            _ => {}
+        },
+    );
+
+    member.update(cx, |t, cx| {
+        t.run_turn(cx);
+    });
+
+    Ok((member, sub))
+}
+
 /// A short capability tag for a sub-agent definition, derived from its
 /// `tools`/`disallowed_tools`: `read-only` when it can neither write files nor
 /// run bash, otherwise the union of `write`/`bash`. Advertised in the tool

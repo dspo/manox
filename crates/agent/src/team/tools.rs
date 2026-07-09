@@ -14,15 +14,19 @@
 
 use std::sync::Arc;
 
-use gpui::{App, Task};
+use gpui::{App, Task, WeakEntity};
 use schemars::JsonSchema;
 use serde::{Deserialize, de};
 use tokio_util::sync::CancellationToken;
 
+use crate::language_model::StopReason;
 use crate::team::Team;
+use crate::thread::{Thread, ThreadEvent};
 use crate::tool::{AgentTool, AnyAgentTool, ToolContext};
+use crate::tools::agent::{MemberSpec, spawn_team_member};
 
 use super::task_list::TaskStatus;
+use super::{LEADER_NAME, Member};
 
 /// Tri-state owner deserializer. `Option<Option<String>>` as written collapses
 /// JSON `null` to the outer `None` (serde's `Option` Visitor short-circuits
@@ -340,6 +344,284 @@ pub fn shared_tools() -> Vec<AnyAgentTool> {
     ]
 }
 
+// ─── leader-only team management ────────────────────────────────────────────
+
+/// The leader's team-management tools (`team_create` / `team_spawn` /
+/// `team_disband`), registered only in `main_registry`. Worker members never
+/// form or disband teams — only the leader does. Each tool holds a weak handle
+/// to the leader `Thread`; all spawning/teardown is synchronous entity work on
+/// `&mut App`, so these return `Task::ready`.
+pub fn leader_tools(leader: WeakEntity<Thread>) -> Vec<AnyAgentTool> {
+    vec![
+        Arc::new(TeamCreateTool {
+            leader: leader.clone(),
+        }) as AnyAgentTool,
+        Arc::new(TeamSpawnTool {
+            leader: leader.clone(),
+        }) as AnyAgentTool,
+        Arc::new(TeamDisbandTool { leader }) as AnyAgentTool,
+    ]
+}
+
+/// Shared input shape for a member spec — used by both `team_create`'s roster
+/// and `team_spawn`'s single-add path.
+#[derive(Deserialize, JsonSchema)]
+struct MemberSpecInput {
+    /// Worker name (unique within the team; used as the routing handle for
+    /// `send_message` and the auth-bubble composite id).
+    name: String,
+    /// Short role label shown in the roster UI (e.g. "explorer").
+    role: String,
+    /// Sub-agent definition to spawn (from `~/.config/cx/manox/agents/*.md`).
+    subagent_type: String,
+    /// The member's first task. Becomes its opening user message; the member
+    /// has no access to the leader's conversation, so include any needed file
+    /// paths, error text, or context here.
+    prompt: String,
+}
+
+impl MemberSpecInput {
+    fn into_spec(self) -> MemberSpec {
+        MemberSpec {
+            name: self.name,
+            subagent_type: self.subagent_type,
+            prompt: self.prompt,
+        }
+    }
+}
+
+pub struct TeamCreateTool {
+    leader: WeakEntity<Thread>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct TeamCreateInput {
+    /// Team name (display only).
+    name: String,
+    /// Initial roster of worker members to spawn alongside the team. Omit for
+    /// an empty team you grow later with `team_spawn`.
+    #[serde(default)]
+    members: Vec<MemberSpecInput>,
+}
+
+impl AgentTool for TeamCreateTool {
+    fn name(&self) -> &str {
+        "team_create"
+    }
+    fn description(&self) -> &str {
+        "Form a peer-agents team with you (the main agent) as leader and the \
+         listed sub-agents as long-lived worker members. Members coordinate via \
+         the shared task list and `send_message`; each member runs autonomously \
+         to completion and reports back. Use for parallel sub-tasks that need to \
+         coordinate or share progress — NOT for independent fire-and-forget work \
+         (use the `agent` tool for that). Only one team may be active at a time; \
+         disband with `team_disband` before forming another. Assign members \
+         disjoint write ranges to avoid file-write lock contention."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        crate::tools::schema::<TeamCreateInput>()
+    }
+    fn run(
+        &self,
+        input: serde_json::Value,
+        _cancel: CancellationToken,
+        _ctx: &dyn ToolContext,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
+        let parsed = match serde_json::from_value::<TeamCreateInput>(input) {
+            Ok(p) => p,
+            Err(e) => return Task::ready(Err(format!("team_create input parse failed: {e}"))),
+        };
+        let Some(leader) = self.leader.upgrade() else {
+            return Task::ready(Err("leader thread dropped".to_string()));
+        };
+        // Single-active-team guard: the team↔member ownership cycle relies on
+        // at most one live team; a second would dangle the first's members.
+        if leader.read(cx).team().is_some() {
+            return Task::ready(Err(
+                "a team is already active; disband it with team_disband first".to_string(),
+            ));
+        }
+        let team = Team::new(parsed.name, leader.downgrade(), cx);
+        leader.update(cx, |t, cx| t.set_team(team.clone(), cx));
+
+        // Wire the leader's terminal-Stop → flush leader inbox. The leader is
+        // mid-turn when team_create runs; this subscription fires on its
+        // subsequent turn ends.
+        let team_w = team.downgrade();
+        let leader_sub =
+            cx.subscribe(
+                &leader,
+                move |_leader, ev: &ThreadEvent, cx: &mut App| match ev {
+                    ThreadEvent::Stop(StopReason::EndTurn)
+                    | ThreadEvent::Stop(StopReason::MaxTokens)
+                    | ThreadEvent::Stop(StopReason::Refusal) => {
+                        let tw = team_w.clone();
+                        cx.defer(move |cx| {
+                            if let Some(t) = tw.upgrade() {
+                                t.update(cx, |tm, cx| tm.flush_inbox(LEADER_NAME, cx));
+                            }
+                        });
+                    }
+                    ThreadEvent::Stop(StopReason::ToolUse) => {}
+                    _ => {}
+                },
+            );
+        team.update(cx, |t, _cx| t.set_leader_sub(leader_sub));
+
+        // Spawn each member and fold it into the roster. A spawn failure aborts:
+        // disband the partial team and clear the leader's team so the user can
+        // retry cleanly rather than landing on a half-built team.
+        for spec in parsed.members {
+            let member_name = spec.name.clone();
+            let role = spec.role.clone();
+            match spawn_team_member(&self.leader, team.clone(), spec.into_spec(), cx) {
+                Ok((thread, sub)) => {
+                    let res = team.update(cx, |t, cx| {
+                        t.insert_member(Member::new(member_name.clone(), role, thread), cx)
+                    });
+                    if let Err(e) = res {
+                        team.update(cx, |t, cx| t.disband(cx));
+                        leader.update(cx, |t, cx| t.clear_team(cx));
+                        return Task::ready(Err(format!(
+                            "team_create aborted: member '{member_name}' rejected: {e}"
+                        )));
+                    }
+                    team.update(cx, |t, _cx| t.set_member_sub(member_name, sub));
+                }
+                Err(e) => {
+                    team.update(cx, |t, cx| t.disband(cx));
+                    leader.update(cx, |t, cx| t.clear_team(cx));
+                    return Task::ready(Err(format!(
+                        "team_create aborted: spawn of '{member_name}' failed: {e}"
+                    )));
+                }
+            }
+        }
+
+        let count = team.read(cx).members().len();
+        let name = team.read(cx).name().to_string();
+        Task::ready(Ok(format!("team '{name}' created with {count} member(s)")))
+    }
+}
+
+pub struct TeamSpawnTool {
+    leader: WeakEntity<Thread>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct TeamSpawnInput {
+    name: String,
+    role: String,
+    subagent_type: String,
+    prompt: String,
+}
+
+impl TeamSpawnInput {
+    fn into_spec(self) -> MemberSpec {
+        MemberSpec {
+            name: self.name,
+            subagent_type: self.subagent_type,
+            prompt: self.prompt,
+        }
+    }
+}
+
+impl AgentTool for TeamSpawnTool {
+    fn name(&self) -> &str {
+        "team_spawn"
+    }
+    fn description(&self) -> &str {
+        "Add a worker member to the active team. The team must already exist \
+         (team_create). The new member runs autonomously and reports back via \
+         `send_message`. Refused if the roster is full (5 workers max)."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        crate::tools::schema::<TeamSpawnInput>()
+    }
+    fn run(
+        &self,
+        input: serde_json::Value,
+        _cancel: CancellationToken,
+        _ctx: &dyn ToolContext,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
+        let parsed = match serde_json::from_value::<TeamSpawnInput>(input) {
+            Ok(p) => p,
+            Err(e) => return Task::ready(Err(format!("team_spawn input parse failed: {e}"))),
+        };
+        let Some(leader) = self.leader.upgrade() else {
+            return Task::ready(Err("leader thread dropped".to_string()));
+        };
+        let Some(team) = leader.read(cx).team().cloned() else {
+            return Task::ready(Err(
+                "no active team; create one with team_create".to_string()
+            ));
+        };
+        if !team.read(cx).has_room() {
+            return Task::ready(Err("team is full (5 workers max)".to_string()));
+        }
+        let member_name = parsed.name.clone();
+        let role = parsed.role.clone();
+        match spawn_team_member(&self.leader, team.clone(), parsed.into_spec(), cx) {
+            Ok((thread, sub)) => {
+                let res = team.update(cx, |t, cx| {
+                    t.insert_member(Member::new(member_name.clone(), role, thread), cx)
+                });
+                if let Err(e) = res {
+                    return Task::ready(Err(format!("spawn of '{member_name}' rejected: {e}")));
+                }
+                team.update(cx, |t, _cx| t.set_member_sub(member_name.clone(), sub));
+                Task::ready(Ok(format!("spawned member '{member_name}'")))
+            }
+            Err(e) => Task::ready(Err(format!("spawn of '{member_name}' failed: {e}"))),
+        }
+    }
+}
+
+pub struct TeamDisbandTool {
+    leader: WeakEntity<Thread>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct TeamDisbandInput {}
+
+impl AgentTool for TeamDisbandTool {
+    fn name(&self) -> &str {
+        "team_disband"
+    }
+    fn description(&self) -> &str {
+        "Disband the active team: drop all worker member threads, release the \
+         shared task list, and clear the leader's team. No-op message if no team \
+         is active. Member conversations are session-scoped and not persisted."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        crate::tools::schema::<TeamDisbandInput>()
+    }
+    fn run(
+        &self,
+        input: serde_json::Value,
+        _cancel: CancellationToken,
+        _ctx: &dyn ToolContext,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
+        let Ok(_) = serde_json::from_value::<TeamDisbandInput>(input) else {
+            return Task::ready(Err("team_disband input parse failed".to_string()));
+        };
+        let Some(leader) = self.leader.upgrade() else {
+            return Task::ready(Err("leader thread dropped".to_string()));
+        };
+        let Some(team) = leader.read(cx).team().cloned() else {
+            return Task::ready(Ok("no active team".to_string()));
+        };
+        // `disband` clears each member's team back-reference (breaking the
+        // strong team↔member cycle) and drops the member threads + subscriptions.
+        team.update(cx, |t, cx| t.disband(cx));
+        leader.update(cx, |t, cx| t.clear_team(cx));
+        Task::ready(Ok("team disbanded".to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,7 +767,7 @@ mod tests {
         cx.update(|cx| {
             team.update(cx, |t, cx| {
                 t.insert_member(
-                    Member::new("plan".into(), "explorer".into(), member.downgrade()),
+                    Member::new("plan".into(), "explorer".into(), member.clone()),
                     cx,
                 )
             })
@@ -525,5 +807,70 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {expected}: {names:?}");
         }
+    }
+
+    #[test]
+    fn leader_tools_exposes_three_management_tools() {
+        let cx = TestAppContext::single();
+        let leader = cx.update(|cx| {
+            Thread::restore(ThreadRecord::for_test("lead", "/tmp", Vec::new()), None, cx)
+        });
+        let tools = leader_tools(leader.downgrade());
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"team_create"), "got: {names:?}");
+        assert!(names.contains(&"team_spawn"), "got: {names:?}");
+        assert!(names.contains(&"team_disband"), "got: {names:?}");
+    }
+
+    /// The team subscription in `spawn_team_member` forwards a member's
+    /// `ToolCallAuthorization` to the leader via `register_child_auth` with a
+    /// `<name>::<child_id>` composite id, which re-emits the auth on the leader
+    /// under that id so the existing approval overlay prompts; the leader's
+    /// `respond_authorization` then routes the decision back. Driving a member
+    /// turn to emit its own auth needs a live provider (out of scope for a unit
+    /// test), so this exercises the surfacing path directly — the call the
+    /// subscription makes.
+    #[test]
+    fn register_child_auth_surfaces_composite_id_on_leader() {
+        crate::agent_def::init();
+        let cx = TestAppContext::single();
+        let (leader, member) = cx.update(|cx| {
+            let leader =
+                Thread::restore(ThreadRecord::for_test("lead", "/tmp", Vec::new()), None, cx);
+            let member =
+                Thread::restore(ThreadRecord::for_test("plan", "/tmp", Vec::new()), None, cx);
+            (leader, member)
+        });
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        cx.update(|cx| {
+            cx.subscribe(&leader, move |_, e: &ThreadEvent, _| {
+                if let ThreadEvent::ToolCallAuthorization { id, .. } = e {
+                    cap.lock().unwrap().push(id.clone());
+                }
+            })
+            .detach();
+        });
+
+        cx.update(|cx| {
+            leader.update(cx, |t, cx| {
+                t.register_child_auth(
+                    "plan::child1".into(),
+                    member.downgrade(),
+                    "child1".into(),
+                    "write_file".into(),
+                    "[plan] write_file /tmp/x".into(),
+                    serde_json::json!({}),
+                    cx,
+                );
+            })
+        });
+
+        let ids = captured.lock().unwrap().clone();
+        assert_eq!(
+            ids,
+            vec!["plan::child1".to_string()],
+            "composite id surfaced"
+        );
     }
 }

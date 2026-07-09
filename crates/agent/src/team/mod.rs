@@ -44,12 +44,18 @@ pub struct PeerMessage {
 }
 
 /// A worker member of a team. The leader is the main thread itself and is held
-/// as a `WeakEntity<Thread>` directly on [`Team`]; workers live in the
-/// `members` map with their own inbox.
+/// as a `WeakEntity<Thread>` directly on [`Team`] (the leader `Thread` owns the
+/// `Entity<Team>`, so the team must not strongly hold the leader back); workers
+/// live in the `members` map, strongly owned by the team — their `Entity<Thread>`
+/// lifetime is the team's lifetime, and `team_disband` drops them. The
+/// `member → team` edge (via `Thread.team`) is also strong, so team↔member is a
+/// strong cycle; `team_disband` breaks it by clearing `member.team` before
+/// dropping the roster, and `team_create` refuses a second team while one is
+/// active so the cycle can't accumulate across recreations.
 pub struct Member {
     pub name: String,
     pub role: String,
-    thread: WeakEntity<Thread>,
+    thread: Entity<Thread>,
     inbox: VecDeque<PeerMessage>,
 }
 
@@ -57,7 +63,7 @@ impl Member {
     /// Construct a member descriptor. `team_spawn` (see `team/tools.rs`) builds
     /// the underlying `Entity<Thread>` via `Thread::new_subagent` then wraps it
     /// here.
-    pub fn new(name: String, role: String, thread: WeakEntity<Thread>) -> Self {
+    pub fn new(name: String, role: String, thread: Entity<Thread>) -> Self {
         Self {
             name,
             role,
@@ -66,8 +72,8 @@ impl Member {
         }
     }
 
-    pub fn thread(&self) -> WeakEntity<Thread> {
-        self.thread.clone()
+    pub fn thread(&self) -> &Entity<Thread> {
+        &self.thread
     }
 
     pub fn role(&self) -> &str {
@@ -89,6 +95,15 @@ pub struct Team {
     leader: WeakEntity<Thread>,
     leader_inbox: VecDeque<PeerMessage>,
     members: BTreeMap<String, Member>,
+    /// Per-member event subscriptions kept alive for the member's lifetime:
+    /// `ToolCallAuthorization` bubbles to the leader as `<name>::<auth>`,
+    /// terminal `Stop` flushes the member's inbox. A `Subscription` does not
+    /// keep its target entity alive, so this is not what retains members —
+    /// `members` does.
+    member_subs: BTreeMap<String, gpui::Subscription>,
+    /// The leader's own `Stop` subscription, flushing `leader_inbox` when the
+    /// leader's turn ends. `None` until `team_create` wires it.
+    leader_sub: Option<gpui::Subscription>,
     tasks: Entity<TaskList>,
 }
 
@@ -105,6 +120,8 @@ impl Team {
             leader,
             leader_inbox: VecDeque::new(),
             members: BTreeMap::new(),
+            member_subs: BTreeMap::new(),
+            leader_sub: None,
             tasks,
         })
     }
@@ -162,13 +179,10 @@ impl Team {
         Ok(())
     }
 
-    /// Resolve a member name (or [`LEADER_NAME`]) to its thread.
-    pub fn thread_for(&self, name: &str) -> Option<WeakEntity<Thread>> {
-        if name == LEADER_NAME {
-            Some(self.leader.clone())
-        } else {
-            self.members.get(name).map(|m| m.thread.clone())
-        }
+    /// Resolve a worker member name to its thread. The leader is not a worker
+    /// — use [`Team::leader`] for the leader's weak handle.
+    pub fn thread_for(&self, name: &str) -> Option<&Entity<Thread>> {
+        self.members.get(name).map(|m| &m.thread)
     }
 
     /// Deliver a peer message. `to` is a member name, [`LEADER_NAME`], or
@@ -206,33 +220,31 @@ impl Team {
             from: from.to_string(),
             content,
         };
-        let thread = if to == LEADER_NAME {
-            self.leader.clone()
-        } else {
-            match self.members.get(to) {
-                Some(m) => m.thread.clone(),
-                None => return Err(format!("unknown team member '{to}'")),
-            }
+        if to == LEADER_NAME {
+            return self.deliver_to_leader(msg, cx);
+        }
+        let Some(m) = self.members.get_mut(to) else {
+            return Err(format!("unknown team member '{to}'"));
         };
-        let busy = thread
-            .upgrade()
-            .map(|t| t.read(cx).is_running())
-            .unwrap_or(false);
-        if busy {
-            if to == LEADER_NAME {
-                self.leader_inbox.push_back(msg);
-            } else {
-                self.members
-                    .get_mut(to)
-                    .expect("member checked above")
-                    .inbox
-                    .push_back(msg);
-            }
+        if m.thread.read(cx).is_running() {
+            m.inbox.push_back(msg);
             return Ok(());
         }
-        if let Some(t) = thread.upgrade() {
-            t.update(cx, |th, cx| th.deliver_peer_messages(vec![msg], cx));
+        let thread = m.thread.clone();
+        thread.update(cx, |th, cx| th.deliver_peer_messages(vec![msg], cx));
+        Ok(())
+    }
+
+    fn deliver_to_leader(&mut self, msg: PeerMessage, cx: &mut App) -> Result<(), String> {
+        let Some(leader) = self.leader.upgrade() else {
+            // Leader gone — there is no one to deliver to; drop the message.
+            return Ok(());
+        };
+        if leader.read(cx).is_running() {
+            self.leader_inbox.push_back(msg);
+            return Ok(());
         }
+        leader.update(cx, |th, cx| th.deliver_peer_messages(vec![msg], cx));
         Ok(())
     }
 
@@ -242,23 +254,51 @@ impl Team {
     /// `run_turn` inside `deliver_peer_messages` proceeds. A no-op when the
     /// inbox is empty.
     pub fn flush_inbox(&mut self, who: &str, cx: &mut App) {
-        let (thread, msgs) = if who == LEADER_NAME {
-            (
-                self.leader.clone(),
-                self.leader_inbox.drain(..).collect::<Vec<_>>(),
-            )
-        } else {
-            let Some(m) = self.members.get_mut(who) else {
+        if who == LEADER_NAME {
+            let msgs: Vec<PeerMessage> = self.leader_inbox.drain(..).collect();
+            if msgs.is_empty() {
                 return;
-            };
-            (m.thread.clone(), m.inbox.drain(..).collect::<Vec<_>>())
+            }
+            if let Some(t) = self.leader.upgrade() {
+                t.update(cx, |th, cx| th.deliver_peer_messages(msgs, cx));
+            }
+            return;
+        }
+        let Some(m) = self.members.get_mut(who) else {
+            return;
         };
+        let msgs: Vec<PeerMessage> = m.inbox.drain(..).collect();
         if msgs.is_empty() {
             return;
         }
-        if let Some(t) = thread.upgrade() {
-            t.update(cx, |th, cx| th.deliver_peer_messages(msgs, cx));
+        let thread = m.thread.clone();
+        thread.update(cx, |th, cx| th.deliver_peer_messages(msgs, cx));
+    }
+
+    /// Store a member's auth/`Stop` subscription. Called by `team_spawn` after
+    /// `insert_member`; the subscription lives for the member's tenure.
+    pub fn set_member_sub(&mut self, name: String, sub: gpui::Subscription) {
+        self.member_subs.insert(name, sub);
+    }
+
+    /// Store the leader's `Stop` subscription. Called once by `team_create`.
+    pub fn set_leader_sub(&mut self, sub: gpui::Subscription) {
+        self.leader_sub = Some(sub);
+    }
+
+    /// Tear down the team: clear each member's `team` back-reference (breaking
+    /// the team↔member strong cycle so the member `Entity<Thread>`s actually
+    /// drop), release the leader/member subscriptions, and drain inboxes. The
+    /// leader's own `team` field is cleared separately by the `team_disband`
+    /// tool — the team entity holds the leader only weakly and cannot reach it.
+    pub fn disband(&mut self, cx: &mut App) {
+        for m in self.members.values() {
+            m.thread.update(cx, |t, cx| t.clear_team(cx));
         }
+        self.members.clear();
+        self.member_subs.clear();
+        self.leader_sub = None;
+        self.leader_inbox.clear();
     }
 }
 
@@ -309,7 +349,7 @@ mod tests {
             let leader = bare_thread("lead", cx);
             let team = Team::new("squad".into(), leader.downgrade(), cx);
             let member = bare_thread("plan", cx);
-            let m = Member::new("plan".into(), "explorer".into(), member.downgrade());
+            let m = Member::new("plan".into(), "explorer".into(), member.clone());
             team.update(cx, |t, cx| t.insert_member(m, cx)).unwrap();
             (team, member)
         });
@@ -345,7 +385,7 @@ mod tests {
             let leader = bare_thread("lead", cx);
             let team = Team::new("squad".into(), leader.downgrade(), cx);
             let member = bare_thread("plan", cx);
-            let m = Member::new("plan".into(), "explorer".into(), member.downgrade());
+            let m = Member::new("plan".into(), "explorer".into(), member.clone());
             team.update(cx, |t, cx| t.insert_member(m, cx)).unwrap();
             (team, member)
         });
@@ -389,7 +429,7 @@ mod tests {
             let leader = bare_thread("lead", cx);
             let team = Team::new("squad".into(), leader.downgrade(), cx);
             let member = bare_thread("plan", cx);
-            let m = Member::new("plan".into(), "explorer".into(), member.downgrade());
+            let m = Member::new("plan".into(), "explorer".into(), member.clone());
             team.update(cx, |t, cx| t.insert_member(m, cx)).unwrap();
             (team, member)
         });
@@ -434,9 +474,9 @@ mod tests {
             let plan = bare_thread("plan", cx);
             let expl = bare_thread("expl", cx);
             team.update(cx, |t, cx| {
-                t.insert_member(Member::new("plan".into(), "p".into(), plan.downgrade()), cx)
+                t.insert_member(Member::new("plan".into(), "p".into(), plan.clone()), cx)
                     .unwrap();
-                t.insert_member(Member::new("expl".into(), "e".into(), expl.downgrade()), cx)
+                t.insert_member(Member::new("expl".into(), "e".into(), expl.clone()), cx)
                     .unwrap();
             });
             (team, leader, plan, expl)
@@ -466,7 +506,7 @@ mod tests {
             team.update(cx, |t, cx| {
                 for i in 0..MAX_WORKERS {
                     let th = bare_thread(&format!("m{i}"), cx);
-                    t.insert_member(Member::new(format!("m{i}"), "r".into(), th.downgrade()), cx)
+                    t.insert_member(Member::new(format!("m{i}"), "r".into(), th.clone()), cx)
                         .unwrap();
                 }
             })
@@ -475,7 +515,7 @@ mod tests {
             .update(|cx| {
                 let th = bare_thread("extra", cx);
                 team.update(cx, |t, cx| {
-                    t.insert_member(Member::new("extra".into(), "r".into(), th.downgrade()), cx)
+                    t.insert_member(Member::new("extra".into(), "r".into(), th.clone()), cx)
                 })
             })
             .unwrap_err();
@@ -490,7 +530,7 @@ mod tests {
         cx.update(|cx| {
             let th = bare_thread("m0", cx);
             team2.update(cx, |t, cx| {
-                t.insert_member(Member::new("m0".into(), "r".into(), th.downgrade()), cx)
+                t.insert_member(Member::new("m0".into(), "r".into(), th.clone()), cx)
             })
         })
         .unwrap();
@@ -498,7 +538,7 @@ mod tests {
             .update(|cx| {
                 let th = bare_thread("m0b", cx);
                 team2.update(cx, |t, cx| {
-                    t.insert_member(Member::new("m0".into(), "r".into(), th.downgrade()), cx)
+                    t.insert_member(Member::new("m0".into(), "r".into(), th.clone()), cx)
                 })
             })
             .unwrap_err();

@@ -257,14 +257,17 @@ pub fn main_registry_with_policy(
     // Worktree harness tools: main-thread-only, they mutate the owning
     // Thread's cwd and rebuild its tool registry on enter/exit.
     reg.register(Arc::new(worktree::EnterWorktreeTool::new(parent.clone())) as AnyAgentTool);
-    reg.register(Arc::new(worktree::ExitWorktreeTool::new(parent)) as AnyAgentTool);
+    reg.register(Arc::new(worktree::ExitWorktreeTool::new(parent.clone())) as AnyAgentTool);
 
     // Team coordination tools (shared by the leader and every worker member).
     // Registering here is a one-time tool-spec fingerprint change — stable
     // across turns thereafter, so the provider prefix cache settles once.
-    // The leader-only team-management tools (team_create / team_spawn /
-    // team_disband) are appended in a later commit.
     for tool in crate::team::tools::shared_tools() {
+        reg.register(tool);
+    }
+    // Leader-only team-management tools: form / grow / disband a peer team.
+    // Never registered on worker members (only the leader manages teams).
+    for tool in crate::team::tools::leader_tools(parent.clone()) {
         reg.register(tool);
     }
 

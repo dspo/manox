@@ -920,6 +920,13 @@ impl Thread {
         cx.notify();
     }
 
+    /// Detach the team. `team_disband` calls this on the leader and on every
+    /// member to break the team↔member strong cycle before the roster drops.
+    pub fn clear_team(&mut self, cx: &mut Context<Self>) {
+        self.team = None;
+        cx.notify();
+    }
+
     /// Deliver peer messages: append each as a user-role message, emit a
     /// `PeerMessage` event per message (UI mirror), then start one turn so the
     /// model sees them together. An empty slice is a no-op so unrelated
