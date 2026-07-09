@@ -794,7 +794,7 @@ Self-built markdown renderer (`manox-components::markdown::Markdown`) replacing 
 
 #### TurnFrame
 
-Shared framed text container (`manox-components::turn_frame::TurnFrame`) used for user turns. It draws one accent-colored rounded border without filling the content background, then masks the bottom center so the top and bottom corner radii stay consistent while preserving the open-bottom `╰─` / `─╯` treatment. Callers provide header, trailing controls, and body content without assembling border fragments.
+Shared framed text container (`manox-components::turn_frame::TurnFrame`) used for user turns. It paints one continuous accent-colored stroke path for the door-shaped frame, leaving the bottom center open while preserving rounded `╰─` / `─╯` corners. The lower stroke is lifted slightly into the bottom padding so the open edge visually hugs the final text line without letting markdown content overflow its layout box. The component does not fill the content background, does not rely on masking a complete border, and avoids assembling the frame from independent rail nodes. Callers provide header, trailing controls, and body content.
 
 > Source: `components/src/turn_frame.rs`
 

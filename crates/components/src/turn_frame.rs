@@ -1,18 +1,17 @@
 use gpui::prelude::*;
-use gpui::{AnyElement, Hsla, SharedString, px};
+use gpui::{AnyElement, Hsla, PathBuilder, SharedString, canvas, point, px};
 use gpui_component::{Theme, h_flex, v_flex};
 
 /// A full-width message frame with an open center on the bottom edge.
 ///
-/// The frame draws one rounded border, then masks the bottom center so callers
-/// can treat the open-bottom treatment as a single text container.
+/// The frame paints the door-shaped border as one continuous path. This keeps
+/// the visual treatment from looking assembled out of independent rail nodes.
 pub struct TurnFrame {
     group: Option<SharedString>,
     header: Option<AnyElement>,
     trailing: Option<AnyElement>,
     children: Vec<AnyElement>,
     accent: Hsla,
-    gap_fill: Hsla,
 }
 
 impl TurnFrame {
@@ -23,7 +22,6 @@ impl TurnFrame {
             trailing: None,
             children: Vec::new(),
             accent: theme.accent,
-            gap_fill: theme.background,
         }
     }
 
@@ -34,11 +32,6 @@ impl TurnFrame {
 
     pub fn accent(mut self, accent: Hsla) -> Self {
         self.accent = accent;
-        self
-    }
-
-    pub fn gap_fill(mut self, fill: Hsla) -> Self {
-        self.gap_fill = fill;
         self
     }
 
@@ -64,7 +57,9 @@ impl IntoElement for TurnFrame {
     fn into_element(self) -> Self::Element {
         let rail = px(2.);
         let radius = px(12.);
-        let corner_w = px(34.);
+        let bottom_lift = px(10.);
+        let lower_tail = px(18.);
+        let accent = self.accent;
 
         let mut shell = v_flex().w_full().min_w_0();
         if let Some(group) = self.group {
@@ -82,28 +77,57 @@ impl IntoElement for TurnFrame {
         }
 
         shell
-            .w_full()
-            .min_w_0()
             .relative()
-            .overflow_hidden()
-            .border(rail)
-            .rounded(radius)
-            .border_color(self.accent)
             .px_4()
             .pt_3()
             .pb_3()
             .gap_2()
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let inset = rail / 2.;
+                        let width = f32::from(bounds.size.width);
+                        let height = f32::from(bounds.size.height);
+                        if width <= f32::from(rail) || height <= f32::from(rail) {
+                            return;
+                        }
+
+                        let radius = px(f32::from(radius)
+                            .min(((width.min(height)) / 2. - f32::from(inset)).max(0.)));
+                        let bottom_lift = px(f32::from(bottom_lift).min((height / 3.).max(0.)));
+                        let lower_tail = px(f32::from(lower_tail).min((width / 4.).max(0.)));
+
+                        let left = bounds.origin.x + inset;
+                        let right = bounds.origin.x + bounds.size.width - inset;
+                        let top = bounds.origin.y + inset;
+                        let bottom = bounds.origin.y + bounds.size.height - inset - bottom_lift;
+
+                        let mut path = PathBuilder::stroke(rail);
+                        path.move_to(point(left + radius + lower_tail, bottom));
+                        path.line_to(point(left + radius, bottom));
+                        path.curve_to(point(left, bottom - radius), point(left, bottom));
+                        path.line_to(point(left, top + radius));
+                        path.curve_to(point(left + radius, top), point(left, top));
+                        path.line_to(point(right - radius, top));
+                        path.curve_to(point(right, top + radius), point(right, top));
+                        path.line_to(point(right, bottom - radius));
+                        path.curve_to(point(right - radius, bottom), point(right, bottom));
+                        path.line_to(point(right - radius - lower_tail, bottom));
+
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, accent);
+                        }
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .bottom_0(),
+            )
             .child(header_row)
             .children(self.children)
-            .child(
-                gpui::div()
-                    .absolute()
-                    .bottom_0()
-                    .left(corner_w)
-                    .right(corner_w)
-                    .h(rail)
-                    .bg(self.gap_fill),
-            )
             .into_any_element()
     }
 }
