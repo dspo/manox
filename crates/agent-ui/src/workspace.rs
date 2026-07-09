@@ -275,11 +275,11 @@ const MAIN_MIN_WIDTH: f32 = 160.;
 /// ↑1b,441m ↓9m,833k" (model id at the cap + in/out counters).
 const ENV_CARD_WIDTH: f32 = 340.;
 const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
-/// Minimum message-area width the env card must coexist with. The card is
-/// shown only when the main-column body exceeds `MESSAGE_MIN_W +
-/// ENV_CONTENT_INSET`; below that the card hides and the messages + composer
-/// take the full body width.
-const MESSAGE_MIN_W: f32 = 360.;
+/// Minimum main-column width for the env card to mount at all. Below this the
+/// card stays hidden and the messages + composer take the full body width, so
+/// a narrow window never crowds the conversation. The card is otherwise
+/// default-off (editor closed, thread interacted with, past first screen).
+const ENV_CARD_MIN_MAIN_W: f32 = 900.;
 /// Longest model id rendered in full, calibrated to "MiniMax/MiniMax-M3[1m]"
 /// (22 chars). Longer ids are cut to this width then trimmed by 3 and given a
 /// "..." suffix, so the result stays one line at `ENV_MODEL_ID_MAX` chars
@@ -2731,6 +2731,14 @@ impl Workspace {
                     .w_full()
                     .p_4()
                     .gap_3()
+                    // Directional drop shadow (offset down-left) so the card
+                    // reads as floating above the conversation — the offset
+                    // pushes the shadow to the left and bottom edges, leaving
+                    // the top/right lit, like a card lifted from the top-right.
+                    .shadow(std::vec![
+                        gpui::BoxShadow::new(px(-3.), px(6.), gpui::hsla(0., 0., 0., 0.22))
+                            .blur_radius(px(10.))
+                    ])
                     .rounded(theme.radius)
                     .border_1()
                     .border_color(theme.border)
@@ -4220,19 +4228,19 @@ impl Render for Workspace {
             .child({
                 // The env card floats across the top-right of the conversation
                 // area and reserves `ENV_CONTENT_INSET` of right gutter on the
-                // message list when shown. Only show it when the main-column
-                // body is wide enough to also leave `MESSAGE_MIN_W` for the
-                // messages beside it — otherwise hide the card and let the
-                // messages + composer use the full width. The body width is
-                // derived from the live window size (sidebar + its divider are
-                // the only siblings when the editor pane is closed, which the
+                // message list when shown. It is default-off and mounts only
+                // once the main-column body is at least `ENV_CARD_MIN_MAIN_W`
+                // wide — below that the card stays hidden and the messages +
+                // composer use the full width. The body width is derived from
+                // the live window size (sidebar + its divider are the only
+                // siblings when the editor pane is closed, which the
                 // `!editor_open` term already guarantees).
                 let main_body_w =
                     window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
                 let show_env = !editor_open
                     && !first_screen
                     && self.thread.read(cx).has_interacted()
-                    && main_body_w > px(MESSAGE_MIN_W + ENV_CONTENT_INSET);
+                    && main_body_w >= px(ENV_CARD_MIN_MAIN_W);
                 v_flex()
                     .flex_1()
                     .h_full()
