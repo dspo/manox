@@ -260,7 +260,7 @@ Horizontal flex: [OutlineRail](#outlinerail) + [MessageList](#messagelist).
 
 #### MessageList
 
-Vertical flex, `overflow_y_scroll`, tail-follow via `stick_to_bottom`.
+Virtualized variable-height `list` (`gpui::list` + `ListState`); only viewport + overdraw items lay out. Tail-follow via `FollowMode::Tail`; count/height reconciled via `splice`/`remeasure_items` from the `ThreadEvent` handler.
 
 > Source: `agent-ui/src/workspace.rs`
 
