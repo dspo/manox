@@ -290,6 +290,15 @@ pub struct Workspace {
     /// on every `TurnStarted` and on thread switch so a prior ticker
     /// self-terminates instead of driving a stale container.
     thinking_ticker_gen: u64,
+    /// Per-cell scoreboard state, keyed by `"{model_name}|{field}"` where
+    /// `field ∈ {in, out, cache_create, cache_read}`. Stored as
+    /// `(gen, last_value)`: `gen` is bumped on every value delta so the
+    /// animation's element id changes and gpui fires a fresh 0→1 tween;
+    /// `last_value` is the value the previous render committed and becomes
+    /// the start of the count-up interpolation. Rebuilt every render so
+    /// cells whose model disappeared (e.g. thread reset) are pruned, keeping
+    /// the map bounded by the number of live models.
+    env_counter_state: HashMap<String, (u64, u64)>,
     /// Lazily created on the first `enter_settings` call so we don't pay the
     /// cost when the user never opens Settings.
     settings_view: Option<Entity<SettingsView>>,
@@ -337,10 +346,10 @@ const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 const MAIN_MIN_WIDTH: f32 = 160.;
 
 /// Environment info card floating at the top-right of the conversation area.
-/// Wide enough to hold the two-line per-model usage block: model id + in/out
-/// on line one, cache read/cache creation on line two, each with `↑↓ cached`
-/// markers.
-const ENV_CARD_WIDTH: f32 = 380.;
+/// Compact width for the per-model tree block: model id on the top line,
+/// `├── 穿透` / `└── 缓存` rows underneath, each with `↑↓` animated counters.
+/// Wide enough to fit a 22-char model id plus the four-column counter row.
+const ENV_CARD_WIDTH: f32 = 260.;
 const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
 /// Minimum main-column width for the env card to mount at all. Below this the
 /// card stays hidden and the messages + composer take the full body width, so
@@ -491,6 +500,7 @@ impl Workspace {
             goal_ticker_gen: 0,
             turn_active: false,
             thinking_ticker_gen: 0,
+            env_counter_state: HashMap::new(),
             settings_view: None,
             settings_sub: None,
             plugin_manager_view: None,
@@ -1237,6 +1247,10 @@ impl Workspace {
         // visible-turn highlight needs no reset — it is queried live from the
         // list each frame.
         self.outline_hover = None;
+        // Drop the old thread's per-model counter state so the scoreboard
+        // animation re-rolls from 0 against the new thread's per_model map
+        // instead of interpolating between unrelated values.
+        self.env_counter_state.clear();
         self.pending_auths.clear();
         self.pending_ask = None;
         self.pending_plan = None;
@@ -2729,21 +2743,16 @@ impl Workspace {
     /// approval modes, and sources. Only rendered once the thread has been
     /// interacted with and the editor pane is closed.
     fn render_environment_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let model_label = truncate_env_model_id(self.model_label(cx));
-        let (project, approval_mode, per_model) = {
+        // Approval mode used to live in the card's "模式" section (now removed);
+        // the per-mode chip in the composer footer reads it directly, so we
+        // don't need to query it here.
+        let (project, per_model) = {
             let thread = self.thread.read(cx);
             (
                 thread.project().cloned(),
-                thread.approval_mode(),
                 thread.per_model_token_usage().clone(),
             )
         };
-        let local_label = self
-            .cwd
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_else(|| self.cwd.to_str().unwrap_or("workspace"))
-            .to_string();
         let branch_label = if project.is_some() {
             "main".to_string()
         } else {
@@ -2758,48 +2767,84 @@ impl Workspace {
             .collect();
         model_rows.sort_by_key(|b| std::cmp::Reverse(b.1.total_tokens()));
 
-        let token_section = v_flex().gap_1().child(
-            h_flex()
+        // Diff every cell against the last-rendered value, bump the per-cell
+        // gen on delta, and rebuild `env_counter_state` so the map is bounded
+        // by the number of live models. The four cells per model are
+        // (field, value) pairs; we capture (from, to, gen) per cell so the
+        // animation closures below can be plain `'static` move-closures.
+        let mut new_state: HashMap<String, (u64, u64)> = HashMap::new();
+        // Each model block carries: model id text + two tree rows. The
+        // capture-based build here keeps the closure machinery out of the
+        // outer builder.
+        let mut model_blocks: Vec<(String, gpui::Div, gpui::Div)> = Vec::with_capacity(model_rows.len());
+
+        for (model_name, usage) in model_rows {
+            let model_display = truncate_env_model_id(model_name.clone());
+            let cells: [(&str, u64); 4] = [
+                ("in", usage.input_tokens),
+                ("out", usage.output_tokens),
+                ("cache_create", usage.cache_creation_input_tokens),
+                ("cache_read", usage.cache_read_input_tokens),
+            ];
+            let mut from_to_gen: [(u64, u64, u64); 4] = [(0, 0, 0); 4];
+            for (i, (field, value)) in cells.iter().enumerate() {
+                let cell_key = format!("{model_name}|{field}");
+                let (old_value, new_gen) = match self.env_counter_state.get(&cell_key) {
+                    // First render for this cell: roll from 0 up to the
+                    // current value (gen 1).
+                    None => (0u64, 1u64),
+                    // Value unchanged: reuse the existing gen so the
+                    // animation id is stable and gpui doesn't replay.
+                    Some(&(gen_, last)) if last == *value => (last, gen_),
+                    // Value changed: roll from the previous value to the
+                    // new one, bumping gen so a fresh tween fires.
+                    Some(&(gen_, last)) => (last, gen_.wrapping_add(1)),
+                };
+                new_state.insert(cell_key, (new_gen, *value));
+                from_to_gen[i] = (old_value, *value, new_gen);
+            }
+
+            // Tree prefix glyph (`├── ` / `└── `) painted slightly muted so
+            // it reads as chrome rather than data.
+            let branch_prefix = |glyph: &'static str| -> gpui::Div {
+                gpui::div()
+                    .text_xs()
+                    .text_color(muted.opacity(0.55))
+                    .child(SharedString::from(glyph))
+            };
+            let throughput_label = i18n::t("workspace-env-throughput");
+            let cache_label = i18n::t("workspace-env-cache");
+
+            let (in_f, in_t, in_g) = from_to_gen[0];
+            let (out_f, out_t, out_g) = from_to_gen[1];
+            let (cce_f, cce_t, cce_g) = from_to_gen[2];
+            let (ccr_f, ccr_t, ccr_g) = from_to_gen[3];
+
+            let throughput_row = h_flex()
+                .pl(px(12.))
+                .gap_1()
                 .items_center()
-                .gap_2()
-                .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(i18n::t("workspace-env-usage")),
-                ),
-        );
-        // Each model renders as two rows: input/output on line one, cache
-        // read/cache creation on line two (indented under the model id). Static
-        // text keeps the four-column layout readable without an odometer fight.
-        let token_model_rows: Vec<AnyElement> = model_rows
-            .into_iter()
-            .map(|(model_name, usage)| {
-                let model_display = truncate_env_model_id(model_name);
-                let line_one = h_flex()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(gpui::div().w(px(80.)).truncate().child(model_display))
-                    .child(counter_text("↑", usage.input_tokens))
-                    .child(counter_text("↓", usage.output_tokens));
-                let line_two = h_flex()
-                    .pl(px(80. + 8.))
-                    .gap_2()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(counter_text_cached("↑", usage.cache_read_input_tokens))
-                    .child(counter_text_cached("↓", usage.cache_creation_input_tokens));
-                v_flex()
-                    .gap_0p5()
-                    .child(line_one)
-                    .child(line_two)
-                    .into_any_element()
-            })
-            .collect();
+                .text_xs()
+                .text_color(muted)
+                .child(branch_prefix("├── "))
+                .child(throughput_label)
+                .child(counter_animated("↑", in_f, in_t, "in", in_g))
+                .child(counter_animated("↓", out_f, out_t, "out", out_g));
+            let cache_row = h_flex()
+                .pl(px(12.))
+                .gap_1()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .child(branch_prefix("└── "))
+                .child(cache_label)
+                .child(counter_animated("↑", cce_f, cce_t, "cache_create", cce_g))
+                .child(counter_animated("↓", ccr_f, ccr_t, "cache_read", ccr_g));
+            model_blocks.push((model_display, throughput_row, cache_row));
+        }
+        // Commit the rebuilt per-cell state; auto-prunes cells whose model
+        // disappeared (the map only contains live cells from this render).
+        self.env_counter_state = new_state;
 
         // The env panel floats over the conversation area (absolute, top-right),
         // sitting below the title-bar overlay. `ENV_CONTENT_INSET` in the body
@@ -2813,8 +2858,8 @@ impl Workspace {
             .child(
                 v_flex()
                     .w_full()
-                    .p_4()
-                    .gap_3()
+                    .p_3()
+                    .gap_2()
                     // Directional drop shadow (offset down-left) so the card
                     // reads as floating above the conversation — the offset
                     // pushes the shadow to the left and bottom edges, leaving
@@ -2861,47 +2906,51 @@ impl Workspace {
                         ),
                         theme,
                     ))
-                    .child(env_row(
-                        IconName::HardDrive,
-                        i18n::t_str("workspace-env-local", &[("name", local_label.as_str())]),
-                        None,
-                        theme,
-                    ))
                     .child(env_row(IconName::Github, branch_label.into(), None, theme))
-                    .child(env_row(
-                        IconName::Cpu,
-                        i18n::t_str("workspace-env-model", &[("name", model_label.as_str())]),
-                        None,
-                        theme,
-                    ))
-                    .child(token_section)
-                    .children(token_model_rows)
-                    .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
+                    // ── 消费 (Usage) section ─────────────────────────────────
+                    // Section header + per-model tree blocks. Each block is
+                    // a v_flex: model id on the top line, throughput + cache
+                    // tree rows below, separated by gap_0p5.
                     .child(
                         v_flex()
-                            .gap_2()
+                            .w_full()
+                            .gap_1()
                             .child(
-                                gpui::div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(i18n::t("workspace-env-modes")),
+                                h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
+                                    .child(
+                                        gpui::div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .text_color(theme.muted_foreground)
+                                            .child(i18n::t("workspace-env-usage")),
+                                    ),
                             )
-                            .child(h_flex().gap_1().flex_wrap().child(mode_tag(
-                                match approval_mode {
-                                    ApprovalMode::OnRequest => i18n::t("workspace-env-yolo-off"),
-                                    ApprovalMode::AutoReview => {
-                                        i18n::t("workspace-env-auto-review")
-                                    }
-                                    ApprovalMode::Yolo => i18n::t("workspace-env-yolo-on"),
+                            .children(model_blocks.into_iter().map(
+                                |(model_display, throughput_row, cache_row)| {
+                                    v_flex()
+                                        .w_full()
+                                        .gap_0p5()
+                                        .child(
+                                            gpui::div()
+                                                .text_xs()
+                                                .text_color(theme.foreground)
+                                                .child(model_display),
+                                        )
+                                        .child(throughput_row)
+                                        .child(cache_row)
+                                        .into_any_element()
                                 },
-                                true,
-                                theme,
-                            ))),
+                            )),
                     )
                     .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
+                    // ── 来源 (Sources) section ───────────────────────────────
                     .child(
                         v_flex()
-                            .gap_2()
+                            .gap_1()
                             .child(
                                 gpui::div()
                                     .text_xs()
@@ -2910,7 +2959,7 @@ impl Workspace {
                             )
                             .child(
                                 gpui::div()
-                                    .text_sm()
+                                    .text_xs()
                                     .text_color(theme.muted_foreground)
                                     .child(i18n::t("workspace-env-no-sources")),
                             ),
@@ -5190,32 +5239,6 @@ fn truncate_env_model_id(id: String) -> String {
     format!("{head}...")
 }
 
-fn mode_tag(label: SharedString, active: bool, theme: &Theme) -> AnyElement {
-    gpui::div()
-        .px_2()
-        .py_1()
-        .rounded_full()
-        .bg(if active {
-            theme.accent.opacity(0.14)
-        } else {
-            theme.secondary.opacity(0.35)
-        })
-        .border_1()
-        .border_color(if active {
-            theme.accent.opacity(0.24)
-        } else {
-            theme.border
-        })
-        .text_xs()
-        .text_color(if active {
-            theme.foreground
-        } else {
-            theme.muted_foreground
-        })
-        .child(label)
-        .into_any_element()
-}
-
 /// Compact token count display: `1m,357k`, `168k,653`, `999`.
 fn format_tokens(n: u64) -> String {
     const MILLION: u64 = 1_000_000;
@@ -5241,26 +5264,43 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Static token counter: `{arrow}{formatted}` (e.g. `↑1m,357k`).
-fn counter_text(arrow: &str, value: u64) -> AnyElement {
+/// Scoreboard-style token counter: linearly interpolates the displayed
+/// integer from `from` to `to` over 600ms with `ease_out_quint`, then
+/// formats it via [`format_tokens`]. The animation id embeds the cell's
+/// `field` identity plus `gen`; bumping `gen` on every value delta forces
+/// gpui to fire a fresh 0→1 tween, while a stable `gen` reuses the cached
+/// end-state and renders the value statically.
+///
+/// `arrow` is `&'static str` (`"↑"` / `"↓"`) so the closure stays
+/// `'static` without copying the arrow into a `SharedString` on every
+/// frame. `field` is also `&'static str` for the same reason — only the
+/// four canonical field names ever flow through here.
+///
+/// The visible text_color cascades from the parent `h_flex` row (which
+/// sets `text_color(muted)`), so this helper only owns the interpolated
+/// value text.
+fn counter_animated(
+    arrow: &'static str,
+    from: u64,
+    to: u64,
+    field: &'static str,
+    gen_: u64,
+) -> AnyElement {
+    let anim_id = format!("env-counter-{field}-{gen_}");
+    let from_f = from as f64;
+    let to_f = to as f64;
     gpui::div()
-        .child(SharedString::from(format!(
-            "{arrow}{}",
-            format_tokens(value)
-        )))
-        .into_any_element()
-}
-
-/// Cached token counter: `{arrow}{formatted} {cached}` — the `cached`
-/// marker is localized so the card doesn't mix languages under non-English
-/// locales.
-fn counter_text_cached(arrow: &str, value: u64) -> AnyElement {
-    h_flex()
-        .gap_0p5()
-        .child(SharedString::from(format!(
-            "{arrow}{}",
-            format_tokens(value)
-        )))
-        .child(i18n::t("workspace-env-cached"))
+        .with_animation(
+            anim_id,
+            Animation::new(Duration::from_millis(600)).with_easing(ease_out_quint()),
+            move |el, t| {
+                let v = (from_f + (to_f - from_f) * t as f64) as u64;
+                el.child(SharedString::from(format!(
+                    "{}{}",
+                    arrow,
+                    format_tokens(v),
+                )))
+            },
+        )
         .into_any_element()
 }
