@@ -39,6 +39,11 @@ use crate::thread::model_facing_content;
 /// least this large. Below it there is not enough headroom for a compaction
 /// pass to be worthwhile, so the thread is left alone and the UI warns instead.
 pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
+/// Trigger fraction of the auto-compact window when a model carries an explicit
+/// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env override (Claude Code parity). The
+/// override's window replaces `max_token_count`; absent the override, the
+/// user's `settings.auto_compact.threshold` (default 0.9) still applies.
+pub const CLAUDE_CODE_AUTO_COMPACT_THRESHOLD: f64 = 0.8;
 
 /// Byte budget for the recent user-message tail retained verbatim alongside a
 /// compaction summary. ~4 bytes/token ⇒ ~20k tokens of recent user prompts
@@ -498,6 +503,39 @@ mod tests {
         assert_eq!(
             auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
             Some(2)
+        );
+    }
+    #[test]
+    fn auto_target_fires_at_eighty_pct_claude_code_parity() {
+        // CLAUDE_CODE_AUTO_COMPACT_WINDOW parity: at an explicit window W, a
+        // compaction fires once active tokens reach 80% of W; below it, no fire.
+        let window = 202_745u64;
+        let threshold = ((window as f64) * 0.8).ceil() as u64; // 162_196
+        let msgs = vec![user("u1", "long session")];
+        let mut per = HashMap::new();
+        // 79.99…% (one short of the threshold) → no fire.
+        per.insert(
+            "u1".to_string(),
+            TokenUsage {
+                input_tokens: threshold - 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            auto_compaction_target_ix(&msgs, &per, true, window, 0.8),
+            None
+        );
+        // Exactly 80% → at threshold, fires.
+        per.insert(
+            "u1".to_string(),
+            TokenUsage {
+                input_tokens: threshold,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            auto_compaction_target_ix(&msgs, &per, true, window, 0.8),
+            Some(1)
         );
     }
 

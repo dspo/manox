@@ -60,6 +60,8 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
         )
     })?)?;
     let max_tokens = resolve_context_window(resolved);
+    let auto_compact_window =
+        resolve_auto_compact_window(resolved.wire_api, &resolved.env, max_tokens);
 
     let model: AnyLanguageModel = match resolved.wire_api {
         WireApi::Anthropic => Arc::new(AnthropicModel::new(
@@ -70,6 +72,7 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             resolved.endpoint_url.clone(),
             api_key,
             max_tokens,
+            auto_compact_window,
         )),
         WireApi::Responses => Arc::new(ResponsesModel::new(
             resolved.key(),
@@ -133,6 +136,81 @@ fn resolve_context_window(resolved: &ResolvedModel) -> u64 {
     } else {
         cx_providers::context_window_from_suffix(&resolved.id).unwrap_or(8192)
     }
+}
+/// Provider-config env var (`~/.config/cx/cx.providers.config.yaml`, provider-
+/// level or model-level `env:`) that overrides a model's auto-compact trigger
+/// window. Only effective on the Anthropic wire; see `build_model`. When set,
+/// the thread auto-compacts at 80% of the parsed token count instead of the
+/// model's full `max_token_count` at the settings threshold — Claude Code parity.
+const CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+
+/// Parse `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from a resolved model's env map.
+/// The value is a plain integer token count (e.g. `"202745"`) — no `k`/`m`
+/// unit suffixes, matching Claude Code. A non-positive or unparseable value is
+/// warn-logged and ignored so a typo never silently shrinks the window.
+fn auto_compact_window_from_env(env: &std::collections::BTreeMap<String, String>) -> Option<u64> {
+    let raw = env.get(CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV)?;
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Some(n),
+        Ok(_) => {
+            tracing::warn!(
+                env = CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV,
+                value = raw.as_str(),
+                "auto-compact window must be a positive integer; ignoring override"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                env = CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV,
+                value = raw.as_str(),
+                "auto-compact window is not a valid integer; ignoring override"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve the auto-compact window override for a model. Encapsulates three
+/// guards: (1) the env var only takes effect on the Anthropic wire; (2) a
+/// value at or above `max_token_count` would make compaction unreachable
+/// (threshold = 80% of a window larger than the real context budget); (3) a
+/// value below `MIN_COMPACTION_CONTEXT_WINDOW` is accepted by the parser but
+/// silently discarded by the compaction floor guard. All three are warn-logged
+/// so a misconfiguration surfaces rather than silently disabling compaction.
+fn resolve_auto_compact_window(
+    wire_api: WireApi,
+    env: &std::collections::BTreeMap<String, String>,
+    max_token_count: u64,
+) -> Option<u64> {
+    if wire_api != WireApi::Anthropic {
+        if env.contains_key(CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV) {
+            tracing::warn!(
+                env = CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV,
+                wire_api = ?wire_api,
+                "CLAUDE_CODE_AUTO_COMPACT_WINDOW is only effective on the Anthropic wire; ignoring"
+            );
+        }
+        return None;
+    }
+    let window = auto_compact_window_from_env(env)?;
+    if window >= max_token_count {
+        tracing::warn!(
+            env = CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV,
+            value = window,
+            max_token_count,
+            "auto-compact window >= max_token_count; the 80% threshold may never be reached — compaction could be silently disabled"
+        );
+    }
+    if window < crate::compact::MIN_COMPACTION_CONTEXT_WINDOW {
+        tracing::warn!(
+            env = CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV,
+            value = window,
+            min = crate::compact::MIN_COMPACTION_CONTEXT_WINDOW,
+            "auto-compact window below MIN_COMPACTION_CONTEXT_WINDOW; compaction will be disabled by the floor guard"
+        );
+    }
+    Some(window)
 }
 
 /// Read the cx config, build the registry, and register it globally. Call at App startup.
@@ -218,4 +296,105 @@ mod tests {
             MAX_OUTPUT_TOKENS_CAP
         );
     }
+    #[test]
+    fn auto_compact_window_from_env_parses_and_falls_back() {
+        use std::collections::BTreeMap;
+        let mut env = BTreeMap::new();
+        // Absent → None.
+        assert_eq!(auto_compact_window_from_env(&env), None);
+        // Plain integer → Some.
+        env.insert(
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(),
+            "202745".to_string(),
+        );
+        assert_eq!(auto_compact_window_from_env(&env), Some(202_745));
+        // Whitespace-tolerant.
+        env.insert(
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(),
+            "  100000  ".to_string(),
+        );
+        assert_eq!(auto_compact_window_from_env(&env), Some(100_000));
+        // Garbage → None (warn).
+        env.insert(
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(),
+            "not-a-number".to_string(),
+        );
+        assert_eq!(auto_compact_window_from_env(&env), None);
+        // Zero → None (warn).
+        env.insert(
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(),
+            "0".to_string(),
+        );
+        assert_eq!(auto_compact_window_from_env(&env), None);
+        // Unit suffix rejected — plain integer only, matching Claude Code.
+        env.insert(
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(),
+            "200k".to_string(),
+        );
+        assert_eq!(auto_compact_window_from_env(&env), None);
+    }
+
+    #[test]
+    fn resolve_auto_compact_window_gates_by_wire_api() {
+        use std::collections::BTreeMap;
+        let mut env = BTreeMap::new();
+        env.insert(
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(),
+            "202745".to_string(),
+        );
+        // Anthropic wire → Some.
+        assert_eq!(
+            resolve_auto_compact_window(WireApi::Anthropic, &env, 1_000_000),
+            Some(202_745)
+        );
+        // Responses wire → None (env var ignored).
+        assert_eq!(
+            resolve_auto_compact_window(WireApi::Responses, &env, 1_000_000),
+            None
+        );
+        // Completions wire → None.
+        assert_eq!(
+            resolve_auto_compact_window(WireApi::Completions, &env, 1_000_000),
+            None
+        );
+        // Empty env on non-Anthropic → None, no warn.
+        assert_eq!(
+            resolve_auto_compact_window(WireApi::Responses, &BTreeMap::new(), 1_000_000),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_auto_compact_window_warns_on_sanity_violations() {
+        use std::collections::BTreeMap;
+        let mut env = BTreeMap::new();
+        // window >= max_token_count → accepted but warned (dead override).
+        env.insert(
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(),
+            "500000".to_string(),
+        );
+        assert_eq!(
+            resolve_auto_compact_window(WireApi::Anthropic, &env, 200_000),
+            Some(500_000)
+        );
+        // window < MIN_COMPACTION_CONTEXT_WINDOW → accepted but warned.
+        env.insert(
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(),
+            "50000".to_string(),
+        );
+        assert_eq!(
+            resolve_auto_compact_window(WireApi::Anthropic, &env, 200_000),
+            Some(50_000)
+        );
+        // window == max_token_count → warned (boundary).
+        env.insert(
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV.to_string(),
+            "200000".to_string(),
+        );
+        assert_eq!(
+            resolve_auto_compact_window(WireApi::Anthropic, &env, 200_000),
+            Some(200_000)
+        );
+    }
 }
+
