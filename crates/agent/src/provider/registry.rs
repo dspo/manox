@@ -96,6 +96,19 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
     Ok(model)
 }
 
+/// Ceiling for a model's `max_output_tokens` request field. A model's context
+/// budget (e.g. glm-5.2 `[1m]` = 1,048,576) far exceeds what any provider lets a
+/// single response emit, so the raw `max_token_count` is unsuitable as the
+/// output budget. Capped to keep responses bounded; floored well above the old
+/// hard `8192` so a reasoning model mid-thinking is not cut off mid-tool-call —
+/// a truncated `tool_use` input JSON stalls the turn (see thread 76aef71a).
+pub(crate) const MAX_OUTPUT_TOKENS_CAP: u64 = 32_768;
+const MIN_OUTPUT_TOKENS: u64 = 8_192;
+
+pub(crate) fn default_max_output_tokens(max_token_count: u64) -> u64 {
+    max_token_count.clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_CAP)
+}
+
 /// Parse a context string (e.g. `1m` / `200k` / `8192`) into a token count.
 /// Falls back to 8192 when unparseable.
 fn parse_max_tokens(context: &str) -> u64 {
@@ -148,5 +161,24 @@ mod tests {
         assert_eq!(parse_max_tokens("8192"), 8192);
         assert_eq!(parse_max_tokens(""), 8192);
         assert_eq!(parse_max_tokens("garbage"), 8192);
+    }
+
+    #[test]
+    fn default_max_output_tokens_cases() {
+        // Floor: a tiny or zero context budget still gets a usable output window.
+        assert_eq!(default_max_output_tokens(0), MIN_OUTPUT_TOKENS);
+        assert_eq!(default_max_output_tokens(4_096), MIN_OUTPUT_TOKENS);
+        // In-range: passes through up to the cap.
+        assert_eq!(default_max_output_tokens(16_384), 16_384);
+        assert_eq!(
+            default_max_output_tokens(MAX_OUTPUT_TOKENS_CAP),
+            MAX_OUTPUT_TOKENS_CAP
+        );
+        // Cap: a 1m-context model is bounded, not handed a million-token budget.
+        assert_eq!(default_max_output_tokens(200 * 1024), MAX_OUTPUT_TOKENS_CAP);
+        assert_eq!(
+            default_max_output_tokens(1024 * 1024),
+            MAX_OUTPUT_TOKENS_CAP
+        );
     }
 }

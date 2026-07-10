@@ -66,7 +66,9 @@ impl AnthropicModel {
             api_model_id,
             endpoint_url: endpoint_url.clone(),
             api_key,
-            max_output_tokens: max_token_count.min(8192),
+            max_output_tokens: crate::provider::registry::default_max_output_tokens(
+                max_token_count,
+            ),
             max_token_count,
             long_ttl,
             supports_effort,
@@ -654,6 +656,37 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// `AnthropicModel::new` derives `max_output_tokens` from the context budget
+    /// via `registry::default_max_output_tokens`: a 1m-context model is capped to
+    /// `MAX_OUTPUT_TOKENS_CAP` (not handed a million-token output budget), and a
+    /// sub-floor context is raised to the minimum so reasoning isn't choked.
+    #[test]
+    fn new_clamps_max_output_tokens_to_budget() {
+        let big = AnthropicModel::new(
+            "p/m/anthropic".into(),
+            "m[1m]".into(),
+            "p".into(),
+            "m".into(),
+            "https://example.invalid".into(),
+            "k".into(),
+            1024 * 1024,
+        );
+        assert_eq!(
+            big.max_output_tokens,
+            crate::provider::registry::MAX_OUTPUT_TOKENS_CAP
+        );
+        let tiny = AnthropicModel::new(
+            "p/m/anthropic".into(),
+            "m".into(),
+            "p".into(),
+            "m".into(),
+            "https://example.invalid".into(),
+            "k".into(),
+            4_096,
+        );
+        assert_eq!(tiny.max_output_tokens, 8_192);
     }
 
     /// Live streaming test: send "hi" via the Bailian glm-5.2[1m] anthropic wire.
