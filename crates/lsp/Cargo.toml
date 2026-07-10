@@ -1,0 +1,20 @@
+[package]
+name = "lsp"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio = { workspace = true }
+tokio-util.workspace = true
+async-channel.workspace = true
+futures.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lsp-types.workspace = true
+supervisor.workspace = true
+
+[lints.clippy]
+dbg_macro = "deny"

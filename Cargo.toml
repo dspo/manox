@@ -16,6 +16,8 @@ members = [
     "crates/terminal",
     "crates/terminal-ui",
     "crates/components",
+    "crates/supervisor",
+    "crates/lsp",
 ]
 resolver = "2"
 
@@ -33,6 +35,8 @@ manox = { path = "crates/manox" }
 terminal = { path = "crates/terminal" }
 terminal-ui = { path = "crates/terminal-ui" }
 manox-components = { path = "crates/components" }
+supervisor = { path = "crates/supervisor" }
+lsp = { path = "crates/lsp" }
 
 anyhow = "1"
 async-channel = "2"
@@ -70,6 +74,10 @@ base64 = "0.22"
 image = "0.25"
 
 rmcp = { version = "1.8", default-features = false }
+# lsp-types —— LSP protocol types (InitializeParams, Location, Hover, ...). The
+# wire framer is hand-rolled (see crates/lsp/src/proto.rs); this crate only
+# supplies typed structs for the params/results we send and parse.
+lsp-types = "0.97"
 toml = "0.8"
 http = "1"
 
