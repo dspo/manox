@@ -2981,18 +2981,14 @@ impl Thread {
         // the summary). The retained tail keeps recent user prompts verbatim so
         // the active request + its tool results stay grounded; see `compact`.
         // Adjacent same-role runs that the assembly can produce
-        // (retained-user → compaction-user → …) are coalesced so Anthropic's
-        // wire, which rejects consecutive same-role messages, accepts the
-        // request.
-        //
-        // The `cache` flag marks the trailing two user/assistant messages as
-        // cache-anchor candidates. It is advisory metadata today — the actual
-        // `cache_control` breakpoints are placed by `apply_prompt_caching`
-        // against messages[-2]/messages[-1] — but keeping the flag aligned with
-        // that intent documents the contract for a future wire mapper that
-        // reads it.
+        // (retained-user → compaction-user → …, or a plan-mode Reject
+        // ending the turn on a user-role ToolResult followed by the user's
+        // next message) are coalesced so Anthropic's wire, which rejects
+        // consecutive same-role messages, accepts the request. A no-op for
+        // the normal alternation, so the cached prefix is byte-stable across
+        // turns; the coalesced run is itself stable once it's in history.
         let mapped: Vec<LanguageModelRequestMessage> =
-            match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
+            crate::compact::coalesce_same_role(match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
                 Some(c_ix) => {
                     let mut rebuilt =
                         crate::compact::retained_user_messages_before(&self.messages, c_ix);
@@ -3017,7 +3013,7 @@ impl Thread {
                             cache: false,
                         }
                     }));
-                    crate::compact::coalesce_same_role(rebuilt)
+                    rebuilt
                 }
                 None => self
                     .messages
@@ -3028,7 +3024,13 @@ impl Thread {
                         cache: false,
                     })
                     .collect(),
-            };
+            });
+        // The `cache` flag marks the trailing two user/assistant messages as
+        // cache-anchor candidates. It is advisory metadata today — the actual
+        // `cache_control` breakpoints are placed by `apply_prompt_caching`
+        // against messages[-2]/messages[-1] — but keeping the flag aligned with
+        // that intent documents the contract for a future wire mapper that
+        // reads it.
         let len = mapped.len();
         for (i, mut m) in mapped.into_iter().enumerate() {
             if i + 2 >= len {
@@ -4316,6 +4318,80 @@ mod tests {
         assert!(
             !names.contains(&"enter_plan_mode"),
             "a whitelisted turn must not advertise enter_plan_mode, got: {names:?}"
+        );
+    }
+
+    /// Regression guard: a plan-mode Reject ends the turn on a user-role
+    /// ToolResult; the user's next message is also user-role. The two adjacent
+    /// user messages must be coalesced before the request leaves
+    /// `build_completion_request`, or Anthropic's wire rejects the turn with a
+    /// 400. `coalesce_same_role` wraps the whole mapping — not just the
+    /// compaction branch — so this adjacent-user run is normalized even when no
+    /// compaction is in play.
+    #[test]
+    fn build_completion_request_coalesces_plan_reject_then_user_message() {
+        use crate::language_model::{LanguageModelToolUse, Role};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-plan-reject-coalesce", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                // Assistant submits a plan via exit_plan_mode.
+                t.messages.push(Message::assistant(vec![MessageContent::ToolUse(
+                    LanguageModelToolUse {
+                        id: "tu_plan".to_string(),
+                        name: Arc::from("exit_plan_mode"),
+                        raw_input: "{}".to_string(),
+                        input: json!({ "plan": "# plan body" }),
+                        is_input_complete: true,
+                        thought_signature: None,
+                    },
+                )]));
+                // Reject: a user-role ToolResult, as `append_tool_result` emits
+                // on the Reject branch.
+                t.messages.push(Message::user_with_content(vec![
+                    MessageContent::ToolResult(LanguageModelToolResult {
+                        tool_use_id: "tu_plan".to_string(),
+                        tool_name: Arc::from("exit_plan_mode"),
+                        is_error: false,
+                        content: "User rejected this plan and ended the turn."
+                            .to_string(),
+                    }),
+                ]));
+                // User's next message carrying new direction — also user role.
+                t.insert_user_message("Focus on the i18n layer instead.".to_string(), cx);
+            });
+        });
+
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        // Drop the leading system message; the wire contract concerns the
+        // user/assistant alternation in the conversation proper.
+        let convo: Vec<_> = req
+            .messages
+            .into_iter()
+            .filter(|m| m.role != Role::System)
+            .collect();
+        for pair in convo.windows(2) {
+            assert_ne!(
+                pair[0].role,
+                pair[1].role,
+                "adjacent same-role messages would be rejected by the wire: {convo:?}"
+            );
+        }
+        // The reject ToolResult and the new-direction text must land in one
+        // coalesced user message, not two.
+        let user_count = convo.iter().filter(|m| m.role == Role::User).count();
+        assert_eq!(
+            user_count, 1,
+            "adjacent user messages were not coalesced into one"
         );
     }
 }
