@@ -1,7 +1,8 @@
 //! Conversation history sidebar.
 //!
 //! A standalone gpui Entity that subscribes to `ThreadStore` and lists past threads. Clicking a
-//! conversation entry emits `OpenThread(id)`; the "new conversation" menu item emits `NewThread`.
+//! conversation entry emits `OpenThread(id)`; the "+" button on each project folder header emits
+//! `NewThreadWithProject(path)`; the "+" button on the "Conversations" section emits `NewThread`.
 //! Workspace subscribes to these events.
 //!
 //! Threads bound to a project (chosen on the first screen) are grouped under a collapsible folder
@@ -9,6 +10,7 @@
 //! menu and bottom account footer are static decoration.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use agent::{ThreadStore, ThreadStoreEvent, i18n, thread::ApprovalMode};
@@ -65,6 +67,8 @@ enum AnimRole {
 pub enum SidebarEvent {
     OpenThread(String),
     NewThread,
+    /// New thread bound to a specific project path.
+    NewThreadWithProject(PathBuf),
     OpenPlugins,
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
@@ -201,6 +205,22 @@ impl Sidebar {
                     .text_color(theme.foreground)
                     .child(name),
             )
+            .child(
+                Button::new(format!("new-thread-in-project-{key}"))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Plus)
+                    .tooltip(i18n::t("sidebar-new-chat"))
+                    .on_click(cx.listener({
+                        let path = path.to_string();
+                        move |_this, _ev, _window, cx| {
+                            cx.stop_propagation();
+                            cx.emit(SidebarEvent::NewThreadWithProject(
+                                PathBuf::from(path.clone()),
+                            ));
+                        }
+                    })),
+            )
             .on_click(cx.listener({
                 let path = path.to_string();
                 move |this, _ev, _window, cx| {
@@ -327,15 +347,6 @@ impl Render for Sidebar {
                         v_flex()
                             .w_full()
                             .gap_0p5()
-                            .child(menu_item(
-                                "new-thread",
-                                IconName::SquareTerminal,
-                                i18n::t("sidebar-new-chat"),
-                                &theme,
-                                Some(cx.listener(|_this, _ev, _window, cx| {
-                                    cx.emit(SidebarEvent::NewThread);
-                                })),
-                            ))
                             .child(static_menu_item(
                                 "search",
                                 IconName::Search,
@@ -360,7 +371,7 @@ impl Render for Sidebar {
                     )
                     .children(
                         (!projects.is_empty())
-                            .then(|| section_header(i18n::t("sidebar-section-projects"), &theme)),
+                            .then(|| section_header(i18n::t("sidebar-section-projects"), &theme, None)),
                     )
                     .children(projects.into_iter().map(|(path, group)| {
                         self.render_project_group(
@@ -372,11 +383,21 @@ impl Render for Sidebar {
                             cx,
                         )
                     }))
-                    .children(
-                        (!loose.is_empty()).then(|| {
-                            section_header(i18n::t("sidebar-section-conversations"), &theme)
-                        }),
-                    )
+                    .child(section_header(
+                        i18n::t("sidebar-section-conversations"),
+                        &theme,
+                        Some(
+                            Button::new("conv-plus")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .tooltip(i18n::t("sidebar-new-chat"))
+                                .on_click(cx.listener(|_this, _ev, _window, cx| {
+                                    cx.emit(SidebarEvent::NewThread);
+                                }))
+                                .into_any_element(),
+                        ),
+                    ))
                     .child(v_flex().w_full().gap_0p5().children(loose.iter().map(|s| {
                         render_thread_item(
                             s,
@@ -440,17 +461,24 @@ fn static_menu_item(
 
 /// A group header (section label). Text size matches the menu items and
 /// thread titles below it so the section reads as a peer of its children
-/// rather than a smaller-label category.
-fn section_header(label: SharedString, theme: &Theme) -> AnyElement {
-    gpui::div()
+/// rather than a smaller-label category. `action` is an optional trailing
+/// element (e.g. a "+" button) rendered to the right of the label.
+fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>) -> AnyElement {
+    let mut row = h_flex()
         .px_2()
         .pt_3()
         .pb_1()
+        .items_center()
         .text_sm()
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.muted_foreground)
-        .child(label)
-        .into_any_element()
+        .child(gpui::div().flex_1().child(label));
+
+    if let Some(el) = action {
+        row = row.child(el);
+    }
+
+    row.into_any_element()
 }
 
 /// Render one conversation row. `indent` adds left padding so rows nested under

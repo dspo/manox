@@ -832,7 +832,10 @@ impl Workspace {
             &sidebar,
             window,
             |this, _sidebar, ev: &SidebarEvent, window, cx| match ev {
-                SidebarEvent::NewThread => this.start_new_thread(window, cx),
+                SidebarEvent::NewThread => this.start_new_thread(None, window, cx),
+                SidebarEvent::NewThreadWithProject(dir) => {
+                    this.start_new_thread(Some(dir.clone()), window, cx);
+                }
                 SidebarEvent::OpenPlugins => this.enter_plugins(cx),
                 SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
                 SidebarEvent::ArchiveThread(id, archived) => {
@@ -1229,9 +1232,17 @@ impl Workspace {
         }
     }
 
-    fn start_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_new_thread(
+        &mut self,
+        project: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let new = Thread::new(id, self.cwd.clone(), cx);
+        if let Some(dir) = project {
+            new.update(cx, |t, cx| t.set_project(dir, cx));
+        }
         self.attach_thread(new, window, cx);
     }
 
@@ -5268,7 +5279,7 @@ impl Workspace {
     }
 
     pub(crate) fn harness_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_new_thread(window, cx);
+        self.start_new_thread(None, window, cx);
     }
 
     pub(crate) fn harness_open_thread(
