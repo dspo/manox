@@ -1,17 +1,13 @@
-//! Composer `+` and `⁄` menus plus pending-attachment support.
+//! Composer `+` menu plus pending-attachment support.
 //!
 //! The `+` menu offers "add / plugins" rows; "Files and Folders" opens a real
 //! file picker and "Plan Mode" toggles the thread's plan mode. The remaining
-//! rows are static decoration. The `⁄` menu's top section lists registered
-//! slash commands dynamically (from the `SlashCommandRegistry`); the rest
-//! (memory / skills) remains static decoration. Clicking a registered command
-//! inserts `/name ` into the composer for the user to complete and submit.
+//! rows are static decoration. Slash-command typeahead (`/`) and `@` mentions
+//! live in [`crate::views::completion`], not here.
 //!
 //! A [`PendingAttachment`] is a file the user picked but has not yet sent. On submit the workspace
 //! turns each into message content: images become base64 [`MessageContent::Image`] blocks, text
 //! files are inlined into the message text wrapped in `<file>` tags.
-
-use std::rc::Rc;
 
 use std::path::{Path, PathBuf};
 
@@ -25,10 +21,10 @@ use gpui_component::{
     v_flex,
 };
 
-/// Static row for the `+` and `⁄` menus: an icon, a name, and a description.
+/// Static row for the `+` menu: an icon, a name, and a description.
 /// `name`/`desc` are fluent message ids for localized rows, or literal English
 /// text for the decorative placeholder rows (resolved identically via
-/// identically via [`menu_row_item`]).
+/// [`menu_row_item`]).
 struct MenuRow {
     icon: IconName,
     name: &'static str,
@@ -93,43 +89,6 @@ const PLUS_PLUGIN_ROWS: &[MenuRow] = &[
     },
 ];
 
-/// `⁄` menu skills group. The `bool` is whether the skill is "personal" vs "system".
-const SLASH_SKILL_ROWS: &[(&str, &str, bool)] = &[
-    (
-        "Browser",
-        "Browser lets manox open and control the in-app browser",
-        true,
-    ),
-    ("CI Debug", "Debug failing GitHub Actions checks", true),
-    (
-        "Chrome: Control Chrome",
-        "Control the user's Chrome browser for tasks",
-        true,
-    ),
-    (
-        "Documents",
-        "Create and edit Word and Google Docs files",
-        true,
-    ),
-    ("GitHub", "Inspect PRs, issues, CI, and publish bots", true),
-    (
-        "GitLab Dev",
-        "Guide GitLab issue, MR, pipeline, and worktree workflows",
-        true,
-    ),
-    (
-        "Image Gen",
-        "Generate or edit images for websites, games, and more",
-        false,
-    ),
-    (
-        "OpenAI Docs",
-        "Reference OpenAI docs, self-knowledge, and model info",
-        false,
-    ),
-    ("PDF", "Read, create, render, and verify PDF files", true),
-];
-
 /// Render one menu row (icon + name + muted description) as a popup-menu element
 /// item. `name`/`desc` are resolved through `i18n::t`: fluent keys yield the
 /// localized text, literal English placeholders fall through unchanged.
@@ -147,33 +106,6 @@ fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
             .child(gpui::div().text_sm().text_color(fg).child(name.clone()));
         if !desc.is_empty() {
             line = line.child(gpui::div().text_xs().text_color(muted).child(desc.clone()));
-        }
-        line
-    })
-}
-
-/// A `⁄`-popover row for a registered slash command: a `/name` label in mono
-/// style plus its description. Clicking inserts the command into the composer.
-fn slash_command_item(name: &str, desc: &str, theme: &Theme) -> PopupMenuItem {
-    let fg = theme.foreground;
-    let muted = theme.muted_foreground;
-    let name = format!("/{name}");
-    let desc = desc.to_string();
-    PopupMenuItem::element(move |_window, _cx| {
-        let mut line = h_flex().w_full().items_center().gap_2().child(
-            gpui::div()
-                .text_sm()
-                .text_color(fg)
-                .child(gpui::StyledText::new(name.clone())),
-        );
-        if !desc.is_empty() {
-            line = line.child(
-                gpui::div()
-                    .flex_1()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(desc.clone()),
-            );
         }
         line
     })
@@ -221,62 +153,6 @@ pub fn build_plus_menu(
     menu = menu.separator().label(i18n::t("composer-plugins-label"));
     for row in PLUS_PLUGIN_ROWS {
         menu = menu.item(menu_row_item(row, theme));
-    }
-    menu
-}
-
-/// Build the `⁄` popover. The top section lists registered slash commands
-/// dynamically; clicking one inserts `/name ` into the composer via
-/// `on_select(name)`. The memory and skills sections remain static decoration.
-pub fn build_slash_menu(
-    menu: PopupMenu,
-    theme: &Theme,
-    on_select: impl Fn(&str, &mut gpui::Window, &mut gpui::App) + 'static,
-) -> PopupMenu {
-    let mut menu = menu.max_w(gpui::px(420.)).scrollable(true);
-    menu = menu.label(i18n::t("composer-commands-label"));
-    // Registered slash commands (dynamic). Falls back to an empty section when
-    // the registry is not yet initialized.
-    let on_select = Rc::new(on_select);
-    if let Some(reg) = crate::slash_command::SlashCommandRegistry::global() {
-        for cmd in reg.commands() {
-            let name = cmd.name().to_string();
-            let desc = cmd.description().to_string();
-            let on_select = on_select.clone();
-            menu = menu.item(slash_command_item(&name, &desc, theme).on_click(
-                move |_, window, cx| {
-                    on_select(&name, window, cx);
-                },
-            ));
-        }
-    }
-    menu = menu.separator().label(i18n::t("composer-memory-label"));
-    menu = menu.item(PopupMenuItem::Label(i18n::t("composer-generate-memory")));
-    menu = menu.separator().label(i18n::t("composer-skills-label"));
-    let fg = theme.foreground;
-    let muted = theme.muted_foreground;
-    for (name, desc, personal) in SLASH_SKILL_ROWS {
-        let tag = if *personal {
-            i18n::t("composer-tag-personal")
-        } else {
-            i18n::t("composer-tag-system")
-        };
-        menu = menu.item(PopupMenuItem::element(move |_window, _cx| {
-            h_flex()
-                .w_full()
-                .items_center()
-                .gap_2()
-                .child(Icon::new(IconName::Frame).small().text_color(muted))
-                .child(gpui::div().text_sm().text_color(fg).child(*name))
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(*desc),
-                )
-                .child(gpui::div().text_xs().text_color(muted).child(tag.clone()))
-        }));
     }
     menu
 }

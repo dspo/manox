@@ -43,7 +43,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Popups & Dropdowns
 
-- [PlusMenu](#plusmenu) · [SlashMenu](#slashmenu) · [ModelMenu](#modelmenu) · [AccessMenu](#accessmenu) · [EffortMenu](#effortmenu) · [ProjectMenu](#projectmenu) · [TitleMenu](#titlemenu) · [GoalPopover](#goalpopover)
+- [PlusMenu](#plusmenu) · [CompletionPopover](#completionpopover) · [ModelMenu](#modelmenu) · [AccessMenu](#accessmenu) · [EffortMenu](#effortmenu) · [ProjectMenu](#projectmenu) · [TitleMenu](#titlemenu) · [GoalPopover](#goalpopover)
 
 ### Overlays
 
@@ -464,7 +464,7 @@ Prev / Next / Cancel / Submit buttons.
 
 #### 3.2.4 Popups & Dropdowns
 
-All are `PopupMenu` entities, created on open, destroyed on close.
+`PopupMenu` entries are `PopupMenu` entities created on open and destroyed on close. [CompletionPopover](#completionpopover) is not a `PopupMenu` — it is a pure render overlay that never takes focus.
 
 #### PlusMenu
 
@@ -472,11 +472,11 @@ Trigger: [PlusBtn](#plusbtn). "Add" menu: files, goal, plan mode, plugins.
 
 > Source: `agent-ui/src/views/composer_menu.rs`
 
-#### SlashMenu
+#### CompletionPopover
 
-Trigger: "/" in [InputField](#inputfield). Slash command picker: commands, memory, skills.
+Trigger: typing `/` (slash commands) or `@` (skills + subagents) at the caret in [InputField](#inputfield). A typeahead list anchored above the composer: filters live on every keystroke, navigated with up/down, confirmed with Tab or Enter, dismissed with Escape. While open the composer wrapper sets a `completion = open` key context so the `completion == open > Input` keybindings shadow the Input's own navigation bindings. A pure render overlay — [InputField](#inputfield) keeps focus throughout, so the query keeps filtering as the user types.
 
-> Source: `agent-ui/src/views/composer_menu.rs`
+> Source: `agent-ui/src/views/completion.rs` (state + detection + rendering), wired in `agent-ui/src/workspace.rs`
 
 #### ModelMenu
 

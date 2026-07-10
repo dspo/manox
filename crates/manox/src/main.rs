@@ -167,6 +167,39 @@ fn main() {
             gpui::KeyBinding::new("ctrl-shift-t", agent_ui::FocusTerminal, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-c", agent_ui::FocusConversation, None),
+            // Completion popover (driven while the composer Input is focused and
+            // a `/` or `@` trigger token is active). The Descendant predicate
+            // `completion == open > Input` matches at the same depth as the
+            // Input's own bindings; since these are registered after
+            // `gpui_component::init` they win the tie and shadow up/down/enter/
+            // tab/escape to navigate the popover instead. When the popover is
+            // closed the ancestor sets no `completion = open` context, so the
+            // predicate fails and the Input's bindings apply normally.
+            gpui::KeyBinding::new(
+                "up",
+                agent_ui::CompletionUp,
+                Some("completion == open > Input"),
+            ),
+            gpui::KeyBinding::new(
+                "down",
+                agent_ui::CompletionDown,
+                Some("completion == open > Input"),
+            ),
+            gpui::KeyBinding::new(
+                "enter",
+                agent_ui::CompletionConfirm,
+                Some("completion == open > Input"),
+            ),
+            gpui::KeyBinding::new(
+                "tab",
+                agent_ui::CompletionConfirm,
+                Some("completion == open > Input"),
+            ),
+            gpui::KeyBinding::new(
+                "escape",
+                agent_ui::CompletionDismiss,
+                Some("completion == open > Input"),
+            ),
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &ToggleFullscreen, cx: &mut App| {
