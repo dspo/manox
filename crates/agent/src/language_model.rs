@@ -293,12 +293,15 @@ pub enum LanguageModelCompletionEvent {
     /// Provider is retrying the HTTP handshake after a transient failure
     /// (429 / 5xx / network error). Emitted before each backoff sleep so the
     /// UI can surface a retry badge; the next non-`Retry` event resolves it.
-    /// Carries no error text — raw error strings stay in tracing logs and out
-    /// of user-facing UI.
+    /// `reason` is a short user-facing label (HTTP status phrase or a network
+    /// error class); `detail` carries the truncated provider response body for
+    /// the expandable card, `None` for network errors.
     Retry {
         attempt: u32,
         max_attempts: u32,
         delay_secs: u64,
+        reason: String,
+        detail: Option<String>,
     },
 }
 

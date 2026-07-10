@@ -89,12 +89,18 @@ pub enum ConvItem {
     },
     /// Provider is retrying the HTTP handshake after a transient failure
     /// (429 / 5xx / network). Transient: the first real content or terminal
-    /// error event replaces it in place. Carries no error text — raw provider
-    /// strings stay out of the UI.
+    /// error event replaces it in place. `reason` is a short label shown on the
+    /// badge; `detail` is the truncated provider body shown when expanded.
+    /// `collapsed` / `user_toggled` preserve the user's expand choice across
+    /// coalesced attempts.
     Retry {
         attempt: u32,
         max_attempts: u32,
         delay_secs: u64,
+        reason: String,
+        detail: Option<String>,
+        collapsed: bool,
+        user_toggled: bool,
     },
     /// A peer message from a team member (or the leader) — `send_message` /
     /// broadcast delivery routed through `ThreadEvent::PeerMessage`. The `from`
@@ -703,6 +709,8 @@ impl ConversationState {
                 attempt,
                 max_attempts,
                 delay_secs,
+                reason,
+                detail,
             } => {
                 // Coalesce consecutive retries into the same tail item so the
                 // badge counts up in place rather than stacking a row per
@@ -714,16 +722,23 @@ impl ConversationState {
                         let attempt = *attempt;
                         let max_attempts = *max_attempts;
                         let delay_secs = *delay_secs;
+                        let reason = reason.clone();
+                        let detail = detail.clone();
                         last.update(cx, |item, cx| {
                             if let ConvItem::Retry {
                                 attempt: a,
                                 max_attempts: m,
                                 delay_secs: d,
+                                reason: r,
+                                detail: det,
+                                ..
                             } = item.kind_mut()
                             {
                                 *a = attempt;
                                 *m = max_attempts;
                                 *d = delay_secs;
+                                *r = reason;
+                                *det = detail;
                             }
                             cx.notify();
                         });
@@ -737,6 +752,10 @@ impl ConversationState {
                             attempt: *attempt,
                             max_attempts: *max_attempts,
                             delay_secs: *delay_secs,
+                            reason: reason.clone(),
+                            detail: detail.clone(),
+                            collapsed: true,
+                            user_toggled: false,
                         },
                         String::new(),
                         id,

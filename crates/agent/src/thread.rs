@@ -140,11 +140,14 @@ pub enum ThreadEvent {
     Stop(StopReason),
     /// The provider is retrying the HTTP handshake after a transient failure
     /// (429 / 5xx / network error). The UI shows a retry badge; the next
-    /// non-`Retry` event resolves it.
+    /// non-`Retry` event resolves it. `reason` / `detail` feed the badge and
+    /// its expandable body.
     Retry {
         attempt: u32,
         max_attempts: u32,
         delay_secs: u64,
+        reason: String,
+        detail: Option<String>,
     },
     /// An error during streaming.
     Error(anyhow::Error),
@@ -2668,11 +2671,15 @@ impl Thread {
                 attempt,
                 max_attempts,
                 delay_secs,
+                reason,
+                detail,
             }) => {
                 cx.emit(ThreadEvent::Retry {
                     attempt,
                     max_attempts,
                     delay_secs,
+                    reason,
+                    detail,
                 });
             }
             Ok(LanguageModelCompletionEvent::ToolUse(tu)) => {
