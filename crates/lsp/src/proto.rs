@@ -39,7 +39,15 @@ where
             break;
         }
         if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
-            content_length = rest.trim().parse::<usize>().ok();
+            content_length = match rest.trim().parse::<usize>() {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("malformed Content-Length `{}`: {e}", rest.trim()),
+                    ));
+                }
+            };
         }
         // Other headers (Content-Type, …) are ignored — JSON is the only body.
     }
@@ -156,5 +164,19 @@ mod tests {
         let (_, rx) = duplex(8192);
         let mut reader = BufReader::new(rx);
         assert!(read_message(&mut reader).await.unwrap().is_none());
+    }
+
+    // A malformed Content-Length value is a hard frame error — not silently
+    // swallowed and misreported as "missing".
+    #[tokio::test]
+    async fn malformed_content_length_errors() {
+        let (mut tx, rx) = duplex(8192);
+        let frame = b"Content-Length: not-a-number\r\n\r\n";
+        tx.write_all(frame).await.unwrap();
+        tx.flush().await.unwrap();
+        let mut reader = BufReader::new(rx);
+        let err = read_message(&mut reader).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().to_lowercase().contains("malformed"));
     }
 }

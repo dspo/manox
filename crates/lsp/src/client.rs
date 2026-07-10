@@ -61,6 +61,33 @@ pub struct LspClient {
     inner: Arc<Inner>,
 }
 
+/// Removes a pending-request entry on drop so a cancelled `request` future
+/// (dropped before its timeout fires or the reader drains the map) doesn't
+/// leave a dangling `oneshot::Sender` keyed by its id forever. On the paths
+/// where the entry is already gone (response arrived → `dispatch` removed it;
+/// reader died → the read loop's `std::mem::take` drained the map), the
+/// guard's `remove` is a harmless no-op.
+struct PendingGuard {
+    id: u64,
+    inner: Arc<Inner>,
+}
+
+impl PendingGuard {
+    fn new(inner: Arc<Inner>, id: u64) -> Self {
+        Self { inner, id }
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.inner
+            .pending
+            .lock()
+            .expect("pending mutex poisoned")
+            .remove(&self.id);
+    }
+}
+
 impl LspClient {
     /// Spawn the server process and start the reader task, returning a client in
     /// the `Starting` state. Does NOT run the `initialize` handshake — that is
@@ -131,6 +158,11 @@ impl LspClient {
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
+        // Guard removes the pending entry on every exit path — including a
+        // dropped future (cancellation), where neither timeout nor the reader's
+        // drain runs. On the response/reader-died paths the entry is already
+        // gone, so the guard's `remove` is a no-op.
+        let _guard = PendingGuard::new(self.inner.clone(), id);
         self.inner
             .pending
             .lock()
@@ -147,11 +179,6 @@ impl LspClient {
             write_message(&mut *w, &msg).await
         };
         if let Err(e) = res {
-            self.inner
-                .pending
-                .lock()
-                .expect("pending mutex poisoned")
-                .remove(&id);
             return Err(anyhow!("writing `{method}` request: {e}"));
         }
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
@@ -165,16 +192,9 @@ impl LspClient {
                     "`{method}` response channel closed (server likely exited)"
                 ))
             }
-            Err(_) => {
-                self.inner
-                    .pending
-                    .lock()
-                    .expect("pending mutex poisoned")
-                    .remove(&id);
-                Err(anyhow!(
-                    "`{method}` request timed out after {REQUEST_TIMEOUT:?}"
-                ))
-            }
+            Err(_) => Err(anyhow!(
+                "`{method}` request timed out after {REQUEST_TIMEOUT:?}"
+            )),
         }
     }
 
