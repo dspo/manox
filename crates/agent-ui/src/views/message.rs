@@ -1473,7 +1473,7 @@ mod tests {
                 thought_signature: None,
             },
         )])];
-        let items = build_items(&messages, &HashMap::new());
+        let items = build_items(&messages, &HashMap::new(), false);
         let tool = items
             .iter()
             .find_map(|i| match i {

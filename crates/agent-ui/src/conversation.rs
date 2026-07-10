@@ -907,12 +907,16 @@ mod tests {
         ];
         let completed = build_items(&messages, &std::collections::HashMap::new(), false);
         match completed.last().unwrap() {
-            ConvItem::Assistant { streaming, .. } => assert!(!*streaming, "completed tail not streaming"),
+            ConvItem::Assistant { streaming, .. } => {
+                assert!(!*streaming, "completed tail not streaming")
+            }
             _ => panic!("trailing item is an assistant bubble"),
         }
         let running = build_items(&messages, &std::collections::HashMap::new(), true);
         match running.last().unwrap() {
-            ConvItem::Assistant { streaming, .. } => assert!(*streaming, "running tail is streaming"),
+            ConvItem::Assistant { streaming, .. } => {
+                assert!(*streaming, "running tail is streaming")
+            }
             _ => panic!("trailing item is an assistant bubble"),
         }
     }

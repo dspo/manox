@@ -2987,8 +2987,8 @@ impl Thread {
         // consecutive same-role messages, accepts the request. A no-op for
         // the normal alternation, so the cached prefix is byte-stable across
         // turns; the coalesced run is itself stable once it's in history.
-        let mapped: Vec<LanguageModelRequestMessage> =
-            crate::compact::coalesce_same_role(match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
+        let mapped: Vec<LanguageModelRequestMessage> = crate::compact::coalesce_same_role(
+            match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
                 Some(c_ix) => {
                     let mut rebuilt =
                         crate::compact::retained_user_messages_before(&self.messages, c_ix);
@@ -3024,7 +3024,8 @@ impl Thread {
                         cache: false,
                     })
                     .collect(),
-            });
+            },
+        );
         // The `cache` flag marks the trailing two user/assistant messages as
         // cache-anchor candidates. It is advisory metadata today — the actual
         // `cache_control` breakpoints are placed by `apply_prompt_caching`
@@ -4345,16 +4346,17 @@ mod tests {
         cx.update(|cx| {
             thread.update(cx, |t, cx| {
                 // Assistant submits a plan via exit_plan_mode.
-                t.messages.push(Message::assistant(vec![MessageContent::ToolUse(
-                    LanguageModelToolUse {
-                        id: "tu_plan".to_string(),
-                        name: Arc::from("exit_plan_mode"),
-                        raw_input: "{}".to_string(),
-                        input: json!({ "plan": "# plan body" }),
-                        is_input_complete: true,
-                        thought_signature: None,
-                    },
-                )]));
+                t.messages
+                    .push(Message::assistant(vec![MessageContent::ToolUse(
+                        LanguageModelToolUse {
+                            id: "tu_plan".to_string(),
+                            name: Arc::from("exit_plan_mode"),
+                            raw_input: "{}".to_string(),
+                            input: json!({ "plan": "# plan body" }),
+                            is_input_complete: true,
+                            thought_signature: None,
+                        },
+                    )]));
                 // Reject: a user-role ToolResult, as `append_tool_result` emits
                 // on the Reject branch.
                 t.messages.push(Message::user_with_content(vec![
@@ -4362,8 +4364,7 @@ mod tests {
                         tool_use_id: "tu_plan".to_string(),
                         tool_name: Arc::from("exit_plan_mode"),
                         is_error: false,
-                        content: "User rejected this plan and ended the turn."
-                            .to_string(),
+                        content: "User rejected this plan and ended the turn.".to_string(),
                     }),
                 ]));
                 // User's next message carrying new direction — also user role.
@@ -4381,8 +4382,7 @@ mod tests {
             .collect();
         for pair in convo.windows(2) {
             assert_ne!(
-                pair[0].role,
-                pair[1].role,
+                pair[0].role, pair[1].role,
                 "adjacent same-role messages would be rejected by the wire: {convo:?}"
             );
         }
