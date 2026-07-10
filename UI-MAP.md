@@ -19,7 +19,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### MainColumn
 
-- [MainColumn](#maincolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarGoalChip](#titlebargoalchip) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body)
+- [MainColumn](#maincolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarGoalChip](#titlebargoalchip) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body) · [EnvironmentCard](#environmentcard)
 
 ### Hero
 
@@ -31,7 +31,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### MessageItem 变体
 
-- [UserMessage](#usermessage) · [AssistantMessage](#assistantmessage) · [ReasoningBlock](#reasoningblock) · [ToolCallCard](#toolcallcard) · [AgentTaskCard](#agenttaskcard) · [ErrorMessage](#errormessage) · [NoticeMessage](#noticemessage) · [RecapCard](#recapcard) · [RetryBadge](#retrybadge)
+- [UserMessage](#usermessage) · [AssistantMessage](#assistantmessage) · [ReasoningBlock](#reasoningblock) · [ThinkingStatusRow](#thinkingstatusrow) · [ToolCallCard](#toolcallcard) · [AgentTaskCard](#agenttaskcard) · [ErrorMessage](#errormessage) · [NoticeMessage](#noticemessage) · [RecapCard](#recapcard) · [RetryBadge](#retrybadge)
 
 ### Footer / Composer
 
@@ -294,9 +294,15 @@ Collapsible: chevron + "Reasoning" label + left-bordered muted body.
 
 > Source: `agent-ui/src/views/message.rs`
 
+#### ThinkingStatusRow
+
+Folded batch of tool calls from one model response, rendered as one Claude Code–style status line. Header: spinner (live) or static dot (frozen) + "Thinking for Xs"/"Thought for Xs" label + aggregated action counts ("reading 2 files, running 1 shell command…") + chevron. Collapsed body shows only the most recent `⎿` entry; expanded lists every entry. Each `⎿` entry (`render_activity_entry`) is a one-line summary (status icon + tool title, mono) that expands to its full tool output via `render_tool_output`. The elapsed counter ticks every second via a gpui background timer spawned on `TurnStarted` and self-terminating on terminal `Stop`/`Error`; `frozen_secs` pins the final value so later re-renders don't inflate it. Ordinary tool calls now fold here instead of producing standalone cards.
+
+> Source: `agent-ui/src/views/message.rs` — `render_thinking`, `render_activity_entry`, `thinking_summary`. Container state: `ConversationState` (`ConvItem::Thinking` / `ThinkingContainer`).
+
 #### ToolCallCard
 
-Collapsible card: title + status badge + 220px output (monospace or markdown).
+Plan card only: `exit_plan_mode`'s plan body + verdict badge + 220px markdown output. Ordinary tool calls no longer produce this variant (they fold into [ThinkingStatusRow](#thinkingstatusrow)).
 
 Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see [ToolCallStatus](#tool-call-statuses).
 
@@ -535,6 +541,28 @@ Trigger: `exit_plan_mode` called. Similar modal: plan text + Approve / Reject bu
 Trigger: "Create blank project" from [ProjectMenu](#projectmenu). Centered modal: project name input + confirm.
 
 > Source: `agent-ui/src/workspace.rs`
+
+#### 3.2.6 EnvironmentCard
+
+Floating card at the top-right of the conversation area, only mounted when all of:
+editor pane closed, thread has interacted, main column ≥ `ENV_CARD_MIN_MAIN_W` (900px). Width `ENV_CARD_WIDTH` (260px). `occlude()` so it paints above the message list.
+
+Contents, top to bottom:
+
+- **Header**: bold "Environment info" title + a `+` ghost button (no behavior yet).
+- **Changes row**: `env_row` with `Frame` icon, "Changes" label, and a trailing `+0 / -0` placeholder (TODO).
+- **Branch row**: `env_row` with `Github` icon and the branch label — `"main"` when a project is bound, "No project" otherwise.
+- **Usage section header**: `MemoryStick` icon + "Usage" label.
+- **Per-model tree blocks** (sorted by total tokens desc; empty for unused models):
+  - Model id (truncated to `ENV_MODEL_ID_MAX` chars).
+  - `├── Throughput ↑<in> ↓<out>` — input / output tokens.
+  - `└── Cache ↑<cache_create> ↓<cache_read>` — cache creation / cache read.
+- **Hairline divider**.
+- **Sources section**: `Sources` label + "No sources yet" placeholder.
+
+Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `Workspace`, rebuilt every render to auto-prune cells whose model disappeared.
+
+> Source: `agent-ui/src/workspace.rs` (`render_environment_panel`)
 
 ### 3.3 EditorPane
 

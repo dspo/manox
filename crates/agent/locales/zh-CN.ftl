@@ -51,6 +51,20 @@ status-continued = 继续讨论
 status-error = 出错
 status-denied = 已拒绝
 
+### views/message.rs — Thinking 状态行
+thinking-live = 思考 { $count } 秒
+thinking-done = 思考了 { $count } 秒
+thinking-done-label = 已思考
+thinking-tool-result = 工具结果
+thinking-reading = 读取 { $count } 个文件
+thinking-writing = 写入 { $count } 个文件
+thinking-editing = 编辑 { $count } 个文件
+thinking-running = 运行 { $count } 条命令
+thinking-searching = 搜索 { $count } 个模式
+thinking-globbing = 匹配 { $count } 个 glob
+thinking-listing = 列出 { $count } 个目录
+thinking-other = { $count } 个其他工具
+
 ### views/settings.rs
 settings-group-general = 通用
 settings-item-general = 常规
@@ -420,17 +434,10 @@ titlebar-not-implemented = 尚未实现。
 # ── 环境信息面板 ──────────────────────────────────────────────────────
 workspace-env-title = 环境信息
 workspace-env-changes = 变更
-workspace-env-local = 本地 {$name}
 workspace-env-no-project = 暂无项目
-workspace-env-model = 模型 {$name}
-workspace-env-modes = 模式
-workspace-env-plan-on = 计划模式
-workspace-env-plan-off = 普通规划
-workspace-env-yolo-on = 完全访问
-workspace-env-yolo-off = 审批模式
-workspace-env-auto-review = 自动审查
 workspace-env-usage = 消费
-workspace-env-cached = 缓存
+workspace-env-throughput = 穿透
+workspace-env-cache = 缓存
 workspace-env-sources = 来源
 workspace-env-no-sources = 暂无来源
 composer-pasted-image = 粘贴的图片

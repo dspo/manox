@@ -64,6 +64,44 @@ status-continued = Continued
 status-error = Error
 status-denied = Denied
 
+### views/message.rs — Thinking status row
+thinking-live = Thinking for { $count }s
+thinking-done = Thought for { $count }s
+thinking-done-label = Thought
+thinking-tool-result = tool result
+thinking-reading = { $count ->
+    [one] reading {$count} file
+   *[other] reading {$count} files
+}
+thinking-writing = { $count ->
+    [one] writing {$count} file
+   *[other] writing {$count} files
+}
+thinking-editing = { $count ->
+    [one] editing {$count} file
+   *[other] editing {$count} files
+}
+thinking-running = { $count ->
+    [one] running {$count} shell command
+   *[other] running {$count} shell commands
+}
+thinking-searching = { $count ->
+    [one] searching {$count} pattern
+   *[other] searching {$count} patterns
+}
+thinking-globbing = { $count ->
+    [one] matching {$count} glob
+   *[other] matching {$count} globs
+}
+thinking-listing = { $count ->
+    [one] listing {$count} directory
+   *[other] listing {$count} directories
+}
+thinking-other = { $count ->
+    [one] {$count} other tool
+   *[other] {$count} other tools
+}
+
 ### views/settings.rs
 settings-group-general = General
 settings-item-general = General
@@ -436,17 +474,10 @@ titlebar-not-implemented = Not implemented yet.
 # ── Environment info panel ──────────────────────────────────────────────
 workspace-env-title = Environment info
 workspace-env-changes = Changes
-workspace-env-local = Local {$name}
 workspace-env-no-project = No project
-workspace-env-model = Model {$name}
-workspace-env-modes = Modes
-workspace-env-plan-on = Plan mode
-workspace-env-plan-off = Normal planning
-workspace-env-yolo-on = Full access
-workspace-env-yolo-off = Approval mode
-workspace-env-auto-review = Auto review
 workspace-env-usage = Usage
-workspace-env-cached = cached
+workspace-env-throughput = Throughput
+workspace-env-cache = Cache
 workspace-env-sources = Sources
 workspace-env-no-sources = No sources yet
 composer-pasted-image = Pasted image

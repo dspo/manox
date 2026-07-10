@@ -8,6 +8,7 @@
 //! finished items' markdown untouched.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use agent::thread::ApprovalMode;
 use agent::{Message, ThreadEvent, TokenUsage, ToolCallStatus};
@@ -70,6 +71,18 @@ pub enum ConvItem {
         collapsed: bool,
         user_toggled: bool,
     },
+    /// A batch of tool calls from one model response, folded into a single
+    /// Claude Code–style status line: a live summary ("Thinking for Xs,
+    /// reading 2 files, running 1 shell command…") over an expandable `⎿`
+    /// list of the batch's tool calls. Collapsed shows only the summary plus
+    /// the most recent entry; expanded lists every entry, each itself
+    /// expandable to its full tool output. `streaming` is true while any entry
+    /// is still non-terminal; `Stop` flips it off and freezes the elapsed time
+    /// ("Thought for Xs").
+    Thinking(ThinkingContainer),
+    /// A plan card for `exit_plan_mode` — the plan body is the card's whole
+    /// point, so it stays a top-level item rather than folding into a
+    /// `Thinking` batch. Ordinary tool calls never produce this variant.
     ToolCall(ToolCallItem),
     AgentTask(AgentTaskItem),
     /// A runtime error from the agent (red danger styling).
@@ -135,6 +148,83 @@ pub struct ToolCallItem {
     /// manual choice survives subsequent status transitions within the same
     /// tool call.
     pub user_toggled: bool,
+}
+
+/// A folded batch of tool calls rendered as one Claude Code–style Thinking
+/// status line. Entries are `ToolCallItem`s (reused for their per-tool
+/// status/output/collapse state); the container owns the batch-level summary,
+/// collapse, and elapsed-time state.
+#[derive(Debug, Clone)]
+pub struct ThinkingContainer {
+    /// The batch's tool calls in arrival order. Each is one `⎿` entry.
+    pub entries: Vec<ToolCallItem>,
+    /// True while any entry is still streaming or in a non-terminal status.
+    /// Drives the spinner + "Thinking for Xs" label vs the frozen "Thought for
+    /// Xs".
+    pub streaming: bool,
+    /// True ⇒ only the summary line plus the most recent entry render. False ⇒
+    /// every entry renders. Auto-flipped to true on terminal `Stop` unless the
+    /// user toggled.
+    pub collapsed: bool,
+    pub user_toggled: bool,
+    /// When the container was created; the live "for Xs" is
+    /// `started_at.elapsed().as_secs()`, recomputed each render while the
+    /// ticker fires.
+    pub started_at: Instant,
+    /// The elapsed seconds captured when the batch went terminal (`Stop`). Once
+    /// set, "Thought for Xs" renders this fixed value instead of re-reading
+    /// `started_at` (which would keep growing on every later re-render). `None`
+    /// for freshly rebuilt historical containers, where the duration is unknown
+    /// and the label degrades to a bare "Thought".
+    pub frozen_secs: Option<u64>,
+}
+
+impl ThinkingContainer {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            streaming: true,
+            collapsed: false,
+            user_toggled: false,
+            started_at: Instant::now(),
+            frozen_secs: None,
+        }
+    }
+
+    /// Re-derive `streaming` from the entries' live flags + statuses. Call
+    /// after any entry mutation that may have flipped a status or streaming
+    /// flag. On the live→frozen transition (the batch's last entry just went
+    /// terminal) the elapsed is pinned here, at the real per-batch completion
+    /// moment — not deferred to the next `Stop`, which fires only after the
+    /// following response's stream and would over-count by that stream's
+    /// duration. Idempotent: a later `finalize_streaming` re-derives the same
+    /// `false` but leaves an already-pinned value untouched.
+    pub fn recompute_streaming(&mut self) {
+        let was_streaming = self.streaming;
+        self.streaming = self.entries.iter().any(|e| {
+            e.streaming
+                || matches!(
+                    e.status,
+                    ToolCallStatus::Running | ToolCallStatus::PendingApproval
+                )
+        });
+        if was_streaming && !self.streaming && self.frozen_secs.is_none() {
+            self.frozen_secs = Some(self.started_at.elapsed().as_secs());
+        }
+    }
+
+    /// True when at least one entry has produced output worth showing (the
+    /// `⎿` list is non-vacuous even while collapsed — the most recent entry's
+    /// summary is the "what's happening right now" line).
+    pub fn has_entries(&self) -> bool {
+        !self.entries.is_empty()
+    }
+}
+
+impl Default for ThinkingContainer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A sub-agent (`agent` tool) invocation. The child `Thread`'s streamed text
@@ -237,6 +327,31 @@ impl ConversationState {
         self.items
             .iter()
             .position(|e| matches!(e.read(cx).kind(), ConvItem::AgentTask(t) if t.id == id))
+    }
+
+    /// Locate a `Thinking` container's entry by tool id. Returns
+    /// `(container_index, entry_index)` so the caller can update the entry in
+    /// place. Scans every container in arrival order so an id always resolves
+    /// to its owning batch regardless of which trailing container is active.
+    pub fn find_thinking_entry(&self, id: &str, cx: &App) -> Option<(usize, usize)> {
+        for (cix, e) in self.items.iter().enumerate() {
+            if let ConvItem::Thinking(t) = e.read(cx).kind()
+                && let Some(eix) = t.entries.iter().position(|en| en.id == id)
+            {
+                return Some((cix, eix));
+            }
+        }
+        None
+    }
+
+    /// The index of the trailing `Thinking` container that is still streaming
+    /// — i.e. the active batch a new `ToolCall` should fold into. `None` when
+    /// the previous batch finalized (all entries terminal) or no batch exists
+    /// yet, in which case the caller opens a fresh container.
+    fn find_trailing_thinking(&self, cx: &App) -> Option<usize> {
+        self.items
+            .iter()
+            .rposition(|e| matches!(e.read(cx).kind(), ConvItem::Thinking(t) if t.streaming))
     }
 
     /// Feed the child `Thread`'s full message list into the matching agent task,
@@ -474,54 +589,104 @@ impl ConversationState {
                         }));
                         ApplyOutcome::Appended
                     }
-                } else if let Some(ix) = self.find_tool(id, cx) {
-                    self.items[ix].update(cx, |item, cx| {
-                        if let ConvItem::ToolCall(t) = item.kind_mut() {
-                            t.title = title.clone();
-                            t.status = *status;
-                            t.name = name.clone();
-                            // Reaching a terminal status flips collapse on —
-                            // matches the same flip in the ToolResult branch
-                            // for tools whose result event lands first. The
-                            // `exit_plan_mode` plan card stays expanded: its
-                            // body is the plan the user just read, and the
-                            // verdict is conveyed by the status icon.
-                            if matches!(
-                                *status,
-                                ToolCallStatus::Success
-                                    | ToolCallStatus::Continued
-                                    | ToolCallStatus::Error
-                                    | ToolCallStatus::Denied
-                            ) && !t.streaming
-                                && t.name != "exit_plan_mode"
-                            {
-                                t.collapsed = !t.user_toggled;
+                } else if name == "exit_plan_mode" || name == "AskUserQuestion" {
+                    // Top-level card, never folded into a Thinking batch. The
+                    // plan card (`exit_plan_mode`) keeps its body expanded —
+                    // the verdict rides on the status icon; `PlanProposed`
+                    // backfills the body. `AskUserQuestion` drives an inline
+                    // clarify card via `render_ask_user_card` while pending and
+                    // a plain answered card once its result lands.
+                    if let Some(ix) = self.find_tool(id, cx) {
+                        self.items[ix].update(cx, |item, cx| {
+                            if let ConvItem::ToolCall(t) = item.kind_mut() {
+                                t.title = title.clone();
+                                t.status = *status;
+                                t.name = name.clone();
                             }
+                            cx.notify();
+                        });
+                        ApplyOutcome::Remeasure(ix)
+                    } else {
+                        let ix = self.items.len();
+                        self.items.push(cx.new(|_| {
+                            MessageItem::new(
+                                ConvItem::ToolCall(ToolCallItem {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    title: title.clone(),
+                                    status: *status,
+                                    output: String::new(),
+                                    is_error: false,
+                                    streaming: matches!(*status, ToolCallStatus::Running),
+                                    collapsed: false,
+                                    user_toggled: false,
+                                }),
+                                role.to_string(),
+                                ix,
+                                weak,
+                            )
+                        }));
+                        ApplyOutcome::Appended
+                    }
+                } else {
+                    // Ordinary tool call: fold into the trailing Thinking
+                    // batch. A fresh batch opens when the previous one
+                    // finalized (all entries terminal) or no batch exists
+                    // yet — so parallel tool calls in one model response
+                    // aggregate into one status line, while a new response
+                    // after the batch completes opens a new line.
+                    let cix = match self.find_trailing_thinking(cx) {
+                        Some(i) => i,
+                        None => {
+                            let i = self.items.len();
+                            self.items.push(cx.new(|_| {
+                                MessageItem::new(
+                                    ConvItem::Thinking(ThinkingContainer::new()),
+                                    role.to_string(),
+                                    i,
+                                    weak,
+                                )
+                            }));
+                            i
+                        }
+                    };
+                    let id = id.clone();
+                    let name = name.clone();
+                    let title = title.clone();
+                    let status = *status;
+                    self.items[cix].update(cx, |item, cx| {
+                        if let ConvItem::Thinking(t) = item.kind_mut() {
+                            if let Some(entry) = t.entries.iter_mut().find(|e| e.id == id) {
+                                entry.title = title;
+                                entry.name = name;
+                                entry.status = status;
+                                if matches!(
+                                    status,
+                                    ToolCallStatus::Success
+                                        | ToolCallStatus::Error
+                                        | ToolCallStatus::Denied
+                                ) && !entry.streaming
+                                {
+                                    entry.collapsed = !entry.user_toggled;
+                                }
+                            } else {
+                                t.entries.push(ToolCallItem {
+                                    id,
+                                    name,
+                                    title,
+                                    status,
+                                    output: String::new(),
+                                    is_error: false,
+                                    streaming: matches!(status, ToolCallStatus::Running),
+                                    collapsed: false,
+                                    user_toggled: false,
+                                });
+                            }
+                            t.recompute_streaming();
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
-                } else {
-                    let ix = self.items.len();
-                    self.items.push(cx.new(|_| {
-                        MessageItem::new(
-                            ConvItem::ToolCall(ToolCallItem {
-                                id: id.clone(),
-                                name: name.clone(),
-                                title: title.clone(),
-                                status: *status,
-                                output: String::new(),
-                                is_error: false,
-                                streaming: matches!(*status, ToolCallStatus::Running),
-                                collapsed: false,
-                                user_toggled: false,
-                            }),
-                            role.to_string(),
-                            ix,
-                            weak,
-                        )
-                    }));
-                    ApplyOutcome::Appended
+                    ApplyOutcome::Remeasure(cix)
                 }
             }
             ThreadEvent::ToolOutput { id, chunk } => {
@@ -534,15 +699,18 @@ impl ConversationState {
                         cx.notify();
                     });
                     ApplyOutcome::Remeasure(ix)
-                } else if let Some(ix) = self.find_tool(id, cx) {
-                    self.items[ix].update(cx, |item, cx| {
-                        if let ConvItem::ToolCall(t) = item.kind_mut() {
-                            t.output.push_str(chunk);
+                } else if let Some((cix, eix)) = self.find_thinking_entry(id, cx) {
+                    self.items[cix].update(cx, |item, cx| {
+                        if let ConvItem::Thinking(t) = item.kind_mut() {
+                            if let Some(entry) = t.entries.get_mut(eix) {
+                                entry.output.push_str(chunk);
+                                entry.streaming = true;
+                            }
                             t.streaming = true;
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
+                    ApplyOutcome::Remeasure(cix)
                 } else {
                     ApplyOutcome::None
                 }
@@ -578,6 +746,29 @@ impl ConversationState {
                         cx.notify();
                     });
                     ApplyOutcome::Remeasure(ix)
+                } else if let Some((cix, eix)) = self.find_thinking_entry(id, cx) {
+                    let entry_output = output.clone();
+                    let entry_is_error = *is_error;
+                    self.items[cix].update(cx, |item, cx| {
+                        if let ConvItem::Thinking(t) = item.kind_mut() {
+                            if let Some(entry) = t.entries.get_mut(eix) {
+                                entry.output = entry_output;
+                                entry.is_error = entry_is_error;
+                                entry.streaming = false;
+                                entry.status = status;
+                                entry.collapsed = !entry.user_toggled;
+                            }
+                            // A finalized entry may close the whole batch; if so,
+                            // auto-collapse the container unless the user pinned
+                            // it open.
+                            t.recompute_streaming();
+                            if !t.streaming {
+                                t.collapsed = !t.user_toggled;
+                            }
+                        }
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(cix)
                 } else if let Some(ix) = self.find_tool(id, cx) {
                     self.items[ix].update(cx, |item, cx| {
                         if let ConvItem::ToolCall(t) = item.kind_mut() {
@@ -605,28 +796,30 @@ impl ConversationState {
                     });
                     ApplyOutcome::Remeasure(ix)
                 } else {
-                    // No matching ToolCall item; insert directly as a result item.
+                    // No matching entry; insert as a finalized single-entry
+                    // Thinking batch so the orphan result still renders as a
+                    // `⎿` line rather than a bare ToolCall card.
                     let ix = self.items.len();
+                    let entry = ToolCallItem {
+                        id: id.clone(),
+                        name: String::new(),
+                        title: String::new(),
+                        status,
+                        output: output.clone(),
+                        is_error: *is_error,
+                        streaming: false,
+                        collapsed: !matches!(
+                            status,
+                            ToolCallStatus::Running | ToolCallStatus::PendingApproval
+                        ),
+                        user_toggled: false,
+                    };
+                    let mut container = ThinkingContainer::new();
+                    container.streaming = false;
+                    container.collapsed = false;
+                    container.entries.push(entry);
                     self.items.push(cx.new(|_| {
-                        MessageItem::new(
-                            ConvItem::ToolCall(ToolCallItem {
-                                id: id.clone(),
-                                name: String::new(),
-                                title: String::new(),
-                                status,
-                                output: output.clone(),
-                                is_error: *is_error,
-                                streaming: false,
-                                collapsed: !matches!(
-                                    status,
-                                    ToolCallStatus::Running | ToolCallStatus::PendingApproval
-                                ),
-                                user_toggled: false,
-                            }),
-                            role.to_string(),
-                            ix,
-                            weak,
-                        )
+                        MessageItem::new(ConvItem::Thinking(container), role.to_string(), ix, weak)
                     }));
                     ApplyOutcome::Appended
                 }
@@ -872,13 +1065,7 @@ mod tests {
             })]),
         ];
         let items = build_items(&messages, &std::collections::HashMap::new(), false);
-        let tool = items
-            .iter()
-            .find_map(|i| match i {
-                ConvItem::ToolCall(t) if t.id == "tu_1" => Some(t),
-                _ => None,
-            })
-            .expect("tool call item present");
+        let tool = find_thinking_entry(&items, "tu_1").expect("tool call entry present");
         assert_eq!(tool.output, "file contents here");
         assert_eq!(tool.status, ToolCallStatus::Success);
         assert!(!tool.is_error);
@@ -900,17 +1087,21 @@ mod tests {
             }),
         ])];
         let items = build_items(&messages, &std::collections::HashMap::new(), false);
-        let tool = items
-            .iter()
-            .find_map(|i| match i {
-                ConvItem::ToolCall(t) if t.id == "tu_x" => Some(t),
-                _ => None,
-            })
-            .expect("standalone result item present");
+        let tool = find_thinking_entry(&items, "tu_x").expect("standalone result entry present");
         assert_eq!(tool.output, "boom");
         assert_eq!(tool.status, ToolCallStatus::Error);
         assert!(tool.is_error);
         assert_eq!(tool.name, "bash");
+    }
+
+    /// Locate a tool-call entry by id within any `ThinkingContainer`. Used by
+    /// rebuild tests that assert against batched entries instead of top-level
+    /// `ToolCall` items.
+    fn find_thinking_entry<'a>(items: &'a [ConvItem], id: &str) -> Option<&'a ToolCallItem> {
+        items.iter().find_map(|i| match i {
+            ConvItem::Thinking(t) => t.entries.iter().find(|e| e.id == id),
+            _ => None,
+        })
     }
 
     /// A reloaded `agent` tool call must restore both its final text and the
@@ -969,6 +1160,70 @@ mod tests {
             "not json { at all"
         );
         assert!(agent::tools::agent::agent_sub_messages("plain text").is_none());
+    }
+
+    /// Multiple ToolUse blocks in one assistant response (a parallel batch)
+    /// rebuild as a single folded `ThinkingContainer` with one entry per call —
+    /// the live `apply` invariant that all of a response's tools share a batch.
+    /// Text flanking the batch becomes its own `Assistant` item on each side.
+    #[test]
+    fn rebuild_batches_parallel_tools_into_one_container() {
+        let messages = vec![
+            Message::user("go".to_string()),
+            Message::assistant(vec![
+                MessageContent::Text("opening two files".to_string()),
+                MessageContent::ToolUse(LanguageModelToolUse {
+                    id: "tu_a".to_string(),
+                    name: Arc::from("read_file"),
+                    raw_input: String::new(),
+                    input: serde_json::Value::Null,
+                    is_input_complete: true,
+                    thought_signature: None,
+                }),
+                MessageContent::ToolUse(LanguageModelToolUse {
+                    id: "tu_b".to_string(),
+                    name: Arc::from("read_file"),
+                    raw_input: String::new(),
+                    input: serde_json::Value::Null,
+                    is_input_complete: true,
+                    thought_signature: None,
+                }),
+            ]),
+            Message::user_with_content(vec![
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "tu_a".to_string(),
+                    tool_name: Arc::from("read_file"),
+                    is_error: false,
+                    content: "a".to_string(),
+                }),
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "tu_b".to_string(),
+                    tool_name: Arc::from("read_file"),
+                    is_error: false,
+                    content: "b".to_string(),
+                }),
+            ]),
+        ];
+        let items = build_items(&messages, &std::collections::HashMap::new(), false);
+        // Exactly one Thinking container, holding both calls in order.
+        let containers: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConvItem::Thinking(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(containers.len(), 1, "one batch → one container");
+        let t = containers[0];
+        assert!(!t.streaming);
+        assert!(t.collapsed, "historical container auto-folds");
+        assert_eq!(t.entries.len(), 2);
+        assert_eq!(t.entries[0].id, "tu_a");
+        assert_eq!(t.entries[0].output, "a");
+        assert_eq!(t.entries[1].id, "tu_b");
+        assert_eq!(t.entries[1].output, "b");
+        // Prose precedes the container.
+        assert!(matches!(items.first(), Some(ConvItem::User { .. })));
     }
 
     /// A still-running thread rebuilds with its trailing assistant bubble marked
