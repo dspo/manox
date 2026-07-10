@@ -14,7 +14,8 @@ use agent::language_model::{
 use agent::provider::WireApi;
 use futures::future::BoxFuture;
 use futures::stream::{BoxStream, StreamExt};
-use gpui::{Entity, TestAppContext};
+use gpui::{AppContext as _, Entity, TestAppContext};
+use gpui_component::Root;
 
 use crate::workspace::Workspace;
 
@@ -83,7 +84,10 @@ impl Drop for StoreGuard {
 /// provider config at `~/.config/cx/cx.providers.config.yaml`, so tests that
 /// need a model require that file present — they are `#[ignore]`-gated.
 pub(crate) fn setup(cx: &mut TestAppContext) -> StoreGuard {
+    cx.update(gpui_component::init);
     cx.update(agent::init);
+    cx.update(terminal::init);
+    cx.update(terminal_ui::init);
     let db =
         Arc::new(ThreadsDatabase::open(std::path::Path::new(":memory:")).expect("open mem db"));
     cx.update(|cx| agent::thread_store::init_for_test(db, cx));
@@ -95,7 +99,13 @@ pub(crate) fn build_workspace(
     cx: &mut TestAppContext,
     model: AnyLanguageModel,
 ) -> Entity<Workspace> {
-    let (ws, _vctx) = cx.add_window_view(Workspace::new);
+    let mut workspace = None;
+    let (_root, _vctx) = cx.add_window_view(|window, cx| {
+        let ws = cx.new(|cx| Workspace::new(window, cx));
+        workspace = Some(ws.clone());
+        Root::new(ws, window, cx)
+    });
+    let ws = workspace.expect("workspace captured from test root");
     cx.update(|cx| {
         ws.update(cx, |ws, cx| {
             ws.thread.update(cx, |t, cx| t.set_model(model, cx));

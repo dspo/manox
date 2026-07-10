@@ -182,7 +182,7 @@ You are currently in plan mode: research the codebase and produce a plan, but do
 - The sub-agent returns only its final conclusion; synthesize that into a complete plan. If research is inconclusive, delegate again with a sharper prompt rather than guessing.\n\
 - Write tools and `bash` are hidden from you. Do not attempt to spawn write-capable sub-agents to bypass this — the bundled `plan`/`explore` are read-only by construction.\n\
 - When the plan is ready, call `exit_plan_mode` with a step-by-step implementation plan: what each step changes, which existing functions to reuse, the tools each step will use, and any risks. End the plan with a `### Critical Files for Implementation` section listing 3–5 paths.\n\
-- After you call `exit_plan_mode` the conversation pauses for user approval or rejection: approval exits plan mode and begins execution; rejection returns you to plan mode to revise the plan per the feedback — do not resubmit the same plan unchanged.\n";
+- After you call `exit_plan_mode` the conversation pauses for user approval or continued discussion: approval exits plan mode and begins execution; continued discussion keeps you in plan mode while you wait for the user's next message — do not resubmit the same plan unchanged.\n";
 
 /// Mid-conversation grant appended when the user selects `Ultracode` effort.
 /// Mirrors Claude Code's ultracode semantic: `xhigh` effort on the wire (sent

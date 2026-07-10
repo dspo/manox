@@ -485,6 +485,7 @@ impl ConversationState {
                             if matches!(
                                 *status,
                                 ToolCallStatus::Success
+                                    | ToolCallStatus::Continued
                                     | ToolCallStatus::Error
                                     | ToolCallStatus::Denied
                             ) && !t.streaming
@@ -560,9 +561,15 @@ impl ConversationState {
                             // filled separately from the in-memory snapshot by the
                             // workspace, so don't touch it here.
                             t.final_text = agent::tools::agent::agent_final_text(output);
+                            let next_status = if !*is_error && t.status == ToolCallStatus::Continued
+                            {
+                                ToolCallStatus::Continued
+                            } else {
+                                status
+                            };
                             t.is_error = *is_error;
                             t.streaming = false;
-                            t.status = status;
+                            t.status = next_status;
                         }
                         cx.notify();
                     });
