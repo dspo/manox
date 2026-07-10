@@ -102,10 +102,10 @@ impl Default for TerminalSettings {
 }
 
 fn default_font_family() -> String {
-    "Menlo".into()
+    "Geist Mono".into()
 }
 fn is_default_font_family(s: &str) -> bool {
-    s == "Menlo"
+    s == "Geist Mono"
 }
 fn default_font_size() -> f32 {
     14.0

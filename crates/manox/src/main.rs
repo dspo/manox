@@ -77,37 +77,28 @@ fn main() {
         terminal_ui::init(cx);
         agent_ui::slash_command::init(cx);
 
-        // Embedded OFL typefaces. Lilex is the message-content monospace family
-        // (assistant markdown, code blocks, composer input, terminal); IBM Plex
-        // Mono is the UI-chrome family (buttons, labels, sidebar, settings).
-        // Both are registered before any view renders so the first frame already
-        // resolves to the embedded faces rather than a system fallback.
+        // Embedded OFL typeface. Geist Mono is the code/terminal monospace family
+        // (fenced code, inline code, tool output, terminal). UI and conversation
+        // text use the system sans-serif via `.SystemUIFont` (San Francisco on
+        // macOS, with CJK glyphs auto-cascaded through Core Text). Registered
+        // before any view renders so the first frame already resolves to the
+        // embedded faces rather than a system fallback.
         cx.text_system()
             .add_fonts(vec![
-                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Regular.ttf")),
-                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Bold.ttf")),
-                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Italic.ttf")),
-                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-BoldItalic.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/geist-mono/GeistMono-Regular.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/geist-mono/GeistMono-Bold.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/geist-mono/GeistMono-Italic.ttf")),
                 Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf"
-                )),
-                Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-Bold.ttf"
-                )),
-                Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-Italic.ttf"
-                )),
-                Cow::Borrowed(include_bytes!(
-                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-BoldItalic.ttf"
+                    "../assets/fonts/geist-mono/GeistMono-BoldItalic.ttf"
                 )),
             ])
             .expect("failed to register embedded fonts");
 
-        // Lilex is the family name embedded in the TTFs (not "Lilex Mono").
+        // `Geist Mono` is the family name baked into the TTFs' name table.
         {
             let theme = Theme::global_mut(cx);
-            theme.font_family = "IBM Plex Mono".into();
-            theme.mono_font_family = "Lilex".into();
+            theme.font_family = ".SystemUIFont".into();
+            theme.mono_font_family = "Geist Mono".into();
             theme.font_size = px(14.);
             theme.mono_font_size = px(14.);
         }

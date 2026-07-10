@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui::{Hsla, Pixels, hsla};
+use gpui::{Hsla, Pixels, SharedString, hsla};
 use gpui_component::Theme;
 use gpui_component::highlighter::HighlightTheme;
 
@@ -34,6 +34,10 @@ pub struct MdStyles {
     pub inline_code_radius: Pixels,
     /// Flat wash behind selected glyphs in selectable code/diff blocks.
     pub selection_bg: Hsla,
+    /// Monospace family for fenced code / diff / conflict blocks. The
+    /// renderer pins this on the block container so code stays monospace
+    /// even when the surrounding prose inherits the (sans-serif) UI family.
+    pub mono_font_family: SharedString,
 }
 
 impl MdStyles {
@@ -54,6 +58,7 @@ impl MdStyles {
             inline_code_bg: theme.secondary,
             inline_code_radius: theme.radius,
             selection_bg: theme.accent.opacity(0.25),
+            mono_font_family: theme.mono_font_family.clone(),
         }
     }
 }

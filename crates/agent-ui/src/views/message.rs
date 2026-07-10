@@ -947,7 +947,6 @@ pub fn render_tool_call(
                 gpui::div()
                     .flex_1()
                     .text_xs()
-                    .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)
                     .child(truncate(&title, 80)),
             )
@@ -1238,7 +1237,6 @@ pub fn render_agent_task(
                 gpui::div()
                     .flex_1()
                     .text_xs()
-                    .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)
                     .child(truncate(&item.title, 80)),
             )

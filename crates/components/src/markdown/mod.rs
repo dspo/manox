@@ -410,6 +410,7 @@ fn code_block(
         .relative()
         .rounded_md()
         .bg(styles.secondary)
+        .font_family(styles.mono_font_family.clone())
         .overflow_hidden()
         .child(
             div()
@@ -535,6 +536,7 @@ fn diff_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
         .border_1()
         .border_color(styles.border)
         .bg(styles.secondary)
+        .font_family(styles.mono_font_family.clone())
         .child(
             div()
                 .id(("diff-scroll", idx))
@@ -710,6 +712,7 @@ fn conflict_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
         .border_1()
         .border_color(styles.border)
         .bg(styles.secondary)
+        .font_family(styles.mono_font_family.clone())
         .child(
             div()
                 .id(("conflict-scroll", idx))

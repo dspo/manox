@@ -2046,7 +2046,6 @@ impl Workspace {
                                 .rounded(theme.radius)
                                 .bg(theme.secondary)
                                 .text_xs()
-                                .font_family(theme.mono_font_family.clone())
                                 .text_color(theme.foreground)
                                 .child(summary),
                         )
@@ -3140,11 +3139,12 @@ impl Workspace {
                 }
             }))
             .child(
-                // Composer input is message content, so it renders in the mono
-                // family (Lilex). The Input component has no per-instance font
-                // knob, so the family is applied from the host context here.
+                // Composer input is conversation text, so it inherits the UI
+                // sans-serif family (`.SystemUIFont`). The Input component has no
+                // per-instance font knob, so the family comes from the host
+                // context here — leaving the div without a font override lets it
+                // inherit the global theme family.
                 gpui::div()
-                    .font_family(theme.mono_font_family.clone())
                     .child(Input::new(&self.input_state).appearance(false)),
             )
             .child(
