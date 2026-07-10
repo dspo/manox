@@ -12,8 +12,8 @@
 //! `exit_plan_mode { plan }` to submit its plan. `Thread::run_tool_inner`
 //! intercepts that call before the registry lookup and runs the approval
 //! handshake (`run_plan_approval`): it emits `ThreadEvent::PlanProposed`,
-//! parks on a oneshot until the user approves/rejects, and either exits plan
-//! mode (approve) or stays in plan mode for revision (reject).
+//! parks on a oneshot until the user approves or continues discussing, and
+//! either exits plan mode (approve) or stays in plan mode for more direction.
 //!
 //! Neither tool is registered in the `ToolRegistry` — their `run` bodies are
 //! stubs, reached only if the intercept is bypassed (a safety net).
@@ -39,9 +39,9 @@ impl AgentTool for ExitPlanModeTool {
 
     fn description(&self) -> &str {
         "Submit your proposed plan and ask the user for approval. Only available in plan \
-         mode. Calling it pauses the conversation while the user approves or rejects: \
-         approval exits plan mode and begins execution; rejection keeps you in plan mode \
-         for revision."
+         mode. Calling it pauses the conversation while the user approves or continues \
+         discussing: approval exits plan mode and begins execution; continued discussion \
+         keeps you in plan mode while you wait for the user's next message."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -145,6 +145,6 @@ pub fn enter_plan_mode_request_tool() -> LanguageModelRequestTool {
 pub enum PlanApprovalResponse {
     /// Exit plan mode and begin executing the approved plan.
     Approve,
-    /// Stay in plan mode and let the model revise.
-    Reject,
+    /// Stay in plan mode and wait for more user direction.
+    ContinueInPlanMode,
 }

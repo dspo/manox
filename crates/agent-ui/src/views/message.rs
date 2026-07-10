@@ -27,11 +27,14 @@ use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
-use gpui::{App, ClipboardItem, Render, SharedString, Task, WeakEntity, px};
+use gpui::{App, ClipboardItem, CursorStyle, Render, SharedString, Task, WeakEntity, px};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
+    input::Input,
+    tag::{Tag, TagVariant},
+    v_flex,
 };
 use manox_components::markdown::ast::Block;
 use manox_components::markdown::incremental::IncrementalParser;
@@ -41,6 +44,7 @@ use manox_components::turn_frame::TurnFrame;
 use crate::Workspace;
 use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage, UserTurnMeta};
 use crate::views::centered;
+use crate::workspace::AskCardSnapshot;
 
 /// Render-time context for sub-agent task cards: which task ids are currently
 /// expanded, and a weak handle to toggle expansion on the owning `Workspace`.
@@ -60,6 +64,8 @@ pub struct AgentTaskCtx {
 #[derive(Clone)]
 pub struct ToolCallCtx {
     pub weak: WeakEntity<Workspace>,
+    pub(crate) ask: Option<AskCardSnapshot>,
+    pub(crate) pending_plan_id: Option<String>,
 }
 
 /// Markdown renderer with theme-aware syntax highlighting.
@@ -230,7 +236,10 @@ impl MessageItem {
                 t.streaming = false;
                 if matches!(
                     t.status,
-                    ToolCallStatus::Success | ToolCallStatus::Error | ToolCallStatus::Denied
+                    ToolCallStatus::Success
+                        | ToolCallStatus::Continued
+                        | ToolCallStatus::Error
+                        | ToolCallStatus::Denied
                 ) {
                     t.collapsed = !t.user_toggled;
                 }
@@ -263,8 +272,17 @@ impl Render for MessageItem {
                 weak: ws.downgrade(),
             }
         });
-        let tool_ctx = self.weak_workspace.upgrade().map(|ws| ToolCallCtx {
-            weak: ws.downgrade(),
+        let tool_ctx = self.weak_workspace.upgrade().map(|ws| {
+            let tool_id = match &self.kind {
+                ConvItem::ToolCall(t) => Some(t.id.as_str()),
+                _ => None,
+            };
+            let read = ws.read(cx);
+            ToolCallCtx {
+                weak: ws.downgrade(),
+                ask: tool_id.and_then(|id| read.ask_card_snapshot(id, cx)),
+                pending_plan_id: read.pending_plan_id(),
+            }
         });
         let blocks_arc = self.blocks();
         let blocks = blocks_arc.as_ref().map(|b| -> &[Block] { &b[..] });
@@ -321,6 +339,8 @@ pub fn render_item(
         ConvItem::ToolCall(t) => {
             if t.name == "exit_plan_mode" {
                 render_plan_card(t, ix, theme, tool_ctx)
+            } else if t.name == "AskUserQuestion" {
+                render_ask_user_card(t, ix, theme, tool_ctx)
             } else {
                 render_tool_call(t, ix, theme, tool_ctx)
             }
@@ -884,6 +904,7 @@ pub fn render_tool_call(
         ToolCallStatus::PendingApproval => (theme.muted_foreground, i18n::t("status-pending")),
         ToolCallStatus::Running => (theme.muted_foreground, i18n::t("status-running")),
         ToolCallStatus::Success => (theme.success, i18n::t("status-success")),
+        ToolCallStatus::Continued => (theme.muted_foreground, i18n::t("status-continued")),
         ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
         ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
     };
@@ -983,6 +1004,245 @@ pub fn render_tool_call(
     card.into_any_element()
 }
 
+fn render_ask_user_card(
+    item: &ToolCallItem,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
+    let Some(ctx) = tool_ctx else {
+        return render_tool_call(item, ix, theme, tool_ctx);
+    };
+    let Some(snapshot) = ctx.ask.clone() else {
+        return render_tool_call(item, ix, theme, tool_ctx);
+    };
+    if item.status != ToolCallStatus::PendingApproval {
+        return render_tool_call(item, ix, theme, tool_ctx);
+    }
+
+    let weak = ctx.weak.clone();
+    let step = snapshot.step;
+    let total = snapshot.total;
+    let can_prev = step > 0;
+    let can_next = step + 1 < total;
+
+    let header = h_flex()
+        .gap_2()
+        .items_center()
+        .justify_between()
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(Icon::new(IconName::Info).small().text_color(theme.primary))
+                .child(
+                    gpui::div()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(i18n::t("workspace-clarify-title")),
+                ),
+        )
+        .child(
+            gpui::div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(format!("{}/{total}", step + 1)),
+        );
+
+    let question_row = h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            Tag::new()
+                .with_variant(TagVariant::Secondary)
+                .small()
+                .child(snapshot.question.header.clone()),
+        )
+        .child(
+            gpui::div()
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(snapshot.question.question.clone()),
+        );
+
+    let mut options_block = v_flex().gap_1p5();
+    for (oi, opt) in snapshot.question.options.iter().enumerate() {
+        let selected = snapshot.selections.get(oi).copied().unwrap_or(false);
+        let indicator_size = px(16.);
+        let indicator = if snapshot.question.multi_select {
+            if selected {
+                h_flex()
+                    .size(indicator_size)
+                    .rounded(px(2.))
+                    .border_1()
+                    .border_color(theme.primary)
+                    .bg(theme.primary.opacity(0.1))
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::Check)
+                            .xsmall()
+                            .text_color(theme.primary),
+                    )
+            } else {
+                h_flex()
+                    .size(indicator_size)
+                    .rounded(px(2.))
+                    .border_1()
+                    .border_color(theme.border)
+            }
+        } else if selected {
+            h_flex()
+                .size(indicator_size)
+                .rounded_full()
+                .border_1()
+                .border_color(theme.primary)
+                .items_center()
+                .justify_center()
+                .child(gpui::div().size(px(8.)).rounded_full().bg(theme.primary))
+        } else {
+            h_flex()
+                .size(indicator_size)
+                .rounded_full()
+                .border_1()
+                .border_color(theme.border)
+        };
+        let weak_for_option = weak.clone();
+        let option_row = h_flex()
+            .gap_2()
+            .items_start()
+            .id(gpui::SharedString::from(format!(
+                "ask-card-opt-{ix}-{step}-{oi}"
+            )))
+            .cursor(CursorStyle::PointingHand)
+            .on_click(move |_, _, cx: &mut App| {
+                let _ = weak_for_option.update(cx, |w, cx| {
+                    w.toggle_ask_option(step, oi, cx);
+                });
+            })
+            .child(indicator)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        gpui::div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(opt.label.clone()),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(opt.description.clone()),
+                    ),
+            );
+        options_block = options_block.child(option_row);
+    }
+
+    let mut other_block = v_flex().gap_1();
+    if let Some(state) = snapshot.other {
+        other_block = other_block
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(i18n::t("workspace-clarify-other")),
+            )
+            .child(Input::new(&state));
+    }
+
+    let response_block = if let Some(state) = snapshot.response_input {
+        v_flex()
+            .gap_1()
+            .child(gpui::div().h(px(1.)).w_full().bg(theme.border).mt_1())
+            .child(Input::new(&state))
+    } else {
+        v_flex()
+    };
+
+    let weak_prev = weak.clone();
+    let weak_next = weak.clone();
+    let weak_cancel = weak.clone();
+    let weak_submit = weak.clone();
+    let nav = h_flex()
+        .gap_2()
+        .items_center()
+        .justify_between()
+        .child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new(("ask-card-prev", ix))
+                        .ghost()
+                        .small()
+                        .icon(IconName::ChevronLeft)
+                        .label(i18n::t("workspace-ask-prev"))
+                        .when(!can_prev, |b| b.disabled(true))
+                        .on_click(move |_, _, cx: &mut App| {
+                            let _ = weak_prev.update(cx, |w, cx| w.ask_prev(cx));
+                        }),
+                )
+                .child(
+                    Button::new(("ask-card-next", ix))
+                        .ghost()
+                        .small()
+                        .icon(IconName::ChevronRight)
+                        .label(i18n::t("workspace-ask-next"))
+                        .when(!can_next, |b| b.disabled(true))
+                        .on_click(move |_, _, cx: &mut App| {
+                            let _ = weak_next.update(cx, |w, cx| w.ask_next(cx));
+                        }),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_1()
+                .child(
+                    Button::new(("ask-card-cancel", ix))
+                        .ghost()
+                        .small()
+                        .label(i18n::t("workspace-cancel"))
+                        .on_click(move |_, _, cx: &mut App| {
+                            let _ = weak_cancel.update(cx, |w, cx| {
+                                w.resolve_auth(agent::PermissionDecision::Deny, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new(("ask-card-submit", ix))
+                        .primary()
+                        .small()
+                        .label(i18n::t("workspace-submit"))
+                        .on_click(move |_, _, cx: &mut App| {
+                            let _ = weak_submit.update(cx, |w, cx| w.resolve_ask(cx));
+                        }),
+                ),
+        );
+
+    v_flex()
+        .id(format!(
+            "ask-card-{}-{}",
+            snapshot.id, snapshot.transition_gen
+        ))
+        .key_context("AskDrawer")
+        .w_full()
+        .gap_3()
+        .p_3()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .child(header)
+        .child(question_row)
+        .child(options_block)
+        .child(other_block)
+        .child(response_block)
+        .child(nav)
+        .into_any_element()
+}
+
 /// Render an `exit_plan_mode` tool-call as a plan card. The body uses
 /// `Markdown` (assistant-style, no code-block wrapping, no height cap) instead
 /// of the monospace scrollable container. PendingApproval forces the body open;
@@ -1011,6 +1271,11 @@ fn render_plan_card(
                 theme.success,
                 i18n::t("status-success"),
             ),
+            ToolCallStatus::Continued => (
+                IconName::Info,
+                theme.muted_foreground,
+                i18n::t("status-continued"),
+            ),
             ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
             ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
         };
@@ -1032,6 +1297,9 @@ fn render_plan_card(
 
     let id_for_toggle = item.id.clone();
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+    let pending_plan_id = tool_ctx.and_then(|c| c.pending_plan_id.clone());
+    let show_actions = item.status == ToolCallStatus::PendingApproval
+        && pending_plan_id.as_deref() == Some(&item.id);
 
     let mut card = v_flex()
         .w_full()
@@ -1120,6 +1388,52 @@ fn render_plan_card(
         );
     }
 
+    if show_actions {
+        let id_for_continue = item.id.clone();
+        let id_for_approve = item.id.clone();
+        let weak_continue = tool_ctx.map(|c| c.weak.clone());
+        let weak_approve = tool_ctx.map(|c| c.weak.clone());
+        card = card.child(
+            h_flex()
+                .gap_2()
+                .justify_end()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .child(
+                    Button::new(("plan-card-continue", ix))
+                        .ghost()
+                        .small()
+                        .label(i18n::t("workspace-plan-continue"))
+                        .on_click(move |_, _, cx: &mut App| {
+                            let Some(weak) = weak_continue.clone() else {
+                                return;
+                            };
+                            let id = id_for_continue.clone();
+                            let _ = weak.update(cx, |w, cx| {
+                                w.respond_plan_for_card(&id, false, cx);
+                            });
+                        }),
+                )
+                .child(
+                    Button::new(("plan-card-approve", ix))
+                        .primary()
+                        .small()
+                        .label(i18n::t("workspace-plan-approve"))
+                        .on_click(move |_, _, cx: &mut App| {
+                            let Some(weak) = weak_approve.clone() else {
+                                return;
+                            };
+                            let id = id_for_approve.clone();
+                            let _ = weak.update(cx, |w, cx| {
+                                w.respond_plan_for_card(&id, true, cx);
+                            });
+                        }),
+                ),
+        );
+    }
+
     card.into_any_element()
 }
 
@@ -1189,6 +1503,7 @@ pub fn render_agent_task(
         ToolCallStatus::PendingApproval => (theme.muted_foreground, i18n::t("status-pending")),
         ToolCallStatus::Running => (theme.muted_foreground, i18n::t("status-running")),
         ToolCallStatus::Success => (theme.success, i18n::t("status-success")),
+        ToolCallStatus::Continued => (theme.muted_foreground, i18n::t("status-continued")),
         ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
         ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
     };

@@ -27,8 +27,8 @@ use gpui::{
     ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
-    TITLE_BAR_HEIGHT, Theme, TitleBar,
+    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT, Theme,
+    TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Paste},
@@ -37,7 +37,7 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
-use manox_components::markdown::{HeadingMode, Markdown};
+use manox_components::markdown::Markdown;
 
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
 use crate::views::centered;
@@ -48,10 +48,7 @@ use crate::views::member_panel::MemberPanel;
 use crate::views::plugin_manager::{PluginManagerEvent, PluginManagerView};
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
-use crate::{
-    AskCancel, AskNext, AskPrev, CloseTerminalTab, FocusConversation, FocusTerminal,
-    NewTerminalTab, OpenSettings,
-};
+use crate::{CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab, OpenSettings};
 use terminal::Terminal;
 use terminal_ui::TerminalView;
 
@@ -82,7 +79,6 @@ struct PendingAuth {
 /// into the matching ToolCall item (for the chat view).
 struct PendingPlan {
     id: String,
-    plan_text: String,
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -100,6 +96,32 @@ struct PendingAsk {
     response_input: Option<Entity<InputState>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct AskCardSnapshot {
+    pub id: String,
+    pub step: usize,
+    pub total: usize,
+    pub transition_gen: u64,
+    pub question: AskCardQuestion,
+    pub selections: Vec<bool>,
+    pub other: Option<Entity<InputState>>,
+    pub response_input: Option<Entity<InputState>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AskCardQuestion {
+    pub question: String,
+    pub header: String,
+    pub multi_select: bool,
+    pub options: Vec<AskCardOption>,
+}
+
+#[derive(Clone)]
+pub(crate) struct AskCardOption {
+    pub label: String,
+    pub description: String,
+}
+
 struct AskQuestion {
     question: String,
     header: String,
@@ -110,6 +132,14 @@ struct AskQuestion {
 struct AskOption {
     label: String,
     description: String,
+}
+
+struct DeferredUserTurn {
+    text: String,
+    images: Vec<agent::language_model::MessageContent>,
+    meta: UserTurnMeta,
+    ui: agent::MessageUiMetadata,
+    user_images: Vec<UserImage>,
 }
 
 pub struct Workspace {
@@ -155,8 +185,7 @@ pub struct Workspace {
     /// approval request — the overlay shows the most recent and queues the rest,
     /// resolving them one at a time so no `oneshot` is stranded by overwrite.
     pending_auths: Vec<PendingAuth>,
-    /// A pending `AskUserQuestion` card; replaces the composer footer with
-    /// the ask drawer while open.
+    /// A pending `AskUserQuestion` card rendered inline in the message list.
     pending_ask: Option<PendingAsk>,
     /// Current question index in the ask drawer (0-based).
     ask_step: usize,
@@ -189,9 +218,13 @@ pub struct Workspace {
     title_menu_open: bool,
     title_menu: Option<Entity<PopupMenu>>,
     title_menu_sub: Option<Subscription>,
-    /// A pending plan approval (model called `exit_plan_mode`). The overlay
-    /// takes precedence after the auth overlay.
+    /// A pending plan approval (model called `exit_plan_mode`) rendered as
+    /// inline actions on the matching plan card.
     pending_plan: Option<PendingPlan>,
+    /// User turn submitted while a plan card is awaiting inline approval. It is
+    /// flushed after the plan-continue tool result lands, preserving provider
+    /// tool_use/tool_result ordering.
+    deferred_user_turn_after_plan_continue: Option<DeferredUserTurn>,
     /// Files picked via the `+` menu, not yet sent. Cleared on submit.
     pending_attachments: Vec<PendingAttachment>,
     /// True while a native directory picker is open from the "Choose project" row.
@@ -429,6 +462,7 @@ impl Workspace {
             title_menu: None,
             title_menu_sub: None,
             pending_plan: None,
+            deferred_user_turn_after_plan_continue: None,
             pending_attachments: Vec::new(),
             project_picker_pending: false,
             blank_project_parent: None,
@@ -496,11 +530,8 @@ impl Workspace {
                     });
                     cx.notify();
                 }
-                ThreadEvent::PlanProposed { id, plan_text } => {
-                    this.pending_plan = Some(PendingPlan {
-                        id: id.clone(),
-                        plan_text: plan_text.clone(),
-                    });
+                ThreadEvent::PlanProposed { id, .. } => {
+                    this.pending_plan = Some(PendingPlan { id: id.clone() });
                     // Delegate to ConversationState to backfill the plan text
                     // into the matching ToolCall item for markdown rendering.
                     let weak = cx.weak_entity();
@@ -567,6 +598,7 @@ impl Workspace {
                         // Clean up background reference if this thread was parked.
                         this.background_threads
                             .retain(|t| t.read(cx).id.0 != thread_id);
+                        this.flush_deferred_user_turn_after_plan_continue(cx);
                     }
                     cx.notify();
                 }
@@ -1190,6 +1222,7 @@ impl Workspace {
         self.pending_auths.clear();
         self.pending_ask = None;
         self.pending_plan = None;
+        self.deferred_user_turn_after_plan_continue = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
         // If the new thread has pending authorizations (e.g. it was parked
         // while waiting for tool approval), re-surface them so the overlay
@@ -1268,8 +1301,19 @@ impl Workspace {
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
+        if self.pending_ask.is_some() {
+            if !text.trim().is_empty() && attachments.is_empty() {
+                self.input_state
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.close_slash_menu();
+                self.resolve_ask_with_response(Some(text), cx);
+            } else {
+                self.pending_attachments = attachments;
+            }
+            return;
+        }
         if (text.trim().is_empty() && attachments.is_empty())
-            || self.thread.read(cx).is_running()
+            || (self.thread.read(cx).is_running() && self.pending_plan.is_none())
             // Block submit while the project picker is open: setting the
             // project after a message lands is a no-op (set_project guards on
             // !messages.is_empty()), so the project would be silently dropped.
@@ -1291,7 +1335,8 @@ impl Workspace {
         // into the same registry as `MarkdownSlashCommand` adapters and dispatch
         // into `run_command_turn` → `Thread::submit_command`, which substitutes
         // `$ARGUMENTS` and applies the command's `allowed-tools` filter.
-        if attachments.is_empty()
+        if self.pending_plan.is_none()
+            && attachments.is_empty()
             && let Some(parsed) = crate::slash_command::parse(&text)
         {
             let result = crate::slash_command::dispatch(&parsed, self, window, cx);
@@ -1408,34 +1453,73 @@ impl Workspace {
         images: Vec<agent::language_model::MessageContent>,
         cx: &mut Context<Self>,
     ) {
-        use agent::language_model::MessageContent;
         let meta = self.user_turn_meta(cx);
         let ui = Self::message_ui_metadata(&meta);
         let weak = cx.weak_entity();
         let user_images = Self::decode_user_images(&images);
+        if self.pending_plan.is_some() {
+            let turn = DeferredUserTurn {
+                text,
+                images,
+                meta,
+                ui,
+                user_images,
+            };
+            self.deferred_user_turn_after_plan_continue = Some(turn);
+            self.respond_plan(false, cx);
+            return;
+        }
+        self.append_and_run_user_turn(
+            DeferredUserTurn {
+                text,
+                images,
+                meta,
+                ui,
+                user_images,
+            },
+            weak,
+            cx,
+        );
+    }
+
+    fn append_and_run_user_turn(
+        &mut self,
+        turn: DeferredUserTurn,
+        weak: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        use agent::language_model::MessageContent;
         self.conversation.update(cx, |c, cx| {
-            c.push_user(text.clone(), user_images, meta, weak, cx)
+            c.push_user(turn.text.clone(), turn.user_images, turn.meta, weak, cx)
         });
         // Splice the new user item in and re-engage tail-follow so the streaming
         // reply stays pinned as it grows.
         self.sync_list_count(cx);
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.thread.update(cx, |thread, cx| {
-            if images.is_empty() {
-                thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
+            if turn.images.is_empty() {
+                thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui), cx);
             } else {
-                let mut content = Vec::with_capacity(images.len() + 1);
-                if !text.trim().is_empty() {
-                    content.push(MessageContent::Text(text));
+                let mut content = Vec::with_capacity(turn.images.len() + 1);
+                if !turn.text.trim().is_empty() {
+                    content.push(MessageContent::Text(turn.text));
                 }
-                content.extend(images);
-                thread.insert_user_message_with_content_and_ui_metadata(content, Some(ui), cx);
+                content.extend(turn.images);
+                thread.insert_user_message_with_content_and_ui_metadata(content, Some(turn.ui), cx);
             }
             thread.run_turn(cx);
         });
         // Persist on submit so the sidebar shows the new entry immediately.
         save_thread(self.thread.clone(), true, cx);
         cx.notify();
+    }
+
+    fn flush_deferred_user_turn_after_plan_continue(&mut self, cx: &mut Context<Self>) {
+        let Some(turn) = self.deferred_user_turn_after_plan_continue.take() else {
+            return;
+        };
+        let weak = cx.weak_entity();
+        self.append_and_run_user_turn(turn, weak, cx);
     }
 
     /// Decode provider-bound image contents into UI-preview `UserImage`s. The
@@ -1630,7 +1714,11 @@ impl Workspace {
     /// focus to the inline input.
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
-        if text.trim().is_empty() || self.thread.read(cx).is_running() {
+        if text.trim().is_empty()
+            || self.pending_ask.is_some()
+            || self.pending_plan.is_some()
+            || self.thread.read(cx).is_running()
+        {
             return;
         }
         let meta = self.user_turn_meta(cx);
@@ -1779,7 +1867,7 @@ impl Workspace {
         self.send_user_turn(prompt, Vec::new(), cx);
     }
 
-    fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
+    pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
         // When an AskUserQuestion card is open its "Cancel" button calls this; the
         // generic approval overlay is suppressed while a card is open, so the
         // card is the only caller in that state. Resolve the card's specific id
@@ -1838,7 +1926,42 @@ impl Workspace {
 
     /// Toggle an option in the pending ask card. Single-select questions reset
     /// siblings; multi-select toggles in place.
-    fn toggle_ask_option(&mut self, qi: usize, oi: usize, cx: &mut Context<Self>) {
+    pub(crate) fn ask_card_snapshot(&self, id: &str, _cx: &App) -> Option<AskCardSnapshot> {
+        let ask = self.pending_ask.as_ref()?;
+        if ask.id != id || ask.questions.is_empty() {
+            return None;
+        }
+        let step = self.ask_step.min(ask.questions.len() - 1);
+        let q = ask.questions.get(step)?;
+        Some(AskCardSnapshot {
+            id: ask.id.clone(),
+            step,
+            total: ask.questions.len(),
+            transition_gen: self.ask_transition_gen,
+            question: AskCardQuestion {
+                question: q.question.clone(),
+                header: q.header.clone(),
+                multi_select: q.multi_select,
+                options: q
+                    .options
+                    .iter()
+                    .map(|o| AskCardOption {
+                        label: o.label.clone(),
+                        description: o.description.clone(),
+                    })
+                    .collect(),
+            },
+            selections: ask.selections.get(step).cloned().unwrap_or_default(),
+            other: ask.others.get(step).cloned(),
+            response_input: ask.response_input.clone(),
+        })
+    }
+
+    pub(crate) fn pending_plan_id(&self) -> Option<String> {
+        self.pending_plan.as_ref().map(|p| p.id.clone())
+    }
+
+    pub(crate) fn toggle_ask_option(&mut self, qi: usize, oi: usize, cx: &mut Context<Self>) {
         if let Some(ask) = self.pending_ask.as_mut()
             && let Some(sel) = ask.selections.get_mut(qi)
         {
@@ -1864,14 +1987,14 @@ impl Workspace {
         cx.notify();
     }
 
-    fn ask_prev(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn ask_prev(&mut self, cx: &mut Context<Self>) {
         if self.ask_step > 0 {
             self.ask_step -= 1;
             cx.notify();
         }
     }
 
-    fn ask_next(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn ask_next(&mut self, cx: &mut Context<Self>) {
         if let Some(ask) = self.pending_ask.as_ref()
             && self.ask_step < ask.questions.len() - 1
         {
@@ -1880,18 +2003,18 @@ impl Workspace {
         }
     }
 
-    fn on_ask_prev(&mut self, _: &AskPrev, _: &mut Window, cx: &mut Context<Self>) {
-        self.ask_prev(cx);
-    }
-
-    fn on_ask_next(&mut self, _: &AskNext, _: &mut Window, cx: &mut Context<Self>) {
-        self.ask_next(cx);
-    }
-
     /// Submit the ask drawer: gather answers (per-question "Other" text
     /// overrides option selections). If the free-form response field has
     /// content, it overrides all per-question answers.
-    fn resolve_ask(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn resolve_ask(&mut self, cx: &mut Context<Self>) {
+        self.resolve_ask_with_response(None, cx);
+    }
+
+    pub(crate) fn resolve_ask_with_response(
+        &mut self,
+        response_override: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let ask = match self.pending_ask.take() {
             Some(a) => a,
             None => return,
@@ -1901,10 +2024,11 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).value().trim().to_string())
             .unwrap_or_default();
-        let response = if response_text.is_empty() {
+        let response_text = response_override.unwrap_or(response_text);
+        let response = if response_text.trim().is_empty() {
             None
         } else {
-            Some(response_text)
+            Some(response_text.trim().to_string())
         };
         let mut answers: Vec<(String, String)> = Vec::with_capacity(ask.questions.len());
         for (i, q) in ask.questions.iter().enumerate() {
@@ -1953,7 +2077,7 @@ impl Workspace {
     }
 
     /// Resolve the pending plan approval (approve/reject from the overlay).
-    fn respond_plan(&mut self, approve: bool, cx: &mut Context<Self>) {
+    pub(crate) fn respond_plan(&mut self, approve: bool, cx: &mut Context<Self>) {
         let Some(plan) = self.pending_plan.take() else {
             return;
         };
@@ -1963,12 +2087,24 @@ impl Workspace {
                 if approve {
                     PlanApprovalResponse::Approve
                 } else {
-                    PlanApprovalResponse::Reject
+                    PlanApprovalResponse::ContinueInPlanMode
                 },
                 cx,
             );
         });
         cx.notify();
+    }
+
+    pub(crate) fn respond_plan_for_card(
+        &mut self,
+        id: &str,
+        approve: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_plan.as_ref().is_none_or(|p| p.id != id) {
+            return;
+        }
+        self.respond_plan(approve, cx);
     }
 
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2108,374 +2244,6 @@ impl Workspace {
                 )
                 .into_any_element(),
         )
-    }
-
-    /// Plan approval overlay (model called `exit_plan_mode`). Renders the
-    /// submitted plan as markdown so the user can read it before deciding;
-    /// Approve exits plan mode and starts execution, Reject ends the turn
-    /// and stays in plan mode awaiting the user's next message. Auth/ask
-    /// overlays take precedence so they never compete.
-    fn render_plan_approval_overlay(
-        &self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        if self.pending_ask.is_some() || !self.pending_auths.is_empty() {
-            return None;
-        }
-        self.pending_plan.as_ref()?;
-
-        let plan_text = self.pending_plan.as_ref()?.plan_text.clone();
-
-        Some(
-            gpui::div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                // Scrim must use the dark foreground, not `background`. A white
-                // veil over a white conversation does not dim, so the page shows
-                // through and the modal reads as transparent.
-                .bg(theme.foreground.opacity(0.6))
-                .child(
-                    v_flex()
-                        .w(px(560.))
-                        .max_h(px(560.))
-                        .p_4()
-                        .gap_3()
-                        .rounded(theme.radius)
-                        .bg(theme.background)
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_lg()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    Icon::new(IconName::LayoutDashboard)
-                                        .small()
-                                        .text_color(theme.accent),
-                                )
-                                .child(
-                                    gpui::div()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(i18n::t("workspace-plan-approval-title")),
-                                ),
-                        )
-                        .child(
-                            gpui::div()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child(i18n::t("workspace-plan-approval-question")),
-                        )
-                        .child(
-                            // The submitted plan body. Scrollable so a long plan
-                            // never overflows the viewport; the wrapper is
-                            // stateful so `overflow_y_scroll` can keep scroll
-                            // state, and `Markdown` additionally scrolls its
-                            // own surface.
-                            gpui::div()
-                                .id("plan-approval-body-scroll")
-                                .flex_1()
-                                .min_h_0()
-                                .max_h(px(420.))
-                                .overflow_y_scroll()
-                                .rounded(theme.radius)
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.secondary)
-                                .p_3()
-                                .child(
-                                    Markdown::new("plan-approval-body", plan_text)
-                                        .theme(theme)
-                                        .selectable(true)
-                                        .scrollable(true)
-                                        .heading_mode(HeadingMode::Uniform),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    Button::new("plan-continue")
-                                        .ghost()
-                                        .small()
-                                        .label(i18n::t("workspace-plan-continue"))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.respond_plan(false, cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("plan-approve")
-                                        .primary()
-                                        .small()
-                                        .label(i18n::t("workspace-plan-approve"))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.respond_plan(true, cx);
-                                        })),
-                                ),
-                        ),
-                )
-                .into_any_element(),
-        )
-    }
-
-    /// Ask drawer: replaces the composer footer while an `AskUserQuestion`
-    /// card is open. Shows one question at a time with stepper navigation,
-    /// checkbox/radio indicators, per-question "Other" input, and a free-form
-    /// response field.
-    fn render_ask_drawer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let ask = self
-            .pending_ask
-            .as_ref()
-            .expect("render_ask_drawer called without pending_ask");
-        let step = self.ask_step.min(ask.questions.len() - 1);
-        let q = &ask.questions[step];
-        let sel = ask.selections.get(step);
-        let other = ask.others.get(step).cloned();
-        let response_input = ask.response_input.clone();
-        let total = ask.questions.len();
-        let transition_gen = self.ask_transition_gen;
-
-        // --- Header: title + stepper ---
-        let header = h_flex()
-            .gap_2()
-            .items_center()
-            .justify_between()
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(Icon::new(IconName::Info).small().text_color(theme.primary))
-                    .child(
-                        gpui::div()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(i18n::t("workspace-clarify-title")),
-                    ),
-            )
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{}/{total}", step + 1)),
-            );
-
-        // --- Question row: header tag + question text ---
-        let question_row = h_flex()
-            .gap_2()
-            .items_center()
-            .child(
-                Tag::new()
-                    .with_variant(TagVariant::Secondary)
-                    .small()
-                    .child(q.header.clone()),
-            )
-            .child(
-                gpui::div()
-                    .text_sm()
-                    .text_color(theme.foreground)
-                    .child(q.question.clone()),
-            );
-
-        // --- Options with checkbox/radio indicators ---
-        let mut options_block = v_flex().gap_1p5();
-        for (oi, opt) in q.options.iter().enumerate() {
-            let selected = sel.and_then(|s| s.get(oi).copied()).unwrap_or(false);
-            let indicator_size = px(16.);
-            let indicator = if q.multi_select {
-                // Checkbox: square with check mark when selected
-                if selected {
-                    h_flex()
-                        .size(indicator_size)
-                        .rounded(px(2.))
-                        .border_1()
-                        .border_color(theme.primary)
-                        .bg(theme.primary.opacity(0.1))
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            Icon::new(IconName::Check)
-                                .xsmall()
-                                .text_color(theme.primary),
-                        )
-                } else {
-                    h_flex()
-                        .size(indicator_size)
-                        .rounded(px(2.))
-                        .border_1()
-                        .border_color(theme.border)
-                }
-            } else {
-                // Radio: filled dot when selected, hollow circle otherwise
-                if selected {
-                    h_flex()
-                        .size(indicator_size)
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme.primary)
-                        .items_center()
-                        .justify_center()
-                        .child(gpui::div().size(px(8.)).rounded_full().bg(theme.primary))
-                } else {
-                    h_flex()
-                        .size(indicator_size)
-                        .rounded_full()
-                        .border_1()
-                        .border_color(theme.border)
-                }
-            };
-            let option_row = h_flex()
-                .gap_2()
-                .items_start()
-                .id(gpui::SharedString::from(format!("ask-opt-{step}-{oi}")))
-                .cursor(CursorStyle::PointingHand)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_ask_option(step, oi, cx);
-                }))
-                .child(indicator)
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .gap_1()
-                        .items_center()
-                        .child(
-                            gpui::div()
-                                .text_sm()
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(opt.label.clone()),
-                        )
-                        .child(
-                            gpui::div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(opt.description.clone()),
-                        ),
-                );
-            options_block = options_block.child(option_row);
-        }
-
-        // --- "Other" input ---
-        let mut other_block = v_flex().gap_1();
-        if let Some(state) = other {
-            other_block = other_block
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(i18n::t("workspace-clarify-other")),
-                )
-                .child(Input::new(&state));
-        }
-
-        // --- Free-form response input ---
-        let response_block = if let Some(state) = response_input {
-            v_flex()
-                .gap_1()
-                .child(gpui::div().h(px(1.)).w_full().bg(theme.border).mt_1())
-                .child(Input::new(&state))
-        } else {
-            v_flex()
-        };
-
-        // --- Navigation bar: prev/next + cancel/submit ---
-        let can_prev = step > 0;
-        let can_next = step < total - 1;
-        let nav = h_flex()
-            .gap_2()
-            .items_center()
-            .justify_between()
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("ask-prev")
-                            .ghost()
-                            .small()
-                            .icon(IconName::ChevronLeft)
-                            .label(i18n::t("workspace-ask-prev"))
-                            .when(!can_prev, |b| b.disabled(true))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.ask_prev(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("ask-next")
-                            .ghost()
-                            .small()
-                            .icon(IconName::ChevronRight)
-                            .label(i18n::t("workspace-ask-next"))
-                            .when(!can_next, |b| b.disabled(true))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.ask_next(cx);
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Button::new("ask-cancel")
-                            .ghost()
-                            .small()
-                            .label(i18n::t("workspace-cancel"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.resolve_auth(PermissionDecision::Deny, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("ask-submit")
-                            .primary()
-                            .small()
-                            .label(i18n::t("workspace-submit"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.resolve_ask(cx);
-                            })),
-                    ),
-            );
-
-        // --- Assemble card with slide-up animation ---
-        let anim_id = format!("ask-slide-{transition_gen}");
-        let card = v_flex()
-            .w_full()
-            .gap_3()
-            .p_3()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.background)
-            .shadow_lg()
-            .child(header)
-            .child(question_row)
-            .child(options_block)
-            .child(other_block)
-            .child(response_block)
-            .child(nav)
-            .with_animation(
-                anim_id,
-                Animation::new(Duration::from_millis(SLIDE_MS)).with_easing(ease_out_quint()),
-                |el, delta| {
-                    // Slide up: offset goes from +120px (below) → 0 (in place).
-                    let offset = px(120.) * (1.0 - delta);
-                    el.mt(offset)
-                },
-            );
-
-        // Keyboard context for AskPrev/AskNext/Cancel actions.
-        v_flex()
-            .id("ask-drawer")
-            .key_context("AskDrawer")
-            .on_action(cx.listener(Workspace::on_ask_prev))
-            .on_action(cx.listener(Workspace::on_ask_next))
-            .on_action(cx.listener(|this, _: &AskCancel, _, cx| {
-                this.resolve_auth(PermissionDecision::Deny, cx);
-            }))
-            .child(card)
-            .into_any_element()
     }
 
     fn render_reasoning_effort_selector(
@@ -3115,7 +2883,10 @@ impl Workspace {
         let access = self.render_access_placeholder(theme, cx);
         let effort = self.render_reasoning_effort_selector(theme, cx);
         let model = self.render_model_selector(theme, cx);
-        let send = self.render_send_button(running, cx);
+        let send = self.render_send_button(
+            running && self.pending_plan.is_none() && self.pending_ask.is_none(),
+            cx,
+        );
 
         v_flex()
             .w_full()
@@ -3777,7 +3548,10 @@ impl Workspace {
             .when(!running, |b| b.primary())
             .rounded(px(16.))
             .on_click(cx.listener(|this, _, window, cx| {
-                if this.thread.read(cx).is_running() {
+                if this.thread.read(cx).is_running()
+                    && this.pending_plan.is_none()
+                    && this.pending_ask.is_none()
+                {
                     this.cancel_turn(cx);
                 } else {
                     this.submit_input(window, cx);
@@ -4394,7 +4168,6 @@ impl Render for Workspace {
 
         let overlay = self
             .render_auth_overlay(&theme, cx)
-            .or_else(|| self.render_plan_approval_overlay(&theme, cx))
             .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
 
         let editor_open = self.editor_open;
@@ -4413,21 +4186,11 @@ impl Render for Workspace {
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
-        // The inline composer and the ask drawer are mutually exclusive: while
-        // an ask card is open the composer is replaced by the drawer; while the
-        // editor pane is open both are hidden.
+        // The inline composer stays visible while inline AskUserQuestion cards
+        // are open; submitting text resolves the ask as a free-form response.
+        // The editor pane still hides the inline composer while editing there.
         let footer = if editor_open || first_screen {
             None
-        } else if self.pending_ask.is_some() {
-            Some(
-                v_flex()
-                    .w_full()
-                    .flex_shrink_0()
-                    .bg(theme.background)
-                    .py_2()
-                    .relative()
-                    .child(centered(self.render_ask_drawer(&theme, cx))),
-            )
         } else {
             Some(
                 v_flex()
@@ -4467,18 +4230,6 @@ impl Render for Workspace {
         };
         let hero = if editor_open || !first_screen {
             None
-        } else if self.pending_ask.is_some() {
-            // On the first screen with an ask card open, show the drawer in
-            // the hero position instead of the composer.
-            Some(
-                v_flex()
-                    .flex_1()
-                    .w_full()
-                    .justify_center()
-                    .items_center()
-                    .relative()
-                    .child(centered(self.render_ask_drawer(&theme, cx))),
-            )
         } else {
             Some(
                 v_flex()
@@ -5255,7 +5006,14 @@ impl Workspace {
         text: String,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
-        if self.thread.read(cx).is_running() {
+        if self.pending_ask.is_some() {
+            if text.trim().is_empty() {
+                return Err("pending ask requires a non-empty response".into());
+            }
+            self.resolve_ask_with_response(Some(text), cx);
+            return Ok(());
+        }
+        if self.thread.read(cx).is_running() && self.pending_plan.is_none() {
             return Err("thread is already running a turn".into());
         }
         self.send_user_turn(text, Vec::new(), cx);
@@ -5276,6 +5034,22 @@ impl Workspace {
         let has = self.pending_plan.is_some();
         self.respond_plan(approve, cx);
         has
+    }
+
+    pub(crate) fn harness_pending_plan_id(&self) -> Option<String> {
+        self.pending_plan_id()
+    }
+
+    pub(crate) fn harness_has_pending_ask(&self) -> bool {
+        self.pending_ask.is_some()
+    }
+
+    pub(crate) fn harness_pending_auth_count(&self) -> usize {
+        self.pending_auths.len()
+    }
+
+    pub(crate) fn harness_has_deferred_plan_turn(&self) -> bool {
+        self.deferred_user_turn_after_plan_continue.is_some()
     }
 
     pub(crate) fn harness_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {

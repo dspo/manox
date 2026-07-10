@@ -52,6 +52,7 @@ pub enum ToolCallStatus {
     PendingApproval,
     Running,
     Success,
+    Continued,
     Error,
     Denied,
 }
@@ -301,9 +302,9 @@ pub struct Thread {
     /// allowed one extra round-trip so the sub-agent can produce a coherent
     /// final message instead of ending mid-work; a second cap hit hard-stops.
     cap_summary_injected: bool,
-    /// Set by `run_plan_approval`'s Reject branch to signal `run_turn_loop`
+    /// Set by `run_plan_approval`'s continue branch to signal `run_turn_loop`
     /// to stop after the tool batch rather than auto-continuing into another
-    /// completion. Reject carries no new information, so a follow-up round
+    /// completion. Continuing carries no new information, so a follow-up round
     /// would be a pointless burn; the user's next message becomes the
     /// revision direction. `plan_mode` stays on.
     stop_after_plan_reject: bool,
@@ -2172,9 +2173,9 @@ impl Thread {
                 break;
             }
 
-            // Plan-mode Reject: the user rejected the submitted plan and the
+            // Plan-mode continue: the user kept discussing the submitted plan and the
             // `exit_plan_mode` result has been appended (wire stays paired).
-            // Stop the turn here — Reject carries no new information, so a
+            // Stop the turn here — continuing carries no new information, so a
             // follow-up completion would be a pointless burn. `plan_mode` is
             // left on; the user's next message restarts the turn still in
             // plan mode with the new direction. Mirrors the `max_turns` cap
@@ -2477,9 +2478,8 @@ impl Thread {
     /// Handle an `exit_plan_mode` tool call: extract the plan text, emit
     /// `ThreadEvent::PlanProposed`, park on a oneshot until the user responds
     /// via `respond_plan_approval`. Mirrors the authorization handshake in
-    /// `run_tool_inner`. Approve → exit plan mode and end the turn (the user
-    /// sends the next message to begin executing); Reject → stay in plan mode
-    /// and feed a revision prompt back so the model revises.
+    /// `run_tool_inner`. Approve exits plan mode and continues execution;
+    /// continue stays in plan mode and waits for the user's next direction.
     async fn run_plan_approval(
         this: gpui::WeakEntity<Self>,
         tu: LanguageModelToolUse,
@@ -2518,8 +2518,8 @@ impl Thread {
         })?;
 
         let response = tokio::select! {
-            r = rx => r.unwrap_or(PlanApprovalResponse::Reject),
-            _ = cancel.cancelled() => PlanApprovalResponse::Reject,
+            r = rx => r.unwrap_or(PlanApprovalResponse::ContinueInPlanMode),
+            _ = cancel.cancelled() => PlanApprovalResponse::ContinueInPlanMode,
         };
         this.update(cx, |this, _cx| {
             this.pending_plan_approval.remove(&id);
@@ -2553,21 +2553,21 @@ impl Thread {
                     cx.notify();
                 })?;
             }
-            PlanApprovalResponse::Reject => {
-                // Reject carries no revision text — the user's next message
-                // IS the new direction (Claude Code model). Append a paired
-                // ToolResult so the wire stays well-formed, then flag the turn
-                // loop to stop: a follow-up completion would burn a round with
-                // zero new information. `plan_mode` stays on; the next user
-                // message restarts the turn still in plan mode.
-                let msg = "User rejected this plan and ended the turn. Do not resubmit a revised plan; await the user's next message for new direction."
+            PlanApprovalResponse::ContinueInPlanMode => {
+                // Continuing carries no revision text — the user's next message
+                // IS the new direction. Append a paired ToolResult so the wire
+                // stays well-formed, then flag the turn loop to stop: a follow-up
+                // completion would burn a round with zero new information.
+                // `plan_mode` stays on; the next user message restarts the turn
+                // still in plan mode.
+                let msg = "User chose to continue discussing in plan mode. Do not resubmit a revised plan yet; await the user's next message for new direction."
                     .to_string();
                 this.update(cx, |this, cx| {
                     cx.emit(ThreadEvent::ToolCall {
                         id: id.clone(),
                         name: name.clone(),
                         title: title.clone(),
-                        status: ToolCallStatus::Denied,
+                        status: ToolCallStatus::Continued,
                     });
                     this.stop_after_plan_reject = true;
                 })?;
@@ -2981,7 +2981,7 @@ impl Thread {
         // the summary). The retained tail keeps recent user prompts verbatim so
         // the active request + its tool results stay grounded; see `compact`.
         // Adjacent same-role runs that the assembly can produce
-        // (retained-user → compaction-user → …, or a plan-mode Reject
+        // (retained-user → compaction-user → …, or a plan-mode continue
         // ending the turn on a user-role ToolResult followed by the user's
         // next message) are coalesced so Anthropic's wire, which rejects
         // consecutive same-role messages, accepts the request. A no-op for
@@ -3701,6 +3701,99 @@ mod tests {
         });
     }
 
+    #[test]
+    fn plan_approval_continue_keeps_plan_mode_and_appends_result() {
+        use crate::language_model::LanguageModelToolUse;
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-plan-continue", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        let tu = LanguageModelToolUse {
+            id: "tu_plan_continue".to_string(),
+            name: Arc::from("exit_plan_mode"),
+            raw_input: r#"{"plan":"do stuff"}"#.to_string(),
+            input: serde_json::json!({"plan": "do stuff"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.plan_mode = true;
+            });
+        });
+
+        let weak = thread.downgrade();
+        let cancel = CancellationToken::new();
+        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let r = result.clone();
+
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *r.lock().unwrap() =
+                    Some(super::Thread::run_plan_approval(weak, tu, cancel, &mut cx).await);
+            }
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.respond_plan_approval(
+                    "tu_plan_continue",
+                    crate::tool::PlanApprovalResponse::ContinueInPlanMode,
+                    cx,
+                );
+            });
+        });
+
+        cx.run_until_parked();
+
+        let res = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("run_plan_approval did not complete");
+        assert!(res.is_ok(), "run_plan_approval failed: {:?}", res.err());
+
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                assert!(t.plan_mode, "plan_mode should stay true after continue");
+                assert!(
+                    t.stop_after_plan_reject,
+                    "continue should ask run_turn_loop to stop before another completion"
+                );
+                let last = t.messages.last().expect("no message after continue");
+                let tr = last
+                    .content
+                    .iter()
+                    .find_map(|c| match c {
+                        MessageContent::ToolResult(tr) => Some(tr),
+                        _ => None,
+                    })
+                    .expect("no ToolResult in last message");
+                assert_eq!(tr.tool_use_id.as_str(), "tu_plan_continue");
+                assert!(!tr.is_error);
+                assert!(
+                    tr.content.contains("continue discussing in plan mode"),
+                    "expected neutral continue message in ToolResult, got: {}",
+                    tr.content
+                );
+            });
+        });
+    }
+
     /// `build_completion_request` must fold `Auto` / `Ultracode` into concrete
     /// wire levels before the request reaches a provider, and append the
     /// Ultracode multi-agent grant to the system prompt. The raw enum never
@@ -4322,7 +4415,7 @@ mod tests {
         );
     }
 
-    /// Regression guard: a plan-mode Reject ends the turn on a user-role
+    /// Regression guard: plan-mode continue ends the turn on a user-role
     /// ToolResult; the user's next message is also user-role. The two adjacent
     /// user messages must be coalesced before the request leaves
     /// `build_completion_request`, or Anthropic's wire rejects the turn with a
@@ -4330,7 +4423,7 @@ mod tests {
     /// compaction branch — so this adjacent-user run is normalized even when no
     /// compaction is in play.
     #[test]
-    fn build_completion_request_coalesces_plan_reject_then_user_message() {
+    fn build_completion_request_coalesces_plan_continue_then_user_message() {
         use crate::language_model::{LanguageModelToolUse, Role};
 
         crate::agent_def::init();
@@ -4357,14 +4450,14 @@ mod tests {
                             thought_signature: None,
                         },
                     )]));
-                // Reject: a user-role ToolResult, as `append_tool_result` emits
-                // on the Reject branch.
+                // Continue: a user-role ToolResult, as `append_tool_result` emits
+                // on the continue branch.
                 t.messages.push(Message::user_with_content(vec![
                     MessageContent::ToolResult(LanguageModelToolResult {
                         tool_use_id: "tu_plan".to_string(),
                         tool_name: Arc::from("exit_plan_mode"),
                         is_error: false,
-                        content: "User rejected this plan and ended the turn.".to_string(),
+                        content: "User chose to continue discussing in plan mode.".to_string(),
                     }),
                 ]));
                 // User's next message carrying new direction — also user role.

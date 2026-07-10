@@ -91,6 +91,22 @@ impl Harness {
             .update(cx, |ws, cx| ws.harness_plan_respond(approve, cx)))
     }
 
+    pub fn pending_plan_id(&self, cx: &App) -> Option<String> {
+        self.workspace.read(cx).harness_pending_plan_id()
+    }
+
+    pub fn has_pending_ask(&self, cx: &App) -> bool {
+        self.workspace.read(cx).harness_has_pending_ask()
+    }
+
+    pub fn pending_auth_count(&self, cx: &App) -> usize {
+        self.workspace.read(cx).harness_pending_auth_count()
+    }
+
+    pub fn has_deferred_plan_turn(&self, cx: &App) -> bool {
+        self.workspace.read(cx).harness_has_deferred_plan_turn()
+    }
+
     pub fn cancel(&self, cx: &mut App) -> Result<(), String> {
         self.workspace.update(cx, |ws, cx| ws.cancel_turn(cx));
         Ok(())

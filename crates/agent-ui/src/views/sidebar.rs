@@ -215,9 +215,9 @@ impl Sidebar {
                         let path = path.to_string();
                         move |_this, _ev, _window, cx| {
                             cx.stop_propagation();
-                            cx.emit(SidebarEvent::NewThreadWithProject(
-                                PathBuf::from(path.clone()),
-                            ));
+                            cx.emit(SidebarEvent::NewThreadWithProject(PathBuf::from(
+                                path.clone(),
+                            )));
                         }
                     })),
             )
@@ -370,8 +370,9 @@ impl Render for Sidebar {
                             )),
                     )
                     .children(
-                        (!projects.is_empty())
-                            .then(|| section_header(i18n::t("sidebar-section-projects"), &theme, None)),
+                        (!projects.is_empty()).then(|| {
+                            section_header(i18n::t("sidebar-section-projects"), &theme, None)
+                        }),
                     )
                     .children(projects.into_iter().map(|(path, group)| {
                         self.render_project_group(
