@@ -61,6 +61,12 @@ impl AgentTool for ListDirectoryTool {
                 std::fs::read_dir(&base).map_err(|e| format!("list_directory failed: {e}"))?;
             let mut lines: Vec<String> = Vec::new();
             for entry in entries.flatten() {
+                // Omit secret-named entries so even their filenames are not
+                // surfaced to the model — contents are already blocked, but a
+                // bare `id_rsa` / `.env` name in a listing is itself a leak.
+                if crate::read_policy::is_likely_secret_file(&entry.path()) {
+                    continue;
+                }
                 let name = entry.file_name().to_string_lossy().to_string();
                 let tag = if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     "/"

@@ -114,7 +114,11 @@ fn home_denied_roots() -> Vec<PathBuf> {
 /// Filenames that conventionally hold secrets: `.env` and `.env.*`, private SSH
 /// key material, and per-tool credential files. Matches by exact filename, so
 /// `id_rsa.pub` (public key) is NOT blocked — only the private key names.
-fn is_likely_secret_file(path: &Path) -> bool {
+///
+/// Cheap filename-only check (no canonicalize) exposed for the walk-based tools
+/// (`grep`, `glob`, `list_directory`) to skip secret-named files inside
+/// otherwise-allowed subtrees without paying a per-entry canonicalize.
+pub(crate) fn is_likely_secret_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
         return false;
     };
@@ -233,5 +237,33 @@ mod tests {
             !roots.is_empty(),
             "HOME-derived denied roots should be present"
         );
+    }
+
+    #[test]
+    fn is_likely_secret_file_matches_secret_filenames() {
+        // Walk-based tools (grep/glob/list_directory) call this directly to skip
+        // secret-named files inside otherwise-permitted subtrees, so its match
+        // set must stay in lockstep with `is_denied`'s filename branch.
+        let secret = [".env", ".env.local", ".env.production", "id_rsa", "id_ed25519",
+            ".npmrc", ".pypirc", ".netrc", "credentials"];
+        for n in secret {
+            assert!(
+                is_likely_secret_file(Path::new(&format!("/proj/{n}"))),
+                "{n} should be flagged as a secret file"
+            );
+        }
+    }
+
+    #[test]
+    fn is_likely_secret_file_passes_non_secret_filenames() {
+        // Public keys and ordinary files must pass — see the `.env.` prefix
+        // contract (a bare `foo.env` is not the dotenv convention).
+        let plain = ["id_rsa.pub", "foo.env", "README.md", "main.rs", "package.json"];
+        for n in plain {
+            assert!(
+                !is_likely_secret_file(Path::new(&format!("/proj/{n}"))),
+                "{n} should not be flagged as a secret file"
+            );
+        }
     }
 }

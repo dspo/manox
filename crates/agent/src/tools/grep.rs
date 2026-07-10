@@ -101,12 +101,17 @@ fn run_grep(
     // Canonicalized denied roots for walk pruning — a search rooted at a
     // parent (e.g. `$HOME`) must not descend into `~/.ssh` or `~/Library`.
     let prune_roots: Vec<PathBuf> = read_policy.denied_roots().to_vec();
+    // Canonicalize the walk root so emitted paths share the prefix of the
+    // canonicalized `prune_roots`. A symlinked root (e.g. `/var` →
+    // `/private/var`) would otherwise make `starts_with` miss sensitive
+    // subtrees and let the walker descend into them.
+    let walk_root = crate::sandbox::canonicalize_best_effort(root);
 
     let matcher = RegexMatcherBuilder::new()
         .build(pattern)
         .map_err(|e| format!("grep invalid regex: {e}"))?;
 
-    let mut walker = WalkBuilder::new(root);
+    let mut walker = WalkBuilder::new(&walk_root);
     walker.standard_filters(true);
     walker.hidden(false);
     // Prune denied subtrees during descent. Returning false skips the entry and
@@ -120,7 +125,7 @@ fn run_grep(
     }
 
     if let Some(g) = glob {
-        let overrides = OverrideBuilder::new(root)
+        let overrides = OverrideBuilder::new(&walk_root)
             .add(g)
             .map_err(|e| format!("grep invalid glob: {e}"))?
             .build()
@@ -144,6 +149,12 @@ fn run_grep(
             continue;
         }
         let file_path = entry.path();
+        // The prune filter only drops whole denied directories; a secret-named
+        // file nested in an otherwise-permitted subtree (e.g. a project-local
+        // `.env`) would still be searched. Skip it by filename.
+        if crate::read_policy::is_likely_secret_file(file_path) {
+            continue;
+        }
         let mut sink = GrepSink {
             path: file_path.display().to_string(),
             results: Vec::new(),

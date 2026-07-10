@@ -161,6 +161,8 @@ impl AgentTool for BashTool {
         // `(allow default)` base admits the Mach IPC Apple Events ride on.
         // Gate it on approval regardless of the `unsandboxed` flag so the model
         // cannot drive other apps without explicit, auditable user consent.
+        // A YOLO session pre-authorizes every tool (like it does for
+        // unsandboxed bash and write tools); outside YOLO this gate fires.
         if let Some(cmd) = input.get("command").and_then(serde_json::Value::as_str)
             && crate::sandbox::is_cross_app_automation(cmd)
         {
