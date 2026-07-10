@@ -168,16 +168,26 @@ pub struct CompletionState {
 }
 
 impl CompletionState {
-    pub fn new(trigger: char, token_start: usize, items: Vec<CompletionItem>) -> Self {
+    pub fn new(
+        trigger: char,
+        token_start: usize,
+        items: Vec<CompletionItem>,
+        selected: usize,
+    ) -> Self {
+        let selected = if items.is_empty() {
+            0
+        } else {
+            selected.min(items.len() - 1)
+        };
         let list_state = ListState::new(items.len(), ListAlignment::Top, px(0.));
         if !items.is_empty() {
-            list_state.scroll_to_reveal_item(0);
+            list_state.scroll_to_reveal_item(selected);
         }
         Self {
             trigger,
             token_start,
             items,
-            selected: 0,
+            selected,
             list_state,
         }
     }

@@ -1053,22 +1053,43 @@ impl Workspace {
             let s = self.input_state.read(cx);
             (s.value().to_string(), s.selected_range().end)
         };
-        let new = detect(&value, cursor).and_then(|det| {
-            let items = if det.trigger == '/' {
-                slash_source(&det.query)
-            } else {
-                mention_source(&det.query)
-            };
-            if items.is_empty() {
-                None
-            } else {
-                Some(CompletionState::new(det.trigger, det.token_start, items))
+        let new = match detect(&value, cursor) {
+            None => None,
+            Some(det) => {
+                let items = if det.trigger == '/' {
+                    slash_source(&det.query)
+                } else {
+                    mention_source(&det.query)
+                };
+                if items.is_empty() {
+                    None
+                } else {
+                    // Carry the selection forward when the same trigger is
+                    // active and the previously-picked item survived the
+                    // narrower filter, so typing more to refine doesn't snap
+                    // the highlight back to the top.
+                    let selected = self
+                        .completion
+                        .as_ref()
+                        .filter(|s| s.trigger == det.trigger)
+                        .and_then(|s| s.items.get(s.selected).map(|it| it.name.clone()))
+                        .and_then(|name| items.iter().position(|it| it.name == name))
+                        .unwrap_or(0);
+                    Some(CompletionState::new(
+                        det.trigger,
+                        det.token_start,
+                        items,
+                        selected,
+                    ))
+                }
             }
-        });
+        };
         let changed = match (&self.completion, &new) {
             (None, None) => false,
             (Some(_), None) | (None, Some(_)) => true,
-            (Some(a), Some(b)) => !a.items.eq(&b.items) || a.trigger != b.trigger,
+            (Some(a), Some(b)) => {
+                !a.items.eq(&b.items) || a.trigger != b.trigger || a.selected != b.selected
+            }
         };
         self.completion = new;
         if changed {
@@ -4569,20 +4590,30 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
                 this.close_terminal_tab(cx);
             }))
+            // Completion actions only match via the `completion == open > Input`
+            // keybindings, so any fire means the popover was open and these
+            // keystrokes belong to it. Stop propagation so the Input's own
+            // parallel up/down/enter/tab/escape binding (same depth, lower
+            // register index) doesn't also fire — otherwise Enter would both
+            // confirm and submit, Up/Down would move caret and selection, etc.
             .on_action(cx.listener(|this, _: &crate::CompletionUp, window, cx| {
                 this.completion_up(window, cx);
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &crate::CompletionDown, window, cx| {
                 this.completion_down(window, cx);
+                cx.stop_propagation();
             }))
             .on_action(
                 cx.listener(|this, _: &crate::CompletionConfirm, window, cx| {
                     this.completion_confirm_selected(window, cx);
+                    cx.stop_propagation();
                 }),
             )
             .on_action(
                 cx.listener(|this, _: &crate::CompletionDismiss, _window, cx| {
                     this.close_completion(cx);
+                    cx.stop_propagation();
                 }),
             )
             // Left sidebar with a draggable divider on its right edge.
