@@ -566,12 +566,18 @@ mod tests {
             rows: vec![
                 OverviewTableRow {
                     model: "a".to_string(),
-                    usage: UsageTotals { in_tokens: 200, ..Default::default() },
+                    usage: UsageTotals {
+                        in_tokens: 200,
+                        ..Default::default()
+                    },
                     color_index: 0,
                 },
                 OverviewTableRow {
                     model: "b".to_string(),
-                    usage: UsageTotals { in_tokens: 2, ..Default::default() },
+                    usage: UsageTotals {
+                        in_tokens: 2,
+                        ..Default::default()
+                    },
                     color_index: 1,
                 },
             ],

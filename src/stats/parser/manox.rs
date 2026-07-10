@@ -51,14 +51,14 @@ pub(super) fn parse(db_path: &Path) -> Result<Vec<RawEntry>> {
     let mut out = Vec::new();
     let mut row_errors = 0u32;
     for row in rows {
-        let (thread_id, input, output, cache_create, cache_read, completed_at, model_id) =
-            match row {
-                Ok(t) => t,
-                Err(_) => {
-                    row_errors += 1;
-                    continue;
-                }
-            };
+        let (thread_id, input, output, cache_create, cache_read, completed_at, model_id) = match row
+        {
+            Ok(t) => t,
+            Err(_) => {
+                row_errors += 1;
+                continue;
+            }
+        };
 
         let input_tokens = input.max(0) as u64;
         let output_tokens = output.max(0) as u64;
@@ -269,7 +269,11 @@ mod tests {
     fn skips_empty_model_id() {
         let (_dir, db_path) = setup_test_db();
         let entries = parse(&db_path).unwrap();
-        assert!(entries.iter().all(|e| e.session_id.as_deref() != Some("th_4")));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.session_id.as_deref() != Some("th_4"))
+        );
     }
 
     #[test]

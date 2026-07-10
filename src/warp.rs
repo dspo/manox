@@ -8,7 +8,6 @@
 // OSC 777 格式: \x1b]777;notify;warp://cli-agent;<JSON>\x07
 // JSON 信封字段: v, agent, event, session_id, cwd, project（+ 可选扩展字段）
 
-use rand::RngCore;
 use serde::Serialize;
 use std::cell::Cell;
 use std::env;
@@ -131,13 +130,7 @@ pub fn maybe_emit_session_start(agent_id: &str, model: Option<&str>) -> Option<W
     Some(session)
 }
 
-/// 生成 32 字符的随机 hex 字符串作为 session ID。
-fn generate_session_id() -> String {
-    let mut rng = rand::thread_rng();
-    let mut bytes = [0u8; 16];
-    rng.fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
+use crate::session::generate_session_id;
 
 /// 获取当前工作目录的字符串表示。
 fn cwd_string() -> String {

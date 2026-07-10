@@ -806,10 +806,7 @@ mod tests {
             normalize_model_name("OpenAI/gpt-4o[1m]/completions"),
             "gpt-4o"
         );
-        assert_eq!(
-            normalize_model_name("OpenAI/gpt-5.4/responses"),
-            "gpt-5.4"
-        );
+        assert_eq!(normalize_model_name("OpenAI/gpt-5.4/responses"), "gpt-5.4");
         // Unknown wire-API label → treated as provider prefix (last segment kept)
         assert_eq!(normalize_model_name("provider/model/unknown"), "unknown");
     }

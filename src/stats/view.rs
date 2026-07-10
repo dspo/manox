@@ -2511,11 +2511,7 @@ mod tests {
     // Overview 的 Model 列底纹按 Total tokens 归一化（除以最大值，非总和）。
     // 以下测试复刻 draw_model_table 中 ratio -> share_width 的计算公式，
     // 锁定其行为契约：最大模型填满整列、其余按比例、不溢出列宽、空数据安全。
-    fn normalized_bar_width(
-        total_tokens: u64,
-        max_total_tokens: u64,
-        col_width: usize,
-    ) -> usize {
+    fn normalized_bar_width(total_tokens: u64, max_total_tokens: u64, col_width: usize) -> usize {
         let ratio = if max_total_tokens > 0 {
             total_tokens as f64 / max_total_tokens as f64
         } else {
@@ -2531,7 +2527,10 @@ mod tests {
         let max_tokens = 1_000_000u64;
 
         // 最大模型：ratio 恒为 1.0（同值自除），填满整列
-        assert_eq!(normalized_bar_width(max_tokens, max_tokens, col_width), col_width);
+        assert_eq!(
+            normalized_bar_width(max_tokens, max_tokens, col_width),
+            col_width
+        );
 
         // 半量模型：恰好半宽
         assert_eq!(normalized_bar_width(500_000, max_tokens, col_width), 12);
@@ -2543,7 +2542,10 @@ mod tests {
         assert_eq!(normalized_bar_width(0, 0, col_width), 0);
 
         // 即使 total_tokens 等于 max（并列最大）也填满整列，不溢出
-        assert_eq!(normalized_bar_width(max_tokens, max_tokens, col_width), col_width);
+        assert_eq!(
+            normalized_bar_width(max_tokens, max_tokens, col_width),
+            col_width
+        );
     }
 
     #[test]
@@ -2572,9 +2574,15 @@ mod tests {
         let max_tokens = 1_000_000u64;
 
         // 最大模型填满整列
-        assert_eq!(normalized_bar_width(max_tokens, max_tokens, col_width), col_width);
+        assert_eq!(
+            normalized_bar_width(max_tokens, max_tokens, col_width),
+            col_width
+        );
         // 半量模型恰好一半
-        assert_eq!(normalized_bar_width(500_000, max_tokens, col_width), col_width / 2);
+        assert_eq!(
+            normalized_bar_width(500_000, max_tokens, col_width),
+            col_width / 2
+        );
         // 微量模型四舍五入到 0
         assert_eq!(normalized_bar_width(1, max_tokens, col_width), 0);
         // 任意占比都不超过列宽
