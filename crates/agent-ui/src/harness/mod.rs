@@ -97,15 +97,27 @@ impl Harness {
     }
 
     pub fn new_thread(&self, cx: &mut App) -> Result<(), String> {
-        self.workspace
-            .update(cx, |ws, cx| ws.harness_new_thread(cx));
+        if let Some(handle) = crate::dispatch::window_global() {
+            let _ = handle.update(cx, |_, window, cx| {
+                self.workspace
+                    .update(cx, |ws, cx| ws.harness_new_thread(window, cx));
+            });
+        }
         Ok(())
     }
 
     pub fn open_thread(&self, id: String, cx: &mut App) -> Result<bool, String> {
-        Ok(self
-            .workspace
-            .update(cx, |ws, cx| ws.harness_open_thread(id, cx)))
+        let opened = if let Some(handle) = crate::dispatch::window_global() {
+            handle
+                .update(cx, |_, window, cx| {
+                    self.workspace
+                        .update(cx, |ws, cx| ws.harness_open_thread(id, window, cx))
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        Ok(opened)
     }
 
     /// All persisted threads, in sidebar order.
@@ -181,6 +193,18 @@ impl Harness {
                         "attempt": attempt,
                         "max_attempts": max_attempts,
                         "delay_secs": delay_secs,
+                    }),
+                    ConvItem::Recap {
+                        summary, collapsed, ..
+                    } => json!({
+                        "kind": "recap",
+                        "summary": summary,
+                        "collapsed": collapsed,
+                    }),
+                    ConvItem::TeamMessage { from, content } => json!({
+                        "kind": "team_message",
+                        "from": from,
+                        "content": content,
                     }),
                 }
             })

@@ -749,10 +749,11 @@ impl ConversationState {
         messages: &[Message],
         usage: &std::collections::HashMap<String, TokenUsage>,
         role: &str,
+        running: bool,
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Self {
-        let plain = build_items(messages, usage);
+        let plain = build_items(messages, usage, running);
         let items = plain
             .into_iter()
             .enumerate()
@@ -795,7 +796,7 @@ mod tests {
                 content: "file contents here".to_string(),
             })]),
         ];
-        let items = build_items(&messages, &std::collections::HashMap::new());
+        let items = build_items(&messages, &std::collections::HashMap::new(), false);
         let tool = items
             .iter()
             .find_map(|i| match i {
@@ -823,7 +824,7 @@ mod tests {
                 content: "boom".to_string(),
             }),
         ])];
-        let items = build_items(&messages, &std::collections::HashMap::new());
+        let items = build_items(&messages, &std::collections::HashMap::new(), false);
         let tool = items
             .iter()
             .find_map(|i| match i {
@@ -867,7 +868,7 @@ mod tests {
                 content: envelope,
             })]),
         ];
-        let items = build_items(&messages, &std::collections::HashMap::new());
+        let items = build_items(&messages, &std::collections::HashMap::new(), false);
         let task = items
             .iter()
             .find_map(|i| match i {
@@ -893,5 +894,26 @@ mod tests {
             "not json { at all"
         );
         assert!(agent::tools::agent::agent_sub_messages("plain text").is_none());
+    }
+
+    /// A still-running thread rebuilds with its trailing assistant bubble marked
+    /// `streaming` so resumed `AgentText` deltas append to it instead of opening
+    /// a second bubble (Bug 2). The completed path stays non-streaming.
+    #[test]
+    fn build_items_trailing_streaming_marks_running_tail() {
+        let messages = vec![
+            Message::user("hello".to_string()),
+            Message::assistant(vec![MessageContent::Text("draft reply".to_string())]),
+        ];
+        let completed = build_items(&messages, &std::collections::HashMap::new(), false);
+        match completed.last().unwrap() {
+            ConvItem::Assistant { streaming, .. } => assert!(!*streaming, "completed tail not streaming"),
+            _ => panic!("trailing item is an assistant bubble"),
+        }
+        let running = build_items(&messages, &std::collections::HashMap::new(), true);
+        match running.last().unwrap() {
+            ConvItem::Assistant { streaming, .. } => assert!(*streaming, "running tail is streaming"),
+            _ => panic!("trailing item is an assistant bubble"),
+        }
     }
 }

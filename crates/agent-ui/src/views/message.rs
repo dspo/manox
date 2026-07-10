@@ -1157,7 +1157,7 @@ pub fn render_agent_task(
         // Expanded: rebuild the child conversation from its snapshot and render
         // each item recursively. Nested agent tasks share the same expansion
         // set (keyed by id), so they expand/collapse in place too.
-        let sub_items = build_items(&item.sub_messages, &HashMap::new());
+        let sub_items = build_items(&item.sub_messages, &HashMap::new(), false);
         if sub_items.is_empty() {
             if !collapsed_body.is_empty() {
                 card = card.child(render_agent_body(&collapsed_body, ix, theme));
@@ -1239,7 +1239,11 @@ fn truncate(s: &str, max_chars: usize) -> String {
 ///
 /// Tool calls pair ToolUse with ToolResult by `tool_use_id`; an unpaired side
 /// becomes its own item.
-pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) -> Vec<ConvItem> {
+pub fn build_items(
+    messages: &[Message],
+    usage: &HashMap<String, TokenUsage>,
+    trailing_streaming: bool,
+) -> Vec<ConvItem> {
     let mut items: Vec<ConvItem> = Vec::new();
     // Id of the most recent user message; usage is keyed by it, so an
     // assistant reply inherits the usage of the user message preceding it.
@@ -1391,6 +1395,17 @@ pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) ->
                 }
             }
             Role::System => {}
+        }
+    }
+    // The trailing in-flight assistant/reasoning content of a still-running
+    // thread must read as live so resumed `AgentText`/`AgentThinking` deltas
+    // append to it instead of spawning a second bubble.
+    if trailing_streaming && let Some(last) = items.last_mut() {
+        match last {
+            ConvItem::Assistant { streaming, .. } | ConvItem::Reasoning { streaming, .. } => {
+                *streaming = true;
+            }
+            _ => {}
         }
     }
     items

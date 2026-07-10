@@ -176,7 +176,6 @@ dependencies = [
  "async-channel 2.5.0",
  "base64",
  "chrono",
- "composer",
  "futures",
  "gpui",
  "gpui-component",
@@ -1482,14 +1481,6 @@ checksum = "1b60b5124979fccd9addd89d8b97a1d6eebb4950694520c75ddd722535ea443f"
 dependencies = [
  "nix 0.31.3",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "composer"
-version = "0.1.0"
-dependencies = [
- "gpui",
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -4437,7 +4428,6 @@ dependencies = [
  "agent-ui",
  "anyhow",
  "async-channel 2.5.0",
- "composer",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
