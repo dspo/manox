@@ -156,6 +156,16 @@ impl AgentTool for BashTool {
         if unsandboxed {
             return true;
         }
+        // Cross-app automation (osascript / `tell application` / `open -a`)
+        // escapes the FS+network confinement seatbelt enforces — seatbelt's
+        // `(allow default)` base admits the Mach IPC Apple Events ride on.
+        // Gate it on approval regardless of the `unsandboxed` flag so the model
+        // cannot drive other apps without explicit, auditable user consent.
+        if let Some(cmd) = input.get("command").and_then(serde_json::Value::as_str)
+            && crate::sandbox::is_cross_app_automation(cmd)
+        {
+            return true;
+        }
         // Sandboxed bash skips approval only where an OS sandbox actually
         // enforces confinement. On platforms without a backend, the default
         // path falls back to an unconstrained brush shell — gate it on
@@ -1044,5 +1054,53 @@ mod tests {
             err.to_string().contains("expected bool"),
             "malformed value must surface a clear error: {err}"
         );
+    }
+
+    // ─── requires_approval: cross-app automation gating ─────────────────────
+
+    fn tool() -> BashTool {
+        BashTool::new(
+            PathBuf::from("."),
+            crate::sandbox::SandboxPolicy::for_project(&PathBuf::from(".")),
+        )
+    }
+
+    #[test]
+    fn requires_approval_flags_cross_app_commands() {
+        // Cross-app automation drives other apps via Apple Events; even a
+        // sandboxed command must be approval-gated, on every platform.
+        let t = tool();
+        assert!(t.requires_approval(&serde_json::json!({
+            "command": "osascript -e 'tell application \"Finder\" to quit'"
+        })));
+        assert!(t.requires_approval(&serde_json::json!({
+            "command": "open -a 'Visual Studio Code' ."
+        })));
+    }
+
+    #[test]
+    fn requires_approval_unsandboxed_still_true() {
+        let t = tool();
+        assert!(t.requires_approval(&serde_json::json!({
+            "command": "ls", "unsandboxed": true
+        })));
+    }
+
+    #[test]
+    fn requires_approval_allows_normal_sandboxed_on_macos() {
+        // A plain sandboxed command is approval-free exactly where an OS
+        // sandbox backend enforces confinement (macOS). On platforms without a
+        // backend the fallback brush shell is gated, so the same command needs
+        // approval there.
+        let t = tool();
+        let decided = t.requires_approval(&serde_json::json!({"command": "ls -la"}));
+        if crate::sandbox::is_available() {
+            assert!(!decided, "sandboxed command must skip approval on macOS");
+        } else {
+            assert!(
+                decided,
+                "sandboxed command needs approval without a backend"
+            );
+        }
     }
 }

@@ -9,12 +9,14 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::read_policy::ReadPolicy;
 use crate::tool::AgentTool;
 
 use super::{resolve_path, schema};
 
 pub struct ReadFileTool {
     pub(crate) cwd: Arc<PathBuf>,
+    pub(crate) read_policy: ReadPolicy,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -49,7 +51,12 @@ impl AgentTool for ReadFileTool {
             return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let path = resolve_path(&parsed.path, &self.cwd);
+        let read_policy = self.read_policy.clone();
         cx.background_spawn(async move {
+            // Enforce the read deny-list before touching the file: SSH keys,
+            // cloud creds, `.env`, media libraries, etc. The error routes the
+            // model toward the approval-gated `bash` escape hatch.
+            read_policy.check(&path)?;
             let raw =
                 std::fs::read_to_string(&path).map_err(|e| format!("read_file failed: {e}"))?;
             let text = crate::hashline::normalize_to_lf(&raw);

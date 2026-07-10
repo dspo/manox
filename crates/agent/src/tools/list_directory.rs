@@ -8,12 +8,14 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::read_policy::ReadPolicy;
 use crate::tool::AgentTool;
 
 use super::{resolve_path, schema};
 
 pub struct ListDirectoryTool {
     pub(crate) cwd: Arc<PathBuf>,
+    pub(crate) read_policy: ReadPolicy,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -50,7 +52,11 @@ impl AgentTool for ListDirectoryTool {
             .path
             .map(|p| resolve_path(&p, &self.cwd))
             .unwrap_or_else(|| self.cwd.as_ref().clone());
+        let read_policy = self.read_policy.clone();
         cx.background_spawn(async move {
+            // Deny listing sensitive subtrees (e.g. `~/.ssh`, `~/Library`) —
+            // the read deny-list applies to directory enumeration too.
+            read_policy.check(&base)?;
             let entries =
                 std::fs::read_dir(&base).map_err(|e| format!("list_directory failed: {e}"))?;
             let mut lines: Vec<String> = Vec::new();
