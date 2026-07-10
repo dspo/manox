@@ -2851,7 +2851,8 @@ impl Workspace {
         // Each model block carries: model id text + two tree rows. The
         // capture-based build here keeps the closure machinery out of the
         // outer builder.
-        let mut model_blocks: Vec<(String, gpui::Div, gpui::Div)> = Vec::with_capacity(model_rows.len());
+        let mut model_blocks: Vec<(String, gpui::Div, gpui::Div)> =
+            Vec::with_capacity(model_rows.len());
 
         for (model_name, usage) in model_rows {
             let model_display = truncate_env_model_id(model_name.clone());
@@ -2990,7 +2991,9 @@ impl Workspace {
                                 h_flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
+                                    .child(
+                                        Icon::new(IconName::MemoryStick).xsmall().text_color(muted),
+                                    )
                                     .child(
                                         gpui::div()
                                             .flex_1()
@@ -5409,11 +5412,9 @@ fn counter_animated(
             Animation::new(Duration::from_millis(600)).with_easing(ease_out_quint()),
             move |el, t| {
                 let v = (from_f + (to_f - from_f) * t as f64) as u64;
-                el.child(SharedString::from(format!(
-                    "{}{}",
-                    arrow,
-                    format_tokens(v),
-                )))
+                el.child(SharedString::from(
+                    format!("{}{}", arrow, format_tokens(v),),
+                ))
             },
         )
         .into_any_element()
