@@ -244,8 +244,17 @@ mod tests {
         // Walk-based tools (grep/glob/list_directory) call this directly to skip
         // secret-named files inside otherwise-permitted subtrees, so its match
         // set must stay in lockstep with `is_denied`'s filename branch.
-        let secret = [".env", ".env.local", ".env.production", "id_rsa", "id_ed25519",
-            ".npmrc", ".pypirc", ".netrc", "credentials"];
+        let secret = [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "id_rsa",
+            "id_ed25519",
+            ".npmrc",
+            ".pypirc",
+            ".netrc",
+            "credentials",
+        ];
         for n in secret {
             assert!(
                 is_likely_secret_file(Path::new(&format!("/proj/{n}"))),
@@ -258,7 +267,13 @@ mod tests {
     fn is_likely_secret_file_passes_non_secret_filenames() {
         // Public keys and ordinary files must pass — see the `.env.` prefix
         // contract (a bare `foo.env` is not the dotenv convention).
-        let plain = ["id_rsa.pub", "foo.env", "README.md", "main.rs", "package.json"];
+        let plain = [
+            "id_rsa.pub",
+            "foo.env",
+            "README.md",
+            "main.rs",
+            "package.json",
+        ];
         for n in plain {
             assert!(
                 !is_likely_secret_file(Path::new(&format!("/proj/{n}"))),
