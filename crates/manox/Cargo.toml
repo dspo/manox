@@ -18,6 +18,7 @@ agent-ui.workspace = true
 agent.workspace = true
 terminal.workspace = true
 terminal-ui.workspace = true
+supervisor.workspace = true
 
 tracing.workspace = true
 tracing-subscriber.workspace = true

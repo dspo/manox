@@ -202,7 +202,7 @@ pub(crate) fn base_tools_with_policy(
     cwd: Arc<PathBuf>,
     sandbox: crate::sandbox::SandboxPolicy,
 ) -> Vec<AnyAgentTool> {
-    vec![
+    let mut tools = vec![
         Arc::new(read_file::ReadFileTool {
             cwd: cwd.clone(),
             read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
@@ -230,7 +230,20 @@ pub(crate) fn base_tools_with_policy(
         }),
         Arc::new(ask_user::AskUserQuestionTool),
         Arc::new(skill::SkillTool),
-    ]
+    ];
+
+    // LSP code-intel is a read-only axis shared with sub-agents (unlike MCP,
+    // which stays main-agent-only). Same one-time-fingerprint discipline as the
+    // main registry.
+    if let Some(lsp_reg) = crate::lsp::try_global()
+        && !lsp_reg.available_specs().is_empty()
+    {
+        for tool in crate::lsp::tools() {
+            tools.push(tool);
+        }
+    }
+
+    tools
 }
 
 /// Build the main-thread `ToolRegistry`: the built-in tools plus the
@@ -290,6 +303,18 @@ pub fn main_registry_with_policy(
     if let Some(mcp) = crate::mcp::registry::try_global() {
         for tool in mcp.tools() {
             reg.register(tool.clone());
+        }
+    }
+    // LSP code-intel tools — all read-only. Registered only when at least one
+    // server is on PATH, so an environment without language servers doesn't
+    // pollute the tool list. Unlike MCP, LSP is a read-only axis shared with
+    // sub-agents (see `base_tools_with_policy`); the registration is one-time,
+    // so the provider prefix cache fingerprint settles once across turns.
+    if let Some(lsp_reg) = crate::lsp::try_global()
+        && !lsp_reg.available_specs().is_empty()
+    {
+        for tool in crate::lsp::tools() {
+            reg.register(tool);
         }
     }
     reg

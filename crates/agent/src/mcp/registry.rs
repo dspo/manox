@@ -151,7 +151,7 @@ async fn connect_one(
     name: &str,
     cfg: crate::mcp::config::McpServerConfig,
 ) -> anyhow::Result<Vec<AnyAgentTool>> {
-    let client = tokio::time::timeout(CONNECT_TIMEOUT, connect_transport(&cfg.transport))
+    let client = tokio::time::timeout(CONNECT_TIMEOUT, connect_transport(name, &cfg.transport))
         .await
         .map_err(|_| {
             anyhow::anyhow!("MCP server `{name}` connect timed out after {CONNECT_TIMEOUT:?}")
@@ -173,7 +173,13 @@ async fn connect_one(
 }
 
 /// Build a transport, run the rmcp client handshake, return the running service.
+///
+/// Stdio servers are spawned through the `supervisor` process bus so manox
+/// owns the `Child` (own process group, reaped on exit via `terminate_all` /
+/// `killpg`) and rmcp only consumes the piped stdin/stdout streams.
+/// Streamable-HTTP servers are not subprocesses and skip the bus.
 async fn connect_transport(
+    name: &str,
     transport: &McpServerTransportConfig,
 ) -> anyhow::Result<rmcp::service::RunningService<rmcp::service::RoleClient, rmcp::model::ClientInfo>>
 {
@@ -181,7 +187,7 @@ async fn connect_transport(
     let service = match transport {
         McpServerTransportConfig::Stdio { command, args, env, cwd } => {
             let mut cmd = tokio::process::Command::new(command);
-            cmd.args(args).kill_on_drop(true);
+            cmd.args(args);
             if let Some(env) = env {
                 for (k, v) in env {
                     cmd.env(k, v);
@@ -190,14 +196,18 @@ async fn connect_transport(
             if let Some(cwd) = cwd {
                 cmd.current_dir(cwd);
             }
-            // `TokioChildProcess` takes the un-spawned `Command` and spawns it
-            // itself; its builder defaults to piped stdin/stdout and inherited
-            // stderr, which is what MCP JSON-RPC over stdio needs.
-            let (child, _stderr) =
-                rmcp::transport::child_process::TokioChildProcess::builder(cmd)
-                    .spawn()
-                    .map_err(|e| anyhow::anyhow!("spawning MCP stdio server `{command}`: {e}"))?;
-            rmcp::service::serve_client(client_info, child).await
+            // supervisor owns the Child (own process group, reaped on exit);
+            // rmcp gets only the streams — the `(R, W)` pair implements
+            // `IntoTransport` via the transport-async-rw feature.
+            let spawned = supervisor::global()
+                .spawn(&format!("mcp-{name}"), cmd, supervisor::ProcessKind::Mcp)
+                .await
+                .map_err(|e| anyhow::anyhow!("spawning MCP stdio server `{command}`: {e}"))?;
+            let transport = rmcp::transport::IntoTransport::into_transport((
+                spawned.stdout,
+                spawned.stdin,
+            ));
+            rmcp::service::serve_client(client_info, transport).await
         }
         McpServerTransportConfig::StreamableHttp { url, headers } => {
             let mut config =

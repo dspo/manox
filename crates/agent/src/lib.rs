@@ -16,6 +16,7 @@ pub mod hook;
 pub mod i18n;
 pub mod image;
 pub mod language_model;
+pub mod lsp;
 pub mod mcp;
 pub mod message;
 pub mod model_alias;
@@ -63,6 +64,10 @@ pub fn init(cx: &mut App) {
     i18n::init();
     provider::registry::init(cx);
     mcp::registry::init(cx);
+    // LSP PATH detection (no spawn — servers start lazily on first code-intel
+    // call). Runs after MCP so the registry is settled before the first
+    // `main_registry` build picks up LSP tools.
+    lsp::init();
     thread_store::init(cx);
     hashline::init();
     agent_def::init();
