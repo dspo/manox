@@ -315,8 +315,9 @@ pub struct ResolvedModel {
 
 impl ResolvedModel {
     /// Build a resolved model with manox semantics: `visible_agents` = endpoint agents,
-    /// `env` = model env only, defaults empty. cx post-processes (agent filtering, env merge)
-    /// in its own `build_all_models` because its TUI needs cross-model agent compatibility.
+    /// `env` = provider base env + model overrides (model takes precedence), defaults empty.
+    /// cx post-processes (agent filtering, env merge) in its own `build_all_models`
+    /// because its TUI needs cross-model agent compatibility.
     fn from_config(
         provider: &ProviderConfig,
         endpoint: &EndpointConfig,
@@ -332,6 +333,9 @@ impl ResolvedModel {
                 .filter(|w| *w != WireApi::Unavailable)
                 .collect()
         };
+        // Merged env: provider is the base, model entries override.
+        let mut merged_env = provider.env.clone();
+        merged_env.extend(model.env.clone());
 
         Self {
             id: model.id.clone(),
@@ -345,7 +349,7 @@ impl ResolvedModel {
             endpoint_url: endpoint.url.clone(),
             visible_agents: endpoint.agents.clone(),
             copilot_auth: CopilotAuth::from_endpoint(endpoint),
-            env: model.env.clone(),
+            env: merged_env,
             apikey_source: provider.apikey_source.clone(),
         }
     }
@@ -565,6 +569,56 @@ providers:
         assert_eq!(resolved[0].id, "glm-5.2");
         assert_eq!(resolved[0].wire_api, WireApi::Anthropic);
         assert_eq!(resolved[0].provider_name, "百炼");
+    }
+
+    #[test]
+    fn resolve_merges_provider_and_model_env() {
+        let yaml = r#"
+providers:
+- name: test
+  env:
+    SHARED: from-provider
+    PROVIDER_ONLY: pv
+  models:
+    m1:
+      env:
+        SHARED: from-model
+        MODEL_ONLY: mv
+      wire_apis: [anthropic]
+  endpoints:
+    anthropic:
+      url: https://example.com
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        // Model env overrides provider env for shared key
+        assert_eq!(resolved[0].env.get("SHARED"), Some(&"from-model".to_string()));
+        // Both unique keys are present
+        assert_eq!(resolved[0].env.get("PROVIDER_ONLY"), Some(&"pv".to_string()));
+        assert_eq!(resolved[0].env.get("MODEL_ONLY"), Some(&"mv".to_string()));
+    }
+
+    #[test]
+    fn resolve_provider_env_without_model_env() {
+        let yaml = r#"
+providers:
+- name: test
+  env:
+    KEY1: v1
+    KEY2: v2
+  models:
+    m1:
+      wire_apis: [anthropic]
+  endpoints:
+    anthropic:
+      url: https://example.com
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].env.get("KEY1"), Some(&"v1".to_string()));
+        assert_eq!(resolved[0].env.get("KEY2"), Some(&"v2".to_string()));
     }
 
     #[test]
