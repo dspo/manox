@@ -76,6 +76,63 @@ fn is_retryable_send_error(err: &reqwest::Error) -> bool {
     false
 }
 
+/// Short, user-facing label for a retryable reqwest send error. Mirrors the
+/// retry-decision logic of `is_retryable_send_error` but only classifies — it
+/// never gates a retry. Kept terse so the retry badge reads as one line.
+fn classify_send_error(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        return "timeout";
+    }
+    if err.is_redirect() {
+        return "redirect error";
+    }
+    if err.is_connect() {
+        return "connection error";
+    }
+    let mut src: Option<&dyn std::error::Error> = Some(err);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionReset => return "connection reset",
+                std::io::ErrorKind::ConnectionAborted => return "connection aborted",
+                std::io::ErrorKind::BrokenPipe => return "broken pipe",
+                std::io::ErrorKind::TimedOut => return "timeout",
+                std::io::ErrorKind::UnexpectedEof => return "unexpected EOF",
+                _ => {}
+            }
+        }
+        src = s.source();
+    }
+    "network error"
+}
+
+/// User-facing label for a retryable HTTP status: "429 Too Many Requests" for
+/// standard codes, bare numeric for unofficial ones (529) where no canonical
+/// reason exists — avoids http's "<unknown status code>" placeholder.
+fn retry_status_reason(status: StatusCode) -> String {
+    match status.canonical_reason() {
+        Some(r) => format!("{} {}", status.as_u16(), r),
+        None => status.as_u16().to_string(),
+    }
+}
+
+/// Cap a provider error body so the expanded retry card stays readable. A 429
+/// or 5xx body can be a multi-KB HTML/JSON error page; truncate with an
+/// ellipsis. Snaps back to the nearest UTF-8 char boundary so the cut never
+/// splits a multi-byte character (provider bodies often carry non-ASCII).
+fn truncate_body(body: &str) -> String {
+    const MAX: usize = 2000;
+    if body.len() <= MAX {
+        body.to_string()
+    } else {
+        let mut end = MAX;
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &body[..end])
+    }
+}
+
 /// Parse `Retry-After`-style headers. Supports the non-standard
 /// `retry-after-ms` (milliseconds) and the standard `Retry-After` (seconds).
 /// The HTTP-date form of `Retry-After` is not parsed — Anthropic and OpenAI
@@ -197,6 +254,8 @@ where
                         attempt,
                         max_attempts: MAX_ATTEMPTS,
                         delay_secs: delay.as_secs(),
+                        reason: retry_status_reason(status),
+                        detail: Some(truncate_body(&body)),
                     }))
                     .await;
                 if !wait_or_cancelled(delay, tx).await {
@@ -221,6 +280,8 @@ where
                         attempt,
                         max_attempts: MAX_ATTEMPTS,
                         delay_secs: delay.as_secs(),
+                        reason: classify_send_error(&err).to_string(),
+                        detail: None,
                     }))
                     .await;
                 if !wait_or_cancelled(delay, tx).await {
@@ -295,5 +356,26 @@ mod tests {
             "Wed, 01 Jan 2099 00:00:00 GMT".parse().unwrap(),
         );
         assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn truncate_body_keeps_short_and_caps_long() {
+        assert_eq!(truncate_body("short"), "short");
+        let long = "x".repeat(3000);
+        let t = truncate_body(&long);
+        assert!(t.ends_with('…'));
+        assert!(t.len() < 3000);
+    }
+
+    #[test]
+    fn truncate_body_respects_utf8_boundary() {
+        // A 3-byte CJK char straddling the 2000-byte cut must be dropped
+        // wholesale, not split mid-codepoint (would panic / yield invalid UTF-8).
+        let prefix = "a".repeat(1999);
+        let body = format!("{prefix}中");
+        let t = truncate_body(&body);
+        assert!(t.ends_with('…'));
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+        assert!(!t.contains('中'));
     }
 }

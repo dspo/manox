@@ -42,8 +42,7 @@ team-drawer-tasks = { $count ->
 }
 message-user-role = 你
 recap-card-title = 上下文已压缩
-retry-badge = 重试中… { $attempt }/{ $max } · { $secs }秒
-message-retry = 重试
+retry-badge = 重试中… { $attempt }/{ $max } · { $secs }秒 · { $reason }
 message-omitted-prefix = …（已省略前面部分）
 status-pending = 待审批
 status-running = 运行中

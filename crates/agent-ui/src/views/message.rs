@@ -375,7 +375,21 @@ pub fn render_item(
             attempt,
             max_attempts,
             delay_secs,
-        } => render_retry(*attempt, *max_attempts, *delay_secs, ix, theme),
+            reason,
+            detail,
+            collapsed,
+            user_toggled: _,
+        } => render_retry(
+            *attempt,
+            *max_attempts,
+            *delay_secs,
+            reason,
+            detail.as_deref(),
+            *collapsed,
+            ix,
+            theme,
+            tool_ctx,
+        ),
     }
 }
 
@@ -861,38 +875,82 @@ pub fn render_recap(
 
 /// Transient retry badge shown while the provider backs off after a 429 / 5xx
 /// / network error. Replaced in place by the first real content or terminal
-/// error event. Amber-toned to read as "waiting, not failed".
+/// error event. Amber-toned to read as "waiting, not failed". The badge line
+/// carries a short `reason` (HTTP status phrase or network error class); when a
+/// provider response body is available it lands in an expandable detail slot
+/// below, toggled by the same `user_toggled`-stamped pattern as recap cards.
+// Mirrors render_banner: each param maps to one banner slot (attempt/max/secs
+// for the badge, reason/detail for the body, collapsed/tool_ctx for the fold).
+#[allow(clippy::too_many_arguments)]
 pub fn render_retry(
     attempt: u32,
     max_attempts: u32,
     delay_secs: u64,
+    reason: &str,
+    detail: Option<&str>,
+    collapsed: bool,
     ix: usize,
     theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
-    let body: SharedString = i18n::t_str(
+    let badge: SharedString = i18n::t_str(
         "retry-badge",
         &[
             ("attempt", &attempt.to_string()),
             ("max", &max_attempts.to_string()),
             ("secs", &delay_secs.to_string()),
+            ("reason", reason),
         ],
     );
-    let copy_text = body.to_string();
+    let copy_text = badge.to_string();
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+    let on_click = Box::new(move |_cx: &mut App| {
+        let Some(weak) = weak_workspace.clone() else {
+            return;
+        };
+        let _ = weak.update(_cx, |w, cx| {
+            let conv = w.conversation.clone();
+            conv.update(cx, |c, cx| {
+                if let Some(item) = c.items().get(ix) {
+                    item.update(cx, |item, cx| {
+                        if let ConvItem::Retry {
+                            collapsed,
+                            user_toggled,
+                            ..
+                        } = item.kind_mut()
+                        {
+                            *collapsed = !*collapsed;
+                            *user_toggled = true;
+                        }
+                        cx.notify();
+                    });
+                }
+            });
+            cx.notify();
+        });
+    }) as Box<dyn Fn(&mut App) + 'static>;
+    let body = detail
+        .map(|d| markdown_tv(("retry", ix), d.to_string(), theme, false))
+        .unwrap_or_else(|| gpui::div().into_any_element());
+    let collapsible = if detail.is_some() {
+        Some(CollapsibleBanner {
+            collapsed,
+            on_click,
+        })
+    } else {
+        None
+    };
     render_banner(
         theme.warning,
-        i18n::t("message-retry"),
+        badge,
         Some(IconName::LoaderCircle),
         format!("retry-{ix}"),
         ix,
         "copy-retry",
         copy_text,
-        gpui::div()
-            .text_sm()
-            .text_color(theme.foreground)
-            .child(body)
-            .into_any_element(),
+        body,
         theme,
-        None,
+        collapsible,
     )
 }
 

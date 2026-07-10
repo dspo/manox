@@ -204,11 +204,19 @@ impl Harness {
                         attempt,
                         max_attempts,
                         delay_secs,
+                        reason,
+                        detail,
+                        collapsed,
+                        user_toggled,
                     } => json!({
                         "kind": "retry",
                         "attempt": attempt,
                         "max_attempts": max_attempts,
                         "delay_secs": delay_secs,
+                        "reason": reason,
+                        "detail": detail,
+                        "collapsed": collapsed,
+                        "user_toggled": user_toggled,
                     }),
                     ConvItem::Recap {
                         summary, collapsed, ..
