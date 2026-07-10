@@ -12,10 +12,9 @@
 //! reference-link definitions, `\r`), the parser falls back to a full parse —
 //! correctness is never sacrificed, only speed.
 //!
-//! Architectural debt to oh-my-pi's `#lexTokens` / `#freezeStablePrefix`: the
-//! freeze guard (never freeze right after a list; never freeze when the next
-//! char is space/`\n`) prevents the desync modes that would otherwise split a
-//! loose list or straddle a block separator across the cut.
+//! The freeze guard (never freeze right after a list; never freeze when the
+//! next char is space/`\n`) prevents the desync modes that would otherwise
+//! split a loose list or straddle a block separator across the cut.
 
 use std::sync::Arc;
 
@@ -121,7 +120,7 @@ impl IncrementalParser {
     /// contain `\n\n` — that separator proves `block[i]` is complete and the
     /// tail re-parse will start cleanly at `block[i+1]`.
     ///
-    /// Guards (from oh-my-pi `#freezeStablePrefix`):
+    /// Freeze guards:
     /// 1. **List guard**: never freeze right after a `List` block — a loose
     ///    list can be extended by a following same-marker item across a blank
     ///    line, and markdown-rs merges them. Freezing there would keep the
@@ -374,8 +373,7 @@ mod tests {
     }
 
     /// Feed `text` to a fresh parser one character at a time, asserting
-    /// incremental == full at every step. This is the core contract test,
-    /// mirroring oh-my-pi's `markdown-incremental-lex.test.ts`.
+    /// incremental == full at every step. This is the core contract test.
     fn feed_char_by_char(text: &str) {
         let mut parser = IncrementalParser::new();
         let mut buf = String::new();
