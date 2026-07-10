@@ -77,17 +77,24 @@ fn main() {
         terminal_ui::init(cx);
         agent_ui::slash_command::init(cx);
 
-        // Embedded OFL typefaces. Lilex is the message-content monospace family
-        // (assistant markdown, code blocks, composer input, terminal); IBM Plex
-        // Mono is the UI-chrome family (buttons, labels, sidebar, settings).
+        // Embedded OFL typefaces. Lilex ships only Light/Medium in upright and
+        // italic cuts: message body inherits Light, markdown bold/headings and
+        // tool-call titles resolve to Medium via nearest-weight matching, italic
+        // syntax plus reasoning/tool cards hit the italic cuts. IBM Plex Mono
+        // stays the UI-chrome family (sidebar, buttons, settings, menus) at its
+        // full weight range.
         // Both are registered before any view renders so the first frame already
         // resolves to the embedded faces rather than a system fallback.
         cx.text_system()
             .add_fonts(vec![
-                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Regular.ttf")),
-                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Bold.ttf")),
-                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Italic.ttf")),
-                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-BoldItalic.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Light.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Medium.ttf")),
+                Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/lilex/Lilex-LightItalic.ttf"
+                )),
+                Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/lilex/Lilex-MediumItalic.ttf"
+                )),
                 Cow::Borrowed(include_bytes!(
                     "../assets/fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf"
                 )),
