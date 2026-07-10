@@ -55,8 +55,7 @@ use crate::markdown::theme::MdStyles;
 // block — its content is incomplete and will change on the next delta, so the
 // L2 cache write is skipped to avoid polluting the cache with throwaway
 // highlight data.
-type HighlightCache =
-    HashMap<(String, u64, usize), (Vec<(Range<usize>, HighlightStyle)>, bool)>;
+type HighlightCache = HashMap<(String, u64, usize), (Vec<(Range<usize>, HighlightStyle)>, bool)>;
 
 thread_local! {
     static CODE_HL_CACHE: RefCell<HighlightCache> = RefCell::new(HashMap::new());

@@ -9,12 +9,13 @@
 //! - Reasoning: a collapsible block, indented secondary text with a left border.
 //! - ToolCall: a card with title + status icon + monospace output.
 //!
-//! Streaming assistant / reasoning bodies go through `Markdown::streaming(true)`,
-//! which paints plain text + a trailing cursor without re-parsing mdast per
-//! token and mounts the full layout once the stream ends. Streaming tool output
-//! is stricter: while lines are still arriving we paint a plain monospace run
-//! and only mount the syntax-highlighted `Markdown` once the final `ToolResult`
-//! lands.
+//! Streaming assistant / reasoning bodies render formatted markdown throughout
+//! the stream via `Markdown::blocks` (blocks from an `IncrementalParser`), with
+//! a trailing cursor on the last block. `Stop` finalizes the parser (one full
+//! parse for consistency) and flips the streaming flag off — no reflow jump.
+//! Streaming tool output is stricter: while lines are still arriving we paint
+//! a plain monospace run and only mount the syntax-highlighted `Markdown` once
+//! the final `ToolResult` lands.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -26,12 +27,14 @@ use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
-use gpui::{App, ClipboardItem, Render, SharedString, WeakEntity, px};
+use gpui::{App, ClipboardItem, Render, SharedString, Task, WeakEntity, px};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
+use manox_components::markdown::ast::Block;
+use manox_components::markdown::incremental::IncrementalParser;
 use manox_components::markdown::{HeadingMode, Markdown};
 use manox_components::turn_frame::TurnFrame;
 
@@ -89,6 +92,13 @@ fn markdown_tv(
 /// the entity's own namespace. `role` is the model display name captured at
 /// creation time so a finished bubble keeps its model label after the user
 /// switches models.
+///
+/// `parser` holds the incremental markdown state for text-bearing items
+/// (Assistant, Reasoning). It is `None` for non-text items (ToolCall, Error,
+/// etc.) — those render static text via `markdown_tv` which parses internally.
+/// `pending_parse` + `dirty` implement backpressure: when a parse is in
+/// flight, further deltas set `dirty` instead of starting a new parse, and the
+/// completion handler re-arms if dirty.
 pub struct MessageItem {
     kind: ConvItem,
     role: String,
@@ -96,15 +106,35 @@ pub struct MessageItem {
     /// Weak handle to the owning `Workspace`, used to read/toggle the shared
     /// `expanded_tasks` set from `AgentTask` cards.
     weak_workspace: WeakEntity<Workspace>,
+    /// Incremental markdown parser for streaming text bodies (Assistant,
+    /// Reasoning). `None` for non-text items.
+    parser: Option<IncrementalParser>,
+    /// In-flight background parse. While `Some`, new deltas set `dirty` rather
+    /// than spawning a competing parse.
+    pending_parse: Option<Task<()>>,
+    /// Set when a delta arrived while `pending_parse` was `Some`. The
+    /// completion handler re-arms a parse when this is true.
+    dirty: bool,
 }
 
 impl MessageItem {
     pub fn new(kind: ConvItem, role: String, id: usize, weak: WeakEntity<Workspace>) -> Self {
+        let is_text = matches!(
+            kind,
+            ConvItem::Assistant { .. } | ConvItem::Reasoning { .. }
+        );
         Self {
             kind,
             role,
             id,
             weak_workspace: weak,
+            parser: if is_text {
+                Some(IncrementalParser::new())
+            } else {
+                None
+            },
+            pending_parse: None,
+            dirty: false,
         }
     }
 
@@ -114,6 +144,70 @@ impl MessageItem {
 
     pub fn kind_mut(&mut self) -> &mut ConvItem {
         &mut self.kind
+    }
+
+    /// The parsed blocks for a text-bearing item. Returns `None` for non-text
+    /// items (they don't carry an `IncrementalParser`).
+    pub fn blocks(&self) -> Option<Arc<Vec<Block>>> {
+        self.parser.as_ref().map(|p| p.blocks())
+    }
+
+    /// Feed a text delta to the incremental parser (synchronous fast path). For
+    /// the streaming body, this updates the blocks in place on the foreground
+    /// thread; Phase 3 backpressure wraps this in a background spawn when the
+    /// body is long enough to jank the frame.
+    pub fn update_text(&mut self, full_text: &str) {
+        if let Some(parser) = &mut self.parser {
+            parser.update(full_text);
+        }
+    }
+
+    /// Finalize the parser (one full parse for consistency) without touching
+    /// the streaming/collapse flags. Used by `rebuild_from_messages` for non-
+    /// streaming text items that need their blocks populated.
+    pub fn finalize_parser(&mut self) {
+        if let Some(parser) = &mut self.parser {
+            parser.finalize();
+        }
+    }
+
+    /// Kick off a background parse if no parse is in flight; otherwise mark
+    /// dirty so the completion handler re-arms. The background task parses on a
+    /// worker thread and updates the parser state + notifies on completion.
+    pub fn schedule_parse(&mut self, full_text: String, cx: &mut gpui::Context<Self>) {
+        if self.pending_parse.is_some() {
+            self.dirty = true;
+            return;
+        }
+        self.dirty = false;
+        let Some(parser) = self.parser.as_mut() else {
+            return;
+        };
+        // Snapshot the parser state so the background task can update a clone
+        // without holding the entity lock. The result (new blocks + frozen
+        // offset) is applied on the foreground thread.
+        let mut snapshot = parser.clone();
+        let task = cx.background_spawn(async move {
+            snapshot.update(&full_text);
+            (snapshot, full_text)
+        });
+        let weak = cx.weak_entity();
+        self.pending_parse = Some(cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
+            let (updated, text) = task.await;
+            this.update(cx, |item, cx| {
+                if let Some(parser) = &mut item.parser {
+                    *parser = updated;
+                }
+                item.pending_parse = None;
+                let was_dirty = item.dirty;
+                if was_dirty {
+                    item.schedule_parse(text, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+            let _ = weak;
+        }));
     }
 
     /// Flip every streaming flag off (terminal `Stop`). Called once per turn,
@@ -144,6 +238,14 @@ impl MessageItem {
             ConvItem::AgentTask(t) => t.streaming = false,
             _ => {}
         }
+        // Final full parse to guarantee the frozen prefix + tail match a
+        // one-shot full parse exactly (the tail may have been held back by
+        // the \n\n boundary guard during streaming).
+        if let Some(parser) = &mut self.parser {
+            parser.finalize();
+        }
+        self.pending_parse = None;
+        self.dirty = false;
     }
 }
 
@@ -164,6 +266,8 @@ impl Render for MessageItem {
         let tool_ctx = self.weak_workspace.upgrade().map(|ws| ToolCallCtx {
             weak: ws.downgrade(),
         });
+        let blocks_arc = self.blocks();
+        let blocks = blocks_arc.as_ref().map(|b| -> &[Block] { &b[..] });
         centered(render_item(
             &self.kind,
             self.id,
@@ -171,6 +275,7 @@ impl Render for MessageItem {
             &theme,
             agent_ctx.as_ref(),
             tool_ctx.as_ref(),
+            blocks,
         ))
     }
 }
@@ -187,6 +292,7 @@ pub fn render_item(
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
     tool_ctx: Option<&ToolCallCtx>,
+    blocks: Option<&[Block]>,
 ) -> gpui::AnyElement {
     match item {
         ConvItem::User { text, images, meta } => {
@@ -196,7 +302,7 @@ pub fn render_item(
             text,
             streaming,
             token_usage: _,
-        } => render_assistant(text, *streaming, ix, role, theme),
+        } => render_assistant(text, *streaming, ix, role, theme, blocks),
         ConvItem::Reasoning {
             text,
             streaming,
@@ -210,6 +316,7 @@ pub fn render_item(
             *user_toggled,
             theme,
             tool_ctx,
+            blocks,
         ),
         ConvItem::ToolCall(t) => {
             if t.name == "exit_plan_mode" {
@@ -352,13 +459,18 @@ fn format_user_turn_time(timestamp: i64) -> String {
     }
 }
 
-/// Render an assistant message: role label + copy button + markdown body. `role` is the model display name (dynamic).
+/// Render an assistant message: role label + copy button + markdown body.
+/// `blocks` carries the pre-parsed blocks from the `IncrementalParser` so the
+/// renderer never re-parses — the streaming path renders formatted markdown
+/// throughout, with a cursor on the last block. `role` is the model display
+/// name (dynamic).
 pub fn render_assistant(
     text: &str,
     streaming: bool,
     ix: usize,
     role: &str,
     theme: &Theme,
+    blocks: Option<&[Block]>,
 ) -> gpui::AnyElement {
     v_flex()
         .group(format!("assistant-{ix}"))
@@ -382,26 +494,36 @@ pub fn render_assistant(
                     text.to_string(),
                 )),
         )
-        .child(render_text_body(text, streaming, ("assistant", ix), theme))
+        .child(render_text_body(
+            text,
+            streaming,
+            ("assistant", ix),
+            theme,
+            blocks,
+        ))
         .into_any_element()
 }
 
-/// Render the assistant / reasoning body. While the stream is live the
-/// renderer paints plain text + a trailing cursor — markdown re-parse and
-/// shaped text layout on every token delta was the source of the visible item
-/// overlap and the scroll-jank. When the stream ends the same `Markdown`
-/// mounts the full layout: headings, lists, and code blocks with syntax
-/// highlighting.
+/// Render the assistant / reasoning body. When `blocks` is supplied (from the
+/// `IncrementalParser`), the renderer uses them directly — no re-parse per
+/// frame. When `None` (e.g. static mounts without a parser), it falls back to
+/// `Markdown::new` which parses internally. `streaming` only controls the
+/// trailing cursor on the last block; the full markdown layout renders
+/// throughout streaming.
 fn render_text_body(
     text: &str,
     streaming: bool,
     id: impl Into<gpui::ElementId>,
     theme: &Theme,
+    blocks: Option<&[Block]>,
 ) -> gpui::AnyElement {
-    // Streaming bodies paint plain + cursor inside the renderer (no mdast
-    // re-parse per token); the full layout mounts once when the stream ends.
-    Markdown::new(id, text.to_string())
-        .theme(theme)
+    let md = match blocks {
+        Some(blocks) if !blocks.is_empty() => {
+            Markdown::blocks(id, text.to_string(), Arc::from(blocks.to_vec()))
+        }
+        _ => Markdown::new(id, text.to_string()),
+    };
+    md.theme(theme)
         .selectable(true)
         .streaming(streaming)
         .heading_mode(HeadingMode::Uniform)
@@ -411,6 +533,11 @@ fn render_text_body(
 /// Render a reasoning (thinking) block: expanded while streaming, collapsed when done, with a copy button.
 /// Clicking the header toggles collapsed state (like tool-call cards), tracked by `user_toggled` so the user's
 /// manual choice survives subsequent status transitions.
+//
+// Each arg is a distinct render input; the function is a leaf render helper,
+// not a public API. Splitting would only forward the same values through an
+// intermediate struct without reducing complexity.
+#[allow(clippy::too_many_arguments)]
 pub fn render_reasoning(
     text: &str,
     ix: usize,
@@ -419,6 +546,7 @@ pub fn render_reasoning(
     _user_toggled: bool,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    blocks: Option<&[Block]>,
 ) -> gpui::AnyElement {
     let chevron = if collapsed {
         IconName::ChevronRight
@@ -475,7 +603,7 @@ pub fn render_reasoning(
                 )),
         );
     if !collapsed {
-        let body = render_text_body(text, streaming, ("reasoning", ix), theme);
+        let body = render_text_body(text, streaming, ("reasoning", ix), theme, blocks);
         block = block.child(
             gpui::div()
                 .pl_3()
@@ -1154,7 +1282,7 @@ pub fn render_agent_task(
                     .py_2()
                     .gap_1()
                     .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                        render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx)
+                        render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx, None)
                     })),
             );
         }

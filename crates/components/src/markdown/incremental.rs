@@ -139,7 +139,7 @@ impl IncrementalParser {
         let mut frozen_count_in_tail = 0;
 
         for i in 0..tail_blocks.len() {
-            let (_, start, end) = &tail_blocks[i];
+            let (_, _, end) = &tail_blocks[i];
             let end_in_full = self.frozen_offset + *end;
 
             // The boundary candidate: start of the next block (in full doc
@@ -182,8 +182,7 @@ impl IncrementalParser {
 
         // Commit the freeze.
         self.frozen_offset = frozen_end;
-        let mut new_frozen =
-            Vec::with_capacity(self.frozen_blocks.len() + frozen_count_in_tail);
+        let mut new_frozen = Vec::with_capacity(self.frozen_blocks.len() + frozen_count_in_tail);
         new_frozen.extend((*self.frozen_blocks).clone());
         new_frozen.extend(
             tail_blocks[..frozen_count_in_tail]
@@ -253,20 +252,12 @@ impl IncrementalParser {
 /// Uses a simple byte scan rather than pulling in the `regex` crate.
 fn has_ref_def(text: &str) -> bool {
     for line in text.lines() {
-        let trimmed = line.trim_start_matches(' ');
-        if trimmed.len() < 4 {
-            // Still might be a short label; check below.
-        }
-        // `[label]:` form: starts with `[`, find `]:` after the label.
-        if let Some(rest) = strip_leading_spaces(line) {
-            if rest.starts_with('[') {
-                if let Some(close) = rest.find(']') {
-                    let after = &rest[close + 1..];
-                    if after.starts_with(':') {
-                        return true;
-                    }
-                }
-            }
+        if let Some(rest) = strip_leading_spaces(line)
+            && rest.starts_with('[')
+            && let Some(close) = rest.find(']')
+            && rest[close + 1..].starts_with(':')
+        {
+            return true;
         }
     }
     false
@@ -298,7 +289,7 @@ fn strip_leading_spaces(line: &str) -> Option<&str> {
 /// (only trim when the last line is a prefix of the fence marker, and shorter
 /// than it) is the same; the recursion into list/blockquote last-block is
 /// mirrored.
-pub fn trim_partial_closing_fences(blocks: &mut Vec<Block>) {
+pub fn trim_partial_closing_fences(blocks: &mut [Block]) {
     let Some(last) = blocks.last_mut() else {
         return;
     };
@@ -308,10 +299,10 @@ pub fn trim_partial_closing_fences(blocks: &mut Vec<Block>) {
 fn trim_last_block(block: &mut Block) {
     match block {
         Block::List { items, .. } => {
-            if let Some(item) = items.last_mut() {
-                if let Some(b) = item.blocks.last_mut() {
-                    trim_last_block(b);
-                }
+            if let Some(item) = items.last_mut()
+                && let Some(b) = item.blocks.last_mut()
+            {
+                trim_last_block(b);
             }
         }
         Block::Blockquote(inner) => {

@@ -1103,12 +1103,6 @@ impl Workspace {
         self.sync_list_count(cx);
         match outcome {
             ApplyOutcome::Remeasure(ix) => self.list_state.remeasure_items(ix..ix + 1),
-            ApplyOutcome::All => {
-                let n = self.conversation.read(cx).items().len();
-                if n > 0 {
-                    self.list_state.remeasure_items(0..n);
-                }
-            }
             // `None` touched no item; `Appended`/`RemovedTail` only changed the
             // count, which `sync_list_count` already spliced.
             ApplyOutcome::None | ApplyOutcome::Appended | ApplyOutcome::RemovedTail => {}

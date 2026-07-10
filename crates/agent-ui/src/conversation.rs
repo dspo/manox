@@ -157,8 +157,6 @@ pub enum ApplyOutcome {
     Remeasure(usize),
     /// A new item was appended at the end; splice the list count up.
     Appended,
-    /// Every item may have changed (terminal `Stop`); remeasure all.
-    All,
     /// A trailing transient item (a `Retry` badge) was popped without a
     /// replacement pushed. Splice the list count down by one at the tail.
     RemovedTail,
@@ -345,8 +343,8 @@ impl ConversationState {
                 };
                 if needs_new {
                     let id = self.items.len();
-                    self.items.push(cx.new(|_| {
-                        MessageItem::new(
+                    self.items.push(cx.new(|cx| {
+                        let mut item = MessageItem::new(
                             ConvItem::Assistant {
                                 text: delta.clone(),
                                 streaming: true,
@@ -355,17 +353,31 @@ impl ConversationState {
                             role.to_string(),
                             id,
                             weak,
-                        )
+                        );
+                        item.update_text(delta);
+                        item.schedule_parse(delta.to_string(), cx);
+                        item
                     }));
                     ApplyOutcome::Appended
                 } else {
                     let ix = self.items.len() - 1;
-                    self.items[ix].update(cx, |item, cx| {
-                        if let ConvItem::Assistant { text, .. } = item.kind_mut() {
-                            text.push_str(delta);
+                    let full_text = {
+                        let item = self.items[ix].read(cx);
+                        match item.kind() {
+                            ConvItem::Assistant { text, .. } => Some(text.clone()),
+                            _ => None,
                         }
-                        cx.notify();
-                    });
+                    };
+                    if let Some(full_text) = full_text {
+                        self.items[ix].update(cx, |item, cx| {
+                            if let ConvItem::Assistant { text, .. } = item.kind_mut() {
+                                text.push_str(delta);
+                            }
+                            item.update_text(&full_text);
+                            item.schedule_parse(full_text, cx);
+                            cx.notify();
+                        });
+                    }
                     ApplyOutcome::Remeasure(ix)
                 }
             }
@@ -382,8 +394,8 @@ impl ConversationState {
                 };
                 if needs_new {
                     let id = self.items.len();
-                    self.items.push(cx.new(|_| {
-                        MessageItem::new(
+                    self.items.push(cx.new(|cx| {
+                        let mut item = MessageItem::new(
                             ConvItem::Reasoning {
                                 text: delta.clone(),
                                 streaming: true,
@@ -393,17 +405,31 @@ impl ConversationState {
                             role.to_string(),
                             id,
                             weak,
-                        )
+                        );
+                        item.update_text(delta);
+                        item.schedule_parse(delta.to_string(), cx);
+                        item
                     }));
                     ApplyOutcome::Appended
                 } else {
                     let ix = self.items.len() - 1;
-                    self.items[ix].update(cx, |item, cx| {
-                        if let ConvItem::Reasoning { text, .. } = item.kind_mut() {
-                            text.push_str(delta);
+                    let full_text = {
+                        let item = self.items[ix].read(cx);
+                        match item.kind() {
+                            ConvItem::Reasoning { text, .. } => Some(text.clone()),
+                            _ => None,
                         }
-                        cx.notify();
-                    });
+                    };
+                    if let Some(full_text) = full_text {
+                        self.items[ix].update(cx, |item, cx| {
+                            if let ConvItem::Reasoning { text, .. } = item.kind_mut() {
+                                text.push_str(delta);
+                            }
+                            item.update_text(&full_text);
+                            item.schedule_parse(full_text, cx);
+                            cx.notify();
+                        });
+                    }
                     ApplyOutcome::Remeasure(ix)
                 }
             }
@@ -625,7 +651,15 @@ impl ConversationState {
                         }
                     }
                 }
-                ApplyOutcome::All
+                // No full reflow: the incremental parser kept blocks in sync
+                // throughout streaming, and `finalize_streaming` only does a
+                // consistency pass. Remeasure just the last item (the one whose
+                // streaming flag flipped, which is the only one whose layout
+                // changes — the cursor disappears).
+                match self.items.len() {
+                    0 => ApplyOutcome::None,
+                    n => ApplyOutcome::Remeasure(n - 1),
+                }
             }
             ThreadEvent::Error(e) => {
                 let ix = self.items.len();
@@ -758,7 +792,24 @@ impl ConversationState {
             .into_iter()
             .enumerate()
             .map(|(id, kind)| {
-                cx.new(|_| MessageItem::new(kind, role.to_string(), id, weak.clone()))
+                cx.new(|cx| {
+                    let text = match &kind {
+                        ConvItem::Assistant { text, .. } | ConvItem::Reasoning { text, .. } => {
+                            Some(text.clone())
+                        }
+                        _ => None,
+                    };
+                    let mut item = MessageItem::new(kind, role.to_string(), id, weak.clone());
+                    // For rebuilt (non-streaming) text items, do a full parse
+                    // + finalize so blocks are populated and the frozen prefix
+                    // is the entire document (no further updates expected).
+                    if let Some(text) = text {
+                        item.update_text(&text);
+                        item.finalize_parser();
+                    }
+                    let _ = cx;
+                    item
+                })
             })
             .collect();
         Self { items }
