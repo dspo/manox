@@ -12,7 +12,6 @@
 members = [
     "crates/agent",
     "crates/agent-ui",
-    "crates/composer",
     "crates/manox",
     "crates/terminal",
     "crates/terminal-ui",
@@ -30,7 +29,6 @@ publish = false
 # `foo.workspace = true` instead of relative `path = "../foo"`.
 agent = { path = "crates/agent" }
 agent-ui = { path = "crates/agent-ui" }
-composer = { path = "crates/composer" }
 manox = { path = "crates/manox" }
 terminal = { path = "crates/terminal" }
 terminal-ui = { path = "crates/terminal-ui" }

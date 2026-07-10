@@ -301,6 +301,12 @@ pub struct Thread {
     /// allowed one extra round-trip so the sub-agent can produce a coherent
     /// final message instead of ending mid-work; a second cap hit hard-stops.
     cap_summary_injected: bool,
+    /// Set by `run_plan_approval`'s Reject branch to signal `run_turn_loop`
+    /// to stop after the tool batch rather than auto-continuing into another
+    /// completion. Reject carries no new information, so a follow-up round
+    /// would be a pointless burn; the user's next message becomes the
+    /// revision direction. `plan_mode` stays on.
+    stop_after_plan_reject: bool,
     /// The running turn task; dropping it aborts the turn.
     running_turn: Option<Task<()>>,
     /// Cancellation token for the running turn. Cancelled by `cancel()` so the
@@ -523,6 +529,7 @@ impl Thread {
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
+                stop_after_plan_reject: false,
                 running_turn: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
@@ -600,6 +607,7 @@ impl Thread {
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
+                stop_after_plan_reject: false,
                 running_turn: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
@@ -681,6 +689,7 @@ impl Thread {
                 max_turns: Some(max_turns),
                 turn_count: 0,
                 cap_summary_injected: false,
+                stop_after_plan_reject: false,
                 running_turn: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
@@ -1821,6 +1830,7 @@ impl Thread {
         this.update(cx, |this, _| {
             this.turn_count = 0;
             this.cap_summary_injected = false;
+            this.stop_after_plan_reject = false;
         })?;
         loop {
             // Increment at the top so `turn_count` is 1-indexed for the
@@ -2159,6 +2169,26 @@ impl Thread {
                 capped
             })?;
             if hit_cap {
+                break;
+            }
+
+            // Plan-mode Reject: the user rejected the submitted plan and the
+            // `exit_plan_mode` result has been appended (wire stays paired).
+            // Stop the turn here — Reject carries no new information, so a
+            // follow-up completion would be a pointless burn. `plan_mode` is
+            // left on; the user's next message restarts the turn still in
+            // plan mode with the new direction. Mirrors the `max_turns` cap
+            // pattern: emit a terminal `Stop` so the workspace marks the
+            // thread idle and persists, then break.
+            let stop_after_reject = this.update(cx, |this, cx| {
+                if this.stop_after_plan_reject {
+                    this.stop_after_plan_reject = false;
+                    cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
+                    return true;
+                }
+                false
+            })?;
+            if stop_after_reject {
                 break;
             }
         }
@@ -2524,15 +2554,22 @@ impl Thread {
                 })?;
             }
             PlanApprovalResponse::Reject => {
-                let msg = "User rejected the plan. Revise it per the user's feedback and call exit_plan_mode again."
+                // Reject carries no revision text — the user's next message
+                // IS the new direction (Claude Code model). Append a paired
+                // ToolResult so the wire stays well-formed, then flag the turn
+                // loop to stop: a follow-up completion would burn a round with
+                // zero new information. `plan_mode` stays on; the next user
+                // message restarts the turn still in plan mode.
+                let msg = "User rejected this plan and ended the turn. Do not resubmit a revised plan; await the user's next message for new direction."
                     .to_string();
-                this.update(cx, |_, cx| {
+                this.update(cx, |this, cx| {
                     cx.emit(ThreadEvent::ToolCall {
                         id: id.clone(),
                         name: name.clone(),
                         title: title.clone(),
                         status: ToolCallStatus::Denied,
                     });
+                    this.stop_after_plan_reject = true;
                 })?;
                 Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
                 Self::append_tool_result(&this, tu, msg, false, cx)?;
@@ -2944,18 +2981,14 @@ impl Thread {
         // the summary). The retained tail keeps recent user prompts verbatim so
         // the active request + its tool results stay grounded; see `compact`.
         // Adjacent same-role runs that the assembly can produce
-        // (retained-user → compaction-user → …) are coalesced so Anthropic's
-        // wire, which rejects consecutive same-role messages, accepts the
-        // request.
-        //
-        // The `cache` flag marks the trailing two user/assistant messages as
-        // cache-anchor candidates. It is advisory metadata today — the actual
-        // `cache_control` breakpoints are placed by `apply_prompt_caching`
-        // against messages[-2]/messages[-1] — but keeping the flag aligned with
-        // that intent documents the contract for a future wire mapper that
-        // reads it.
+        // (retained-user → compaction-user → …, or a plan-mode Reject
+        // ending the turn on a user-role ToolResult followed by the user's
+        // next message) are coalesced so Anthropic's wire, which rejects
+        // consecutive same-role messages, accepts the request. A no-op for
+        // the normal alternation, so the cached prefix is byte-stable across
+        // turns; the coalesced run is itself stable once it's in history.
         let mapped: Vec<LanguageModelRequestMessage> =
-            match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
+            crate::compact::coalesce_same_role(match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
                 Some(c_ix) => {
                     let mut rebuilt =
                         crate::compact::retained_user_messages_before(&self.messages, c_ix);
@@ -2980,7 +3013,7 @@ impl Thread {
                             cache: false,
                         }
                     }));
-                    crate::compact::coalesce_same_role(rebuilt)
+                    rebuilt
                 }
                 None => self
                     .messages
@@ -2991,7 +3024,13 @@ impl Thread {
                         cache: false,
                     })
                     .collect(),
-            };
+            });
+        // The `cache` flag marks the trailing two user/assistant messages as
+        // cache-anchor candidates. It is advisory metadata today — the actual
+        // `cache_control` breakpoints are placed by `apply_prompt_caching`
+        // against messages[-2]/messages[-1] — but keeping the flag aligned with
+        // that intent documents the contract for a future wire mapper that
+        // reads it.
         let len = mapped.len();
         for (i, mut m) in mapped.into_iter().enumerate() {
             if i + 2 >= len {
@@ -4279,6 +4318,80 @@ mod tests {
         assert!(
             !names.contains(&"enter_plan_mode"),
             "a whitelisted turn must not advertise enter_plan_mode, got: {names:?}"
+        );
+    }
+
+    /// Regression guard: a plan-mode Reject ends the turn on a user-role
+    /// ToolResult; the user's next message is also user-role. The two adjacent
+    /// user messages must be coalesced before the request leaves
+    /// `build_completion_request`, or Anthropic's wire rejects the turn with a
+    /// 400. `coalesce_same_role` wraps the whole mapping — not just the
+    /// compaction branch — so this adjacent-user run is normalized even when no
+    /// compaction is in play.
+    #[test]
+    fn build_completion_request_coalesces_plan_reject_then_user_message() {
+        use crate::language_model::{LanguageModelToolUse, Role};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-plan-reject-coalesce", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                // Assistant submits a plan via exit_plan_mode.
+                t.messages.push(Message::assistant(vec![MessageContent::ToolUse(
+                    LanguageModelToolUse {
+                        id: "tu_plan".to_string(),
+                        name: Arc::from("exit_plan_mode"),
+                        raw_input: "{}".to_string(),
+                        input: json!({ "plan": "# plan body" }),
+                        is_input_complete: true,
+                        thought_signature: None,
+                    },
+                )]));
+                // Reject: a user-role ToolResult, as `append_tool_result` emits
+                // on the Reject branch.
+                t.messages.push(Message::user_with_content(vec![
+                    MessageContent::ToolResult(LanguageModelToolResult {
+                        tool_use_id: "tu_plan".to_string(),
+                        tool_name: Arc::from("exit_plan_mode"),
+                        is_error: false,
+                        content: "User rejected this plan and ended the turn."
+                            .to_string(),
+                    }),
+                ]));
+                // User's next message carrying new direction — also user role.
+                t.insert_user_message("Focus on the i18n layer instead.".to_string(), cx);
+            });
+        });
+
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        // Drop the leading system message; the wire contract concerns the
+        // user/assistant alternation in the conversation proper.
+        let convo: Vec<_> = req
+            .messages
+            .into_iter()
+            .filter(|m| m.role != Role::System)
+            .collect();
+        for pair in convo.windows(2) {
+            assert_ne!(
+                pair[0].role,
+                pair[1].role,
+                "adjacent same-role messages would be rejected by the wire: {convo:?}"
+            );
+        }
+        // The reject ToolResult and the new-direction text must land in one
+        // coalesced user message, not two.
+        let user_count = convo.iter().filter(|m| m.role == Role::User).count();
+        assert_eq!(
+            user_count, 1,
+            "adjacent user messages were not coalesced into one"
         );
     }
 }

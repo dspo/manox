@@ -100,12 +100,26 @@ pub fn spawn_dispatcher(
 async fn handle_request(req: McpRequest, workspace: &Entity<Workspace>, cx: &mut AsyncApp) {
     match req {
         McpRequest::NewThread { reply } => {
-            cx.update(|cx| workspace.update(cx, |ws, cx| ws.harness_new_thread(cx)));
+            cx.update(|cx| {
+                if let Some(handle) = crate::dispatch::window_global() {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        workspace.update(cx, |ws, cx| ws.harness_new_thread(window, cx));
+                    });
+                }
+            });
             let _ = reply.send(Ok(json!({})));
         }
         McpRequest::OpenThread { id, reply } => {
-            let opened =
-                cx.update(|cx| workspace.update(cx, |ws, cx| ws.harness_open_thread(id, cx)));
+            let opened = cx.update(|cx| {
+                let Some(handle) = crate::dispatch::window_global() else {
+                    return false;
+                };
+                handle
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |ws, cx| ws.harness_open_thread(id, window, cx))
+                    })
+                    .unwrap_or(false)
+            });
             let _ = reply.send(Ok(json!({ "opened": opened })));
         }
         McpRequest::ListThreads { reply } => {
