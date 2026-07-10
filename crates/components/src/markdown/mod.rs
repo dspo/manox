@@ -14,6 +14,7 @@
 //! renderer never constructs a `TextStyle`.
 
 pub mod ast;
+pub mod incremental;
 pub mod rich_text;
 pub mod theme;
 
@@ -49,7 +50,12 @@ use crate::markdown::theme::MdStyles;
 // highlight theme pointer is part of the key so a theme swap invalidates the
 // cache automatically; manox has no runtime theme switch today, so in
 // practice the key reduces to `(lang, content_hash)`.
-type HighlightCache = HashMap<(String, u64, usize), Vec<(Range<usize>, HighlightStyle)>>;
+//
+// `transient` marks an entry written while rendering a still-streaming tail
+// block — its content is incomplete and will change on the next delta, so the
+// L2 cache write is skipped to avoid polluting the cache with throwaway
+// highlight data.
+type HighlightCache = HashMap<(String, u64, usize), (Vec<(Range<usize>, HighlightStyle)>, bool)>;
 
 thread_local! {
     static CODE_HL_CACHE: RefCell<HighlightCache> = RefCell::new(HashMap::new());
@@ -59,6 +65,11 @@ thread_local! {
 pub struct Markdown {
     id: ElementId,
     text: SharedString,
+    /// Pre-parsed blocks. When set, `into_element` renders these directly;
+    /// otherwise it falls back to `ast::parse(&text)`. The streaming path
+    /// (caller supplies blocks from an `IncrementalParser`) and the static
+    /// path (editor preview, `Markdown::new`) share the same render pipeline.
+    blocks: Option<Arc<Vec<Block>>>,
     styles: Option<MdStyles>,
     scrollable: bool,
     streaming: bool,
@@ -70,6 +81,28 @@ impl Markdown {
         Self {
             id: id.into(),
             text: text.into(),
+            blocks: None,
+            styles: None,
+            scrollable: false,
+            streaming: false,
+            heading_mode: HeadingMode::default(),
+        }
+    }
+
+    /// Render already-parsed blocks. The caller owns parsing (full or
+    /// incremental); `text` is retained only for the streaming cursor and the
+    /// copy-button payload. Streaming bodies pass blocks from an
+    /// `IncrementalParser` so completed blocks render as formatted markdown
+    /// while the tail still grows.
+    pub fn blocks(
+        id: impl Into<ElementId>,
+        text: impl Into<SharedString>,
+        blocks: Arc<Vec<Block>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            text: text.into(),
+            blocks: Some(blocks),
             styles: None,
             scrollable: false,
             streaming: false,
@@ -109,8 +142,10 @@ impl Markdown {
         self
     }
 
-    /// Mark the document as mid-stream: the body renders plain + a trailing
-    /// cursor, and the full markdown layout mounts once when the stream ends.
+    /// Mark the document as mid-stream: a trailing cursor `▌` is appended to
+    /// the last block's text. The full markdown layout is rendered throughout
+    /// streaming (from caller-supplied blocks or a fallback `ast::parse`);
+    /// `streaming` no longer gates a plain-text fast-path.
     pub fn streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
         self
@@ -135,21 +170,14 @@ impl IntoElement for Markdown {
             return div().id(id).into_any_element();
         };
 
-        if self.streaming {
-            // Plain text + cursor while streaming — no mdast re-parse per token
-            // delta, so the body never reflows mid-stream.
-            let shown = format!("{}▌", self.text);
-            return div()
-                .id(id)
-                .w_full()
-                .min_w_0()
-                .overflow_hidden()
-                .text_sm()
-                .child(SharedString::from(shown))
-                .into_any_element();
-        }
-
-        let blocks = ast::parse(&self.text);
+        // Blocks come from the caller (IncrementalParser / pre-parsed) when
+        // available; otherwise parse `text` here. The streaming path no longer
+        // bypasses parsing — formatted markdown renders throughout streaming,
+        // and `streaming` only adds the trailing cursor to the last block.
+        let blocks_owned: Vec<Block> = match self.blocks {
+            Some(b) => (*b).clone(),
+            None => ast::parse(&self.text),
+        };
         // Root carries `text_sm` so the document is self-contained: every
         // block that does not override the size itself (paragraph, list item
         // bodies) inherits it, rather than depending on the caller's ancestor.
@@ -168,18 +196,29 @@ impl IntoElement for Markdown {
         if self.scrollable {
             col = col.h_full().overflow_y_scroll();
         }
-        for (i, block) in blocks.into_iter().enumerate() {
-            col = col.child(render_block(block, &styles, self.heading_mode, i));
+        let streaming = self.streaming;
+        let block_count = blocks_owned.len();
+        for (i, block) in blocks_owned.into_iter().enumerate() {
+            let is_last = streaming && i == block_count.saturating_sub(1);
+            col = col.child(render_block(block, &styles, self.heading_mode, i, is_last));
         }
         col.into_any_element()
     }
 }
 
-fn render_block(block: Block, styles: &MdStyles, mode: HeadingMode, idx: usize) -> AnyElement {
+fn render_block(
+    block: Block,
+    styles: &MdStyles,
+    mode: HeadingMode,
+    idx: usize,
+    streaming_tail: bool,
+) -> AnyElement {
     match block {
-        Block::Paragraph(runs) => paragraph(&runs, styles),
+        Block::Paragraph(runs) => paragraph(&runs, styles, streaming_tail),
         Block::Heading { runs, depth } => heading(&runs, mode, depth, styles),
-        Block::Code { lang, value } => code_block(&value, lang.as_deref(), styles, idx),
+        Block::Code { lang, value } => {
+            code_block(&value, lang.as_deref(), styles, idx, streaming_tail)
+        }
         Block::Diff { value } => diff_block(&value, styles, idx),
         Block::Conflict { value } => conflict_block(&value, styles, idx),
         Block::Blockquote(inner) => blockquote(inner, styles, mode),
@@ -207,14 +246,23 @@ fn code_spans(runs: &InlineRuns, styles: &MdStyles) -> Vec<CodeSpan> {
         .collect()
 }
 
-fn paragraph(runs: &InlineRuns, styles: &MdStyles) -> AnyElement {
+/// Render a paragraph. When `streaming_tail` is true (the last block of a
+/// mid-stream document) the cursor `▌` is appended to the paragraph text so
+/// it lands at the end of the visible content. The cursor is plain text rather
+/// than a separate element so it wraps with the paragraph flow.
+fn paragraph(runs: &InlineRuns, styles: &MdStyles, streaming_tail: bool) -> AnyElement {
+    let text = if streaming_tail {
+        format!("{}▌", runs.text)
+    } else {
+        runs.text.clone()
+    };
     div()
         .w_full()
         .min_w_0()
         .overflow_hidden()
         .text_sm()
         .child(
-            RichText::anonymous(runs.text.clone())
+            RichText::anonymous(text)
                 .highlights(runs.highlights.clone())
                 .code_spans(code_spans(runs, styles)),
         )
@@ -246,8 +294,6 @@ struct HeadingSpec {
 
 #[derive(Clone, Copy)]
 enum HeadingSize {
-    Xl,
-    Lg,
     Base,
     Sm,
 }
@@ -255,8 +301,6 @@ enum HeadingSize {
 impl HeadingSize {
     fn apply<S: Styled>(self, s: S) -> S {
         match self {
-            Self::Xl => s.text_xl(),
-            Self::Lg => s.text_lg(),
             Self::Base => s.text_base(),
             Self::Sm => s.text_sm(),
         }
@@ -272,17 +316,20 @@ impl HeadingMode {
     }
 }
 
-/// `Scaled`: H1–H3 step the font down from extra-large to base; H4+ fall back
-/// to body size. Every level is bold — weight does not discriminate depth.
+/// `Scaled`: H1/H2 stay at base size (16px) and discriminate by weight — H1
+/// gets `Black` (900), H2 gets `Bold` (700). H3 is base + bold; H4+ collapse to
+/// small (14px) + bold. The six-level ladder compresses to three distinguishable
+/// levels without any line growing taller than the body, matching the app-wide
+/// 3-font-size discipline.
 fn scaled_heading(depth: u8) -> HeadingSpec {
-    let size = match depth {
-        1 => HeadingSize::Xl,
-        2 => HeadingSize::Lg,
-        3 => HeadingSize::Base,
-        _ => HeadingSize::Sm,
+    let (weight, size) = match depth {
+        1 => (FontWeight::BLACK, HeadingSize::Base),
+        2 => (FontWeight::BOLD, HeadingSize::Base),
+        3 => (FontWeight::BOLD, HeadingSize::Base),
+        _ => (FontWeight::BOLD, HeadingSize::Sm),
     };
     HeadingSpec {
-        weight: FontWeight::BOLD,
+        weight,
         italic: false,
         underline: false,
         space_after: false,
@@ -339,12 +386,18 @@ fn heading(runs: &InlineRuns, mode: HeadingMode, depth: u8, styles: &MdStyles) -
 /// highlighting via `SyntaxHighlighter`. The run is a selectable `RichText`
 /// (drag-select + Cmd/Ctrl+C copy); a hover-revealed button copies the whole
 /// block for one-click capture.
-fn code_block(value: &str, lang: Option<&str>, styles: &MdStyles, idx: usize) -> AnyElement {
+fn code_block(
+    value: &str,
+    lang: Option<&str>,
+    styles: &MdStyles,
+    idx: usize,
+    transient: bool,
+) -> AnyElement {
     // Fenced-code values carry a trailing `\n` (the closing fence sits on its
     // own line); strip it so the gutter count and the painted run agree —
     // `split('\n')` on `"a\n"` would otherwise count a phantom empty line.
     let value = value.trim_end_matches('\n');
-    let highlights = code_highlights(value, lang, styles);
+    let highlights = code_highlights(value, lang, styles, transient);
     let line_count = value.split('\n').count().max(1);
     let gutter: String = (1..=line_count).map(|n| format!("{n:>3}\n")).collect();
     let gutter = gutter.trim_end_matches('\n');
@@ -415,10 +468,15 @@ fn copy_button(idx: usize, text: String) -> Button {
 /// long conversation from re-highlighting every block on each streaming
 /// delta. Lives on the render thread — `SyntaxHighlighter` owns a thread-local
 /// `Parser` and is not `Send`.
+///
+/// `transient` marks a still-growing tail block: its content will change on
+/// the next delta, so the result is computed fresh but not written to the L2
+/// cache, avoiding cache pollution with throwaway highlight data.
 fn code_highlights(
     value: &str,
     lang: Option<&str>,
     styles: &MdStyles,
+    transient: bool,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
     let lang = lang.unwrap_or("text").to_string();
     let theme_ptr = Arc::as_ptr(&styles.highlight_theme) as usize;
@@ -426,7 +484,7 @@ fn code_highlights(
     value.hash(&mut hasher);
     let content_hash = hasher.finish();
     let key = (lang.clone(), content_hash, theme_ptr);
-    if let Some(hit) = CODE_HL_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+    if let Some((hit, _)) = CODE_HL_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return hit;
     }
     let rope = Rope::from_str(value);
@@ -435,7 +493,9 @@ fn code_highlights(
     let result = hl
         .styles(&(0..value.len()), styles.highlight_theme.as_ref())
         .clone();
-    CODE_HL_CACHE.with(|c| c.borrow_mut().insert(key, result.clone()));
+    if !transient {
+        CODE_HL_CACHE.with(|c| c.borrow_mut().insert(key, (result.clone(), false)));
+    }
     result
 }
 
@@ -670,7 +730,7 @@ fn blockquote(inner: Vec<Block>, styles: &MdStyles, mode: HeadingMode) -> AnyEle
         .pl_3()
         .gap_2();
     for (i, block) in inner.into_iter().enumerate() {
-        col = col.child(render_block(block, styles, mode, i));
+        col = col.child(render_block(block, styles, mode, i, false));
     }
     col.into_any_element()
 }
@@ -744,7 +804,7 @@ fn list_block(
     for (i, item) in items.into_iter().enumerate() {
         let mut item_col = v_flex().flex_1().min_w_0().gap_1();
         for (j, b) in item.blocks.into_iter().enumerate() {
-            item_col = item_col.child(render_block(b, styles, mode, j));
+            item_col = item_col.child(render_block(b, styles, mode, j, false));
         }
         col = col.child(
             h_flex()
@@ -812,15 +872,20 @@ mod tests {
     }
 
     #[test]
-    fn scaled_heading_steps_font_down_with_depth() {
-        assert!(matches!(HeadingMode::Scaled.spec(1).size, HeadingSize::Xl));
-        assert!(matches!(HeadingMode::Scaled.spec(2).size, HeadingSize::Lg));
-        assert!(matches!(
-            HeadingMode::Scaled.spec(3).size,
-            HeadingSize::Base
-        ));
-        // H4+ fall back to body size; every level is bold, none carries
-        // space-after (the gap-based layout already separates blocks).
+    fn scaled_heading_converges_to_three_sizes() {
+        // D3 convergence: H1=base+Black, H2/H3=base+Bold, H4+=small+Bold.
+        let h1 = HeadingMode::Scaled.spec(1);
+        assert!(matches!(h1.size, HeadingSize::Base));
+        assert_eq!(h1.weight, FontWeight::BLACK);
+
+        let h2 = HeadingMode::Scaled.spec(2);
+        assert!(matches!(h2.size, HeadingSize::Base));
+        assert_eq!(h2.weight, FontWeight::BOLD);
+
+        let h3 = HeadingMode::Scaled.spec(3);
+        assert!(matches!(h3.size, HeadingSize::Base));
+        assert_eq!(h3.weight, FontWeight::BOLD);
+
         for depth in 4..=6 {
             let h = HeadingMode::Scaled.spec(depth);
             assert!(matches!(h.size, HeadingSize::Sm), "depth {depth}");

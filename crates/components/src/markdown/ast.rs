@@ -17,7 +17,7 @@ use markdown::{ParseOptions, to_mdast};
 /// `code_ranges` marks inline-code segments that get a rounded wash behind the
 /// glyphs — the wash is painted by the renderer, not carried as a run
 /// `background_color`, so it can be rounded and caller-customized.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct InlineRuns {
     pub text: String,
     pub highlights: Vec<(Range<usize>, HighlightStyle)>,
@@ -26,7 +26,7 @@ pub struct InlineRuns {
 
 /// Column alignment for table cells. The manox-owned mirror of mdast's
 /// `AlignKind` so the renderer does not depend on the `markdown` crate.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TableAlign {
     #[default]
     None,
@@ -37,14 +37,14 @@ pub enum TableAlign {
 
 /// A list item: its `checked` flag carries GFM task-list state (`[ ]`/`[x]`),
 /// `None` for plain bullets/numbers.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ListItem {
     pub checked: Option<bool>,
     pub blocks: Vec<Block>,
 }
 
 /// A block-level node in the manox-owned document model.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Block {
     Paragraph(InlineRuns),
     Heading {
@@ -90,7 +90,42 @@ pub fn parse(src: &str) -> Vec<Block> {
     }
 }
 
-fn block_of(node: &Node) -> Option<Block> {
+/// Parse a *tail* slice of a streaming document independently. The offsets are
+/// relative to the tail (start at 0), not the full document — the incremental
+/// parser stitches frozen prefix blocks + tail blocks together. Returns each
+/// block alongside the mdast `position` start and end byte offsets of its
+/// top-level node, so the incrementer can locate the `\n\n` separator *between*
+/// blocks to advance the frozen boundary. Positions are populated by default in
+/// markdown-rs; note that mdast `position` does not include trailing inter-block
+/// whitespace, so the `\n\n` separator lives in the gap between one block's
+/// `end` and the next block's `start`.
+pub(crate) fn parse_tail(src: &str) -> Vec<(Block, usize, usize)> {
+    let opts = ParseOptions::gfm();
+    match to_mdast(src, &opts) {
+        Ok(Node::Root(root)) => root
+            .children
+            .iter()
+            .filter_map(|node| {
+                let pos = node.position();
+                let start = pos.map(|p| p.start.offset).unwrap_or(0);
+                let end = pos.map(|p| p.end.offset).unwrap_or(src.len());
+                block_of(node).map(|b| (b, start, end))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a block is a `List`. The freeze guard refuses to advance the frozen
+/// boundary past a list — a loose list can be extended by a following
+/// same-marker item across a blank line, and markdown-rs merges them into one
+/// renumbered list. Freezing at that cut would keep the lists separate,
+/// desyncing incremental from full parse.
+pub(crate) fn is_list_block(b: &Block) -> bool {
+    matches!(b, Block::List { .. })
+}
+
+pub(crate) fn block_of(node: &Node) -> Option<Block> {
     match node {
         Node::Paragraph(p) => Some(Block::Paragraph(inline_of(&p.children))),
         Node::Heading(h) => Some(Block::Heading {
