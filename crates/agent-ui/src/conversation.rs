@@ -361,23 +361,24 @@ impl ConversationState {
                     ApplyOutcome::Appended
                 } else {
                     let ix = self.items.len() - 1;
-                    let full_text = {
-                        let item = self.items[ix].read(cx);
-                        match item.kind() {
-                            ConvItem::Assistant { text, .. } => Some(text.clone()),
-                            _ => None,
-                        }
-                    };
-                    if let Some(full_text) = full_text {
-                        self.items[ix].update(cx, |item, cx| {
-                            if let ConvItem::Assistant { text, .. } = item.kind_mut() {
+                    self.items[ix].update(cx, |item, cx| {
+                        // Snapshot the text *after* appending the delta so the
+                        // parser and the `text` field (the copy-button source)
+                        // stay in lockstep — feeding a pre-append snapshot here
+                        // would render the body one delta behind forever, and
+                        // `finalize()` on stream stop would re-parse that stale
+                        // text, permanently dropping the last delta.
+                        let full_text = match item.kind_mut() {
+                            ConvItem::Assistant { text, .. } => {
                                 text.push_str(delta);
+                                text.clone()
                             }
-                            item.update_text(&full_text);
-                            item.schedule_parse(full_text, cx);
-                            cx.notify();
-                        });
-                    }
+                            _ => return,
+                        };
+                        item.update_text(&full_text);
+                        item.schedule_parse(full_text, cx);
+                        cx.notify();
+                    });
                     ApplyOutcome::Remeasure(ix)
                 }
             }
@@ -413,23 +414,20 @@ impl ConversationState {
                     ApplyOutcome::Appended
                 } else {
                     let ix = self.items.len() - 1;
-                    let full_text = {
-                        let item = self.items[ix].read(cx);
-                        match item.kind() {
-                            ConvItem::Reasoning { text, .. } => Some(text.clone()),
-                            _ => None,
-                        }
-                    };
-                    if let Some(full_text) = full_text {
-                        self.items[ix].update(cx, |item, cx| {
-                            if let ConvItem::Reasoning { text, .. } = item.kind_mut() {
+                    self.items[ix].update(cx, |item, cx| {
+                        // Snapshot after appending — see the `AgentText` branch
+                        // for why a pre-append snapshot drops the last delta.
+                        let full_text = match item.kind_mut() {
+                            ConvItem::Reasoning { text, .. } => {
                                 text.push_str(delta);
+                                text.clone()
                             }
-                            item.update_text(&full_text);
-                            item.schedule_parse(full_text, cx);
-                            cx.notify();
-                        });
-                    }
+                            _ => return,
+                        };
+                        item.update_text(&full_text);
+                        item.schedule_parse(full_text, cx);
+                        cx.notify();
+                    });
                     ApplyOutcome::Remeasure(ix)
                 }
             }

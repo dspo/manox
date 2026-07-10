@@ -195,19 +195,36 @@ impl MessageItem {
         let mut snapshot = parser.clone();
         let task = cx.background_spawn(async move {
             snapshot.update(&full_text);
-            (snapshot, full_text)
+            snapshot
         });
         let weak = cx.weak_entity();
         self.pending_parse = Some(cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
-            let (updated, text) = task.await;
+            let updated = task.await;
             this.update(cx, |item, cx| {
-                if let Some(parser) = &mut item.parser {
+                // The authoritative text is the item's `text` field, which the
+                // append branch mutates *before* re-arming. The background
+                // snapshot may lag it (deltas landed during the parse), so only
+                // adopt the snapshot when it matches the authoritative text —
+                // overwriting with a stale snapshot would regress the rendered
+                // body and, after stream stop, permanently drop the last
+                // delta. When the snapshot lagged, the foreground `update_text`
+                // already holds the authoritative text, so leaving the parser
+                // is correct; the dirty re-arm catches up.
+                let authoritative = match item.kind() {
+                    ConvItem::Assistant { text, .. } | ConvItem::Reasoning { text, .. } => {
+                        text.clone()
+                    }
+                    _ => return,
+                };
+                if let Some(parser) = &mut item.parser
+                    && updated.text() == authoritative
+                {
                     *parser = updated;
                 }
                 item.pending_parse = None;
-                let was_dirty = item.dirty;
-                if was_dirty {
-                    item.schedule_parse(text, cx);
+                if item.dirty {
+                    item.dirty = false;
+                    item.schedule_parse(authoritative, cx);
                 }
                 cx.notify();
             })
