@@ -246,8 +246,10 @@ impl SandboxPolicy {
 
 /// Canonicalize a path that may not yet exist: resolve the longest existing
 /// ancestor and rejoin the remaining tail. Falls back to the raw path when no
-/// ancestor exists.
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
+/// ancestor exists. Shared with the read policy so FS read-side and write-side
+/// path classification use the same canonical baseline (symlink resolution,
+/// `/private/var` on macOS).
+pub(crate) fn canonicalize_best_effort(path: &Path) -> PathBuf {
     if path.exists() {
         return path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     }
@@ -283,12 +285,87 @@ pub fn is_available() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// Conservative heuristic for bash commands that drive other macOS applications
+/// via Apple Events — `osascript` (the AppleScript bridge), the `tell
+/// application` AppleScript phrase, and `open -a <App>` (launch by name).
+///
+/// These escape the FS/network confinement seatbelt enforces: seatbelt's
+/// `(allow default)` base admits Mach IPC, so a sandboxed `osascript` can still
+/// reach other apps. They are therefore gated on user approval in
+/// [`BashTool::requires_approval`](crate::tools::bash::BashTool) regardless of
+/// the `unsandboxed` flag, and audited in hook execution. The match is a
+/// substring/word check, not a shell parser — it errs toward flagging (an extra
+/// approval prompt) over silently letting cross-app automation through. A model
+/// determined to evade via aliasing cannot be fully stopped at the string layer;
+/// the entitlement removal (no `automation.apple-events` + no usage
+/// description) is the hard OS-level backstop.
+pub fn is_cross_app_automation(command: &str) -> bool {
+    // `osascript` is the AppleScript / OSA bridge binary; matching the file
+    // name of any whitespace token catches `osascript`, `/usr/bin/osascript`,
+    // and `./osascript` while avoiding a bare substring false positive on a
+    // word that merely contains the letters (e.g. a path segment `osascripts`).
+    if command
+        .split_whitespace()
+        .any(|tok| Path::new(tok).file_name().is_some_and(|n| n == "osascript"))
+    {
+        return true;
+    }
+    let lower = command.to_ascii_lowercase();
+    // Canonical AppleScript phrase; covers `tell application "Finder" to ...`.
+    if lower.contains("tell application") {
+        return true;
+    }
+    // `open -a <App>` launches a specific application by name.
+    if lower.contains("open -a") {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn policy() -> SandboxPolicy {
         SandboxPolicy::for_project(Path::new("/tmp/manox-sandbox-test"))
+    }
+
+    #[test]
+    fn is_cross_app_automation_flags_osascript() {
+        assert!(is_cross_app_automation(
+            "osascript -e 'tell application \"Finder\" to quit'"
+        ));
+        assert!(is_cross_app_automation("/usr/bin/osascript foo.scpt"));
+    }
+
+    #[test]
+    fn is_cross_app_automation_flags_tell_application() {
+        assert!(is_cross_app_automation(
+            "echo 'tell application \"Music\" to play' | osascript"
+        ));
+    }
+
+    #[test]
+    fn is_cross_app_automation_flags_open_a() {
+        assert!(is_cross_app_automation("open -a 'Visual Studio Code' ."));
+    }
+
+    #[test]
+    fn is_cross_app_automation_ignores_ordinary_commands() {
+        assert!(!is_cross_app_automation("echo hi"));
+        // `open file.txt` (no `-a`) opens via the default handler, not a named app.
+        assert!(!is_cross_app_automation("open file.txt"));
+        assert!(!is_cross_app_automation("cat tell.txt"));
+        assert!(!is_cross_app_automation("cargo build"));
+    }
+
+    #[test]
+    fn is_cross_app_automation_conservatively_flags_tell_application_substring() {
+        // A grep for the literal string "tell application" contains the phrase
+        // and is flagged — a deliberate false positive: the heuristic errs
+        // toward an extra approval prompt over silently admitting cross-app
+        // automation.
+        assert!(is_cross_app_automation("grep -r tell application src"));
     }
 
     #[test]

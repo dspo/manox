@@ -133,9 +133,6 @@ cat > "${app_path}/Contents/Info.plist" <<PLIST
     <true/>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright 2024-2026 DSPo. All rights reserved.</string>
-
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Manox agent tools need to send Apple Events to run shell commands and interact with other applications.</string>
 </dict>
 </plist>
 PLIST

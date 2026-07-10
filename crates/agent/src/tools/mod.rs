@@ -203,7 +203,10 @@ pub(crate) fn base_tools_with_policy(
     sandbox: crate::sandbox::SandboxPolicy,
 ) -> Vec<AnyAgentTool> {
     vec![
-        Arc::new(read_file::ReadFileTool { cwd: cwd.clone() }) as AnyAgentTool,
+        Arc::new(read_file::ReadFileTool {
+            cwd: cwd.clone(),
+            read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
+        }) as AnyAgentTool,
         Arc::new(write_file::WriteFileTool {
             cwd: cwd.clone(),
             sandbox: sandbox.clone(),
@@ -212,10 +215,19 @@ pub(crate) fn base_tools_with_policy(
             cwd: cwd.clone(),
             sandbox: sandbox.clone(),
         }),
-        Arc::new(list_directory::ListDirectoryTool { cwd: cwd.clone() }),
+        Arc::new(list_directory::ListDirectoryTool {
+            cwd: cwd.clone(),
+            read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
+        }),
         Arc::new(bash::BashTool::new(cwd.as_ref().clone(), sandbox.clone())),
-        Arc::new(grep::GrepTool { cwd: cwd.clone() }),
-        Arc::new(glob::GlobTool { cwd: cwd.clone() }),
+        Arc::new(grep::GrepTool {
+            cwd: cwd.clone(),
+            read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
+        }),
+        Arc::new(glob::GlobTool {
+            cwd: cwd.clone(),
+            read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
+        }),
         Arc::new(ask_user::AskUserQuestionTool),
         Arc::new(skill::SkillTool),
     ]

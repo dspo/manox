@@ -11,12 +11,14 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::read_policy::ReadPolicy;
 use crate::tool::AgentTool;
 
 use super::{resolve_path, schema};
 
 pub struct GlobTool {
     pub(crate) cwd: Arc<PathBuf>,
+    pub(crate) read_policy: ReadPolicy,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -68,18 +70,27 @@ impl AgentTool for GlobTool {
             return cx.background_spawn(async { Err("input parse failed".to_string()) });
         };
         let cwd = self.cwd.as_ref().clone();
+        let read_policy = self.read_policy.clone();
         cx.background_spawn(async move {
             let root = parsed
                 .path
                 .map(|p| resolve_path(&p, &cwd))
                 .unwrap_or_else(|| cwd.clone());
+            // Deny a glob rooted in a sensitive subtree outright; prune such
+            // subtrees during descent when rooted at a parent (e.g. `$HOME`).
+            read_policy.check(&root)?;
+            let prune_roots: Vec<PathBuf> = read_policy.denied_roots().to_vec();
+            // Canonicalize the walk root so emitted paths share the prefix of
+            // the canonicalized `prune_roots`; a symlinked root would otherwise
+            // make `starts_with` miss sensitive subtrees.
+            let walk_root = crate::sandbox::canonicalize_best_effort(&root);
             let matcher = GlobSetBuilder::new()
                 .add(Glob::new(&parsed.pattern).map_err(|e| format!("glob invalid pattern: {e}"))?)
                 .build()
                 .map_err(|e| format!("glob build failed: {e}"))?;
             let limit = parsed.limit.unwrap_or(100);
             // Default flags enforce the strongest filtering; each toggle relaxes one axis.
-            let mut builder = WalkBuilder::new(&root);
+            let mut builder = WalkBuilder::new(&walk_root);
             builder
                 .hidden(!parsed.include_hidden)
                 .ignore(!parsed.no_ignore)
@@ -87,11 +98,22 @@ impl AgentTool for GlobTool {
                 .git_global(!parsed.no_ignore)
                 .git_exclude(!parsed.no_ignore)
                 .parents(!parsed.no_ignore);
+            if !prune_roots.is_empty() {
+                builder.filter_entry(move |entry| {
+                    let p = entry.path();
+                    !prune_roots.iter().any(|r| p.starts_with(r))
+                });
+            }
             let mut out: Vec<String> = Vec::new();
             let mut truncated = false;
             for entry in builder.build().by_ref() {
                 let Ok(e) = entry else { continue };
                 let path = e.path();
+                // Skip secret-named files in otherwise-permitted subtrees; the
+                // prune filter only drops whole denied directories.
+                if crate::read_policy::is_likely_secret_file(path) {
+                    continue;
+                }
                 let is_dir = path.is_dir();
                 if is_dir {
                     if !parsed.include_dirs {
@@ -101,7 +123,7 @@ impl AgentTool for GlobTool {
                     // Skip symlinks-to-nonfiles and special nodes.
                     continue;
                 }
-                let rel = path.strip_prefix(&root).unwrap_or(path);
+                let rel = path.strip_prefix(&walk_root).unwrap_or(path);
                 if matcher.is_match(rel) {
                     out.push(rel.display().to_string());
                     if out.len() >= limit {

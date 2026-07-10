@@ -188,6 +188,18 @@ async fn run_hook(
     project_cwd: Option<&str>,
     timeout_secs: u64,
 ) {
+    // Hooks are fire-and-forget outside the tool approval loop (fail-open by
+    // design). Cross-app automation commands would otherwise silently broker
+    // Apple Events from a plugin; flag them so the attempt is at least
+    // auditable in the trace log, even though it is not blocked here.
+    if crate::sandbox::is_cross_app_automation(command) {
+        tracing::warn!(
+            plugin = plugin_name,
+            command = command,
+            "hook runs cross-app automation command (osascript / AppleScript / `open -a`) \
+             — not approval-gated; auditing only",
+        );
+    }
     let mut cmd = tokio::process::Command::new("/bin/sh");
     cmd.arg("-c").arg(command);
     cmd.env("CLAUDE_PLUGIN_ROOT", plugin_root);

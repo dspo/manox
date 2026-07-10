@@ -12,12 +12,14 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::read_policy::ReadPolicy;
 use crate::tool::AgentTool;
 
 use super::{resolve_path, schema};
 
 pub struct GrepTool {
     pub(crate) cwd: Arc<PathBuf>,
+    pub(crate) read_policy: ReadPolicy,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -59,7 +61,10 @@ impl AgentTool for GrepTool {
             .path
             .map(|p| resolve_path(&p, &self.cwd))
             .unwrap_or_else(|| self.cwd.as_ref().clone());
-        cx.background_spawn(async move { run_grep(&parsed.pattern, &base, parsed.glob.as_deref()) })
+        let read_policy = self.read_policy.clone();
+        cx.background_spawn(async move {
+            run_grep(&parsed.pattern, &base, parsed.glob.as_deref(), &read_policy)
+        })
     }
 }
 
@@ -85,17 +90,42 @@ impl Sink for GrepSink {
     }
 }
 
-fn run_grep(pattern: &str, root: &Path, glob: Option<&str>) -> Result<String, String> {
+fn run_grep(
+    pattern: &str,
+    root: &Path,
+    glob: Option<&str>,
+    read_policy: &ReadPolicy,
+) -> Result<String, String> {
+    // Deny a search rooted in a sensitive subtree outright.
+    read_policy.check(root)?;
+    // Canonicalized denied roots for walk pruning — a search rooted at a
+    // parent (e.g. `$HOME`) must not descend into `~/.ssh` or `~/Library`.
+    let prune_roots: Vec<PathBuf> = read_policy.denied_roots().to_vec();
+    // Canonicalize the walk root so emitted paths share the prefix of the
+    // canonicalized `prune_roots`. A symlinked root (e.g. `/var` →
+    // `/private/var`) would otherwise make `starts_with` miss sensitive
+    // subtrees and let the walker descend into them.
+    let walk_root = crate::sandbox::canonicalize_best_effort(root);
+
     let matcher = RegexMatcherBuilder::new()
         .build(pattern)
         .map_err(|e| format!("grep invalid regex: {e}"))?;
 
-    let mut walker = WalkBuilder::new(root);
+    let mut walker = WalkBuilder::new(&walk_root);
     walker.standard_filters(true);
     walker.hidden(false);
+    // Prune denied subtrees during descent. Returning false skips the entry and
+    // its children; the root itself was already checked above, so this catches
+    // sensitive dirs nested under the search root.
+    if !prune_roots.is_empty() {
+        walker.filter_entry(move |entry| {
+            let p = entry.path();
+            !prune_roots.iter().any(|r| p.starts_with(r))
+        });
+    }
 
     if let Some(g) = glob {
-        let overrides = OverrideBuilder::new(root)
+        let overrides = OverrideBuilder::new(&walk_root)
             .add(g)
             .map_err(|e| format!("grep invalid glob: {e}"))?
             .build()
@@ -119,6 +149,12 @@ fn run_grep(pattern: &str, root: &Path, glob: Option<&str>) -> Result<String, St
             continue;
         }
         let file_path = entry.path();
+        // The prune filter only drops whole denied directories; a secret-named
+        // file nested in an otherwise-permitted subtree (e.g. a project-local
+        // `.env`) would still be searched. Skip it by filename.
+        if crate::read_policy::is_likely_secret_file(file_path) {
+            continue;
+        }
         let mut sink = GrepSink {
             path: file_path.display().to_string(),
             results: Vec::new(),
