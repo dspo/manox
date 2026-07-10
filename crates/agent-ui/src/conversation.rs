@@ -879,4 +879,25 @@ mod tests {
         );
         assert!(agent::tools::agent::agent_sub_messages("plain text").is_none());
     }
+
+    /// A still-running thread rebuilds with its trailing assistant bubble marked
+    /// `streaming` so resumed `AgentText` deltas append to it instead of opening
+    /// a second bubble (Bug 2). The completed path stays non-streaming.
+    #[test]
+    fn build_items_trailing_streaming_marks_running_tail() {
+        let messages = vec![
+            Message::user("hello".to_string()),
+            Message::assistant(vec![MessageContent::Text("draft reply".to_string())]),
+        ];
+        let completed = build_items(&messages, &std::collections::HashMap::new(), false);
+        match completed.last().unwrap() {
+            ConvItem::Assistant { streaming, .. } => assert!(!*streaming, "completed tail not streaming"),
+            _ => panic!("trailing item is an assistant bubble"),
+        }
+        let running = build_items(&messages, &std::collections::HashMap::new(), true);
+        match running.last().unwrap() {
+            ConvItem::Assistant { streaming, .. } => assert!(*streaming, "running tail is streaming"),
+            _ => panic!("trailing item is an assistant bubble"),
+        }
+    }
 }

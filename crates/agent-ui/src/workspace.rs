@@ -5242,6 +5242,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Reclaim a thread still running in the background instead of loading a
+        // stale DB snapshot — mirrors `open_thread`. Without this, an MCP
+        // `OpenThread` on a parked running thread swaps in a dead snapshot,
+        // leaving the live `run_turn_loop` entity orphaned in
+        // `background_threads` and its streaming deltas lost.
+        if let Some(pos) = self
+            .background_threads
+            .iter()
+            .position(|t| t.read(cx).id.0 == id)
+        {
+            let thread = self.background_threads.remove(pos);
+            self.attach_thread(thread, window, cx);
+            return true;
+        }
         let store = self.sidebar.read(cx).store();
         let Some(loaded) = store.update(cx, |s, cx| s.load_thread(&id, cx)) else {
             return false;
