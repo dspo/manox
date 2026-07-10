@@ -386,8 +386,8 @@ impl Render for PluginManagerView {
                             )
                             .child(
                                 div()
-                                    .text_lg()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::BLACK)
                                     .child(i18n::t("plugins-title")),
                             ),
                     )

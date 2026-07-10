@@ -827,8 +827,8 @@ pub fn render_config(view: &mut SettingsView, cx: &mut Context<SettingsView>) ->
                 .gap_2()
                 .child(
                     div()
-                        .text_2xl()
-                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_base()
+                        .font_weight(gpui::FontWeight::BLACK)
                         .child(i18n::t("settings-panel-config")),
                 )
                 .child(
@@ -1138,8 +1138,8 @@ pub fn render_mcp(view: &mut SettingsView, cx: &mut Context<SettingsView>) -> An
                 .justify_between()
                 .child(
                     div()
-                        .text_2xl()
-                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_base()
+                        .font_weight(gpui::FontWeight::BLACK)
                         .child(i18n::t("settings-panel-mcp")),
                 )
                 .child(
@@ -1253,8 +1253,8 @@ pub fn render_environment(_view: &mut SettingsView, cx: &mut Context<SettingsVie
                 .justify_between()
                 .child(
                     div()
-                        .text_2xl()
-                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_base()
+                        .font_weight(gpui::FontWeight::BLACK)
                         .child(i18n::t("settings-panel-environment")),
                 )
                 .child(

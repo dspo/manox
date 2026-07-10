@@ -13,6 +13,7 @@ mod mcp_server;
 use gpui::{App, AppContext as _, Menu, MenuItem, actions, px, size};
 use gpui::{WindowBounds, WindowOptions};
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
+use std::borrow::Cow;
 
 actions!(manox, [Quit, ToggleFullscreen]);
 
@@ -75,6 +76,41 @@ fn main() {
         terminal::init(cx);
         terminal_ui::init(cx);
         agent_ui::slash_command::init(cx);
+
+        // Embedded OFL typefaces. Lilex is the message-content monospace family
+        // (assistant markdown, code blocks, composer input, terminal); IBM Plex
+        // Mono is the UI-chrome family (buttons, labels, sidebar, settings).
+        // Both are registered before any view renders so the first frame already
+        // resolves to the embedded faces rather than a system fallback.
+        cx.text_system()
+            .add_fonts(vec![
+                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Regular.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Bold.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Italic.ttf")),
+                Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-BoldItalic.ttf")),
+                Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf"
+                )),
+                Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-Bold.ttf"
+                )),
+                Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-Italic.ttf"
+                )),
+                Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/ibm-plex-mono/IBMPlexMono-BoldItalic.ttf"
+                )),
+            ])
+            .expect("failed to register embedded fonts");
+
+        // Lilex is the family name embedded in the TTFs (not "Lilex Mono").
+        {
+            let theme = Theme::global_mut(cx);
+            theme.font_family = "IBM Plex Mono".into();
+            theme.mono_font_family = "Lilex".into();
+            theme.font_size = px(14.);
+            theme.mono_font_size = px(14.);
+        }
 
         cx.bind_keys([
             #[cfg(target_os = "macos")]

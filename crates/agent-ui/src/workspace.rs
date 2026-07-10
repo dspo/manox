@@ -3145,7 +3145,14 @@ impl Workspace {
                     }
                 }
             }))
-            .child(Input::new(&self.input_state).appearance(false))
+            .child(
+                // Composer input is message content, so it renders in the mono
+                // family (Lilex). The Input component has no per-instance font
+                // knob, so the family is applied from the host context here.
+                gpui::div()
+                    .font_family(theme.mono_font_family.clone())
+                    .child(Input::new(&self.input_state).appearance(false)),
+            )
             .child(
                 h_flex()
                     .w_full()
@@ -4483,8 +4490,8 @@ impl Render for Workspace {
                                 .items_center()
                                 .child(
                                     gpui::div()
-                                        .text_2xl()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_base()
+                                        .font_weight(gpui::FontWeight::BLACK)
                                         .text_color(theme.foreground)
                                         .child(i18n::t("workspace-empty-prompt")),
                                 )
