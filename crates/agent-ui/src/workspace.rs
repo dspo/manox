@@ -347,7 +347,7 @@ const MAIN_MIN_WIDTH: f32 = 160.;
 
 /// Environment info card floating at the top-right of the conversation area.
 /// Compact width for the per-model tree block: model id on the top line,
-/// `├── 穿透` / `└── 缓存` rows underneath, each with `↑↓` animated counters.
+/// `├── Throughput` / `└── Cache` tree rows underneath, each with `↑↓` animated counters.
 /// Wide enough to fit a 22-char model id plus the four-column counter row.
 const ENV_CARD_WIDTH: f32 = 260.;
 const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
@@ -2743,7 +2743,7 @@ impl Workspace {
     /// approval modes, and sources. Only rendered once the thread has been
     /// interacted with and the editor pane is closed.
     fn render_environment_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        // Approval mode used to live in the card's "模式" section (now removed);
+        // Approval mode used to live in the card's "Modes" section (now removed);
         // the per-mode chip in the composer footer reads it directly, so we
         // don't need to query it here.
         let (project, per_model) = {
@@ -2772,6 +2772,11 @@ impl Workspace {
         // by the number of live models. The four cells per model are
         // (field, value) pairs; we capture (from, to, gen) per cell so the
         // animation closures below can be plain `'static` move-closures.
+        // Tree labels are constant across iterations; resolve once before the
+        // loop so each iteration just clones the SharedString instead of
+        // re-running the i18n lookup.
+        let throughput_label = i18n::t("workspace-env-throughput");
+        let cache_label = i18n::t("workspace-env-cache");
         let mut new_state: HashMap<String, (u64, u64)> = HashMap::new();
         // Each model block carries: model id text + two tree rows. The
         // capture-based build here keeps the closure machinery out of the
@@ -2812,9 +2817,6 @@ impl Workspace {
                     .text_color(muted.opacity(0.55))
                     .child(SharedString::from(glyph))
             };
-            let throughput_label = i18n::t("workspace-env-throughput");
-            let cache_label = i18n::t("workspace-env-cache");
-
             let (in_f, in_t, in_g) = from_to_gen[0];
             let (out_f, out_t, out_g) = from_to_gen[1];
             let (cce_f, cce_t, cce_g) = from_to_gen[2];
@@ -2827,7 +2829,7 @@ impl Workspace {
                 .text_xs()
                 .text_color(muted)
                 .child(branch_prefix("├── "))
-                .child(throughput_label)
+                .child(throughput_label.clone())
                 .child(counter_animated("↑", in_f, in_t, "in", in_g))
                 .child(counter_animated("↓", out_f, out_t, "out", out_g));
             let cache_row = h_flex()
@@ -2837,7 +2839,7 @@ impl Workspace {
                 .text_xs()
                 .text_color(muted)
                 .child(branch_prefix("└── "))
-                .child(cache_label)
+                .child(cache_label.clone())
                 .child(counter_animated("↑", cce_f, cce_t, "cache_create", cce_g))
                 .child(counter_animated("↓", ccr_f, ccr_t, "cache_read", ccr_g));
             model_blocks.push((model_display, throughput_row, cache_row));
@@ -2907,10 +2909,9 @@ impl Workspace {
                         theme,
                     ))
                     .child(env_row(IconName::Github, branch_label.into(), None, theme))
-                    // ── 消费 (Usage) section ─────────────────────────────────
-                    // Section header + per-model tree blocks. Each block is
-                    // a v_flex: model id on the top line, throughput + cache
-                    // tree rows below, separated by gap_0p5.
+                    // Usage section: section header + per-model tree blocks.
+                    // Each block is a v_flex: model id on the top line,
+                    // throughput + cache tree rows below, separated by gap_0p5.
                     .child(
                         v_flex()
                             .w_full()
@@ -2947,7 +2948,7 @@ impl Workspace {
                             )),
                     )
                     .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
-                    // ── 来源 (Sources) section ───────────────────────────────
+                    // Sources section.
                     .child(
                         v_flex()
                             .gap_1()

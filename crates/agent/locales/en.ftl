@@ -471,15 +471,7 @@ titlebar-not-implemented = Not implemented yet.
 # ── Environment info panel ──────────────────────────────────────────────
 workspace-env-title = Environment info
 workspace-env-changes = Changes
-workspace-env-local = Local {$name}
 workspace-env-no-project = No project
-workspace-env-model = Model {$name}
-workspace-env-modes = Modes
-workspace-env-plan-on = Plan mode
-workspace-env-plan-off = Normal planning
-workspace-env-yolo-on = Full access
-workspace-env-yolo-off = Approval mode
-workspace-env-auto-review = Auto review
 workspace-env-usage = Usage
 workspace-env-throughput = Throughput
 workspace-env-cache = Cache
