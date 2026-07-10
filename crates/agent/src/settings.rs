@@ -32,6 +32,11 @@ pub struct Settings {
     /// 10% headroom for the output turn that follows. See `compact`.
     #[serde(default)]
     pub auto_compact: AutoCompactSettings,
+
+    /// How the composer (input area + divider + attachments) is horizontally
+    /// aligned in the conversation column. Config-file only; no UI toggle.
+    #[serde(default)]
+    pub composer_alignment: ComposerAlignment,
 }
 
 /// Auto-compaction knobs. Read at the top of each turn loop iteration; a flip
@@ -50,6 +55,26 @@ impl Default for AutoCompactSettings {
             enabled: true,
             threshold: 0.9,
         }
+    }
+}
+/// Horizontal alignment of the composer in the conversation column.
+///
+/// `MainColumn` (default) centers the composer in the full main column — the
+/// pre-existing behavior. `MessageList` shifts the composer right by half the
+/// outline-rail width so it shares the same center axis as the message
+/// content, which sits right of the 40px outline rail.
+///
+/// Config-file only; no UI toggle. TOML values: `"main-column"`, `"message-list"`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComposerAlignment {
+    MainColumn,
+    MessageList,
+}
+
+impl Default for ComposerAlignment {
+    fn default() -> Self {
+        Self::MainColumn
     }
 }
 

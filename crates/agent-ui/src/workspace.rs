@@ -40,7 +40,7 @@ use gpui_component::{
 use manox_components::markdown::Markdown;
 
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
-use crate::views::centered;
+use crate::views::{centered, centered_with_offset};
 use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
 };
@@ -3619,10 +3619,10 @@ impl Workspace {
     }
 
     /// The `⁄` command menu overlaid above the composer while `slash_open`.
-    fn render_slash_overlay(&self) -> Option<AnyElement> {
+    fn render_slash_overlay(&self, offset: Pixels) -> Option<AnyElement> {
         let menu = self.slash_menu.clone()?;
         Some(
-            centered(
+            centered_with_offset(
                 gpui::div()
                     .id("slash-dropdown")
                     .absolute()
@@ -3630,13 +3630,14 @@ impl Workspace {
                     .left_0()
                     .occlude()
                     .child(menu),
+                offset,
             )
             .into_any_element(),
         )
     }
 
     /// Pending-attachment chips shown above the composer, each removable.
-    fn render_attachments(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_attachments(&self, theme: &Theme, cx: &mut Context<Self>, offset: Pixels) -> Option<AnyElement> {
         if self.pending_attachments.is_empty() {
             return None;
         }
@@ -3647,11 +3648,11 @@ impl Workspace {
             }
         });
         Some(
-            centered(render_attachment_chips(
+            centered_with_offset(render_attachment_chips(
                 &self.pending_attachments,
                 theme,
                 move |ix, window, cx| on_remove(&ix, window, cx),
-            ))
+            ), offset)
             .into_any_element(),
         )
     }
@@ -4247,6 +4248,17 @@ impl Render for Workspace {
         // The inline composer stays visible while inline AskUserQuestion cards
         // are open; submitting text resolves the ask as a free-form response.
         // The editor pane still hides the inline composer while editing there.
+        // Composer alignment: shift the footer content right by half the
+        // outline-rail width so the input box shares the message list's
+        // center axis. The hero (first screen) has no outline rail, so it
+        // always uses zero offset.
+        let composer_offset = if agent::settings::load().composer_alignment
+            == agent::settings::ComposerAlignment::MessageList
+        {
+            px(OUTLINE_RAIL_WIDTH / 2.0)
+        } else {
+            px(0.)
+        };
         let footer = if editor_open || first_screen {
             None
         } else {
@@ -4258,10 +4270,10 @@ impl Render for Workspace {
                     .py_2()
                     .gap_2()
                     .relative()
-                    .children(self.render_slash_overlay())
-                    .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
-                    .children(self.render_attachments(&theme, cx))
-                    .child(centered(self.render_composer(running, &theme, cx))),
+                    .children(self.render_slash_overlay(composer_offset))
+                    .child(centered_with_offset(gpui::div().w_full().h(px(1.)).bg(theme.border), composer_offset))
+                    .children(self.render_attachments(&theme, cx, composer_offset))
+                    .child(centered_with_offset(self.render_composer(running, &theme, cx), composer_offset)),
             )
         };
         // Hero occupies the message-list region on the first screen.
@@ -4309,7 +4321,7 @@ impl Render for Workspace {
                                         .text_color(theme.foreground)
                                         .child(i18n::t("workspace-empty-prompt")),
                                 )
-                                .children(self.render_attachments(&theme, cx))
+                                .children(self.render_attachments(&theme, cx, px(0.)))
                                 .child(self.render_composer(running, &theme, cx))
                                 .children(hero_notices.map(|msg| {
                                     gpui::div()
@@ -4326,7 +4338,7 @@ impl Render for Workspace {
                                 })),
                         )
                         .relative()
-                        .children(self.render_slash_overlay()),
+                        .children(self.render_slash_overlay(px(0.))),
                     ),
             )
         };

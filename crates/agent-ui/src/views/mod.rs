@@ -10,7 +10,7 @@ pub mod sidebar;
 pub mod title_menu;
 
 use gpui::prelude::*;
-use gpui::{Div, px};
+use gpui::{Div, Pixels, px};
 
 /// Max content width (centered, width-capped).
 pub const CONTENT_MAX_W: f32 = 760.0;
@@ -37,6 +37,21 @@ pub fn centered(child: impl gpui::IntoElement) -> Div {
             .w_full()
             .min_w_0()
             .max_w(px(CONTENT_MAX_W))
+            .child(child),
+    )
+}
+
+/// Like [`centered`], but shifts the content's center axis right by `offset`
+/// so it aligns with a sibling column that starts `offset * 2` from the left
+/// edge (e.g. the message list, which sits right of the 40px outline rail).
+pub fn centered_with_offset(child: impl gpui::IntoElement, offset: Pixels) -> Div {
+    use gpui_component::{h_flex, v_flex};
+    h_flex().w_full().min_w_0().justify_center().px_4().child(
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .max_w(px(CONTENT_MAX_W))
+            .ml(offset)
             .child(child),
     )
 }
