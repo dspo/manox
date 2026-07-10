@@ -12,6 +12,9 @@
 //!   decompressing the message BLOB.
 //! - `terminal_sessions`: per-terminal metadata (cwd/env/title) for tab
 //!   restore; scrollback is not persisted.
+//! - `thread_ui_notes`: persisted UI annotations (`Error` / `Notice` cards)
+//!   that are not part of the model-facing message list — reload splices them
+//!   back into the conversation without touching the request prefix.
 //!
 //! `ThreadsDatabase` holds a `Mutex<Connection>`; all methods are synchronous
 //! and blocking (callers wrap them in `background_spawn`).
@@ -20,6 +23,7 @@ mod events;
 mod terminals;
 mod threads;
 mod token_usage;
+mod ui_notes;
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -31,6 +35,7 @@ pub use events::{ThreadEventRecord, ThreadEventType};
 pub use terminals::TerminalSession;
 pub use threads::{ThreadRecord, ThreadSummary};
 pub use token_usage::TokenUsageRecord;
+pub use ui_notes::{UiNoteKind, UiNoteRecord};
 
 use crate::paths;
 
@@ -68,6 +73,7 @@ impl ThreadsDatabase {
         events::create_table(conn)?;
         token_usage::create_table(conn)?;
         terminals::create_table(conn)?;
+        ui_notes::create_table(conn)?;
         Ok(())
     }
 }
@@ -228,6 +234,67 @@ mod tests {
         assert_eq!(evs.len(), 3);
         assert_eq!(evs[0].seq, 1);
         assert_eq!(evs[2].seq, 3);
+    }
+
+    #[test]
+    fn ui_notes_round_trip() {
+        // `init_schema` must create the table, and record/list must round-trip
+        // kind + anchor + payload with monotonic per-thread seq.
+        let db = open_mem();
+        db.upsert(&sample_record("t1"), true).unwrap();
+
+        db.record_ui_note(
+            "t1",
+            UiNoteKind::Error,
+            Some("u1"),
+            &serde_json::json!({ "text": "boom" }),
+        )
+        .unwrap();
+        db.record_ui_note(
+            "t1",
+            UiNoteKind::Notice,
+            None,
+            &serde_json::json!({ "text": "hi" }),
+        )
+        .unwrap();
+
+        let notes = db.list_ui_notes("t1").unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].seq, 1);
+        assert_eq!(notes[1].seq, 2);
+        assert_eq!(notes[0].kind, UiNoteKind::Error);
+        assert_eq!(notes[0].anchor_user_id.as_deref(), Some("u1"));
+        assert_eq!(
+            notes[0].data.get("text").and_then(|v| v.as_str()),
+            Some("boom")
+        );
+        assert_eq!(notes[1].kind, UiNoteKind::Notice);
+        assert!(notes[1].anchor_user_id.is_none());
+
+        // Seq is per-thread, so a second thread starts fresh at 1.
+        db.upsert(&sample_record("t2"), true).unwrap();
+        db.record_ui_note(
+            "t2",
+            UiNoteKind::Notice,
+            None,
+            &serde_json::json!({ "text": "x" }),
+        )
+        .unwrap();
+        let t2 = db.list_ui_notes("t2").unwrap();
+        assert_eq!(t2.len(), 1);
+        assert_eq!(t2[0].seq, 1);
+
+        // Unknown kind strings degrade to Notice rather than panicking, so a
+        // future wire value never breaks reload.
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO thread_ui_notes (thread_id, seq, kind, data) VALUES ('t1', 99, 'bogus', '{}')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let all = db.list_ui_notes("t1").unwrap();
+        assert_eq!(all.last().unwrap().kind, UiNoteKind::Notice);
     }
 
     #[test]

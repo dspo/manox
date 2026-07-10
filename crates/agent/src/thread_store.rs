@@ -160,7 +160,18 @@ impl ThreadStore {
             }
         };
         let model: Option<AnyLanguageModel> = registry::global().get_model(&rec.model_id);
-        Some(Thread::restore(rec, model, cx))
+        let entity = Thread::restore(rec, model, cx);
+        // Backfill the UI-note cache from its own append-only table. Best-effort:
+        // a read failure leaves the thread without historical Error/Notice
+        // cards but otherwise intact. This is the only place `ui_notes` is
+        // populated; `restore` and `new` leave it empty.
+        match self.db.list_ui_notes(id) {
+            Ok(notes) => entity.update(cx, |t, _| t.set_ui_notes(notes)),
+            Err(e) => {
+                tracing::warn!(thread_id = id, error = ?e, "load_thread: ui_notes load failed")
+            }
+        }
+        Some(entity)
     }
 
     /// Create a fresh empty `Thread` (used by the sidebar "new conversation" button).
@@ -249,6 +260,37 @@ impl ThreadStore {
                 .await;
             if let Err(e) = res {
                 tracing::warn!(error = %e, "Failed to record thread event");
+            }
+        })
+        .detach();
+    }
+
+    /// Persist a UI annotation (`Error` / `Notice` card) to the
+    /// `thread_ui_notes` table. Best-effort on the background executor; a db
+    /// failure warns and does not surface — the live `ConversationState`
+    /// already shows the item this turn, only the reload copy is at stake.
+    /// `anchor_user_id` ties the note to the turn it belongs to (`None` for
+    /// notes emitted before the first user message) so the rebuild can splice
+    /// it back at the right spot.
+    pub fn record_ui_note(
+        &self,
+        thread_id: &str,
+        kind: crate::db::UiNoteKind,
+        anchor_user_id: Option<&str>,
+        data: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let db = self.db.clone();
+        let thread_id = thread_id.to_string();
+        let anchor = anchor_user_id.map(str::to_owned);
+        let data = data.clone();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { db.record_ui_note(&thread_id, kind, anchor.as_deref(), &data) })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "Failed to record ui note");
             }
         })
         .detach();

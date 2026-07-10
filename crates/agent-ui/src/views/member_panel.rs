@@ -62,6 +62,7 @@ impl MemberPanel {
                 &empty_usage,
                 &role,
                 false,
+                &[],
                 weak_ws,
                 cx,
             )
