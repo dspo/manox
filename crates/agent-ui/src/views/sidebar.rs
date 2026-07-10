@@ -702,6 +702,7 @@ fn render_thread_item(
                                         .xsmall()
                                         .icon(IconName::Inbox)
                                         .on_click(cx.listener(move |_this, _ev, _window, cx| {
+                                            cx.stop_propagation();
                                             cx.emit(SidebarEvent::ArchiveThread(
                                                 id_archive.clone(),
                                                 archive_to,

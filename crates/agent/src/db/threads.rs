@@ -208,8 +208,6 @@ impl ThreadsDatabase {
                 reasoning_effort = excluded.reasoning_effort,
                 depth = excluded.depth,
                 parent_id = excluded.parent_id,
-                archived = excluded.archived,
-                pinned = excluded.pinned,
                 interacted_at = excluded.interacted_at,
                 updated_at = excluded.updated_at,
                 session_started_at = excluded.session_started_at,

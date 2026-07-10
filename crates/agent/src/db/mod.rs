@@ -278,4 +278,34 @@ mod tests {
         let loaded = db.load("t1").unwrap().unwrap();
         assert_eq!(loaded.title_override.as_deref(), Some("renamed"));
     }
+
+    #[test]
+    fn upsert_does_not_overwrite_archived_or_pinned() {
+        // Regression: a stale in-memory snapshot (archived=false) must not
+        // clobber the DB's archived=true set by `archive()`. Same for pinned.
+        // These flags are independent metadata managed exclusively by their
+        // dedicated setters, not by the general upsert path.
+        let db = open_mem();
+        let rec = sample_record("t1");
+        db.upsert(&rec, true).unwrap();
+
+        // Archive and pin via the dedicated setters.
+        db.archive("t1", true).unwrap();
+        db.pin("t1", true).unwrap();
+        let loaded = db.load("t1").unwrap().unwrap();
+        assert!(loaded.archived);
+        assert!(loaded.pinned);
+
+        // A stale upsert carrying archived=false / pinned=false (e.g. from
+        // an in-memory snapshot taken before the archive/pin) must not reset
+        // those flags.
+        let stale = sample_record("t1");
+        assert!(!stale.archived);
+        assert!(!stale.pinned);
+        db.upsert(&stale, true).unwrap();
+
+        let loaded = db.load("t1").unwrap().unwrap();
+        assert!(loaded.archived, "archived flag must survive stale upsert");
+        assert!(loaded.pinned, "pinned flag must survive stale upsert");
+    }
 }
