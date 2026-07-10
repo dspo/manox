@@ -42,10 +42,12 @@ use manox_components::markdown::Markdown;
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
 use crate::views::centered;
 use crate::views::completion::{
-    CompletionState, SelectHandler, build_replacement, detect, mention_source,
-    render_completion, slash_source,
+    CompletionState, SelectHandler, build_replacement, detect, mention_source, render_completion,
+    slash_source,
 };
-use crate::views::composer_menu::{PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips};
+use crate::views::composer_menu::{
+    PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
+};
 use crate::views::member_panel::MemberPanel;
 use crate::views::plugin_manager::{PluginManagerEvent, PluginManagerView};
 use crate::views::settings::{SettingsEvent, SettingsView};
@@ -1125,11 +1127,7 @@ impl Workspace {
     }
 
     fn completion_confirm_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ix = self
-            .completion
-            .as_ref()
-            .map(|s| s.selected)
-            .unwrap_or(0);
+        let ix = self.completion.as_ref().map(|s| s.selected).unwrap_or(0);
         self.completion_confirm(ix, window, cx);
     }
 
@@ -4577,12 +4575,16 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &crate::CompletionDown, window, cx| {
                 this.completion_down(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &crate::CompletionConfirm, window, cx| {
-                this.completion_confirm_selected(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &crate::CompletionDismiss, _window, cx| {
-                this.close_completion(cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::CompletionConfirm, window, cx| {
+                    this.completion_confirm_selected(window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::CompletionDismiss, _window, cx| {
+                    this.close_completion(cx);
+                }),
+            )
             // Left sidebar with a draggable divider on its right edge.
             .child(self.sidebar.clone())
             .child(sidebar_divider)

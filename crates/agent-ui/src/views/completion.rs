@@ -278,12 +278,7 @@ pub fn render_completion(
                     .child(desc),
             );
         }
-        row = row.child(
-            gpui::div()
-                .text_xs()
-                .text_color(muted)
-                .child(tag.clone()),
-        );
+        row = row.child(gpui::div().text_xs().text_color(muted).child(tag.clone()));
         // Apply the mono family + selected highlight at the row root so the
         // whole line reads as code and the highlight spans full width.
         let mut row = row.font_family(mono);
