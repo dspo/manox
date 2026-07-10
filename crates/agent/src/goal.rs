@@ -21,7 +21,6 @@ use std::time::Duration;
 use futures::StreamExt as _;
 use gpui::AsyncApp;
 use serde::Deserialize;
-use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::language_model::{
@@ -125,8 +124,15 @@ pub async fn evaluate(
         Some(text)
     };
 
+    // Race the evaluator call against a hard deadline and cancellation.
+    // `evaluate` runs inline on the gpui foreground executor — there is no
+    // tokio runtime context here, so `tokio::time::timeout` would panic at
+    // `Handle::current` and abort the process. The timer comes from the gpui
+    // executor instead; `call` is safe on the foreground executor because
+    // `stream_completion` bridges its HTTP work onto the global tokio runtime.
     let outcome = tokio::select! {
-        result = timeout(EVAL_TIMEOUT, call) => result.ok().flatten(),
+        result = call => result,
+        _ = cx.background_executor().timer(EVAL_TIMEOUT) => None,
         _ = cancel.cancelled() => None,
     };
     let Some(text) = outcome else {
