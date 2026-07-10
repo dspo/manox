@@ -631,6 +631,9 @@ pub fn render_reasoning(
                 .border_color(theme.border)
                 .text_sm()
                 .text_color(theme.muted_foreground)
+                // Thinking renders as Lilex italic; weight inherits Light from the
+                // list, so this hits Lilex-LightItalic (MediumItalic under bold).
+                .italic()
                 .child(body),
         );
     }
@@ -925,66 +928,72 @@ pub fn render_tool_call(
     let id_for_toggle = item.id.clone();
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
 
-    let mut card = v_flex().group(format!("tool-{ix}")).w_full().child(
-        h_flex()
-            .id(("tool-header", ix))
-            .w_full()
-            .px_2()
-            .py_1()
-            .gap_1p5()
-            .items_center()
-            .rounded(theme.radius)
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
-            .on_click(move |_, _window, cx: &mut App| {
-                let Some(weak) = weak_workspace.clone() else {
-                    return;
-                };
-                let _ = weak.update(cx, |w, cx| {
-                    let id = id_for_toggle.clone();
-                    let conv = w.conversation.clone();
-                    conv.update(cx, |c, cx| {
-                        if let Some(ix) = c.find_tool(&id, &*cx)
-                            && let Some(item) = c.items().get(ix)
-                        {
-                            item.update(cx, |item, cx| {
-                                if let ConvItem::ToolCall(t) = item.kind_mut() {
-                                    t.collapsed = !t.collapsed;
-                                    t.user_toggled = true;
-                                }
-                                cx.notify();
-                            });
-                        }
+    let mut card = v_flex()
+        .group(format!("tool-{ix}"))
+        .w_full()
+        // Tool-call chrome and output render as Lilex italic to set them apart
+        // from upright body text.
+        .italic()
+        .child(
+            h_flex()
+                .id(("tool-header", ix))
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .items_center()
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+                .on_click(move |_, _window, cx: &mut App| {
+                    let Some(weak) = weak_workspace.clone() else {
+                        return;
+                    };
+                    let _ = weak.update(cx, |w, cx| {
+                        let id = id_for_toggle.clone();
+                        let conv = w.conversation.clone();
+                        conv.update(cx, |c, cx| {
+                            if let Some(ix) = c.find_tool(&id, &*cx)
+                                && let Some(item) = c.items().get(ix)
+                            {
+                                item.update(cx, |item, cx| {
+                                    if let ConvItem::ToolCall(t) = item.kind_mut() {
+                                        t.collapsed = !t.collapsed;
+                                        t.user_toggled = true;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        cx.notify();
                     });
-                    cx.notify();
-                });
-            })
-            .child(
-                Icon::new(chevron)
-                    .xsmall()
-                    .text_color(theme.muted_foreground),
-            )
-            .child(
-                gpui::div()
-                    .flex_1()
-                    .text_xs()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_color(theme.muted_foreground)
-                    .child(truncate(&title, 80)),
-            )
-            .child(copy_button_hoverable(
-                ix,
-                "copy-tool",
-                format!("tool-{ix}"),
-                item.output.clone(),
-            ))
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(status_color)
-                    .child(status_label),
-            ),
-    );
+                })
+                .child(
+                    Icon::new(chevron)
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .text_xs()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(truncate(&title, 80)),
+                )
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-tool",
+                    format!("tool-{ix}"),
+                    item.output.clone(),
+                ))
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(status_color)
+                        .child(status_label),
+                ),
+        );
 
     let display_output = if item.streaming {
         live_tail(&item.output)
@@ -1522,54 +1531,60 @@ pub fn render_agent_task(
         item.final_text.clone()
     };
 
-    let mut card = v_flex().group(format!("agent-{ix}")).w_full().child(
-        h_flex()
-            .id(("agent-header", ix))
-            .w_full()
-            .px_2()
-            .py_1()
-            .gap_1p5()
-            .items_center()
-            .rounded(theme.radius)
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
-            .on_click(move |_, _window, cx: &mut App| {
-                let Some(weak) = weak.clone() else {
-                    return;
-                };
-                let _ = weak.update(cx, |w, cx| {
-                    if !w.expanded_tasks.insert(id_for_toggle.clone()) {
-                        w.expanded_tasks.remove(&id_for_toggle);
-                    }
-                    cx.notify();
-                });
-            })
-            .child(
-                Icon::new(chevron)
-                    .xsmall()
-                    .text_color(theme.muted_foreground),
-            )
-            .child(
-                gpui::div()
-                    .flex_1()
-                    .text_xs()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_color(theme.muted_foreground)
-                    .child(truncate(&item.title, 80)),
-            )
-            .child(copy_button_hoverable(
-                ix,
-                "copy-agent",
-                format!("agent-{ix}"),
-                copy_text,
-            ))
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(status_color)
-                    .child(status_label),
-            ),
-    );
+    let mut card = v_flex()
+        .group(format!("agent-{ix}"))
+        .w_full()
+        // A sub-agent task is tool-call kin, so its chrome and nested output
+        // render as Lilex italic alongside tool-call cards.
+        .italic()
+        .child(
+            h_flex()
+                .id(("agent-header", ix))
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .items_center()
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+                .on_click(move |_, _window, cx: &mut App| {
+                    let Some(weak) = weak.clone() else {
+                        return;
+                    };
+                    let _ = weak.update(cx, |w, cx| {
+                        if !w.expanded_tasks.insert(id_for_toggle.clone()) {
+                            w.expanded_tasks.remove(&id_for_toggle);
+                        }
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(chevron)
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .text_xs()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(truncate(&item.title, 80)),
+                )
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-agent",
+                    format!("agent-{ix}"),
+                    copy_text,
+                ))
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(status_color)
+                        .child(status_label),
+                ),
+        );
 
     let collapsed_body = if item.streaming {
         live_tail(&item.sub_text)

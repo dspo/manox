@@ -2194,6 +2194,10 @@ impl Workspace {
                                 .bg(theme.secondary)
                                 .text_xs()
                                 .font_family(theme.mono_font_family.clone())
+                                // Permission summaries read as tool-call output, so
+                                // they render in Lilex LightItalic.
+                                .italic()
+                                .font_weight(gpui::FontWeight::LIGHT)
                                 .text_color(theme.foreground)
                                 .child(summary),
                         )
@@ -2922,11 +2926,13 @@ impl Workspace {
                 }
             }))
             .child(
-                // Composer input is message content, so it renders in the mono
-                // family (Lilex). The Input component has no per-instance font
-                // knob, so the family is applied from the host context here.
+                // Composer input is message content in the mono family (Lilex).
+                // Weight is pinned to Light to match body type; the Input component
+                // has no per-instance font knob, so family + weight are applied
+                // from the host context here.
                 gpui::div()
                     .font_family(theme.mono_font_family.clone())
+                    .font_weight(gpui::FontWeight::LIGHT)
                     .child(Input::new(&self.input_state).appearance(false)),
             )
             .child(
@@ -4593,7 +4599,13 @@ impl Render for Workspace {
                                 .w_full()
                                 .h_full()
                                 .min_h_0()
-                                .min_w_0();
+                                .min_w_0()
+                                // Body typeface: Lilex Light. Every message row (assistant,
+                                // user, reasoning, tool cards, notices) inherits from here;
+                                // markdown bold/headings resolve to Medium via nearest-weight,
+                                // italic syntax and tool-card overrides hit the italic cuts.
+                                .font_family(theme.mono_font_family.clone())
+                                .font_weight(gpui::FontWeight::LIGHT);
                                 // Outer column fills the list region. `h_full()` is load-
                                 // bearing: the region is an `h_flex()` row (items_center,
                                 // not stretch), so without it the wrapper shrinks to
