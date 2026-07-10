@@ -452,13 +452,17 @@ impl ConversationState {
                             t.name = name.clone();
                             // Reaching a terminal status flips collapse on —
                             // matches the same flip in the ToolResult branch
-                            // for tools whose result event lands first.
+                            // for tools whose result event lands first. The
+                            // `exit_plan_mode` plan card stays expanded: its
+                            // body is the plan the user just read, and the
+                            // verdict is conveyed by the status icon.
                             if matches!(
                                 *status,
                                 ToolCallStatus::Success
                                     | ToolCallStatus::Error
                                     | ToolCallStatus::Denied
                             ) && !t.streaming
+                                && t.name != "exit_plan_mode"
                             {
                                 t.collapsed = !t.user_toggled;
                             }
@@ -540,13 +544,25 @@ impl ConversationState {
                 } else if let Some(ix) = self.find_tool(id, cx) {
                     self.items[ix].update(cx, |item, cx| {
                         if let ConvItem::ToolCall(t) = item.kind_mut() {
-                            t.output = output.clone();
+                            // `exit_plan_mode`'s body is the plan (backfilled
+                            // from `PlanProposed`); the approval verdict lives
+                            // in `status`, so keep the plan body and keep it
+                            // expanded — collapsing would hide the very plan
+                            // the user just read.
+                            let is_plan = t.name == "exit_plan_mode";
+                            if !is_plan {
+                                t.output = output.clone();
+                            }
                             t.is_error = *is_error;
                             t.streaming = false;
                             t.status = status;
                             // Auto-collapse once the tool call reaches a terminal
                             // status. Preserves the user's manual choice if any.
-                            t.collapsed = !t.user_toggled;
+                            t.collapsed = if is_plan {
+                                t.user_toggled
+                            } else {
+                                !t.user_toggled
+                            };
                         }
                         cx.notify();
                     });

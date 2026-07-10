@@ -1333,6 +1333,30 @@ pub fn build_items(messages: &[Message], usage: &HashMap<String, TokenUsage>) ->
                                     final_text: String::new(),
                                     is_error: false,
                                 }));
+                            } else if tu.name.as_ref() == "exit_plan_mode" {
+                                // The plan body is the card's whole point; pull it
+                                // from the tool input so a reloaded thread shows the
+                                // plan even before (or without) a paired approval
+                                // result. Expanded by default; a paired result only
+                                // stamps the verdict status, never overwrites the
+                                // plan body (see `pair_tool_result`).
+                                let plan_text = tu
+                                    .input
+                                    .get("plan")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                items.push(ConvItem::ToolCall(ToolCallItem {
+                                    id: tu.id.clone(),
+                                    name: tu.name.to_string(),
+                                    title: agent::thread::tool_title(tu.name.as_ref(), &tu.input),
+                                    status: ToolCallStatus::Success,
+                                    output: plan_text,
+                                    is_error: false,
+                                    streaming: false,
+                                    collapsed: false,
+                                    user_toggled: false,
+                                }));
                             } else {
                                 items.push(ConvItem::ToolCall(ToolCallItem {
                                     id: tu.id.clone(),
@@ -1413,7 +1437,13 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
             t.status = status;
         }
         ConvItem::ToolCall(t) => {
-            t.output = tr.content.clone();
+            // `exit_plan_mode`'s body is the plan (extracted from the tool
+            // input at build time); the approval verdict lives in `status`,
+            // so never clobber the plan with the canned approval/rejection
+            // result text.
+            if t.name != "exit_plan_mode" {
+                t.output = tr.content.clone();
+            }
             t.is_error = tr.is_error;
             t.status = status;
             if t.name.is_empty() {
@@ -1427,6 +1457,71 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
+
+    /// A reloaded `exit_plan_mode` ToolUse with no paired ToolResult (plan was
+    /// pending approval at save time) still renders the plan body, expanded —
+    /// the plan is extracted from the tool input, not left empty.
+    #[test]
+    fn build_items_extracts_exit_plan_mode_plan_from_input() {
+        let plan = "## Goal\n\nUnify the banner UI.\n\n### Critical Files\n\n- message.rs\n";
+        let messages = vec![Message::assistant(vec![MessageContent::ToolUse(
+            LanguageModelToolUse {
+                id: "tu_plan".to_string(),
+                name: Arc::from("exit_plan_mode"),
+                raw_input: String::new(),
+                input: serde_json::json!({ "plan": plan }),
+                is_input_complete: true,
+                thought_signature: None,
+            },
+        )])];
+        let items = build_items(&messages, &HashMap::new());
+        let tool = items
+            .iter()
+            .find_map(|i| match i {
+                ConvItem::ToolCall(t) if t.name == "exit_plan_mode" => Some(t),
+                _ => None,
+            })
+            .expect("exit_plan_mode card present");
+        assert_eq!(tool.output, plan);
+        assert!(!tool.collapsed);
+    }
+
+    /// Pairing an approval/rejection ToolResult onto an `exit_plan_mode` card
+    /// stamps the verdict status but must not clobber the plan body with the
+    /// canned verdict text — the plan is the card's content, the verdict is the
+    /// icon.
+    #[test]
+    fn pair_tool_result_preserves_exit_plan_mode_plan_body() {
+        let plan = "## Goal\n\nKeep this plan body.\n";
+        let mut items: Vec<ConvItem> = vec![ConvItem::ToolCall(ToolCallItem {
+            id: "tu_plan".to_string(),
+            name: "exit_plan_mode".to_string(),
+            title: "Submit plan".to_string(),
+            status: ToolCallStatus::PendingApproval,
+            output: plan.to_string(),
+            is_error: false,
+            streaming: false,
+            collapsed: false,
+            user_toggled: false,
+        })];
+        pair_tool_result(
+            &mut items,
+            &LanguageModelToolResult {
+                tool_use_id: "tu_plan".to_string(),
+                tool_name: Arc::from("exit_plan_mode"),
+                is_error: false,
+                content: "User approved the plan. You may now begin execution.".to_string(),
+            },
+        );
+        match &items[0] {
+            ConvItem::ToolCall(t) => {
+                assert_eq!(t.output, plan, "plan body must survive pairing");
+                assert_eq!(t.status, ToolCallStatus::Success);
+            }
+            _ => panic!("item is still a ToolCall"),
+        }
+    }
 
     #[test]
     fn live_tail_short_output_unchanged() {

@@ -37,7 +37,7 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
-use manox_components::markdown::Markdown;
+use manox_components::markdown::{HeadingMode, Markdown};
 
 use composer::{ComposerEvent, ComposerInput};
 
@@ -80,10 +80,11 @@ struct PendingAuth {
 }
 
 /// A pending plan approval prompted by `ThreadEvent::PlanProposed`. The plan
-/// text is rendered in the chat view as a ToolCall item; the overlay only
-/// shows the approval question.
+/// text is carried both here (for the approval overlay body) and backfilled
+/// into the matching ToolCall item (for the chat view).
 struct PendingPlan {
     id: String,
+    plan_text: String,
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -492,8 +493,11 @@ impl Workspace {
                     });
                     cx.notify();
                 }
-                ThreadEvent::PlanProposed { id, .. } => {
-                    this.pending_plan = Some(PendingPlan { id: id.clone() });
+                ThreadEvent::PlanProposed { id, plan_text } => {
+                    this.pending_plan = Some(PendingPlan {
+                        id: id.clone(),
+                        plan_text: plan_text.clone(),
+                    });
                     // Delegate to ConversationState to backfill the plan text
                     // into the matching ToolCall item for markdown rendering.
                     let weak = cx.weak_entity();
@@ -2072,9 +2076,11 @@ impl Workspace {
         )
     }
 
-    /// Plan approval overlay (model called `exit_plan_mode`). The plan text
-    /// is rendered in the chat view; this overlay only asks the approval
-    /// question. Auth/ask overlays take precedence so they never compete.
+    /// Plan approval overlay (model called `exit_plan_mode`). Renders the
+    /// submitted plan as markdown so the user can read it before deciding;
+    /// Approve exits plan mode and starts execution, Reject ends the turn
+    /// and stays in plan mode awaiting the user's next message. Auth/ask
+    /// overlays take precedence so they never compete.
     fn render_plan_approval_overlay(
         &self,
         theme: &Theme,
@@ -2084,6 +2090,8 @@ impl Workspace {
             return None;
         }
         self.pending_plan.as_ref()?;
+
+        let plan_text = self.pending_plan.as_ref()?.plan_text.clone();
 
         Some(
             gpui::div()
@@ -2100,7 +2108,8 @@ impl Workspace {
                 .bg(theme.foreground.opacity(0.6))
                 .child(
                     v_flex()
-                        .w(px(420.))
+                        .w(px(560.))
+                        .max_h(px(560.))
                         .p_4()
                         .gap_3()
                         .rounded(theme.radius)
@@ -2126,8 +2135,33 @@ impl Workspace {
                         .child(
                             gpui::div()
                                 .text_sm()
-                                .text_color(theme.foreground)
+                                .text_color(theme.muted_foreground)
                                 .child(i18n::t("workspace-plan-approval-question")),
+                        )
+                        .child(
+                            // The submitted plan body. Scrollable so a long plan
+                            // never overflows the viewport; the wrapper is
+                            // stateful so `overflow_y_scroll` can keep scroll
+                            // state, and `Markdown` additionally scrolls its
+                            // own surface.
+                            gpui::div()
+                                .id("plan-approval-body-scroll")
+                                .flex_1()
+                                .min_h_0()
+                                .max_h(px(420.))
+                                .overflow_y_scroll()
+                                .rounded(theme.radius)
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.secondary)
+                                .p_3()
+                                .child(
+                                    Markdown::new("plan-approval-body", plan_text)
+                                        .theme(theme)
+                                        .selectable(true)
+                                        .scrollable(true)
+                                        .heading_mode(HeadingMode::Uniform),
+                                ),
                         )
                         .child(
                             h_flex()

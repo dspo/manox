@@ -301,6 +301,12 @@ pub struct Thread {
     /// allowed one extra round-trip so the sub-agent can produce a coherent
     /// final message instead of ending mid-work; a second cap hit hard-stops.
     cap_summary_injected: bool,
+    /// Set by `run_plan_approval`'s Reject branch to signal `run_turn_loop`
+    /// to stop after the tool batch rather than auto-continuing into another
+    /// completion. Reject carries no new information, so a follow-up round
+    /// would be a pointless burn; the user's next message becomes the
+    /// revision direction. `plan_mode` stays on.
+    stop_after_plan_reject: bool,
     /// The running turn task; dropping it aborts the turn.
     running_turn: Option<Task<()>>,
     /// Cancellation token for the running turn. Cancelled by `cancel()` so the
@@ -523,6 +529,7 @@ impl Thread {
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
+                stop_after_plan_reject: false,
                 running_turn: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
@@ -600,6 +607,7 @@ impl Thread {
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
+                stop_after_plan_reject: false,
                 running_turn: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
@@ -681,6 +689,7 @@ impl Thread {
                 max_turns: Some(max_turns),
                 turn_count: 0,
                 cap_summary_injected: false,
+                stop_after_plan_reject: false,
                 running_turn: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
@@ -1821,6 +1830,7 @@ impl Thread {
         this.update(cx, |this, _| {
             this.turn_count = 0;
             this.cap_summary_injected = false;
+            this.stop_after_plan_reject = false;
         })?;
         loop {
             // Increment at the top so `turn_count` is 1-indexed for the
@@ -2159,6 +2169,26 @@ impl Thread {
                 capped
             })?;
             if hit_cap {
+                break;
+            }
+
+            // Plan-mode Reject: the user rejected the submitted plan and the
+            // `exit_plan_mode` result has been appended (wire stays paired).
+            // Stop the turn here — Reject carries no new information, so a
+            // follow-up completion would be a pointless burn. `plan_mode` is
+            // left on; the user's next message restarts the turn still in
+            // plan mode with the new direction. Mirrors the `max_turns` cap
+            // pattern: emit a terminal `Stop` so the workspace marks the
+            // thread idle and persists, then break.
+            let stop_after_reject = this.update(cx, |this, cx| {
+                if this.stop_after_plan_reject {
+                    this.stop_after_plan_reject = false;
+                    cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
+                    return true;
+                }
+                false
+            })?;
+            if stop_after_reject {
                 break;
             }
         }
@@ -2524,15 +2554,22 @@ impl Thread {
                 })?;
             }
             PlanApprovalResponse::Reject => {
-                let msg = "User rejected the plan. Revise it per the user's feedback and call exit_plan_mode again."
+                // Reject carries no revision text — the user's next message
+                // IS the new direction (Claude Code model). Append a paired
+                // ToolResult so the wire stays well-formed, then flag the turn
+                // loop to stop: a follow-up completion would burn a round with
+                // zero new information. `plan_mode` stays on; the next user
+                // message restarts the turn still in plan mode.
+                let msg = "User rejected this plan and ended the turn. Do not resubmit a revised plan; await the user's next message for new direction."
                     .to_string();
-                this.update(cx, |_, cx| {
+                this.update(cx, |this, cx| {
                     cx.emit(ThreadEvent::ToolCall {
                         id: id.clone(),
                         name: name.clone(),
                         title: title.clone(),
                         status: ToolCallStatus::Denied,
                     });
+                    this.stop_after_plan_reject = true;
                 })?;
                 Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
                 Self::append_tool_result(&this, tu, msg, false, cx)?;
