@@ -129,6 +129,7 @@ pub(super) fn parse(
                 is_sidechain: false,
                 session_id: Some(sid.clone()),
                 message_id: None,
+                timestamp_secs: None,
             })
         }
 
@@ -253,6 +254,7 @@ pub(super) fn parse(
             is_sidechain: false,
             session_id: Some(sid.clone()),
             message_id: None,
+            timestamp_secs: None,
         });
     }
 

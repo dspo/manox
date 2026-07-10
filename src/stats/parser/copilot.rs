@@ -102,6 +102,7 @@ pub(super) fn parse(content: &str, agent: &str, _path: &Path) -> Vec<RawEntry> {
             is_sidechain: false,
             session_id: Some(c.session_id.clone()),
             message_id: c.response_id.clone(),
+            timestamp_secs: None,
         })
         .collect()
 }

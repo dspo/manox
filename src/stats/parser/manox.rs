@@ -97,6 +97,7 @@ pub(super) fn parse(db_path: &Path) -> Result<Vec<RawEntry>> {
             is_sidechain: false,
             session_id: Some(thread_id),
             message_id: None,
+            timestamp_secs: None,
         });
     }
     if row_errors > 0 {

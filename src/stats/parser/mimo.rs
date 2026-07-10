@@ -179,6 +179,7 @@ fn parse_one(v: &Value, session_id: &str) -> Option<RawEntry> {
         is_sidechain: false,
         session_id: Some(session_id.to_string()),
         message_id: None, // mimo message.id 是内部生成的，对用户无意义
+        timestamp_secs: None,
     })
 }
 

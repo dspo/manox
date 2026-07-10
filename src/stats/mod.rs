@@ -284,13 +284,18 @@ impl SessionTokens {
     }
 }
 
-/// 查找指定 agent 在 `since` 之后修改的最新日志文件并汇总 token 用量。
+/// 查找指定 agent 在 `since` 之后修改的日志文件并汇总本次会话的 token 用量。
 ///
 /// 用于 agent 退出后在退出摘要中显示本次会话的 token 消耗。
 /// 如果找不到匹配的日志文件或解析失败，返回 `None`（静默降级）。
+///
+/// 与之前版本不同，此函数现在：
+/// 1. 按条目的 `timestamp` 字段过滤，只计入 `timestamp >= since` 的条目
+/// 2. 汇总所有匹配文件中的符合条件的条目，而非仅取 mtime 最新的单个文件
 pub(crate) fn count_recent_session_tokens(
     agent_id: &str,
     since: std::time::SystemTime,
+    cwd: &Path,
 ) -> Option<SessionTokens> {
     let since_secs = since
         .duration_since(UNIX_EPOCH)
@@ -310,13 +315,20 @@ pub(crate) fn count_recent_session_tokens(
         _ => false,
     })?;
 
-    // 收集日志文件，筛选 session 开始后修改的
-    let mut files = collect_jsonl_files(&source.root);
+    // Scope the file search to the current project directory.
+    // Claude Code stores session logs under ~/.claude/projects/<project-dir>/,
+    // where <project-dir> is the workspace path with "/" replaced by "-".
+    let search_root = project_dir_from_cwd(cwd)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| source.root.clone());
+
+    let mut files = collect_jsonl_files(&search_root);
     if let Some(ref extra) = source.extra_file {
         files.push(extra.clone());
     }
 
-    let mut recent: Vec<_> = files
+    // Collect all files modified since the session started.
+    let recent: Vec<_> = files
         .into_iter()
         .filter_map(|path| {
             let meta = fs::metadata(&path).ok()?;
@@ -327,7 +339,7 @@ pub(crate) fn count_recent_session_tokens(
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             if mtime_secs >= since_secs {
-                Some((path, mtime_secs))
+                Some(path)
             } else {
                 None
             }
@@ -338,27 +350,49 @@ pub(crate) fn count_recent_session_tokens(
         return None;
     }
 
-    // 按 mtime 降序排列，取最新的文件
-    recent.sort_by(|a, b| b.1.cmp(&a.1));
-    let newest_path = &recent[0].0;
-
-    // 解析日志文件
-    let result = parse_file(newest_path, source.kind).ok()?;
-
     let mut tokens = SessionTokens {
         input: 0,
         output: 0,
         cache_read: 0,
         cache_creation: 0,
     };
-    for entry in &result.entries {
-        tokens.input += entry.input_tokens;
-        tokens.output += entry.output_tokens;
-        tokens.cache_read += entry.cache_read_input_tokens;
-        tokens.cache_creation += entry.cache_creation_input_tokens;
+
+    for path in &recent {
+        let Ok(result) = parse_file(path, source.kind) else {
+            continue;
+        };
+        for entry in &result.entries {
+            // Only count entries that were created during this session.
+            // Entries without a timestamp (parsers that don't extract it) are
+            // counted unconditionally for backward compatibility.
+            if entry
+                .timestamp_secs
+                .map_or(true, |ts| ts >= since_secs)
+            {
+                tokens.input += entry.input_tokens;
+                tokens.output += entry.output_tokens;
+                tokens.cache_read += entry.cache_read_input_tokens;
+                tokens.cache_creation += entry.cache_creation_input_tokens;
+            }
+        }
+    }
+
+    if tokens.total() == 0 {
+        return None;
     }
 
     Some(tokens)
+}
+
+/// Compute the project directory name under `~/.claude/projects/` from the
+/// current working directory.
+///
+/// Claude Code stores session logs under `~/.claude/projects/<slug>/`, where
+/// `<slug>` is the absolute workspace path with `/` replaced by `-`.
+fn project_dir_from_cwd(cwd: &Path) -> Option<PathBuf> {
+    let abs = std::fs::canonicalize(cwd).ok()?;
+    let slug = abs.to_str()?.replace('/', "-");
+    home_dir().map(|h| h.join(".claude/projects").join(slug))
 }
 
 /// 将 token 数格式化为紧凑的人类可读表示。

@@ -2090,6 +2090,7 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
         started_at,
         started_sys,
         &warp_session,
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     );
 }
 
@@ -2104,6 +2105,7 @@ fn finalize_agent_exit(
     started_at: std::time::Instant,
     started_sys: std::time::SystemTime,
     warp_session: &Option<warp::WarpSession>,
+    cwd: &Path,
 ) -> ! {
     let exit_code = exit_code_from(status);
     let termination = format_exit_status(status);
@@ -2141,7 +2143,7 @@ pub(crate) fn finalize_exit_common(
     let duration = started_at.elapsed();
 
     // 从 agent 日志中提取本次会话的 token 用量
-    let tokens = stats::count_recent_session_tokens(agent_id, started_sys);
+    let tokens = stats::count_recent_session_tokens(agent_id, started_sys, cwd);
 
     println!();
     println!(

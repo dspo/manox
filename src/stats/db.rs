@@ -502,6 +502,7 @@ mod tests {
             is_sidechain: false,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         }
     }
 
@@ -547,6 +548,7 @@ mod tests {
                 is_sidechain: false,
                 session_id: None,
                 message_id: None,
+                timestamp_secs: None,
             },
         ];
         let inserted = insert_file_messages(&conn, &entries, "/test/file.jsonl").unwrap();
@@ -580,6 +582,7 @@ mod tests {
             is_sidechain: false,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         };
         let bigger = RawEntry {
             agent: "codex".to_string(),
@@ -595,6 +598,7 @@ mod tests {
             is_sidechain: false,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         };
         // 先插入小的，再插入大的 → 大的替换小的
         insert_file_messages(&conn, &[smaller.clone()], "/file1.jsonl").unwrap();
@@ -623,6 +627,7 @@ mod tests {
             is_sidechain: false,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         };
         let replay = RawEntry {
             agent: "claude".to_string(),
@@ -638,6 +643,7 @@ mod tests {
             is_sidechain: true,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         };
         // 先插入 parent，再插入 sidechain replay → replay 不应替换 parent
         insert_file_messages(&conn, &[parent.clone()], "/file1.jsonl").unwrap();
@@ -665,6 +671,7 @@ mod tests {
             is_sidechain: true,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         };
         let parent = RawEntry {
             agent: "claude".to_string(),
@@ -680,6 +687,7 @@ mod tests {
             is_sidechain: false,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         };
         // 先插入 sidechain，再插入 parent → parent 替换 sidechain
         insert_file_messages(&conn, &[replay], "/file1.jsonl").unwrap();
@@ -707,6 +715,7 @@ mod tests {
             is_sidechain: false,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         };
         let e2 = RawEntry {
             agent: "x".to_string(),
@@ -722,6 +731,7 @@ mod tests {
             is_sidechain: false,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         };
         insert_file_messages(&conn, &[e1, e2], "/file.jsonl").unwrap();
 
@@ -753,6 +763,7 @@ mod tests {
             is_sidechain: false,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         }];
         insert_file_messages(&conn, &updated, "/test/file.jsonl").unwrap();
         mark_file_scanned(&conn, "/test/file.jsonl", 1001, 200, 200, None).unwrap();
@@ -780,6 +791,7 @@ mod tests {
             is_sidechain: false,
             session_id: None,
             message_id: None,
+            timestamp_secs: None,
         }];
         insert_file_messages(&conn, &active_entries, "/active/file.jsonl").unwrap();
         mark_file_scanned(&conn, "/active/file.jsonl", 1000, 200, 200, None).unwrap();
@@ -983,6 +995,7 @@ mod tests {
                 is_sidechain: false,
                 session_id: None,
                 message_id: None,
+                timestamp_secs: None,
             },
             RawEntry {
                 agent: "claude".to_string(),
@@ -998,6 +1011,7 @@ mod tests {
                 is_sidechain: false,
                 session_id: None,
                 message_id: None,
+                timestamp_secs: None,
             },
         ];
         insert_file_messages(&conn, &entries, "/test/claude.jsonl").unwrap();
@@ -1026,6 +1040,7 @@ mod tests {
                 is_sidechain: false,
                 session_id: None,
                 message_id: None,
+                timestamp_secs: None,
             },
             RawEntry {
                 agent: "claude".to_string(),
@@ -1041,6 +1056,7 @@ mod tests {
                 is_sidechain: false,
                 session_id: None,
                 message_id: None,
+                timestamp_secs: None,
             },
         ];
         insert_file_messages(&conn, &entries, "/test/minimax.jsonl").unwrap();
@@ -1069,6 +1085,7 @@ mod tests {
                 is_sidechain: false,
                 session_id: None,
                 message_id: None,
+                timestamp_secs: None,
             },
             RawEntry {
                 agent: "claude".to_string(),
@@ -1084,6 +1101,7 @@ mod tests {
                 is_sidechain: false,
                 session_id: None,
                 message_id: None,
+                timestamp_secs: None,
             },
         ];
         insert_file_messages(&conn, &entries, "/test/glm.jsonl").unwrap();

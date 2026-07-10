@@ -113,6 +113,7 @@ fn parse_one(v: &Value, agent: &str, session_id: Option<&str>) -> Option<RawEntr
         is_sidechain: false,
         session_id: session_id.map(str::to_string),
         message_id: v.get("id").and_then(Value::as_str).map(str::to_string),
+        timestamp_secs: None,
     })
 }
 

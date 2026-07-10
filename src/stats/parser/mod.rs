@@ -54,6 +54,10 @@ pub(super) struct RawEntry {
     /// 消息标识（可选，来自源数据中的自然 ID）。
     #[serde(default)]
     pub(super) message_id: Option<String>,
+    /// Unix timestamp (seconds since epoch) extracted from the source timestamp.
+    /// Used for session-scoped token filtering in the exit summary.
+    #[serde(default)]
+    pub(super) timestamp_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]

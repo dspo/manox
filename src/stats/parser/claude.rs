@@ -10,7 +10,7 @@
 use serde_json::Value;
 
 use super::{RawEntry, u64_field};
-use crate::stats::date::date_field;
+use crate::stats::date::{date_field, timestamp_secs_from_iso};
 
 const AGENT: &str = super::super::AGENT_CLAUDE;
 
@@ -65,6 +65,11 @@ fn parse_one(v: &Value) -> Option<RawEntry> {
 
     let date = date_field(v.get("timestamp"))?;
 
+    let timestamp_secs = v
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(timestamp_secs_from_iso);
+
     let input_tokens = u64_field(usage, "input_tokens");
     let cache_read = u64_field(usage, "cache_read_input_tokens");
     let cache_create = u64_field(usage, "cache_creation_input_tokens");
@@ -96,6 +101,7 @@ fn parse_one(v: &Value) -> Option<RawEntry> {
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_string),
+        timestamp_secs,
     })
 }
 
@@ -148,6 +154,7 @@ mod tests {
         assert!(e.dedup_primary.is_none());
         assert!(e.dedup_secondary.is_none());
         assert!(!e.is_sidechain);
+        assert_eq!(e.timestamp_secs, Some(1_779_885_296)); // 2026-05-27T12:34:56Z
     }
 
     #[test]
