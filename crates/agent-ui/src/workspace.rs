@@ -7,7 +7,7 @@
 //!
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -31,15 +31,13 @@ use gpui_component::{
     TITLE_BAR_HEIGHT, Theme, TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Paste},
     menu::{PopupMenu, PopupMenuItem},
     tab::{Tab, TabBar},
     tag::{Tag, TagVariant},
     v_flex,
 };
 use manox_components::markdown::Markdown;
-
-use composer::{ComposerEvent, ComposerInput};
 
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
 use crate::views::centered;
@@ -122,7 +120,11 @@ pub struct Workspace {
     background_threads: Vec<Entity<Thread>>,
     sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
-    pub(crate) input_state: Entity<ComposerInput>,
+    pub(crate) input_state: Entity<InputState>,
+    /// Per-thread unsent composer text, keyed by thread id. Saved when
+    /// switching away and restored on return, so each thread keeps its own
+    /// in-progress draft instead of a single shared input bleeding across.
+    drafts: HashMap<String, String>,
     /// Right-side markdown composer; opened via the `ToggleEditor` shortcut.
     /// Plain-text edit mode by default; `ToggleEditorPreview` switches to a
     /// rendered markdown preview (`Markdown`).
@@ -367,7 +369,7 @@ impl Workspace {
         };
 
         let input_state = cx.new(|cx| {
-            ComposerInput::new(window, cx)
+            InputState::new(window, cx)
                 .multi_line(true)
                 .auto_grow(4, 12)
                 .submit_on_enter(true)
@@ -393,6 +395,7 @@ impl Workspace {
             sidebar,
             conversation: cx.new(|_| ConversationState::new()),
             input_state,
+            drafts: HashMap::new(),
             editor_state,
             editor_open: false,
             editor_preview: false,
@@ -450,7 +453,7 @@ impl Workspace {
             outline_hover: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
-        ws.sidebar_sub = Some(ws.subscribe_sidebar(cx));
+        ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
         ws.editor_sub = Some(ws.subscribe_editor(window, cx));
         // Focus the composer so typing works immediately on the hero screen.
@@ -819,23 +822,27 @@ impl Workspace {
         )
     }
 
-    fn subscribe_sidebar(&self, cx: &mut Context<Self>) -> Subscription {
+    fn subscribe_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
         let sidebar = self.sidebar.clone();
-        cx.subscribe(&sidebar, |this, _sidebar, ev: &SidebarEvent, cx| match ev {
-            SidebarEvent::NewThread => this.start_new_thread(cx),
-            SidebarEvent::OpenPlugins => this.enter_plugins(cx),
-            SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), cx),
-            SidebarEvent::ArchiveThread(id, archived) => {
-                let store = agent::thread_store_global();
-                store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
-                // Sync the in-memory flag so the title-bar menu label stays
-                // fresh when the sidebar archives the currently active thread.
-                if this.thread.read(cx).id.0 == *id {
-                    this.thread
-                        .update(cx, |t, cx| t.set_archived(*archived, cx));
+        cx.subscribe_in(
+            &sidebar,
+            window,
+            |this, _sidebar, ev: &SidebarEvent, window, cx| match ev {
+                SidebarEvent::NewThread => this.start_new_thread(window, cx),
+                SidebarEvent::OpenPlugins => this.enter_plugins(cx),
+                SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
+                SidebarEvent::ArchiveThread(id, archived) => {
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
+                    // Sync the in-memory flag so the title-bar menu label stays
+                    // fresh when the sidebar archives the currently active thread.
+                    if this.thread.read(cx).id.0 == *id {
+                        this.thread
+                            .update(cx, |t, cx| t.set_archived(*archived, cx));
+                    }
                 }
-            }
-        })
+            },
+        )
     }
 
     /// Switch into the Settings overlay. The Settings view is created lazily on
@@ -966,13 +973,12 @@ impl Workspace {
         cx.subscribe_in(
             &input,
             window,
-            |this, _, ev: &ComposerEvent, window, cx| match ev {
-                ComposerEvent::PressEnter => this.submit_input(window, cx),
-                ComposerEvent::Change => this.sync_slash_menu(window, cx),
-                ComposerEvent::PastedImage(image) => {
-                    this.handle_pasted_image(image.clone(), cx);
-                }
-                ComposerEvent::Focus | ComposerEvent::Blur => {}
+            |this, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { shift: false, .. } => this.submit_input(window, cx),
+                // Shift+Enter inserts a newline inside the input and does not submit.
+                InputEvent::PressEnter { shift: true, .. } => {}
+                InputEvent::Change => this.sync_slash_menu(window, cx),
+                InputEvent::Focus | InputEvent::Blur => {}
             },
         )
     }
@@ -1106,10 +1112,23 @@ impl Workspace {
     }
 
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
-    fn attach_thread(&mut self, new_thread: Entity<Thread>, cx: &mut Context<Self>) {
+    fn attach_thread(
+        &mut self,
+        new_thread: Entity<Thread>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let old_thread = self.thread.clone();
         let old_id = old_thread.read(cx).id.0.clone();
         let new_id = new_thread.read(cx).id.0.clone();
+
+        // Save the outgoing thread's unsent composer text before switching, so
+        // a draft survives a round-trip through another thread (Bug 1). A
+        // thread that just submitted already cleared its input, storing "".
+        self.drafts.insert(
+            old_id.clone(),
+            self.input_state.read(cx).value().to_string(),
+        );
 
         // If the old thread is still running a turn, park it in the background
         // so its `run_turn_loop` task stays alive (the entity is otherwise only
@@ -1135,9 +1154,19 @@ impl Workspace {
         let usage = self.thread.read(cx).request_token_usage().clone();
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
-        let new_conv = cx
-            .new(|cx| ConversationState::rebuild_from_messages(&messages, &usage, &role, weak, cx));
+        let running = self.thread.read(cx).is_running();
+        let new_conv = cx.new(|cx| {
+            ConversationState::rebuild_from_messages(&messages, &usage, &role, running, weak, cx)
+        });
         self.conversation = new_conv;
+        // Restore the incoming thread's saved draft, or clear the input if it
+        // has none — without this the previous thread's text would bleed into
+        // the new one (Bug 1). `set_value` is silent (no Change event), so
+        // re-sync the slash menu by hand in case the draft begins with `/`.
+        let saved = self.drafts.remove(&new_id).unwrap_or_default();
+        self.input_state
+            .update(cx, |s, cx| s.set_value(saved, window, cx));
+        self.sync_slash_menu(window, cx);
         // Rebuild the list state for the new thread: `reset` drops the old
         // thread's measured heights and scroll position, then reveal the latest
         // turn once. A running thread keeps following the tail; a completed
@@ -1202,13 +1231,13 @@ impl Workspace {
         }
     }
 
-    fn start_new_thread(&mut self, cx: &mut Context<Self>) {
+    fn start_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let new = Thread::new(id, self.cwd.clone(), cx);
-        self.attach_thread(new, cx);
+        self.attach_thread(new, window, cx);
     }
 
-    fn open_thread(&mut self, id: String, cx: &mut Context<Self>) {
+    fn open_thread(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         // If the thread is already running in the background, reclaim it
         // instead of loading a stale snapshot from the db.
         if let Some(pos) = self
@@ -1217,14 +1246,14 @@ impl Workspace {
             .position(|t| t.read(cx).id.0 == id)
         {
             let thread = self.background_threads.remove(pos);
-            self.attach_thread(thread, cx);
+            self.attach_thread(thread, window, cx);
             return;
         }
         let store = self.sidebar.read(cx).store();
         let Some(loaded) = store.update(cx, |s, cx| s.load_thread(&id, cx)) else {
             return;
         };
-        self.attach_thread(loaded, cx);
+        self.attach_thread(loaded, window, cx);
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3052,7 +3081,37 @@ impl Workspace {
         v_flex()
             .w_full()
             .gap_2()
-            .child(self.input_state.clone())
+            // Own paste at the capture phase so a clipboard image becomes a
+            // pending attachment instead of letting `InputState::paste` insert
+            // the image's alt-text. `stop_propagation` keeps the inner input's
+            // text-paste handler from also running; text is inserted via the
+            // public `replace` so the slash-menu `/` re-check still fires.
+            .capture_action(cx.listener(|this, _: &Paste, window, cx| {
+                cx.stop_propagation();
+                let Some(clipboard) = cx.read_from_clipboard() else {
+                    return;
+                };
+                let entries = clipboard.entries();
+                let has_image = entries
+                    .iter()
+                    .any(|e| matches!(e, gpui::ClipboardEntry::Image(_)));
+                if has_image {
+                    for entry in entries {
+                        if let gpui::ClipboardEntry::Image(image) = entry {
+                            this.handle_pasted_image(image.clone(), cx);
+                        }
+                    }
+                    cx.notify();
+                } else {
+                    let text = clipboard.text().unwrap_or_default();
+                    if !text.is_empty() {
+                        this.input_state
+                            .update(cx, |state, cx| state.replace(text, window, cx));
+                        this.sync_slash_menu(window, cx);
+                    }
+                }
+            }))
+            .child(Input::new(&self.input_state).appearance(false))
             .child(
                 h_flex()
                     .w_full()
@@ -5173,16 +5232,21 @@ impl Workspace {
         has
     }
 
-    pub(crate) fn harness_new_thread(&mut self, cx: &mut Context<Self>) {
-        self.start_new_thread(cx);
+    pub(crate) fn harness_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_new_thread(window, cx);
     }
 
-    pub(crate) fn harness_open_thread(&mut self, id: String, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn harness_open_thread(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let store = self.sidebar.read(cx).store();
         let Some(loaded) = store.update(cx, |s, cx| s.load_thread(&id, cx)) else {
             return false;
         };
-        self.attach_thread(loaded, cx);
+        self.attach_thread(loaded, window, cx);
         true
     }
 }

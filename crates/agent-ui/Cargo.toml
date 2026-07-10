@@ -25,7 +25,6 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 
 agent.workspace = true
-composer.workspace = true
 terminal.workspace = true
 terminal-ui.workspace = true
 manox-components.workspace = true

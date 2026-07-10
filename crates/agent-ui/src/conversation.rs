@@ -733,10 +733,11 @@ impl ConversationState {
         messages: &[Message],
         usage: &std::collections::HashMap<String, TokenUsage>,
         role: &str,
+        running: bool,
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Self {
-        let plain = build_items(messages, usage);
+        let plain = build_items(messages, usage, running);
         let items = plain
             .into_iter()
             .enumerate()
@@ -779,7 +780,7 @@ mod tests {
                 content: "file contents here".to_string(),
             })]),
         ];
-        let items = build_items(&messages, &std::collections::HashMap::new());
+        let items = build_items(&messages, &std::collections::HashMap::new(), false);
         let tool = items
             .iter()
             .find_map(|i| match i {
@@ -807,7 +808,7 @@ mod tests {
                 content: "boom".to_string(),
             }),
         ])];
-        let items = build_items(&messages, &std::collections::HashMap::new());
+        let items = build_items(&messages, &std::collections::HashMap::new(), false);
         let tool = items
             .iter()
             .find_map(|i| match i {
@@ -851,7 +852,7 @@ mod tests {
                 content: envelope,
             })]),
         ];
-        let items = build_items(&messages, &std::collections::HashMap::new());
+        let items = build_items(&messages, &std::collections::HashMap::new(), false);
         let task = items
             .iter()
             .find_map(|i| match i {

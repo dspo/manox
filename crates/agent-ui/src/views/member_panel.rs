@@ -57,7 +57,14 @@ impl MemberPanel {
         let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
         let weak_ws = weak_workspace.clone();
         let conversation = cx.new(|cx| {
-            ConversationState::rebuild_from_messages(&messages, &empty_usage, &role, weak_ws, cx)
+            ConversationState::rebuild_from_messages(
+                &messages,
+                &empty_usage,
+                &role,
+                false,
+                weak_ws,
+                cx,
+            )
         });
 
         let panel = cx.new(|_| Self {
