@@ -4248,14 +4248,27 @@ impl Render for Workspace {
         // The inline composer stays visible while inline AskUserQuestion cards
         // are open; submitting text resolves the ask as a free-form response.
         // The editor pane still hides the inline composer while editing there.
-        // Composer alignment: shift the footer content right by half the
-        // outline-rail width so the input box shares the message list's
-        // center axis. The hero (first screen) has no outline rail, so it
-        // always uses zero offset.
+        // Compute main-column body width and env-card visibility early —
+        // both the footer (composer alignment) and the main-column child
+        // closure need them. Lifting here avoids recomputing inside the
+        // closure.
+        let main_body_w =
+            window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
+        let show_env = !editor_open
+            && !first_screen
+            && self.thread.read(cx).has_interacted()
+            && main_body_w >= px(ENV_CARD_MIN_MAIN_W);
+        // Composer alignment: the message list's center axis is offset from
+        // the main-column center by (left_gutter - right_gutter) / 2, where
+        // left_gutter = OUTLINE_RAIL_WIDTH (always present when the footer
+        // is shown) and right_gutter = ENV_CONTENT_INSET when the env card
+        // is visible, else 0. The hero (first screen) has no outline rail,
+        // so it always uses zero offset.
         let composer_offset = if agent::settings::load().composer_alignment
             == agent::settings::ComposerAlignment::MessageList
         {
-            px(OUTLINE_RAIL_WIDTH / 2.0)
+            let right_gutter = if show_env { px(ENV_CONTENT_INSET) } else { px(0.) };
+            (px(OUTLINE_RAIL_WIDTH) - right_gutter) / 2.0
         } else {
             px(0.)
         };
@@ -4581,12 +4594,6 @@ impl Render for Workspace {
                 // the live window size (sidebar + its divider are the only
                 // siblings when the editor pane is closed, which the
                 // `!editor_open` term already guarantees).
-                let main_body_w =
-                    window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
-                let show_env = !editor_open
-                    && !first_screen
-                    && self.thread.read(cx).has_interacted()
-                    && main_body_w >= px(ENV_CARD_MIN_MAIN_W);
                 v_flex()
                     .flex_1()
                     .h_full()
