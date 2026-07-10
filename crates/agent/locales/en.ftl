@@ -64,6 +64,44 @@ status-continued = Continued
 status-error = Error
 status-denied = Denied
 
+### views/message.rs — Thinking status row
+thinking-live = Thinking for { $count }s
+thinking-done = Thought for { $count }s
+thinking-done-label = Thought
+thinking-tool-result = tool result
+thinking-reading = { $count ->
+    [one] reading {$count} file
+   *[other] reading {$count} files
+}
+thinking-writing = { $count ->
+    [one] writing {$count} file
+   *[other] writing {$count} files
+}
+thinking-editing = { $count ->
+    [one] editing {$count} file
+   *[other] editing {$count} files
+}
+thinking-running = { $count ->
+    [one] running {$count} shell command
+   *[other] running {$count} shell commands
+}
+thinking-searching = { $count ->
+    [one] searching {$count} pattern
+   *[other] searching {$count} patterns
+}
+thinking-globbing = { $count ->
+    [one] matching {$count} glob
+   *[other] matching {$count} globs
+}
+thinking-listing = { $count ->
+    [one] listing {$count} directory
+   *[other] listing {$count} directories
+}
+thinking-other = { $count ->
+    [one] {$count} other tool
+   *[other] {$count} other tools
+}
+
 ### views/settings.rs
 settings-group-general = General
 settings-item-general = General

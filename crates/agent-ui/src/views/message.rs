@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::thread::ApprovalMode;
@@ -33,6 +34,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::Input,
+    spinner::Spinner,
     tag::{Tag, TagVariant},
     v_flex,
 };
@@ -42,7 +44,9 @@ use manox_components::markdown::{HeadingMode, Markdown};
 use manox_components::turn_frame::TurnFrame;
 
 use crate::Workspace;
-use crate::conversation::{AgentTaskItem, ConvItem, ToolCallItem, UserImage, UserTurnMeta};
+use crate::conversation::{
+    AgentTaskItem, ConvItem, ThinkingContainer, ToolCallItem, UserImage, UserTurnMeta,
+};
 use crate::views::centered;
 use crate::workspace::AskCardSnapshot;
 
@@ -249,6 +253,28 @@ impl MessageItem {
                 *streaming = false;
                 *collapsed = !*user_toggled;
             }
+            ConvItem::Thinking(t) => {
+                // Fallback freeze: `recompute_streaming` already pins the
+                // elapsed at the batch's real completion moment; this only
+                // fires for a container that went terminal without a
+                // `ToolResult` (an aborted/error path) so "Thought for Xs"
+                // never re-reads the still-growing `started_at.elapsed()` on a
+                // later manual expand.
+                if t.frozen_secs.is_none() {
+                    t.frozen_secs = Some(t.started_at.elapsed().as_secs());
+                }
+                t.streaming = false;
+                for entry in &mut t.entries {
+                    entry.streaming = false;
+                    if matches!(
+                        entry.status,
+                        ToolCallStatus::Success | ToolCallStatus::Error | ToolCallStatus::Denied
+                    ) {
+                        entry.collapsed = !entry.user_toggled;
+                    }
+                }
+                t.collapsed = !t.user_toggled;
+            }
             ConvItem::ToolCall(t) => {
                 t.streaming = false;
                 if matches!(
@@ -353,12 +379,17 @@ pub fn render_item(
             tool_ctx,
             blocks,
         ),
+        ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx),
         ConvItem::ToolCall(t) => {
             if t.name == "exit_plan_mode" {
                 render_plan_card(t, ix, theme, tool_ctx)
             } else if t.name == "AskUserQuestion" {
                 render_ask_user_card(t, ix, theme, tool_ctx)
             } else {
+                // Ordinary tool calls fold into `Thinking`; a top-level
+                // ToolCall here is the answered-state fallback for an
+                // `AskUserQuestion` whose interactive snapshot is gone, or a
+                // defensive orphan — render it as a plain card.
                 render_tool_call(t, ix, theme, tool_ctx)
             }
         }
@@ -967,125 +998,268 @@ fn lang_hint_for_tool(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Render a tool-call card: title + status icon + copy button + (collapsible)
-/// monospace output. While streaming the body is always shown so the user can
-/// watch the output land; once a terminal status arrives the body auto-folds
-/// to a single-line card unless the user pre-toggled it open.
-pub fn render_tool_call(
-    item: &ToolCallItem,
+/// Render a folded batch of tool calls as one Claude Code–style Thinking status
+/// line. The header carries a spinner (while live) or a static dot, the
+/// elapsed-time label, and aggregated action counts; clicking toggles between
+/// the summary (plus the most recent `⎿` entry) and the full `⎿` list. Each
+/// entry is itself a one-line summary that expands to its full tool output.
+pub fn render_thinking(
+    t: &ThinkingContainer,
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
-    use agent::ToolCallStatus;
-    let (status_color, status_label): (gpui::Hsla, SharedString) = match item.status {
-        ToolCallStatus::PendingApproval => (theme.muted_foreground, i18n::t("status-pending")),
-        ToolCallStatus::Running => (theme.muted_foreground, i18n::t("status-running")),
-        ToolCallStatus::Success => (theme.success, i18n::t("status-success")),
-        ToolCallStatus::Continued => (theme.muted_foreground, i18n::t("status-continued")),
-        ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
-        ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
-    };
-
-    let title = if item.title.is_empty() {
-        item.name.clone()
+    let label = if t.streaming {
+        i18n::t_count("thinking-live", t.started_at.elapsed().as_secs() as i64)
     } else {
-        item.title.clone()
+        // Use the frozen terminal duration; for a freshly rebuilt historical
+        // container this is `None` and the label degrades to a bare "Thought".
+        match t.frozen_secs {
+            Some(secs) => i18n::t_count("thinking-done", secs as i64),
+            None => i18n::t("thinking-done-label"),
+        }
     };
-
-    let show_body = item.streaming || !item.collapsed;
-    let chevron = if item.collapsed {
+    let summary = thinking_summary(&t.entries);
+    let chevron = if t.collapsed {
         IconName::ChevronRight
     } else {
         IconName::ChevronDown
     };
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+    let ix_click = ix;
 
-    let id_for_toggle = item.id.clone();
+    let mut header = h_flex()
+        .id(("thinking-header", ix))
+        .gap_1p5()
+        .items_center()
+        .cursor_pointer()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .on_click(move |_, _window, cx: &mut App| {
+            let Some(weak) = weak_workspace.clone() else {
+                return;
+            };
+            let _ = weak.update(cx, |w, cx| {
+                let conv = w.conversation.clone();
+                conv.update(cx, |c, cx| {
+                    if let Some(item) = c.items().get(ix_click) {
+                        item.update(cx, |item, cx| {
+                            if let ConvItem::Thinking(t) = item.kind_mut() {
+                                t.collapsed = !t.collapsed;
+                                t.user_toggled = true;
+                            }
+                            cx.notify();
+                        });
+                    }
+                });
+                cx.notify();
+            });
+        });
+    // A spinning loader while the batch is live; a static muted dot once frozen.
+    if t.streaming {
+        header = header.child(Spinner::new().xsmall().color(theme.muted_foreground));
+    } else {
+        header = header.child(
+            gpui::div()
+                .w(px(6.))
+                .h(px(6.))
+                .rounded_full()
+                .bg(theme.muted_foreground.opacity(0.5)),
+        );
+    }
+    header = header.child(label);
+    if !summary.is_empty() {
+        header = header.child(gpui::div().child(summary));
+    }
+    header = header.child(gpui::div().flex_1());
+    header = header.child(Icon::new(chevron).xsmall());
+
+    let mut block = v_flex()
+        .group(format!("thinking-{ix}"))
+        .w_full()
+        .gap_1()
+        .child(header);
+    // Collapsed shows only the most recent entry (the "what's happening right
+    // now" line); expanded lists every entry in arrival order.
+    let visible: &[ToolCallItem] = if t.collapsed {
+        let start = t.entries.len().saturating_sub(1);
+        &t.entries[start..]
+    } else {
+        &t.entries[..]
+    };
+    if !visible.is_empty() {
+        block = block.child(
+            v_flex().pl_3().gap_0p5().children(
+                visible
+                    .iter()
+                    .enumerate()
+                    .map(|(eix, e)| render_activity_entry(e, eix, theme, tool_ctx)),
+            ),
+        );
+    }
+    block.into_any_element()
+}
+
+/// Render one `⎿` entry of a Thinking batch: a single-line summary (status
+/// icon + tool title) that expands to the full tool output on click. The
+/// container index isn't needed for element ids — each `MessageItem` entity
+/// namespaces its own ids, so the entry index alone is unique within a batch.
+fn render_activity_entry(
+    e: &ToolCallItem,
+    eix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
+    use agent::ToolCallStatus;
+    let (status_icon, status_color) = match e.status {
+        ToolCallStatus::PendingApproval | ToolCallStatus::Running => {
+            (IconName::LoaderCircle, theme.muted_foreground)
+        }
+        // `Continued` is exit_plan_mode-specific and never folds into a batch,
+        // but the match stays exhaustive; grouped with the success-like
+        // outcomes so a hypothetical entry reads as completed, not errored.
+        ToolCallStatus::Success | ToolCallStatus::Continued => {
+            (IconName::CircleCheck, theme.success)
+        }
+        ToolCallStatus::Error | ToolCallStatus::Denied => (IconName::CircleX, theme.danger),
+    };
+    let show_output = e.streaming || !e.collapsed;
+    let entry_chevron = if e.collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    };
+    // `title` falls back to `name`, then to a generic label so an orphan
+    // `ToolResult` (no matching `ToolCall`, so neither is populated — the
+    // live event carries no tool_name) still renders a visible `⎿` row.
+    let title = if !e.title.is_empty() {
+        e.title.clone()
+    } else if !e.name.is_empty() {
+        e.name.clone()
+    } else {
+        i18n::t("thinking-tool-result").to_string()
+    };
+    let id_for_toggle = e.id.clone();
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
 
-    let mut card = v_flex()
-        .group(format!("tool-{ix}"))
-        .w_full()
-        // Tool-call chrome and output render as Lilex italic to set them apart
-        // from upright body text.
-        .italic()
-        .child(
-            h_flex()
-                .id(("tool-header", ix))
-                .w_full()
-                .px_2()
-                .py_1()
-                .gap_1p5()
-                .items_center()
-                .rounded(theme.radius)
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.secondary.opacity(0.5)))
-                .on_click(move |_, _window, cx: &mut App| {
-                    let Some(weak) = weak_workspace.clone() else {
-                        return;
-                    };
-                    let _ = weak.update(cx, |w, cx| {
-                        let id = id_for_toggle.clone();
-                        let conv = w.conversation.clone();
-                        conv.update(cx, |c, cx| {
-                            if let Some(ix) = c.find_tool(&id, &*cx)
-                                && let Some(item) = c.items().get(ix)
-                            {
-                                item.update(cx, |item, cx| {
-                                    if let ConvItem::ToolCall(t) = item.kind_mut() {
-                                        t.collapsed = !t.collapsed;
-                                        t.user_toggled = true;
-                                    }
-                                    cx.notify();
-                                });
-                            }
-                        });
-                        cx.notify();
+    // Italic to match #140's "tool-call chrome renders as Lilex italic" — the
+    // `⎿` entry is the per-tool successor to the old `render_tool_call` card.
+    let mut row = v_flex().w_full().italic().child(
+        h_flex()
+            .id(("act-header", eix))
+            .w_full()
+            .px_2()
+            .py_0p5()
+            .gap_1p5()
+            .items_center()
+            .rounded(theme.radius)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+            .on_click(move |_, _window, cx: &mut App| {
+                let Some(weak) = weak_workspace.clone() else {
+                    return;
+                };
+                let _ = weak.update(cx, |w, cx| {
+                    let id = id_for_toggle.clone();
+                    let conv = w.conversation.clone();
+                    conv.update(cx, |c, cx| {
+                        if let Some((cix, eix)) = c.find_thinking_entry(&id, &*cx)
+                            && let Some(item) = c.items().get(cix)
+                        {
+                            item.update(cx, |item, cx| {
+                                if let ConvItem::Thinking(t) = item.kind_mut()
+                                    && let Some(entry) = t.entries.get_mut(eix)
+                                {
+                                    entry.collapsed = !entry.collapsed;
+                                    entry.user_toggled = true;
+                                }
+                                cx.notify();
+                            });
+                        }
                     });
-                })
-                .child(
-                    Icon::new(chevron)
-                        .xsmall()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .text_xs()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.muted_foreground)
-                        .child(truncate(&title, 80)),
-                )
-                .child(copy_button_hoverable(
-                    ix,
-                    "copy-tool",
-                    format!("tool-{ix}"),
-                    item.output.clone(),
-                ))
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(status_color)
-                        .child(status_label),
-                ),
-        );
+                    cx.notify();
+                });
+            })
+            .child(gpui::div().text_color(theme.muted_foreground).child("⎿"))
+            .child(Icon::new(status_icon).xsmall().text_color(status_color))
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.muted_foreground)
+                    .child(truncate(&title, 80)),
+            )
+            .child(
+                Icon::new(entry_chevron)
+                    .xsmall()
+                    .text_color(theme.muted_foreground),
+            ),
+    );
 
-    let display_output = if item.streaming {
-        live_tail(&item.output)
+    let display_output = if e.streaming {
+        live_tail(&e.output)
     } else {
-        item.output.clone()
+        e.output.clone()
     };
 
-    if show_body && !display_output.is_empty() {
-        card = card.child(render_tool_output(
+    if show_output && !display_output.is_empty() {
+        row = row.child(render_tool_output(
             &display_output,
-            &item.name,
-            item.streaming,
-            ix,
+            &e.name,
+            e.streaming,
+            eix,
             theme,
         ));
     }
-    card.into_any_element()
+    row.into_any_element()
+}
+
+/// Aggregate a batch's tool calls into a comma-joined summary like
+/// "reading 2 files, running 1 shell command". Each category is localized with
+/// its count; categories with zero calls are omitted. Trailing "…" mirrors the
+/// Claude Code "still working" cadence.
+fn thinking_summary(entries: &[ToolCallItem]) -> String {
+    let mut reading = 0u32;
+    let mut writing = 0u32;
+    let mut editing = 0u32;
+    let mut running = 0u32;
+    let mut searching = 0u32;
+    let mut globbing = 0u32;
+    let mut listing = 0u32;
+    let mut other = 0u32;
+    for e in entries {
+        match e.name.as_str() {
+            "read_file" => reading += 1,
+            "write_file" => writing += 1,
+            "edit_file" => editing += 1,
+            "bash" => running += 1,
+            "grep" => searching += 1,
+            "glob" => globbing += 1,
+            "list_directory" => listing += 1,
+            _ => other += 1,
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let push = |count: u32, key: &str, parts: &mut Vec<String>| {
+        if count > 0 {
+            parts.push(i18n::t_count(key, count as i64).to_string());
+        }
+    };
+    push(reading, "thinking-reading", &mut parts);
+    push(writing, "thinking-writing", &mut parts);
+    push(editing, "thinking-editing", &mut parts);
+    push(searching, "thinking-searching", &mut parts);
+    push(globbing, "thinking-globbing", &mut parts);
+    push(listing, "thinking-listing", &mut parts);
+    push(running, "thinking-running", &mut parts);
+    push(other, "thinking-other", &mut parts);
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{}…", parts.join(", "))
+    }
 }
 
 fn render_ask_user_card(
@@ -1325,6 +1499,130 @@ fn render_ask_user_card(
         .child(response_block)
         .child(nav)
         .into_any_element()
+}
+
+/// Render a plain tool-call card: title + status icon + copy button + (collapsible)
+/// monospace output. Used only as the answered-state fallback for an
+/// `AskUserQuestion` whose interactive snapshot is gone (and the defensive
+/// orphan in `render_item`'s ToolCall dispatch). Ordinary tool calls no longer
+/// reach this path — they fold into a `Thinking` batch via `render_thinking`.
+pub fn render_tool_call(
+    item: &ToolCallItem,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
+    use agent::ToolCallStatus;
+    let (status_color, status_label): (gpui::Hsla, SharedString) = match item.status {
+        ToolCallStatus::PendingApproval => (theme.muted_foreground, i18n::t("status-pending")),
+        ToolCallStatus::Running => (theme.muted_foreground, i18n::t("status-running")),
+        ToolCallStatus::Success => (theme.success, i18n::t("status-success")),
+        ToolCallStatus::Continued => (theme.muted_foreground, i18n::t("status-continued")),
+        ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
+        ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
+    };
+
+    let title = if item.title.is_empty() {
+        item.name.clone()
+    } else {
+        item.title.clone()
+    };
+
+    let show_body = item.streaming || !item.collapsed;
+    let chevron = if item.collapsed {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronDown
+    };
+
+    let id_for_toggle = item.id.clone();
+    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
+
+    // Tool-call chrome and output render as Lilex italic to set them apart
+    // from upright body text (#140). This card is now only the AskUserQuestion
+    // answered-state fallback + the defensive orphan; ordinary tools fold into
+    // `render_activity_entry`, which carries the same italic.
+    let mut card = v_flex()
+        .group(format!("tool-{ix}"))
+        .w_full()
+        .italic()
+        .child(
+            h_flex()
+                .id(("tool-header", ix))
+                .w_full()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .items_center()
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+                .on_click(move |_, _window, cx: &mut App| {
+                    let Some(weak) = weak_workspace.clone() else {
+                        return;
+                    };
+                    let _ = weak.update(cx, |w, cx| {
+                        let id = id_for_toggle.clone();
+                        let conv = w.conversation.clone();
+                        conv.update(cx, |c, cx| {
+                            if let Some(ix) = c.find_tool(&id, &*cx)
+                                && let Some(item) = c.items().get(ix)
+                            {
+                                item.update(cx, |item, cx| {
+                                    if let ConvItem::ToolCall(t) = item.kind_mut() {
+                                        t.collapsed = !t.collapsed;
+                                        t.user_toggled = true;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(chevron)
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .text_xs()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(truncate(&title, 80)),
+                )
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-tool",
+                    format!("tool-{ix}"),
+                    item.output.clone(),
+                ))
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(status_color)
+                        .child(status_label),
+                ),
+        );
+
+    let display_output = if item.streaming {
+        live_tail(&item.output)
+    } else {
+        item.output.clone()
+    };
+
+    if show_body && !display_output.is_empty() {
+        card = card.child(render_tool_output(
+            &display_output,
+            &item.name,
+            item.streaming,
+            ix,
+            theme,
+        ));
+    }
+    card.into_any_element()
 }
 
 /// Render an `exit_plan_mode` tool-call as a plan card. The body uses
@@ -1823,9 +2121,15 @@ pub fn build_items(
                 }
             }
             Role::Assistant => {
+                // A contiguous run of ToolUse blocks within one assistant
+                // message is one model-response batch → one `ThinkingContainer`.
+                // Text/Thinking splits the run: flush the batch before pushing
+                // the prose, so prose and tool activity stay in arrival order.
+                let mut pending_batch: Vec<ToolCallItem> = Vec::new();
                 for c in &m.content {
                     match c {
                         MessageContent::Text(t) => {
+                            flush_thinking_batch(&mut items, &mut pending_batch);
                             items.push(ConvItem::Assistant {
                                 text: t.clone(),
                                 streaming: false,
@@ -1833,6 +2137,7 @@ pub fn build_items(
                             });
                         }
                         MessageContent::Thinking { text, .. } => {
+                            flush_thinking_batch(&mut items, &mut pending_batch);
                             items.push(ConvItem::Reasoning {
                                 text: text.clone(),
                                 streaming: false,
@@ -1842,6 +2147,10 @@ pub fn build_items(
                         }
                         MessageContent::ToolUse(tu) => {
                             if tu.name.as_ref() == "agent" {
+                                // Sub-agent tasks stay as standalone top-level
+                                // cards (their expand panel reuses the full
+                                // sub-conversation renderer); never folded.
+                                flush_thinking_batch(&mut items, &mut pending_batch);
                                 let title = agent::thread::tool_title(tu.name.as_ref(), &tu.input);
                                 items.push(ConvItem::AgentTask(AgentTaskItem {
                                     id: tu.id.clone(),
@@ -1853,6 +2162,24 @@ pub fn build_items(
                                     final_text: String::new(),
                                     is_error: false,
                                 }));
+                            } else if tu.name.as_ref() == "AskUserQuestion" {
+                                // An inline clarify card: stays a top-level
+                                // ToolCall so `render_ask_user_card` can drive
+                                // its interactive snapshot while pending; the
+                                // paired ToolResult stamps the user's answer
+                                // into `output`. Never folded into Thinking.
+                                flush_thinking_batch(&mut items, &mut pending_batch);
+                                items.push(ConvItem::ToolCall(ToolCallItem {
+                                    id: tu.id.clone(),
+                                    name: tu.name.to_string(),
+                                    title: agent::thread::tool_title(tu.name.as_ref(), &tu.input),
+                                    status: ToolCallStatus::PendingApproval,
+                                    output: String::new(),
+                                    is_error: false,
+                                    streaming: false,
+                                    collapsed: false,
+                                    user_toggled: false,
+                                }));
                             } else if tu.name.as_ref() == "exit_plan_mode" {
                                 // The plan body is the card's whole point; pull it
                                 // from the tool input so a reloaded thread shows the
@@ -1860,6 +2187,7 @@ pub fn build_items(
                                 // result. Expanded by default; a paired result only
                                 // stamps the verdict status, never overwrites the
                                 // plan body (see `pair_tool_result`).
+                                flush_thinking_batch(&mut items, &mut pending_batch);
                                 let plan_text = tu
                                     .input
                                     .get("plan")
@@ -1878,17 +2206,17 @@ pub fn build_items(
                                     user_toggled: false,
                                 }));
                             } else {
-                                items.push(ConvItem::ToolCall(ToolCallItem {
+                                pending_batch.push(ToolCallItem {
                                     id: tu.id.clone(),
                                     name: tu.name.to_string(),
-                                    title: tu.name.to_string(),
+                                    title: agent::thread::tool_title(tu.name.as_ref(), &tu.input),
                                     status: ToolCallStatus::Success,
                                     output: String::new(),
                                     is_error: false,
                                     streaming: false,
                                     collapsed: true,
                                     user_toggled: false,
-                                }));
+                                });
                             }
                         }
                         MessageContent::ToolResult(tr) => {
@@ -1901,6 +2229,7 @@ pub fn build_items(
                         // they cannot appear in an assistant turn. Reachable
                         // here only if a future caller mis-assigns the role.
                         MessageContent::Compaction(summary) => {
+                            flush_thinking_batch(&mut items, &mut pending_batch);
                             items.push(ConvItem::Recap {
                                 summary: summary.clone(),
                                 collapsed: true,
@@ -1909,6 +2238,7 @@ pub fn build_items(
                         }
                     }
                 }
+                flush_thinking_batch(&mut items, &mut pending_batch);
             }
             Role::System => {}
         }
@@ -1921,40 +2251,85 @@ pub fn build_items(
             ConvItem::Assistant { streaming, .. } | ConvItem::Reasoning { streaming, .. } => {
                 *streaming = true;
             }
+            ConvItem::Thinking(t) => {
+                // A resumed turn may still be mid-batch: mark the container
+                // live so later-arriving `ToolCall`/`ToolOutput` deltas fold
+                // into it instead of opening a fresh one.
+                t.streaming = true;
+            }
             _ => {}
         }
     }
     items
 }
 
+/// Emit the accumulated ToolUse run as a single folded `ThinkingContainer` and
+/// clear the accumulator. A no-op when the run is empty, so callers can flush
+/// at every prose/plan/agent boundary without tracking whether tools preceded
+/// it.
+fn flush_thinking_batch(items: &mut Vec<ConvItem>, batch: &mut Vec<ToolCallItem>) {
+    if batch.is_empty() {
+        return;
+    }
+    let entries = std::mem::take(batch);
+    items.push(ConvItem::Thinking(ThinkingContainer {
+        entries,
+        streaming: false,
+        collapsed: true,
+        user_toggled: false,
+        started_at: Instant::now(),
+        frozen_secs: None,
+    }));
+}
+
 /// Attach a tool_result to its matching item by id. Sub-agent results land in
-/// `AgentTaskItem::final_text`; ordinary tool results land in `ToolCallItem::output`.
-/// If no match exists, emit a standalone ToolCall result item.
+/// `AgentTaskItem::final_text`; `exit_plan_mode` results stamp only the verdict
+/// on the plan card; ordinary tool results stamp the entry inside the owning
+/// `ThinkingContainer`. A result with no matching ToolUse becomes a standalone
+/// single-entry `ThinkingContainer` so an orphan result still renders as a `⎿`.
 fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
     let status = if tr.is_error {
         ToolCallStatus::Error
     } else {
         ToolCallStatus::Success
     };
+    // Locate the owning item: an AgentTask, the exit_plan_mode plan card, or a
+    // Thinking-container entry. Remember the entry index for the Thinking path
+    // so we can stamp the right `⎿` inside its batch.
+    let mut thinking_eix: Option<usize> = None;
     let ix = items.iter().position(|i| match i {
         ConvItem::AgentTask(t) => t.id == tr.tool_use_id,
         ConvItem::ToolCall(t) => t.id == tr.tool_use_id,
+        ConvItem::Thinking(t) => match t.entries.iter().position(|e| e.id == tr.tool_use_id) {
+            Some(eix) => {
+                thinking_eix = Some(eix);
+                true
+            }
+            None => false,
+        },
         _ => false,
     });
     let Some(ix) = ix else {
-        items.push(ConvItem::ToolCall(ToolCallItem {
-            id: tr.tool_use_id.clone(),
-            name: tr.tool_name.to_string(),
-            title: String::new(),
-            status,
-            output: tr.content.clone(),
-            is_error: tr.is_error,
-            streaming: false,
-            collapsed: !matches!(
+        items.push(ConvItem::Thinking(ThinkingContainer {
+            entries: vec![ToolCallItem {
+                id: tr.tool_use_id.clone(),
+                name: tr.tool_name.to_string(),
+                title: tr.tool_name.to_string(),
                 status,
-                ToolCallStatus::Running | ToolCallStatus::PendingApproval
-            ),
+                output: tr.content.clone(),
+                is_error: tr.is_error,
+                streaming: false,
+                collapsed: !matches!(
+                    status,
+                    ToolCallStatus::Running | ToolCallStatus::PendingApproval
+                ),
+                user_toggled: false,
+            }],
+            streaming: false,
+            collapsed: false,
             user_toggled: false,
+            started_at: Instant::now(),
+            frozen_secs: None,
         }));
         return;
     };
@@ -1979,6 +2354,21 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
             t.status = status;
             if t.name.is_empty() {
                 t.name = tr.tool_name.to_string();
+            }
+        }
+        ConvItem::Thinking(t) => {
+            if let Some(eix) = thinking_eix
+                && let Some(entry) = t.entries.get_mut(eix)
+            {
+                entry.output = tr.content.clone();
+                entry.is_error = tr.is_error;
+                entry.status = status;
+                entry.streaming = false;
+                entry.collapsed = !entry.user_toggled;
+            }
+            t.recompute_streaming();
+            if !t.streaming {
+                t.collapsed = !t.user_toggled;
             }
         }
         _ => {}

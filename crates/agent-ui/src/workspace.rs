@@ -281,6 +281,15 @@ pub struct Workspace {
     /// self-terminates instead of notifying a stale chip. Mirrors
     /// `settings_transition_gen`.
     goal_ticker_gen: u64,
+    /// True while the active thread has a turn in flight, so the Thinking
+    /// status row's "for Xs" counter ticks every second. Set on `TurnStarted`,
+    /// cleared on a terminal `Stop`/`Error`. The ticker task polls this and
+    /// self-terminates when it goes false.
+    turn_active: bool,
+    /// Generation counter for the thinking elapsed-time ticker. Incremented
+    /// on every `TurnStarted` and on thread switch so a prior ticker
+    /// self-terminates instead of driving a stale container.
+    thinking_ticker_gen: u64,
     /// Lazily created on the first `enter_settings` call so we don't pay the
     /// cost when the user never opens Settings.
     settings_view: Option<Entity<SettingsView>>,
@@ -480,6 +489,8 @@ impl Workspace {
             goal_popover_open: false,
             team_chip_open: false,
             goal_ticker_gen: 0,
+            turn_active: false,
+            thinking_ticker_gen: 0,
             settings_view: None,
             settings_sub: None,
             plugin_manager_view: None,
@@ -571,6 +582,11 @@ impl Workspace {
                     let thread_id = this.thread.read(cx).id.0.clone();
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| s.mark_running(&thread_id, cx));
+                    // Drive the Thinking status row's per-second "for Xs"
+                    // counter while this turn is live. The ticker polls
+                    // `turn_active` and self-terminates on the terminal stop.
+                    this.turn_active = true;
+                    this.spawn_thinking_ticker(cx);
                 }
                 ThreadEvent::Stop(reason) => {
                     // A terminal state ends any pending plan approval (the
@@ -595,6 +611,7 @@ impl Workspace {
                         // Terminal stop → this thread is no longer running.
                         let store = agent::thread_store_global();
                         store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                        this.turn_active = false;
                         // Clean up background reference if this thread was parked.
                         this.background_threads
                             .retain(|t| t.read(cx).id.0 != thread_id);
@@ -649,6 +666,7 @@ impl Workspace {
                         let thread_id = this.thread.read(cx).id.0.clone();
                         let store = agent::thread_store_global();
                         store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                        this.turn_active = false;
                         this.background_threads
                             .retain(|t| t.read(cx).id.0 != thread_id);
                     }
@@ -1224,6 +1242,14 @@ impl Workspace {
         self.pending_plan = None;
         self.deferred_user_turn_after_plan_continue = None;
         self.thread_sub = Some(self.subscribe_thread(cx));
+        // The thinking ticker belongs to the outgoing thread: bump its
+        // generation so the old ticker self-terminates, then mirror the incoming
+        // thread's running state. A parked thread resumed mid-turn keeps the
+        // "for Xs" counter live; a completed history thread is idle.
+        self.turn_active = running;
+        if running {
+            self.spawn_thinking_ticker(cx);
+        }
         // If the new thread has pending authorizations (e.g. it was parked
         // while waiting for tool approval), re-surface them so the overlay
         // appears immediately upon switching back.
@@ -1231,6 +1257,32 @@ impl Workspace {
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id), cx));
         cx.notify();
+    }
+
+    /// Start (or restart) the per-second ticker that drives the Thinking status
+    /// row's "for Xs" counter. Bumping `thinking_ticker_gen` first invalidates
+    /// any prior ticker — it polls the generation and self-terminates when it
+    /// no longer matches, so a new turn or thread switch replaces the old task
+    /// instead of stacking a second one.
+    fn spawn_thinking_ticker(&mut self, cx: &mut Context<Self>) {
+        self.thinking_ticker_gen = self.thinking_ticker_gen.wrapping_add(1);
+        let entity = cx.entity().clone();
+        let ticker_gen = self.thinking_ticker_gen;
+        cx.spawn(async move |_this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let still = entity.read_with(cx, |this, _cx| {
+                    this.thinking_ticker_gen == ticker_gen && this.turn_active
+                });
+                if !still {
+                    break;
+                }
+                entity.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
     }
 
     /// Re-surface any pending authorizations on the current thread that were
