@@ -525,7 +525,7 @@ impl SettingsView {
                     .justify_center()
                     .child(
                         gpui::div()
-                            .text_xl()
+                            .text_base()
                             .text_color(theme.muted_foreground)
                             .child(coming_label),
                     )
