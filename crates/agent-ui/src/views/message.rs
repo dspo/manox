@@ -489,141 +489,154 @@ pub fn render_reasoning(
     block.into_any_element()
 }
 
-/// Render an error message + copy button.
-pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
-    v_flex()
-        .group(format!("error-{ix}"))
+/// Optional collapsible slot for `render_banner`: turns the label row into a
+/// click-toggle that shows/hides the body. Used by the recap card; `None` for
+/// the always-open banners (error / notice / team message / retry).
+struct CollapsibleBanner {
+    collapsed: bool,
+    on_click: Box<dyn Fn(&mut App) + 'static>,
+}
+
+/// Unified banner card: a label row (accent-colored label + optional icon,
+/// hover-revealed copy button, optional collapse chevron) over a foreground-
+/// tinted body. All five non-card banners (error / notice / team message /
+/// recap / retry) share this shape so only accent, label, icon, body, and
+/// collapse differ between them.
+// The parameter list is intentionally rich: each param maps to one slot the
+// five call sites need to differentiate (accent / label / icon / group /
+// copy / body / fold). Grouping them into a config struct would obscure the
+// per-call-site differences the unification is meant to make visible.
+#[allow(clippy::too_many_arguments)]
+fn render_banner(
+    accent: gpui::Hsla,
+    label: SharedString,
+    icon: Option<IconName>,
+    group: impl Into<SharedString>,
+    ix: usize,
+    copy_prefix: &'static str,
+    copy_text: String,
+    body: gpui::AnyElement,
+    theme: &Theme,
+    collapsible: Option<CollapsibleBanner>,
+) -> gpui::AnyElement {
+    let group = group.into();
+    let mut left = h_flex().items_center().gap_1().text_xs().text_color(accent);
+    if let Some(c) = &collapsible {
+        let chevron = if c.collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+        left = left.child(Icon::new(chevron).xsmall());
+    }
+    left = left.when_some(icon, |row, name| row.child(Icon::new(name).xsmall()));
+    left = left.child(label);
+
+    let label_row = h_flex()
+        .w_full()
+        .justify_between()
+        .items_center()
+        .child(left)
+        .child(copy_button_hoverable(
+            ix,
+            copy_prefix,
+            group.clone(),
+            copy_text,
+        ));
+    // `.id()` turns `Div` into `Stateful<Div>`, so erase to `AnyElement` to
+    // keep the collapsible and non-collapsible branches one type. Read the
+    // collapsed flag before `on_click` moves the closure out of `collapsible`.
+    let show_body = match &collapsible {
+        Some(c) => !c.collapsed,
+        None => true,
+    };
+    let label_row: gpui::AnyElement = match collapsible {
+        Some(c) => label_row
+            .id(("banner-header", ix))
+            .cursor_pointer()
+            .on_click(move |_, _window, cx: &mut App| (c.on_click)(cx))
+            .into_any_element(),
+        None => label_row.into_any_element(),
+    };
+
+    let mut card = v_flex()
+        .group(group)
         .w_full()
         .gap_1()
         .px_3()
         .py_2()
         .rounded(theme.radius)
-        .bg(theme.danger.opacity(0.06))
-        .child(
-            h_flex()
-                .w_full()
-                .justify_between()
-                .items_center()
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .text_color(theme.danger)
-                        .child(i18n::t("message-error")),
-                )
-                .child(copy_button_hoverable(
-                    ix,
-                    "copy-error",
-                    format!("error-{ix}"),
-                    msg.to_string(),
-                )),
-        )
-        .child(
+        .bg(accent.opacity(0.10))
+        .child(label_row);
+    if show_body {
+        card = card.child(
             gpui::div()
                 .text_sm()
-                .text_color(theme.danger)
-                .child(markdown_tv(("error", ix), msg.to_string(), theme, false)),
-        )
-        .into_any_element()
+                .text_color(theme.foreground)
+                .child(body),
+        );
+    }
+    card.into_any_element()
+}
+
+/// Render an error message + copy button.
+pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
+    render_banner(
+        theme.danger,
+        i18n::t("message-error"),
+        None,
+        format!("error-{ix}"),
+        ix,
+        "copy-error",
+        msg.to_string(),
+        markdown_tv(("error", ix), msg.to_string(), theme, false),
+        theme,
+        None,
+    )
 }
 
 /// Render an ephemeral system notice — status toggles, slash-command acks.
 /// Neutral tones so positive state changes (e.g. "YOLO mode is on") do not
 /// read as a runtime error.
 pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
-    v_flex()
-        .group(format!("notice-{ix}"))
-        .w_full()
-        .gap_1()
-        .px_3()
-        .py_2()
-        .rounded(theme.radius)
-        .bg(theme.secondary.opacity(0.15))
-        .child(
-            h_flex()
-                .w_full()
-                .justify_between()
-                .items_center()
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(i18n::t("message-notice")),
-                )
-                .child(copy_button_hoverable(
-                    ix,
-                    "copy-notice",
-                    format!("notice-{ix}"),
-                    msg.to_string(),
-                )),
-        )
-        .child(
-            gpui::div()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(markdown_tv(("notice", ix), msg.to_string(), theme, false)),
-        )
-        .into_any_element()
+    render_banner(
+        theme.muted_foreground,
+        i18n::t("message-notice"),
+        None,
+        format!("notice-{ix}"),
+        ix,
+        "copy-notice",
+        msg.to_string(),
+        markdown_tv(("notice", ix), msg.to_string(), theme, false),
+        theme,
+        None,
+    )
 }
 
 /// A peer message from a teammate (or the leader) within a team. The `from`
-/// name is rendered as a bold label; `content` is the peer's own body,
-/// rendered as markdown the way notice text is. Accent-tinted to read apart
-/// from user / assistant turns without the danger tone of an error.
+/// name leads the label in the accent color; `content` is the peer's own body,
+/// rendered as markdown. Accent-tinted to read apart from user / assistant
+/// turns without the danger tone of an error.
 pub fn render_team_message(
     from: &str,
     content: &str,
     ix: usize,
     theme: &Theme,
 ) -> gpui::AnyElement {
-    v_flex()
-        .group(format!("team-msg-{ix}"))
-        .w_full()
-        .gap_1()
-        .px_3()
-        .py_2()
-        .rounded(theme.radius)
-        .bg(theme.primary.opacity(0.08))
-        .child(
-            h_flex()
-                .w_full()
-                .justify_between()
-                .items_center()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            gpui::div()
-                                .text_sm()
-                                .text_color(theme.primary)
-                                .child(from.to_string()),
-                        )
-                        .child(
-                            gpui::div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(i18n::t("message-team")),
-                        ),
-                )
-                .child(copy_button_hoverable(
-                    ix,
-                    "copy-team-msg",
-                    format!("team-msg-{ix}"),
-                    content.to_string(),
-                )),
-        )
-        .child(
-            gpui::div()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(markdown_tv(
-                    ("team-msg", ix),
-                    content.to_string(),
-                    theme,
-                    false,
-                )),
-        )
-        .into_any_element()
+    // The whole label row is accent-colored, so `from` inherits primary here.
+    let label: SharedString = format!("{from} · {}", i18n::t("message-team")).into();
+    render_banner(
+        theme.primary,
+        label,
+        None,
+        format!("team-msg-{ix}"),
+        ix,
+        "copy-team-msg",
+        content.to_string(),
+        markdown_tv(("team-msg", ix), content.to_string(), theme, false),
+        theme,
+        None,
+    )
 }
 
 /// Render a compaction Recap card: a collapsible summary of the history that
@@ -637,79 +650,48 @@ pub fn render_recap(
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
-    let chevron = if collapsed {
-        IconName::ChevronRight
-    } else {
-        IconName::ChevronDown
-    };
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
-    let mut block = v_flex()
-        .group(format!("recap-{ix}"))
-        .w_full()
-        .gap_1()
-        .px_3()
-        .py_2()
-        .rounded(theme.radius)
-        .bg(theme.secondary.opacity(0.15))
-        .child(
-            h_flex()
-                .id(("recap-header", ix))
-                .gap_1p5()
-                .items_center()
-                .cursor_pointer()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .on_click(move |_, _window, cx: &mut App| {
-                    let Some(weak) = weak_workspace.clone() else {
-                        return;
-                    };
-                    let ix_click = ix;
-                    let _ = weak.update(cx, |w, cx| {
-                        let conv = w.conversation.clone();
-                        conv.update(cx, |c, cx| {
-                            if let Some(item) = c.items().get(ix_click) {
-                                item.update(cx, |item, cx| {
-                                    if let ConvItem::Recap {
-                                        collapsed,
-                                        user_toggled,
-                                        ..
-                                    } = item.kind_mut()
-                                    {
-                                        *collapsed = !*collapsed;
-                                        *user_toggled = true;
-                                    }
-                                    cx.notify();
-                                });
-                            }
-                        });
+    let on_click = Box::new(move |_cx: &mut App| {
+        let Some(weak) = weak_workspace.clone() else {
+            return;
+        };
+        let ix_click = ix;
+        let _ = weak.update(_cx, |w, cx| {
+            let conv = w.conversation.clone();
+            conv.update(cx, |c, cx| {
+                if let Some(item) = c.items().get(ix_click) {
+                    item.update(cx, |item, cx| {
+                        if let ConvItem::Recap {
+                            collapsed,
+                            user_toggled,
+                            ..
+                        } = item.kind_mut()
+                        {
+                            *collapsed = !*collapsed;
+                            *user_toggled = true;
+                        }
                         cx.notify();
                     });
-                })
-                .child(Icon::new(chevron).xsmall())
-                .child(Icon::new(IconName::BookOpen).xsmall())
-                .child(i18n::t("recap-card-title"))
-                .child(gpui::div().flex_1())
-                .child(copy_button_hoverable(
-                    ix,
-                    "copy-recap",
-                    format!("recap-{ix}"),
-                    summary.to_string(),
-                )),
-        );
-    if !collapsed {
-        block = block.child(
-            gpui::div()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(markdown_tv(
-                    ("recap", ix),
-                    summary.to_string(),
-                    theme,
-                    false,
-                )),
-        );
-    }
-    block.into_any_element()
+                }
+            });
+            cx.notify();
+        });
+    }) as Box<dyn Fn(&mut App) + 'static>;
+    render_banner(
+        theme.muted_foreground,
+        i18n::t("recap-card-title"),
+        Some(IconName::BookOpen),
+        format!("recap-{ix}"),
+        ix,
+        "copy-recap",
+        summary.to_string(),
+        markdown_tv(("recap", ix), summary.to_string(), theme, false),
+        theme,
+        Some(CollapsibleBanner {
+            collapsed,
+            on_click,
+        }),
+    )
 }
 
 /// Transient retry badge shown while the provider backs off after a 429 / 5xx
@@ -722,7 +704,7 @@ pub fn render_retry(
     ix: usize,
     theme: &Theme,
 ) -> gpui::AnyElement {
-    let label = i18n::t_str(
+    let body: SharedString = i18n::t_str(
         "retry-badge",
         &[
             ("attempt", &attempt.to_string()),
@@ -730,22 +712,23 @@ pub fn render_retry(
             ("secs", &delay_secs.to_string()),
         ],
     );
-    h_flex()
-        .group(format!("retry-{ix}"))
-        .w_full()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .py_2()
-        .rounded(theme.radius)
-        .bg(theme.warning.opacity(0.12))
-        .child(
-            Icon::new(IconName::LoaderCircle)
-                .small()
-                .text_color(theme.warning),
-        )
-        .child(gpui::div().text_sm().text_color(theme.warning).child(label))
-        .into_any_element()
+    let copy_text = body.to_string();
+    render_banner(
+        theme.warning,
+        i18n::t("message-retry"),
+        Some(IconName::LoaderCircle),
+        format!("retry-{ix}"),
+        ix,
+        "copy-retry",
+        copy_text,
+        gpui::div()
+            .text_sm()
+            .text_color(theme.foreground)
+            .child(body)
+            .into_any_element(),
+        theme,
+        None,
+    )
 }
 
 /// Heuristic: map a tool name to a markdown code-block language tag so that

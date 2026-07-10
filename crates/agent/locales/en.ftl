@@ -56,6 +56,7 @@ team-drawer-tasks = { $count ->
 message-user-role = You
 recap-card-title = Context compacted
 retry-badge = Retrying… { $attempt }/{ $max } · { $secs }s
+message-retry = Retry
 message-omitted-prefix = …(earlier omitted)
 status-pending = Pending approval
 status-running = Running
