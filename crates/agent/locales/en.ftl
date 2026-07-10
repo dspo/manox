@@ -410,6 +410,9 @@ composer-plan-mode-desc = Enter plan mode
 composer-generate-memory = Generate
 composer-tag-personal = Personal
 composer-tag-system = System
+completion-tag-command = Command
+completion-tag-skill = Skill
+completion-tag-agent = Agent
 
 ### slash_command.rs
 slash-yolo-desc = Switch to Full access (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately

@@ -31,6 +31,10 @@ gpui::actions!(
         NewTerminalTab,
         CloseTerminalTab,
         FocusTerminal,
-        FocusConversation
+        FocusConversation,
+        CompletionUp,
+        CompletionDown,
+        CompletionConfirm,
+        CompletionDismiss
     ]
 );

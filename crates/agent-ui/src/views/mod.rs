@@ -1,5 +1,6 @@
 //! View rendering layer for the conversation.
 
+pub mod completion;
 pub mod composer_menu;
 pub mod member_panel;
 pub mod message;

@@ -31,7 +31,7 @@ use gpui_component::{
     TitleBar,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState, Paste},
+    input::{Input, InputEvent, InputState, Paste, RopeExt},
     menu::{PopupMenu, PopupMenuItem},
     tab::{Tab, TabBar},
     tag::{Tag, TagVariant},
@@ -41,8 +41,12 @@ use manox_components::markdown::Markdown;
 
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
 use crate::views::centered;
+use crate::views::completion::{
+    CompletionState, SelectHandler, build_replacement, detect, mention_source, render_completion,
+    slash_source,
+};
 use crate::views::composer_menu::{
-    PendingAttachment, build_plus_menu, build_slash_menu, load_attachment, render_attachment_chips,
+    PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
 };
 use crate::views::member_panel::MemberPanel;
 use crate::views::plugin_manager::{PluginManagerEvent, PluginManagerView};
@@ -209,9 +213,11 @@ pub struct Workspace {
     project_chip_open: bool,
     project_chip_menu: Option<Entity<PopupMenu>>,
     project_chip_menu_sub: Option<Subscription>,
-    slash_open: bool,
-    slash_menu: Option<Entity<PopupMenu>>,
-    slash_menu_sub: Option<Subscription>,
+    /// Composer typeahead completion popover (`/` commands, `@` skills/agents).
+    /// `None` when no trigger token is active at the caret. A pure render
+    /// overlay — it never grabs focus, so the `InputState` keeps focus and the
+    /// query filters live on every keystroke.
+    completion: Option<CompletionState>,
     /// Title bar "..." dropdown (conversation menu). Mirrors the
     /// model selector pattern: a button toggles `title_menu_open`; the
     /// `PopupMenu` entity and its dismiss subscription are created on open.
@@ -473,9 +479,7 @@ impl Workspace {
             project_chip_open: false,
             project_chip_menu: None,
             project_chip_menu_sub: None,
-            slash_open: false,
-            slash_menu: None,
-            slash_menu_sub: None,
+            completion: None,
             title_menu_open: false,
             title_menu: None,
             title_menu_sub: None,
@@ -1044,7 +1048,7 @@ impl Workspace {
                 InputEvent::PressEnter { shift: false, .. } => this.submit_input(window, cx),
                 // Shift+Enter inserts a newline inside the input and does not submit.
                 InputEvent::PressEnter { shift: true, .. } => {}
-                InputEvent::Change => this.sync_slash_menu(window, cx),
+                InputEvent::Change => this.sync_completion(window, cx),
                 InputEvent::Focus | InputEvent::Blur => {}
             },
         )
@@ -1065,49 +1069,115 @@ impl Workspace {
         })
     }
 
-    /// Open the `⁄` command menu when the input is exactly `/`, close it otherwise.
-    /// Selecting a registered command inserts `/name ` into the composer for the
-    /// user to complete and submit; the memory/skills rows remain static decoration.
-    fn sync_slash_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let value = self.input_state.read(cx).value().to_string();
-        // Open the `⁄` popover only when the input is exactly `/`; selecting a
-        // command replaces the value with `/name ` (see `on_select` below).
-        let should_open = value == "/";
-        if should_open && !self.slash_open {
-            let theme = cx.theme().clone();
-            let on_select = cx.listener(|this, name: &str, window, cx| {
-                // Insert `/name ` into the composer so the user can add args
-                // and submit. Replacing the whole value keeps the leading `/`
-                // consistent (the popover only opens for input == "/").
-                let text = format!("/{name} ");
-                this.input_state
-                    .update(cx, |state, cx| state.set_value(text, window, cx));
-                this.close_slash_menu();
-                cx.notify();
-            });
-            let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-                build_slash_menu(menu, &theme, move |name, window, cx| {
-                    on_select(name, window, cx);
-                })
-            });
-            let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
-                this.close_slash_menu();
-                cx.notify();
-            });
-            self.slash_open = true;
-            self.slash_menu = Some(menu);
-            self.slash_menu_sub = Some(sub);
-            cx.notify();
-        } else if !should_open && self.slash_open {
-            self.close_slash_menu();
+    /// Re-evaluate the completion popover against the live input value + caret.
+    ///
+    /// When the caret sits inside a `/` or `@` trigger token, the matching
+    /// source is filtered by the query and a fresh [`CompletionState`] replaces
+    /// the current one. With no trigger or zero matches the popover closes. The
+    /// popover is a pure render overlay and never grabs focus, so the
+    /// `InputState` keeps typing and the filter updates every keystroke.
+    fn sync_completion(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let (value, cursor) = {
+            let s = self.input_state.read(cx);
+            (s.value().to_string(), s.selected_range().end)
+        };
+        let new = match detect(&value, cursor) {
+            None => None,
+            Some(det) => {
+                let items = if det.trigger == '/' {
+                    slash_source(&det.query)
+                } else {
+                    mention_source(&det.query)
+                };
+                if items.is_empty() {
+                    None
+                } else {
+                    // Carry the selection forward when the same trigger is
+                    // active and the previously-picked item survived the
+                    // narrower filter, so typing more to refine doesn't snap
+                    // the highlight back to the top.
+                    let selected = self
+                        .completion
+                        .as_ref()
+                        .filter(|s| s.trigger == det.trigger)
+                        .and_then(|s| s.items.get(s.selected).map(|it| it.name.clone()))
+                        .and_then(|name| items.iter().position(|it| it.name == name))
+                        .unwrap_or(0);
+                    Some(CompletionState::new(
+                        det.trigger,
+                        det.token_start,
+                        items,
+                        selected,
+                    ))
+                }
+            }
+        };
+        let changed = match (&self.completion, &new) {
+            (None, None) => false,
+            (Some(_), None) | (None, Some(_)) => true,
+            (Some(a), Some(b)) => {
+                !a.items.eq(&b.items) || a.trigger != b.trigger || a.selected != b.selected
+            }
+        };
+        self.completion = new;
+        if changed {
             cx.notify();
         }
     }
 
-    fn close_slash_menu(&mut self) {
-        self.slash_open = false;
-        self.slash_menu = None;
-        self.slash_menu_sub = None;
+    /// Drop the popover without touching the input.
+    fn close_completion(&mut self, cx: &mut Context<Self>) {
+        if self.completion.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Confirm the selected (or clicked) completion item: replace the trigger
+    /// token with `trigger + name + " "` and place the caret after the space.
+    fn completion_confirm(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.completion.take() else {
+            return;
+        };
+        let Some(item) = state.items.get(ix) else {
+            self.completion = Some(state);
+            return;
+        };
+        let name = item.name.to_string();
+        let trigger = state.trigger;
+        let token_start = state.token_start;
+        let (value, cursor) = {
+            let s = self.input_state.read(cx);
+            (s.value().to_string(), s.selected_range().end)
+        };
+        if cursor > value.len() || token_start > cursor {
+            return;
+        }
+        let (new_value, caret) = build_replacement(trigger, &name, &value, token_start, cursor);
+        self.input_state.update(cx, |s, cx| {
+            s.set_value(new_value, window, cx);
+            let pos = RopeExt::offset_to_position(s.text(), caret.min(s.text().len()));
+            s.set_cursor_position(pos, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn completion_up(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.completion.as_mut() {
+            state.move_selection(-1);
+            cx.notify();
+        }
+    }
+
+    fn completion_down(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.completion.as_mut() {
+            state.move_selection(1);
+            cx.notify();
+        }
+    }
+
+    fn completion_confirm_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ix = self.completion.as_ref().map(|s| s.selected).unwrap_or(0);
+        self.completion_confirm(ix, window, cx);
     }
 
     /// Close the title bar "..." dropdown, dropping the menu entity + subscription.
@@ -1227,7 +1297,7 @@ impl Workspace {
         let saved = self.drafts.remove(&new_id).unwrap_or_default();
         self.input_state
             .update(cx, |s, cx| s.set_value(saved, window, cx));
-        self.sync_slash_menu(window, cx);
+        self.sync_completion(window, cx);
         // Rebuild the list state for the new thread: `reset` drops the old
         // thread's measured heights and scroll position, then reveal the latest
         // turn once. A running thread keeps following the tail; a completed
@@ -1371,7 +1441,7 @@ impl Workspace {
             if !text.trim().is_empty() && attachments.is_empty() {
                 self.input_state
                     .update(cx, |state, cx| state.set_value("", window, cx));
-                self.close_slash_menu();
+                self.close_completion(cx);
                 self.resolve_ask_with_response(Some(text), cx);
             } else {
                 self.pending_attachments = attachments;
@@ -1390,7 +1460,7 @@ impl Workspace {
         }
         self.input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
-        self.close_slash_menu();
+        self.close_completion(cx);
 
         // Slash commands (line-initial `/name [args]`) are intercepted before
         // sending a normal user turn. A recognized command fully handles the
@@ -1651,7 +1721,7 @@ impl Workspace {
     /// Ctrl-G / Cmd-W to move the draft back.
     fn open_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Close any open inline menus so they don't linger behind the hidden footer.
-        self.close_slash_menu();
+        self.close_completion(cx);
         self.close_plus_menu();
         if let Some(ix) = self.editor_tab_ix() {
             self.set_active_right_tab(ix, cx);
@@ -2781,7 +2851,8 @@ impl Workspace {
         // Each model block carries: model id text + two tree rows. The
         // capture-based build here keeps the closure machinery out of the
         // outer builder.
-        let mut model_blocks: Vec<(String, gpui::Div, gpui::Div)> = Vec::with_capacity(model_rows.len());
+        let mut model_blocks: Vec<(String, gpui::Div, gpui::Div)> =
+            Vec::with_capacity(model_rows.len());
 
         for (model_name, usage) in model_rows {
             let model_display = truncate_env_model_id(model_name.clone());
@@ -2920,7 +2991,9 @@ impl Workspace {
                                 h_flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
+                                    .child(
+                                        Icon::new(IconName::MemoryStick).xsmall().text_color(muted),
+                                    )
                                     .child(
                                         gpui::div()
                                             .flex_1()
@@ -3001,7 +3074,7 @@ impl Workspace {
             // pending attachment instead of letting `InputState::paste` insert
             // the image's alt-text. `stop_propagation` keeps the inner input's
             // text-paste handler from also running; text is inserted via the
-            // public `replace` so the slash-menu `/` re-check still fires.
+            // public `replace` so the completion popover re-sync still fires.
             .capture_action(cx.listener(|this, _: &Paste, window, cx| {
                 cx.stop_propagation();
                 let Some(clipboard) = cx.read_from_clipboard() else {
@@ -3023,7 +3096,7 @@ impl Workspace {
                     if !text.is_empty() {
                         this.input_state
                             .update(cx, |state, cx| state.replace(text, window, cx));
-                        this.sync_slash_menu(window, cx);
+                        this.sync_completion(window, cx);
                     }
                 }
             }))
@@ -3031,11 +3104,20 @@ impl Workspace {
                 // Composer input is message content in the mono family (Lilex).
                 // Weight is pinned to Light to match body type; the Input component
                 // has no per-instance font knob, so family + weight are applied
-                // from the host context here.
-                gpui::div()
-                    .font_family(theme.mono_font_family.clone())
-                    .font_weight(gpui::FontWeight::LIGHT)
-                    .child(Input::new(&self.input_state).appearance(false)),
+                // from the host context here. While the completion popover is open
+                // this wrapper sets a `completion = open` key context so the
+                // `completion == open > Input` keybindings in `main.rs` can shadow
+                // the Input's own up/down/enter/tab/escape bindings and drive the
+                // popover instead.
+                {
+                    let mut wrap = gpui::div()
+                        .font_family(theme.mono_font_family.clone())
+                        .font_weight(gpui::FontWeight::LIGHT);
+                    if self.completion.is_some() {
+                        wrap = wrap.key_context("completion = open");
+                    }
+                    wrap.child(Input::new(&self.input_state).appearance(false))
+                },
             )
             .child(
                 h_flex()
@@ -3668,18 +3750,26 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The `⁄` command menu overlaid above the composer while `slash_open`.
-    fn render_slash_overlay(&self) -> Option<AnyElement> {
-        let menu = self.slash_menu.clone()?;
+    /// The completion popover overlaid above the composer while a trigger token
+    /// (`/` or `@`) is active at the caret. Anchored to the footer's relative
+    /// container, floating above the input. A click on a row confirms it.
+    fn render_completion_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let state = self.completion.as_ref()?;
+        let theme = cx.theme().clone();
+        let on_select = cx.listener(|this, ix: &usize, window, cx| {
+            this.completion_confirm(*ix, window, cx);
+        });
+        let on_select: SelectHandler =
+            std::rc::Rc::new(move |ix, window, cx| on_select(&ix, window, cx));
         Some(
             centered(
                 gpui::div()
-                    .id("slash-dropdown")
+                    .id("completion-dropdown")
                     .absolute()
                     .bottom_full()
                     .left_0()
                     .occlude()
-                    .child(menu),
+                    .child(render_completion(state, &theme, on_select)),
             )
             .into_any_element(),
         )
@@ -4308,7 +4398,7 @@ impl Render for Workspace {
                     .py_2()
                     .gap_2()
                     .relative()
-                    .children(self.render_slash_overlay())
+                    .children(self.render_completion_overlay(cx))
                     .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
                     .children(self.render_attachments(&theme, cx))
                     .child(centered(self.render_composer(running, &theme, cx))),
@@ -4376,7 +4466,7 @@ impl Render for Workspace {
                                 })),
                         )
                         .relative()
-                        .children(self.render_slash_overlay()),
+                        .children(self.render_completion_overlay(cx)),
                     ),
             )
         };
@@ -4605,6 +4695,32 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
                 this.close_terminal_tab(cx);
             }))
+            // Completion actions only match via the `completion == open > Input`
+            // keybindings, so any fire means the popover was open and these
+            // keystrokes belong to it. Stop propagation so the Input's own
+            // parallel up/down/enter/tab/escape binding (same depth, lower
+            // register index) doesn't also fire — otherwise Enter would both
+            // confirm and submit, Up/Down would move caret and selection, etc.
+            .on_action(cx.listener(|this, _: &crate::CompletionUp, window, cx| {
+                this.completion_up(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(cx.listener(|this, _: &crate::CompletionDown, window, cx| {
+                this.completion_down(window, cx);
+                cx.stop_propagation();
+            }))
+            .on_action(
+                cx.listener(|this, _: &crate::CompletionConfirm, window, cx| {
+                    this.completion_confirm_selected(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::CompletionDismiss, _window, cx| {
+                    this.close_completion(cx);
+                    cx.stop_propagation();
+                }),
+            )
             // Left sidebar with a draggable divider on its right edge.
             .child(self.sidebar.clone())
             .child(sidebar_divider)
@@ -5296,11 +5412,9 @@ fn counter_animated(
             Animation::new(Duration::from_millis(600)).with_easing(ease_out_quint()),
             move |el, t| {
                 let v = (from_f + (to_f - from_f) * t as f64) as u64;
-                el.child(SharedString::from(format!(
-                    "{}{}",
-                    arrow,
-                    format_tokens(v),
-                )))
+                el.child(SharedString::from(
+                    format!("{}{}", arrow, format_tokens(v),),
+                ))
             },
         )
         .into_any_element()

@@ -373,6 +373,9 @@ composer-plan-mode-desc = 开启计划模式
 composer-generate-memory = 生成开
 composer-tag-personal = 个人
 composer-tag-system = 系统
+completion-tag-command = 命令
+completion-tag-skill = 技能
+completion-tag-agent = Agent
 
 ### slash_command.rs
 slash-yolo-desc = 切换到完全访问（免审批 + bash 沙箱外）；带提示词则切换后直接开工
