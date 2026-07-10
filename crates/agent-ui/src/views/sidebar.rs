@@ -1,7 +1,8 @@
 //! Conversation history sidebar.
 //!
 //! A standalone gpui Entity that subscribes to `ThreadStore` and lists past threads. Clicking a
-//! conversation entry emits `OpenThread(id)`; the "new conversation" menu item emits `NewThread`.
+//! conversation entry emits `OpenThread(id)`; the "+" button on each project folder header emits
+//! `NewThreadWithProject(path)`; the "+" button on the "Conversations" section emits `NewThread`.
 //! Workspace subscribes to these events.
 //!
 //! Threads bound to a project (chosen on the first screen) are grouped under a collapsible folder
@@ -61,6 +62,7 @@ enum AnimRole {
     None,
 }
 
+/// Events the sidebar emits to the Workspace.
 #[derive(Debug, Clone)]
 pub enum SidebarEvent {
     OpenThread(String),
@@ -208,6 +210,7 @@ impl Sidebar {
                     .ghost()
                     .xsmall()
                     .icon(IconName::Plus)
+                    .tooltip(i18n::t("sidebar-new-chat"))
                     .on_click(cx.listener({
                         let path = path.to_string();
                         move |_this, _ev, _window, cx| {
@@ -368,7 +371,7 @@ impl Render for Sidebar {
                     )
                     .children(
                         (!projects.is_empty())
-                            .then(|| section_header(i18n::t("sidebar-section-projects"), &theme, None::<AnyElement>)),
+                            .then(|| section_header(i18n::t("sidebar-section-projects"), &theme, None)),
                     )
                     .children(projects.into_iter().map(|(path, group)| {
                         self.render_project_group(
@@ -388,6 +391,7 @@ impl Render for Sidebar {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Plus)
+                                .tooltip(i18n::t("sidebar-new-chat"))
                                 .on_click(cx.listener(|_this, _ev, _window, cx| {
                                     cx.emit(SidebarEvent::NewThread);
                                 }))
