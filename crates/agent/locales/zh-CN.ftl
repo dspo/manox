@@ -456,13 +456,6 @@ cockpit-status-stopped = 已停止
 cockpit-status-failed = 失败
 # 里程碑区段标题。
 cockpit-milestones-header = 计划
-cockpit-milestones-empty = 暂无计划步骤
-# 里程碑状态符号 + 标签，逐行内联渲染。
-cockpit-milestone-pending = ◻
-cockpit-milestone-in-progress = ▶
-cockpit-milestone-blocked = ⏳
-cockpit-milestone-completed = ✔
-cockpit-milestone-failed = ✕
 # 被阻塞里程碑的尾注。{$deps} 为逗号分隔的列表。
 cockpit-blocked-by = 被 {$deps} 阻塞
 # 折叠的已完成里程碑汇总。{$count} 为数字。

@@ -498,13 +498,6 @@ cockpit-status-stopped = Stopped
 cockpit-status-failed = Failed
 # Milestone section header.
 cockpit-milestones-header = Plan
-cockpit-milestones-empty = No plan steps yet
-# Milestone status glyph + label. Rendered inline per row.
-cockpit-milestone-pending = ◻
-cockpit-milestone-in-progress = ▶
-cockpit-milestone-blocked = ⏳
-cockpit-milestone-completed = ✔
-cockpit-milestone-failed = ✕
 # Trailing note for a blocked milestone. {$deps} is a comma-separated list.
 cockpit-blocked-by = blocked by {$deps}
 # Collapsed summary of completed milestones. {$count} is a number.
