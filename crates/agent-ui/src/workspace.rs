@@ -603,9 +603,6 @@ impl Workspace {
                     this.spawn_thinking_ticker(cx);
                 }
                 ThreadEvent::Stop(reason) => {
-                    // A terminal state ends any pending plan approval (the
-                    // oneshot was resolved or cancelled on the thread side).
-                    this.pending_plan = None;
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
@@ -620,6 +617,14 @@ impl Workspace {
                     this.apply_list_outcome(outcome, cx);
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
+                        // A terminal state ends any pending plan approval — the
+                        // oneshot was resolved or cancelled on the thread side.
+                        // Mid-turn `Stop(ToolUse)` must NOT clear it: that fires
+                        // between tool rounds and would race a `PlanProposed`
+                        // arriving in the same turn (thread 1c9c8df1: the first
+                        // `exit_plan_mode` call dropped the overlay because this
+                        // cleared `pending_plan` before the approval arm ran).
+                        this.pending_plan = None;
                         let thread_id = this.thread.read(cx).id.0.clone();
                         save_thread(this.thread.clone(), true, cx);
                         // Terminal stop → this thread is no longer running.
@@ -683,6 +688,10 @@ impl Workspace {
                         this.turn_active = false;
                         this.background_threads
                             .retain(|t| t.read(cx).id.0 != thread_id);
+                        // An error is a terminal state symmetric to a terminal
+                        // `Stop`: the turn aborted, so any pending plan overlay
+                        // is now stale and must not linger over an idle thread.
+                        this.pending_plan = None;
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
                         this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);

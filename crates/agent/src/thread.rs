@@ -55,6 +55,11 @@ pub enum ToolCallStatus {
     Continued,
     Error,
     Denied,
+    /// The call was not acted upon (overlay not shown or turn cancelled) —
+    /// distinct from `Denied` (a real user rejection) so the UI does not
+    /// render a "denied" verdict for a non-response. Used by the plan-approval
+    /// flow's `Cancelled` arm.
+    Cancelled,
 }
 
 /// User-facing approval policy for tool calls. Drives both the access chip in
@@ -2114,42 +2119,67 @@ impl Thread {
 
             if tool_uses.is_empty() {
                 // The model stopped without producing any executable tool call.
-                // Three cases: a clean EndTurn (the turn is done),
+                // Four cases: a clean EndTurn (the turn is done),
                 // max_output_tokens truncation (the response was cut mid-stream,
-                // often mid-tool_use), or a tool_use JSON parse error (the
+                // often mid-tool_use), a tool_use JSON parse error (the
                 // placeholder tool_use + error tool_result are already in
-                // history). The last two feed the failure back to the model and
-                // continue the loop — aligning with pi/oh-my-pi/codex/zed —
-                // instead of ending the turn dead on a half-finished assistant
-                // message (thread 76aef71a). Append-only: a directive or an
-                // error tool_result is added, history is never rewritten, so the
-                // provider prefix cache stays intact. Both recovery paths share
-                // a per-turn retry cap so a model stuck re-truncating or
-                // re-emitting bad JSON cannot loop forever (the main thread has
-                // no `max_turns` guard).
+                // history), or a degenerate empty turn (only empty Thinking, no
+                // visible text — thread 1c9c8df1 msg23). The last three feed a
+                // failure/nudge back to the model and continue the loop —
+                // aligning with pi/oh-my-pi/codex/zed — instead of ending the
+                // turn dead on a half-finished or empty assistant message.
+                // Append-only: a directive, an error tool_result, or a user
+                // nudge is added, history is never rewritten, so the provider
+                // prefix cache stays intact. All three recovery paths share a
+                // per-turn retry cap so a model stuck re-truncating,
+                // re-emitting bad JSON, or re-producing empty turns cannot
+                // loop forever (the main thread has no `max_turns` guard).
                 let recovery = this.update(cx, |this, cx| {
-                    let recoverable = this.pending_parse_error
-                        || this.last_stop_reason == Some(StopReason::MaxTokens);
-                    if !recoverable {
+                    let parse_err = this.pending_parse_error;
+                    let max_tok = this.last_stop_reason == Some(StopReason::MaxTokens);
+                    // Degenerate empty turn: no tool_use and no visible
+                    // assistant text (only empty Thinking). Distinct from
+                    // parse_err / max_tok — the model produced nothing useful
+                    // and the turn would otherwise end silently.
+                    let degenerate = !parse_err
+                        && !max_tok
+                        && match this.messages.last() {
+                            Some(m) if m.role == Role::Assistant => !m
+                                .content
+                                .iter()
+                                .any(|c| matches!(c, MessageContent::Text(t) if !t.is_empty())),
+                            _ => false,
+                        };
+                    if !parse_err && !max_tok && !degenerate {
                         return RecoveryAction::Done;
                     }
                     this.recovery_retries += 1;
                     if this.recovery_retries > MAX_RECOVERY_ATTEMPTS {
                         cx.emit(ThreadEvent::Error(anyhow::anyhow!(
-                            "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (tool_use JSON parse error / max_output_tokens truncation)"
+                            "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (tool_use JSON parse error / max_output_tokens truncation / degenerate empty turn)"
                         )));
                         this.pending_parse_error = false;
                         this.last_stop_reason = None;
                         return RecoveryAction::Abort;
                     }
-                    if this.pending_parse_error {
+                    if parse_err {
                         // The error tool_result is already in history from
                         // `handle_completion_event`; the model retries from it.
                         // Nothing to append.
-                    } else {
+                    } else if max_tok {
                         // MaxTokens: append a "redo compactly" directive so the
                         // model shortens the next attempt to fit the budget.
                         this.append_max_tokens_directive(cx);
+                    } else {
+                        // Degenerate empty turn: nudge the model toward visible
+                        // output so it does not end silently on empty reasoning.
+                        this.insert_user_message(
+                            "Your previous turn produced no visible output (only reasoning). \
+                             If you were about to submit a plan, call exit_plan_mode; if \
+                             researching, continue; otherwise state your next step."
+                                .to_string(),
+                            cx,
+                        );
                     }
                     this.pending_parse_error = false;
                     this.last_stop_reason = None;
@@ -2659,8 +2689,8 @@ impl Thread {
         })?;
 
         let response = tokio::select! {
-            r = rx => r.unwrap_or(PlanApprovalResponse::ContinueInPlanMode),
-            _ = cancel.cancelled() => PlanApprovalResponse::ContinueInPlanMode,
+            r = rx => r.unwrap_or(PlanApprovalResponse::Cancelled),
+            _ = cancel.cancelled() => PlanApprovalResponse::Cancelled,
         };
         this.update(cx, |this, _cx| {
             this.pending_plan_approval.remove(&id);
@@ -2711,6 +2741,29 @@ impl Thread {
                         status: ToolCallStatus::Continued,
                     });
                     this.stop_after_plan_reject = true;
+                })?;
+                Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
+                Self::append_tool_result(&this, tu, msg, false, cx)?;
+            }
+            PlanApprovalResponse::Cancelled => {
+                // The overlay was not shown or the turn was cancelled before the
+                // user responded. Append an honest ToolResult (the wire stays
+                // paired) but do NOT set `stop_after_plan_reject`: this is not a
+                // user "keep discussing" verdict, so the turn must not stop on
+                // the pretense that the user gave direction. The model re-reads
+                // the result, re-submits the plan, and the second `exit_plan_mode`
+                // call (now that the overlay is armed) surfaces real approval.
+                // Mirrors codex `ReviewDecision::Abort`: a non-response is a
+                // distinct terminal from a real decline.
+                let msg = "Plan approval was not acted upon (the approval overlay was not shown or the turn was cancelled). Re-submit the plan with `exit_plan_mode`."
+                    .to_string();
+                this.update(cx, |_, cx| {
+                    cx.emit(ThreadEvent::ToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        title: title.clone(),
+                        status: ToolCallStatus::Cancelled,
+                    });
                 })?;
                 Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
                 Self::append_tool_result(&this, tu, msg, false, cx)?;

@@ -1122,6 +1122,9 @@ fn render_activity_entry(
             (IconName::CircleCheck, theme.success)
         }
         ToolCallStatus::Error | ToolCallStatus::Denied => (IconName::CircleX, theme.danger),
+        // `Cancelled` is a non-response (overlay not shown or turn cancelled),
+        // not a success or an error: a muted `Minus` reads "no action taken".
+        ToolCallStatus::Cancelled => (IconName::Minus, theme.muted_foreground),
     };
     let show_output = e.streaming || !e.collapsed;
     let entry_chevron = if e.collapsed {
@@ -1520,6 +1523,7 @@ pub fn render_tool_call(
         ToolCallStatus::Continued => (theme.muted_foreground, i18n::t("status-continued")),
         ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
         ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
+        ToolCallStatus::Cancelled => (theme.muted_foreground, i18n::t("status-cancelled")),
     };
 
     let title = if item.title.is_empty() {
@@ -1660,6 +1664,11 @@ fn render_plan_card(
             ),
             ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
             ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
+            ToolCallStatus::Cancelled => (
+                IconName::Minus,
+                theme.muted_foreground,
+                i18n::t("status-cancelled"),
+            ),
         };
 
     let title = if item.title.is_empty() {
@@ -1888,6 +1897,7 @@ pub fn render_agent_task(
         ToolCallStatus::Continued => (theme.muted_foreground, i18n::t("status-continued")),
         ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
         ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
+        ToolCallStatus::Cancelled => (theme.muted_foreground, i18n::t("status-cancelled")),
     };
 
     let expanded = agent_ctx.is_some_and(|c| c.expanded.contains(&item.id));
