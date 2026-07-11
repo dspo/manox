@@ -4230,7 +4230,314 @@ mod tests {
         }
     }
 
-    /// Regression for the switch-loses-assistant bug: a turn whose stream
+    /// A `ReplayMockModel` that also counts `stream_completion` invocations via
+    /// a shared atomic, so a test can assert the outer turn loop re-requested
+    /// the model — the proof that a parse error or `MaxTokens` truncation was
+    /// fed back to the model rather than dropped on a bare `break`.
+    struct CountingReplayMockModel {
+        id: String,
+        events: Arc<Vec<LanguageModelCompletionEvent>>,
+        calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl crate::language_model::LanguageModel for CountingReplayMockModel {
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+        fn name(&self) -> String {
+            self.id.clone()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            let events = self.events.clone();
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                use futures::StreamExt as _;
+                use std::sync::atomic::Ordering;
+                let _ = calls.fetch_add(1, Ordering::SeqCst);
+                let events: Vec<_> = events.iter().cloned().map(Ok).collect();
+                Ok(futures::stream::iter(events).boxed())
+            })
+        }
+    }
+
+    /// Regression for the parse-error bare-break freeze: a stream that emits a
+    /// `ToolUseJsonParseError` (malformed tool-call JSON) and then closes
+    /// enqueues no `pending_tool_uses`, so a naive turn loop would bare-break
+    /// on the empty collection and the error tool_result would sit in history
+    /// never fed back to the model — the thread froze on an orphan result
+    /// (thread 76aef71a). The recovery branch must re-request the model (the
+    /// error result is already in history) until `MAX_RECOVERY_ATTEMPTS`
+    /// aborts. This asserts the model was actually called again and that the
+    /// error result landed in history.
+    #[test]
+    fn run_turn_feeds_parse_error_back_to_model() {
+        use crate::language_model::LanguageModelToolResult;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open mem db"),
+        );
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db, cx);
+        });
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(CountingReplayMockModel {
+            id: "test/parse-error".into(),
+            events: Arc::new(vec![
+                LanguageModelCompletionEvent::Text("let me read the file".into()),
+                LanguageModelCompletionEvent::ToolUseJsonParseError {
+                    id: "tu_parse_1".into(),
+                    tool_name: Arc::from("read_file"),
+                    raw_input: "{bad".into(),
+                    json_parse_error: "expected `}`".into(),
+                },
+            ]),
+            calls: calls.clone(),
+        });
+
+        let thread_id = "reg-parse-error-feedback";
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("read foo".into())],
+            );
+            // Pin the title and run as a sub-agent (depth 1) so
+            // `maybe_generate_title` bails on its `depth != 0` guard — an
+            // appended error tool_result must not trip a topic-shift re-eval
+            // and pollute the call counter.
+            rec.title = Some("regression".into());
+            let thread = super::Thread::restore(rec, Some(model), cx);
+            thread.update(cx, |t, _| t.depth = 1);
+            thread
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+
+        // 1 initial call + MAX_RECOVERY_ATTEMPTS re-requests: the parse error
+        // must be fed back to the model instead of ending the turn on a bare
+        // break with an orphaned error result. The final attempt hits the cap
+        // and aborts.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + super::MAX_RECOVERY_ATTEMPTS as u64,
+            "parse error must be fed back to the model, not dropped on a bare break"
+        );
+
+        // The error tool_result must be in history so the re-request carries it.
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                let has_error_result = t.messages.iter().any(|m| {
+                    m.content.iter().any(|c| match c {
+                        MessageContent::ToolResult(LanguageModelToolResult {
+                            is_error: true,
+                            content,
+                            ..
+                        }) => content.contains("Tool input JSON parse failed"),
+                        _ => false,
+                    })
+                });
+                assert!(
+                    has_error_result,
+                    "parse-error tool_result must be in history to feed back"
+                );
+            });
+        });
+    }
+
+    /// Regression for the silent-truncation freeze: a stream that stops with
+    /// `MaxTokens` and no actionable tool_use used to end the turn dead on the
+    /// truncated assistant message. The recovery branch must re-request the
+    /// model, appending a "redo compactly" directive (append-only, so the
+    /// prefix cache stays intact and the truncated assistant messages are
+    /// retained, not dropped) until `MAX_RECOVERY_ATTEMPTS` aborts. This
+    /// asserts the model was retried, the directive was appended, and that
+    /// every round's assistant message survives (proving the append-only
+    /// contract — a drop-and-rewrite variant would leave fewer).
+    #[test]
+    fn run_turn_recovers_max_tokens_via_append_only_directive() {
+        use crate::language_model::{MessageContent, Role, StopReason};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open mem db"),
+        );
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db, cx);
+        });
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(CountingReplayMockModel {
+            id: "test/max-tokens".into(),
+            events: Arc::new(vec![
+                LanguageModelCompletionEvent::Text("truncated mid-thought".into()),
+                LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+            ]),
+            calls: calls.clone(),
+        });
+
+        let thread_id = "reg-max-tokens-retry";
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("write a long essay".into())],
+            );
+            // Pin the title and run as a sub-agent (depth 1) so
+            // `maybe_generate_title` bails on its `depth != 0` guard — the
+            // append-only max-tokens directive is a user-role text message that
+            // increments the user-message count, which would otherwise trip a
+            // topic-shift re-eval and spawn an extra model stream (polluting the
+            // call counter). `for_test` leaves `max_turns` `None`, so the
+            // sub-agent turn cap does not fire.
+            rec.title = Some("regression".into());
+            let thread = super::Thread::restore(rec, Some(model), cx);
+            thread.update(cx, |t, _| t.depth = 1);
+            thread
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+
+        // 1 initial call + MAX_RECOVERY_ATTEMPTS re-requests; the final attempt
+        // hits the cap and aborts rather than silently ending on the first
+        // truncation.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + super::MAX_RECOVERY_ATTEMPTS as u64,
+            "MaxTokens truncation must be retried, not silently end the turn"
+        );
+
+        // The recovery is append-only: every round's truncated assistant message
+        // is retained (one per round), never dropped. A drop-and-rewrite variant
+        // would leave only the final round's assistant message.
+        let (assistant_count, directive_count) = cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                let assistant_count = t
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::Assistant)
+                    .count();
+                let directive_count =
+                    t.messages
+                        .iter()
+                        .filter(|m| m.role == Role::User)
+                        .fold(0, |acc, m| {
+                            let has_directive = m.content.iter().any(|c| match c {
+                                MessageContent::Text(t) => {
+                                    t.contains("cut off by the max_output_tokens budget")
+                                }
+                                _ => false,
+                            });
+                            if has_directive { acc + 1 } else { acc }
+                        });
+                (assistant_count, directive_count)
+            })
+        });
+        assert_eq!(
+            assistant_count,
+            (1 + super::MAX_RECOVERY_ATTEMPTS) as usize,
+            "append-only recovery must retain every round's assistant message, not drop them"
+        );
+        // The directive is appended on every retry that continues (not on the
+        // final abort), so MAX_RECOVERY_ATTEMPTS directives — one fewer than the
+        // assistant-message count, since the abort round keeps its assistant
+        // message but appends no directive.
+        assert_eq!(
+            directive_count,
+            super::MAX_RECOVERY_ATTEMPTS as usize,
+            "a max_output_tokens directive must be appended on each continued retry"
+        );
+    }
+
+    /// `run_enter_plan_mode` flips `plan_mode` on, emits a success ToolCall,
     /// produces text but ends WITHOUT a `MessageStop` (provider hiccup,
     /// non-SSE compatibility response) leaves the assistant text only in
     /// memory — no terminal `Stop` event reaches a subscriber, so without the
