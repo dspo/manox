@@ -676,13 +676,16 @@ impl Workspace {
                     // running. Pulled out of the catch-all rather than given a
                     // dedicated arm because the conversation still needs the
                     // generic `apply` below to render the error item.
-                    if let ThreadEvent::Error(_) = ev {
+                    if let ThreadEvent::Error(e) = ev {
                         let thread_id = this.thread.read(cx).id.0.clone();
                         let store = agent::thread_store_global();
                         store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
                         this.turn_active = false;
                         this.background_threads
                             .retain(|t| t.read(cx).id.0 != thread_id);
+                        // Persist the error card so a reloaded thread reproduces
+                        // what went wrong, anchored to the failed turn.
+                        this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);
                     }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -1283,11 +1286,14 @@ impl Workspace {
         let id = self.thread.read(cx).id.0.clone();
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
         let usage = self.thread.read(cx).request_token_usage().clone();
+        let notes = self.thread.read(cx).ui_notes().to_vec();
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
         let running = self.thread.read(cx).is_running();
         let new_conv = cx.new(|cx| {
-            ConversationState::rebuild_from_messages(&messages, &usage, &role, running, weak, cx)
+            ConversationState::rebuild_from_messages(
+                &messages, &usage, &role, running, &notes, weak, cx,
+            )
         });
         self.conversation = new_conv;
         // Restore the incoming thread's saved draft, or clear the input if it
@@ -1521,15 +1527,7 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 this.send_user_turn(text, extra, cx);
                 if failed > 0 {
-                    let weak = cx.weak_entity();
-                    this.conversation.update(cx, |c, cx| {
-                        c.push_notice(
-                            i18n::t("composer-image-process-failed").to_string(),
-                            weak,
-                            cx,
-                        );
-                    });
-                    this.sync_list_count(cx);
+                    this.add_info_message(i18n::t("composer-image-process-failed").to_string(), cx);
                 }
             })
             .ok();
@@ -1965,16 +1963,58 @@ impl Workspace {
     /// no model turn). Used by slash commands to report outcomes — e.g. the
     /// `/yolo` toggle acknowledging the mode change. Renders as a neutral-toned
     /// `ConvItem::Notice` card (distinct from the red `ConvItem::Error`).
+    ///
+    /// Also persists the notice so a reloaded thread reproduces it. The live
+    /// `push_notice` only touches `ConversationState`; the persisted copy is
+    /// spliced back by `rebuild_from_messages` on next load, anchored to the
+    /// current turn.
     pub fn add_info_message(&mut self, text: String, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
-            c.push_notice(text, weak, cx);
+            c.push_notice(text.clone(), weak, cx);
         });
+        self.record_ui_note(agent::db::UiNoteKind::Notice, text, cx);
         // Splice the notice item in. If tail-follow is engaged the list reveals
         // it; if the user scrolled up, `FollowMode::Tail` has already
         // disengaged so the viewport stays put.
         self.sync_list_count(cx);
         cx.notify();
+    }
+
+    /// Persist a UI annotation (`Error` / `Notice`) to `thread_ui_notes`.
+    /// The anchor is the current turn's user message — `None` before the first
+    /// user message — so the rebuild can place the note at the end of its turn.
+    /// Best-effort: the live item already rendered this turn; only the reload
+    /// copy is at stake.
+    ///
+    /// Also appends to the in-memory `Thread::ui_notes` cache so a background
+    /// thread reclaimed via `attach_thread` (which rebuilds from the entity,
+    /// not a db reload) still reproduces the note. The placeholder row is
+    /// discarded on the next db reload, which replaces the cache wholesale.
+    fn record_ui_note(&self, kind: agent::db::UiNoteKind, text: String, cx: &mut Context<Self>) {
+        let thread_id = self.thread.read(cx).id.0.clone();
+        let anchor = self
+            .thread
+            .read(cx)
+            .last_user_message_id()
+            .map(str::to_owned);
+        let data = serde_json::json!({ "text": text });
+        // Keep the in-memory cache consistent with the persisted record so the
+        // background-reclaim rebuild path (no db reload) reproduces the note.
+        let cached = agent::db::UiNoteRecord {
+            id: 0,
+            thread_id: thread_id.clone(),
+            seq: 0,
+            anchor_user_id: anchor.clone(),
+            kind,
+            data: data.clone(),
+            ts: 0,
+        };
+        self.thread.update(cx, |t, _| t.push_ui_note(cached));
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| {
+            s.record_ui_note(&thread_id, kind, anchor.as_deref(), &data, cx)
+        });
     }
 
     /// Toggle YOLO mode on the current thread. Pushes a notice so the user

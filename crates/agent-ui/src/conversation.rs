@@ -7,9 +7,12 @@
 //! streaming delta notifies (and re-renders) only that item, leaving already-
 //! finished items' markdown untouched.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use agent::db::{UiNoteKind, UiNoteRecord};
+use agent::language_model::{MessageContent, Role};
 use agent::thread::ApprovalMode;
 use agent::{Message, ThreadEvent, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, WeakEntity};
@@ -996,16 +999,24 @@ impl ConversationState {
     }
 
     /// Rebuild view state from a `Thread`'s canonical message list (used when loading a historical thread).
+    ///
+    /// `notes` are the persisted UI annotations (`Error` / `Notice`) that live
+    /// outside the canonical message list — they are spliced back at the end of
+    /// the turn they belong to (anchored by user-message id), so a reloaded
+    /// thread reproduces what the user saw without the model request ever
+    /// learning they exist. The request prefix is untouched.
     pub fn rebuild_from_messages(
         messages: &[Message],
         usage: &std::collections::HashMap<String, TokenUsage>,
         role: &str,
         running: bool,
+        notes: &[UiNoteRecord],
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) -> Self {
         let plain = build_items(messages, usage, running);
-        let items = plain
+        let merged = merge_ui_notes(messages, plain, notes);
+        let items = merged
             .into_iter()
             .enumerate()
             .map(|(id, kind)| {
@@ -1033,12 +1044,281 @@ impl ConversationState {
     }
 }
 
+/// Splice persisted UI notes back into the rebuilt canonical item list.
+///
+/// A note is anchored to the user message whose turn it belongs to. The
+/// canonical `items` list has one `ConvItem::User` bubble per text/image-
+/// bearing user message (in message order), so those bubbles align 1:1 with
+/// the "segment anchors" derived from `messages`. Each note lands at the end
+/// of its segment — i.e. right before the next turn's user bubble — mirroring
+/// where it appeared live. Notes whose anchor was a pure-tool-result user
+/// message (no bubble) fold into the nearest preceding segment; notes whose
+/// anchor was dropped by compaction land at the tail; notes emitted before
+/// any user message (anchor `None`) land at the top.
+///
+/// Notes arrive already sorted by `seq` from `list_ui_notes`, so per-segment
+/// order preserves emit order with no extra sort.
+fn merge_ui_notes(
+    messages: &[Message],
+    items: Vec<ConvItem>,
+    notes: &[UiNoteRecord],
+) -> Vec<ConvItem> {
+    if notes.is_empty() {
+        return items;
+    }
+
+    // Segment anchors: user messages that produce a User bubble, in message
+    // order. These align 1:1 with the User bubbles in `items` because
+    // `build_items` pushes exactly one User bubble per such message and none
+    // otherwise. The predicate mirrors `build_items` exactly: a bubble is
+    // pushed iff the message has a non-empty Text/Thinking join or any Image.
+    let segment_ids: Vec<&str> = messages
+        .iter()
+        .filter(|m| {
+            if m.role != Role::User {
+                return false;
+            }
+            let has_text = m.content.iter().any(|c| match c {
+                MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => !t.is_empty(),
+                _ => false,
+            });
+            let has_image = m
+                .content
+                .iter()
+                .any(|c| matches!(c, MessageContent::Image { .. }));
+            has_text || has_image
+        })
+        .map(|m| m.id.as_str())
+        .collect();
+
+    // Message index of every user message (including pure-tool-result ones),
+    // so a note anchored to a no-bubble user message can be folded into the
+    // nearest preceding segment instead of orphaning.
+    let user_msg_index: HashMap<&str, usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User)
+        .map(|(i, m)| (m.id.as_str(), i))
+        .collect();
+    let segment_msg_ix: Vec<usize> = segment_ids.iter().map(|id| user_msg_index[id]).collect();
+
+    // User-bubble positions in `items`, aligned with `segment_ids` by order.
+    let bubble_ix: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| matches!(it, ConvItem::User { .. }))
+        .map(|(i, _)| i)
+        .collect();
+
+    // The 1:1 alignment between segment anchors (from messages) and User
+    // bubbles (from items) is what lets a note be placed at its turn's end.
+    // If these ever diverge — e.g. `build_items` changes its bubble rule —
+    // placement would silently misfire, so assert in dev builds and warn in
+    // release: a crash on misplacement is worse than a logged divergence, but
+    // silence is worse than either.
+    if segment_ids.len() != bubble_ix.len() {
+        tracing::warn!(
+            anchors = segment_ids.len(),
+            bubbles = bubble_ix.len(),
+            "merge_ui_notes: segment anchors and User bubbles diverged; \
+             UI-note placement may be wrong until build_items is realigned"
+        );
+    }
+    debug_assert_eq!(
+        segment_ids.len(),
+        bubble_ix.len(),
+        "segment anchors and User bubbles diverged: build_items and merge_ui_notes disagree"
+    );
+
+    // Bucket each note by its target segment.
+    let mut buckets: Vec<Vec<&UiNoteRecord>> = (0..segment_ids.len()).map(|_| Vec::new()).collect();
+    let mut top: Vec<&UiNoteRecord> = Vec::new();
+    let mut orphan: Vec<&UiNoteRecord> = Vec::new();
+    for n in notes {
+        match &n.anchor_user_id {
+            None => top.push(n),
+            Some(aid) => {
+                if let Some(k) = segment_ids.iter().position(|id| *id == aid.as_str()) {
+                    buckets[k].push(n);
+                } else if let Some(&mi) = user_msg_index.get(aid.as_str()) {
+                    // Anchor is a no-bubble user message (e.g. a tool-result
+                    // message mid-loop): fold into the nearest preceding segment.
+                    let seg = segment_msg_ix
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, smi)| **smi <= mi)
+                        .map(|(k, _)| k)
+                        .next_back();
+                    match seg {
+                        Some(k) => buckets[k].push(n),
+                        None => top.push(n),
+                    }
+                } else {
+                    // Anchor references a message compaction dropped — tail it.
+                    orphan.push(n);
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<ConvItem> = Vec::with_capacity(items.len() + notes.len());
+    let first_bubble = bubble_ix.first().copied().unwrap_or(items.len());
+    for n in &top {
+        out.push(note_to_item(n));
+    }
+    // Canonical items before the first User bubble (a no-user-message prefix,
+    // normally empty since conversations start with a user message).
+    for it in items.iter().take(first_bubble) {
+        out.push(it.clone());
+    }
+    for (k, &start) in bubble_ix.iter().enumerate() {
+        let end = bubble_ix.get(k + 1).copied().unwrap_or(items.len());
+        for it in items.iter().take(end).skip(start) {
+            out.push(it.clone());
+        }
+        for n in &buckets[k] {
+            out.push(note_to_item(n));
+        }
+    }
+    for n in &orphan {
+        out.push(note_to_item(n));
+    }
+    out
+}
+
+/// Render a persisted note as its live `ConvItem` counterpart, reading the
+/// `text` payload from `data`.
+fn note_to_item(n: &UiNoteRecord) -> ConvItem {
+    let text = n
+        .data
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    match n.kind {
+        UiNoteKind::Error => ConvItem::Error(text),
+        UiNoteKind::Notice => ConvItem::Notice(text),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent::Message;
-    use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse, MessageContent};
+    use agent::language_model::{
+        LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role,
+    };
     use std::sync::Arc;
+
+    /// Build a message with a chosen id (Message::user randomizes it, which
+    /// defeats anchor-based placement tests).
+    fn msg_with_id(id: &str, role: Role, text: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            timestamp: 0,
+            parent_id: None,
+            role,
+            content: vec![MessageContent::Text(text.to_string())],
+            ui: None,
+        }
+    }
+
+    fn note(seq: i64, kind: UiNoteKind, anchor: Option<&str>, text: &str) -> UiNoteRecord {
+        UiNoteRecord {
+            id: seq,
+            thread_id: "t".to_string(),
+            seq,
+            anchor_user_id: anchor.map(str::to_owned),
+            kind,
+            data: serde_json::json!({ "text": text }),
+            ts: 0,
+        }
+    }
+
+    /// A flat signature of each merged item, in order, for readable assertions.
+    fn signature(items: &[ConvItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|it| match it {
+                ConvItem::User { text, .. } => format!("U:{text}"),
+                ConvItem::Assistant { text, .. } => format!("A:{text}"),
+                ConvItem::Notice(t) => format!("N:{t}"),
+                ConvItem::Error(t) => format!("E:{t}"),
+                _ => "?".to_string(),
+            })
+            .collect()
+    }
+
+    /// Persisted Error/Notice cards are spliced back at the end of their owning
+    /// turn; None-anchor notes top the list; notes whose anchor was dropped by
+    /// compaction land at the tail.
+    #[test]
+    fn merge_ui_notes_places_notes_at_turn_end() {
+        let messages = vec![
+            msg_with_id("u1", Role::User, "hello"),
+            msg_with_id("a1", Role::Assistant, "hi"),
+            msg_with_id("u2", Role::User, "again"),
+            msg_with_id("a2", Role::Assistant, "yo"),
+        ];
+        let items = build_items(&messages, &HashMap::new(), false);
+        // Notes arrive seq-sorted from list_ui_notes.
+        let notes = vec![
+            note(1, UiNoteKind::Notice, None, "top"),
+            note(2, UiNoteKind::Notice, Some("u1"), "t0end"),
+            note(3, UiNoteKind::Error, Some("u2"), "t1end"),
+            note(4, UiNoteKind::Notice, Some("ghost"), "orphan"),
+        ];
+        let merged = merge_ui_notes(&messages, items, &notes);
+        assert_eq!(
+            signature(&merged),
+            vec![
+                "N:top",   // None-anchor → top
+                "U:hello", // turn 0
+                "A:hi", "N:t0end", // anchor u1 → end of turn 0
+                "U:again", // turn 1
+                "A:yo", "E:t1end",  // anchor u2 → end of turn 1
+                "N:orphan", // unknown anchor → tail
+            ]
+        );
+    }
+
+    /// A note anchored to a pure-tool-result user message (no User bubble)
+    /// folds into the nearest preceding segment rather than orphaning.
+    #[test]
+    fn merge_ui_notes_folds_no_bubble_anchor_into_preceding_turn() {
+        // Turn 0: user prompt + assistant; then a tool-result user message
+        // (no text → no bubble) + assistant reply. A note anchored to the
+        // tool-result user message should land at the end of turn 0.
+        let mut tr = msg_with_id("u2", Role::User, "");
+        tr.content = vec![MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: "tu_1".to_string(),
+            tool_name: Arc::from("read_file"),
+            is_error: false,
+            content: "done".to_string(),
+        })];
+        let messages = vec![
+            msg_with_id("u1", Role::User, "do it"),
+            msg_with_id("a1", Role::Assistant, "ok"),
+            tr,
+            msg_with_id("a2", Role::Assistant, "done"),
+        ];
+        let items = build_items(&messages, &HashMap::new(), false);
+        // No second User bubble — both assistant replies belong to turn 0.
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i, ConvItem::User { .. }))
+                .count(),
+            1
+        );
+        let notes = vec![note(1, UiNoteKind::Notice, Some("u2"), "mid")];
+        let merged = merge_ui_notes(&messages, items, &notes);
+        assert_eq!(
+            signature(&merged).last(),
+            Some(&"N:mid".to_string()),
+            "no-bubble anchor folds to the nearest preceding segment's tail"
+        );
+    }
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the
     /// preceding assistant message, so a reloaded historical thread shows tool output.

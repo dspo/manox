@@ -423,6 +423,13 @@ pub struct Thread {
     /// them. The revision lets `upsert` refuse the stale write instead of
     /// clobbering the newer state — see `ThreadsDatabase::upsert`.
     persist_revision: AtomicU64,
+    /// Persisted UI annotations (`Error` / `Notice` cards) loaded from the
+    /// `thread_ui_notes` table. A UI-only cache: it is never part of the
+    /// canonical `messages`, never read by `build_completion_request`, and
+    /// never written by `snapshot` — so it cannot perturb the request
+    /// prefix or prompt-cache hits. Reload splices these back into the
+    /// conversation at the end of their owning turn.
+    ui_notes: Vec<crate::db::UiNoteRecord>,
 }
 
 /// A forwarded authorization request from a sub-agent: which child thread holds
@@ -591,6 +598,7 @@ impl Thread {
                 interacted_at: now,
                 token_meter: TokenMeter::default(),
                 persist_revision: AtomicU64::new(0),
+                ui_notes: Vec::new(),
             }
         })
     }
@@ -680,6 +688,7 @@ impl Thread {
                     rec.per_model_token_usage,
                 ),
                 persist_revision: AtomicU64::new(rec.revision),
+                ui_notes: Vec::new(),
             }
         })
     }
@@ -757,6 +766,7 @@ impl Thread {
                 interacted_at: chrono::Utc::now().timestamp(),
                 token_meter: TokenMeter::default(),
                 persist_revision: AtomicU64::new(0),
+                ui_notes: Vec::new(),
             }
         })
     }
@@ -1200,6 +1210,27 @@ impl Thread {
         &self.messages
     }
 
+    /// Persisted UI annotations loaded from `thread_ui_notes`. UI-only cache:
+    /// not part of `messages()`, not read by request building — see the field
+    /// doc on `Thread::ui_notes`.
+    pub fn ui_notes(&self) -> &[crate::db::UiNoteRecord] {
+        &self.ui_notes
+    }
+
+    /// Replace the loaded UI-note cache. Called by `thread_store::load_thread`
+    /// after `restore`; sub-agent and fresh-thread paths leave it empty.
+    pub fn set_ui_notes(&mut self, notes: Vec<crate::db::UiNoteRecord>) {
+        self.ui_notes = notes;
+    }
+
+    /// Append a UI note to the in-memory cache so a background thread that is
+    /// reclaimed without a db reload still reproduces it on rebuild. The
+    /// placeholder row (`id`/`seq`/`ts` unset) is discarded wholesale the next
+    /// time `set_ui_notes` loads from db.
+    pub fn push_ui_note(&mut self, note: crate::db::UiNoteRecord) {
+        self.ui_notes.push(note);
+    }
+
     /// True when at least one user message has been appended — i.e. the user
     /// has submitted real input to the model. Unpersisted empty threads (the
     /// initial "new conversation" screen) return `false`.
@@ -1210,7 +1241,8 @@ impl Thread {
     /// Id of the last `Role::User` message, if any. Used as the key for
     /// per-request token usage: each LLM round in a tool-use loop is attributed
     /// to the user message that triggered the turn (tool results are `User`).
-    fn last_user_message_id(&self) -> Option<&str> {
+    /// Also the anchor for persisting a UI note to the turn it belongs to.
+    pub fn last_user_message_id(&self) -> Option<&str> {
         self.messages
             .iter()
             .rev()
