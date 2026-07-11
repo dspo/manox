@@ -370,36 +370,108 @@ impl ResolvedModel {
     }
 }
 
-/// Strip a trailing `[<digits><unit?>]` context-window suffix from a model id (e.g. `glm-5.2[1m]` → `glm-5.2`).
-/// Non-regex scan: requires at least one digit after `[`, an optional single-letter unit,
-/// a closing `]`, and the suffix at the end of the string.
-pub fn strip_context_suffix(id: &str) -> String {
-    if !id.ends_with(']') {
-        return id.to_string();
+/// Parse a context-window string into a token count.
+///
+/// Grammar: one or more terms of `<digits><unit?>` concatenated with no
+/// separator, where `unit` ∈ {`k`,`K`,`m`,`M`} (case-insensitive, decimal
+/// radix: `k` = 1_000, `m` = 1_000_000), summed. `1m123k` = 1_123_000,
+/// `1m1234k` = 2_234_000 (pure sum, no magnitude cap). Integers only;
+/// `0` accepted; leading zeros (`01m`) rejected; any internal whitespace
+/// (`1 m`) rejected; surrounding whitespace trimmed. Any deviation → `None`.
+pub fn parse_context_window(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return None;
     }
-    let Some(open) = id.rfind('[') else {
+    let b = t.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    let mut total: u64 = 0;
+    let mut saw_term = false;
+    while i < n {
+        // A term must start with a digit.
+        if !b[i].is_ascii_digit() {
+            return None;
+        }
+        // Read the digit run.
+        let mut j = i;
+        while j < n && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        let digits = &b[i..j];
+        // Leading-zero rule: a multi-digit run must not start with '0'.
+        if digits.len() > 1 && digits[0] == b'0' {
+            return None;
+        }
+        i = j;
+        // Optional single unit letter; absence means a bare-number term.
+        let mult: u64 = if i < n {
+            match b[i] {
+                b'k' | b'K' => {
+                    i += 1;
+                    1_000
+                }
+                b'm' | b'M' => {
+                    i += 1;
+                    1_000_000
+                }
+                // Not a unit: the term is a bare number. The char is
+                // re-examined as the next term's start; if it is a
+                // non-digit the loop rejects on the next pass.
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let val: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+        total = total.checked_add(val.checked_mul(mult)?)?;
+        saw_term = true;
+    }
+    if !saw_term {
+        return None;
+    }
+    Some(total)
+}
+
+/// Byte index of the `[` opening a single trailing `[...]` group, or `None`
+/// when the id has no trailing group or has multiple / non-trailing brackets.
+fn trailing_bracket_open(id: &str) -> Option<usize> {
+    if !id.ends_with(']') {
+        return None;
+    }
+    let open = id.rfind('[')?;
+    // A single trailing group requires the prefix to contain no bracket of
+    // its own, otherwise the id carries multiple groups (e.g. `[1m][2m]`).
+    let prefix = &id[..open];
+    if prefix.contains('[') || prefix.contains(']') {
+        return None;
+    }
+    Some(open)
+}
+
+/// Extract a single trailing `[...]` context-window group from a model id and
+/// parse it. Multi-group or non-trailing groups yield `None` (caller leaves
+/// the id intact, so the bracket is sent to the API verbatim).
+pub fn context_window_from_suffix(id: &str) -> Option<u64> {
+    let open = trailing_bracket_open(id)?;
+    let inner = &id[open + 1..id.len() - 1];
+    parse_context_window(inner)
+}
+
+/// Strip a trailing `[...]` context-window suffix from a model id
+/// (e.g. `glm-5.2[1m]` → `glm-5.2`, `glm-5.2[1m123k]` → `glm-5.2`). The
+/// suffix must parse via [`parse_context_window`]; otherwise the id is
+/// returned unchanged so an unparseable bracket reaches the API verbatim.
+pub fn strip_context_suffix(id: &str) -> String {
+    let Some(open) = trailing_bracket_open(id) else {
         return id.to_string();
     };
     let inner = &id[open + 1..id.len() - 1];
-    let mut chars = inner.chars();
-    let Some(first) = chars.next() else {
-        return id.to_string();
-    };
-    if !first.is_ascii_digit() {
-        return id.to_string();
+    if parse_context_window(inner).is_some() {
+        id[..open].to_string()
+    } else {
+        id.to_string()
     }
-    let mut unit: Option<char> = None;
-    for c in chars {
-        if c.is_ascii_digit() {
-            continue;
-        }
-        if unit.is_none() && c.is_ascii_alphabetic() {
-            unit = Some(c);
-        } else {
-            return id.to_string();
-        }
-    }
-    id[..open].to_string()
 }
 
 impl CxConfig {
@@ -635,7 +707,52 @@ providers:
     }
 
     #[test]
+    fn parse_context_window_cases() {
+        // Accepted (decimal radix, pure sum).
+        assert_eq!(parse_context_window("1m"), Some(1_000_000));
+        assert_eq!(parse_context_window("244k"), Some(244_000));
+        assert_eq!(parse_context_window("208000"), Some(208_000));
+        assert_eq!(parse_context_window("1m123k"), Some(1_123_000));
+        assert_eq!(parse_context_window("1m1234k"), Some(2_234_000));
+        assert_eq!(parse_context_window("1M"), Some(1_000_000));
+        assert_eq!(parse_context_window("244K"), Some(244_000));
+        assert_eq!(parse_context_window("1m123K"), Some(1_123_000));
+        assert_eq!(parse_context_window("0"), Some(0));
+        assert_eq!(parse_context_window("0k"), Some(0));
+        assert_eq!(parse_context_window("2m0k"), Some(2_000_000));
+        assert_eq!(parse_context_window(" 1m "), Some(1_000_000));
+        assert_eq!(parse_context_window("8192"), Some(8192));
+
+        // Rejected → None.
+        assert_eq!(parse_context_window("01m"), None); // leading zero
+        assert_eq!(parse_context_window("1 m"), None); // internal whitespace
+        assert_eq!(parse_context_window("1.5m"), None); // decimal
+        assert_eq!(parse_context_window(""), None);
+        assert_eq!(parse_context_window("   "), None);
+        assert_eq!(parse_context_window("garbage"), None);
+        assert_eq!(parse_context_window("1g"), None); // unknown unit
+        assert_eq!(parse_context_window("1m2"), Some(1_000_002)); // m + bare 2
+    }
+
+    #[test]
+    fn context_window_from_suffix_cases() {
+        assert_eq!(context_window_from_suffix("glm-5.2[1m]"), Some(1_000_000));
+        assert_eq!(
+            context_window_from_suffix("deepseek-v4-pro[1m1234k]"),
+            Some(2_234_000)
+        );
+        assert_eq!(context_window_from_suffix("plain-model"), None);
+        assert_eq!(context_window_from_suffix("bad[]"), None);
+        assert_eq!(context_window_from_suffix("bad[abc]"), None);
+        assert_eq!(context_window_from_suffix("no-suffix[1m"), None); // unclosed
+        assert_eq!(context_window_from_suffix("glm[1m]5.2"), None); // non-trailing
+        assert_eq!(context_window_from_suffix("[1m][2m]"), None); // multi-group
+        assert_eq!(context_window_from_suffix("[01m]"), None); // leading zero
+    }
+
+    #[test]
     fn strip_context_suffix_cases() {
+        // Single-term (unchanged from before).
         assert_eq!(strip_context_suffix("glm-5.2[1m]"), "glm-5.2");
         assert_eq!(strip_context_suffix("qwen3.7-plus[200k]"), "qwen3.7-plus");
         assert_eq!(strip_context_suffix("plain-model"), "plain-model");
@@ -643,6 +760,20 @@ providers:
         assert_eq!(strip_context_suffix("bad[]"), "bad[]");
         assert_eq!(strip_context_suffix("bad[abc]"), "bad[abc]");
         assert_eq!(strip_context_suffix("num-only[128]"), "num-only");
+
+        // Multi-term duration-style now strips.
+        assert_eq!(strip_context_suffix("glm-5.2[1m123k]"), "glm-5.2");
+        assert_eq!(strip_context_suffix("glm-5.2[1m1234k]"), "glm-5.2");
+        assert_eq!(strip_context_suffix("m[1M]"), "m");
+        assert_eq!(strip_context_suffix("m[0]"), "m");
+
+        // Rejections leave the bracket verbatim.
+        assert_eq!(strip_context_suffix("m[01m]"), "m[01m]"); // leading zero
+        assert_eq!(strip_context_suffix("m[1 m]"), "m[1 m]"); // internal space
+        assert_eq!(strip_context_suffix("m[1.5m]"), "m[1.5m]"); // decimal
+        assert_eq!(strip_context_suffix("m[1g]"), "m[1g]"); // unknown unit
+        assert_eq!(strip_context_suffix("a[1m][2m]"), "a[1m][2m]"); // multi-group
+        assert_eq!(strip_context_suffix("glm[1m]5.2"), "glm[1m]5.2"); // non-trailing
     }
 
     #[test]
