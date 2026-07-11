@@ -50,6 +50,7 @@ status-success = 完成
 status-continued = 继续讨论
 status-error = 出错
 status-denied = 已拒绝
+status-cancelled = 已取消
 
 ### views/message.rs — Thinking 状态行
 thinking-live = 思考 { $count } 秒

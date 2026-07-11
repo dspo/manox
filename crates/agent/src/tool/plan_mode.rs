@@ -147,4 +147,10 @@ pub enum PlanApprovalResponse {
     Approve,
     /// Stay in plan mode and wait for more user direction.
     ContinueInPlanMode,
+    /// The approval was never acted upon — the overlay was not shown or the
+    /// turn was cancelled before the user could respond. Distinct from
+    /// `ContinueInPlanMode` (a real user "keep discussing" verdict) so the
+    /// turn loop does not stop on a fabricated "user gave direction" basis;
+    /// the model is told to re-submit the plan instead.
+    Cancelled,
 }

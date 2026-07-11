@@ -63,6 +63,7 @@ status-success = Done
 status-continued = Continued
 status-error = Error
 status-denied = Denied
+status-cancelled = Cancelled
 
 ### views/message.rs — Thinking status row
 thinking-live = Thinking for { $count }s
