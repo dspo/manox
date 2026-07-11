@@ -1994,9 +1994,14 @@ impl Thread {
             }
 
             let request = this.update(cx, |this, cx| {
-                this.drain_pending_steer();
                 this.pending_tool_uses.clear();
+                // Pair any orphaned tool_uses (truncated MaxTokens rounds,
+                // interrupted sessions) with error tool_results *before*
+                // draining a steer — otherwise the steer user message lands
+                // last and `reconcile_tool_uses` skips the pairing, shipping an
+                // unpaired `tool_use` to the provider (Anthropic 400).
                 this.reconcile_tool_uses(cx);
+                this.drain_pending_steer();
                 this.build_completion_request()
             })?;
 
