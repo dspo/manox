@@ -240,6 +240,26 @@ enum GoalAction {
     Abort,
 }
 
+/// Per-turn cap on recovery continuations (tool-use JSON parse error +
+/// max-tokens truncation). Guards the main thread — which has no `max_turns` —
+/// against a model that loops on unparseable JSON or keeps hitting the output
+/// budget. Each recovery continuation bumps `recovery_retries`; exceeding
+/// this emits `ThreadEvent::Error` and ends the turn rather than spinning
+/// forever.
+const MAX_RECOVERY_ATTEMPTS: u32 = 2;
+
+/// What `run_turn_loop` does after a round-trip produced no executable tool
+/// call. `Done` ends the turn (a clean `EndTurn` with nothing to retry);
+/// `Continue` loops back to `build_completion_request` with the failure fed
+/// back into history (a max-tokens directive or an error tool_result, both
+/// append-only so the prefix cache stays intact); `Abort` ends the turn on the
+/// recovery-retry cap.
+enum RecoveryAction {
+    Done,
+    Continue,
+    Abort,
+}
+
 pub struct Thread {
     pub id: ThreadId,
     messages: Vec<Message>,
@@ -305,6 +325,21 @@ pub struct Thread {
     /// allowed one extra round-trip so the sub-agent can produce a coherent
     /// final message instead of ending mid-work; a second cap hit hard-stops.
     cap_summary_injected: bool,
+    /// Set when a `ToolUseJsonParseError` landed this round: the placeholder
+    /// tool_use and the error tool_result are already in history, so the loop
+    /// continues to feed the failure back to the model instead of ending the
+    /// turn dead on an orphaned error result (thread 76aef71a).
+    pending_parse_error: bool,
+    /// Recovery continuations this turn (parse error or max-tokens truncation).
+    /// Bumped on each retry and capped by `MAX_RECOVERY_ATTEMPTS`. Reset at
+    /// `run_turn_loop` entry — it accumulates within a single turn's retries,
+    /// not across turns.
+    recovery_retries: u32,
+    /// The `StopReason` of the most recent completion, inspected by the
+    /// empty-tool-use branch to detect max-tokens truncation. Reset at the top
+    /// of each round-trip and after a recovery turn so a prior stop reason
+    /// never bleeds forward.
+    last_stop_reason: Option<StopReason>,
     /// Set by `run_plan_approval`'s continue branch to signal `run_turn_loop`
     /// to stop after the tool batch rather than auto-continuing into another
     /// completion. Continuing carries no new information, so a follow-up round
@@ -533,6 +568,9 @@ impl Thread {
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
+                pending_parse_error: false,
+                recovery_retries: 0,
+                last_stop_reason: None,
                 stop_after_plan_reject: false,
                 running_turn: None,
                 turn_cancel: None,
@@ -611,6 +649,9 @@ impl Thread {
                 max_turns: None,
                 turn_count: 0,
                 cap_summary_injected: false,
+                pending_parse_error: false,
+                recovery_retries: 0,
+                last_stop_reason: None,
                 stop_after_plan_reject: false,
                 running_turn: None,
                 turn_cancel: None,
@@ -693,6 +734,9 @@ impl Thread {
                 max_turns: Some(max_turns),
                 turn_count: 0,
                 cap_summary_injected: false,
+                pending_parse_error: false,
+                recovery_retries: 0,
+                last_stop_reason: None,
                 stop_after_plan_reject: false,
                 running_turn: None,
                 turn_cancel: None,
@@ -1835,12 +1879,27 @@ impl Thread {
             this.turn_count = 0;
             this.cap_summary_injected = false;
             this.stop_after_plan_reject = false;
+            // Reset the turn's recovery state: a prior turn's parse error or
+            // max-tokens truncation must not bleed into this one. The retry
+            // counter is turn-scoped — it accumulates across this turn's
+            // recovery round-trips, then resets here on the next user turn.
+            this.pending_parse_error = false;
+            this.recovery_retries = 0;
+            this.last_stop_reason = None;
         })?;
         loop {
             // Increment at the top so `turn_count` is 1-indexed for the
             // round-trip about to run — `self_info` mid-batch reads the current
-            // index, not the previous batch's count.
-            this.update(cx, |this, _| this.turn_count += 1)?;
+            // index, not the previous batch's count. Also clear the round-
+            // trip's recovery flags: a previous round-trip's stop reason or
+            // parse-error flag has either been consumed by the empty-tool-use
+            // branch or is stale (the model produced executable tools this
+            // round, so no recovery path applies).
+            this.update(cx, |this, _| {
+                this.turn_count += 1;
+                this.pending_parse_error = false;
+                this.last_stop_reason = None;
+            })?;
 
             // Auto-compaction: if the previous request's token usage crossed
             // the threshold, summarize the old history into a handoff message
@@ -2020,8 +2079,55 @@ impl Thread {
                     this.cwd.clone(),
                 )
             })?;
+
             if tool_uses.is_empty() {
-                break;
+                // The model stopped without producing any executable tool call.
+                // Three cases: a clean EndTurn (the turn is done),
+                // max_output_tokens truncation (the response was cut mid-stream,
+                // often mid-tool_use), or a tool_use JSON parse error (the
+                // placeholder tool_use + error tool_result are already in
+                // history). The last two feed the failure back to the model and
+                // continue the loop — aligning with pi/oh-my-pi/codex/zed —
+                // instead of ending the turn dead on a half-finished assistant
+                // message (thread 76aef71a). Append-only: a directive or an
+                // error tool_result is added, history is never rewritten, so the
+                // provider prefix cache stays intact. Both recovery paths share
+                // a per-turn retry cap so a model stuck re-truncating or
+                // re-emitting bad JSON cannot loop forever (the main thread has
+                // no `max_turns` guard).
+                let recovery = this.update(cx, |this, cx| {
+                    let recoverable = this.pending_parse_error
+                        || this.last_stop_reason == Some(StopReason::MaxTokens);
+                    if !recoverable {
+                        return RecoveryAction::Done;
+                    }
+                    this.recovery_retries += 1;
+                    if this.recovery_retries > MAX_RECOVERY_ATTEMPTS {
+                        cx.emit(ThreadEvent::Error(anyhow::anyhow!(
+                            "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (tool_use JSON parse error / max_output_tokens truncation)"
+                        )));
+                        this.pending_parse_error = false;
+                        this.last_stop_reason = None;
+                        return RecoveryAction::Abort;
+                    }
+                    if this.pending_parse_error {
+                        // The error tool_result is already in history from
+                        // `handle_completion_event`; the model retries from it.
+                        // Nothing to append.
+                    } else {
+                        // MaxTokens: append a "redo compactly" directive so the
+                        // model shortens the next attempt to fit the budget.
+                        this.append_max_tokens_directive(cx);
+                    }
+                    this.pending_parse_error = false;
+                    this.last_stop_reason = None;
+                    RecoveryAction::Continue
+                })?;
+                match recovery {
+                    RecoveryAction::Done => break,
+                    RecoveryAction::Abort => break,
+                    RecoveryAction::Continue => continue,
+                }
             }
 
             // AutoReview: ask the security-reviewer agent for each pending call.
@@ -2665,6 +2771,7 @@ impl Thread {
                         "stop_reason": format!("{reason:?}"),
                     }),
                 );
+                self.last_stop_reason = Some(reason);
                 cx.emit(ThreadEvent::Stop(reason));
             }
             Ok(LanguageModelCompletionEvent::Retry {
@@ -2726,6 +2833,13 @@ impl Thread {
                     output: json_parse_error,
                     is_error: true,
                 });
+                // Flag the round-trip so the empty-tool-use branch in
+                // `run_turn_loop` continues the loop to feed this failure
+                // back to the model, instead of ending the turn dead on the
+                // orphaned error result (thread 76aef71a). The placeholder
+                // tool_use is in the assistant message but deliberately not
+                // enqueued for execution, so `pending_tool_uses` stays empty.
+                self.pending_parse_error = true;
             }
             Err(e) => {
                 cx.emit(ThreadEvent::Error(e));
@@ -2768,6 +2882,29 @@ impl Thread {
             m.push_content(MessageContent::ToolResult(result));
         }
         let _ = cx;
+    }
+
+    /// Append the max-tokens recovery directive (`system_prompt::max_tokens_directive`)
+    /// as a `Text` block to the trailing user message, or to a fresh user
+    /// message when the last message is the truncated assistant turn. The stop
+    /// path finalizes the assistant message before this runs, so in practice
+    /// the directive lands in a new user message — append-only, so the prefix
+    /// cache is unaffected. Mirrors `push_tool_result`'s "accumulate into the
+    /// last user message" pattern: a directive is just another user-role block
+    /// paired with the preceding assistant turn.
+    fn append_max_tokens_directive(&mut self, _cx: &mut Context<Self>) {
+        let needs_new = match self.messages.last() {
+            Some(m) => m.role != Role::User,
+            None => true,
+        };
+        if needs_new {
+            self.messages.push(Message::user_with_content(Vec::new()));
+        }
+        if let Some(m) = self.messages.last_mut() {
+            m.push_content(MessageContent::Text(
+                crate::system_prompt::max_tokens_directive().to_string(),
+            ));
+        }
     }
 
     fn append_assistant_text(&mut self, text: String, _cx: &mut Context<Self>) {

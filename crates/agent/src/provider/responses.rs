@@ -59,7 +59,9 @@ impl ResponsesModel {
             api_model_id,
             endpoint_url: endpoint_url.clone(),
             api_key,
-            max_output_tokens: max_token_count.min(8192),
+            max_output_tokens: crate::provider::registry::default_max_output_tokens(
+                max_token_count,
+            ),
             max_token_count,
             long_ttl: crate::provider::openai_long_ttl(&endpoint_url),
         }

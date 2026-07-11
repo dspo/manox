@@ -171,6 +171,17 @@ pub fn max_turns_summary_prompt(max: u32) -> String {
     )
 }
 
+/// Appended as a user-role directive when a turn ends on `StopReason::MaxTokens`:
+/// the response was cut mid-stream by the output budget (often mid-`tool_use`,
+/// which surfaces as a JSON parse error on the next round). Tells the model to
+/// redo the work compactly so the retry fits, rather than ending the turn dead
+/// on a half-finished assistant message. Model-facing English — never
+/// localized. Kept in code for the same reason as `max_turns_summary_prompt`:
+/// a short, templated instruction, not prose.
+pub fn max_tokens_directive() -> &'static str {
+    "The previous response was cut off by the max_output_tokens budget before it finished. Redo the work more compactly: shorter reasoning, and if you were mid-way through a tool call, re-issue that tool call with shorter arguments. Do not repeat the truncated output verbatim."
+}
+
 /// Appended to the system prompt while the thread is in plan mode. Tells the
 /// model to delegate research to the read-only `plan`/`explore` sub-agents
 /// (isolated context) and then submit its plan via `exit_plan_mode`. Kept in

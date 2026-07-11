@@ -55,7 +55,9 @@ impl CompletionsModel {
             api_model_id,
             endpoint_url: endpoint_url.clone(),
             api_key,
-            max_output_tokens: max_token_count.min(8192),
+            max_output_tokens: crate::provider::registry::default_max_output_tokens(
+                max_token_count,
+            ),
             max_token_count,
             long_ttl: crate::provider::openai_long_ttl(&endpoint_url),
         }
@@ -656,6 +658,37 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// `CompletionsModel::new` derives `max_output_tokens` from the context
+    /// budget via `registry::default_max_output_tokens`: a 1m-context model is
+    /// capped to `MAX_OUTPUT_TOKENS_CAP`, a sub-floor context is raised to the
+    /// minimum. Mirrors the anthropic wire's assertion.
+    #[test]
+    fn new_clamps_max_output_tokens_to_budget() {
+        let big = CompletionsModel::new(
+            "p/m/completions".into(),
+            "m[1m]".into(),
+            "p".into(),
+            "m".into(),
+            "https://example.invalid".into(),
+            "k".into(),
+            1024 * 1024,
+        );
+        assert_eq!(
+            big.max_output_tokens,
+            crate::provider::registry::MAX_OUTPUT_TOKENS_CAP
+        );
+        let tiny = CompletionsModel::new(
+            "p/m/completions".into(),
+            "m".into(),
+            "p".into(),
+            "m".into(),
+            "https://example.invalid".into(),
+            "k".into(),
+            4_096,
+        );
+        assert_eq!(tiny.max_output_tokens, 8_192);
     }
 
     #[test]
