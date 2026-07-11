@@ -375,4 +375,26 @@ mod tests {
         assert!(loaded.archived, "archived flag must survive stale upsert");
         assert!(loaded.pinned, "pinned flag must survive stale upsert");
     }
+
+    #[test]
+    fn set_unread_is_independent_of_upsert() {
+        // Regression: a stale snapshot upsert must not clobber the has_unread
+        // flag set by `set_unread` — the sidebar's read state. Mirrors the
+        // archived/pinned invariant: has_unread is owned exclusively by
+        // `set_unread`, never by the general upsert path.
+        let db = open_mem();
+        db.upsert(&sample_record("t1"), true).unwrap();
+        db.set_unread("t1", true).unwrap();
+        assert!(db.list(false).unwrap()[0].has_unread);
+
+        // A stale upsert carrying no knowledge of has_unread must leave it set.
+        db.upsert(&sample_record("t1"), true).unwrap();
+        assert!(db.list(false).unwrap()[0].has_unread);
+
+        // Clearing and re-upserting must not resurrect the flag.
+        db.set_unread("t1", false).unwrap();
+        assert!(!db.list(false).unwrap()[0].has_unread);
+        db.upsert(&sample_record("t1"), true).unwrap();
+        assert!(!db.list(false).unwrap()[0].has_unread);
+    }
 }

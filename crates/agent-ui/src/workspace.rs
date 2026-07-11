@@ -146,13 +146,25 @@ struct DeferredUserTurn {
     user_images: Vec<UserImage>,
 }
 
+/// A thread parked in the background while still running a turn. The held
+/// `Subscription` is a minimal handler that only tracks terminal `Stop`/`Error`
+/// to clear the running indicator, mark the thread unread, and drop it from
+/// `background_threads` — it never touches `conversation`/`self.thread`, so a
+/// background thread's events cannot be misattributed to the foreground thread.
+struct BackgroundThread {
+    entity: Entity<Thread>,
+    _sub: Subscription,
+}
+
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<Thread>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
-    /// in the background and persist via the spawned-task save backstop.
-    background_threads: Vec<Entity<Thread>>,
+    /// in the background and persist via the spawned-task save backstop. Each
+    /// carries a minimal subscription so a terminal `Stop`/`Error` arriving
+    /// while parked marks the thread unread for the sidebar red dot.
+    background_threads: Vec<BackgroundThread>,
     sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
@@ -519,7 +531,12 @@ impl Workspace {
         // Focus the composer so typing works immediately on the hero screen.
         ws.input_state.update(cx, |s, cx| s.focus(window, cx));
         let id = ws.thread.read(cx).id.0.clone();
-        ws.sidebar.update(cx, |s, cx| s.set_selected(Some(id), cx));
+        ws.sidebar
+            .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
+        // The initial thread is the one the user lands on at startup: clear any
+        // unread red dot it carried from a prior background completion.
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.set_unread(&id, false, cx));
         ws
     }
 
@@ -633,7 +650,7 @@ impl Workspace {
                         this.turn_active = false;
                         // Clean up background reference if this thread was parked.
                         this.background_threads
-                            .retain(|t| t.read(cx).id.0 != thread_id);
+                            .retain(|b| b.entity.read(cx).id.0 != thread_id);
                         this.flush_deferred_user_turn_after_plan_continue(cx);
                     }
                     cx.notify();
@@ -687,7 +704,7 @@ impl Workspace {
                         store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
                         this.turn_active = false;
                         this.background_threads
-                            .retain(|t| t.read(cx).id.0 != thread_id);
+                            .retain(|b| b.entity.read(cx).id.0 != thread_id);
                         // An error is a terminal state symmetric to a terminal
                         // `Stop`: the turn aborted, so any pending plan overlay
                         // is now stale and must not linger over an idle thread.
@@ -722,6 +739,38 @@ impl Workspace {
                     cx.notify();
                 }
             }
+        })
+    }
+
+    /// Minimal subscription for a thread parked in `background_threads`. Unlike
+    /// `subscribe_thread`, this only reacts to terminal `Stop`/`Error`: it clears
+    /// the running indicator and marks the thread unread (the user is not
+    /// viewing it, so its finished turn deserves a red dot). It never touches
+    /// `conversation` or `self.thread`, so a background thread's streaming
+    /// deltas and tool events cannot be misrouted into the foreground view.
+    /// The parked entry is left in `background_threads` (reclaimed on a later
+    /// `open_thread`); self-removal from within the callback would drop the very
+    /// subscription running it.
+    fn subscribe_background_thread(
+        &self,
+        thread: Entity<Thread>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        let id = thread.read(cx).id.0.clone();
+        cx.subscribe(&thread, move |_this, _thread, ev: &ThreadEvent, cx| {
+            let terminal = match ev {
+                ThreadEvent::Stop(reason) => !matches!(reason, StopReason::ToolUse),
+                ThreadEvent::Error(_) => true,
+                _ => false,
+            };
+            if !terminal {
+                return;
+            }
+            let store = agent::thread_store_global();
+            store.update(cx, |s, cx| {
+                s.mark_idle(&id, cx);
+                s.set_unread(&id, true, cx);
+            });
         })
     }
 
@@ -1278,13 +1327,17 @@ impl Workspace {
         // held by `self.thread`; overwriting that field would drop it and
         // silently kill the turn via `WeakEntity::upgrade() -> None`).
         if old_thread.read(cx).is_running() && old_id != new_id {
-            self.background_threads.push(old_thread);
+            let sub = self.subscribe_background_thread(old_thread.clone(), cx);
+            self.background_threads.push(BackgroundThread {
+                entity: old_thread,
+                _sub: sub,
+            });
         }
 
         // If the new thread was previously parked in the background, reclaim it
         // so it becomes the foreground thread and is no longer double-held.
         self.background_threads
-            .retain(|t| t.read(cx).id.0 != new_id);
+            .retain(|b| b.entity.read(cx).id.0 != new_id);
 
         // Persist the old thread's current state before switching away. The
         // spawned-task save backstop in `run_turn` will persist again when the
@@ -1354,7 +1407,11 @@ impl Workspace {
         // appears immediately upon switching back.
         self.resurface_pending_auths(cx);
         self.sidebar
-            .update(cx, |s, cx| s.set_selected(Some(id), cx));
+            .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
+        // The user is now viewing this thread: clear any unread red dot it
+        // carried from a prior background completion.
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.set_unread(&id, false, cx));
         cx.notify();
     }
 
@@ -1436,9 +1493,9 @@ impl Workspace {
         if let Some(pos) = self
             .background_threads
             .iter()
-            .position(|t| t.read(cx).id.0 == id)
+            .position(|b| b.entity.read(cx).id.0 == id)
         {
-            let thread = self.background_threads.remove(pos);
+            let thread = self.background_threads.remove(pos).entity;
             self.attach_thread(thread, window, cx);
             return;
         }
@@ -5348,9 +5405,9 @@ impl Workspace {
         if let Some(pos) = self
             .background_threads
             .iter()
-            .position(|t| t.read(cx).id.0 == id)
+            .position(|b| b.entity.read(cx).id.0 == id)
         {
-            let thread = self.background_threads.remove(pos);
+            let thread = self.background_threads.remove(pos).entity;
             self.attach_thread(thread, window, cx);
             return true;
         }

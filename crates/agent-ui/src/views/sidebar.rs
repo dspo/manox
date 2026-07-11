@@ -683,6 +683,15 @@ fn render_thread_item(
                         .gap_1()
                         .items_center()
                         .min_w_0()
+                        .when(summary.has_unread, |this| {
+                            this.child(
+                                gpui::div()
+                                    .w(px(8.))
+                                    .h(px(8.))
+                                    .rounded_full()
+                                    .bg(theme.danger),
+                            )
+                        })
                         .when(summary.pinned, |this| {
                             this.child(Icon::new(IconName::Star).xsmall().text_color(theme.accent))
                         })

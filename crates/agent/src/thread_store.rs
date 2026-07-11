@@ -109,6 +109,49 @@ impl ThreadStore {
         }
     }
 
+    /// Set the unread flag on a thread. Updates the in-memory summary
+    /// immediately so the sidebar re-renders without a db round-trip, then
+    /// persists fire-and-forget on the background executor. A no-op when the
+    /// value is unchanged, so switching into an already-read thread does not
+    /// trigger a redraw or a pointless write.
+    pub fn set_unread(&mut self, id: &str, unread: bool, cx: &mut Context<Self>) {
+        let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) else {
+            // Not in the active list (archived / not yet loaded): still persist
+            // so the flag is correct if it surfaces later.
+            let db = self.db.clone();
+            let id = id.to_string();
+            cx.spawn(async move |_, cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move { db.set_unread(&id, unread) })
+                    .await;
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "Failed to set thread unread");
+                }
+            })
+            .detach();
+            return;
+        };
+        if s.has_unread == unread {
+            return;
+        }
+        s.has_unread = unread;
+        cx.emit(ThreadStoreEvent::SummariesUpdated);
+        cx.notify();
+        let db = self.db.clone();
+        let id = id.to_string();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { db.set_unread(&id, unread) })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "Failed to set thread unread");
+            }
+        })
+        .detach();
+    }
+
     /// Re-read the db, refresh the summary list, and emit. The `db.list()`
     /// query runs off the UI thread so a large history (or a busy SQLite lock)
     /// can't stall the main thread on turn end / submit / delete.
