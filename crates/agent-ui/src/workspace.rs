@@ -3066,10 +3066,16 @@ impl Workspace {
             running && self.pending_plan.is_none() && self.pending_ask.is_none(),
             cx,
         );
+        // The completion popover overlays the composer; anchoring it on the
+        // composer's own v_flex keeps it glued to the input bar in both hero
+        // and footer, with a single mount point and ElementId.
+        let completion_overlay = self.render_completion_overlay(cx);
 
         v_flex()
             .w_full()
             .gap_2()
+            .relative()
+            .children(completion_overlay)
             // Own paste at the capture phase so a clipboard image becomes a
             // pending attachment instead of letting `InputState::paste` insert
             // the image's alt-text. `stop_propagation` keeps the inner input's
@@ -3751,8 +3757,10 @@ impl Workspace {
     }
 
     /// The completion popover overlaid above the composer while a trigger token
-    /// (`/` or `@`) is active at the caret. Anchored to the footer's relative
-    /// container, floating above the input. A click on a row confirms it.
+    /// (`/` or `@`) is active at the caret. Mounted once on the composer's own
+    /// relative v_flex in `render_composer`, so it stays glued to the input bar
+    /// in both hero and footer layouts without perturbing the composer's centering.
+    /// A click on a row confirms it.
     fn render_completion_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = self.completion.as_ref()?;
         let theme = cx.theme().clone();
@@ -3762,16 +3770,14 @@ impl Workspace {
         let on_select: SelectHandler =
             std::rc::Rc::new(move |ix, window, cx| on_select(&ix, window, cx));
         Some(
-            centered(
-                gpui::div()
-                    .id("completion-dropdown")
-                    .absolute()
-                    .bottom_full()
-                    .left_0()
-                    .occlude()
-                    .child(render_completion(state, &theme, on_select)),
-            )
-            .into_any_element(),
+            gpui::div()
+                .id("completion-dropdown")
+                .absolute()
+                .bottom_full()
+                .left_0()
+                .occlude()
+                .child(render_completion(state, &theme, on_select))
+                .into_any_element(),
         )
     }
 
@@ -4397,8 +4403,6 @@ impl Render for Workspace {
                     .bg(theme.background)
                     .py_2()
                     .gap_2()
-                    .relative()
-                    .children(self.render_completion_overlay(cx))
                     .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
                     .children(self.render_attachments(&theme, cx))
                     .child(centered(self.render_composer(running, &theme, cx))),
@@ -4435,39 +4439,34 @@ impl Render for Workspace {
                     .w_full()
                     .justify_center()
                     .items_center()
-                    .relative()
-                    .child(
-                        centered(
-                            v_flex()
-                                .w_full()
-                                .gap_5()
-                                .items_center()
-                                .child(
-                                    gpui::div()
-                                        .text_base()
-                                        .font_weight(gpui::FontWeight::BLACK)
-                                        .text_color(theme.foreground)
-                                        .child(i18n::t("workspace-empty-prompt")),
-                                )
-                                .children(self.render_attachments(&theme, cx))
-                                .child(self.render_composer(running, &theme, cx))
-                                .children(hero_notices.map(|msg| {
-                                    gpui::div()
-                                        .w_full()
-                                        .px_3()
-                                        .py_1p5()
-                                        .rounded(theme.radius)
-                                        .bg(theme.accent.opacity(0.1))
-                                        .border_1()
-                                        .border_color(theme.accent.opacity(0.2))
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(msg)
-                                })),
-                        )
-                        .relative()
-                        .children(self.render_completion_overlay(cx)),
-                    ),
+                    .child(centered(
+                        v_flex()
+                            .w_full()
+                            .gap_5()
+                            .items_center()
+                            .child(
+                                gpui::div()
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::BLACK)
+                                    .text_color(theme.foreground)
+                                    .child(i18n::t("workspace-empty-prompt")),
+                            )
+                            .children(self.render_attachments(&theme, cx))
+                            .child(self.render_composer(running, &theme, cx))
+                            .children(hero_notices.map(|msg| {
+                                gpui::div()
+                                    .w_full()
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded(theme.radius)
+                                    .bg(theme.accent.opacity(0.1))
+                                    .border_1()
+                                    .border_color(theme.accent.opacity(0.2))
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(msg)
+                            })),
+                    )),
             )
         };
         // Outline rail sits left of the message list (right of the sidebar
