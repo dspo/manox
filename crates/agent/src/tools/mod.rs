@@ -102,8 +102,20 @@ pub(crate) fn resolve_path_for_write<P: AsRef<Path>>(
         ));
     }
     if !policy.is_writable(&path) {
+        // Phrase the recovery hint for a worktree-scoped policy as "target the
+        // active worktree" — an absolute path into the main checkout (thread
+        // 56ed5d5f msg133) is the common worktree-mode slip, and the generic
+        // "outside project root" wording would mislead the model into thinking
+        // the project root is the intended write target.
+        let hint = match policy.worktree_anchor() {
+            Some(wt) => format!(
+                "Use a path under the active worktree `{}`, or set `unsandboxed: true` in the bash tool and pass user approval to write elsewhere.",
+                wt.display()
+            ),
+            None => "To write outside the project root, set `unsandboxed: true` in the bash tool and pass user approval.".to_string(),
+        };
         return Err(format!(
-            "Write outside project root and temp dir: {}. To write outside the project root, set `unsandboxed: true` in the bash tool and pass user approval.",
+            "Write outside the writable area (project root / worktree / temp dir): {}. {hint}",
             path.display()
         ));
     }
@@ -427,7 +439,11 @@ mod tests {
         let r = resolve_path_for_write("/etc/manox-probe", cwd, &policy);
         assert!(r.is_err(), "must reject write outside project: {r:?}");
         let e = r.unwrap_err();
-        assert!(e.contains("outside project root"), "error: {e}");
+        assert!(e.contains("outside the writable area"), "error: {e}");
+        assert!(
+            e.contains("unsandboxed"),
+            "must hint at the escape hatch: {e}"
+        );
     }
 
     #[test]

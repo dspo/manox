@@ -39,6 +39,11 @@ use std::path::{Path, PathBuf};
 /// protected set is the project's `.git`.
 #[derive(Clone, Debug)]
 pub struct SandboxPolicy {
+    /// FS-side writable roots. The seatbelt renderer shares this set EXCEPT for
+    /// the `/tmp` scratch admission (see [`Self::admit_tmp_scratch`]), which is
+    /// FS-only: a sandboxed bash must not reach a sibling repo's `.git` under
+    /// `/tmp` (the c5aefe4d escape), so `/tmp` is kept out of the seatbelt
+    /// allowlist even when the FS check admits it for `write_file` scratch files.
     writable_roots: Vec<PathBuf>,
     protected_paths: Vec<PathBuf>,
     /// Read only by the seatbelt renderer (macOS). Kept cross-platform as a
@@ -54,6 +59,37 @@ pub struct SandboxPolicy {
     /// same repo is an approved action distinct from the c5aefe4d unauthorized
     /// jump to a sibling repo's `.git`.
     git_allowed_roots: Vec<PathBuf>,
+    /// The active worktree root when this policy is worktree-scoped
+    /// ([`SandboxPolicy::with_worktree`] / [`SandboxPolicy::for_worktree`]),
+    /// `None` for a plain project policy. Drives the write-rejection message so
+    /// a stray absolute path into the main checkout is told to target the
+    /// active worktree, not the generic "outside project root" wording.
+    worktree_anchor: Option<PathBuf>,
+    /// Whether `/tmp` + `/private/tmp` are admitted as scratch space for the
+    /// FS write check ([`Self::is_writable`]) only — `true` in project mode,
+    /// `false` under a worktree (isolation: write the worktree, not `/tmp`).
+    /// Never admitted to the seatbelt: `write_file` authors `/tmp/scratch`
+    /// (thread `56ed5d5f` msg226), but a sandboxed bash must not reach a
+    /// sibling repo's `.git` under `/tmp`.
+    admit_tmp_scratch: bool,
+}
+
+/// The canonical `$TMPDIR` (`/var/folders/.../T` on macOS) as a writable root,
+/// shared by every policy. `/tmp` and `/private/tmp` are NOT here — they are
+/// admitted FS-only via [`SandboxPolicy::admit_tmp_scratch`] (project mode) so
+/// the seatbelt never lets a sandboxed bash into a sibling repo's `.git` under
+/// `/tmp`.
+fn temp_root() -> PathBuf {
+    canonicalize_best_effort(&std::env::temp_dir())
+}
+
+/// Whether `canon` falls under `/tmp` or `/private/tmp` (the conventional
+/// scratch locations distinct from `$TMPDIR`). FS-only admission, gated on
+/// [`SandboxPolicy::admit_tmp_scratch`].
+fn is_under_tmp(canon: &Path) -> bool {
+    [Path::new("/tmp"), Path::new("/private/tmp")]
+        .iter()
+        .any(|t| canon.starts_with(t))
 }
 
 impl SandboxPolicy {
@@ -71,45 +107,57 @@ impl SandboxPolicy {
     /// `tracing::warn` marks the degenerate policy so the launch is audible.
     pub fn for_project(project_root: &Path) -> Self {
         let root = canonicalize_best_effort(project_root);
-        let temp = canonicalize_best_effort(&std::env::temp_dir());
         if root.parent().is_none() {
             tracing::warn!(
                 root = %root.display(),
                 "sandbox project root is the filesystem root; narrowing writable set to temp dir only — launch manox from a real project directory to restore full confinement"
             );
             return Self {
-                writable_roots: vec![temp],
+                writable_roots: vec![temp_root()],
                 protected_paths: Vec::new(),
                 allow_network: false,
                 git_allowed_roots: Vec::new(),
+                worktree_anchor: None,
+                admit_tmp_scratch: true,
             };
         }
         Self {
-            writable_roots: vec![root.clone(), temp],
+            writable_roots: vec![root.clone(), temp_root()],
             protected_paths: vec![root.join(".git")],
             allow_network: false,
             git_allowed_roots: Vec::new(),
+            worktree_anchor: None,
+            admit_tmp_scratch: true,
         }
     }
 
-    /// Extend a project policy for an active worktree: admit the worktree path
-    /// as a writable root, re-open the bound repo's shared `.git` for writes
-    /// (so `git commit`/`rebase`/`push` against the main repo's `.git` work),
-    /// and enable network — a worktree is an approved isolation context, and
-    /// git workflows need `push`/`fetch` to be frictionless. The c5aefe4d
-    /// threat (unauthorized `cd` into a sibling repo's `.git`) stays blocked:
-    /// only `main_repo_git_dir` is de-protected, sibling worktrees' `.git`
-    /// entries are neither under `writable_roots` nor in `git_allowed_roots`.
+    /// Extend a project policy for an active worktree: confine writes to the
+    /// worktree (+ temp), re-open the bound repo's shared `.git` for writes (so
+    /// `git commit`/`rebase`/`push` against the main repo's `.git` work), and
+    /// enable network — a worktree is an approved isolation context, and git
+    /// workflows need `push`/`fetch` to be frictionless.
+    ///
+    /// The project root is dropped from the writable set and `/tmp` scratch
+    /// admission is turned off: while a worktree is active, an absolute path
+    /// into the main checkout (thread `56ed5d5f` msg133) is rejected so the main
+    /// checkout cannot be polluted from inside the worktree, and isolation means
+    /// writes target the worktree (not `/tmp`). Writes target the worktree via
+    /// relative paths (resolved against the switched session cwd) or explicit
+    /// worktree paths. The c5aefe4d threat (unauthorized `cd` into a sibling
+    /// repo's `.git`) stays blocked: only `main_repo_git_dir` is de-protected,
+    /// sibling worktrees' `.git` entries are neither under `writable_roots` nor
+    /// in `git_allowed_roots`.
     ///
     /// `main_repo_git_dir` is the path returned by `git rev-parse
     /// --git-common-dir` from inside the worktree — the main repo's `.git`,
     /// shared across all linked worktrees.
     pub fn with_worktree(mut self, worktree_path: &Path, main_repo_git_dir: &Path) -> Self {
-        self.writable_roots
-            .push(canonicalize_best_effort(worktree_path));
+        self.writable_roots = vec![canonicalize_best_effort(worktree_path), temp_root()];
         self.git_allowed_roots
             .push(canonicalize_best_effort(main_repo_git_dir));
         self.allow_network = true;
+        self.worktree_anchor = Some(canonicalize_best_effort(worktree_path));
+        self.admit_tmp_scratch = false;
         self
     }
 
@@ -122,14 +170,21 @@ impl SandboxPolicy {
     /// `.git` directory of its own (it shares the main repo's).
     pub fn for_worktree(worktree_path: &Path, main_repo_git_dir: &Path) -> Self {
         Self {
-            writable_roots: vec![
-                canonicalize_best_effort(worktree_path),
-                canonicalize_best_effort(&std::env::temp_dir()),
-            ],
+            writable_roots: vec![canonicalize_best_effort(worktree_path), temp_root()],
             protected_paths: Vec::new(),
             allow_network: true,
             git_allowed_roots: vec![canonicalize_best_effort(main_repo_git_dir)],
+            worktree_anchor: Some(canonicalize_best_effort(worktree_path)),
+            admit_tmp_scratch: false,
         }
+    }
+
+    /// The active worktree root when this policy is worktree-scoped, else
+    /// `None`. Used by the FS write-rejection path to phrase the error as
+    /// "target the active worktree" rather than the generic project-root
+    /// wording.
+    pub fn worktree_anchor(&self) -> Option<&Path> {
+        self.worktree_anchor.as_deref()
     }
 
     /// Whether `path` falls under a writable root. The candidate may not
@@ -138,22 +193,39 @@ impl SandboxPolicy {
     /// remaining components rejoined — otherwise a non-existent path like
     /// `/var/folders/.../T/scratch` would miss the canonicalized root
     /// `/private/var/folders/.../T`.
+    ///
+    /// In project mode, `/tmp` + `/private/tmp` are admitted as scratch (so a
+    /// `write_file` to `/tmp/scratch` is not rejected) — FS-only, never
+    /// reaching the seatbelt. A worktree policy does not admit `/tmp`:
+    /// isolation means writing the worktree.
     pub fn is_writable(&self, path: &Path) -> bool {
         let canon = canonicalize_best_effort(path);
-        self.writable_roots
+        if self
+            .writable_roots
             .iter()
             .any(|root| canon.starts_with(root))
+        {
+            return true;
+        }
+        self.admit_tmp_scratch && is_under_tmp(&canon)
     }
 
-    /// Whether `path` falls under a protected path (e.g. project `.git`), minus
-    /// any subtree explicitly re-opened via `git_allowed_roots` (the bound
-    /// repo's `.git` while a worktree is active). A path under a protected root
-    /// that also falls under a git-allowed root is NOT protected — the
-    /// harness-managed worktree entry de-protects the same repo's `.git` for git
-    /// ops, without admitting sibling repos' `.git` (the c5aefe4d escape).
+    /// Whether `path` is protected. Any `.git` path component is protected
+    /// (the c5aefe4d escape targeted a sibling repo's `.git`; once `/tmp` is
+    /// FS-admitted a sibling repo under `/tmp` would otherwise be writable, so
+    /// the protection is component-based, not just the project's own `.git`),
+    /// plus the explicit `protected_paths` set. A protected path that also
+    /// falls under a `git_allowed_roots` entry (the bound repo's `.git` while a
+    /// worktree is active) is NOT protected — the harness-managed worktree
+    /// entry de-protects the same repo's `.git` for git ops, without admitting
+    /// sibling repos' `.git`.
     pub fn is_protected(&self, path: &Path) -> bool {
         let canon = canonicalize_best_effort(path);
-        let under_protected = self.protected_paths.iter().any(|p| canon.starts_with(p));
+        let has_git_component = canon
+            .components()
+            .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"));
+        let under_protected =
+            has_git_component || self.protected_paths.iter().any(|p| canon.starts_with(p));
         if !under_protected {
             return false;
         }
@@ -227,8 +299,11 @@ impl SandboxPolicy {
     /// never re-evaluated by an outer shell — no escaping, no injection. The
     /// login shell's PATH is injected so the sandboxed bash finds Homebrew /
     /// toolchain binaries the GUI process env otherwise lacks (thread
-    /// `e5047fd2`: `gh` not found). Other env (HOME, KEYCHAIN_*, LANG) is
-    /// inherited as-is.
+    /// `e5047fd2`: `gh` not found). Non-interactive editor/pager env
+    /// (`GIT_EDITOR`/`EDITOR`=`true`, `GIT_PAGER`/`PAGER`=`cat`) is injected
+    /// when unset so `git rebase --continue` / `git log` do not open an
+    /// interactive `$EDITOR` / pager and hang the turn (thread `56ed5d5f`
+    /// msg308). Other env (HOME, KEYCHAIN_*, LANG) is inherited as-is.
     #[cfg(target_os = "macos")]
     pub fn wrap_command(&self, command: &str, cwd: &Path) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
@@ -240,6 +315,7 @@ impl SandboxPolicy {
             .arg(command)
             .env("PATH", crate::path_env::resolved_login_path())
             .current_dir(cwd);
+        inject_noninteractive_env(&mut cmd);
         cmd
     }
 }
@@ -283,6 +359,34 @@ fn escape_seatbelt_path(path: &Path) -> String {
 /// Whether the OS sandbox backend is available on the current platform.
 pub fn is_available() -> bool {
     cfg!(target_os = "macos")
+}
+
+/// Non-interactive editor/pager defaults injected into every bash subprocess
+/// when the surrounding environment has not set them. `GIT_EDITOR`/`EDITOR` =
+/// `true` makes git accept the default message instead of opening an
+/// interactive `$EDITOR` (thread `56ed5d5f` msg308: `git rebase --continue`
+/// hung on `$EDITOR`); `GIT_PAGER`/`PAGER` = `cat` emits raw stdout the tool
+/// already caps instead of spawning a pager. The agent's bash is
+/// non-interactive, so an interactive editor/pager would hang the turn.
+pub(crate) const NONINTERACTIVE_ENV: &[(&str, &str)] = &[
+    ("GIT_EDITOR", "true"),
+    ("EDITOR", "true"),
+    ("GIT_PAGER", "cat"),
+    ("PAGER", "cat"),
+];
+
+/// Set [`NONINTERACTIVE_ENV`] on a tokio `Command` only for vars the process
+/// environment has not already defined — a user who deliberately set
+/// `EDITOR=code` in the GUI env keeps theirs. macOS-only because it feeds the
+/// seatbelt `wrap_command` path; the non-macOS bash path sets the same vars
+/// through brush's `set_env_global` in `bash.rs`.
+#[cfg(target_os = "macos")]
+pub(crate) fn inject_noninteractive_env(cmd: &mut tokio::process::Command) {
+    for (k, v) in NONINTERACTIVE_ENV {
+        if std::env::var_os(k).is_none() {
+            cmd.env(k, v);
+        }
+    }
 }
 
 /// Conservative heuristic for bash commands that drive other macOS applications
@@ -442,30 +546,37 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn fs_and_seatbelt_agree_on_representative_paths() {
-        // The Rust-side `is_write_allowed` (used by FS `resolve_path_for_write`
-        // and the bash unsandboxed cwd pre-check) and the seatbelt
-        // `(allow file-write* (subpath ...))` + `(deny ... .git)` lines must
-        // classify the same paths the same way — otherwise a write FS rejects
-        // bash allows (or vice-versa), the inconsistency behind issue 3. A
-        // protected subtree (`.git`) is under the project root, so the combined
-        // `is_write_allowed` (writable AND not protected) is the predicate that
-        // matches seatbelt's more-specific-rule-wins ordering.
+        // FS `is_write_allowed` and the seatbelt agree on the project root, the
+        // system temp dir, and `.git` (protected on both sides). They
+        // INTENTIONALLY diverge on `/tmp` scratch: the FS admits `/tmp` for
+        // `write_file` scratch files (thread 56ed5d5f msg226), but the seatbelt
+        // does NOT — a sandboxed bash must not reach a sibling repo's `.git`
+        // under `/tmp` (the c5aefe4d escape). `.git` is protected on both sides
+        // regardless of location (component-based), so even an FS `/tmp` write
+        // into a `.git` is blocked.
         let p = policy();
         let s = p.render_seatbelt();
-        // Project root + tmp are writable on both sides.
+        // Project root + $TMPDIR writable on both sides.
         assert!(p.is_write_allowed(Path::new("/tmp/manox-sandbox-test/src/lib.rs")));
         assert!(s.contains("/tmp/manox-sandbox-test"));
         assert!(p.is_write_allowed(&std::env::temp_dir().join("scratch")));
-        // Sibling worktree, /etc are NOT writable on either side.
-        assert!(!p.is_write_allowed(Path::new("/tmp/manox-sibling-worktree/x")));
+        // `/etc` is NOT writable on either side.
         assert!(!p.is_write_allowed(Path::new("/etc/passwd")));
-        // The seatbelt policy string contains no `allow` for these.
-        assert!(!s.contains("/tmp/manox-sibling-worktree"));
         assert!(!s.contains("/etc/passwd"));
-        // `.git` is under the project root (so `is_writable` alone is true) but
-        // protected — the combined predicate must reject it, matching seatbelt's
-        // explicit deny.
-        assert!(!p.is_write_allowed(Path::new("/tmp/manox-sandbox-test/.git/config")));
+        // `/tmp/scratch` is FS-writable but NOT in the seatbelt — the deliberate
+        // split: `write_file` can author `/tmp` scratch, sandboxed bash cannot.
+        assert!(
+            p.is_writable(Path::new("/tmp/manox-scratch.json")),
+            "FS admits /tmp scratch in project mode"
+        );
+        assert!(
+            !s.contains("(allow file-write* (subpath \"/tmp\"))"),
+            "seatbelt must NOT admit /tmp (c5aefe4d): {s}"
+        );
+        // A sibling repo's source under `/tmp` is FS-writable, but its `.git`
+        // is protected on both sides (component-based `.git` protection).
+        assert!(p.is_writable(Path::new("/tmp/manox-sibling-worktree/src")));
+        assert!(!p.is_write_allowed(Path::new("/tmp/manox-sibling-worktree/.git/config")));
         assert!(s.contains("deny file-write* (subpath"));
     }
 
@@ -537,10 +648,13 @@ mod tests {
         let git_dir = project.join(".git");
         let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
         let p = SandboxPolicy::for_project(project).with_worktree(worktree, &git_dir);
-        // The bound repo's .git is now writable (git ops work).
+        // The bound repo's .git is NOT FS-writable (it is not under the
+        // worktree or $TMPDIR, and the `.git` component is protected). bash
+        // seatbelt is the git-op path: the seatbelt re-allows the bound .git
+        // via `git_allowed_roots` (see `seatbelt_with_worktree_allows_bound_git_and_network`).
         assert!(
-            p.is_write_allowed(&git_dir.join("config")),
-            "bound .git must be writable under worktree policy"
+            !p.is_write_allowed(&git_dir.join("config")),
+            "FS tools must not write .git directly; bash seatbelt is the git-op path"
         );
         // The worktree itself is writable.
         assert!(p.is_write_allowed(&worktree.join("src/lib.rs")));
@@ -622,5 +736,88 @@ mod tests {
             "FS tools must not write .git directly; bash seatbelt is the git-op path"
         );
         assert!(p.allow_network);
+    }
+
+    #[test]
+    fn with_worktree_drops_project_root_from_writable_set() {
+        // P4: entering a worktree must confine FS writes to the worktree — a
+        // stray absolute path into the main checkout (thread 56ed5d5f msg133)
+        // is rejected so the main checkout is not polluted from the worktree.
+        let project = Path::new("/tmp/manox-sandbox-test");
+        let git_dir = project.join(".git");
+        let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
+        let p = SandboxPolicy::for_project(project).with_worktree(worktree, &git_dir);
+        assert!(p.is_write_allowed(&worktree.join("src/lib.rs")));
+        assert!(
+            !p.is_write_allowed(&project.join("src/lib.rs")),
+            "main project root must NOT be writable under a worktree policy"
+        );
+        assert_eq!(
+            p.worktree_anchor().map(|p| p.to_path_buf()),
+            Some(canonicalize_best_effort(worktree)),
+            "worktree anchor is recorded for the write-rejection message"
+        );
+    }
+
+    #[test]
+    fn tmp_scratch_writable_in_project_mode_only() {
+        // P8: `$TMPDIR` (`/var/folders/.../T` on macOS) is neither `/tmp` nor
+        // `/private/tmp`, so a `write_file` to `/tmp/scratch` was rejected
+        // while bash could write there. Now `/tmp` + `/private/tmp` are
+        // admitted FS-side in project mode (so `write_file` can author scratch),
+        // but NOT in worktree mode (isolation: write the worktree).
+        let p = SandboxPolicy::for_project(Path::new("/tmp/manox-sandbox-test"));
+        assert!(p.is_writable(Path::new("/tmp/scratch-file")));
+        assert!(p.is_writable(Path::new("/private/tmp/scratch-file")));
+        assert!(p.is_writable(&std::env::temp_dir().join("scratch-file")));
+
+        let git_dir = Path::new("/tmp/manox-sandbox-test/.git");
+        let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
+        let wt = SandboxPolicy::for_project(Path::new("/tmp/manox-sandbox-test"))
+            .with_worktree(worktree, git_dir);
+        assert!(
+            !wt.is_writable(Path::new("/tmp/scratch-file")),
+            "worktree mode must not admit /tmp (isolation)"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wrap_command_injects_noninteractive_editor_and_pager_when_unset() {
+        // P6: when the process env lacks EDITOR/PAGER, the sandboxed bash gets
+        // non-interactive defaults so `git rebase --continue` does not open an
+        // interactive editor (thread 56ed5d5f msg308).
+        let p = policy();
+        let cmd = p.wrap_command(
+            "git rebase --continue",
+            Path::new("/tmp/manox-sandbox-test"),
+        );
+        let env = cmd.as_std().get_envs();
+        // Only assert the vars we expect to be set; a host that pre-sets
+        // EDITOR/PAGER would override, so guard against that.
+        let mut have_editor = false;
+        let mut have_pager = false;
+        for (k, v) in env {
+            let (Some(key), val) = (k.to_str(), v.and_then(|x| x.to_str())) else {
+                continue;
+            };
+            match (key, val) {
+                ("EDITOR" | "GIT_EDITOR", Some("true")) => have_editor = true,
+                ("PAGER" | "GIT_PAGER", Some("cat")) => have_pager = true,
+                _ => {}
+            }
+        }
+        if std::env::var_os("EDITOR").is_none() && std::env::var_os("GIT_EDITOR").is_none() {
+            assert!(
+                have_editor,
+                "EDITOR/GIT_EDITOR must be set to `true` when unset"
+            );
+        }
+        if std::env::var_os("PAGER").is_none() && std::env::var_os("GIT_PAGER").is_none() {
+            assert!(
+                have_pager,
+                "PAGER/GIT_PAGER must be set to `cat` when unset"
+            );
+        }
     }
 }

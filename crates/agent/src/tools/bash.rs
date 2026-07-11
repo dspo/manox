@@ -133,6 +133,15 @@ struct BashInput {
     /// approval.
     #[serde(default, deserialize_with = "lenient_bool_opt")]
     unsandboxed: Option<bool>,
+    /// Keep only the first N lines of stdout/stderr. The command still runs to
+    /// completion (no SIGPIPE) — prefer this over piping into `head`, which
+    /// truncates the upstream pipe and can SIGPIPE-kill a long-running command.
+    #[serde(default)]
+    head_lines: Option<usize>,
+    /// Keep only the last N lines of stdout/stderr. The command still runs to
+    /// completion (no SIGPIPE) — prefer this over piping into `tail`.
+    #[serde(default)]
+    tail_lines: Option<usize>,
 }
 
 impl AgentTool for BashTool {
@@ -146,7 +155,10 @@ impl AgentTool for BashTool {
          the `cwd` parameter. For out-of-sandbox capabilities (network, writing outside the project root) \
          set `unsandboxed: true`, which after user approval runs in a persistent shell session (cd/export \
          persist across calls). Default timeout is 120s (override with timeout_secs); on timeout or cancel \
-         the whole process group is terminated. stdout/stderr stream back to the UI live."
+         the whole process group is terminated. stdout/stderr stream back to the UI live. \
+         Do NOT pipe output to `head`/`tail` to reduce volume — that truncates the upstream pipe and can \
+         SIGPIPE-kill a long-running command; use `head_lines`/`tail_lines` instead, which keep the \
+         selection (first N, last N, or both with middle elided) while letting the command finish naturally."
     }
     fn requires_approval(&self, input: &serde_json::Value) -> bool {
         let unsandboxed = input
@@ -210,6 +222,8 @@ impl AgentTool for BashTool {
         // always run via the persistent shell without seatbelt confinement.
         let yolo = ctx.yolo();
         let unsandboxed = parsed.unsandboxed.unwrap_or(false) || yolo;
+        let head_lines = parsed.head_lines;
+        let tail_lines = parsed.tail_lines;
         bridge_tokio(cx, async move {
             if unsandboxed {
                 // Approved escalation / YOLO: brush's persistent shell, no confinement.
@@ -222,6 +236,8 @@ impl AgentTool for BashTool {
                     timeout,
                     cancel,
                     sink,
+                    head_lines,
+                    tail_lines,
                 )
                 .await
             } else if crate::sandbox::is_available() {
@@ -236,6 +252,8 @@ impl AgentTool for BashTool {
                         timeout,
                         cancel,
                         sink,
+                        head_lines,
+                        tail_lines,
                     )
                     .await
                 }
@@ -257,6 +275,8 @@ impl AgentTool for BashTool {
                     timeout,
                     cancel,
                     sink,
+                    head_lines,
+                    tail_lines,
                 )
                 .await
             }
@@ -282,6 +302,11 @@ enum Outcome {
 /// its `.git`. Direct writes outside the project root are NOT blocked here:
 /// the unsandboxed path is the user-approved / YOLO escape route, and
 /// constraining writes (not cwd) would defeat its purpose.
+// too_many_arguments: the bash entry points pass the full subprocess-spawn +
+// capture + cancel knob set down the call chain, and `run_sandboxed_bash`
+// mirrors this list 1:1. Bundling into a config struct would diverge the two
+// signatures and obscure the trivial arg-forward that routes unsandboxed →
+// sandboxed, so the high count is structural, not a design smell.
 #[allow(clippy::too_many_arguments)]
 async fn run_bash(
     shell: Arc<tokio::sync::Mutex<Option<Shell>>>,
@@ -292,6 +317,8 @@ async fn run_bash(
     timeout: Duration,
     cancel: CancellationToken,
     sink: ToolOutputSink,
+    head_lines: Option<usize>,
+    tail_lines: Option<usize>,
 ) -> Result<String, anyhow::Error> {
     // Reject a cwd override outside the writable set or inside a protected
     // subtree before brush executes it. `cd <sibling-worktree>` is the exact
@@ -349,6 +376,17 @@ async fn run_bash(
                 brush_core::ShellVariable::new(crate::path_env::resolved_login_path().to_string()),
             )
             .map_err(brush_err)?;
+            // Inject non-interactive editor/pager defaults (only when the
+            // process env hasn't set them) so `git rebase --continue` / `git
+            // log` do not open an interactive `$EDITOR` / pager and hang the
+            // turn (thread 56ed5d5f msg308). brush propagates shell env to
+            // external children, so one set on init covers every call.
+            for (k, v) in crate::sandbox::NONINTERACTIVE_ENV {
+                if std::env::var_os(k).is_none() {
+                    s.set_env_global(k, brush_core::ShellVariable::new((*v).to_string()))
+                        .map_err(brush_err)?;
+                }
+            }
             *guard = Some(s);
         }
         if let Some(cwd) = cwd_override {
@@ -403,6 +441,8 @@ async fn run_bash(
     let (err_str, _err_trunc, err_dropped) =
         err_buf.lock().expect("capture buffer lock poisoned").take();
 
+    let out_str = select_lines(&out_str, head_lines, tail_lines);
+    let err_str = select_lines(&err_str, head_lines, tail_lines);
     format_result(ran, out_str, out_dropped, err_str, err_dropped)
 }
 
@@ -558,6 +598,44 @@ impl CaptureBuffer {
     }
 }
 
+/// Return the requested slice of `text`: first `head` lines, last `tail`
+/// lines, or both with the elided middle collapsed into a marker. The command
+/// has already run to completion (capture is post-hoc), so unlike a `| head`
+/// pipe the upstream process never sees SIGPIPE. `None`/`None` returns the
+/// full text unchanged — the byte cap ([`CaptureBuffer`] / [`TruncatedText`])
+/// still applies downstream.
+///
+/// When both bounds are set and the text has more than `head + tail` lines, the
+/// middle is replaced with `... (N lines elided) ...` so the model knows lines
+/// were dropped and can widen the selection. `split_inclusive('\n')` keeps the
+/// trailing newline with each line so re-joining reproduces the original
+/// byte layout, including a final unterminated line.
+fn select_lines(text: &str, head: Option<usize>, tail: Option<usize>) -> String {
+    match (head, tail) {
+        (None, None) => text.to_string(),
+        (Some(h), None) => text.split_inclusive('\n').take(h).collect::<String>(),
+        (None, Some(t)) => {
+            let lines: Vec<&str> = text.split_inclusive('\n').collect();
+            let start = lines.len().saturating_sub(t);
+            lines[start..].concat()
+        }
+        (Some(h), Some(t)) => {
+            let lines: Vec<&str> = text.split_inclusive('\n').collect();
+            if lines.len() <= h + t {
+                text.to_string()
+            } else {
+                let head_part: String = lines[..h].concat();
+                let tail_start = lines.len() - t;
+                let tail_part: String = lines[tail_start..].concat();
+                let elided = lines.len() - h - t;
+                format!(
+                    "{head_part}... ({elided} lines elided, widen head_lines/tail_lines to see them) ...\n{tail_part}"
+                )
+            }
+        }
+    }
+}
+
 /// Why a sandboxed wait ended: child exited, spawn failed, wall-clock
 /// timeout, or user cancellation.
 #[cfg(target_os = "macos")]
@@ -649,6 +727,10 @@ async fn read_pipe_async<R: tokio::io::AsyncRead + Unpin>(
 /// [`run_bash`]'s capture/timeout/cancel structure but over a one-shot
 /// `tokio::process::Command` rather than brush's persistent shell.
 #[cfg(target_os = "macos")]
+// too_many_arguments: mirrors `run_bash`'s parameter list 1:1 (the sandboxed
+// path swaps brush's persistent shell for a one-shot `sandbox-exec` Command
+// but keeps the same knobs); see `run_bash` for why a config struct is worse.
+#[allow(clippy::too_many_arguments)]
 async fn run_sandboxed_bash(
     command: &str,
     base_cwd: &Path,
@@ -657,6 +739,8 @@ async fn run_sandboxed_bash(
     timeout: Duration,
     cancel: CancellationToken,
     sink: ToolOutputSink,
+    head_lines: Option<usize>,
+    tail_lines: Option<usize>,
 ) -> Result<String, anyhow::Error> {
     use std::process::Stdio;
     use tokio::process::Child;
@@ -741,6 +825,8 @@ async fn run_sandboxed_bash(
         (t, d)
     };
 
+    let out_str = select_lines(&out_str, head_lines, tail_lines);
+    let err_str = select_lines(&err_str, head_lines, tail_lines);
     format_sandboxed_result(ran, out_str, out_dropped, err_str, err_dropped)
 }
 
@@ -799,6 +885,8 @@ mod tests {
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -823,6 +911,8 @@ mod tests {
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
+            None,
+            None,
         )
         .await
         .expect("fast exit must not panic and must report Ok");
@@ -840,6 +930,8 @@ mod tests {
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -859,6 +951,8 @@ mod tests {
             Duration::from_secs(1),
             CancellationToken::new(),
             null_sink(),
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -889,6 +983,8 @@ mod tests {
             Duration::from_secs(60),
             cancel,
             null_sink(),
+            None,
+            None,
         )
         .await
         .unwrap_err();
@@ -911,6 +1007,8 @@ mod tests {
             Duration::from_secs(1),
             CancellationToken::new(),
             null_sink(),
+            None,
+            None,
         )
         .await;
         assert!(
@@ -934,6 +1032,8 @@ mod tests {
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -946,6 +1046,8 @@ mod tests {
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1104,5 +1206,52 @@ mod tests {
                 "sandboxed command needs approval without a backend"
             );
         }
+    }
+
+    // ─── select_lines: head/tail selection without SIGPIPE ─────────────────
+
+    #[test]
+    fn select_lines_none_returns_full_text() {
+        let s = "line1\nline2\nline3\n";
+        assert_eq!(select_lines(s, None, None), s);
+    }
+
+    #[test]
+    fn select_lines_head_only_keeps_first_n() {
+        assert_eq!(select_lines("a\nb\nc\nd\n", Some(2), None), "a\nb\n");
+        // Fewer lines than requested: returns all of them, no padding.
+        assert_eq!(select_lines("a\nb\n", Some(5), None), "a\nb\n");
+    }
+
+    #[test]
+    fn select_lines_tail_only_keeps_last_n() {
+        assert_eq!(select_lines("a\nb\nc\nd\n", None, Some(2)), "c\nd\n");
+        assert_eq!(select_lines("a\nb\n", None, Some(5)), "a\nb\n");
+    }
+
+    #[test]
+    fn select_lines_head_and_tail_elides_middle() {
+        let out = select_lines("a\nb\nc\nd\ne\n", Some(1), Some(1));
+        assert!(out.starts_with("a\n"), "head kept first: {out}");
+        assert!(out.ends_with("e\n"), "tail kept last: {out}");
+        assert!(
+            out.contains("3 lines elided"),
+            "elision count reported: {out}"
+        );
+    }
+
+    #[test]
+    fn select_lines_head_and_tail_no_elision_when_short_enough() {
+        // 3 lines, head=1 + tail=1 = 2 < 3 → elide. head=2 + tail=2 = 4 ≥ 3 →
+        // no elision, full text returned verbatim.
+        assert!(select_lines("a\nb\nc\n", Some(1), Some(1)).contains("elided"));
+        assert_eq!(select_lines("a\nb\nc\n", Some(2), Some(2)), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn select_lines_handles_unterminated_final_line() {
+        // A final line without a trailing newline is preserved as one line.
+        assert_eq!(select_lines("a\nb\nca", Some(1), None), "a\n");
+        assert_eq!(select_lines("a\nb\nca", None, Some(1)), "ca");
     }
 }
