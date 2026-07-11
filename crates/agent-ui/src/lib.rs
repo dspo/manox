@@ -35,6 +35,7 @@ gpui::actions!(
         CompletionUp,
         CompletionDown,
         CompletionConfirm,
-        CompletionDismiss
+        CompletionDismiss,
+        UndoLastQueued
     ]
 );

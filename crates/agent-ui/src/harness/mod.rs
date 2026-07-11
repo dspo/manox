@@ -103,8 +103,8 @@ impl Harness {
         self.workspace.read(cx).harness_pending_auth_count()
     }
 
-    pub fn has_deferred_plan_turn(&self, cx: &App) -> bool {
-        self.workspace.read(cx).harness_has_deferred_plan_turn()
+    pub fn has_queued_follow_up(&self, cx: &App) -> bool {
+        self.workspace.read(cx).harness_has_queued_follow_up()
     }
 
     pub fn cancel(&self, cx: &mut App) -> Result<(), String> {
@@ -197,6 +197,12 @@ impl Harness {
                         "streaming": a.streaming,
                         "is_error": a.is_error,
                         "final_text": a.final_text,
+                    }),
+                    ConvItem::Thinking(t) => json!({
+                        "kind": "thinking",
+                        "streaming": t.streaming,
+                        "collapsed": t.collapsed,
+                        "entries": t.entries.len(),
                     }),
                     ConvItem::Error(t) => json!({ "kind": "error", "text": t }),
                     ConvItem::Notice(t) => json!({ "kind": "notice", "text": t }),

@@ -18,7 +18,10 @@ use gpui_component::{
     v_flex,
 };
 
-use agent::{i18n, mcp, settings as user_settings};
+use agent::{
+    i18n, mcp,
+    settings::{self as user_settings, FollowUpBehavior},
+};
 
 mod panels;
 
@@ -159,7 +162,7 @@ pub struct SettingsView {
     keep_awake: bool,
     code_review_mode: SharedString,
     send_shortcut: SharedString,
-    follow_up_behavior: SharedString,
+    follow_up_behavior: FollowUpBehavior,
     pop_up_shortcut_status: SharedString,
     default_no_project_chat: bool,
     microphone: SharedString,
@@ -251,7 +254,7 @@ impl SettingsView {
             keep_awake: true,
             code_review_mode: i18n::t("settings-value-detached"),
             send_shortcut: i18n::t("settings-value-enter-shift"),
-            follow_up_behavior: i18n::t("settings-value-queue"),
+            follow_up_behavior: user_settings::load().follow_up_behavior,
             pop_up_shortcut_status: i18n::t("settings-value-disabled"),
             default_no_project_chat: false,
             microphone: i18n::t("settings-value-system-default"),
@@ -322,6 +325,15 @@ impl SettingsView {
         settings.language = Some(token);
         if let Err(e) = user_settings::save(&settings) {
             tracing::warn!(error = %e, "failed to save language");
+        }
+        cx.notify();
+    }
+
+    fn persist_follow_up_behavior(&mut self, value: FollowUpBehavior, cx: &mut Context<Self>) {
+        let mut settings = user_settings::load();
+        settings.follow_up_behavior = value;
+        if let Err(e) = user_settings::save(&settings) {
+            tracing::warn!(error = %e, "failed to save follow_up_behavior");
         }
         cx.notify();
     }

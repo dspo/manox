@@ -156,6 +156,17 @@ struct BackgroundThread {
     _sub: Subscription,
 }
 
+/// A follow-up submitted while a turn is running. `steer` marks the item for
+/// injection at the next safe join point (the running turn absorbs it as
+/// directional context); an unmarked item waits for the turn to end and then
+/// flushes as the next user turn. The default disposition of a newly submitted
+/// item is seeded from `Settings::follow_up_behavior`; the per-item Steer
+/// action overrides it.
+struct QueuedFollowUp {
+    turn: DeferredUserTurn,
+    steer: bool,
+}
+
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<Thread>,
@@ -239,10 +250,18 @@ pub struct Workspace {
     /// A pending plan approval (model called `exit_plan_mode`) rendered as
     /// inline actions on the matching plan card.
     pending_plan: Option<PendingPlan>,
-    /// User turn submitted while a plan card is awaiting inline approval. It is
-    /// flushed after the plan-continue tool result lands, preserving provider
-    /// tool_use/tool_result ordering.
-    deferred_user_turn_after_plan_continue: Option<DeferredUserTurn>,
+    /// Follow-ups submitted while a turn is running (or while a plan card is
+    /// awaiting inline approval). Steer items are injected into the running
+    /// turn at the next safe join point; queue items flush as the next user
+    /// turn on terminal Stop. The first item also covers the plan-continue
+    /// deferred-turn path: it is pushed here and `respond_plan(false)` auto
+    /// continues, so the flush lands after the plan-continue tool result.
+    queued_follow_ups: std::collections::VecDeque<QueuedFollowUp>,
+    /// Tracks whether the composer placeholder currently reads the follow-up
+    /// hint, so the placeholder only flips on the running↔idle transition
+    /// (avoids re-setting it every render and the notify churn that would
+    /// cause).
+    composer_followup_placeholder: bool,
     /// Files picked via the `+` menu, not yet sent. Cleared on submit.
     pending_attachments: Vec<PendingAttachment>,
     /// True while a native directory picker is open from the "Choose project" row.
@@ -496,7 +515,8 @@ impl Workspace {
             title_menu: None,
             title_menu_sub: None,
             pending_plan: None,
-            deferred_user_turn_after_plan_continue: None,
+            queued_follow_ups: std::collections::VecDeque::new(),
+            composer_followup_placeholder: false,
             pending_attachments: Vec::new(),
             project_picker_pending: false,
             blank_project_parent: None,
@@ -651,7 +671,7 @@ impl Workspace {
                         // Clean up background reference if this thread was parked.
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
-                        this.flush_deferred_user_turn_after_plan_continue(cx);
+                        this.flush_queued_follow_ups(cx);
                     }
                     cx.notify();
                 }
@@ -712,6 +732,10 @@ impl Workspace {
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
                         this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);
+                        // Error is terminal; flush queued follow-ups the same way
+                        // a terminal Stop does so the queue never desyncs from
+                        // the running state (mirrors the Stop arm above).
+                        this.flush_queued_follow_ups(cx);
                     }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -1392,7 +1416,7 @@ impl Workspace {
         self.pending_auths.clear();
         self.pending_ask = None;
         self.pending_plan = None;
-        self.deferred_user_turn_after_plan_continue = None;
+        self.queued_follow_ups.clear();
         self.thread_sub = Some(self.subscribe_thread(cx));
         // The thinking ticker belongs to the outgoing thread: bump its
         // generation so the old ticker self-terminates, then mirror the incoming
@@ -1520,13 +1544,13 @@ impl Workspace {
             }
             return;
         }
-        if (text.trim().is_empty() && attachments.is_empty())
-            || (self.thread.read(cx).is_running() && self.pending_plan.is_none())
-            // Block submit while the project picker is open: setting the
-            // project after a message lands is a no-op (set_project guards on
-            // !messages.is_empty()), so the project would be silently dropped.
-            || self.project_picker_pending
-        {
+        // Block submit on empty input or while the project picker is open.
+        // Setting the project after a message lands is a no-op (`set_project`
+        // guards on `!messages.is_empty()`), so the project would be silently
+        // dropped. A message submitted while a turn is running is *not* dropped
+        // here — it is routed through `send_user_turn`, which enqueues it as a
+        // follow-up instead of interrupting the running turn.
+        if (text.trim().is_empty() && attachments.is_empty()) || self.project_picker_pending {
             self.pending_attachments = attachments;
             return;
         }
@@ -1543,7 +1567,12 @@ impl Workspace {
         // into the same registry as `MarkdownSlashCommand` adapters and dispatch
         // into `run_command_turn` → `Thread::submit_command`, which substitutes
         // `$ARGUMENTS` and applies the command's `allowed-tools` filter.
-        if self.pending_plan.is_none()
+        // Slash commands only dispatch while idle — a `/name [args]` typed
+        // while a turn is running is parked in the follow-up queue as raw text
+        // rather than interrupting the run (e.g. `/clear` mid-turn would race
+        // the streaming conversation). The queued text flushes at turn end.
+        if !self.thread.read(cx).is_running()
+            && self.pending_plan.is_none()
             && attachments.is_empty()
             && let Some(parsed) = crate::slash_command::parse(&text)
         {
@@ -1657,32 +1686,43 @@ impl Workspace {
         let ui = Self::message_ui_metadata(&meta);
         let weak = cx.weak_entity();
         let user_images = Self::decode_user_images(&images);
+        let turn = DeferredUserTurn {
+            text,
+            images,
+            meta,
+            ui,
+            user_images,
+        };
+        // Plan approval in flight: park the turn and let the plan response
+        // drive it. Reuses the queue; the steer flag is moot here since the
+        // turn runs as soon as the plan-continue result lands.
         if self.pending_plan.is_some() {
-            let turn = DeferredUserTurn {
-                text,
-                images,
-                meta,
-                ui,
-                user_images,
-            };
-            self.deferred_user_turn_after_plan_continue = Some(turn);
+            self.queued_follow_ups
+                .push_back(QueuedFollowUp { turn, steer: false });
             self.respond_plan(false, cx);
             return;
         }
-        self.append_and_run_user_turn(
-            DeferredUserTurn {
-                text,
-                images,
-                meta,
-                ui,
-                user_images,
-            },
-            weak,
-            cx,
-        );
+        // A turn is running — park the message as a visible follow-up instead
+        // of interrupting the in-flight tool calls. The default disposition
+        // (Queue vs Steer) comes from the setting and seeds the per-item flag;
+        // the Steer action can later promote it to a mid-turn injection.
+        if self.thread.read(cx).is_running() {
+            let default_steer = agent::settings::load().follow_up_behavior
+                == agent::settings::FollowUpBehavior::Steer;
+            self.queued_follow_ups.push_back(QueuedFollowUp {
+                turn,
+                steer: default_steer,
+            });
+            cx.notify();
+            return;
+        }
+        self.append_and_run_user_turn(turn, weak, cx);
     }
 
-    fn append_and_run_user_turn(
+    /// Push a user turn into the conversation UI and the thread's message
+    /// history without starting a turn. Used to batch drained follow-ups into a
+    /// single follow-up turn.
+    fn append_user_turn(
         &mut self,
         turn: DeferredUserTurn,
         weak: WeakEntity<Workspace>,
@@ -1692,8 +1732,8 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(turn.text.clone(), turn.user_images, turn.meta, weak, cx)
         });
-        // Splice the new user item in and re-engage tail-follow so the streaming
-        // reply stays pinned as it grows.
+        // Splice the new user item in and re-engage tail-follow so the
+        // streaming reply stays pinned as it grows.
         self.sync_list_count(cx);
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.thread.update(cx, |thread, cx| {
@@ -1707,19 +1747,94 @@ impl Workspace {
                 content.extend(turn.images);
                 thread.insert_user_message_with_content_and_ui_metadata(content, Some(turn.ui), cx);
             }
-            thread.run_turn(cx);
         });
+    }
+
+    /// Like [`append_user_turn`](Self::append_user_turn), but the message lands
+    /// in the thread's steer queue instead of its history — the running turn
+    /// absorbs it at the next safe join point rather than starting a new turn.
+    /// The UI bubble is rendered immediately so the steer is visible while the
+    /// running turn digests it.
+    fn append_steer_turn(
+        &mut self,
+        turn: DeferredUserTurn,
+        weak: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        use agent::language_model::MessageContent;
+        self.conversation.update(cx, |c, cx| {
+            c.push_user(turn.text.clone(), turn.user_images, turn.meta, weak, cx)
+        });
+        self.sync_list_count(cx);
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        let mut content = Vec::with_capacity(turn.images.len() + 1);
+        if !turn.text.trim().is_empty() {
+            content.push(MessageContent::Text(turn.text));
+        }
+        content.extend(turn.images);
+        let ui = turn.ui;
+        self.thread.update(cx, |thread, cx| {
+            thread.enqueue_steer(content, Some(ui), cx);
+        });
+    }
+
+    fn append_and_run_user_turn(
+        &mut self,
+        turn: DeferredUserTurn,
+        weak: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        self.append_user_turn(turn, weak, cx);
+        self.thread.update(cx, |thread, cx| thread.run_turn(cx));
         // Persist on submit so the sidebar shows the new entry immediately.
         save_thread(self.thread.clone(), true, cx);
         cx.notify();
     }
 
-    fn flush_deferred_user_turn_after_plan_continue(&mut self, cx: &mut Context<Self>) {
-        let Some(turn) = self.deferred_user_turn_after_plan_continue.take() else {
+    /// Drain every parked follow-up into a single new turn. Multiple messages
+    /// coalesce into one user block, keeping the request prefix stable
+    /// (mirrors the team inbox flush). Steer-flagged items that were not
+    /// explicitly promoted to a mid-turn injection land here as ordinary
+    /// follow-up messages — the run is over, so the steer disposition is moot.
+    fn flush_queued_follow_ups(&mut self, cx: &mut Context<Self>) {
+        if self.queued_follow_ups.is_empty() {
+            return;
+        }
+        let weak = cx.weak_entity();
+        while let Some(item) = self.queued_follow_ups.pop_front() {
+            self.append_user_turn(item.turn, weak.clone(), cx);
+        }
+        self.thread.update(cx, |thread, cx| thread.run_turn(cx));
+        save_thread(self.thread.clone(), true, cx);
+        cx.notify();
+    }
+
+    /// Promote a parked follow-up to a steer: while running, hand it to the
+    /// thread's steer queue so the turn absorbs it at the next safe join point;
+    /// while idle, just run it. Either way the item leaves the visible queue.
+    fn steer_follow_up(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let running = self.thread.read(cx).is_running();
+        let Some(item) = self.queued_follow_ups.remove(idx) else {
             return;
         };
         let weak = cx.weak_entity();
-        self.append_and_run_user_turn(turn, weak, cx);
+        if running {
+            self.append_steer_turn(item.turn, weak, cx);
+        } else {
+            self.append_and_run_user_turn(item.turn, weak, cx);
+        }
+    }
+
+    fn delete_follow_up(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if self.queued_follow_ups.remove(idx).is_some() {
+            cx.notify();
+        }
+    }
+
+    fn undo_last_queued(&mut self, cx: &mut Context<Self>) {
+        if self.queued_follow_ups.pop_back().is_some() {
+            cx.notify();
+        }
     }
 
     /// Decode provider-bound image contents into UI-preview `UserImage`s. The
@@ -3156,9 +3271,27 @@ impl Workspace {
     fn render_composer(
         &mut self,
         running: bool,
+        window: &mut Window,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Flip the composer placeholder to a follow-up hint while a turn is
+        // running (and no plan/ask is awaiting input), restoring it on idle.
+        // The cached flag limits the InputState mutation to the transition so
+        // render doesn't churn the placeholder every frame.
+        let followup_mode = running && self.pending_plan.is_none() && self.pending_ask.is_none();
+        if followup_mode != self.composer_followup_placeholder {
+            self.composer_followup_placeholder = followup_mode;
+            let key = if followup_mode {
+                "composer-placeholder-followup"
+            } else {
+                "workspace-input-placeholder"
+            };
+            self.input_state.update(cx, |state, cx| {
+                state.set_placeholder(i18n::t(key), window, cx);
+            });
+        }
+        let queue = self.render_queued_follow_ups(theme, cx);
         let plus = self.render_plus_button(cx);
         let project_chip = self.render_project_chip(theme, cx);
         let worktree_chip = self.render_worktree_chip(theme, cx);
@@ -3181,6 +3314,7 @@ impl Workspace {
             .w_full()
             .gap_2()
             .relative()
+            .children(queue)
             .children(completion_overlay)
             // Own paste at the capture phase so a clipboard image becomes a
             // pending attachment instead of letting `InputState::paste` insert
@@ -3267,6 +3401,87 @@ impl Workspace {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Render the compact queue of follow-ups parked above the composer while a
+    /// turn is running. Each row carries the message summary, a Steer badge
+    /// when the item is flagged for mid-turn injection, and Steer / Remove /
+    /// More affordances. Steer promotes the item to a mid-turn injection;
+    /// Remove drops it before it lands.
+    fn render_queued_follow_ups(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut rows = Vec::with_capacity(self.queued_follow_ups.len());
+        for (idx, item) in self.queued_follow_ups.iter().enumerate() {
+            let summary = truncate_follow_up(&item.turn.text);
+            let steer_badge = item.steer.then(|| {
+                gpui::div()
+                    .px_1()
+                    .py_0p5()
+                    .rounded(theme.radius)
+                    .bg(theme.accent.opacity(0.15))
+                    .text_xs()
+                    .text_color(theme.accent)
+                    .child(i18n::t("queued-steer-badge"))
+            });
+            let steer_btn = Button::new(format!("queue-steer-{idx}"))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Map)
+                .tooltip(i18n::t("queued-steer-action"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.steer_follow_up(idx, cx);
+                }));
+            let delete_btn = Button::new(format!("queue-delete-{idx}"))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Close)
+                .tooltip(i18n::t("queued-delete-action"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.delete_follow_up(idx, cx);
+                }));
+            let more_btn = Button::new(format!("queue-more-{idx}"))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Ellipsis)
+                .tooltip(i18n::t("queued-more-action"));
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded(theme.radius)
+                    .bg(theme.secondary)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                gpui::div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_x_hidden()
+                                    .text_xs()
+                                    .text_color(theme.foreground)
+                                    .child(summary),
+                            )
+                            .children(steer_badge),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_0p5()
+                            .flex_shrink_0()
+                            .child(steer_btn)
+                            .child(delete_btn)
+                            .child(more_btn),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows
     }
 
     /// Access chip + 3-tier approval popover.
@@ -4511,7 +4726,7 @@ impl Render for Workspace {
                     .gap_2()
                     .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
                     .children(self.render_attachments(&theme, cx))
-                    .child(centered(self.render_composer(running, &theme, cx))),
+                    .child(centered(self.render_composer(running, window, &theme, cx))),
             )
         };
         // Hero occupies the message-list region on the first screen.
@@ -4558,7 +4773,7 @@ impl Render for Workspace {
                                     .child(i18n::t("workspace-empty-prompt")),
                             )
                             .children(self.render_attachments(&theme, cx))
-                            .child(self.render_composer(running, &theme, cx))
+                            .child(self.render_composer(running, window, &theme, cx))
                             .children(hero_notices.map(|msg| {
                                 gpui::div()
                                     .w_full()
@@ -4799,6 +5014,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
                 this.close_terminal_tab(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::UndoLastQueued, _window, cx| {
+                this.undo_last_queued(cx);
             }))
             // Completion actions only match via the `completion == open > Input`
             // keybindings, so any fire means the popover was open and these
@@ -5383,8 +5601,8 @@ impl Workspace {
         self.pending_auths.len()
     }
 
-    pub(crate) fn harness_has_deferred_plan_turn(&self) -> bool {
-        self.deferred_user_turn_after_plan_continue.is_some()
+    pub(crate) fn harness_has_queued_follow_up(&self) -> bool {
+        !self.queued_follow_ups.is_empty()
     }
 
     pub(crate) fn harness_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5459,6 +5677,20 @@ fn truncate_env_model_id(id: String) -> String {
     }
     let head: String = chars.into_iter().take(ENV_MODEL_ID_MAX - 3).collect();
     format!("{head}...")
+}
+
+/// Cap a queued follow-up's text for the compact queue row so long pastes
+/// don't blow out the composer chrome. Trailing whitespace is trimmed and an
+/// ellipsis marks a truncation.
+fn truncate_follow_up(s: &str) -> String {
+    const MAX: usize = 80;
+    let s = s.trim();
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(MAX).collect();
+    t.push('…');
+    t
 }
 
 /// Compact token count display: `1m,357k`, `168k,653`, `999`.

@@ -58,8 +58,8 @@ async fn direct_messages_route_pending_plan_and_ask_inline(cx: &mut gpui::TestAp
     });
     assert_eq!(cx.update(|cx| h.pending_plan_id(cx)), None);
     assert!(
-        cx.update(|cx| h.has_deferred_plan_turn(cx)),
-        "composer submit should defer the user turn until the plan-continue result lands"
+        cx.update(|cx| h.has_queued_follow_up(cx)),
+        "composer submit should queue the user turn until the plan-continue result lands"
     );
 
     let ask_input = json!({
