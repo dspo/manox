@@ -174,7 +174,7 @@ Bottom section: loose (non-project) threads.
 
 #### SidebarThreadItem
 
-Single thread row: title, short-id tag (shimmer if running), token count, time, archive btn. Hover/active/selected wash uses the thread's last saved approval-mode color.
+Single thread row: unread red dot (8px, `theme.danger`, shown when `summary.has_unread`), pinned star, title, short-id tag (shimmer if running), token count, time, archive btn. Hover/active/selected wash uses the thread's last saved approval-mode color. The red dot marks a thread that finished a turn while the user was viewing another thread; it clears when the user switches into the thread.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 

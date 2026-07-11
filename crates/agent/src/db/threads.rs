@@ -32,6 +32,11 @@ pub struct ThreadSummary {
     /// Pinned flag toggled from the title bar menu. Pinned threads float to
     /// the top of the sidebar list (sorted first by `pinned DESC`).
     pub pinned: bool,
+    /// Unread flag: the thread finished a turn the user has not yet viewed.
+    /// Set on a background thread's terminal `Stop`/`Error`, cleared when the
+    /// user switches into the thread. `upsert` never touches this column — only
+    /// `set_unread` does — so snapshots cannot clobber the read state.
+    pub has_unread: bool,
     pub created_at: i64,
     pub interacted_at: i64,
     pub updated_at: i64,
@@ -122,6 +127,7 @@ pub fn create_table(conn: &Connection) -> Result<()> {
             parent_id TEXT,
             archived INTEGER NOT NULL DEFAULT 0,
             pinned INTEGER NOT NULL DEFAULT 0,
+            has_unread INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             interacted_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -365,13 +371,15 @@ impl ThreadsDatabase {
             "SELECT id, summary, title, title_override, model_id, provider_id, approval_mode, project, depth,
                     parent_id, archived, pinned, created_at, interacted_at, updated_at,
                     cumulative_input_tokens + cumulative_output_tokens
-                        + cumulative_cache_creation_input_tokens + cumulative_cache_read_input_tokens
+                        + cumulative_cache_creation_input_tokens + cumulative_cache_read_input_tokens,
+                    has_unread
                     FROM threads ORDER BY pinned DESC, interacted_at DESC"
         } else {
             "SELECT id, summary, title, title_override, model_id, provider_id, approval_mode, project, depth,
                     parent_id, archived, pinned, created_at, interacted_at, updated_at,
                     cumulative_input_tokens + cumulative_output_tokens
-                        + cumulative_cache_creation_input_tokens + cumulative_cache_read_input_tokens
+                        + cumulative_cache_creation_input_tokens + cumulative_cache_read_input_tokens,
+                    has_unread
                     FROM threads WHERE archived = 0 ORDER BY pinned DESC, interacted_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -393,6 +401,7 @@ impl ThreadsDatabase {
                 interacted_at: row.get(13)?,
                 updated_at: row.get(14)?,
                 cumulative_total_tokens: row.get::<_, i64>(15)? as u64,
+                has_unread: row.get::<_, i64>(16)? != 0,
             })
         })?;
         let mut out = Vec::new();
@@ -410,6 +419,18 @@ impl ThreadsDatabase {
             params![archived as i64, id],
         )
         .context("archive thread")?;
+        Ok(())
+    }
+
+    /// Set the unread flag on a thread. Independent of `upsert` so snapshot
+    /// saves can never clobber the read state.
+    pub fn set_unread(&self, id: &str, unread: bool) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE threads SET has_unread = ?1 WHERE id = ?2",
+            params![unread as i64, id],
+        )
+        .context("set thread unread")?;
         Ok(())
     }
 
