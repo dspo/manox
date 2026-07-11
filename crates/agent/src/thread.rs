@@ -181,6 +181,12 @@ pub enum ThreadEvent {
     /// Goal mode toggled on/off. The UI shows or hides the `◎ /goal active`
     /// chip and, on activation, starts its elapsed-time ticker.
     GoalChanged { active: bool },
+    /// Auto-compaction summarization pass started: the side-LLM call in
+    /// `stream_summary` is in flight. The cockpit flips to a "Summarizing
+    /// context…" phase until the matching `Compaction` event lands. Carries
+    /// the active-token total that crossed the trigger threshold, mirroring
+    /// `Compaction::tokens_before`.
+    CompactionStarted { tokens_before: u64 },
     /// A compaction pass landed: older history was replaced by a handoff
     /// summary message. `messages_compacted` is the count of messages folded
     /// into the summary; `tokens_before` is the active-token total that
@@ -365,6 +371,12 @@ pub struct Thread {
     /// in-flight tool (e.g. `bash`) can reap its process group promptly instead
     /// of relying on task-drop, which does not reach the detached tokio child.
     turn_cancel: Option<CancellationToken>,
+    /// Wall-clock anchor for the in-flight turn, set the instant `TurnStarted`
+    /// is emitted and cleared when the turn ends (`Stop`/`Error`/cancel). The
+    /// cockpit reads `elapsed()` for its run-status timer; `None` ⇒ idle.
+    /// Mirrors `GoalState::started_at` — a core-side anchor that travels with
+    /// the entity across thread swaps, so the UI does not re-wire on switch.
+    turn_started_at: Option<Instant>,
     /// Optional tool whitelist for the current turn, set by a slash command's
     /// `allowed-tools` frontmatter. `None` or empty = inherit all tools. The
     /// filter lasts for the turn's lifetime and is cleared when the turn ends,
@@ -594,6 +606,7 @@ impl Thread {
                 last_stop_reason: None,
                 stop_after_plan_reject: false,
                 running_turn: None,
+                turn_started_at: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
@@ -677,6 +690,7 @@ impl Thread {
                 last_stop_reason: None,
                 stop_after_plan_reject: false,
                 running_turn: None,
+                turn_started_at: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
@@ -764,6 +778,7 @@ impl Thread {
                 last_stop_reason: None,
                 stop_after_plan_reject: false,
                 running_turn: None,
+                turn_started_at: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
@@ -1157,6 +1172,12 @@ impl Thread {
         self.approval_mode
     }
 
+    /// Whether any tool is in the session always-allow set. The cockpit
+    /// permission indicator surfaces this as a "session allowlist active" tag.
+    pub fn session_allowlist_active(&self) -> bool {
+        self.permission.allowed_count() > 0
+    }
+
     /// Switch approval mode. Emits [`ThreadEvent::ApprovalModeChanged`] so the
     /// UI refreshes the chip, the popover's selected row, and (for Yolo) the
     /// seatbelt branch in the next tool call. No-op when the mode is unchanged.
@@ -1431,6 +1452,12 @@ impl Thread {
         self.running_turn.is_some()
     }
 
+    /// Wall-clock anchor of the in-flight turn, or `None` when idle. The
+    /// cockpit reads `elapsed()` for its run-status timer.
+    pub fn turn_started_at(&self) -> Option<Instant> {
+        self.turn_started_at
+    }
+
     /// Return the UI metadata for pending authorizations. Used by the workspace
     /// to re-emit `ToolCallAuthorization` events when switching back to a thread
     /// that was parked waiting for user approval.
@@ -1546,6 +1573,7 @@ impl Thread {
         // first streaming delta arrives — so the sidebar running indicator
         // lights up during the warm-up gap. `ThreadStore::set_running` (called
         // by the workspace on this event) is the bridge to the sidebar.
+        self.turn_started_at = Some(Instant::now());
         cx.emit(ThreadEvent::TurnStarted);
 
         let cancel = CancellationToken::new();
@@ -1561,6 +1589,7 @@ impl Thread {
             let turn_cancelled = this
                 .update(cx, |this, cx| {
                     this.running_turn = None;
+                    this.turn_started_at = None;
                     this.turn_cancel = None;
                     // A slash command's tool filter lasts only for its turn; clear it
                     // so a subsequent free-form message inherits the full tool set.
@@ -1781,8 +1810,9 @@ impl Thread {
 
     /// Run the side LLM call that summarizes `messages[0..insertion_ix]` into a
     /// handoff summary, then insert a `Compaction` message at `insertion_ix`,
-    /// emit `ThreadEvent::Compaction`, persist, record the event, and bust the
-    /// prefix-cache fingerprint. The summary request is built and streamed
+    /// emit `ThreadEvent::CompactionStarted` (before the call) then
+    /// `ThreadEvent::Compaction` (after), persist, record the event, and bust
+    /// the prefix-cache fingerprint. The summary request is built and streamed
     /// outside any `this` write lease; only the final insert + bookkeeping hold
     /// the lease. Returns the summary text on success.
     async fn perform_compaction(
@@ -1802,6 +1832,14 @@ impl Thread {
                     .unwrap_or(0)
             })
             .unwrap_or(0);
+        // Signal the cockpit that the side-LLM summarization is in flight so
+        // it can flip to a "Summarizing context…" phase; the matching
+        // `Compaction` event below reverts it. Emitted under its own short
+        // lease — never held across the `stream_summary` await.
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::CompactionStarted { tokens_before });
+            cx.notify();
+        })?;
         let request = this.read_with(cx, |this, _| {
             crate::compact::build_compaction_request(&this.messages, insertion_ix)
         })?;

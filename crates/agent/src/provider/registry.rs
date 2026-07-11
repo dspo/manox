@@ -59,7 +59,7 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             resolved.provider_name
         )
     })?)?;
-    let max_tokens = parse_max_tokens(&resolved.context);
+    let max_tokens = resolve_context_window(resolved);
 
     let model: AnyLanguageModel = match resolved.wire_api {
         WireApi::Anthropic => Arc::new(AnthropicModel::new(
@@ -97,7 +97,7 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
 }
 
 /// Ceiling for a model's `max_output_tokens` request field. A model's context
-/// budget (e.g. glm-5.2 `[1m]` = 1,048,576) far exceeds what any provider lets a
+/// budget (e.g. glm-5.2 `[1m]` = 1,000,000, decimal) far exceeds what any provider lets a
 /// single response emit, so the raw `max_token_count` is unsuitable as the
 /// output budget. Capped to keep responses bounded; floored well above the old
 /// hard `8192` so a reasoning model mid-thinking is not cut off mid-tool-call —
@@ -109,26 +109,30 @@ pub(crate) fn default_max_output_tokens(max_token_count: u64) -> u64 {
     max_token_count.clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_CAP)
 }
 
-/// Parse a context string (e.g. `1m` / `200k` / `8192`) into a token count.
-/// Falls back to 8192 when unparseable.
-fn parse_max_tokens(context: &str) -> u64 {
-    let trimmed = context.trim();
-    if trimmed.is_empty() {
-        return 8192;
+/// Resolve a model's context-window size in tokens. The `context` yaml field
+/// takes precedence when present and parseable; an unparseable `context` is a
+/// hard error (warn + 8192 fallback) — it does NOT silently fall through to a
+/// bracket suffix on the id, because an explicit field means the operator chose
+/// a value and a typo should surface, not masquerade as a different number. When
+/// no `context` is set, a trailing bracket suffix on the id (e.g.
+/// `glm-5.2[1m123k]`) is parsed; absent both, 8192.
+fn resolve_context_window(resolved: &ResolvedModel) -> u64 {
+    let ctx = resolved.context.trim();
+    if !ctx.is_empty() {
+        match cx_providers::parse_context_window(ctx) {
+            Some(n) => n,
+            None => {
+                tracing::warn!(
+                    model_id = %resolved.id,
+                    context = %resolved.context,
+                    "context field unparseable; fallback 8192, no bracket fallback"
+                );
+                8192
+            }
+        }
+    } else {
+        cx_providers::context_window_from_suffix(&resolved.id).unwrap_or(8192)
     }
-    let (num_part, unit) = match trimmed.chars().last() {
-        Some(u) if u.is_ascii_alphabetic() => (&trimmed[..trimmed.len() - 1], Some(u)),
-        _ => (trimmed, None),
-    };
-    let Ok(n) = num_part.parse::<u64>() else {
-        return 8192;
-    };
-    let mult: u64 = match unit {
-        Some('k') | Some('K') => 1024,
-        Some('m') | Some('M') => 1024 * 1024,
-        _ => 1,
-    };
-    n.saturating_mul(mult)
 }
 
 /// Read the cx config, build the registry, and register it globally. Call at App startup.
@@ -154,13 +158,46 @@ pub fn global() -> &'static ProviderRegistry {
 mod tests {
     use super::*;
 
+    fn model(id: &str, context: &str) -> ResolvedModel {
+        ResolvedModel {
+            id: id.to_string(),
+            swe_pro: String::new(),
+            hle: String::new(),
+            desc: String::new(),
+            context: context.to_string(),
+            wire_api: WireApi::Anthropic,
+            model_wire_apis: Vec::new(),
+            provider_name: String::new(),
+            endpoint_url: String::new(),
+            visible_agents: Vec::new(),
+            copilot_auth: cx_providers::CopilotAuth::ApiKey,
+            env: std::collections::BTreeMap::new(),
+            apikey_source: None,
+        }
+    }
+
     #[test]
-    fn parse_max_tokens_cases() {
-        assert_eq!(parse_max_tokens("1m"), 1024 * 1024);
-        assert_eq!(parse_max_tokens("200k"), 200 * 1024);
-        assert_eq!(parse_max_tokens("8192"), 8192);
-        assert_eq!(parse_max_tokens(""), 8192);
-        assert_eq!(parse_max_tokens("garbage"), 8192);
+    fn resolve_context_window_cases() {
+        // context field wins over a bracket suffix on the id.
+        assert_eq!(
+            resolve_context_window(&model("glm-5.2[1m]", "244k")),
+            244_000
+        );
+        // bracket suffix when no context field.
+        assert_eq!(resolve_context_window(&model("glm-5.2[1m]", "")), 1_000_000);
+        assert_eq!(
+            resolve_context_window(&model("glm-5.2[1m1234k]", "")),
+            2_234_000
+        );
+        // unparseable context is a hard error: 8192, no bracket fallback.
+        assert_eq!(
+            resolve_context_window(&model("glm-5.2[1m]", "garbage")),
+            8192
+        );
+        // neither context nor suffix.
+        assert_eq!(resolve_context_window(&model("glm-5.2", "")), 8192);
+        // context is trimmed before parsing.
+        assert_eq!(resolve_context_window(&model("glm-5.2", " 1m ")), 1_000_000);
     }
 
     #[test]

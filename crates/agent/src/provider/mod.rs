@@ -13,7 +13,7 @@ pub mod sse;
 pub use cx_providers::{
     AgentConfig, ApiKeySourceKind, CopilotAuth, CxConfig, EndpointConfig, ModelConfig,
     ProviderConfig, ProviderEndpointDetail, ProviderEndpointSpec, ProviderModelConfig,
-    ResolvedModel, WireApi, resolve_apikey,
+    ResolvedModel, WireApi, context_window_from_suffix, parse_context_window, resolve_apikey,
 };
 pub use registry::{ProviderRegistry, global as registry_global, init as registry_init};
 
