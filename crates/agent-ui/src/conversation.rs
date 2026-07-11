@@ -444,7 +444,11 @@ impl ConversationState {
             // model-history overlay). No conversation item.
             ThreadEvent::TokenUsageUpdated(_)
             | ThreadEvent::ModelChanged { .. }
-            | ThreadEvent::ReasoningEffortChanged { .. } => ApplyOutcome::None,
+            | ThreadEvent::ReasoningEffortChanged { .. }
+            // `CompactionStarted` is a cockpit-only phase signal (the side-LLM
+            // summarization is in flight); the conversation list renders nothing
+            // for it. The workspace flips the cockpit phase on this event.
+            | ThreadEvent::CompactionStarted { .. } => ApplyOutcome::None,
             // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
             // workspace to light the sidebar running indicator; it carries no
             // conversation content.

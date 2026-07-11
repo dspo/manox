@@ -68,6 +68,16 @@ impl PermissionCache {
             .clone()
     }
 
+    /// Count of always-allowed tools without cloning the set. The cockpit
+    /// permission indicator uses this to tell whether a session allowlist is
+    /// active.
+    pub fn allowed_count(&self) -> usize {
+        self.always_allow
+            .lock()
+            .expect("always_allow poisoned")
+            .len()
+    }
+
     /// Construct a cache pre-seeded with an always-allow snapshot (e.g. a
     /// sub-agent inheriting its parent's grants).
     pub fn from_snapshot(tools: HashSet<String>) -> Self {

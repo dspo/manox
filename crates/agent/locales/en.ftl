@@ -473,7 +473,7 @@ titlebar-unarchive-notice = Conversation unarchived.
 titlebar-not-implemented = Not implemented yet.
 
 # ── Environment info panel ──────────────────────────────────────────────
-workspace-env-title = Environment info
+workspace-env-title = Conversation info
 workspace-env-changes = Changes
 workspace-env-no-project = No project
 workspace-env-usage = Usage
@@ -481,6 +481,36 @@ workspace-env-throughput = Throughput
 workspace-env-cache = Cache
 workspace-env-sources = Sources
 workspace-env-no-sources = No sources yet
+
+# ── Cockpit (run status / milestones / context budget) ──────────────────
+# The "Conversation info" card's run-status row. {$phase} is a localized
+# phase label, {$elapsed} a pre-formatted duration, {$tokens} a pre-formatted
+# token count (e.g. "22.7k").
+cockpit-run-status = {$phase} · {$elapsed} · ↓ {$tokens}
+# Phase labels for the run-status row.
+cockpit-status-idle = Idle
+cockpit-status-thinking = Thinking
+cockpit-status-streaming = Streaming
+cockpit-status-running-tool = Running tool
+cockpit-status-awaiting-approval = Awaiting approval
+cockpit-status-summarizing = Summarizing context
+cockpit-status-stopped = Stopped
+cockpit-status-failed = Failed
+# Milestone section header.
+cockpit-milestones-header = Plan
+# Trailing note for a blocked milestone. {$deps} is a comma-separated list.
+cockpit-blocked-by = blocked by {$deps}
+# Collapsed summary of completed milestones. {$count} is a number.
+cockpit-completed-summary = +{$count} completed
+# Context-budget row. {$pct} is a number 0–100.
+cockpit-context-until-auto-summary = {$pct}% until auto-summary
+cockpit-context-of-window = {$pct}% of context
+cockpit-context-estimate = estimate
+# Hide/show tasks hint appended to the milestone section header. Generic —
+# the header is also clickable to toggle.
+cockpit-hide-tasks-hint = click to collapse
+cockpit-show-tasks-hint = click to expand
+
 composer-pasted-image = Pasted image
 composer-image-process-failed = Some pasted images could not be sent (unsupported format or too large)
 composer-placeholder-followup = Request a follow-up change…
