@@ -10,6 +10,7 @@
 //! escalation or when no OS sandbox backend is available (see [`bash`]).
 
 pub mod agent;
+pub mod apply_patch;
 pub mod ask_user;
 pub mod bash;
 pub mod edit_file;
@@ -212,6 +213,10 @@ pub(crate) fn base_tools_with_policy(
             sandbox: sandbox.clone(),
         }),
         Arc::new(edit_file::EditFileTool {
+            cwd: cwd.clone(),
+            sandbox: sandbox.clone(),
+        }),
+        Arc::new(apply_patch::ApplyPatchTool {
             cwd: cwd.clone(),
             sandbox: sandbox.clone(),
         }),
