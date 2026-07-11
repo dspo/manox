@@ -243,10 +243,10 @@ enum GoalAction {
 /// Per-turn cap on recovery continuations (tool-use JSON parse error +
 /// max-tokens truncation). Guards the main thread — which has no `max_turns` —
 /// against a model that loops on unparseable JSON or keeps hitting the output
-/// budget. Each recovery continuation bumps `parse_error_retries`; exceeding
+/// budget. Each recovery continuation bumps `recovery_retries`; exceeding
 /// this emits `ThreadEvent::Error` and ends the turn rather than spinning
 /// forever.
-const MAX_PARSE_ERROR_RETRIES: u32 = 2;
+const MAX_RECOVERY_ATTEMPTS: u32 = 2;
 
 /// What `run_turn_loop` does after a round-trip produced no executable tool
 /// call. `Done` ends the turn (a clean `EndTurn` with nothing to retry);
@@ -331,10 +331,10 @@ pub struct Thread {
     /// turn dead on an orphaned error result (thread 76aef71a).
     pending_parse_error: bool,
     /// Recovery continuations this turn (parse error or max-tokens truncation).
-    /// Bumped on each retry and capped by `MAX_PARSE_ERROR_RETRIES`. Reset at
+    /// Bumped on each retry and capped by `MAX_RECOVERY_ATTEMPTS`. Reset at
     /// `run_turn_loop` entry — it accumulates within a single turn's retries,
     /// not across turns.
-    parse_error_retries: u32,
+    recovery_retries: u32,
     /// The `StopReason` of the most recent completion, inspected by the
     /// empty-tool-use branch to detect max-tokens truncation. Reset at the top
     /// of each round-trip and after a recovery turn so a prior stop reason
@@ -569,7 +569,7 @@ impl Thread {
                 turn_count: 0,
                 cap_summary_injected: false,
                 pending_parse_error: false,
-                parse_error_retries: 0,
+                recovery_retries: 0,
                 last_stop_reason: None,
                 stop_after_plan_reject: false,
                 running_turn: None,
@@ -650,7 +650,7 @@ impl Thread {
                 turn_count: 0,
                 cap_summary_injected: false,
                 pending_parse_error: false,
-                parse_error_retries: 0,
+                recovery_retries: 0,
                 last_stop_reason: None,
                 stop_after_plan_reject: false,
                 running_turn: None,
@@ -735,7 +735,7 @@ impl Thread {
                 turn_count: 0,
                 cap_summary_injected: false,
                 pending_parse_error: false,
-                parse_error_retries: 0,
+                recovery_retries: 0,
                 last_stop_reason: None,
                 stop_after_plan_reject: false,
                 running_turn: None,
@@ -1884,7 +1884,7 @@ impl Thread {
             // counter is turn-scoped — it accumulates across this turn's
             // recovery round-trips, then resets here on the next user turn.
             this.pending_parse_error = false;
-            this.parse_error_retries = 0;
+            this.recovery_retries = 0;
             this.last_stop_reason = None;
         })?;
         loop {
@@ -2101,10 +2101,10 @@ impl Thread {
                     if !recoverable {
                         return RecoveryAction::Done;
                     }
-                    this.parse_error_retries += 1;
-                    if this.parse_error_retries > MAX_PARSE_ERROR_RETRIES {
+                    this.recovery_retries += 1;
+                    if this.recovery_retries > MAX_RECOVERY_ATTEMPTS {
                         cx.emit(ThreadEvent::Error(anyhow::anyhow!(
-                            "turn aborted: exceeded {MAX_PARSE_ERROR_RETRIES} recovery retries (tool_use JSON parse error / max_output_tokens truncation)"
+                            "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (tool_use JSON parse error / max_output_tokens truncation)"
                         )));
                         this.pending_parse_error = false;
                         this.last_stop_reason = None;
