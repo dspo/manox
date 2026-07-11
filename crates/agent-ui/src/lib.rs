@@ -3,6 +3,7 @@
 //! Workspace top-level view + `ConversationState` + views. Holds an
 //! `Entity<agent::Thread>` and subscribes to `ThreadEvent` for incremental rendering.
 
+pub mod cockpit;
 pub mod conversation;
 pub mod dispatch;
 #[cfg(feature = "debug")]
@@ -36,6 +37,7 @@ gpui::actions!(
         CompletionDown,
         CompletionConfirm,
         CompletionDismiss,
-        UndoLastQueued
+        UndoLastQueued,
+        ToggleCockpitTasks
     ]
 );

@@ -12,9 +12,11 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+use agent::compact::MIN_COMPACTION_CONTEXT_WINDOW;
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::provider::registry;
+use agent::settings;
 use agent::thread::ApprovalMode;
 use agent::{
     PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId, i18n,
@@ -39,6 +41,9 @@ use gpui_component::{
 };
 use manox_components::markdown::Markdown;
 
+use crate::cockpit::{
+    CockpitPhase, Milestone, MilestoneStatus, context_budget_pct, parse_milestones,
+};
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
 use crate::views::centered;
 use crate::views::completion::{
@@ -79,10 +84,12 @@ struct PendingAuth {
 }
 
 /// A pending plan approval prompted by `ThreadEvent::PlanProposed`. The plan
-/// text is carried both here (for the approval overlay body) and backfilled
-/// into the matching ToolCall item (for the chat view).
+/// text is carried here for the approval overlay body, backfilled into the
+/// matching ToolCall item for the chat view, and parsed into cockpit
+/// milestones when the user approves.
 struct PendingPlan {
     id: String,
+    plan_text: String,
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -327,6 +334,25 @@ pub struct Workspace {
     /// on every `TurnStarted` and on thread switch so a prior ticker
     /// self-terminates instead of driving a stale container.
     thinking_ticker_gen: u64,
+    /// Coarse run phase shown in the "Conversation info" status row. Derived
+    /// from `ThreadEvent`s in `subscribe_thread`; the per-second thinking
+    /// ticker's `cx.notify()` also refreshes the elapsed display.
+    cockpit_phase: CockpitPhase,
+    /// Title of the most recently running tool, surfaced in the status row
+    /// when the phase is `RunningTool`. Cleared on terminal stop.
+    cockpit_running_tool_title: Option<String>,
+    /// Plan steps parsed from the approved `exit_plan_mode` plan. All
+    /// `Pending` outside a turn; the first is promoted to `InProgress` while
+    /// the thread runs, demoted back to `Pending` on terminal stop.
+    cockpit_milestones: Vec<Milestone>,
+    /// Whether the milestone section is collapsed (`ToggleCockpitTasks` /
+    /// ctrl+t toggles). Hidden still renders the run-status row.
+    cockpit_hide_tasks: bool,
+    /// Cached `settings.auto_compact.{enabled,threshold}`, refreshed on
+    /// construction and when the user exits the Settings overlay. Avoids a
+    /// per-frame file read in the cockpit context-budget render.
+    cockpit_auto_compact_enabled: bool,
+    cockpit_auto_compact_threshold: f64,
     /// Per-cell scoreboard state, keyed by `"{model_name}|{field}"` where
     /// `field ∈ {in, out, cache_create, cache_read}`. Stored as
     /// `(gen, last_value)`: `gen` is bumped on every value delta so the
@@ -452,6 +478,7 @@ impl Render for DraggedSidebarDivider {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let auto_compact = settings::load().auto_compact;
         let thread = {
             let id = ThreadId(uuid::Uuid::new_v4().to_string());
             Thread::new(id, cwd.clone(), cx)
@@ -536,6 +563,12 @@ impl Workspace {
             goal_ticker_gen: 0,
             turn_active: false,
             thinking_ticker_gen: 0,
+            cockpit_phase: CockpitPhase::Idle,
+            cockpit_running_tool_title: None,
+            cockpit_milestones: Vec::new(),
+            cockpit_hide_tasks: false,
+            cockpit_auto_compact_enabled: auto_compact.enabled,
+            cockpit_auto_compact_threshold: auto_compact.threshold,
             env_counter_state: HashMap::new(),
             settings_view: None,
             settings_sub: None,
@@ -590,10 +623,14 @@ impl Workspace {
                         summary: summary.clone(),
                         reason,
                     });
+                    this.cockpit_phase = CockpitPhase::AwaitingApproval;
                     cx.notify();
                 }
-                ThreadEvent::PlanProposed { id, .. } => {
-                    this.pending_plan = Some(PendingPlan { id: id.clone() });
+                ThreadEvent::PlanProposed { id, plan_text } => {
+                    this.pending_plan = Some(PendingPlan {
+                        id: id.clone(),
+                        plan_text: plan_text.clone(),
+                    });
                     // Delegate to ConversationState to backfill the plan text
                     // into the matching ToolCall item for markdown rendering.
                     let weak = cx.weak_entity();
@@ -638,6 +675,8 @@ impl Workspace {
                     // `turn_active` and self-terminates on the terminal stop.
                     this.turn_active = true;
                     this.spawn_thinking_ticker(cx);
+                    this.cockpit_phase = CockpitPhase::Thinking;
+                    this.promote_first_milestone_in_progress();
                 }
                 ThreadEvent::Stop(reason) => {
                     let weak = cx.weak_entity();
@@ -668,6 +707,9 @@ impl Workspace {
                         let store = agent::thread_store_global();
                         store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
                         this.turn_active = false;
+                        this.cockpit_phase = CockpitPhase::Stopped;
+                        this.cockpit_running_tool_title = None;
+                        this.demote_milestones_to_pending();
                         // Clean up background reference if this thread was parked.
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
@@ -729,6 +771,9 @@ impl Workspace {
                         // `Stop`: the turn aborted, so any pending plan overlay
                         // is now stale and must not linger over an idle thread.
                         this.pending_plan = None;
+                        this.cockpit_phase = CockpitPhase::Failed;
+                        this.cockpit_running_tool_title = None;
+                        this.demote_milestones_to_pending();
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
                         this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);
@@ -737,6 +782,13 @@ impl Workspace {
                         // the running state (mirrors the Stop arm above).
                         this.flush_queued_follow_ups(cx);
                     }
+                    // Cockpit phase tracking for the streaming/tool variants
+                    // that flow through this generic arm. `Error` is handled
+                    // above; `CompactionStarted` flips Summarizing, `Compaction`
+                    // flips back to Streaming; a `Running` tool call caches its
+                    // title and flips RunningTool; other tool statuses return to
+                    // Streaming; text/thinking deltas mark Thinking/Streaming.
+                    this.update_cockpit_phase(ev);
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
@@ -1426,6 +1478,23 @@ impl Workspace {
         if running {
             self.spawn_thinking_ticker(cx);
         }
+        // Cockpit state is per-thread: the outgoing thread's milestones and
+        // running-tool title do not apply to the incoming one. Milestones are
+        // not persisted (PlanProposed isn't in the store's event stream), so a
+        // reloaded thread starts with an empty panel; a still-running parked
+        // thread resumes mid-stream.
+        self.cockpit_phase = if running {
+            CockpitPhase::Streaming
+        } else {
+            CockpitPhase::Idle
+        };
+        self.cockpit_running_tool_title = None;
+        self.cockpit_milestones = Vec::new();
+        // Refresh cached auto-compact knobs in case the user edited settings
+        // while viewing another thread — cheap, and keeps the budget accurate.
+        let auto_compact = settings::load().auto_compact;
+        self.cockpit_auto_compact_enabled = auto_compact.enabled;
+        self.cockpit_auto_compact_threshold = auto_compact.threshold;
         // If the new thread has pending authorizations (e.g. it was parked
         // while waiting for tool approval), re-surface them so the overlay
         // appears immediately upon switching back.
@@ -1463,6 +1532,64 @@ impl Workspace {
             }
         })
         .detach();
+    }
+
+    /// Update `cockpit_phase` and `cockpit_running_tool_title` for the
+    /// streaming/tool variants that flow through the generic catch-all arm.
+    /// `Error`, `Stop`, `TurnStarted`, and `ToolCallAuthorization` are handled
+    /// in their dedicated arms; this only covers the residual transitions.
+    fn update_cockpit_phase(&mut self, ev: &ThreadEvent) {
+        match ev {
+            ThreadEvent::AgentText(_) => {
+                self.cockpit_phase = CockpitPhase::Streaming;
+            }
+            ThreadEvent::AgentThinking(_) => {
+                self.cockpit_phase = CockpitPhase::Thinking;
+            }
+            ThreadEvent::ToolCall { status, title, .. } => match status {
+                agent::thread::ToolCallStatus::Running => {
+                    self.cockpit_phase = CockpitPhase::RunningTool;
+                    self.cockpit_running_tool_title = Some(title.clone());
+                }
+                // A non-running terminal/intermediate status means the model
+                // is back to streaming the next assistant segment.
+                _ => {
+                    self.cockpit_phase = CockpitPhase::Streaming;
+                }
+            },
+            ThreadEvent::CompactionStarted { .. } => {
+                self.cockpit_phase = CockpitPhase::Summarizing;
+            }
+            ThreadEvent::Compaction { .. } => {
+                // The summary landed; the turn resumes streaming.
+                self.cockpit_phase = CockpitPhase::Streaming;
+            }
+            _ => {}
+        }
+    }
+
+    /// Mark the first `Pending` milestone `InProgress` so the panel signals
+    /// which step is currently being worked. Called on `TurnStarted`. Only the
+    /// first pending item is promoted — the cockpit never claims to know the
+    /// model's exact progress within a step.
+    fn promote_first_milestone_in_progress(&mut self) {
+        for m in &mut self.cockpit_milestones {
+            if m.status == MilestoneStatus::Pending {
+                m.status = MilestoneStatus::InProgress;
+                break;
+            }
+        }
+    }
+
+    /// Revert any `InProgress` milestone back to `Pending`. Called on terminal
+    /// `Stop`/`Error`. The cockpit never auto-marks a step `Completed` (no
+    /// reliable signal exists), so a stopped turn just clears the live marker.
+    fn demote_milestones_to_pending(&mut self) {
+        for m in &mut self.cockpit_milestones {
+            if m.status == MilestoneStatus::InProgress {
+                m.status = MilestoneStatus::Pending;
+            }
+        }
     }
 
     /// Re-surface any pending authorizations on the current thread that were
@@ -2438,6 +2565,12 @@ impl Workspace {
         let Some(plan) = self.pending_plan.take() else {
             return;
         };
+        // An approved plan seeds the cockpit milestone panel. Continue-in-plan
+        // does not — the user asked for another planning round, so the prior
+        // steps no longer describe committed work.
+        if approve {
+            self.cockpit_milestones = parse_milestones(&plan.plan_text);
+        }
         self.thread.update(cx, |thread, cx| {
             thread.respond_plan_approval(
                 &plan.id,
@@ -3179,6 +3312,13 @@ impl Workspace {
                             )
                             .child(Button::new("env-add").ghost().xsmall().icon(IconName::Plus)),
                     )
+                    .child(self.render_cockpit_status_row(theme, cx))
+                    .child(env_row(
+                        IconName::Bot,
+                        self.thread.read(cx).display_title().into(),
+                        None,
+                        theme,
+                    ))
                     .child(env_row(
                         IconName::Frame,
                         i18n::t("workspace-env-changes"),
@@ -3241,6 +3381,8 @@ impl Workspace {
                                 },
                             )),
                     )
+                    .child(self.render_cockpit_context_budget(theme, cx))
+                    .child(self.render_cockpit_milestones(theme, cx))
                     .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
                     // Sources section.
                     .child(
@@ -3263,7 +3405,241 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Composer: an auto-growing text area above a single toolbar row.
+    /// Run-status row: phase label + elapsed (per-second refresh via the
+    /// thinking ticker) + cumulative token count. Sits directly under the card
+    /// title so the current phase is the first thing the eye lands on.
+    fn render_cockpit_status_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let phase_key = match self.cockpit_phase {
+            CockpitPhase::Idle => "cockpit-status-idle",
+            CockpitPhase::Thinking => "cockpit-status-thinking",
+            CockpitPhase::Streaming => "cockpit-status-streaming",
+            CockpitPhase::RunningTool => "cockpit-status-running-tool",
+            CockpitPhase::AwaitingApproval => "cockpit-status-awaiting-approval",
+            CockpitPhase::Summarizing => "cockpit-status-summarizing",
+            CockpitPhase::Stopped => "cockpit-status-stopped",
+            CockpitPhase::Failed => "cockpit-status-failed",
+        };
+        let phase_label = i18n::t(phase_key).to_string();
+        let thread = self.thread.read(cx);
+        let elapsed = thread
+            .turn_started_at()
+            .map(|t| format_elapsed(t.elapsed()))
+            .unwrap_or_else(|| "0s".to_string());
+        let tokens = crate::cockpit::format_tokens(thread.cumulative_token_usage().total_tokens());
+        let mut label = i18n::t_str(
+            "cockpit-run-status",
+            &[
+                ("phase", phase_label.as_str()),
+                ("elapsed", elapsed.as_str()),
+                ("tokens", tokens.as_str()),
+            ],
+        )
+        .to_string();
+        // When a tool is running, append its title so the user can see *what*
+        // is executing, not just that something is.
+        if let Some(title) = &self.cockpit_running_tool_title
+            && !title.is_empty()
+        {
+            label.push_str(" · ");
+            label.push_str(title);
+        }
+        let icon = match self.cockpit_phase {
+            CockpitPhase::Thinking | CockpitPhase::Streaming | CockpitPhase::Summarizing => {
+                IconName::LoaderCircle
+            }
+            CockpitPhase::RunningTool => IconName::Play,
+            CockpitPhase::AwaitingApproval => IconName::Bell,
+            CockpitPhase::Stopped => IconName::Pause,
+            CockpitPhase::Failed => IconName::CircleX,
+            CockpitPhase::Idle => IconName::Dash,
+        };
+        env_row(icon, label.into(), None, theme)
+    }
+
+    /// Context-budget row: percent of the window still free before auto-summary
+    /// fires (or before the raw window fills, when auto-summary is off / window
+    /// too small). Hidden entirely when no usage has been reported yet (first
+    /// turn). Turns warning-colored within 10% of the trigger.
+    fn render_cockpit_context_budget(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let thread = self.thread.read(cx);
+        let max_input = thread.model().map(|m| m.max_token_count()).unwrap_or(0);
+        let budget = context_budget_pct(
+            max_input,
+            thread.last_request_token_usage(),
+            self.cockpit_auto_compact_enabled,
+            self.cockpit_auto_compact_threshold,
+        );
+        let Some(budget) = budget else {
+            // No usage yet — render a muted placeholder so the section doesn't
+            // pop in/out as the first turn streams.
+            return env_row(
+                IconName::BatteryFull,
+                i18n::t("cockpit-context-of-window")
+                    .replace("{$pct}", "100")
+                    .into(),
+                None,
+                theme,
+            );
+        };
+        let pct = (budget.remaining_pct.round() as i64).clamp(0, 100);
+        let key = if self.cockpit_auto_compact_enabled && max_input >= MIN_COMPACTION_CONTEXT_WINDOW
+        {
+            "cockpit-context-until-auto-summary"
+        } else {
+            "cockpit-context-of-window"
+        };
+        let label = i18n::t_str(key, &[("pct", &pct.to_string())]);
+        let near = budget.remaining_pct <= 10.0;
+        let color = if near {
+            theme.warning
+        } else {
+            theme.muted_foreground
+        };
+        env_row(
+            IconName::BatteryFull,
+            label,
+            Some(
+                gpui::div()
+                    .text_xs()
+                    .text_color(color)
+                    .child(i18n::t("cockpit-context-estimate"))
+                    .into_any_element(),
+            ),
+            theme,
+        )
+    }
+
+    /// Milestone section: the parsed plan steps with status glyphs. Collapsible
+    /// by clicking the header or pressing `ToggleCockpitTasks`
+    /// (cmd-shift-m / ctrl-shift-m). When collapsed, only the header renders
+    /// so the user always has an affordance to expand again. Hidden entirely
+    /// when there are no milestones (no plan yet).
+    fn render_cockpit_milestones(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.cockpit_milestones.is_empty() {
+            return gpui::div().into_any_element();
+        }
+        let muted = theme.muted_foreground;
+        let hidden = self.cockpit_hide_tasks;
+        let hint_key = if hidden {
+            "cockpit-show-tasks-hint"
+        } else {
+            "cockpit-hide-tasks-hint"
+        };
+        // Header is a clickable toggle — `cursor_pointer` signals it, and the
+        // chevron indicates expand/collapse state so the row is readable even
+        // without the trailing hint.
+        let chevron = if hidden {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronDown
+        };
+        let header = h_flex()
+            .id("cockpit-milestones-header")
+            .w_full()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                this.cockpit_hide_tasks = !this.cockpit_hide_tasks;
+                cx.notify();
+            }))
+            .child(Icon::new(IconName::Menu).xsmall().text_color(muted))
+            .child(Icon::new(chevron).xsmall().text_color(muted))
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(i18n::t("cockpit-milestones-header")),
+            )
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(muted.opacity(0.6))
+                    .child(i18n::t(hint_key)),
+            );
+        if hidden {
+            return v_flex().w_full().gap_1().child(header).into_any_element();
+        }
+        // Render the most recent completed milestone plus a collapsed summary
+        // of any earlier ones, so a long list of done steps doesn't drown out
+        // the live one. The cockpit only ever marks Pending/InProgress, so the
+        // completed/failed branches are forward-compat render paths.
+        let mut completed_tail: Option<&Milestone> = None;
+        let mut completed_count = 0usize;
+        for m in &self.cockpit_milestones {
+            if m.status == MilestoneStatus::Completed {
+                completed_count += 1;
+                completed_tail = Some(m);
+            }
+        }
+        let mut section = v_flex().w_full().gap_1().child(header);
+        for m in &self.cockpit_milestones {
+            if m.status == MilestoneStatus::Completed && Some(m) != completed_tail {
+                continue;
+            }
+            section = section.child(self.render_milestone_row(m, theme));
+        }
+        if completed_count > 1 {
+            section = section.child(gpui::div().pl(px(12.)).text_xs().text_color(muted).child(
+                i18n::t_count("cockpit-completed-summary", (completed_count - 1) as i64),
+            ));
+        }
+        section.into_any_element()
+    }
+
+    /// One milestone row: status glyph + title (+blocked-by note). The
+    /// in-progress step is foreground-bold; others are muted so the live step
+    /// stands out.
+    fn render_milestone_row(&self, m: &Milestone, theme: &Theme) -> AnyElement {
+        let muted = theme.muted_foreground;
+        let (glyph, glyph_color) = match m.status {
+            MilestoneStatus::Pending => ("◻", muted),
+            MilestoneStatus::InProgress => ("▶", theme.foreground),
+            MilestoneStatus::Blocked { .. } => ("⏳", theme.warning),
+            MilestoneStatus::Completed => ("✔", muted.opacity(0.7)),
+            MilestoneStatus::Failed => ("✕", theme.danger),
+        };
+        let (title_color, weight) = match m.status {
+            MilestoneStatus::InProgress => (theme.foreground, gpui::FontWeight::SEMIBOLD),
+            _ => (muted, gpui::FontWeight::NORMAL),
+        };
+        let mut title = m.title.clone();
+        if let MilestoneStatus::Blocked { by } = &m.status
+            && !by.is_empty()
+        {
+            let deps: Vec<String> = by.iter().map(|i| format!("#{i}")).collect();
+            title.push(' ');
+            title.push_str(&i18n::t_str(
+                "cockpit-blocked-by",
+                &[("deps", &deps.join(", "))],
+            ));
+        }
+        h_flex()
+            .w_full()
+            .pl(px(12.))
+            .gap_1()
+            .items_center()
+            .text_xs()
+            .child(
+                gpui::div()
+                    .text_color(glyph_color)
+                    .min_w(px(14.))
+                    .child(SharedString::from(glyph)),
+            )
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(title_color)
+                    .font_weight(weight)
+                    .child(SharedString::from(title)),
+            )
+            .into_any_element()
+    }
+
     /// Rendered bare — no card border, fill, or rounding — so it shares the
     /// page background with the message list and reads as the same layer.
     /// The `Input` has no appearance of its own; the only visual separator
@@ -4657,6 +5033,12 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
                     this.close_terminal_tab(cx);
                 }))
+                .on_action(
+                    cx.listener(|this, _: &crate::ToggleCockpitTasks, _window, cx| {
+                        this.cockpit_hide_tasks = !this.cockpit_hide_tasks;
+                        cx.notify();
+                    }),
+                )
                 .child(self.sidebar.clone())
                 .child(
                     v_flex()

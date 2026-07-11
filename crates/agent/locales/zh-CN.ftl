@@ -433,7 +433,7 @@ titlebar-unarchive-notice = 会话已取消归档。
 titlebar-not-implemented = 尚未实现。
 
 # ── 环境信息面板 ──────────────────────────────────────────────────────
-workspace-env-title = 环境信息
+workspace-env-title = 对话信息
 workspace-env-changes = 变更
 workspace-env-no-project = 暂无项目
 workspace-env-usage = 消费
@@ -441,6 +441,40 @@ workspace-env-throughput = 穿透
 workspace-env-cache = 缓存
 workspace-env-sources = 来源
 workspace-env-no-sources = 暂无来源
+
+# ── Cockpit（运行状态 / 里程碑 / 上下文预算）──────────────────────────
+# 「对话信息」卡片的运行状态行。{$phase} 为本地化的阶段标签，{$elapsed} 为预格式化的时长，{$tokens} 为预格式化的 token 计数（如 "22.7k"）。
+cockpit-run-status = {$phase} · {$elapsed} · ↓ {$tokens}
+# 运行状态行的阶段标签。
+cockpit-status-idle = 空闲
+cockpit-status-thinking = 思考中
+cockpit-status-streaming = 生成中
+cockpit-status-running-tool = 执行工具
+cockpit-status-awaiting-approval = 等待审批
+cockpit-status-summarizing = 压缩上下文
+cockpit-status-stopped = 已停止
+cockpit-status-failed = 失败
+# 里程碑区段标题。
+cockpit-milestones-header = 计划
+cockpit-milestones-empty = 暂无计划步骤
+# 里程碑状态符号 + 标签，逐行内联渲染。
+cockpit-milestone-pending = ◻
+cockpit-milestone-in-progress = ▶
+cockpit-milestone-blocked = ⏳
+cockpit-milestone-completed = ✔
+cockpit-milestone-failed = ✕
+# 被阻塞里程碑的尾注。{$deps} 为逗号分隔的列表。
+cockpit-blocked-by = 被 {$deps} 阻塞
+# 折叠的已完成里程碑汇总。{$count} 为数字。
+cockpit-completed-summary = +{$count} 已完成
+# 上下文预算行。{$pct} 为 0–100 的数字。
+cockpit-context-until-auto-summary = {$pct}% 距自动压缩
+cockpit-context-of-window = {$pct}% 上下文
+cockpit-context-estimate = 估算
+# 里程碑区段标题末尾的隐藏/显示提示。通用——标题也可点击切换。
+cockpit-hide-tasks-hint = 点击折叠
+cockpit-show-tasks-hint = 点击展开
+
 composer-pasted-image = 粘贴的图片
 composer-image-process-failed = 部分粘贴的图片无法发送（格式不支持或过大）
 composer-placeholder-followup = 要求后续变更…

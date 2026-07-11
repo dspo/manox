@@ -1,0 +1,310 @@
+//! Agent cockpit view-model logic: milestone parsing, run-phase enum, and
+//! context-budget estimation. Pure functions over [`agent`] types — no GPUI,
+//! no rendering (the workspace reads these and lays them into the
+//! "Conversation info" card).
+
+use std::time::Duration;
+
+use agent::compact::{MIN_COMPACTION_CONTEXT_WINDOW, active_tokens};
+use agent::language_model::TokenUsage;
+
+/// Lifecycle of a single plan-derived milestone. `Blocked` / `Completed` /
+/// `Failed` are declared for the future model-driven update interface; in v1
+/// only `Pending` / `InProgress` are populated by the conservative cockpit
+/// logic (never auto-marks a step done — no reliable signal exists).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MilestoneStatus {
+    Pending,
+    InProgress,
+    Blocked { by: Vec<usize> },
+    Completed,
+    Failed,
+}
+
+/// A parsed plan step. The cockpit never reorders; list order is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Milestone {
+    pub title: String,
+    pub status: MilestoneStatus,
+}
+
+/// Coarse run phase shown in the status row. Derived from `ThreadEvent`s in
+/// the workspace's `subscribe_thread` closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CockpitPhase {
+    Idle,
+    Thinking,
+    Streaming,
+    RunningTool,
+    AwaitingApproval,
+    Summarizing,
+    Stopped,
+    Failed,
+}
+
+/// Estimated headroom before the context budget is exhausted. `is_estimate` is
+/// always true — provider usage is reported per-request and the trigger is a
+/// configured threshold, not a hard limit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextBudget {
+    /// 0.0–100.0; percent of the budget still free before auto-summary fires
+    /// (or before the raw window fills, when auto-summary is off / window too
+    /// small to qualify).
+    pub remaining_pct: f64,
+    pub is_estimate: bool,
+}
+
+/// Parse a plan's markdown body into milestones. Best-effort: each line that
+/// opens with an ordered (`1.` / `1)`) or unordered (`-` / `*` / `+`) list
+/// marker yields one milestone (marker stripped, remainder is the title).
+/// Non-list prose lines are dropped rather than folded in (folding mangles
+/// titles). When no list item is found, the whole plan is kept as a single
+/// milestone so the panel never regresses to empty. All milestones start
+/// `Pending`; the workspace promotes the first to `InProgress` while running.
+/// Pseudo-dependency text (e.g. "needs #2") is not parsed into edges.
+pub fn parse_milestones(plan_text: &str) -> Vec<Milestone> {
+    let mut out: Vec<Milestone> = Vec::new();
+    for line in plan_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(title) = strip_list_marker(trimmed) else {
+            continue;
+        };
+        let title = title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        out.push(Milestone {
+            title: title.to_string(),
+            status: MilestoneStatus::Pending,
+        });
+    }
+    if out.is_empty() {
+        let fallback = plan_text.trim();
+        if fallback.is_empty() {
+            return Vec::new();
+        }
+        out.push(Milestone {
+            title: fallback.to_string(),
+            status: MilestoneStatus::Pending,
+        });
+    }
+    out
+}
+
+/// Strip a leading ordered or unordered list marker, returning the remainder.
+/// Returns `None` for lines that do not open with a list marker (callers drop
+/// them). Pure byte scan — no regex.
+fn strip_list_marker(line: &str) -> Option<&str> {
+    let b = line.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    // Ordered: one or more digits followed by '.' or ')'.
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 {
+        if i < b.len() && (b[i] == b'.' || b[i] == b')') {
+            return Some(&line[i + 1..]);
+        }
+        return None;
+    }
+    // Unordered: a single leading '-' / '*' / '+'.
+    match b[0] {
+        b'-' | b'*' | b'+' => Some(&line[1..]),
+        _ => None,
+    }
+}
+
+/// Estimate the remaining context budget. `None` when no usage has been
+/// reported yet (first turn, model warming) or the window is zero — the
+/// cockpit hides the indicator in that case. When auto-summary is enabled and
+/// the window qualifies (≥ [`MIN_COMPACTION_CONTEXT_WINDOW`]), the budget is
+/// measured against the trigger threshold; otherwise against the raw window.
+pub fn context_budget_pct(
+    max_input_tokens: u64,
+    last_usage: Option<TokenUsage>,
+    auto_compact_enabled: bool,
+    threshold: f64,
+) -> Option<ContextBudget> {
+    if max_input_tokens == 0 {
+        return None;
+    }
+    let usage = last_usage?;
+    let active = active_tokens(usage) as f64;
+    let cap = max_input_tokens as f64;
+    let trigger = if auto_compact_enabled && max_input_tokens >= MIN_COMPACTION_CONTEXT_WINDOW {
+        cap * threshold
+    } else {
+        cap
+    };
+    if trigger <= 0.0 {
+        return None;
+    }
+    let remaining = ((trigger - active) / trigger * 100.0).clamp(0.0, 100.0);
+    Some(ContextBudget {
+        remaining_pct: remaining,
+        is_estimate: true,
+    })
+}
+
+/// Compact token-count rendering: `1.1m` / `8.1k` / `512`. Decimal (matches
+/// provider billing and the `[k]`/`[m]` window convention).
+pub fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}m", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Compact elapsed-time rendering: `1h 5m` / `10m 30s` / `3s`.
+pub fn format_elapsed(d: Duration) -> String {
+    let s = d.as_secs();
+    let h = s / 3600;
+    let m = (s % 3600) / 60;
+    let sec = s % 60;
+    if h >= 1 {
+        format!("{h}h {m}m")
+    } else if m >= 1 {
+        format!("{m}m {sec}s")
+    } else {
+        format!("{sec}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_milestones_ordered_and_unordered() {
+        let plan =
+            "1. First step\n2. Second step\n- Third step\n* Fourth step\nprose intro\n3) Sixth";
+        let ms = parse_milestones(plan);
+        let titles: Vec<&str> = ms.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "First step",
+                "Second step",
+                "Third step",
+                "Fourth step",
+                "Sixth"
+            ]
+        );
+        assert!(ms.iter().all(|m| m.status == MilestoneStatus::Pending));
+    }
+
+    #[test]
+    fn parse_milestones_drops_non_list_prose() {
+        let plan = "This plan does X.\n1. Real step\nSome closing remark.";
+        let ms = parse_milestones(plan);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].title, "Real step");
+    }
+
+    #[test]
+    fn parse_milestones_fallback_single_when_no_list() {
+        let plan = "Free-form prose plan with no markers.";
+        let ms = parse_milestones(plan);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].title, plan);
+    }
+
+    #[test]
+    fn parse_milestones_empty_plan() {
+        assert!(parse_milestones("").is_empty());
+        assert!(parse_milestones("   \n  ").is_empty());
+    }
+
+    #[test]
+    fn strip_list_marker_cases() {
+        assert_eq!(strip_list_marker("1. foo"), Some(" foo"));
+        assert_eq!(strip_list_marker("12) bar"), Some(" bar"));
+        assert_eq!(strip_list_marker("- baz"), Some(" baz"));
+        assert_eq!(strip_list_marker("* qux"), Some(" qux"));
+        assert_eq!(strip_list_marker("+ quux"), Some(" quux"));
+        assert_eq!(strip_list_marker("plain text"), None);
+        assert_eq!(strip_list_marker("2026 plan"), None); // digits, no marker
+    }
+
+    #[test]
+    fn context_budget_pct_basic() {
+        // 200k window, auto-compact on (threshold 0.9 → trigger 180k), 90k active.
+        let usage = TokenUsage {
+            input_tokens: 90_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let b = context_budget_pct(200_000, Some(usage), true, 0.9).unwrap();
+        // remaining = (180k - 90k)/180k = 50%
+        assert!((b.remaining_pct - 50.0).abs() < 0.01);
+        assert!(b.is_estimate);
+    }
+
+    #[test]
+    fn context_budget_pct_no_usage_yet() {
+        assert_eq!(context_budget_pct(200_000, None, true, 0.9), None);
+    }
+
+    #[test]
+    fn context_budget_pct_zero_window() {
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        assert_eq!(context_budget_pct(0, Some(usage), true, 0.9), None);
+    }
+
+    #[test]
+    fn context_budget_pct_small_window_uses_raw_cap() {
+        // Window < MIN_COMPACTION_CONTEXT_WINDOW (80k): budget vs raw cap, not trigger.
+        let usage = TokenUsage {
+            input_tokens: 40_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let b = context_budget_pct(50_000, Some(usage), true, 0.9).unwrap();
+        // remaining = (50k - 40k)/50k = 20%
+        assert!((b.remaining_pct - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn context_budget_pct_clamps_at_zero_when_over() {
+        let usage = TokenUsage {
+            input_tokens: 500_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        let b = context_budget_pct(200_000, Some(usage), true, 0.9).unwrap();
+        assert_eq!(b.remaining_pct, 0.0);
+    }
+
+    #[test]
+    fn format_tokens_cases() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(512), "512");
+        assert_eq!(format_tokens(8_100), "8.1k");
+        assert_eq!(format_tokens(22_700), "22.7k");
+        assert_eq!(format_tokens(1_100_000), "1.1m");
+    }
+
+    #[test]
+    fn format_elapsed_cases() {
+        assert_eq!(format_elapsed(Duration::from_secs(3)), "3s");
+        assert_eq!(format_elapsed(Duration::from_secs(630)), "10m 30s");
+        assert_eq!(format_elapsed(Duration::from_secs(3900)), "1h 5m");
+    }
+}
