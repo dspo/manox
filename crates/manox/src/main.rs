@@ -167,6 +167,12 @@ fn main() {
             gpui::KeyBinding::new("ctrl-shift-t", agent_ui::FocusTerminal, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-c", agent_ui::FocusConversation, None),
+            // Pop the last follow-up parked above the composer while a turn is
+            // running (mirrors the per-item Remove affordance for the tail).
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-alt-/", agent_ui::UndoLastQueued, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-alt-/", agent_ui::UndoLastQueued, None),
             // Completion popover (driven while the composer Input is focused and
             // a `/` or `@` trigger token is active). The Descendant predicate
             // `completion == open > Input` matches at the same depth as the

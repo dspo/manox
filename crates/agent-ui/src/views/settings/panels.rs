@@ -29,6 +29,7 @@ use gpui_component::{
 
 use agent::i18n;
 use agent::mcp;
+use agent::settings::FollowUpBehavior;
 
 use super::{MOCK_PROJECTS, MockProject, SettingsView, WorkMode};
 
@@ -306,6 +307,93 @@ fn build_segmented_pair(
             right_label,
             view,
             pick_right,
+        ))
+        .into_any_element()
+}
+
+/// Post-apply hook for a segmented pick that needs `Context` (e.g. to persist a
+/// setting to disk). Runs inside the same `Entity::update` as the pick closure,
+/// after the field has been mutated.
+type SegmentedPostApply =
+    Arc<dyn Fn(&mut SettingsView, &mut Context<SettingsView>) + Send + Sync + 'static>;
+
+/// Pick closure shared by both halves of a segmented pair: `true` selects the
+/// left option, `false` the right.
+type SegmentedPick = Arc<dyn Fn(bool, &mut SettingsView) + Send + Sync + 'static>;
+
+/// Same as [`mock_segmented`] but invokes `post` with the context after the
+/// pick closure mutates state, so a pick can persist to `settings.toml`.
+fn mock_segmented_with_post(
+    id: impl Into<gpui::ElementId>,
+    active: bool,
+    label: SharedString,
+    view: Entity<SettingsView>,
+    apply: Arc<dyn Fn(&mut SettingsView) + Send + Sync + 'static>,
+    post: SegmentedPostApply,
+) -> AnyElement {
+    let view = view;
+    let id = id.into();
+    let label_for_active = label.clone();
+    let label_for_inactive = label;
+    if active {
+        Button::new(id)
+            .label(label_for_active)
+            .small()
+            .on_click(move |_ev, _window, cx| {
+                view.update(cx, |this, cx| {
+                    apply(this);
+                    post(this, cx);
+                    cx.notify();
+                });
+            })
+            .into_any_element()
+    } else {
+        Button::new(id)
+            .label(label_for_inactive)
+            .small()
+            .outline()
+            .on_click(move |_ev, _window, cx| {
+                view.update(cx, |this, cx| {
+                    apply(this);
+                    post(this, cx);
+                    cx.notify();
+                });
+            })
+            .into_any_element()
+    }
+}
+
+/// [`build_segmented_pair`] variant where each pick also runs a `post` hook
+/// (with context) after mutating state. `pick` receives `true` for the left
+/// option and `false` for the right, so the two picks share one closure.
+fn build_segmented_pair_with_post(
+    id_prefix: &'static str,
+    active_is_left: bool,
+    left_label: SharedString,
+    right_label: SharedString,
+    view: Entity<SettingsView>,
+    pick: SegmentedPick,
+    post: SegmentedPostApply,
+) -> AnyElement {
+    let pick_left = pick.clone();
+    let pick_right = pick;
+    h_flex()
+        .gap_2()
+        .child(mock_segmented_with_post(
+            format!("{}-L", id_prefix),
+            active_is_left,
+            left_label,
+            view.clone(),
+            Arc::new(move |this| pick_left(true, this)),
+            post.clone(),
+        ))
+        .child(mock_segmented_with_post(
+            format!("{}-R", id_prefix),
+            !active_is_left,
+            right_label,
+            view,
+            Arc::new(move |this| pick_right(false, this)),
+            post,
         ))
         .into_any_element()
 }
@@ -606,7 +694,7 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
         let entity = entity.clone();
         let follow_left = i18n::t("settings-value-queue");
         let follow_right = i18n::t("settings-value-steer");
-        let follow_active_is_left = view.follow_up_behavior == follow_left;
+        let follow_active_is_left = view.follow_up_behavior == FollowUpBehavior::Queue;
         let children = vec![
             section_header("settings-section-editor"),
             row_with_control(
@@ -624,14 +712,22 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
             row_with_control(
                 i18n::t("settings-row-follow-up"),
                 Some(muted_text(i18n::t("settings-desc-follow-up"), muted)),
-                build_segmented_pair(
+                build_segmented_pair_with_post(
                     "follow",
                     follow_active_is_left,
                     follow_left.clone(),
                     follow_right.clone(),
                     entity,
-                    Arc::new(move |this| this.follow_up_behavior = follow_left.clone()),
-                    Arc::new(move |this| this.follow_up_behavior = follow_right.clone()),
+                    Arc::new(move |is_left, this| {
+                        this.follow_up_behavior = if is_left {
+                            FollowUpBehavior::Queue
+                        } else {
+                            FollowUpBehavior::Steer
+                        };
+                    }),
+                    Arc::new(|this, cx| {
+                        this.persist_follow_up_behavior(this.follow_up_behavior, cx)
+                    }),
                 ),
             ),
         ];

@@ -35,7 +35,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Footer / Composer
 
-- [Footer](#footer) · [Composer](#composer) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [EffortChip](#effortchip) · [ProjectChip](#projectchip) · [PlusBtn](#plusbtn) · [TeamChip](#teamchip)
+- [Footer](#footer) · [Composer](#composer) · [QueuedFollowUps](#queuedfollowups) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [EffortChip](#effortchip) · [ProjectChip](#projectchip) · [PlusBtn](#plusbtn) · [TeamChip](#teamchip)
 
 ### AskDrawer
 
@@ -355,6 +355,12 @@ Vertical flex, `flex_shrink_0`, `py_2`, contains [Composer](#composer) or [AskDr
 Centered wrapper around the input row + chips.
 
 > Source: `agent-ui/src/workspace.rs`
+
+#### QueuedFollowUps
+
+Compact stack of follow-up items parked above the input while a turn is running — one row each: truncated summary + optional Steer badge + Steer / Remove / More icon buttons. Rendered only while `queued_follow_ups` is non-empty; the Steer action promotes an item to a mid-turn injection, Remove drops it, and `⌘ + ⌥ + /` (`UndoLastQueued`) pops the tail.
+
+> Source: `agent-ui/src/workspace.rs` (`render_queued_follow_ups`)
 
 #### ComposerDivider
 

@@ -300,6 +300,14 @@ pub struct Thread {
     team: Option<Entity<crate::team::Team>>,
     /// tool_uses collected during the current turn, processed after the stream ends.
     pending_tool_uses: Vec<LanguageModelToolUse>,
+    /// Steer follow-ups queued by the UI while a turn is running. Drained into
+    /// `messages` at each safe join point — before every `build_completion_request`
+    /// (so the running turn absorbs the steer in its next round) and at the
+    /// EndTurn break (so a steer that arrived during the final assistant text is
+    /// not orphaned). The drain happens after the previous round's tool results
+    /// are already appended, keeping each `tool_use` paired with its
+    /// `tool_result` ahead of any injected user message.
+    pending_steer: std::collections::VecDeque<Message>,
     /// Pending authorizations for THIS thread's own tool calls, keyed by
     /// tool_use id. A map (not a single slot) so parallel tool calls can each
     /// await their own decision without overwriting one another.
@@ -571,6 +579,7 @@ impl Thread {
                 worktree: None,
                 team: None,
                 pending_tool_uses: Vec::new(),
+                pending_steer: std::collections::VecDeque::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
@@ -653,6 +662,7 @@ impl Thread {
                 worktree: None,
                 team: None,
                 pending_tool_uses: Vec::new(),
+                pending_steer: std::collections::VecDeque::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
@@ -739,6 +749,7 @@ impl Thread {
                 worktree: None,
                 team: None,
                 pending_tool_uses: Vec::new(),
+                pending_steer: std::collections::VecDeque::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
@@ -1472,6 +1483,36 @@ impl Thread {
         cx.notify();
     }
 
+    /// Queue a steer follow-up — a user message that the running turn absorbs
+    /// at the next safe join point rather than starting a new turn. Drained by
+    /// `run_turn_loop` before each `build_completion_request` and at the EndTurn
+    /// break, so the steer lands after the previous round's tool results
+    /// (preserving `tool_use`→`tool_result` pairing) and the model sees it on
+    /// its next round.
+    pub fn enqueue_steer(
+        &mut self,
+        content: Vec<MessageContent>,
+        ui: Option<crate::MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut message = Message::user_with_content(content);
+        message.ui = ui;
+        self.pending_steer.push_back(message);
+        cx.notify();
+    }
+
+    /// Flush every queued steer follow-up onto `messages` in submission order.
+    /// Returns whether any message was drained, so the caller can decide to
+    /// continue the turn loop rather than ending on an unconsumed steer.
+    fn drain_pending_steer(&mut self) -> bool {
+        let mut drained = false;
+        while let Some(msg) = self.pending_steer.pop_front() {
+            self.messages.push(msg);
+            drained = true;
+        }
+        drained
+    }
+
     /// Resolve and run a slash command. The command body (with `$ARGUMENTS`
     /// substituted) is appended as a user message, and the command's
     /// `allowed-tools` whitelist narrows the turn's tool set for the duration
@@ -1954,7 +1995,13 @@ impl Thread {
 
             let request = this.update(cx, |this, cx| {
                 this.pending_tool_uses.clear();
+                // Pair any orphaned tool_uses (truncated MaxTokens rounds,
+                // interrupted sessions) with error tool_results *before*
+                // draining a steer — otherwise the steer user message lands
+                // last and `reconcile_tool_uses` skips the pairing, shipping an
+                // unpaired `tool_use` to the provider (Anthropic 400).
                 this.reconcile_tool_uses(cx);
+                this.drain_pending_steer();
                 this.build_completion_request()
             })?;
 
@@ -2186,7 +2233,19 @@ impl Thread {
                     RecoveryAction::Continue
                 })?;
                 match recovery {
-                    RecoveryAction::Done => break,
+                    RecoveryAction::Done => {
+                        // A steer follow-up queued during the final assistant
+                        // text is not yet drained; loop once more so the next
+                        // build absorbs it instead of orphaning the user
+                        // message. The drain at the top of the loop flushes it
+                        // onto `messages` after the last round's tool results.
+                        let steer_pending =
+                            this.update(cx, |this, _cx| !this.pending_steer.is_empty())?;
+                        if steer_pending {
+                            continue;
+                        }
+                        break;
+                    }
                     RecoveryAction::Abort => break,
                     RecoveryAction::Continue => continue,
                 }
