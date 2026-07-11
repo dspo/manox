@@ -66,7 +66,7 @@ impl AnthropicModel {
             api_model_id,
             endpoint_url: endpoint_url.clone(),
             api_key,
-            max_output_tokens: max_token_count.min(8192),
+            max_output_tokens: max_token_count.min(crate::provider::MAX_OUTPUT_TOKENS_CAP),
             max_token_count,
             long_ttl,
             supports_effort,

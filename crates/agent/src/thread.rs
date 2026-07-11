@@ -42,6 +42,14 @@ use crate::tool::{
 };
 use crate::tools;
 
+/// Max consecutive rounds ending on a `ToolUseJsonParseError` before the loop
+/// gives up and hands control back to the user. Bounds a model that persistently
+/// emits malformed JSON.
+const MAX_PARSE_ERROR_RETRIES: u32 = 3;
+/// Max consecutive rounds truncated by `StopReason::MaxTokens` before the loop
+/// gives up. Bounds a turn that keeps burning its output budget mid-tool-call.
+const MAX_TOKENS_RETRIES: u32 = 2;
+
 /// Stable `Thread` id used for persistence.
 #[derive(Debug, Clone)]
 pub struct ThreadId(pub String);
@@ -275,6 +283,22 @@ pub struct Thread {
     team: Option<Entity<crate::team::Team>>,
     /// tool_uses collected during the current turn, processed after the stream ends.
     pending_tool_uses: Vec<LanguageModelToolUse>,
+    /// True when this round emitted a `ToolUseJsonParseError` and already inlined
+    /// the failure as a `tool_result` into history. The loop must not bare-break
+    /// on empty `pending_tool_uses` while set: the error result has to be fed
+    /// back to the model via another `build_completion_request`.
+    parse_error_pending: bool,
+    /// Consecutive rounds ending on a parse error, bounded to stop a model that
+    /// persistently emits malformed JSON from looping forever. Reset once a
+    /// round produces at least one actionable tool_use.
+    parse_error_retries: u32,
+    /// Stop reason of the most recent round. `MaxTokens` with no actionable
+    /// tool_use means the output budget truncated the response; the truncated
+    /// assistant message is dropped and the round retried.
+    last_stop_reason: Option<StopReason>,
+    /// Consecutive `MaxTokens` truncations, bounded for the same reason as
+    /// `parse_error_retries`. Reset once a round yields a non-truncated stop.
+    max_tokens_retries: u32,
     /// Pending authorizations for THIS thread's own tool calls, keyed by
     /// tool_use id. A map (not a single slot) so parallel tool calls can each
     /// await their own decision without overwriting one another.
@@ -524,6 +548,10 @@ impl Thread {
                 worktree: None,
                 team: None,
                 pending_tool_uses: Vec::new(),
+                parse_error_pending: false,
+                parse_error_retries: 0,
+                last_stop_reason: None,
+                max_tokens_retries: 0,
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
@@ -602,6 +630,10 @@ impl Thread {
                 worktree: None,
                 team: None,
                 pending_tool_uses: Vec::new(),
+                parse_error_pending: false,
+                parse_error_retries: 0,
+                last_stop_reason: None,
+                max_tokens_retries: 0,
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
@@ -684,6 +716,10 @@ impl Thread {
                 worktree: None,
                 team: None,
                 pending_tool_uses: Vec::new(),
+                parse_error_pending: false,
+                parse_error_retries: 0,
+                last_stop_reason: None,
+                max_tokens_retries: 0,
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
                 pending_child_auth: HashMap::new(),
@@ -1858,6 +1894,10 @@ impl Thread {
 
             let request = this.update(cx, |this, cx| {
                 this.pending_tool_uses.clear();
+                // Clear last round's stop/parse state so it cannot bleed into this
+                // round's empty-turn decision. Both are set fresh during the stream below.
+                this.last_stop_reason = None;
+                this.parse_error_pending = false;
                 this.reconcile_tool_uses(cx);
                 this.build_completion_request()
             })?;
@@ -2010,6 +2050,12 @@ impl Thread {
                     .turn_cancel
                     .clone()
                     .unwrap_or_else(CancellationToken::new);
+                // A productive round (at least one actionable tool_use) breaks any
+                // consecutive parse-error / max-tokens retry chain.
+                if !tool_uses.is_empty() {
+                    this.parse_error_retries = 0;
+                    this.max_tokens_retries = 0;
+                }
                 (
                     tool_uses,
                     free,
@@ -2021,7 +2067,28 @@ impl Thread {
                 )
             })?;
             if tool_uses.is_empty() {
-                break;
+                let re_request = this.update(cx, |this, cx| {
+                    let stop_reason = this.last_stop_reason;
+                    if this.parse_error_pending {
+                        if this.parse_error_retries >= MAX_PARSE_ERROR_RETRIES {
+                            return false;
+                        }
+                        this.parse_error_retries += 1;
+                        return true;
+                    }
+                    if stop_reason == Some(StopReason::MaxTokens)
+                        && this.max_tokens_retries < MAX_TOKENS_RETRIES
+                    {
+                        this.max_tokens_retries += 1;
+                        this.drop_truncated_assistant_message(cx);
+                        return true;
+                    }
+                    false
+                })?;
+                if !re_request {
+                    break;
+                }
+                continue;
             }
 
             // AutoReview: ask the security-reviewer agent for each pending call.
@@ -2649,6 +2716,10 @@ impl Thread {
             }
             Ok(LanguageModelCompletionEvent::Stop(reason)) => {
                 self.finalize_assistant_message(cx);
+                // Record this round's stop reason so the post-stream control
+                // flow can detect an output-budget truncation (`MaxTokens`)
+                // and retry instead of silently ending the turn.
+                self.last_stop_reason = Some(reason);
                 // Attribute the just-finished request's usage to its triggering
                 // user message, then reset the per-request counter so the next
                 // round (a tool-use loop iteration or a new user turn) starts
@@ -2726,6 +2797,10 @@ impl Thread {
                     output: json_parse_error,
                     is_error: true,
                 });
+                // The error result is now in history but no tool was enqueued, so
+                // the loop would otherwise bare-break on empty `pending_tool_uses`
+                // and never feed it back. Flag the round so the loop re-requests.
+                self.parse_error_pending = true;
             }
             Err(e) => {
                 cx.emit(ThreadEvent::Error(e));
@@ -2840,6 +2915,23 @@ impl Thread {
             m.push_text(String::new());
         }
         cx.notify();
+    }
+
+    /// Drop the trailing assistant message left by a `MaxTokens`-truncated round.
+    /// Such a round has no actionable tool_use (an empty `pending_tool_uses` is
+    /// the precondition for calling this), so the assistant message carries only
+    /// incomplete text/thinking and no tool_use block — popping it cannot orphan
+    /// a tool_result. The next `build_completion_request` retries from the last
+    /// valid user turn.
+    fn drop_truncated_assistant_message(&mut self, cx: &mut Context<Self>) {
+        if self
+            .messages
+            .last()
+            .is_some_and(|m| m.role == Role::Assistant)
+        {
+            self.messages.pop();
+            cx.notify();
+        }
     }
 
     /// Backfill a trailing unpaired tool_use: if the last assistant message holds a
@@ -4061,6 +4153,57 @@ mod tests {
         }
     }
 
+    /// A `ReplayMockModel` that also counts `stream_completion` invocations via
+    /// a shared atomic, so a test can assert the outer turn loop re-requested the
+    /// model — the proof that a parse error or `MaxTokens` truncation was fed
+    /// back to the model rather than dropped on a bare `break`.
+    struct CountingReplayMockModel {
+        id: String,
+        events: Arc<Vec<LanguageModelCompletionEvent>>,
+        calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl crate::language_model::LanguageModel for CountingReplayMockModel {
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+        fn name(&self) -> String {
+            self.id.clone()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            let events = self.events.clone();
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                use futures::StreamExt as _;
+                use std::sync::atomic::Ordering;
+                let _ = calls.fetch_add(1, Ordering::SeqCst);
+                let events: Vec<_> = events.iter().cloned().map(Ok).collect();
+                Ok(futures::stream::iter(events).boxed())
+            })
+        }
+    }
+
     /// Regression for the switch-loses-assistant bug: a turn whose stream
     /// produces text but ends WITHOUT a `MessageStop` (provider hiccup,
     /// non-SSE compatibility response) leaves the assistant text only in
@@ -4256,6 +4399,219 @@ mod tests {
             !cx.update(|cx| store.read_with(cx, |s, _| s.is_running(thread_id))),
             "indicator must be cleared by the run_turn task-tail backstop when \
              the stream ends without a Stop event"
+        );
+    }
+
+    /// Regression for the parse-error bare-break freeze: a stream that emits a
+    /// `ToolUseJsonParseError` (malformed tool-call JSON) and then closes
+    /// enqueues no `pending_tool_uses`, so the pre-fix turn loop hit the bare
+    /// `if tool_uses.is_empty() { break; }` and the error tool_result sat in
+    /// history never fed back to the model — the thread froze on an orphan
+    /// result. The fix flags the round so the loop re-requests until the retry
+    /// cap; this asserts the model was actually called again and that the error
+    /// result landed in history.
+    #[test]
+    fn run_turn_feeds_parse_error_back_to_model() {
+        use crate::language_model::{LanguageModelToolResult, MessageContent};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open mem db"),
+        );
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db, cx);
+        });
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(CountingReplayMockModel {
+            id: "test/parse-error".into(),
+            events: Arc::new(vec![
+                LanguageModelCompletionEvent::Text("let me read the file".into()),
+                LanguageModelCompletionEvent::ToolUseJsonParseError {
+                    id: "tu_parse_1".into(),
+                    tool_name: Arc::from("read_file"),
+                    raw_input: "{bad".into(),
+                    json_parse_error: "expected `}`".into(),
+                },
+            ]),
+            calls: calls.clone(),
+        });
+
+        let thread_id = "reg-parse-error-feedback";
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("read foo".into())],
+            );
+            // Pin the title so `maybe_generate_title` short-circuits and does
+            // not spawn a title stream task that outlives the test.
+            rec.title = Some("regression".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+
+        // 1 initial call + MAX_PARSE_ERROR_RETRIES re-requests: the parse error
+        // must be fed back to the model instead of ending the turn on a bare
+        // break with an orphaned error result.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + super::MAX_PARSE_ERROR_RETRIES as u64,
+            "parse error must be fed back to the model, not dropped on a bare break"
+        );
+
+        // The error tool_result must be in history so the re-request carries it.
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                let has_error_result = t.messages.iter().any(|m| {
+                    m.content.iter().any(|c| match c {
+                        MessageContent::ToolResult(LanguageModelToolResult {
+                            is_error: true,
+                            content,
+                            ..
+                        }) => content.contains("Tool input JSON parse failed"),
+                        _ => false,
+                    })
+                });
+                assert!(
+                    has_error_result,
+                    "parse-error tool_result must be in history to feed back"
+                );
+            });
+        });
+    }
+
+    /// Regression for the silent-truncation freeze: a stream that stops with
+    /// `MaxTokens` and no actionable tool_use used to leave the half-finished
+    /// assistant message in history and end the turn — the user saw a truncated
+    /// reply with no recovery. The fix retries up to `MAX_TOKENS_RETRIES`,
+    /// dropping each truncated assistant message first so the next request
+    /// starts clean. This asserts the model was retried and that only the final
+    /// (cap-hit) assistant message survives.
+    #[test]
+    fn run_turn_retries_and_drops_truncated_message_on_max_tokens() {
+        use crate::language_model::{Role, StopReason};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open mem db"),
+        );
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db, cx);
+        });
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(CountingReplayMockModel {
+            id: "test/max-tokens".into(),
+            events: Arc::new(vec![
+                LanguageModelCompletionEvent::Text("truncated mid-thought".into()),
+                LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+            ]),
+            calls: calls.clone(),
+        });
+
+        let thread_id = "reg-max-tokens-retry";
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("write a long essay".into())],
+            );
+            rec.title = Some("regression".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+
+        // 1 initial call + MAX_TOKENS_RETRIES re-requests; the cap then forces
+        // the loop to give up rather than silently end on the first truncation.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + super::MAX_TOKENS_RETRIES as u64,
+            "MaxTokens truncation must be retried, not silently end the turn"
+        );
+
+        // Each retried round's truncated assistant message was dropped; only the
+        // final cap-hit round's assistant message survives — without the drop,
+        // all three would accumulate.
+        let assistant_count = cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                t.messages
+                    .iter()
+                    .filter(|m| m.role == Role::Assistant)
+                    .count()
+            })
+        });
+        assert_eq!(
+            assistant_count, 1,
+            "retried truncated assistant messages must be dropped, not accumulated"
         );
     }
 

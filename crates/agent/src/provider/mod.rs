@@ -10,6 +10,14 @@ pub mod responses;
 pub mod retry;
 pub mod sse;
 
+/// Hard cap on a model's per-request output token budget. The configured context
+/// window (`max_token_count`) is clamped down to this so a single response —
+/// especially one that spends a long reasoning block — cannot burn the whole
+/// budget mid-tool-call and truncate the `tool_use` arguments. 8192 was too
+/// small for reasoning models; 32768 leaves room for thinking plus a full
+/// tool call while keeping cost bounded.
+pub(crate) const MAX_OUTPUT_TOKENS_CAP: u64 = 32768;
+
 pub use cx_providers::{
     AgentConfig, ApiKeySourceKind, CopilotAuth, CxConfig, EndpointConfig, ModelConfig,
     ProviderConfig, ProviderEndpointDetail, ProviderEndpointSpec, ProviderModelConfig,
