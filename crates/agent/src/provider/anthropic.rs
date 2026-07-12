@@ -715,6 +715,36 @@ mod tests {
         assert_eq!(tiny.max_output_tokens, 8_192);
     }
 
+    /// `auto_compact_window` round-trips from the config struct into the stored
+    /// field unchanged — a regression guard for the `AnthropicModelConfig`
+    /// bundling (destructure must not drop or swap the field).
+    #[test]
+    fn new_stores_auto_compact_window_from_config() {
+        let with_override = AnthropicModel::new(AnthropicModelConfig {
+            id: "p/m/anthropic".into(),
+            name: "m".into(),
+            provider_name: "p".into(),
+            api_model_id: "m".into(),
+            endpoint_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+            max_token_count: 8_192,
+            auto_compact_window: Some(202_745),
+        });
+        assert_eq!(with_override.auto_compact_window, Some(202_745));
+
+        let without_override = AnthropicModel::new(AnthropicModelConfig {
+            id: "p/m/anthropic".into(),
+            name: "m".into(),
+            provider_name: "p".into(),
+            api_model_id: "m".into(),
+            endpoint_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+            max_token_count: 8_192,
+            auto_compact_window: None,
+        });
+        assert_eq!(without_override.auto_compact_window, None);
+    }
+
     /// Live streaming test: send "hi" via the Bailian glm-5.2[1m] anthropic wire.
     /// Requires `MANOX_RUN_LIVE=1` and DASHSCOPE_API_KEY in the macOS Keychain.
     #[tokio::test]
