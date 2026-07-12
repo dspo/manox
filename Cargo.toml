@@ -19,6 +19,7 @@ members = [
     "crates/supervisor",
     "crates/lsp",
     "crates/webview",
+    "crates/webview-macros",
 ]
 resolver = "2"
 
@@ -39,6 +40,7 @@ manox-components = { path = "crates/components" }
 supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
 manox-webview = { path = "crates/webview" }
+manox-webview-macros = { path = "crates/webview-macros" }
 
 anyhow = "1"
 async-channel = "2"
@@ -88,6 +90,19 @@ http = "1"
 # resolves the same major as the gpui WindowHandle it parents to.
 wry = "0.53"
 raw-window-handle = { version = "0.6", features = ["std"] }
+
+# webview crate extras — Tauri-style IPC layer + plugins ported from manos.
+# serialize-to-javascript embeds the Tauri IPC bundle + init scripts as
+# `&[u8]` JS literals; async-task backs the PlatformDispatcher main-thread
+# marshal; the rest are plugin backends (clipboard/dialog/opener) the
+# Trusted-mode webview can invoke.
+serialize-to-javascript = "0.1.2"
+mime_guess = "2.0"
+pollster = "0.4"
+async-task = "4.7.1"
+rfd = "0.15"
+arboard = "3"
+open = "5"
 
 # i18n —— fluent + BCP47 LanguageIdentifier。仅 UI chrome 走 t!()；模型面向字符串一律英文，不经此栈。
 fluent = "0.17"
