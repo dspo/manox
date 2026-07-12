@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use gpui::App;
 
 use crate::language_model::AnyLanguageModel;
-use crate::provider::anthropic::AnthropicModel;
+use crate::provider::anthropic::{AnthropicModel, AnthropicModelConfig};
 use crate::provider::completions::CompletionsModel;
 use crate::provider::resolve_apikey;
 use crate::provider::responses::ResponsesModel;
@@ -64,16 +64,16 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
         resolve_auto_compact_window(resolved.wire_api, &resolved.env, max_tokens);
 
     let model: AnyLanguageModel = match resolved.wire_api {
-        WireApi::Anthropic => Arc::new(AnthropicModel::new(
-            resolved.key(),
-            resolved.id.clone(),
-            resolved.provider_name.clone(),
-            resolved.api_model_id(),
-            resolved.endpoint_url.clone(),
+        WireApi::Anthropic => Arc::new(AnthropicModel::new(AnthropicModelConfig {
+            id: resolved.key(),
+            name: resolved.id.clone(),
+            provider_name: resolved.provider_name.clone(),
+            api_model_id: resolved.api_model_id(),
+            endpoint_url: resolved.endpoint_url.clone(),
             api_key,
-            max_tokens,
+            max_token_count: max_tokens,
             auto_compact_window,
-        )),
+        })),
         WireApi::Responses => Arc::new(ResponsesModel::new(
             resolved.key(),
             resolved.id.clone(),
@@ -397,4 +397,3 @@ mod tests {
         );
     }
 }
-
