@@ -1931,6 +1931,57 @@ fn render_plan_card(
 /// `ToolResult` lands we mount the syntax-highlighted, scrollable `Markdown`.
 /// The container keeps a deterministic height either way so the parent card
 /// (and the list) reports a stable layout.
+/// Strip the hashline envelope from a `read_file` result for display: drop the
+/// leading `[path#TAG]` header and the `N:` line-number prefix on each numbered
+/// line, so the user sees raw file content rather than the anchoring prefixes
+/// the LLM relies on. Returns the input unchanged when the first line is not
+/// the `[path#TAG]` header — non-hashline output (errors, non-`read_file` tools)
+/// passes through verbatim. Only the first `digits:` run is stripped per line,
+/// so file content that itself begins with `digits:` is preserved. The
+/// persisted `ToolCallItem.output` is never touched; this is display-only.
+fn strip_hashline_numbering(raw: &str) -> String {
+    let mut lines = raw.split('\n');
+    let Some(header) = lines.next() else {
+        return String::new();
+    };
+    if !is_hashline_header(header) {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    for (i, line) in lines.enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(strip_leading_line_number(line));
+    }
+    out
+}
+
+/// Recognize the `[path#TAG]` header `format_numbered` emits: bracketed, with
+/// a non-empty path and tag separated by the first `#`.
+fn is_hashline_header(line: &str) -> bool {
+    let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return false;
+    };
+    let mut parts = inner.splitn(2, '#');
+    matches!((parts.next(), parts.next()), (Some(p), Some(t)) if !p.is_empty() && !t.is_empty())
+}
+
+/// Strip a leading `<digits>:` prefix if present; return the remainder. A line
+/// without the prefix passes through unchanged (per-line fallback).
+fn strip_leading_line_number(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i < bytes.len() && bytes[i] == b':' {
+        &line[i + 1..]
+    } else {
+        line
+    }
+}
+
 fn render_tool_output(
     output: &str,
     tool_name: &str,
@@ -1948,25 +1999,48 @@ fn render_tool_output(
         .border_color(theme.border)
         .text_xs()
         .text_color(theme.muted_foreground);
+    // Display-only transform for `read_file`: hide the hashline `[path#TAG]`
+    // header and `N:` line numbers so the user sees raw file content. The raw
+    // `output` (LLM-facing, persisted, edit_file-anchored) is untouched, so
+    // copy-selection yields the display text while the LLM still sees numbered
+    // output on the next turn. Non-`read_file` tools borrow the raw output
+    // without allocating.
+    let display: std::borrow::Cow<'_, str> = if tool_name == "read_file" {
+        std::borrow::Cow::Owned(strip_hashline_numbering(output))
+    } else {
+        std::borrow::Cow::Borrowed(output)
+    };
     if streaming {
-        // Plain monospace run, one div per line, while lines are still
-        // arriving — no Tree-sitter, no shaped-text layout per chunk. Matches
-        // the assistant body's streaming rule. gpui has no `WhiteSpace::Pre`,
-        // so we split on newlines to preserve line structure.
+        // Bidirectional scroll for streaming output, mirroring the final
+        // branch's `markdown_tv(scrollable)` + `code_block` pattern: an outer
+        // vertical-scroll viewport over the fixed 220px panel, with an inner
+        // horizontal-scroll run so long lines scroll instead of wrapping. Both
+        // need an `id` — `overflow_*_scroll` are `InteractiveElement` methods.
         container
             .font_family(theme.mono_font_family.clone())
-            .children(
-                output
-                    .split('\n')
-                    .map(|line| gpui::div().child(line.to_string())),
+            .child(
+                gpui::div()
+                    .id(("tool-output-vscroll", ix))
+                    .h_full()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        gpui::div()
+                            .id(("tool-output-hscroll", ix))
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .children(display.split('\n').map(|line| {
+                                gpui::div().whitespace_nowrap().child(line.to_string())
+                            })),
+                    ),
             )
             .into_any_element()
     } else {
         let lang = lang_hint_for_tool(tool_name);
         let code = if let Some(l) = lang {
-            format!("```{l}\n{output}\n```")
+            format!("```{l}\n{display}\n```")
         } else {
-            format!("```\n{output}\n```")
+            format!("```\n{display}\n```")
         };
         container
             .child(markdown_tv(("tool-output-text", ix), code, theme, true))
@@ -3000,5 +3074,33 @@ mod tests {
             Vec::new()
         };
         assert_eq!(visible.len(), 2, "expanded shows all entries");
+    }
+
+    #[test]
+    fn strip_hashline_numbering_drops_header_and_line_prefixes() {
+        let raw = "[a.rs#1A2B]\n1:fn main() {\n2:}";
+        assert_eq!(strip_hashline_numbering(raw), "fn main() {\n}");
+    }
+
+    #[test]
+    fn strip_hashline_numbering_preserves_digit_colon_content() {
+        // File content that itself begins with `digits:` survives: only the
+        // first `N:` run (the hashline line number) is stripped.
+        let raw = "[cfg.toml#TAG]\n1:10: first\n2:20: second";
+        assert_eq!(strip_hashline_numbering(raw), "10: first\n20: second");
+    }
+
+    #[test]
+    fn strip_hashline_numbering_passes_through_non_header_output() {
+        // Errors and non-hashline shapes are returned verbatim.
+        let err = "file not found: missing.rs";
+        assert_eq!(strip_hashline_numbering(err), "file not found: missing.rs");
+        assert_eq!(strip_hashline_numbering(""), "");
+    }
+
+    #[test]
+    fn strip_hashline_numbering_keeps_blank_lines() {
+        let raw = "[a.rs#T]\n1:line one\n2:\n3:line three";
+        assert_eq!(strip_hashline_numbering(raw), "line one\n\nline three");
     }
 }
