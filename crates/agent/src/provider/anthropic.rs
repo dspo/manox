@@ -43,18 +43,33 @@ pub struct AnthropicModel {
     supports_effort: bool,
 }
 
+/// Construction inputs for [`AnthropicModel`]. Bundled into a struct so the
+/// builder stays under clippy's `too_many_arguments` threshold without an
+/// `#[allow]`, and so call sites name fields instead of counting positions.
+pub struct AnthropicModelConfig {
+    pub id: String,
+    pub name: String,
+    pub provider_name: String,
+    pub api_model_id: String,
+    pub endpoint_url: String,
+    pub api_key: String,
+    pub max_token_count: u64,
+    pub auto_compact_window: Option<u64>,
+}
+
 impl AnthropicModel {
     /// Build from a `ResolvedModel` (the api_key is already resolved at this point).
-    pub fn new(
-        id: String,
-        name: String,
-        provider_name: String,
-        api_model_id: String,
-        endpoint_url: String,
-        api_key: String,
-        max_token_count: u64,
-        auto_compact_window: Option<u64>,
-    ) -> Self {
+    pub fn new(cfg: AnthropicModelConfig) -> Self {
+        let AnthropicModelConfig {
+            id,
+            name,
+            provider_name,
+            api_model_id,
+            endpoint_url,
+            api_key,
+            max_token_count,
+            auto_compact_window,
+        } = cfg;
         let long_ttl = crate::provider::anthropic_cache::supports_long_ttl(
             crate::provider::anthropic_cache::resolve_prompt_caching_policy(
                 None,
@@ -673,30 +688,30 @@ mod tests {
     /// sub-floor context is raised to the minimum so reasoning isn't choked.
     #[test]
     fn new_clamps_max_output_tokens_to_budget() {
-        let big = AnthropicModel::new(
-            "p/m/anthropic".into(),
-            "m[1m]".into(),
-            "p".into(),
-            "m".into(),
-            "https://example.invalid".into(),
-            "k".into(),
-            1024 * 1024,
-            None,
-        );
+        let big = AnthropicModel::new(AnthropicModelConfig {
+            id: "p/m/anthropic".into(),
+            name: "m[1m]".into(),
+            provider_name: "p".into(),
+            api_model_id: "m".into(),
+            endpoint_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+            max_token_count: 1024 * 1024,
+            auto_compact_window: None,
+        });
         assert_eq!(
             big.max_output_tokens,
             crate::provider::registry::MAX_OUTPUT_TOKENS_CAP
         );
-        let tiny = AnthropicModel::new(
-            "p/m/anthropic".into(),
-            "m".into(),
-            "p".into(),
-            "m".into(),
-            "https://example.invalid".into(),
-            "k".into(),
-            4_096,
-            None,
-        );
+        let tiny = AnthropicModel::new(AnthropicModelConfig {
+            id: "p/m/anthropic".into(),
+            name: "m".into(),
+            provider_name: "p".into(),
+            api_model_id: "m".into(),
+            endpoint_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+            max_token_count: 4_096,
+            auto_compact_window: None,
+        });
         assert_eq!(tiny.max_output_tokens, 8_192);
     }
 
@@ -855,4 +870,3 @@ mod tests {
         assert!(body.get("output_config").is_none());
     }
 }
-
