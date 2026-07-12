@@ -2011,16 +2011,28 @@ fn render_tool_output(
         std::borrow::Cow::Borrowed(output)
     };
     if streaming {
-        // Plain monospace run, one div per line, while lines are still
-        // arriving — no Tree-sitter, no shaped-text layout per chunk. Matches
-        // the assistant body's streaming rule. gpui has no `WhiteSpace::Pre`,
-        // so we split on newlines to preserve line structure.
+        // Bidirectional scroll for streaming output, mirroring the final
+        // branch's `markdown_tv(scrollable)` + `code_block` pattern: an outer
+        // vertical-scroll viewport over the fixed 220px panel, with an inner
+        // horizontal-scroll run so long lines scroll instead of wrapping. Both
+        // need an `id` — `overflow_*_scroll` are `InteractiveElement` methods.
         container
             .font_family(theme.mono_font_family.clone())
-            .children(
-                display
-                    .split('\n')
-                    .map(|line| gpui::div().child(line.to_string())),
+            .child(
+                gpui::div()
+                    .id(("tool-output-vscroll", ix))
+                    .h_full()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        gpui::div()
+                            .id(("tool-output-hscroll", ix))
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .children(display.split('\n').map(|line| {
+                                gpui::div().whitespace_nowrap().child(line.to_string())
+                            })),
+                    ),
             )
             .into_any_element()
     } else {

@@ -409,7 +409,12 @@ fn code_block(
         .min_w_0()
         .relative()
         .rounded_md()
-        .bg(styles.secondary)
+        // Transparent surface + hairline border instead of a solid `secondary`
+        // block: keeps the code panel readable on the message surface without
+        // stacking gray rectangles down the list. Syntax highlighting and the
+        // gutter carry the structure; only hover/selection add local fill.
+        .border_1()
+        .border_color(styles.border)
         .overflow_hidden()
         .child(
             div()
@@ -534,7 +539,6 @@ fn diff_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
         .overflow_hidden()
         .border_1()
         .border_color(styles.border)
-        .bg(styles.secondary)
         .child(
             div()
                 .id(("diff-scroll", idx))
@@ -709,7 +713,6 @@ fn conflict_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
         .overflow_hidden()
         .border_1()
         .border_color(styles.border)
-        .bg(styles.secondary)
         .child(
             div()
                 .id(("conflict-scroll", idx))
