@@ -429,10 +429,12 @@ fn handle_notify(routes: &Arc<Routes>, tx: &Sender<HostMessage>, label: String, 
         WvNotification::Navigation(url) => AgentNotification::Navigation { url },
         WvNotification::UserHandback | WvNotification::EvalResult { .. } => unreachable!(),
     };
-    let _ = tx.try_send(HostMessage::Notify {
+    if let Err(e) = tx.try_send(HostMessage::Notify {
         tab_id,
         notification: agent_n,
-    });
+    }) {
+        tracing::warn!(error = %e, "browser host: notify channel full, dropping page-state notification");
+    }
 }
 
 /// The inbound-handler side: resolve label → tab and enqueue the write for
@@ -460,7 +462,9 @@ fn handle_inbound(
         intent: w.intent,
         payload: w.payload,
     };
-    let _ = tx.try_send(HostMessage::InboundWrite { tab_id, write });
+    if let Err(e) = tx.try_send(HostMessage::InboundWrite { tab_id, write }) {
+        tracing::warn!(error = %e, "browser host: inbound channel full, dropping inbound-write request");
+    }
 }
 
 impl BrowserHost for WorkspaceBrowserHost {
@@ -511,6 +515,24 @@ impl BrowserHost for WorkspaceBrowserHost {
             .weak_ws
             .upgrade()
             .ok_or_else(|| "browser host: workspace dropped".to_string())?;
+        // A navigation unloads the old page — its in-flight eval/yield scripts
+        // will never respond. Cancel the pending oneshots so their parked
+        // tasks fail fast instead of waiting the 60s eval timeout.
+        if let Some(tab) = self
+            .routes
+            .tabs
+            .lock()
+            .expect("routes lock poisoned")
+            .get(&id)
+        {
+            tab.pending_evals
+                .lock()
+                .expect("pending_evals lock poisoned")
+                .clear();
+            *tab.pending_yield
+                .lock()
+                .expect("pending_yield lock poisoned") = None;
+        }
         handle
             .update(cx, |_, window, cx| {
                 ws.update(cx, |ws, cx| {

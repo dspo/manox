@@ -1034,6 +1034,20 @@ impl Thread {
         responder: tokio::sync::oneshot::Sender<bool>,
         cx: &mut Context<Self>,
     ) {
+        // The confirmation overlay that resolves these is wired in a later
+        // step; until then a flooding page could grow this map unbounded
+        // until the thread is cancelled / released. Cap it: a request past
+        // the cap is dropped (the responder is dropped here → the host's
+        // parked await unparks with a cancellation).
+        const MAX_PENDING_INBOUND: usize = 64;
+        if self.pending_inbound.len() >= MAX_PENDING_INBOUND {
+            tracing::warn!(
+                pending = self.pending_inbound.len(),
+                id = %id,
+                "browser inbound queue saturated; dropping inbound-write request"
+            );
+            return;
+        }
         self.pending_inbound.insert(id.clone(), responder);
         cx.emit(ThreadEvent::InboundAuthorization {
             id,
