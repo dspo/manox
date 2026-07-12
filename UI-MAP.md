@@ -47,7 +47,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Overlays
 
-- [ApprovalOverlay](#approvaloverlay) · [PlanApprovalOverlay](#planapprovaloverlay) · [BlankProjectOverlay](#blankprojectoverlay)
+- [ApprovalOverlay](#approvaloverlay) · [PlanApprovalOverlay](#planapprovaloverlay) · [InboundWriteOverlay](#inboundwriteoverlay) · [BlankProjectOverlay](#blankprojectoverlay)
 
 ### EditorPane
 
@@ -641,7 +641,18 @@ Read-only observation panel for a single team worker member. Subscribes to the m
 
 A right-pane tab hosting an untrusted embedded native webview (`RightTab::Browser(BrowserTabId)`, an equal citizen of the right tab bar alongside `Editor` / `Member`). Chrome row is pure GPUI: back / forward buttons + a single-line address bar whose `Enter` navigates (re-submitting the current URL reloads). The content area is the native `WebViewElement` from `manox-webview`, which tracks the gpui layout via `set_bounds`. Built with `TrustMode::Untrusted`: only the closed-enum notify bridge and the inbound-write request bridge are injected — the page has no Tauri command surface. Tabs are opened via the `OpenBrowserTab` action (`cmd-b`) and closed via the tab's × affordance or `CloseBrowserTab` (`cmd-shift-b`, closes the active browser tab). `tab_id`s are process-unique and woven into the webview label so the host can route inbound notifications back to their tab.
 
+Two transient banners render between the chrome row and the content area, both driven by flags the `BrowserHost` sets on the view (cleared on navigation / resolution):
+
+- **Yield banner** — shown while a `web_explore_yield` call is parked. A "Done" button resolves the parked Task via `WorkspaceBrowserHost::resolve_handback` (the page-side `user_handback` notify is ignored by design — an untrusted page must not resume a parked yield). Retired by the "Done" click, by navigation, or by Stop/Error cleanup (`clear_yields_for_thread`).
+- **Read hint** — a muted one-liner shown after `read_text` / `read_dom` / `screenshot` / `eval_script` extracts content from an `https://` origin, signalling that logged-in page content was exposed to the agent.
+
 > Source: `agent-ui/src/views/browser_view.rs`
+
+#### InboundWriteOverlay
+
+A scrim + card modal mirroring the [ApprovalOverlay](#approvaloverlay), surfaced by `ThreadEvent::InboundAuthorization` when a built-in browser tab calls `window.__manox_request_write__`. Unlike outbound tool approval this axis is `ApprovalMode`-blind — a web page must never gain a write path because the agent runs in Yolo — so the overlay always shows and resolves through `Thread::respond_inbound`, not the outbound approval pipeline (`pending_auths` / `resolve_auth`). Stacked in `pending_inbounds` (LIFO); queued behind any open outbound approval overlay so only one modal shows at a time. Cleared on terminal `Stop` / `Error`.
+
+> Source: `agent-ui/src/workspace.rs`
 
 #### TeamChip
 
