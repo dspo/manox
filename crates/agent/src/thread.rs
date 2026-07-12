@@ -115,6 +115,11 @@ pub enum ThreadEvent {
         name: String,
         title: String,
         status: ToolCallStatus,
+        /// The structured tool input, surfaced so the UI can derive aggregate
+        /// counts by target (file path / command / pattern) without re-parsing
+        /// the localized title. `None` only on historical rebuild paths that
+        /// restore input from the persisted `MessageContent::ToolUse` instead.
+        input: Option<serde_json::Value>,
     },
     /// Tool execution result (output fed back to the model and shown in the UI).
     ToolResult {
@@ -2549,6 +2554,7 @@ impl Thread {
                     name: name.clone(),
                     title: title.clone(),
                     status: ToolCallStatus::PendingApproval,
+                    input: Some(tu.input.clone()),
                 });
             })?;
 
@@ -2623,6 +2629,7 @@ impl Thread {
                 name: name.clone(),
                 title: title.clone(),
                 status: ToolCallStatus::Running,
+                input: Some(tu.input.clone()),
             });
         })?;
 
@@ -2691,6 +2698,7 @@ impl Thread {
                 } else {
                     ToolCallStatus::Success
                 },
+                input: Some(tu.input.clone()),
             });
         })?;
 
@@ -2745,6 +2753,7 @@ impl Thread {
                 name: name.clone(),
                 title: title.clone(),
                 status: ToolCallStatus::Success,
+                input: Some(tu.input.clone()),
             });
         })?;
         Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
@@ -2780,6 +2789,7 @@ impl Thread {
                 name: name.clone(),
                 title: title.clone(),
                 status: ToolCallStatus::PendingApproval,
+                input: Some(tu.input.clone()),
             });
         })?;
 
@@ -2813,6 +2823,7 @@ impl Thread {
                         name: name.clone(),
                         title: title.clone(),
                         status: ToolCallStatus::Success,
+                        input: Some(tu.input.clone()),
                     });
                 })?;
                 Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
@@ -2845,6 +2856,7 @@ impl Thread {
                         name: name.clone(),
                         title: title.clone(),
                         status: ToolCallStatus::Continued,
+                        input: Some(tu.input.clone()),
                     });
                     this.stop_after_plan_reject = true;
                 })?;
@@ -2869,6 +2881,7 @@ impl Thread {
                         name: name.clone(),
                         title: title.clone(),
                         status: ToolCallStatus::Cancelled,
+                        input: Some(tu.input.clone()),
                     });
                 })?;
                 Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
@@ -2897,6 +2910,7 @@ impl Thread {
                 name: name.clone(),
                 title: title.clone(),
                 status: ToolCallStatus::Denied,
+                input: Some(tu.input.clone()),
             });
         })?;
         Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
@@ -5244,4 +5258,3 @@ mod tests {
         );
     }
 }
-
