@@ -30,6 +30,9 @@ pub struct AnthropicModel {
     api_key: String,
     max_output_tokens: u64,
     max_token_count: u64,
+    /// Auto-compact window override from the provider config's
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var; `None` = no override.
+    auto_compact_window: Option<u64>,
     /// Whether the endpoint is real Anthropic (api.anthropic.com) and thus
     /// eligible for the long (1h) cache TTL + the extended-cache-ttl beta header.
     long_ttl: bool,
@@ -50,6 +53,7 @@ impl AnthropicModel {
         endpoint_url: String,
         api_key: String,
         max_token_count: u64,
+        auto_compact_window: Option<u64>,
     ) -> Self {
         let long_ttl = crate::provider::anthropic_cache::supports_long_ttl(
             crate::provider::anthropic_cache::resolve_prompt_caching_policy(
@@ -70,6 +74,7 @@ impl AnthropicModel {
                 max_token_count,
             ),
             max_token_count,
+            auto_compact_window,
             long_ttl,
             supports_effort,
         }
@@ -94,6 +99,10 @@ impl LanguageModel for AnthropicModel {
     }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
+    }
+
+    fn auto_compact_window(&self) -> Option<u64> {
+        self.auto_compact_window
     }
 
     fn stream_completion(
@@ -672,6 +681,7 @@ mod tests {
             "https://example.invalid".into(),
             "k".into(),
             1024 * 1024,
+            None,
         );
         assert_eq!(
             big.max_output_tokens,
@@ -685,6 +695,7 @@ mod tests {
             "https://example.invalid".into(),
             "k".into(),
             4_096,
+            None,
         );
         assert_eq!(tiny.max_output_tokens, 8_192);
     }
@@ -844,3 +855,4 @@ mod tests {
         assert!(body.get("output_config").is_none());
     }
 }
+

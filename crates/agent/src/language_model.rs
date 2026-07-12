@@ -378,6 +378,16 @@ pub trait LanguageModel: Send + Sync {
         false
     }
     fn max_token_count(&self) -> u64;
+    /// Auto-compact window override (token count), sourced from the provider
+    /// config's provider-level or model-level `env: CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+    /// Only effective on the Anthropic wire. When `Some`, the thread
+    /// auto-compacts at 80% of this value (Claude Code parity) instead of the
+    /// model's full `max_token_count` at the user's settings threshold. Defaults
+    /// to `None`; only Anthropic-wire models whose config sets the env var
+    /// override it.
+    fn auto_compact_window(&self) -> Option<u64> {
+        None
+    }
 
     /// Stream a completion. Returns a `BoxFuture` (handshake) that yields a `BoxStream` of events.
     fn stream_completion(
@@ -447,3 +457,4 @@ mod tests {
         }
     }
 }
+

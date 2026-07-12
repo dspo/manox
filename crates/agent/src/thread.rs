@@ -1764,14 +1764,23 @@ impl Thread {
             return None;
         }
         let model = self.model.as_ref()?;
-        let max_input = model.max_token_count();
         let settings = crate::settings::load();
+        // Claude Code parity: an explicit auto-compact window from the
+        // provider config's `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var drives
+        // both the window and an 80% trigger threshold. Without it, fall back
+        // to the model's full `max_token_count` at the user's settings
+        // threshold (default 0.9). `settings.auto_compact.enabled` still gates
+        // the whole mechanism.
+        let (max_input, threshold) = match model.auto_compact_window() {
+            Some(window) => (window, crate::compact::CLAUDE_CODE_AUTO_COMPACT_THRESHOLD),
+            None => (model.max_token_count(), settings.auto_compact.threshold),
+        };
         crate::compact::auto_compaction_target_ix(
             &self.messages,
             self.token_meter.per_request(),
             settings.auto_compact.enabled,
             max_input,
-            settings.auto_compact.threshold,
+            threshold,
         )
     }
 
@@ -4340,6 +4349,7 @@ mod tests {
     struct ReplayMockModel {
         id: String,
         events: Arc<Vec<LanguageModelCompletionEvent>>,
+        auto_compact_window: Option<u64>,
     }
 
     impl crate::language_model::LanguageModel for ReplayMockModel {
@@ -4360,6 +4370,9 @@ mod tests {
         }
         fn max_token_count(&self) -> u64 {
             4096
+        }
+        fn auto_compact_window(&self) -> Option<u64> {
+            self.auto_compact_window
         }
         fn stream_completion(
             &self,
@@ -4734,6 +4747,7 @@ mod tests {
             events: Arc::new(vec![LanguageModelCompletionEvent::Text(
                 "hello world".into(),
             )]),
+            auto_compact_window: None,
         });
 
         let thread_id = "reg-persist-no-stop";
@@ -4831,6 +4845,7 @@ mod tests {
             events: Arc::new(vec![LanguageModelCompletionEvent::Text(
                 "hello world".into(),
             )]),
+            auto_compact_window: None,
         });
 
         let thread_id = "reg-running-no-stop";
@@ -5120,4 +5135,113 @@ mod tests {
             "adjacent user messages were not coalesced into one"
         );
     }
+
+    /// `auto_compaction_target` honors a model's `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+    /// override: at 80% of the window it fires; below, it does not. The default
+    /// (`None`) path falls back to `max_token_count` + the settings threshold.
+    #[test]
+    fn auto_compaction_target_uses_env_window_at_eighty_pct() {
+        use crate::language_model::TokenUsage;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let window = 202_745u64;
+        let threshold_80 = ((window as f64) * 0.8).ceil() as u64; // 162_196
+        // Mock model carrying the env-var window override.
+        let model: AnyLanguageModel = Arc::new(ReplayMockModel {
+            id: "test/auto-compact-window".into(),
+            events: Arc::new(vec![]),
+            auto_compact_window: Some(window),
+        });
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                "reg-auto-compact-window",
+                "/tmp",
+                vec![Message::user("long session".into())],
+            );
+            rec.title = Some("reg".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+
+        // Below 80% → no compaction target.
+        cx.update(|cx| {
+            thread.update(cx, |t, _| {
+                let uid = t.messages.last().unwrap().id.clone();
+                t.token_meter.accumulate(TokenUsage {
+                    input_tokens: threshold_80 - 1,
+                    ..Default::default()
+                });
+                t.token_meter.finalize_request(Some(&uid));
+            });
+        });
+        assert_eq!(
+            cx.update(|cx| thread.read_with(cx, |t, _| t.auto_compaction_target())),
+            None,
+            "below 80% of the env window must not trigger"
+        );
+
+        // At 80% → compaction target (appends at the end — the trailing user
+        // message already has reported usage).
+        cx.update(|cx| {
+            thread.update(cx, |t, _| {
+                let uid = t.messages.last().unwrap().id.clone();
+                t.token_meter.accumulate(TokenUsage {
+                    input_tokens: threshold_80,
+                    ..Default::default()
+                });
+                t.token_meter.finalize_request(Some(&uid));
+            });
+        });
+        assert_eq!(
+            cx.update(|cx| thread.read_with(cx, |t, _| t.auto_compaction_target())),
+            Some(1),
+            "at 80% of the env window the compaction target must fire"
+        );
+    }
+
+    /// The `None` fallback path: a model without `auto_compact_window` uses
+    /// `max_token_count` (4096 on the mock) + `settings.auto_compact.threshold`.
+    /// Since 4096 < MIN_COMPACTION_CONTEXT_WINDOW (80_000), compaction is
+    /// disabled — the `None` branch is taken, not the `Some` branch.
+    #[test]
+    fn auto_compaction_target_none_falls_back_to_max_token_count() {
+        use crate::language_model::TokenUsage;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        // Mock model without the env-var override.
+        let model: AnyLanguageModel = Arc::new(ReplayMockModel {
+            id: "test/no-compact-window".into(),
+            events: Arc::new(vec![]),
+            auto_compact_window: None,
+        });
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                "reg-no-compact-window",
+                "/tmp",
+                vec![Message::user("session".into())],
+            );
+            rec.title = Some("reg".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+
+        // Even with high usage, compaction is disabled because the mock's
+        // max_token_count (4096) is below MIN_COMPACTION_CONTEXT_WINDOW.
+        cx.update(|cx| {
+            thread.update(cx, |t, _| {
+                let uid = t.messages.last().unwrap().id.clone();
+                t.token_meter.accumulate(TokenUsage {
+                    input_tokens: 500_000,
+                    ..Default::default()
+                });
+                t.token_meter.finalize_request(Some(&uid));
+            });
+        });
+        assert_eq!(
+            cx.update(|cx| thread.read_with(cx, |t, _| t.auto_compaction_target())),
+            None,
+            "None auto_compact_window must fall back to max_token_count (below MIN), not use 0.8 threshold"
+        );
+    }
 }
+

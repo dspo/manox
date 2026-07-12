@@ -958,3 +958,4 @@ mod tests {
         assert!(stopped, "应收到 Stop 事件");
     }
 }
+
