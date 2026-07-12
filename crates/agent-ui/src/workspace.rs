@@ -24,9 +24,8 @@ use agent::{
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle, DismissEvent,
     DragMoveEvent, Entity, FollowMode, ListAlignment, ListOffset, ListSizingBehavior, ListState,
-    MouseButton,
-    MouseUpEvent, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
-    ease_out_quint, prelude::*, px,
+    MouseButton, MouseUpEvent, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
+    deferred, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
