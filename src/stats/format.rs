@@ -13,7 +13,7 @@ pub(super) fn format_tokens(n: u64) -> String {
         if remainder_in_millions == 0 {
             format!("{}b", billions)
         } else {
-            format!("{}b,{}m", billions, remainder_in_millions)
+            format!("{}b{}m", billions, remainder_in_millions)
         }
     } else if n >= MILLION {
         let millions = n / MILLION;
@@ -21,7 +21,7 @@ pub(super) fn format_tokens(n: u64) -> String {
         if remainder_in_thousands == 0 {
             format!("{}m", millions)
         } else {
-            format!("{}m,{}k", millions, remainder_in_thousands)
+            format!("{}m{}k", millions, remainder_in_thousands)
         }
     } else if n >= THOUSAND {
         let thousands = n / THOUSAND;
@@ -29,7 +29,7 @@ pub(super) fn format_tokens(n: u64) -> String {
         if remainder == 0 {
             format!("{}k", thousands)
         } else {
-            format!("{}k,{}", thousands, remainder)
+            format!("{}k{}", thousands, remainder)
         }
     } else {
         n.to_string()
@@ -126,11 +126,11 @@ mod tests {
 
     #[test]
     fn format_tokens_uses_integer_units_with_remainder() {
-        assert_eq!(format_tokens(1_357_000_000), "1b,357m");
+        assert_eq!(format_tokens(1_357_000_000), "1b357m");
         assert_eq!(format_tokens(1_000_000_000), "1b");
-        assert_eq!(format_tokens(1_300_000), "1m,300k");
+        assert_eq!(format_tokens(1_300_000), "1m300k");
         assert_eq!(format_tokens(1_000_000), "1m");
-        assert_eq!(format_tokens(1_300), "1k,300");
+        assert_eq!(format_tokens(1_300), "1k300");
         assert_eq!(format_tokens(1_000), "1k");
         assert_eq!(format_tokens(999), "999");
     }
