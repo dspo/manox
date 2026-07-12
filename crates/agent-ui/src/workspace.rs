@@ -28,9 +28,9 @@ use gpui::{
     ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT, Theme,
-    TitleBar,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
+    TITLE_BAR_HEIGHT, Theme, TitleBar,
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Paste, RopeExt},
     menu::{PopupMenu, PopupMenuItem},
@@ -3813,18 +3813,60 @@ impl Workspace {
 
     /// Circular icon-only send/stop button.
     ///
-    /// Reuses `Button` for built-in focus ring, keyboard activation, and disabled handling;
-    /// `.rounded(px(16.))` renders the button as a 32px disc.
+    /// The composer's primary action control, reused across the hero and footer
+    /// layouts. The box is pinned to `SEND_BTN_SIZE` so the icon, spinner, hover
+    /// border, and disabled tint never perturb the composer row's geometry.
+    ///
+    /// States are kept visually disjoint: while a turn is running (and no
+    /// plan/ask awaits input) the button is a stop control — Pause glyph, danger
+    /// tint, always enabled so cancel stays reachable. When idle it is a send
+    /// control — ArrowUp glyph, accent tint — and goes inert (`disabled`) the
+    /// moment the composer has no text and no pending attachments, so an empty
+    /// input never reads as a ready-to-fire primary. The follow-up queue is
+    /// driven by Enter, not by this button, so running never disables stop.
     fn render_send_button(&self, running: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        // Idle + (no text and no attachments) => inert. Running is a stop
+        // control and stays clickable regardless of composer content.
+        let input_empty = self.input_state.read(cx).value().trim().is_empty()
+            && self.pending_attachments.is_empty();
+        let disabled = !running && input_empty;
+
+        // Matches the composer chip row height (px_2/py_1 + text_xs ≈ 20px),
+        // so the send control shares the effort/model chips' rhythm instead of
+        // towering over them. The disc corner radius is half the box => circle.
+        const SEND_BTN_SIZE: Pixels = px(24.);
+        const SEND_BTN_RADIUS: Pixels = px(12.);
+
+        // Accent/danger-tinted transparent fills that strengthen on hover/active,
+        // mirroring the chip family's accent.opacity(0.08) hover rather than a
+        // heavy solid disc. Custom variant computes bg as color@~0.2, hover
+        // color@~0.3, active color@~0.4; disabled falls back to color@0.15 +
+        // muted_foreground@0.5 automatically.
+        let variant = if running {
+            ButtonCustomVariant::new(cx)
+                .color(theme.danger)
+                .foreground(theme.danger)
+                .hover(theme.danger.opacity(0.18))
+                .active(theme.danger.opacity(0.28))
+        } else {
+            ButtonCustomVariant::new(cx)
+                .color(theme.accent)
+                .foreground(theme.accent)
+                .hover(theme.accent.opacity(0.18))
+                .active(theme.accent.opacity(0.28))
+        };
+
         Button::new("send-btn")
+            .custom(variant)
+            .with_size(Size::Size(SEND_BTN_SIZE))
+            .rounded(SEND_BTN_RADIUS)
             .icon(if running {
                 IconName::Pause
             } else {
                 IconName::ArrowUp
             })
-            .when(running, |b| b.danger())
-            .when(!running, |b| b.primary())
-            .rounded(px(16.))
+            .disabled(disabled)
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.thread.read(cx).is_running()
                     && this.pending_plan.is_none()
