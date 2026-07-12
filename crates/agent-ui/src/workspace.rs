@@ -1183,7 +1183,14 @@ impl Workspace {
     pub fn focus_terminal(&mut self, cx: &mut Context<Self>) {
         if self.terminal_view.is_none() {
             let id = uuid::Uuid::new_v4().to_string();
-            let terminal = match Terminal::new(id, self.cwd.clone(), 80, 24, cx) {
+            let pty = match terminal::pty::default_source(&self.cwd, 80, 24) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to open terminal pty");
+                    return;
+                }
+            };
+            let terminal = match Terminal::new(id, self.cwd.clone(), 80, 24, pty, cx) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to spawn terminal");
@@ -1203,8 +1210,8 @@ impl Workspace {
     }
 
     /// Close the terminal tab and return to the conversation pane. Dropping
-    /// the `TerminalView` drops the underlying `Terminal`, whose `PtyHandle`
-    /// kills the child and joins the reader/waiter threads.
+    /// the `TerminalView` drops the underlying `Terminal`, whose `PtySource`
+    /// kills the child and detaches the reader/waiter threads.
     pub fn close_terminal_tab(&mut self, cx: &mut Context<Self>) {
         self.terminal_view = None;
         self.focus_conversation(cx);
