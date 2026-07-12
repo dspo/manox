@@ -34,7 +34,9 @@ pub type BrowserTabId = u64;
 pub enum BrowserNotification {
     PageLoaded,
     DomChanged,
-    Navigation(String),
+    Navigation {
+        url: String,
+    },
     UserHandback,
     EvalResult {
         request_id: u64,
@@ -49,6 +51,7 @@ pub enum BrowserNotification {
 /// command name; no intents are registered yet, so every request is rejected
 /// until a write surface is added.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct BrowserInboundWrite {
     pub intent: String,
     pub payload: serde_json::Value,
@@ -119,4 +122,60 @@ pub fn set_host(host: Arc<dyn BrowserHost>) {
 /// than panic.
 pub fn host() -> Option<&'static Arc<dyn BrowserHost>> {
     HOST.get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The internally-tagged `BrowserNotification` must round-trip every variant
+    // — a newtype-of-String variant would fail serde's tag-merge at runtime, so
+    // `Navigation` is a struct variant. This test pins that invariant against
+    // any future "simplify back to `Navigation(String)`" refactor.
+    #[test]
+    fn notification_round_trips() {
+        let cases: Vec<BrowserNotification> = vec![
+            BrowserNotification::PageLoaded,
+            BrowserNotification::DomChanged,
+            BrowserNotification::Navigation {
+                url: "https://example.com".into(),
+            },
+            BrowserNotification::UserHandback,
+            BrowserNotification::EvalResult {
+                request_id: 42,
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        for notification in cases {
+            let json = serde_json::to_value(&notification).expect("serialize");
+            let back: BrowserNotification = serde_json::from_value(json).expect("deserialize");
+            assert_eq!(
+                serde_json::to_value(&back).unwrap(),
+                serde_json::to_value(&notification).unwrap(),
+                "round-trip not idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn notification_navigation_serializes_with_tag_and_url() {
+        let n = BrowserNotification::Navigation {
+            url: "https://example.com".into(),
+        };
+        let json = serde_json::to_value(&n).expect("serialize navigation");
+        assert_eq!(json["kind"], "navigation");
+        assert_eq!(json["url"], "https://example.com");
+    }
+
+    #[test]
+    fn inbound_write_round_trips() {
+        let w = BrowserInboundWrite {
+            intent: "save_file".into(),
+            payload: serde_json::json!({"path": "/tmp/x"}),
+        };
+        let json = serde_json::to_value(&w).expect("serialize");
+        let back: BrowserInboundWrite = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.intent, "save_file");
+        assert_eq!(back.payload["path"], "/tmp/x");
+    }
 }
