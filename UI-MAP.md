@@ -560,6 +560,8 @@ Right-side context sidecar inside the Workspace's middle-column `h_flex` — a f
 
 Width is responsive to the main-column body width (`ContextRail::rail_width_for`): `RAIL_DESKTOP_WIDTH` (300px) at wide windows, `RAIL_NARROW_WIDTH` (280px) just above the breakpoint, and folded into a drawer (absent from the h_flex, surfaced via a [ContextRailCollapseBtn](#contextrailcollapsebtn) affordance) below `RAIL_NARROW_BREAK` (900px). The collapse state stays local to the view; it is not persisted into thread messages.
 
+The rail stays mounted while the [EditorPane](#editorpane) is open — it is a peer of the conversation, not the editor's replacement, so opening the right pane no longer hides the conversation info. The editor-divider drag clamp reserves the rail's width alongside `MAIN_MIN_WIDTH` so a wide editor cannot squeeze the conversation column to zero; the rail itself is `flex_shrink_0`, the conversation column is `flex_1`/`min_w_0`.
+
 #### ContextRail
 
 Vertical flex container, `bg:background`, left border. Owns `Entity<Thread>` and renders the panel body in a stateful scrollable inner div (`overflow_y_scroll`).

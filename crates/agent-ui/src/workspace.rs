@@ -5299,17 +5299,17 @@ impl Render for Workspace {
                     // Context rail: a stable sidecar of the conversation column within
                     // the middle h_flex (not an overlay, not the rightmost column — the
                     // editor pane sits right of the whole middle column). Mounts inline
-                    // once the middle column is wide enough; below the narrow breakpoint
-                    // it folds into a drawer and the conversation column takes the full
-                    // middle width. Hidden on the empty first screen, while the editor
-                    // pane is open, and until the thread has interacted — same gates as
-                    // the old floating env card so behavior carries over unchanged.
+                    // once the window is wide enough; below the narrow breakpoint it folds
+                    // into a drawer and the conversation column takes the full middle
+                    // width. Stays mounted while the editor pane is open — the rail is a
+                    // peer of the conversation, not the editor's replacement, so opening
+                    // the right pane no longer hides the conversation info. Hidden only on
+                    // the empty first screen and until the thread has interacted.
                     .children({
                         let main_body_w = window.bounds().size.width
                             - self.sidebar_width
                             - px(SIDEBAR_DIVIDER_WIDTH);
-                        let show_rail = !editor_open
-                            && !first_screen
+                        let show_rail = !first_screen
                             && self.thread.read(cx).has_interacted()
                             && crate::views::context_rail::ContextRail::rail_width_for(main_body_w)
                                 .is_some();
@@ -5341,16 +5341,27 @@ impl Render for Workspace {
                     // The root fills the window, so its right edge is the
                     // window's right edge and the editor pane's width is the
                     // distance from the cursor to that edge. Clamp both to a
-                    // minimum and to leave the main column at least
+                    // minimum and to leave the middle column at least
                     // `MAIN_MIN_WIDTH` (sidebar + main + divider sit left of
                     // the editor), so dragging wide never overflows the window
-                    // or collapses the conversation column. `sidebar_width`
+                    // or collapses the conversation column. The middle column
+                    // now also hosts the context rail when the window is wide
+                    // enough, so reserve the rail's width too — otherwise a
+                    // wide editor would squeeze the conversation to zero while
+                    // the rail (flex_shrink_0) keeps its 300px. `sidebar_width`
                     // is read live so a wide sidebar correctly shrinks the
                     // available editor envelope.
                     let new_w = e.bounds.right() - e.event.position.x;
+                    let main_body_w =
+                        e.bounds.size.width - this.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
+                    let rail_w =
+                        crate::views::context_rail::ContextRail::rail_width_for(main_body_w)
+                            .map(px)
+                            .unwrap_or(px(0.));
                     let dynamic_max = e.bounds.size.width
                         - this.sidebar_width
                         - px(EDITOR_DIVIDER_WIDTH)
+                        - rail_w
                         - px(MAIN_MIN_WIDTH);
                     let max_w = dynamic_max
                         .min(px(EDITOR_MAX_WIDTH))
