@@ -312,6 +312,10 @@ impl WorkspaceBrowserHost {
             }
             return cx.background_spawn(async move { Err(e) });
         }
+        // The injected script will report the page's content back as the eval
+        // result — flag the view so the user sees that logged-in content is
+        // being exposed to the agent on this authenticated origin.
+        self.mark_read_if_https(id, cx);
         let routes = self.routes.clone();
         cx.background_spawn(async move {
             // Race the page's EvalResult notify against a 60s timeout. The
@@ -352,6 +356,118 @@ impl WorkspaceBrowserHost {
             }
             result
         })
+    }
+
+    /// Reclaim the routing state for a tab closed from the UI side (the tab's
+    /// close button) — without re-entering [`BrowserHost::close_tab`], which
+    /// itself calls `close_browser_tab` and would recurse. Mirrors the reclaim
+    /// half of `close_tab`: drops the per-tab `TabState` (closing any parked
+    /// eval/yield oneshots) and the label entry, so a stale label on a late
+    /// notify finds no entry. No-op (and safe) when `close_tab` already
+    /// reclaimed the routes for this id.
+    pub(crate) fn reclaim_routes(&self, id: BrowserTabId) {
+        let Some(label) = self
+            .routes
+            .tabs
+            .lock()
+            .expect("routes lock poisoned")
+            .remove(&id)
+            .map(|t| t.label)
+        else {
+            return;
+        };
+        self.routes
+            .label_to_tab
+            .lock()
+            .expect("routes lock poisoned")
+            .remove(&label);
+    }
+
+    /// Resolve a parked `yield_to_user` from the GPUI chrome (the yield banner's
+    /// "Done" button). Takes the pending oneshot — the parked `Task` resumes —
+    /// and retires the banner. No-op when no yield is parked (e.g. the user
+    /// clicks Done twice, or the yield already resolved via Stop cleanup).
+    pub(crate) fn resolve_handback(&self, id: BrowserTabId, cx: &mut App) {
+        if let Some(tab) = self
+            .routes
+            .tabs
+            .lock()
+            .expect("routes lock poisoned")
+            .get(&id)
+            && let Some(sender) = tab
+                .pending_yield
+                .lock()
+                .expect("pending_yield lock poisoned")
+                .take()
+        {
+            let _ = sender.send(());
+        }
+        if let Some(ws) = self.weak_ws.upgrade() {
+            ws.update(cx, |ws, cx| {
+                if let Some(view) = ws.browser_views.get(&id).cloned() {
+                    view.update(cx, |v, cx| v.set_yielded(false, cx));
+                }
+            });
+        }
+    }
+
+    /// Retire every outstanding yield owned by `thread` — called from the
+    /// workspace Stop handler so a stopped turn leaves no parked yield or stale
+    /// banner behind. Dropping each pending sender resolves the parked `Task`
+    /// with a cancellation error; the banner is cleared on the live view.
+    pub(crate) fn clear_yields_for_thread(&self, thread: &Entity<Thread>, cx: &mut App) {
+        let owned: Vec<BrowserTabId> = self
+            .routes
+            .tabs
+            .lock()
+            .expect("routes lock poisoned")
+            .iter()
+            .filter(|(_, t)| {
+                t.thread
+                    .upgrade()
+                    .is_some_and(|owner| owner.entity_id() == thread.entity_id())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in owned {
+            if let Some(tab) = self
+                .routes
+                .tabs
+                .lock()
+                .expect("routes lock poisoned")
+                .get(&id)
+            {
+                let _ = tab
+                    .pending_yield
+                    .lock()
+                    .expect("pending_yield lock poisoned")
+                    .take();
+            }
+            if let Some(ws) = self.weak_ws.upgrade() {
+                ws.update(cx, |ws, cx| {
+                    if let Some(view) = ws.browser_views.get(&id).cloned() {
+                        view.update(cx, |v, cx| v.set_yielded(false, cx));
+                    }
+                });
+            }
+        }
+    }
+
+    /// Flag the tab's view that a read exposed its content to the agent — a
+    /// transparency hint, only on authenticated (https) origins. Http origins
+    /// carry no credential worth flagging. Idempotent; cleared by navigation.
+    fn mark_read_if_https(&self, id: BrowserTabId, cx: &mut App) {
+        let Some(ws) = self.weak_ws.upgrade() else {
+            return;
+        };
+        ws.update(cx, |ws, cx| {
+            if let Some(view) = ws.browser_views.get(&id).cloned() {
+                let is_https = view.read_with(cx, |v, _| v.url().starts_with("https://"));
+                if is_https {
+                    view.update(cx, |v, cx| v.mark_read(cx));
+                }
+            }
+        });
     }
 }
 
@@ -406,19 +522,10 @@ fn handle_notify(routes: &Arc<Routes>, tx: &Sender<HostMessage>, label: String, 
             return;
         }
         WvNotification::UserHandback => {
-            if let Some(tab) = routes
-                .tabs
-                .lock()
-                .expect("routes lock poisoned")
-                .get(&tab_id)
-                && let Some(sender) = tab
-                    .pending_yield
-                    .lock()
-                    .expect("pending_yield lock poisoned")
-                    .take()
-            {
-                let _ = sender.send(());
-            }
+            // Deliberately ignored on the page side. An untrusted page must
+            // not resume a parked `web_explore_yield` — that would let it
+            // drive the agent's turn flow unprompted. Only the user's chrome
+            // "Done" button resolves a yield, via `resolve_handback`.
             return;
         }
         _ => {}
@@ -537,7 +644,10 @@ impl BrowserHost for WorkspaceBrowserHost {
             .update(cx, |_, window, cx| {
                 ws.update(cx, |ws, cx| {
                     if let Some(view) = ws.browser_views.get(&id).cloned() {
-                        view.update(cx, |v, cx| v.load_url(url, window, cx));
+                        view.update(cx, |v, cx| {
+                            v.set_yielded(false, cx);
+                            v.load_url(url, window, cx);
+                        });
                     }
                 })
             })
@@ -676,6 +786,15 @@ impl BrowserHost for WorkspaceBrowserHost {
         if !registered {
             return cx.background_spawn(async move {
                 Err(format!("browser host: no browser tab with id {id}"))
+            });
+        }
+        // Surface the yield banner so the user knows control is theirs (e.g.
+        // to complete a login) and that clicking "Done" resumes the agent.
+        if let Some(ws) = self.weak_ws.upgrade() {
+            ws.update(cx, |ws, cx| {
+                if let Some(view) = ws.browser_views.get(&id).cloned() {
+                    view.update(cx, |v, cx| v.set_yielded(true, cx));
+                }
             });
         }
         cx.background_spawn(async move {

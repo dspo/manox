@@ -46,6 +46,12 @@ pub struct BrowserView {
     webview: Entity<manox_webview::webview::WebView>,
     address: Entity<InputState>,
     url: String,
+    // Set by the host while a `web_explore_yield` call is parked waiting for
+    // the user to signal handback. Drives the yield banner.
+    yielded: bool,
+    // Set by the host when a read tool extracts content from an authenticated
+    // origin — a transparency hint, not a gate. Cleared on navigation.
+    read_hint: bool,
     _input_sub: Subscription,
 }
 
@@ -99,6 +105,8 @@ impl BrowserView {
             webview,
             address,
             url: url.to_string(),
+            yielded: false,
+            read_hint: false,
             _input_sub,
         }
     }
@@ -116,12 +124,31 @@ impl BrowserView {
         &self.webview
     }
 
-    /// Navigate to `url` and sync the address bar.
+    /// Navigate to `url` and sync the address bar. Navigation retires the
+    /// read hint — a fresh origin's exposure status is unknown until the
+    /// agent reads it again.
     pub fn load_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.url = url.to_string();
+        self.read_hint = false;
         self.address
             .update(cx, |s, cx| s.set_value(url, window, cx));
         self.webview.update(cx, |wv, _| wv.load_url(url));
+    }
+
+    /// Mark the tab as yielded (or resumed). Toggling resumes the parked
+    /// `web_explore_yield` Task via the host's handback resolution.
+    pub fn set_yielded(&mut self, yielded: bool, cx: &mut Context<Self>) {
+        self.yielded = yielded;
+        cx.notify();
+    }
+
+    /// Mark that a read tool has exposed the current page's content to the
+    /// agent. Idempotent; cleared by navigation.
+    pub fn mark_read(&mut self, cx: &mut Context<Self>) {
+        if !self.read_hint {
+            self.read_hint = true;
+            cx.notify();
+        }
     }
 
     /// Go back in the webview history.
@@ -180,6 +207,55 @@ impl Render for BrowserView {
                             .child(Input::new(&self.address).appearance(false)),
                     ),
             )
+            .children(self.yielded.then(|| {
+                div()
+                    .id("browser-yield-banner")
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .bg(theme.accent.opacity(0.15))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(theme.foreground)
+                            .text_sm()
+                            .child(agent::i18n::t("browser-yield-hint")),
+                    )
+                    .child(
+                        Button::new("browser-yield-complete")
+                            .small()
+                            .primary()
+                            .label(agent::i18n::t("browser-yield-complete"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                // Resume the parked yield Task via the host;
+                                // clear the banner locally either way.
+                                this.set_yielded(false, cx);
+                                if let Some(host) =
+                                    crate::browser_host::WorkspaceBrowserHost::concrete()
+                                {
+                                    host.resolve_handback(this.tab_id, cx);
+                                }
+                            })),
+                    )
+            }))
+            .children(self.read_hint.then(|| {
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(agent::i18n::t("browser-read-hint"))
+            }))
             .child(
                 div()
                     .flex_1()
