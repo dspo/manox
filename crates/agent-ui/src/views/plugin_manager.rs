@@ -358,61 +358,45 @@ impl Render for PluginManagerView {
         let busy = self.busy;
         let search = self.search.clone();
 
+        // Unified window chrome: the management-shell TitleBar carries the
+        // macOS traffic-light inset and a drag region (the old hand-rolled
+        // 56px header had neither), with the back control and page title on
+        // the leading side and the search field on the trailing side.
+        let on_back = cx.listener(|_this, _ev, _window, cx| {
+            cx.emit(PluginManagerEvent::Exit);
+        });
+        let search_box = h_flex()
+            .w(px(280.))
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .child(
+                Icon::new(IconName::Search)
+                    .small()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                Input::new(&search)
+                    .appearance(false)
+                    .bordered(false)
+                    .focus_bordered(false),
+            );
+
         v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .child(
-                h_flex()
-                    .h(px(56.))
-                    .px_5()
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                Button::new("plugin-manager-back")
-                                    .ghost()
-                                    .small()
-                                    .icon(Icon::new(IconName::ArrowLeft))
-                                    .label(i18n::t("settings-back"))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(PluginManagerEvent::Exit);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(gpui::FontWeight::BLACK)
-                                    .child(i18n::t("plugins-title")),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .w(px(280.))
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded(theme.radius)
-                            .bg(theme.secondary)
-                            .child(
-                                Icon::new(IconName::Search)
-                                    .small()
-                                    .text_color(theme.muted_foreground),
-                            )
-                            .child(
-                                Input::new(&search)
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .focus_bordered(false),
-                            ),
-                    ),
-            )
+            .child(crate::views::management_shell::titlebar(
+                &theme,
+                i18n::t("settings-back"),
+                on_back,
+                i18n::t("plugins-title"),
+                Some(search_box.into_any_element()),
+            ))
             .child(
                 h_flex().px_5().pt_3().child(
                     TabBar::new("plugin-manager-tabs")
@@ -495,6 +479,7 @@ impl PluginManagerView {
                             .label(i18n::t("plugins-add-marketplace"))
                             .icon(Icon::new(IconName::Plus))
                             .disabled(self.busy)
+                            .flex_shrink_0()
                             .on_click(cx.listener(|this, _, _, cx| this.add_marketplace(cx))),
                     ),
             )
@@ -816,6 +801,7 @@ fn marketplace_card(
                 ))
                 .child(
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .child(
                             Button::new(format!("select-marketplace-{}", record.slug))
@@ -871,6 +857,7 @@ fn marketplace_plugin_card(
                 .child(item_text(name, plugin.source, plugin.description, &theme))
                 .child(
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .child(status_tag(
                             if installed {
@@ -937,6 +924,7 @@ fn installed_plugin_card(
                 ))
                 .child(
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .children(can_update.then(|| {
                             Button::new(format!("update-installed-{}", name_update))
@@ -994,6 +982,7 @@ fn skill_card(
                 .child(item_text(record.key, origin, Some(source), &theme))
                 .child(
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .child(
                             Button::new(format!("edit-skill-{}", action_key))
@@ -1045,6 +1034,7 @@ fn mcp_card(
                 .child(item_text(name, summary, None, &theme))
                 .children((!readonly).then(|| {
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .child(
                             Button::new(format!("edit-mcp-{}", edit_name))
@@ -1129,18 +1119,27 @@ fn item_text(
             div()
                 .text_sm()
                 .font_weight(gpui::FontWeight::SEMIBOLD)
+                .min_w_0()
+                .truncate()
                 .child(title.into()),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .min_w_0()
+                // Subtitle often carries a Git URL or filesystem path —
+                // truncate so a long incompressible run can't blow the row
+                // out under a narrow window. Description below wraps instead,
+                // since it is prose the user may want to read in full.
+                .truncate()
                 .child(subtitle.into()),
         )
         .children(description.filter(|s| !s.is_empty()).map(|description| {
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .min_w_0()
                 .child(description)
         }))
         .into_any_element()

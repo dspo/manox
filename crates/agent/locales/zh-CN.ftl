@@ -90,6 +90,7 @@ settings-item-archived = 已归档对话
 settings-item-chat-settings = Chat Settings
 settings-search-placeholder = 搜索设置…
 settings-back = 返回应用
+settings-title = 设置
 settings-coming-soon = Coming soon…
 settings-coming-soon-label = Coming soon… {$label}
 
