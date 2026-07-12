@@ -177,7 +177,7 @@ Bottom section: loose (non-project) threads. The header's `+` button opens the `
 
 #### SidebarNewSessionMenu
 
-`PopupMenu` anchored below the "Conversations" header `+`. Four rows: Manox Thread (emits `NewThread`), Claude Code / Codex / GitHub Copilot (emit `NewExternalSession(SessionKind)`). Phase 4 spawns the external rows immediately with the first supporting model; Phase 5 replaces that with a provider→model wizard.
+`PopupMenu` anchored below the "Conversations" header `+`. One flat row (Manox Thread → `NewThread`) plus one `submenu_with_icon` per external agent kind (Claude Code / Codex / GitHub Copilot). Each agent submenu is a provider→model cascade: models from `registry::global().models()` filtered by the agent's `visible_agents()`, grouped by `provider_name()` into provider submenus, each listing its supported models. Picking a model emits `SpawnExternalSession(kind, provider, model)`. An agent with no supporting model renders a muted "no model configured" label row instead of provider submenus.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 

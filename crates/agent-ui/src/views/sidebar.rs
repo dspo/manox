@@ -13,10 +13,12 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use agent::provider::registry;
 use agent::{ThreadStore, ThreadStoreEvent, i18n, thread::ApprovalMode};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
-    EventEmitter, Pixels, Render, SharedString, Subscription, Window, ease_in_out, prelude::*, px,
+    EventEmitter, Pixels, Render, SharedString, Subscription, WeakEntity, Window, ease_in_out,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
@@ -73,11 +75,11 @@ pub enum SidebarEvent {
     OpenPlugins,
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
-    /// Launch a new external agent CLI session (claude / codex / copilot) from
-    /// the sidebar `+` menu. Phase 4 spawns with the first model that declares
-    /// support for the agent; Phase 5 replaces this with a provider→model
-    /// wizard overlay.
-    NewExternalSession(crate::external_session::SessionKind),
+    /// Launch an external agent CLI session with a user-picked provider + model
+    /// (the cascade wizard's terminal action). The kind identifies the agent
+    /// (`claude` / `codex` / `copilot`); the two strings are provider name +
+    /// model id.
+    SpawnExternalSession(crate::external_session::SessionKind, String, String),
     /// Switch the main area to an already-running external session.
     OpenExternalSession(String),
     /// Close an external session (× on the row): kill the agent and drop it
@@ -172,13 +174,15 @@ impl Sidebar {
     }
 
     /// Open the new-session `PopupMenu` off the "Conversations" header `+`.
-    /// Four rows: Manox Thread (emits `NewThread`) and one per external agent
-    /// kind (emit `NewExternalSession(kind)`). Phase 5 will replace the
-    /// external rows' immediate spawn with a provider→model wizard overlay.
+    /// One flat row (Manox Thread → `NewThread`) plus one submenu per external
+    /// agent kind. Each agent submenu is a provider→model cascade built from
+    /// `registry::global().models()` filtered by the agent's id; picking a
+    /// model emits `SpawnExternalSession(kind, provider, model)`. An agent with
+    /// no supporting model renders a muted "no model" label row.
     fn open_new_session_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let theme = cx.theme().clone();
         let sidebar = cx.entity().downgrade();
-        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+        let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
             let mut menu = menu
                 .max_w(gpui::px(280.))
                 .label(i18n::t("sidebar-new-session-label"));
@@ -202,24 +206,22 @@ impl Sidebar {
             ] {
                 let sidebar = sidebar.clone();
                 let theme = theme.clone();
-                let label = kind.label();
                 let icon = match kind {
                     crate::external_session::SessionKind::ClaudeCode => IconName::Bot,
                     crate::external_session::SessionKind::Codex => IconName::Cpu,
                     crate::external_session::SessionKind::GithubCopilot => IconName::Github,
                 };
-                menu = menu.item(new_session_item(
-                    icon,
+                let label = kind.label();
+                let agent_id = kind.agent_id();
+                menu = menu.submenu_with_icon(
+                    Some(Icon::new(icon).small().text_color(theme.muted_foreground)),
                     label,
-                    &theme,
-                    move |_, _window, cx| {
-                        let _ = sidebar.update(cx, |this, cx| {
-                            this.close_new_session_menu();
-                            cx.emit(SidebarEvent::NewExternalSession(kind));
-                            cx.notify();
-                        });
+                    window,
+                    cx,
+                    move |submenu, window, cx| {
+                        build_agent_model_cascade(submenu, kind, agent_id, &sidebar, window, cx)
                     },
-                ));
+                );
             }
             menu
         });
@@ -642,6 +644,75 @@ fn new_session_item(
             .into_any_element()
     })
     .on_click(on_click)
+}
+
+/// Build the provider→model cascade inside an external-agent submenu. Models
+/// are drawn from `registry::global().models()` filtered by the agent's id
+/// (`visible_agents`); they are grouped by provider, each provider a nested
+/// submenu. Picking a model emits `SpawnExternalSession(kind, provider, model)`
+/// to the sidebar; the top-level menu's `DismissEvent` closes the popup stack.
+/// An agent with no supporting model renders a muted "no model" label instead
+/// of empty submenus, so the dogfooder sees what to configure.
+fn build_agent_model_cascade(
+    menu: PopupMenu,
+    kind: crate::external_session::SessionKind,
+    agent_id: &'static str,
+    sidebar: &WeakEntity<Sidebar>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let mut providers: Vec<(String, Vec<agent::language_model::AnyLanguageModel>)> = Vec::new();
+    for m in registry::global().models() {
+        if !m.visible_agents().iter().any(|a| a == agent_id) {
+            continue;
+        }
+        let prov = m.provider_name().to_string();
+        if let Some(last) = providers.last_mut()
+            && last.0 == prov
+        {
+            last.1.push(m.clone());
+        } else {
+            providers.push((prov, vec![m.clone()]));
+        }
+    }
+
+    let mut menu = menu;
+    if providers.is_empty() {
+        menu = menu.label(i18n::t("external-wizard-no-model"));
+        return menu;
+    }
+    for (prov_name, models) in providers {
+        let sidebar = sidebar.clone();
+        menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
+            let mut submenu = submenu;
+            for m in &models {
+                let model_id = m.id().to_string();
+                let model_name = m.name().to_string();
+                let prov = m.provider_name().to_string();
+                let sidebar = sidebar.clone();
+                submenu = submenu.item(
+                    PopupMenuItem::element(move |_window, _cx| {
+                        gpui::div()
+                            .text_sm()
+                            .child(model_name.clone())
+                            .into_any_element()
+                    })
+                    .on_click(move |_, _, cx: &mut App| {
+                        let _ = sidebar.update(cx, |_this, cx| {
+                            cx.emit(SidebarEvent::SpawnExternalSession(
+                                kind,
+                                prov.clone(),
+                                model_id.clone(),
+                            ));
+                            cx.notify();
+                        });
+                    }),
+                );
+            }
+            submenu
+        });
+    }
+    menu
 }
 
 /// Render one external-session row in the "External" section. Simpler than a
