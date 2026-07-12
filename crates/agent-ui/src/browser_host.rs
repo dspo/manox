@@ -314,20 +314,30 @@ impl WorkspaceBrowserHost {
         }
         let routes = self.routes.clone();
         cx.background_spawn(async move {
-            let result = match tokio::time::timeout(Duration::from_secs(60), rx).await {
-                Ok(Ok(payload)) => {
+            // Race the page's EvalResult notify against a 60s timeout. The
+            // timeout needs a tokio time reactor, so spawn it on the global
+            // tokio Handle (provider SSE streams use the same bridge); the
+            // JoinHandle is then polled here on the gpui background executor —
+            // polling a JoinHandle needs no reactor context, unlike
+            // tokio::time itself.
+            let join = agent::runtime::handle().spawn(async move {
+                tokio::time::timeout(Duration::from_secs(60), rx).await
+            });
+            let result = match join.await {
+                Ok(Ok(Ok(payload))) => {
                     if let Some(msg) = payload.get("__error").and_then(|v| v.as_str()) {
                         Err(format!("browser host: page script error: {msg}"))
                     } else {
                         Ok(stringify_value(&payload))
                     }
                 }
-                Ok(Err(_)) => {
-                    Err("browser host: eval was cancelled before the page responded".to_string())
-                }
-                Err(_) => {
-                    Err("browser host: eval timed out (60s) — the page did not respond".to_string())
-                }
+                Ok(Ok(Err(_))) => Err(
+                    "browser host: eval was cancelled before the page responded".to_string(),
+                ),
+                Ok(Err(_)) => Err(
+                    "browser host: eval timed out (60s) — the page did not respond".to_string(),
+                ),
+                Err(_) => Err("browser host: eval task failed".to_string()),
             };
             // The notify handler already removed the sender on success; on the
             // timeout / cancellation path, reclaim it so a late response
