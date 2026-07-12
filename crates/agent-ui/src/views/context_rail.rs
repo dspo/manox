@@ -1093,7 +1093,7 @@ fn truncate_env_model_id(id: String) -> String {
     format!("{head}...")
 }
 
-/// Compact token count display: `1m,357k`, `168k,653`, `999`.
+/// Compact token count display: `1m357k`, `168k653`, `999`.
 fn format_tokens(n: u64) -> String {
     const MILLION: u64 = 1_000_000;
     const THOUSAND: u64 = 1_000;
@@ -1103,7 +1103,7 @@ fn format_tokens(n: u64) -> String {
         if r == 0 {
             format!("{m}m")
         } else {
-            format!("{m}m,{r}k")
+            format!("{m}m{r}k")
         }
     } else if n >= THOUSAND {
         let k = n / THOUSAND;
@@ -1111,7 +1111,7 @@ fn format_tokens(n: u64) -> String {
         if r == 0 {
             format!("{k}k")
         } else {
-            format!("{k}k,{r}")
+            format!("{k}k{r}")
         }
     } else {
         n.to_string()
