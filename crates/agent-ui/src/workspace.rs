@@ -102,6 +102,17 @@ struct PendingPlan {
     plan_text: String,
 }
 
+/// A pending inbound-write request from a built-in browser tab, surfaced by
+/// `ThreadEvent::InboundAuthorization`. Unlike outbound tool approval this
+/// axis is `ApprovalMode`-blind — a web page must never gain a write path
+/// because the agent runs in Yolo — so the overlay always shows and the
+/// decision always routes through `Thread::respond_inbound`, not the outbound
+/// approval pipeline.
+struct PendingInbound {
+    id: String,
+    intent: String,
+}
+
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
 struct PendingAsk {
     id: String,
@@ -253,6 +264,10 @@ pub struct Workspace {
     /// approval request — the overlay shows the most recent and queues the rest,
     /// resolving them one at a time so no `oneshot` is stranded by overwrite.
     pending_auths: Vec<PendingAuth>,
+    /// Pending inbound-write requests from built-in browser tabs. Stacked
+    /// like `pending_auths`; the overlay shows the most recent and queues the
+    /// rest. Each carries its own `Thread::respond_inbound` id.
+    pending_inbounds: Vec<PendingInbound>,
     /// A pending `AskUserQuestion` card rendered inline in the message list.
     pending_ask: Option<PendingAsk>,
     /// Current question index in the ask drawer (0-based).
@@ -568,6 +583,7 @@ impl Workspace {
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
             pending_auths: Vec::new(),
+            pending_inbounds: Vec::new(),
             pending_ask: None,
             ask_step: 0,
             ask_transition_gen: 0,
@@ -750,6 +766,14 @@ impl Workspace {
                         // `exit_plan_mode` call dropped the overlay because this
                         // cleared `pending_plan` before the approval arm ran).
                         this.pending_plan = None;
+                        // A terminal stop abandons any parked browser yield
+                        // (the parked Task is cancelled on the thread side)
+                        // and dismisses stranded inbound-write overlays whose
+                        // decision oneshot the thread just dropped.
+                        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
+                            host.clear_yields_for_thread(&this.thread, cx);
+                        }
+                        this.pending_inbounds.clear();
                         let thread_id = this.thread.read(cx).id.0.clone();
                         save_thread(this.thread.clone(), true, cx);
                         // Terminal stop → this thread is no longer running.
@@ -817,6 +841,18 @@ impl Workspace {
                     // bubble's placement marks the turn that was steered.
                     this.consume_steered_follow_up(message_id, cx);
                 }
+                ThreadEvent::InboundAuthorization { id, intent, .. } => {
+                    // A built-in browser tab requested an inbound write. This
+                    // axis ignores `ApprovalMode` — always confirm, never let
+                    // a page drive the agent unprompted — so it is stacked
+                    // separately from `pending_auths` and resolved through
+                    // `Thread::respond_inbound`, not the outbound pipeline.
+                    this.pending_inbounds.push(PendingInbound {
+                        id: id.clone(),
+                        intent: intent.clone(),
+                    });
+                    cx.notify();
+                }
                 _ => {
                     // `Error` is a terminal signal symmetric to a terminal
                     // `Stop`: the turn aborted, so this thread is no longer
@@ -834,6 +870,13 @@ impl Workspace {
                         // `Stop`: the turn aborted, so any pending plan overlay
                         // is now stale and must not linger over an idle thread.
                         this.pending_plan = None;
+                        // Symmetric to the terminal `Stop` arm: retire parked
+                        // browser yields + stranded inbound overlays so an
+                        // aborted turn leaves no stale banner behind.
+                        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
+                            host.clear_yields_for_thread(&this.thread, cx);
+                        }
+                        this.pending_inbounds.clear();
                         this.cockpit_phase = CockpitPhase::Failed;
                         this.cockpit_running_tool_title = None;
                         this.demote_milestones_to_pending();
@@ -1427,6 +1470,13 @@ impl Workspace {
     pub fn close_browser_tab(&mut self, tab_id: BrowserTabId, cx: &mut Context<Self>) {
         if self.browser_views.remove(&tab_id).is_none() {
             return;
+        }
+        // Reclaim the host's routing entry so a late notify for this tab finds
+        // no route (no orphaned oneshot). `close_tab` reclaims first then calls
+        // us — in that direction `reclaim_routes` is a no-op; this call covers
+        // the UI-close direction.
+        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
+            host.reclaim_routes(tab_id);
         }
         if let Some(ix) = self
             .right_tabs
@@ -2822,6 +2872,20 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Resolve the most-recent inbound-write request from a built-in browser
+    /// tab. Routed through `Thread::respond_inbound` — separate from the
+    /// outbound `resolve_auth` pipeline because this axis is `ApprovalMode`-
+    /// blind by design.
+    pub(crate) fn resolve_inbound(&mut self, allowed: bool, cx: &mut Context<Self>) {
+        let Some(req) = self.pending_inbounds.pop() else {
+            return;
+        };
+        self.thread.update(cx, |thread, cx| {
+            thread.respond_inbound(&req.id, allowed, cx);
+        });
+        cx.notify();
+    }
+
     /// Allocate the per-question `InputState` entities for the ask drawer on
     /// first render. `InputState::new` needs a `Window`, which the event
     /// handler lacks, so creation is deferred to here.
@@ -3173,6 +3237,105 @@ impl Workspace {
                                                     PermissionDecision::AllowOnce,
                                                     cx,
                                                 );
+                                            }
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Confirmation overlay for an inbound-write request from a built-in
+    /// browser tab. Mirrors `render_auth_overlay`'s scrim + card layout but
+    /// resolves through `respond_inbound` (the `ApprovalMode`-blind axis).
+    fn render_inbound_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let req = self.pending_inbounds.last()?;
+        let intent = req.intent.clone();
+        let queued = self.pending_inbounds.len().saturating_sub(1);
+        Some(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.foreground.opacity(0.6))
+                .child(
+                    v_flex()
+                        .w(px(420.))
+                        .p_4()
+                        .gap_3()
+                        .rounded(theme.radius)
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .small()
+                                        .text_color(theme.danger),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(i18n::t("workspace-inbound-title")),
+                                ),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(i18n::t_str(
+                                    "workspace-inbound-intent",
+                                    &[("intent", intent.as_str())],
+                                )),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(i18n::t("workspace-inbound-note")),
+                        )
+                        .children(if queued > 0 {
+                            Some(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(i18n::t_count("workspace-queued", queued as i64)),
+                            )
+                        } else {
+                            None
+                        })
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("inbound-deny")
+                                        .ghost()
+                                        .small()
+                                        .label(i18n::t("workspace-inbound-deny"))
+                                        .on_click(cx.listener({
+                                            move |this, _, _, cx| {
+                                                this.resolve_inbound(false, cx);
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new("inbound-allow")
+                                        .primary()
+                                        .small()
+                                        .label(i18n::t("workspace-inbound-allow"))
+                                        .on_click(cx.listener({
+                                            move |this, _, _, cx| {
+                                                this.resolve_inbound(true, cx);
                                             }
                                         })),
                                 ),
@@ -5682,6 +5845,7 @@ impl Render for Workspace {
 
         let overlay = self
             .render_auth_overlay(&theme, cx)
+            .or_else(|| self.render_inbound_overlay(&theme, cx))
             .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
 
         let editor_open = self.editor_open;
