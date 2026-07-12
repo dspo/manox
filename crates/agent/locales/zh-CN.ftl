@@ -437,8 +437,11 @@ workspace-env-title = 对话信息
 workspace-env-changes = 变更
 workspace-env-no-project = 暂无项目
 workspace-env-usage = 消费
-workspace-env-throughput = 穿透
-workspace-env-cache = 缓存
+workspace-env-noncached-input = 输入
+workspace-env-output = 输出
+workspace-env-cache-read = 缓存读
+workspace-env-cache-write = 缓存写
+workspace-env-cache-hit-rate = 缓存 {$pct}%
 workspace-env-sources = 来源
 workspace-env-no-sources = 暂无来源
 
@@ -449,8 +452,8 @@ context-rail-expand = 展开上下文栏
 context-rail-drawer-open = 打开上下文栏
 
 # ── Cockpit（运行状态 / 里程碑 / 上下文预算）──────────────────────────
-# 「对话信息」卡片的运行状态行。{$phase} 为本地化的阶段标签，{$elapsed} 为预格式化的时长，{$tokens} 为预格式化的 token 计数（如 "22.7k"）。
-cockpit-run-status = {$phase} · {$elapsed} · ↓ {$tokens}
+# 多行运行状态块。{$elapsed} 为预格式化的时长，{$tokens} 为预格式化的 token 计数（如 "22.7k"）。阶段标签单独渲染为加粗行，位于本行之上。
+cockpit-run-status-meta = {$elapsed} · {$tokens}
 # 运行状态行的阶段标签。
 cockpit-status-idle = 空闲
 cockpit-status-thinking = 思考中
@@ -470,6 +473,7 @@ cockpit-completed-summary = +{$count} 已完成
 cockpit-context-until-auto-summary = {$pct}% 距自动压缩
 cockpit-context-of-window = {$pct}% 上下文
 cockpit-context-estimate = 估算
+cockpit-context-waiting = 等待用量
 # 里程碑区段标题末尾的隐藏/显示提示。通用——标题也可点击切换。
 cockpit-hide-tasks-hint = 点击折叠
 cockpit-show-tasks-hint = 点击展开

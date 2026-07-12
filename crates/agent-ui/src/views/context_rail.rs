@@ -29,13 +29,16 @@ use gpui_component::{
     h_flex, v_flex,
 };
 
-use crate::cockpit::{CockpitPhase, Milestone, MilestoneStatus, context_budget_pct};
+use crate::cockpit::{
+    CockpitPhase, Milestone, MilestoneStatus, cache_read_ratio, context_budget_pct,
+};
 
 // ── Geometry ─────────────────────────────────────────────────────────────
 
-/// Desktop rail width. Compact enough for the per-model tree block: model id
-/// on the top line, `├── Throughput` / `└── Cache` tree rows underneath, each
-/// with `↑↓` animated counters.
+/// Desktop rail width. Wide enough for the per-model usage block: model id
+/// (plus trailing cache-hit badge) on the top line, four labeled token rows
+/// underneath (input / output / cache read / cache write), each with an
+/// animated counter.
 pub(crate) const RAIL_DESKTOP_WIDTH: f32 = 300.;
 /// Narrowed rail width once the window drops below [`RAIL_NARROW_BREAK`].
 /// Keeps the rail visible while leaving the conversation more room.
@@ -225,96 +228,6 @@ impl ContextRail {
         } else {
             i18n::t("workspace-env-no-project").to_string()
         };
-        let muted = theme.muted_foreground;
-
-        // Build per-model token rows, sorted by total usage descending.
-        let mut model_rows: Vec<_> = per_model
-            .into_iter()
-            .filter(|(_, u)| u.total_tokens() > 0)
-            .collect();
-        model_rows.sort_by_key(|b| std::cmp::Reverse(b.1.total_tokens()));
-
-        // Diff every cell against the last-rendered value, bump the per-cell
-        // gen on delta, and rebuild `env_counter_state` so the map is bounded
-        // by the number of live models. The four cells per model are
-        // (field, value) pairs; we capture (from, to, gen) per cell so the
-        // animation closures below can be plain `'static` move-closures.
-        // Tree labels are constant across iterations; resolve once before the
-        // loop so each iteration just clones the SharedString instead of
-        // re-running the i18n lookup.
-        let throughput_label = i18n::t("workspace-env-throughput");
-        let cache_label = i18n::t("workspace-env-cache");
-        let mut new_state: HashMap<String, (u64, u64)> = HashMap::new();
-        // Each model block carries: model id text + two tree rows. The
-        // capture-based build here keeps the closure machinery out of the
-        // outer builder.
-        let mut model_blocks: Vec<(String, gpui::Div, gpui::Div)> =
-            Vec::with_capacity(model_rows.len());
-
-        for (model_name, usage) in model_rows {
-            let model_display = truncate_env_model_id(model_name.clone());
-            let cells: [(&str, u64); 4] = [
-                ("in", usage.input_tokens),
-                ("out", usage.output_tokens),
-                ("cache_create", usage.cache_creation_input_tokens),
-                ("cache_read", usage.cache_read_input_tokens),
-            ];
-            let mut from_to_gen: [(u64, u64, u64); 4] = [(0, 0, 0); 4];
-            for (i, (field, value)) in cells.iter().enumerate() {
-                let cell_key = format!("{model_name}|{field}");
-                let (old_value, new_gen) = match self.env_counter_state.get(&cell_key) {
-                    // First render for this cell: roll from 0 up to the
-                    // current value (gen 1).
-                    None => (0u64, 1u64),
-                    // Value unchanged: reuse the existing gen so the
-                    // animation id is stable and gpui doesn't replay.
-                    Some(&(gen_, last)) if last == *value => (last, gen_),
-                    // Value changed: roll from the previous value to the
-                    // new one, bumping gen so a fresh tween fires.
-                    Some(&(gen_, last)) => (last, gen_.wrapping_add(1)),
-                };
-                new_state.insert(cell_key, (new_gen, *value));
-                from_to_gen[i] = (old_value, *value, new_gen);
-            }
-
-            // Tree prefix glyph (`├── ` / `└── `) painted slightly muted so
-            // it reads as chrome rather than data.
-            let branch_prefix = |glyph: &'static str| -> gpui::Div {
-                gpui::div()
-                    .text_xs()
-                    .text_color(muted.opacity(0.55))
-                    .child(SharedString::from(glyph))
-            };
-            let (in_f, in_t, in_g) = from_to_gen[0];
-            let (out_f, out_t, out_g) = from_to_gen[1];
-            let (cce_f, cce_t, cce_g) = from_to_gen[2];
-            let (ccr_f, ccr_t, ccr_g) = from_to_gen[3];
-
-            let throughput_row = h_flex()
-                .pl(px(12.))
-                .gap_1()
-                .items_center()
-                .text_xs()
-                .text_color(muted)
-                .child(branch_prefix("├── "))
-                .child(throughput_label.clone())
-                .child(counter_animated("↑", in_f, in_t, "in", in_g))
-                .child(counter_animated("↓", out_f, out_t, "out", out_g));
-            let cache_row = h_flex()
-                .pl(px(12.))
-                .gap_1()
-                .items_center()
-                .text_xs()
-                .text_color(muted)
-                .child(branch_prefix("└── "))
-                .child(cache_label.clone())
-                .child(counter_animated("↑", cce_f, cce_t, "cache_create", cce_g))
-                .child(counter_animated("↓", ccr_f, ccr_t, "cache_read", ccr_g));
-            model_blocks.push((model_display, throughput_row, cache_row));
-        }
-        // Commit the rebuilt per-cell state; auto-prunes cells whose model
-        // disappeared (the map only contains live cells from this render).
-        self.env_counter_state = new_state;
 
         v_flex()
             .w_full()
@@ -370,44 +283,7 @@ impl ContextRail {
                 theme,
             ))
             .child(env_row(IconName::Github, branch_label.into(), None, theme))
-            // Usage section: section header + per-model tree blocks.
-            // Each block is a v_flex: model id on the top line,
-            // throughput + cache tree rows below, separated by gap_0p5.
-            .child(
-                v_flex()
-                    .w_full()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
-                            .child(
-                                gpui::div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(i18n::t("workspace-env-usage")),
-                            ),
-                    )
-                    .children(model_blocks.into_iter().map(
-                        |(model_display, throughput_row, cache_row)| {
-                            v_flex()
-                                .w_full()
-                                .gap_0p5()
-                                .child(
-                                    gpui::div()
-                                        .text_xs()
-                                        .text_color(theme.foreground)
-                                        .child(model_display),
-                                )
-                                .child(throughput_row)
-                                .child(cache_row)
-                                .into_any_element()
-                        },
-                    )),
-            )
+            .child(self.render_usage_section(theme, cx, per_model))
             .child(self.render_cockpit_context_budget(theme, cx))
             .child(self.render_cockpit_milestones(theme, cx))
             .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
@@ -431,9 +307,160 @@ impl ContextRail {
             .into_any_element()
     }
 
-    /// Run-status row: phase label + elapsed (per-second refresh via the
-    /// thinking ticker) + cumulative token count. Sits directly under the rail
-    /// title so the current phase is the first thing the eye lands on.
+    /// Per-model token usage as four explicit labeled rows (non-cached input,
+    /// output, cache read, cache write) with the cache-hit ratio beside the
+    /// model name. Supersedes the old two-row "Throughput ↑in ↓out / Cache
+    /// ↑cce ↓ccr" tree, which hid the cache-read share behind a generic
+    /// "Throughput" label. Counter animation state is diffed and rebuilt here
+    /// so the per-cell `gen` bumps on every value delta (see `env_counter_state`).
+    fn render_usage_section(
+        &mut self,
+        theme: &Theme,
+        _cx: &mut Context<Self>,
+        per_model: HashMap<String, agent::language_model::TokenUsage>,
+    ) -> AnyElement {
+        let muted = theme.muted_foreground;
+        let mut model_rows: Vec<_> = per_model
+            .into_iter()
+            .filter(|(_, u)| u.total_tokens() > 0)
+            .collect();
+        model_rows.sort_by_key(|b| std::cmp::Reverse(b.1.total_tokens()));
+
+        let input_label = i18n::t("workspace-env-noncached-input");
+        let output_label = i18n::t("workspace-env-output");
+        let cache_read_label = i18n::t("workspace-env-cache-read");
+        let cache_write_label = i18n::t("workspace-env-cache-write");
+
+        let mut new_state: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut model_blocks: Vec<(
+            String,
+            Option<SharedString>,
+            gpui::Div,
+            gpui::Div,
+            gpui::Div,
+            gpui::Div,
+        )> = Vec::with_capacity(model_rows.len());
+
+        for (model_name, usage) in model_rows {
+            let model_display = truncate_env_model_id(model_name.clone());
+            // Cache-hit ratio shown beside the model name when the model has
+            // any cache-readable input this turn.
+            let hit_rate = cache_read_ratio(usage).map(|r| {
+                let pct = (r * 100.0).round() as i64;
+                i18n::t_str("workspace-env-cache-hit-rate", &[("pct", &pct.to_string())])
+            });
+            let cells: [(&str, u64); 4] = [
+                ("in", usage.input_tokens),
+                ("out", usage.output_tokens),
+                ("cache_read", usage.cache_read_input_tokens),
+                ("cache_create", usage.cache_creation_input_tokens),
+            ];
+            let mut from_to_gen: [(u64, u64, u64); 4] = [(0, 0, 0); 4];
+            for (i, (field, value)) in cells.iter().enumerate() {
+                let cell_key = format!("{model_name}|{field}");
+                let (old_value, new_gen) = match self.env_counter_state.get(&cell_key) {
+                    None => (0u64, 1u64),
+                    Some(&(gen_, last)) if last == *value => (last, gen_),
+                    Some(&(gen_, last)) => (last, gen_.wrapping_add(1)),
+                };
+                new_state.insert(cell_key, (new_gen, *value));
+                from_to_gen[i] = (old_value, *value, new_gen);
+            }
+            let (in_f, in_t, in_g) = from_to_gen[0];
+            let (out_f, out_t, out_g) = from_to_gen[1];
+            let (cr_f, cr_t, cr_g) = from_to_gen[2];
+            let (cc_f, cc_t, cc_g) = from_to_gen[3];
+
+            let input_row = usage_row(&input_label, counter_animated("", in_f, in_t, "in", in_g));
+            let output_row = usage_row(
+                &output_label,
+                counter_animated("", out_f, out_t, "out", out_g),
+            );
+            let cache_read_row = usage_row(
+                &cache_read_label,
+                counter_animated("", cr_f, cr_t, "cache_read", cr_g),
+            );
+            let cache_write_row = usage_row(
+                &cache_write_label,
+                counter_animated("", cc_f, cc_t, "cache_create", cc_g),
+            );
+            model_blocks.push((
+                model_display,
+                hit_rate,
+                input_row,
+                output_row,
+                cache_read_row,
+                cache_write_row,
+            ));
+        }
+        self.env_counter_state = new_state;
+
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
+                    .child(
+                        gpui::div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(i18n::t("workspace-env-usage")),
+                    ),
+            )
+            .children(model_blocks.into_iter().map(
+                |(
+                    model_display,
+                    hit_rate,
+                    input_row,
+                    output_row,
+                    cache_read_row,
+                    cache_write_row,
+                )| {
+                    v_flex()
+                        .w_full()
+                        .gap_0p5()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    gpui::div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(theme.foreground)
+                                        .child(model_display),
+                                )
+                                .children(hit_rate.map(|r| {
+                                    gpui::div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child(r)
+                                        .into_any_element()
+                                })),
+                        )
+                        .child(input_row)
+                        .child(output_row)
+                        .child(cache_read_row)
+                        .child(cache_write_row)
+                        .into_any_element()
+                },
+            ))
+            .into_any_element()
+    }
+
+    /// Run-status block: a multi-line card so a long phase / tool title is
+    /// not cramped into one truncated line. Line 1 carries the phase label
+    /// (semibold) + elapsed + cumulative tokens; line 2 is the elapsed/tokens
+    /// meta in xs muted; line 3 (when a tool is running) shows the tool title
+    /// in xs muted truncate. The elapsed still refreshes per-second via the
+    /// thinking ticker's `cx.notify()`.
     fn render_cockpit_status_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let phase_key = match self.cockpit_phase {
             CockpitPhase::Idle => "cockpit-status-idle",
@@ -452,23 +479,14 @@ impl ContextRail {
             .map(|t| crate::cockpit::format_elapsed(t.elapsed()))
             .unwrap_or_else(|| "0s".to_string());
         let tokens = crate::cockpit::format_tokens(thread.cumulative_token_usage().total_tokens());
-        let mut label = i18n::t_str(
-            "cockpit-run-status",
-            &[
-                ("phase", phase_label.as_str()),
-                ("elapsed", elapsed.as_str()),
-                ("tokens", tokens.as_str()),
-            ],
-        )
-        .to_string();
-        // When a tool is running, append its title so the user can see *what*
-        // is executing, not just that something is.
-        if let Some(title) = &self.cockpit_running_tool_title
-            && !title.is_empty()
-        {
-            label.push_str(" · ");
-            label.push_str(title);
-        }
+        let meta = i18n::t_str(
+            "cockpit-run-status-meta",
+            &[("elapsed", elapsed.as_str()), ("tokens", tokens.as_str())],
+        );
+        let tool_title = self
+            .cockpit_running_tool_title
+            .as_deref()
+            .filter(|t| !t.is_empty());
         let icon = match self.cockpit_phase {
             CockpitPhase::Thinking | CockpitPhase::Streaming | CockpitPhase::Summarizing => {
                 IconName::LoaderCircle
@@ -479,30 +497,34 @@ impl ContextRail {
             CockpitPhase::Failed => IconName::CircleX,
             CockpitPhase::Idle => IconName::Dash,
         };
-        env_row(icon, label.into(), None, theme)
+        cockpit_status_block(
+            icon,
+            phase_label.into(),
+            meta,
+            tool_title.map(Into::into),
+            theme,
+        )
     }
 
-    /// Context-budget row: percent of the window still free before auto-summary
-    /// fires (or before the raw window fills, when auto-summary is off / window
-    /// too small). Hidden entirely when no usage has been reported yet (first
-    /// turn). Turns warning-colored within 10% of the trigger.
+    /// Context-budget row. Reads `latest_reported_request_token_usage` so the
+    /// display holds the last real budget during turn warmup instead of
+    /// flashing a fake 100%. When no usage exists at all (fresh thread) it
+    /// shows a muted "waiting for usage" placeholder — never a fake full bar.
+    /// The trailing element renders the explicit `current / cap` token counts
+    /// so the user can read the absolute numbers behind the percentage.
     fn render_cockpit_context_budget(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let thread = self.thread.read(cx);
         let max_input = thread.model().map(|m| m.max_token_count()).unwrap_or(0);
         let budget = context_budget_pct(
             max_input,
-            thread.last_request_token_usage(),
+            thread.latest_reported_request_token_usage(),
             self.cockpit_auto_compact_enabled,
             self.cockpit_auto_compact_threshold,
         );
         let Some(budget) = budget else {
-            // No usage yet — render a muted placeholder so the section doesn't
-            // pop in/out as the first turn streams.
             return env_row(
                 IconName::BatteryFull,
-                i18n::t("cockpit-context-of-window")
-                    .replace("{$pct}", "100")
-                    .into(),
+                i18n::t("cockpit-context-waiting"),
                 None,
                 theme,
             );
@@ -521,14 +543,23 @@ impl ContextRail {
         } else {
             theme.muted_foreground
         };
+        let current = crate::cockpit::format_tokens(budget.active_tokens);
+        let cap = crate::cockpit::format_tokens(budget.cap_tokens);
+        let ratio = format!("{current} / {cap}");
         env_row(
             IconName::BatteryFull,
             label,
             Some(
-                gpui::div()
+                h_flex()
+                    .gap_1()
                     .text_xs()
                     .text_color(color)
-                    .child(i18n::t("cockpit-context-estimate"))
+                    .child(gpui::div().child(ratio))
+                    .child(
+                        gpui::div()
+                            .text_color(theme.muted_foreground.opacity(0.7))
+                            .child(i18n::t("cockpit-context-estimate")),
+                    )
                     .into_any_element(),
             ),
             theme,
@@ -719,6 +750,53 @@ fn env_row(
         .into_any_element()
 }
 
+/// Multi-line run-status block. Replaces the single-line `env_row` the status
+/// row used to occupy: phase on a semibold line, a xs muted meta line
+/// (elapsed + tokens), and an optional xs truncate tool-title line so a long
+/// tool title no longer truncates the phase. The icon anchors the left column.
+fn cockpit_status_block(
+    icon: IconName,
+    phase: SharedString,
+    meta: SharedString,
+    tool_title: Option<SharedString>,
+    theme: &Theme,
+) -> AnyElement {
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap_2()
+        .child(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(phase),
+                )
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(meta),
+                )
+                .children(tool_title.map(|t| {
+                    gpui::div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(t)
+                        .into_any_element()
+                })),
+        )
+        .into_any_element()
+}
+
 /// Clamp a model id so the rail never wraps it. Ids up to
 /// `ENV_MODEL_ID_MAX` ("MiniMax/MiniMax-M3[1m]") render in full; longer ones
 /// are cut to the cap, trimmed by 3 chars, then suffixed with "..." — so the
@@ -794,4 +872,24 @@ fn counter_animated(
             },
         )
         .into_any_element()
+}
+
+/// One labeled usage row: label on the left (flex-1, indented), animated
+/// counter on the right. The indented label aligns under the model name so
+/// the four rows read as a column belonging to that model. Text color
+/// cascades from the caller (muted).
+fn usage_row(label: &SharedString, counter: AnyElement) -> gpui::Div {
+    h_flex()
+        .pl(px(12.))
+        .gap_1()
+        .items_center()
+        .text_xs()
+        .child(
+            gpui::div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .child(label.clone()),
+        )
+        .child(counter)
 }

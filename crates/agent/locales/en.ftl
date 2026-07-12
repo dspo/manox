@@ -477,8 +477,11 @@ workspace-env-title = Conversation info
 workspace-env-changes = Changes
 workspace-env-no-project = No project
 workspace-env-usage = Usage
-workspace-env-throughput = Throughput
-workspace-env-cache = Cache
+workspace-env-noncached-input = Input
+workspace-env-output = Output
+workspace-env-cache-read = Cache read
+workspace-env-cache-write = Cache write
+workspace-env-cache-hit-rate = cache {$pct}%
 workspace-env-sources = Sources
 workspace-env-no-sources = No sources yet
 
@@ -489,10 +492,10 @@ context-rail-expand = Expand context rail
 context-rail-drawer-open = Open context rail
 
 # ── Cockpit (run status / milestones / context budget) ──────────────────
-# The "Conversation info" card's run-status row. {$phase} is a localized
-# phase label, {$elapsed} a pre-formatted duration, {$tokens} a pre-formatted
-# token count (e.g. "22.7k").
-cockpit-run-status = {$phase} · {$elapsed} · ↓ {$tokens}
+# The multi-line run-status block. {$elapsed} is a pre-formatted duration,
+# {$tokens} a pre-formatted token count (e.g. "22.7k"). The phase label is
+# rendered on its own semibold line above this meta line.
+cockpit-run-status-meta = {$elapsed} · {$tokens}
 # Phase labels for the run-status row.
 cockpit-status-idle = Idle
 cockpit-status-thinking = Thinking
@@ -512,6 +515,7 @@ cockpit-completed-summary = +{$count} completed
 cockpit-context-until-auto-summary = {$pct}% until auto-summary
 cockpit-context-of-window = {$pct}% of context
 cockpit-context-estimate = estimate
+cockpit-context-waiting = waiting for usage
 # Hide/show tasks hint appended to the milestone section header. Generic —
 # the header is also clickable to toggle.
 cockpit-hide-tasks-hint = click to collapse

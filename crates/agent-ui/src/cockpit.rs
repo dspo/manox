@@ -52,6 +52,13 @@ pub struct ContextBudget {
     /// small to qualify).
     pub remaining_pct: f64,
     pub is_estimate: bool,
+    /// Tokens counted against the budget in the last reported request
+    /// (`active_tokens` of the usage). UI shows this as the numerator of
+    /// `current / cap`.
+    pub active_tokens: u64,
+    /// The budget cap the percentage is measured against: the auto-summary
+    /// trigger when enabled and the window qualifies, else the raw window.
+    pub cap_tokens: u64,
 }
 
 /// Parse a plan's markdown body into milestones. Best-effort: each line that
@@ -149,6 +156,8 @@ pub fn context_budget_pct(
     Some(ContextBudget {
         remaining_pct: remaining,
         is_estimate: true,
+        active_tokens: active as u64,
+        cap_tokens: trigger as u64,
     })
 }
 
@@ -162,6 +171,21 @@ pub fn format_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Cache-hit ratio: share of the model's input that was served from the
+/// prompt cache rather than re-processed. Denominator is uncached input plus
+/// cache-read (cache-creation and output are excluded — they are not "input
+/// the model reused"). `None` when the denominator is zero (no input this
+/// turn, e.g. first turn before any usage lands).
+pub fn cache_read_ratio(usage: TokenUsage) -> Option<f64> {
+    let denom = usage
+        .input_tokens
+        .saturating_add(usage.cache_read_input_tokens);
+    if denom == 0 {
+        return None;
+    }
+    Some(usage.cache_read_input_tokens as f64 / denom as f64)
 }
 
 /// Compact elapsed-time rendering: `1h 5m` / `10m 30s` / `3s`.
@@ -306,5 +330,54 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(3)), "3s");
         assert_eq!(format_elapsed(Duration::from_secs(630)), "10m 30s");
         assert_eq!(format_elapsed(Duration::from_secs(3900)), "1h 5m");
+    }
+
+    #[test]
+    fn cache_read_ratio_typical_turn() {
+        // input=2_797_897, cache_read=13_633_280 → denom=16_431_177,
+        // ratio≈0.8298 (83%).
+        let usage = TokenUsage {
+            input_tokens: 2_797_897,
+            output_tokens: 500,
+            cache_creation_input_tokens: 1_000,
+            cache_read_input_tokens: 13_633_280,
+        };
+        let r = cache_read_ratio(usage).unwrap();
+        assert!((r - 0.8298).abs() < 0.001, "got {r}");
+    }
+
+    #[test]
+    fn cache_read_ratio_no_cache_read() {
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        assert_eq!(cache_read_ratio(usage), Some(0.0));
+    }
+
+    #[test]
+    fn cache_read_ratio_zero_denominator() {
+        // No uncached input and no cache read → None.
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 500,
+            cache_creation_input_tokens: 1_000,
+            cache_read_input_tokens: 0,
+        };
+        assert_eq!(cache_read_ratio(usage), None);
+    }
+
+    #[test]
+    fn cache_read_ratio_all_cached_read() {
+        // Pure cache read, no uncached input → ratio 1.0.
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 10_000,
+        };
+        assert_eq!(cache_read_ratio(usage), Some(1.0));
     }
 }

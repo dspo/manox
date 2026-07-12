@@ -571,20 +571,18 @@ Scrollable panel body. Migrated verbatim from the old `render_environment_panel`
 Contents, top to bottom:
 
 - **Header**: bold title (i18n `context-rail-title`) + a [ContextRailCollapseBtn](#contextrailcollapsebtn) ghost button.
-- **Status row**: run phase, elapsed time, running tool title (when `cockpit_phase == RunningTool`). Uses `crate::cockpit::format_elapsed` / `format_tokens`.
-- **Context budget row**: `context_budget_pct` against `MIN_COMPACTION_CONTEXT_WINDOW` and the `cockpit_auto_compact_threshold` cached on the rail.
+- **Status block** (`cockpit_status_block`): a multi-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2, and an optional xs muted truncate tool-title line 3 when `cockpit_phase == RunningTool`. Elapsed refreshes per-second via the thinking ticker.
+- **Context budget row**: `context_budget_pct` reads `Thread::latest_reported_request_token_usage` (stable during turn warmup) against `MIN_COMPACTION_CONTEXT_WINDOW` and the `cockpit_auto_compact_threshold` cached on the rail. Shows a muted "waiting for usage" placeholder (i18n `cockpit-context-waiting`) when no usage has landed yet — never a fake 100%. Trailing element renders explicit `current / cap` token counts (e.g. `396k / 900k`) alongside the "estimate" note; warning-colored within 10% of the trigger.
 - **Milestone section** (collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): plan steps parsed from the approved `exit_plan_mode` plan. All `Pending` outside a turn; the first is promoted to `InProgress` while the thread runs, demoted back to `Pending` on terminal stop.
 - **Changes row**: `env_row` with `Frame` icon, "Changes" label, and a trailing `+0 / -0` placeholder (TODO — δ track).
 - **Branch row**: `env_row` with `Github` icon and the branch label — `"main"` when a project is bound, "No project" otherwise.
-- **Usage section header**: `MemoryStick` icon + "Usage" label.
-- **Per-model tree blocks** (sorted by total tokens desc; empty for unused models):
-  - Model id (truncated to `ENV_MODEL_ID_MAX` chars).
-  - `├── Throughput ↑<in> ↓<out>` — input / output tokens.
-  - `└── Cache ↑<cache_create> ↓<cache_read>` — cache creation / cache read.
+- **Usage section** (`render_usage_section`): `MemoryStick` icon + "Usage" header, then per-model blocks (sorted by total tokens desc; empty for unused models). Each block is:
+  - Model id line (truncated to `ENV_MODEL_ID_MAX` chars) + trailing `cache {pct}%` hit-rate badge (i18n `workspace-env-cache-hit-rate`) computed by `cockpit::cache_read_ratio` (denominator = uncached input + cache-read).
+  - Four explicit labeled rows (`usage_row`): non-cached input (`workspace-env-noncached-input`), output (`workspace-env-output`), cache read (`workspace-env-cache-read`), cache write (`workspace-env-cache-write`). Each row's counter animates via `counter_animated`.
 - **Hairline divider**.
 - **Sources section**: `Sources` label + "No sources yet" placeholder (ε track).
 
-Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `ContextRail`, rebuilt every render to auto-prune cells whose model disappeared.
+Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `ContextRail`, rebuilt every render inside `render_usage_section` to auto-prune cells whose model disappeared.
 
 > Source: `agent-ui/src/views/context_rail.rs` (`render_panel`)
 
