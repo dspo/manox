@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent::compact::MIN_COMPACTION_CONTEXT_WINDOW;
@@ -45,6 +46,7 @@ use crate::cockpit::{
     CockpitPhase, Milestone, MilestoneStatus, context_budget_pct, parse_milestones,
 };
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
+use crate::external_session::{ExternalSession, SessionKind};
 use crate::views::browser_view::BrowserView;
 use crate::views::centered;
 use crate::views::completion::{
@@ -394,6 +396,16 @@ pub struct Workspace {
     /// The terminal tab's view, lazily created on the first `FocusTerminal` /
     /// `NewTerminalTab`. `None` until then. Dropped on `CloseTerminalTab`.
     terminal_view: Option<Entity<TerminalView>>,
+    /// Live external agent CLI sessions (claude / codex / copilot) launched from
+    /// the sidebar `+` menu. In-memory only — never persisted. Each owns its
+    /// `TerminalView` plus a shared `Arc<SessionHandle>` so the close path can
+    /// `kill` the agent explicitly.
+    external_sessions: Vec<crate::external_session::ExternalSession>,
+    /// The currently-displayed external session id when
+    /// `view_mode == ExternalSession`. Mirrors `terminal_view`'s "one at a
+    /// time" model; switching away parks the session (its terminal keeps
+    /// running) rather than killing it.
+    active_external: Option<String>,
     /// Embedded native webview, opened via `OpenBrowserGoNoGo` for the step-1
     /// embed check. `None` until then. Dropped on `CloseBrowserGoNoGo`.
     /// Step 5 replaces this single overlay with proper `RightTab::Browser`
@@ -408,8 +420,9 @@ pub struct Workspace {
 
 /// Top-level rendering mode of the Workspace window. `Settings` and
 /// `Terminal` are full-pane switches off the default `Workspace` (conversation)
-/// mode; future overlays can extend this enum rather than carrying parallel
-/// `bool` flags.
+/// mode; `ExternalSession` shows an external agent CLI's TUI terminal in place
+/// of the conversation. Future overlays can extend this enum rather than
+/// carrying parallel `bool` flags.
 #[derive(Default)]
 enum ViewMode {
     #[default]
@@ -417,6 +430,7 @@ enum ViewMode {
     Settings,
     Plugins,
     Terminal,
+    ExternalSession,
 }
 
 /// Right-side composer width. Wide enough for rendered markdown
@@ -603,6 +617,8 @@ impl Workspace {
             plugin_manager_view: None,
             plugin_manager_sub: None,
             terminal_view: None,
+            external_sessions: Vec::new(),
+            active_external: None,
             browser_view: None,
             outline_hover: None,
         };
@@ -1083,6 +1099,15 @@ impl Workspace {
                 }
                 SidebarEvent::OpenPlugins => this.enter_plugins(cx),
                 SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
+                SidebarEvent::NewExternalSession(kind) => {
+                    this.spawn_external_session(*kind, cx);
+                }
+                SidebarEvent::OpenExternalSession(id) => {
+                    this.attach_external_session(id, cx);
+                }
+                SidebarEvent::CloseExternalSession(id) => {
+                    this.close_external_session(id, cx);
+                }
                 SidebarEvent::ArchiveThread(id, archived) => {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
@@ -1225,6 +1250,110 @@ impl Workspace {
     pub fn close_terminal_tab(&mut self, cx: &mut Context<Self>) {
         self.terminal_view = None;
         self.focus_conversation(cx);
+    }
+
+    /// Launch a new external agent CLI session (`claude` / `codex` / `copilot`).
+    /// Phase 4 picks the first model whose `visible_agents` declares support
+    /// for the agent's id; Phase 5 replaces this with a provider→model wizard.
+    /// The shared `SessionHandle` backs a `CxSessionSource` PTY source that
+    /// drives a `Terminal`/`TerminalView`, and is also held by the
+    /// `ExternalSession` so the close path can `kill` the agent explicitly.
+    pub fn spawn_external_session(&mut self, kind: SessionKind, cx: &mut Context<Self>) {
+        let agent_id = kind.agent_id();
+        let (provider_name, model_id) = match registry::global()
+            .models()
+            .iter()
+            .find(|m| m.visible_agents().iter().any(|a| a == agent_id))
+        {
+            Some(m) => (m.provider_name().to_string(), m.id().to_string()),
+            None => {
+                tracing::error!(agent = agent_id, "no model configured for external agent");
+                return;
+            }
+        };
+        let handle = match cx::AgentBuilder::new()
+            .agent(kind.agent())
+            .pty(true)
+            .provider(provider_name.clone())
+            .model(model_id.clone())
+            .spawn()
+        {
+            Ok(h) => Arc::new(h),
+            Err(e) => {
+                tracing::error!(error = %e, agent = agent_id, "external agent spawn failed");
+                return;
+            }
+        };
+        let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
+        let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
+        let terminal =
+            match Terminal::new(id.clone(), self.cwd.clone(), 80, 24, Box::new(source), cx) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to create terminal for external session");
+                    return;
+                }
+            };
+        let view = TerminalView::new(terminal, cx);
+        self.external_sessions.push(ExternalSession {
+            id: id.clone(),
+            kind,
+            provider_name,
+            model_id,
+            terminal_view: view,
+            handle,
+        });
+        self.sync_sidebar_external(cx);
+        self.attach_external_session(&id, cx);
+    }
+
+    /// Display an already-running external session in the main area. Does not
+    /// touch the foreground `Thread` (the thread entity stays mounted; only the
+    /// view mode flips) — the session's terminal keeps running across switches
+    /// because the `ExternalSession` owns the live `TerminalView` + handle.
+    pub fn attach_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.external_sessions.iter().any(|s| s.id == id) {
+            return;
+        }
+        self.active_external = Some(id.to_string());
+        self.view_mode = ViewMode::ExternalSession;
+        self.sidebar
+            .update(cx, |s, cx| s.set_selected(Some(id.to_string()), cx));
+        cx.notify();
+    }
+
+    /// Kill an external session and remove it. If it was the active session,
+    /// fall back to the conversation pane. Dropping the `ExternalSession` drops
+    /// its `TerminalView` (and thus the `Terminal` + `CxSessionSource`); the
+    /// explicit `handle.kill()` ensures the child is terminated even if the
+    /// reader thread is mid-`read`.
+    pub fn close_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        let pos = self.external_sessions.iter().position(|s| s.id == id);
+        let Some(pos) = pos else {
+            return;
+        };
+        let session = self.external_sessions.remove(pos);
+        if let Err(e) = session.handle.kill() {
+            // Best-effort: the child may already be dead (natural exit). Log and
+            // continue with the rest of the cleanup rather than stranding the
+            // sidebar row.
+            tracing::warn!(error = %e, id, "external session kill failed");
+        }
+        drop(session);
+        if self.active_external.as_deref() == Some(id) {
+            self.active_external = None;
+            self.focus_conversation(cx);
+        }
+        self.sync_sidebar_external(cx);
+    }
+
+    /// Push a fresh projection of the live external sessions to the sidebar so
+    /// its "External" section reflects spawns / closes without owning the
+    /// PTY-bearing structs.
+    fn sync_sidebar_external(&mut self, cx: &mut Context<Self>) {
+        let summaries: Vec<_> = self.external_sessions.iter().map(|s| s.summary()).collect();
+        self.sidebar
+            .update(cx, |s, cx| s.set_external_sessions(summaries, cx));
     }
 
     /// Open the embedded browser overlay for the step-1 go/no-go embed check.
@@ -5361,6 +5490,92 @@ impl Render for Workspace {
                                             .min_w_0()
                                             .truncate()
                                             .child(title_text),
+                                    ),
+                            ),
+                        )
+                        .child(v_flex().flex_1().h_full().w_full().child(terminal)),
+                );
+        }
+        // External agent CLI session: render the active session's terminal TUI
+        // in place of the conversation. Mirrors the Terminal branch — sidebar on
+        // the left, a TitleBar + the terminal filling the main column — but the
+        // bar shows the agent kind + provider/model and a `×` that kills the
+        // session and removes it from the sidebar.
+        if matches!(self.view_mode, ViewMode::ExternalSession) {
+            let theme = cx.theme().clone();
+            let active = self
+                .active_external
+                .as_deref()
+                .and_then(|id| self.external_sessions.iter().find(|s| s.id == id));
+            let Some(session) = active else {
+                // No live session matches the recorded id (closed underneath
+                // us). Fall back to the conversation pane.
+                self.view_mode = ViewMode::Workspace;
+                cx.notify();
+                return h_flex().size_full().child(self.sidebar.clone());
+            };
+            let kind = session.kind;
+            let title = session.kind.label();
+            let subtitle = format!("{} · {}", session.provider_name, session.model_id);
+            let terminal = session.terminal_view.clone();
+            let close_id = session.id.clone();
+            return h_flex()
+                .size_full()
+                .bg(theme.background)
+                .text_color(theme.foreground)
+                .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
+                    this.focus_conversation(cx);
+                }))
+                .child(self.sidebar.clone())
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .h_full()
+                        .relative()
+                        .child(
+                            TitleBar::new().child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        Icon::new(match kind {
+                                            crate::external_session::SessionKind::ClaudeCode => {
+                                                IconName::Bot
+                                            }
+                                            crate::external_session::SessionKind::Codex => {
+                                                IconName::Cpu
+                                            }
+                                            crate::external_session::SessionKind::GithubCopilot => {
+                                                IconName::Github
+                                            }
+                                        })
+                                        .small(),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .text_sm()
+                                            .text_left()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(title)
+                                            .child(
+                                                gpui::div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(subtitle),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("close-external")
+                                            .small()
+                                            .ghost()
+                                            .icon(IconName::Close)
+                                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                                this.close_external_session(&close_id.clone(), cx);
+                                            })),
                                     ),
                             ),
                         )

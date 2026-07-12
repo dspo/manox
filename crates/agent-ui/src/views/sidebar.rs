@@ -15,13 +15,14 @@ use std::time::Duration;
 
 use agent::{ThreadStore, ThreadStoreEvent, i18n, thread::ApprovalMode};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, Entity, EventEmitter,
-    Pixels, Render, SharedString, Subscription, Window, ease_in_out, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
+    EventEmitter, Pixels, Render, SharedString, Subscription, Window, ease_in_out, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex,
+    menu::{PopupMenu, PopupMenuItem},
     tag::{Tag, TagVariant},
     v_flex,
 };
@@ -72,6 +73,16 @@ pub enum SidebarEvent {
     OpenPlugins,
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
+    /// Launch a new external agent CLI session (claude / codex / copilot) from
+    /// the sidebar `+` menu. Phase 4 spawns with the first model that declares
+    /// support for the agent; Phase 5 replaces this with a provider→model
+    /// wizard overlay.
+    NewExternalSession(crate::external_session::SessionKind),
+    /// Switch the main area to an already-running external session.
+    OpenExternalSession(String),
+    /// Close an external session (× on the row): kill the agent and drop it
+    /// from the sidebar.
+    CloseExternalSession(String),
 }
 
 pub struct Sidebar {
@@ -87,6 +98,15 @@ pub struct Sidebar {
     select_gen: u64,
     /// Project paths whose folder group is collapsed; absent means expanded.
     collapsed: HashSet<String>,
+    /// Live external agent sessions, projected from the Workspace's canonical
+    /// list. Rendered in a dedicated "External" section; an `external:` id in
+    /// `selected` highlights the active one.
+    external_sessions: Vec<crate::external_session::ExternalSessionSummary>,
+    /// Whether the new-session `PopupMenu` (Manox Thread / Claude Code / Codex /
+    /// GitHub Copilot) is open off the "Conversations" header `+`.
+    new_session_open: bool,
+    new_session_menu: Option<Entity<PopupMenu>>,
+    new_session_menu_sub: Option<Subscription>,
     /// Live width driven by dragging the divider on the right edge. Updated
     /// from the owning `Workspace` on every drag-move tick.
     width: Pixels,
@@ -116,6 +136,10 @@ impl Sidebar {
             collapsed: HashSet::new(),
             prev_selected: None,
             select_gen: 0,
+            external_sessions: Vec::new(),
+            new_session_open: false,
+            new_session_menu: None,
+            new_session_menu_sub: None,
             width,
             _sub: sub,
         }
@@ -123,6 +147,18 @@ impl Sidebar {
 
     pub fn store(&self) -> Entity<ThreadStore> {
         self.store.clone()
+    }
+
+    /// Replace the external-session projection. Called by the Workspace
+    /// whenever the canonical set changes (spawn / close). The sidebar never
+    /// owns the live sessions — it only renders this snapshot.
+    pub fn set_external_sessions(
+        &mut self,
+        sessions: Vec<crate::external_session::ExternalSessionSummary>,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_sessions = sessions;
+        cx.notify();
     }
 
     /// Update the rendered width. Called by the owning `Workspace` on every
@@ -133,6 +169,73 @@ impl Sidebar {
         }
         self.width = width;
         cx.notify();
+    }
+
+    /// Open the new-session `PopupMenu` off the "Conversations" header `+`.
+    /// Four rows: Manox Thread (emits `NewThread`) and one per external agent
+    /// kind (emit `NewExternalSession(kind)`). Phase 5 will replace the
+    /// external rows' immediate spawn with a provider→model wizard overlay.
+    fn open_new_session_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let theme = cx.theme().clone();
+        let sidebar = cx.entity().downgrade();
+        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+            let mut menu = menu
+                .max_w(gpui::px(280.))
+                .label(i18n::t("sidebar-new-session-label"));
+            let sidebar_manox = sidebar.clone();
+            menu = menu.item(new_session_item(
+                IconName::Plus,
+                i18n::t("sidebar-new-session-manox"),
+                &theme,
+                move |_, _window, cx| {
+                    let _ = sidebar_manox.update(cx, |this, cx| {
+                        this.close_new_session_menu();
+                        cx.emit(SidebarEvent::NewThread);
+                        cx.notify();
+                    });
+                },
+            ));
+            for kind in [
+                crate::external_session::SessionKind::ClaudeCode,
+                crate::external_session::SessionKind::Codex,
+                crate::external_session::SessionKind::GithubCopilot,
+            ] {
+                let sidebar = sidebar.clone();
+                let theme = theme.clone();
+                let label = kind.label();
+                let icon = match kind {
+                    crate::external_session::SessionKind::ClaudeCode => IconName::Bot,
+                    crate::external_session::SessionKind::Codex => IconName::Cpu,
+                    crate::external_session::SessionKind::GithubCopilot => IconName::Github,
+                };
+                menu = menu.item(new_session_item(
+                    icon,
+                    label,
+                    &theme,
+                    move |_, _window, cx| {
+                        let _ = sidebar.update(cx, |this, cx| {
+                            this.close_new_session_menu();
+                            cx.emit(SidebarEvent::NewExternalSession(kind));
+                            cx.notify();
+                        });
+                    },
+                ));
+            }
+            menu
+        });
+        let sub = cx.subscribe(&menu, |this, _menu, _: &DismissEvent, cx| {
+            this.close_new_session_menu();
+            cx.notify();
+        });
+        self.new_session_open = true;
+        self.new_session_menu = Some(menu);
+        self.new_session_menu_sub = Some(sub);
+    }
+
+    fn close_new_session_menu(&mut self) {
+        self.new_session_open = false;
+        self.new_session_menu = None;
+        self.new_session_menu_sub = None;
     }
 
     /// Mark the currently selected thread id (back-filled by Workspace on switch/new, for highlight).
@@ -388,13 +491,32 @@ impl Render for Sidebar {
                         i18n::t("sidebar-section-conversations"),
                         &theme,
                         Some(
-                            Button::new("conv-plus")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Plus)
-                                .tooltip(i18n::t("sidebar-new-chat"))
-                                .on_click(cx.listener(|_this, _ev, _window, cx| {
-                                    cx.emit(SidebarEvent::NewThread);
+                            gpui::div()
+                                .relative()
+                                .child(
+                                    Button::new("conv-plus")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Plus)
+                                        .tooltip(i18n::t("sidebar-new-chat"))
+                                        .on_click(cx.listener(|this, _ev, window, cx| {
+                                            if this.new_session_open {
+                                                this.close_new_session_menu();
+                                            } else {
+                                                this.open_new_session_menu(window, cx);
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .children(self.new_session_menu.clone().map(|menu| {
+                                    gpui::div()
+                                        .id("new-session-dropdown")
+                                        .absolute()
+                                        .top_full()
+                                        .right_0()
+                                        .occlude()
+                                        .child(menu)
+                                        .into_any_element()
                                 }))
                                 .into_any_element(),
                         ),
@@ -409,7 +531,22 @@ impl Render for Sidebar {
                             &theme,
                             cx,
                         )
-                    }))),
+                    })))
+                    .children(
+                        (!self.external_sessions.is_empty()).then(|| {
+                            section_header(i18n::t("sidebar-section-external"), &theme, None)
+                        }),
+                    )
+                    .child(v_flex().w_full().gap_0p5().children(
+                        self.external_sessions.iter().map(|s| {
+                            render_external_session_item(
+                                s,
+                                selected.as_deref() == Some(s.id.as_str()),
+                                &theme,
+                                cx,
+                            )
+                        }),
+                    )),
             )
     }
 }
@@ -479,6 +616,103 @@ fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>
         row = row.child(el);
     }
 
+    row.into_any_element()
+}
+
+/// One row of the new-session `PopupMenu`: icon + label. Brand names
+/// (`kind.label()`) are passed through `i18n::t` which falls back to the
+/// literal string when no fluent key matches, so "Claude Code" etc. render
+/// verbatim without needing a translation entry.
+fn new_session_item(
+    icon: IconName,
+    label: impl Into<SharedString>,
+    theme: &Theme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> PopupMenuItem {
+    let fg = theme.foreground;
+    let muted = theme.muted_foreground;
+    let icon = icon.clone();
+    let label = label.into();
+    PopupMenuItem::element(move |_window, _cx| {
+        h_flex()
+            .items_center()
+            .gap_2()
+            .child(Icon::new(icon.clone()).small().text_color(muted))
+            .child(gpui::div().text_sm().text_color(fg).child(label.clone()))
+            .into_any_element()
+    })
+    .on_click(on_click)
+}
+
+/// Render one external-session row in the "External" section. Simpler than a
+/// thread row — no slide-wash (external sessions live in their own section and
+/// don't participate in the conversation selection slide), just an icon + kind
+/// label + muted provider/model subtitle + a trailing `×` that emits
+/// `CloseExternalSession(id)`. Clicking the row emits `OpenExternalSession(id)`.
+fn render_external_session_item(
+    summary: &crate::external_session::ExternalSessionSummary,
+    selected: bool,
+    theme: &Theme,
+    cx: &mut Context<Sidebar>,
+) -> AnyElement {
+    let id = summary.id.clone();
+    let id_open = id.clone();
+    let id_close = id.clone();
+    let kind = summary.kind;
+    let icon = match kind {
+        crate::external_session::SessionKind::ClaudeCode => IconName::Bot,
+        crate::external_session::SessionKind::Codex => IconName::Cpu,
+        crate::external_session::SessionKind::GithubCopilot => IconName::Github,
+    };
+    let subtitle = format!("{} · {}", summary.provider_name, summary.model_id);
+    let mut row = h_flex()
+        .id(format!("external-row-{id}"))
+        .w_full()
+        .px_2()
+        .py_1p5()
+        .gap_2()
+        .items_center()
+        .rounded(theme.radius)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.accent.opacity(0.06)))
+        .on_click(cx.listener(move |_this, _ev, _window, cx| {
+            cx.emit(SidebarEvent::OpenExternalSession(id_open.clone()));
+        }));
+    if selected {
+        row = row.bg(theme.accent.opacity(0.10));
+    }
+    row = row
+        .child(Icon::new(icon).small().text_color(theme.muted_foreground))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .text_color(theme.foreground)
+                        .child(kind.label()),
+                )
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(subtitle),
+                ),
+        )
+        .child(
+            Button::new(format!("external-close-{id}"))
+                .ghost()
+                .xsmall()
+                .compact()
+                .icon(IconName::Close)
+                .tooltip(i18n::t("sidebar-close-external"))
+                .on_click(cx.listener(move |_this, _ev, _window, cx| {
+                    cx.stop_propagation();
+                    cx.emit(SidebarEvent::CloseExternalSession(id_close.clone()));
+                })),
+        );
     row.into_any_element()
 }
 
