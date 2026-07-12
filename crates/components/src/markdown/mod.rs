@@ -753,7 +753,13 @@ fn table_block(
         .overflow_x_scroll();
     for (r, row) in rows.into_iter().enumerate() {
         let is_header = r == 0;
-        let mut row_flex = h_flex().min_w_0().w_full();
+        // `items_stretch` is load-bearing: `h_flex()` defaults to cross-axis
+        // centering, so each cell would take its own content height and draw
+        // `border_b` at a different y when a cell wraps to multiple lines —
+        // producing the split "double bottom border" per row. Stretching every
+        // cell to the row's max height makes the per-cell `border_b` land on
+        // one shared baseline, so each row shows a single aligned border.
+        let mut row_flex = h_flex().min_w_0().w_full().items_stretch();
         for (c, cell) in row.into_iter().enumerate() {
             let mut cell_div = div()
                 .flex_1()
