@@ -482,6 +482,12 @@ workspace-env-cache = Cache
 workspace-env-sources = Sources
 workspace-env-no-sources = No sources yet
 
+# ── Context rail (right sidecar) ────────────────────────────────────────
+context-rail-title = Context
+context-rail-collapse = Collapse context rail
+context-rail-expand = Expand context rail
+context-rail-drawer-open = Open context rail
+
 # ── Cockpit (run status / milestones / context budget) ──────────────────
 # The "Conversation info" card's run-status row. {$phase} is a localized
 # phase label, {$elapsed} a pre-formatted duration, {$tokens} a pre-formatted

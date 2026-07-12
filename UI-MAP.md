@@ -19,7 +19,11 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### MainColumn
 
-- [MainColumn](#maincolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarGoalChip](#titlebargoalchip) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body) · [EnvironmentCard](#environmentcard)
+- [MainColumn](#maincolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarGoalChip](#titlebargoalchip) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body)
+
+### ContextRail
+
+- [ContextRail](#contextrail) · [ContextRailPanel](#contextrailpanel) · [ContextRailCollapseBtn](#contextrailcollapsebtn)
 
 ### Hero
 
@@ -115,15 +119,15 @@ Full-window terminal emulator.
 
 ## 3. ViewMode::Workspace Layout
 
-The default mode. Three horizontal slots: Sidebar, MainColumn, EditorPane.
+The default mode. Three horizontal slots: Sidebar, MainColumn (conversation column), ContextRail. The EditorPane overlays the conversation column when open; ContextRail folds into a drawer below `RAIL_NARROW_BREAK` (900px main-column width).
 
 ```
-┌──────────┬──┬─────────────────────────┬──┬──────────────┐
-│          │  │                         │  │              │
-│ Sidebar  │▌│     MainColumn           │▌│ EditorPane   │
-│          │  │                         │  │ (conditional)│
-│          │  │                         │  │              │
-└──────────┴──┴─────────────────────────┴──┴──────────────┘
+┌──────────┬──┬─────────────────────────┬──────────────┐
+│          │  │                         │              │
+│ Sidebar  │▌│     MainColumn           │ ContextRail  │
+│          │  │  (conversation column)  │  (flex sib.) │
+│          │  │                         │              │
+└──────────┴──┴─────────────────────────┴──────────────┘
 ```
 
 ### 3.1 Sidebar
@@ -186,7 +190,7 @@ Single thread row: unread red dot (8px, `theme.danger`, shown when `summary.has_
 
 ### 3.2 MainColumn
 
-Central area, flex-1, relative positioning.
+Central conversation column, flex-1, relative positioning. Has the [ContextRail](#contextrail) as a flex sibling to its right (not a child); the composer no longer spans underneath the rail.
 
 #### MainColumn
 
@@ -548,15 +552,29 @@ Trigger: "Create blank project" from [ProjectMenu](#projectmenu). Centered modal
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### 3.2.6 EnvironmentCard
+### 3.3 ContextRail
 
-Floating card at the top-right of the conversation area, only mounted when all of:
-editor pane closed, thread has interacted, main column ≥ `ENV_CARD_MIN_MAIN_W` (900px). Width `ENV_CARD_WIDTH` (260px). `occlude()` so it paints above the message list.
+Right-side context sidecar. A normal flex sibling of [MainColumn](#maincolumn) (no longer the old floating `EnvironmentCard`), so it never overlaps the conversation and the composer never spans underneath it. Owned by `Workspace` as `Entity<ContextRail>`; the rail owns the cockpit state (run phase, milestones, per-cell counter animation) that used to live on `Workspace`.
+
+Width is responsive to the main-column body width (`ContextRail::rail_width_for`): `RAIL_DESKTOP_WIDTH` (300px) at wide windows, `RAIL_NARROW_WIDTH` (280px) just above the breakpoint, and folded into a drawer (absent from the h_flex, surfaced via a [ContextRailCollapseBtn](#contextrailcollapsebtn) affordance) below `RAIL_NARROW_BREAK` (900px). The collapse state stays local to the view; it is not persisted into thread messages.
+
+#### ContextRail
+
+Vertical flex container, `bg:background`, left border. Owns `Entity<Thread>` and renders the panel body in a stateful scrollable inner div (`overflow_y_scroll`).
+
+> Source: `agent-ui/src/views/context_rail.rs`
+
+#### ContextRailPanel
+
+Scrollable panel body. Migrated verbatim from the old `render_environment_panel` (only the field-read entry points and placement changed; the internal rows are unchanged and are the targets of later δ/ε tracks).
 
 Contents, top to bottom:
 
-- **Header**: bold "Environment info" title + a `+` ghost button (no behavior yet).
-- **Changes row**: `env_row` with `Frame` icon, "Changes" label, and a trailing `+0 / -0` placeholder (TODO).
+- **Header**: bold title (i18n `context-rail-title`) + a [ContextRailCollapseBtn](#contextrailcollapsebtn) ghost button.
+- **Status row**: run phase, elapsed time, running tool title (when `cockpit_phase == RunningTool`). Uses `crate::cockpit::format_elapsed` / `format_tokens`.
+- **Context budget row**: `context_budget_pct` against `MIN_COMPACTION_CONTEXT_WINDOW` and the `cockpit_auto_compact_threshold` cached on the rail.
+- **Milestone section** (collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): plan steps parsed from the approved `exit_plan_mode` plan. All `Pending` outside a turn; the first is promoted to `InProgress` while the thread runs, demoted back to `Pending` on terminal stop.
+- **Changes row**: `env_row` with `Frame` icon, "Changes" label, and a trailing `+0 / -0` placeholder (TODO — δ track).
 - **Branch row**: `env_row` with `Github` icon and the branch label — `"main"` when a project is bound, "No project" otherwise.
 - **Usage section header**: `MemoryStick` icon + "Usage" label.
 - **Per-model tree blocks** (sorted by total tokens desc; empty for unused models):
@@ -564,13 +582,19 @@ Contents, top to bottom:
   - `├── Throughput ↑<in> ↓<out>` — input / output tokens.
   - `└── Cache ↑<cache_create> ↓<cache_read>` — cache creation / cache read.
 - **Hairline divider**.
-- **Sources section**: `Sources` label + "No sources yet" placeholder.
+- **Sources section**: `Sources` label + "No sources yet" placeholder (ε track).
 
-Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `Workspace`, rebuilt every render to auto-prune cells whose model disappeared.
+Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `ContextRail`, rebuilt every render to auto-prune cells whose model disappeared.
 
-> Source: `agent-ui/src/workspace.rs` (`render_environment_panel`)
+> Source: `agent-ui/src/views/context_rail.rs` (`render_panel`)
 
-### 3.3 EditorPane
+#### ContextRailCollapseBtn
+
+Ghost `xsmall` button in the panel header, `IconName::PanelRightClose`, tooltip i18n `context-rail-collapse`. Folds the rail into a drawer when narrow (the drawer's open affordance uses `context-rail-drawer-open` / `context-rail-expand`).
+
+> Source: `agent-ui/src/views/context_rail.rs`
+
+### 3.4 EditorPane
 
 Right-side panel, shown when `editor_open` is true. 640px default (320–960 draggable).
 

@@ -45,6 +45,12 @@ pub struct AnthropicModel {
 
 impl AnthropicModel {
     /// Build from a `ResolvedModel` (the api_key is already resolved at this point).
+    // All eight fields are required to construct a configured Anthropic model
+    // from a `ResolvedModel`; the `auto_compact_window` knob was added last and
+    // pushed the count over clippy's default. Refactoring into a builder would
+    // spread the invariant (cache-policy resolution reads endpoint_url) across
+    // setters, so the lint is allowed here rather than the constructor split.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         name: String,
@@ -855,4 +861,3 @@ mod tests {
         assert!(body.get("output_config").is_none());
     }
 }
-

@@ -18,12 +18,10 @@ use std::borrow::Cow;
 actions!(manox, [Quit, ToggleFullscreen]);
 
 /// Minimum window width budget, left to right:
-/// sidebar (260) + sidebar divider (6) + env-card gutter (376, reserved on
-/// the message-list region only — see `ENV_CONTENT_INSET` in agent-ui) + a
-/// readable message column (~218). The composer sits below the env card and
-/// uses the full main-column width, so it is not constrained by the gutter;
-/// between this floor and the `CONTENT_MAX_W` cap the composer adapts (input
-/// narrows, chip-row gap closes) and only the floor resists further shrink.
+/// sidebar (260) + sidebar divider (6) + a readable conversation column
+/// (~594). The context rail is a flex sibling of the conversation column
+/// (not an overlay), and folds into a drawer below `RAIL_NARROW_BREAK` in
+/// agent-ui, so it never constrains the minimum window width.
 const MIN_WINDOW_W: f32 = 860.0;
 
 /// Minimum window height: title bar + several message lines + composer +

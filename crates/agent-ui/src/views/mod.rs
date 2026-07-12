@@ -2,6 +2,7 @@
 
 pub mod completion;
 pub mod composer_menu;
+pub mod context_rail;
 pub mod member_panel;
 pub mod message;
 pub mod outline;

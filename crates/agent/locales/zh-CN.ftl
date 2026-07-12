@@ -442,6 +442,12 @@ workspace-env-cache = 缓存
 workspace-env-sources = 来源
 workspace-env-no-sources = 暂无来源
 
+# ── 上下文栏（右侧边栏）────────────────────────────────────────────────
+context-rail-title = 上下文
+context-rail-collapse = 折叠上下文栏
+context-rail-expand = 展开上下文栏
+context-rail-drawer-open = 打开上下文栏
+
 # ── Cockpit（运行状态 / 里程碑 / 上下文预算）──────────────────────────
 # 「对话信息」卡片的运行状态行。{$phase} 为本地化的阶段标签，{$elapsed} 为预格式化的时长，{$tokens} 为预格式化的 token 计数（如 "22.7k"）。
 cockpit-run-status = {$phase} · {$elapsed} · ↓ {$tokens}

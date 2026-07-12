@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use agent::compact::MIN_COMPACTION_CONTEXT_WINDOW;
 use agent::language_model::StopReason;
 use agent::provider::WireApi;
 use agent::provider::registry;
@@ -41,9 +40,7 @@ use gpui_component::{
 };
 use manox_components::markdown::Markdown;
 
-use crate::cockpit::{
-    CockpitPhase, Milestone, MilestoneStatus, context_budget_pct, parse_milestones,
-};
+use crate::cockpit::CockpitPhase;
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
 use crate::views::centered;
 use crate::views::completion::{
@@ -334,34 +331,6 @@ pub struct Workspace {
     /// on every `TurnStarted` and on thread switch so a prior ticker
     /// self-terminates instead of driving a stale container.
     thinking_ticker_gen: u64,
-    /// Coarse run phase shown in the "Conversation info" status row. Derived
-    /// from `ThreadEvent`s in `subscribe_thread`; the per-second thinking
-    /// ticker's `cx.notify()` also refreshes the elapsed display.
-    cockpit_phase: CockpitPhase,
-    /// Title of the most recently running tool, surfaced in the status row
-    /// when the phase is `RunningTool`. Cleared on terminal stop.
-    cockpit_running_tool_title: Option<String>,
-    /// Plan steps parsed from the approved `exit_plan_mode` plan. All
-    /// `Pending` outside a turn; the first is promoted to `InProgress` while
-    /// the thread runs, demoted back to `Pending` on terminal stop.
-    cockpit_milestones: Vec<Milestone>,
-    /// Whether the milestone section is collapsed (`ToggleCockpitTasks` /
-    /// ctrl+t toggles). Hidden still renders the run-status row.
-    cockpit_hide_tasks: bool,
-    /// Cached `settings.auto_compact.{enabled,threshold}`, refreshed on
-    /// construction and when the user exits the Settings overlay. Avoids a
-    /// per-frame file read in the cockpit context-budget render.
-    cockpit_auto_compact_enabled: bool,
-    cockpit_auto_compact_threshold: f64,
-    /// Per-cell scoreboard state, keyed by `"{model_name}|{field}"` where
-    /// `field ∈ {in, out, cache_create, cache_read}`. Stored as
-    /// `(gen, last_value)`: `gen` is bumped on every value delta so the
-    /// animation's element id changes and gpui fires a fresh 0→1 tween;
-    /// `last_value` is the value the previous render committed and becomes
-    /// the start of the count-up interpolation. Rebuilt every render so
-    /// cells whose model disappeared (e.g. thread reset) are pruned, keeping
-    /// the map bounded by the number of live models.
-    env_counter_state: HashMap<String, (u64, u64)>,
     /// Lazily created on the first `enter_settings` call so we don't pay the
     /// cost when the user never opens Settings.
     settings_view: Option<Entity<SettingsView>>,
@@ -371,6 +340,11 @@ pub struct Workspace {
     /// The terminal tab's view, lazily created on the first `FocusTerminal` /
     /// `NewTerminalTab`. `None` until then. Dropped on `CloseTerminalTab`.
     terminal_view: Option<Entity<TerminalView>>,
+    /// Right-hand context rail. Owns the cockpit state (run phase, milestones,
+    /// per-cell counter animation state) that used to live directly on
+    /// `Workspace`, plus strong handles to the active thread and conversation
+    /// it renders against. Writes flow through `self.context_rail.update`.
+    context_rail: Entity<crate::views::context_rail::ContextRail>,
     /// Ordinal of the outline tick currently under the cursor, if any. Drives
     /// the "wave" hover effect: the hovered tick and its neighbors lengthen and
     /// spread apart, tapering off with distance. `None` when the cursor is off
@@ -407,23 +381,6 @@ const SIDEBAR_MAX_WIDTH: f32 = 480.;
 const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the main column width when the editor pane is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
-
-/// Environment info card floating at the top-right of the conversation area.
-/// Compact width for the per-model tree block: model id on the top line,
-/// `├── Throughput` / `└── Cache` tree rows underneath, each with `↑↓` animated counters.
-/// Wide enough to fit a 22-char model id plus the four-column counter row.
-const ENV_CARD_WIDTH: f32 = 260.;
-const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
-/// Minimum main-column width for the env card to mount at all. Below this the
-/// card stays hidden and the messages + composer take the full body width, so
-/// a narrow window never crowds the conversation. The card is otherwise
-/// default-off (editor closed, thread interacted with, past first screen).
-const ENV_CARD_MIN_MAIN_W: f32 = 900.;
-/// Longest model id rendered in full, calibrated to "MiniMax/MiniMax-M3[1m]"
-/// (22 chars). Longer ids are cut to this width then trimmed by 3 and given a
-/// "..." suffix, so the result stays one line at `ENV_MODEL_ID_MAX` chars
-/// (e.g. "MiniMax/MiniMax-M3[...").
-const ENV_MODEL_ID_MAX: usize = 22;
 
 /// User-turn outline rail geometry. The rail is a fixed-width gutter between
 /// the sidebar divider and the message list; every tick is the same length so
@@ -503,13 +460,21 @@ impl Workspace {
         });
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
+        let conversation = cx.new(|_| ConversationState::new());
+        let context_rail = cx.new(|_| {
+            crate::views::context_rail::ContextRail::new(
+                thread.clone(),
+                auto_compact.enabled,
+                auto_compact.threshold,
+            )
+        });
 
         let mut ws = Self {
             cwd,
             thread,
             background_threads: Vec::new(),
             sidebar,
-            conversation: cx.new(|_| ConversationState::new()),
+            conversation: conversation.clone(),
             input_state,
             drafts: HashMap::new(),
             editor_state,
@@ -563,18 +528,12 @@ impl Workspace {
             goal_ticker_gen: 0,
             turn_active: false,
             thinking_ticker_gen: 0,
-            cockpit_phase: CockpitPhase::Idle,
-            cockpit_running_tool_title: None,
-            cockpit_milestones: Vec::new(),
-            cockpit_hide_tasks: false,
-            cockpit_auto_compact_enabled: auto_compact.enabled,
-            cockpit_auto_compact_threshold: auto_compact.threshold,
-            env_counter_state: HashMap::new(),
             settings_view: None,
             settings_sub: None,
             plugin_manager_view: None,
             plugin_manager_sub: None,
             terminal_view: None,
+            context_rail,
             outline_hover: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
@@ -623,7 +582,10 @@ impl Workspace {
                         summary: summary.clone(),
                         reason,
                     });
-                    this.cockpit_phase = CockpitPhase::AwaitingApproval;
+                    this.context_rail.update(cx, |r, cx| {
+                        r.cockpit_phase = CockpitPhase::AwaitingApproval;
+                        cx.notify();
+                    });
                     cx.notify();
                 }
                 ThreadEvent::PlanProposed { id, plan_text } => {
@@ -675,8 +637,10 @@ impl Workspace {
                     // `turn_active` and self-terminates on the terminal stop.
                     this.turn_active = true;
                     this.spawn_thinking_ticker(cx);
-                    this.cockpit_phase = CockpitPhase::Thinking;
-                    this.promote_first_milestone_in_progress();
+                    this.context_rail.update(cx, |r, cx| {
+                        r.cockpit_phase = CockpitPhase::Thinking;
+                        r.promote_first_milestone_in_progress(cx);
+                    });
                 }
                 ThreadEvent::Stop(reason) => {
                     let weak = cx.weak_entity();
@@ -707,9 +671,11 @@ impl Workspace {
                         let store = agent::thread_store_global();
                         store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
                         this.turn_active = false;
-                        this.cockpit_phase = CockpitPhase::Stopped;
-                        this.cockpit_running_tool_title = None;
-                        this.demote_milestones_to_pending();
+                        this.context_rail.update(cx, |r, cx| {
+                            r.cockpit_phase = CockpitPhase::Stopped;
+                            r.cockpit_running_tool_title = None;
+                            r.demote_milestones_to_pending(cx);
+                        });
                         // Clean up background reference if this thread was parked.
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
@@ -771,9 +737,11 @@ impl Workspace {
                         // `Stop`: the turn aborted, so any pending plan overlay
                         // is now stale and must not linger over an idle thread.
                         this.pending_plan = None;
-                        this.cockpit_phase = CockpitPhase::Failed;
-                        this.cockpit_running_tool_title = None;
-                        this.demote_milestones_to_pending();
+                        this.context_rail.update(cx, |r, cx| {
+                            r.cockpit_phase = CockpitPhase::Failed;
+                            r.cockpit_running_tool_title = None;
+                            r.demote_milestones_to_pending(cx);
+                        });
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
                         this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);
@@ -788,7 +756,8 @@ impl Workspace {
                     // flips back to Streaming; a `Running` tool call caches its
                     // title and flips RunningTool; other tool statuses return to
                     // Streaming; text/thinking deltas mark Thinking/Streaming.
-                    this.update_cockpit_phase(ev);
+                    this.context_rail
+                        .update(cx, |r, cx| r.update_cockpit_phase(ev, cx));
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
@@ -1461,10 +1430,6 @@ impl Workspace {
         // visible-turn highlight needs no reset — it is queried live from the
         // list each frame.
         self.outline_hover = None;
-        // Drop the old thread's per-model counter state so the scoreboard
-        // animation re-rolls from 0 against the new thread's per_model map
-        // instead of interpolating between unrelated values.
-        self.env_counter_state.clear();
         self.pending_auths.clear();
         self.pending_ask = None;
         self.pending_plan = None;
@@ -1478,23 +1443,20 @@ impl Workspace {
         if running {
             self.spawn_thinking_ticker(cx);
         }
-        // Cockpit state is per-thread: the outgoing thread's milestones and
-        // running-tool title do not apply to the incoming one. Milestones are
-        // not persisted (PlanProposed isn't in the store's event stream), so a
-        // reloaded thread starts with an empty panel; a still-running parked
-        // thread resumes mid-stream.
-        self.cockpit_phase = if running {
-            CockpitPhase::Streaming
-        } else {
-            CockpitPhase::Idle
-        };
-        self.cockpit_running_tool_title = None;
-        self.cockpit_milestones = Vec::new();
-        // Refresh cached auto-compact knobs in case the user edited settings
-        // while viewing another thread — cheap, and keeps the budget accurate.
+        // Cockpit state is per-thread: the outgoing thread's milestones,
+        // running-tool title, and per-model counter state do not apply to the
+        // incoming one. Milestones are not persisted (PlanProposed isn't in
+        // the store's event stream), so a reloaded thread starts with an empty
+        // panel; a still-running parked thread resumes mid-stream. Refresh
+        // cached auto-compact knobs in case the user edited settings while
+        // viewing another thread — cheap, and keeps the budget accurate.
         let auto_compact = settings::load().auto_compact;
-        self.cockpit_auto_compact_enabled = auto_compact.enabled;
-        self.cockpit_auto_compact_threshold = auto_compact.threshold;
+        self.context_rail.update(cx, |r, cx| {
+            r.reset_for_thread_switch(running, cx);
+            r.cockpit_auto_compact_enabled = auto_compact.enabled;
+            r.cockpit_auto_compact_threshold = auto_compact.threshold;
+            cx.notify();
+        });
         // If the new thread has pending authorizations (e.g. it was parked
         // while waiting for tool approval), re-surface them so the overlay
         // appears immediately upon switching back.
@@ -1532,64 +1494,6 @@ impl Workspace {
             }
         })
         .detach();
-    }
-
-    /// Update `cockpit_phase` and `cockpit_running_tool_title` for the
-    /// streaming/tool variants that flow through the generic catch-all arm.
-    /// `Error`, `Stop`, `TurnStarted`, and `ToolCallAuthorization` are handled
-    /// in their dedicated arms; this only covers the residual transitions.
-    fn update_cockpit_phase(&mut self, ev: &ThreadEvent) {
-        match ev {
-            ThreadEvent::AgentText(_) => {
-                self.cockpit_phase = CockpitPhase::Streaming;
-            }
-            ThreadEvent::AgentThinking(_) => {
-                self.cockpit_phase = CockpitPhase::Thinking;
-            }
-            ThreadEvent::ToolCall { status, title, .. } => match status {
-                agent::thread::ToolCallStatus::Running => {
-                    self.cockpit_phase = CockpitPhase::RunningTool;
-                    self.cockpit_running_tool_title = Some(title.clone());
-                }
-                // A non-running terminal/intermediate status means the model
-                // is back to streaming the next assistant segment.
-                _ => {
-                    self.cockpit_phase = CockpitPhase::Streaming;
-                }
-            },
-            ThreadEvent::CompactionStarted { .. } => {
-                self.cockpit_phase = CockpitPhase::Summarizing;
-            }
-            ThreadEvent::Compaction { .. } => {
-                // The summary landed; the turn resumes streaming.
-                self.cockpit_phase = CockpitPhase::Streaming;
-            }
-            _ => {}
-        }
-    }
-
-    /// Mark the first `Pending` milestone `InProgress` so the panel signals
-    /// which step is currently being worked. Called on `TurnStarted`. Only the
-    /// first pending item is promoted — the cockpit never claims to know the
-    /// model's exact progress within a step.
-    fn promote_first_milestone_in_progress(&mut self) {
-        for m in &mut self.cockpit_milestones {
-            if m.status == MilestoneStatus::Pending {
-                m.status = MilestoneStatus::InProgress;
-                break;
-            }
-        }
-    }
-
-    /// Revert any `InProgress` milestone back to `Pending`. Called on terminal
-    /// `Stop`/`Error`. The cockpit never auto-marks a step `Completed` (no
-    /// reliable signal exists), so a stopped turn just clears the live marker.
-    fn demote_milestones_to_pending(&mut self) {
-        for m in &mut self.cockpit_milestones {
-            if m.status == MilestoneStatus::InProgress {
-                m.status = MilestoneStatus::Pending;
-            }
-        }
     }
 
     /// Re-surface any pending authorizations on the current thread that were
@@ -2569,7 +2473,8 @@ impl Workspace {
         // does not — the user asked for another planning round, so the prior
         // steps no longer describe committed work.
         if approve {
-            self.cockpit_milestones = parse_milestones(&plan.plan_text);
+            self.context_rail
+                .update(cx, |r, cx| r.set_milestones_from_plan(&plan.plan_text, cx));
         }
         self.thread.update(cx, |thread, cx| {
             thread.respond_plan_approval(
@@ -3162,484 +3067,6 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Floating environment info card at the top-right of the conversation
-    /// area. Shows project, branch, model, per-model token usage (animated),
-    /// approval modes, and sources. Only rendered once the thread has been
-    /// interacted with and the editor pane is closed.
-    fn render_environment_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        // Approval mode used to live in the card's "Modes" section (now removed);
-        // the per-mode chip in the composer footer reads it directly, so we
-        // don't need to query it here.
-        let (project, per_model) = {
-            let thread = self.thread.read(cx);
-            (
-                thread.project().cloned(),
-                thread.per_model_token_usage().clone(),
-            )
-        };
-        let branch_label = if project.is_some() {
-            "main".to_string()
-        } else {
-            i18n::t("workspace-env-no-project").to_string()
-        };
-        let muted = theme.muted_foreground;
-
-        // Build per-model token rows, sorted by total usage descending.
-        let mut model_rows: Vec<_> = per_model
-            .into_iter()
-            .filter(|(_, u)| u.total_tokens() > 0)
-            .collect();
-        model_rows.sort_by_key(|b| std::cmp::Reverse(b.1.total_tokens()));
-
-        // Diff every cell against the last-rendered value, bump the per-cell
-        // gen on delta, and rebuild `env_counter_state` so the map is bounded
-        // by the number of live models. The four cells per model are
-        // (field, value) pairs; we capture (from, to, gen) per cell so the
-        // animation closures below can be plain `'static` move-closures.
-        // Tree labels are constant across iterations; resolve once before the
-        // loop so each iteration just clones the SharedString instead of
-        // re-running the i18n lookup.
-        let throughput_label = i18n::t("workspace-env-throughput");
-        let cache_label = i18n::t("workspace-env-cache");
-        let mut new_state: HashMap<String, (u64, u64)> = HashMap::new();
-        // Each model block carries: model id text + two tree rows. The
-        // capture-based build here keeps the closure machinery out of the
-        // outer builder.
-        let mut model_blocks: Vec<(String, gpui::Div, gpui::Div)> =
-            Vec::with_capacity(model_rows.len());
-
-        for (model_name, usage) in model_rows {
-            let model_display = truncate_env_model_id(model_name.clone());
-            let cells: [(&str, u64); 4] = [
-                ("in", usage.input_tokens),
-                ("out", usage.output_tokens),
-                ("cache_create", usage.cache_creation_input_tokens),
-                ("cache_read", usage.cache_read_input_tokens),
-            ];
-            let mut from_to_gen: [(u64, u64, u64); 4] = [(0, 0, 0); 4];
-            for (i, (field, value)) in cells.iter().enumerate() {
-                let cell_key = format!("{model_name}|{field}");
-                let (old_value, new_gen) = match self.env_counter_state.get(&cell_key) {
-                    // First render for this cell: roll from 0 up to the
-                    // current value (gen 1).
-                    None => (0u64, 1u64),
-                    // Value unchanged: reuse the existing gen so the
-                    // animation id is stable and gpui doesn't replay.
-                    Some(&(gen_, last)) if last == *value => (last, gen_),
-                    // Value changed: roll from the previous value to the
-                    // new one, bumping gen so a fresh tween fires.
-                    Some(&(gen_, last)) => (last, gen_.wrapping_add(1)),
-                };
-                new_state.insert(cell_key, (new_gen, *value));
-                from_to_gen[i] = (old_value, *value, new_gen);
-            }
-
-            // Tree prefix glyph (`├── ` / `└── `) painted slightly muted so
-            // it reads as chrome rather than data.
-            let branch_prefix = |glyph: &'static str| -> gpui::Div {
-                gpui::div()
-                    .text_xs()
-                    .text_color(muted.opacity(0.55))
-                    .child(SharedString::from(glyph))
-            };
-            let (in_f, in_t, in_g) = from_to_gen[0];
-            let (out_f, out_t, out_g) = from_to_gen[1];
-            let (cce_f, cce_t, cce_g) = from_to_gen[2];
-            let (ccr_f, ccr_t, ccr_g) = from_to_gen[3];
-
-            let throughput_row = h_flex()
-                .pl(px(12.))
-                .gap_1()
-                .items_center()
-                .text_xs()
-                .text_color(muted)
-                .child(branch_prefix("├── "))
-                .child(throughput_label.clone())
-                .child(counter_animated("↑", in_f, in_t, "in", in_g))
-                .child(counter_animated("↓", out_f, out_t, "out", out_g));
-            let cache_row = h_flex()
-                .pl(px(12.))
-                .gap_1()
-                .items_center()
-                .text_xs()
-                .text_color(muted)
-                .child(branch_prefix("└── "))
-                .child(cache_label.clone())
-                .child(counter_animated("↑", cce_f, cce_t, "cache_create", cce_g))
-                .child(counter_animated("↓", ccr_f, ccr_t, "cache_read", ccr_g));
-            model_blocks.push((model_display, throughput_row, cache_row));
-        }
-        // Commit the rebuilt per-cell state; auto-prunes cells whose model
-        // disappeared (the map only contains live cells from this render).
-        self.env_counter_state = new_state;
-
-        // The env panel floats over the conversation area (absolute, top-right),
-        // sitting below the title-bar overlay. `ENV_CONTENT_INSET` in the body
-        // wrapper's `pr()` prevents content from being hidden behind the card.
-        v_flex()
-            .absolute()
-            .top(TITLE_BAR_HEIGHT + px(16.))
-            .right(px(16.))
-            .w(px(ENV_CARD_WIDTH))
-            .occlude()
-            .child(
-                v_flex()
-                    .w_full()
-                    .p_3()
-                    .gap_2()
-                    // Directional drop shadow (offset down-left) so the card
-                    // reads as floating above the conversation — the offset
-                    // pushes the shadow to the left and bottom edges, leaving
-                    // the top/right lit, like a card lifted from the top-right.
-                    .shadow(std::vec![
-                        gpui::BoxShadow::new(px(-3.), px(6.), gpui::hsla(0., 0., 0., 0.22))
-                            .blur_radius(px(10.))
-                    ])
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                gpui::div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(theme.foreground)
-                                    .child(i18n::t("workspace-env-title")),
-                            )
-                            .child(Button::new("env-add").ghost().xsmall().icon(IconName::Plus)),
-                    )
-                    .child(self.render_cockpit_status_row(theme, cx))
-                    .child(env_row(
-                        IconName::Bot,
-                        self.thread.read(cx).display_title().into(),
-                        None,
-                        theme,
-                    ))
-                    .child(env_row(
-                        IconName::Frame,
-                        i18n::t("workspace-env-changes"),
-                        Some(
-                            h_flex()
-                                .gap_1()
-                                .text_xs()
-                                .child(
-                                    gpui::div()
-                                        .text_color(theme.success)
-                                        .child(if project.is_some() { "+0" } else { "--" }),
-                                )
-                                .child(
-                                    gpui::div()
-                                        .text_color(theme.danger)
-                                        .child(if project.is_some() { "-0" } else { "" }),
-                                )
-                                .into_any_element(),
-                        ),
-                        theme,
-                    ))
-                    .child(env_row(IconName::Github, branch_label.into(), None, theme))
-                    // Usage section: section header + per-model tree blocks.
-                    // Each block is a v_flex: model id on the top line,
-                    // throughput + cache tree rows below, separated by gap_0p5.
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Icon::new(IconName::MemoryStick).xsmall().text_color(muted),
-                                    )
-                                    .child(
-                                        gpui::div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(i18n::t("workspace-env-usage")),
-                                    ),
-                            )
-                            .children(model_blocks.into_iter().map(
-                                |(model_display, throughput_row, cache_row)| {
-                                    v_flex()
-                                        .w_full()
-                                        .gap_0p5()
-                                        .child(
-                                            gpui::div()
-                                                .text_xs()
-                                                .text_color(theme.foreground)
-                                                .child(model_display),
-                                        )
-                                        .child(throughput_row)
-                                        .child(cache_row)
-                                        .into_any_element()
-                                },
-                            )),
-                    )
-                    .child(self.render_cockpit_context_budget(theme, cx))
-                    .child(self.render_cockpit_milestones(theme, cx))
-                    .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
-                    // Sources section.
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                gpui::div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(i18n::t("workspace-env-sources")),
-                            )
-                            .child(
-                                gpui::div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(i18n::t("workspace-env-no-sources")),
-                            ),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// Run-status row: phase label + elapsed (per-second refresh via the
-    /// thinking ticker) + cumulative token count. Sits directly under the card
-    /// title so the current phase is the first thing the eye lands on.
-    fn render_cockpit_status_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let phase_key = match self.cockpit_phase {
-            CockpitPhase::Idle => "cockpit-status-idle",
-            CockpitPhase::Thinking => "cockpit-status-thinking",
-            CockpitPhase::Streaming => "cockpit-status-streaming",
-            CockpitPhase::RunningTool => "cockpit-status-running-tool",
-            CockpitPhase::AwaitingApproval => "cockpit-status-awaiting-approval",
-            CockpitPhase::Summarizing => "cockpit-status-summarizing",
-            CockpitPhase::Stopped => "cockpit-status-stopped",
-            CockpitPhase::Failed => "cockpit-status-failed",
-        };
-        let phase_label = i18n::t(phase_key).to_string();
-        let thread = self.thread.read(cx);
-        let elapsed = thread
-            .turn_started_at()
-            .map(|t| format_elapsed(t.elapsed()))
-            .unwrap_or_else(|| "0s".to_string());
-        let tokens = crate::cockpit::format_tokens(thread.cumulative_token_usage().total_tokens());
-        let mut label = i18n::t_str(
-            "cockpit-run-status",
-            &[
-                ("phase", phase_label.as_str()),
-                ("elapsed", elapsed.as_str()),
-                ("tokens", tokens.as_str()),
-            ],
-        )
-        .to_string();
-        // When a tool is running, append its title so the user can see *what*
-        // is executing, not just that something is.
-        if let Some(title) = &self.cockpit_running_tool_title
-            && !title.is_empty()
-        {
-            label.push_str(" · ");
-            label.push_str(title);
-        }
-        let icon = match self.cockpit_phase {
-            CockpitPhase::Thinking | CockpitPhase::Streaming | CockpitPhase::Summarizing => {
-                IconName::LoaderCircle
-            }
-            CockpitPhase::RunningTool => IconName::Play,
-            CockpitPhase::AwaitingApproval => IconName::Bell,
-            CockpitPhase::Stopped => IconName::Pause,
-            CockpitPhase::Failed => IconName::CircleX,
-            CockpitPhase::Idle => IconName::Dash,
-        };
-        env_row(icon, label.into(), None, theme)
-    }
-
-    /// Context-budget row: percent of the window still free before auto-summary
-    /// fires (or before the raw window fills, when auto-summary is off / window
-    /// too small). Hidden entirely when no usage has been reported yet (first
-    /// turn). Turns warning-colored within 10% of the trigger.
-    fn render_cockpit_context_budget(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let thread = self.thread.read(cx);
-        let max_input = thread.model().map(|m| m.max_token_count()).unwrap_or(0);
-        let budget = context_budget_pct(
-            max_input,
-            thread.last_request_token_usage(),
-            self.cockpit_auto_compact_enabled,
-            self.cockpit_auto_compact_threshold,
-        );
-        let Some(budget) = budget else {
-            // No usage yet — render a muted placeholder so the section doesn't
-            // pop in/out as the first turn streams.
-            return env_row(
-                IconName::BatteryFull,
-                i18n::t("cockpit-context-of-window")
-                    .replace("{$pct}", "100")
-                    .into(),
-                None,
-                theme,
-            );
-        };
-        let pct = (budget.remaining_pct.round() as i64).clamp(0, 100);
-        let key = if self.cockpit_auto_compact_enabled && max_input >= MIN_COMPACTION_CONTEXT_WINDOW
-        {
-            "cockpit-context-until-auto-summary"
-        } else {
-            "cockpit-context-of-window"
-        };
-        let label = i18n::t_str(key, &[("pct", &pct.to_string())]);
-        let near = budget.remaining_pct <= 10.0;
-        let color = if near {
-            theme.warning
-        } else {
-            theme.muted_foreground
-        };
-        env_row(
-            IconName::BatteryFull,
-            label,
-            Some(
-                gpui::div()
-                    .text_xs()
-                    .text_color(color)
-                    .child(i18n::t("cockpit-context-estimate"))
-                    .into_any_element(),
-            ),
-            theme,
-        )
-    }
-
-    /// Milestone section: the parsed plan steps with status glyphs. Collapsible
-    /// by clicking the header or pressing `ToggleCockpitTasks`
-    /// (cmd-shift-m / ctrl-shift-m). When collapsed, only the header renders
-    /// so the user always has an affordance to expand again. Hidden entirely
-    /// when there are no milestones (no plan yet).
-    fn render_cockpit_milestones(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        if self.cockpit_milestones.is_empty() {
-            return gpui::div().into_any_element();
-        }
-        let muted = theme.muted_foreground;
-        let hidden = self.cockpit_hide_tasks;
-        let hint_key = if hidden {
-            "cockpit-show-tasks-hint"
-        } else {
-            "cockpit-hide-tasks-hint"
-        };
-        // Header is a clickable toggle — `cursor_pointer` signals it, and the
-        // chevron indicates expand/collapse state so the row is readable even
-        // without the trailing hint.
-        let chevron = if hidden {
-            IconName::ChevronRight
-        } else {
-            IconName::ChevronDown
-        };
-        let header = h_flex()
-            .id("cockpit-milestones-header")
-            .w_full()
-            .items_center()
-            .gap_1()
-            .cursor_pointer()
-            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                this.cockpit_hide_tasks = !this.cockpit_hide_tasks;
-                cx.notify();
-            }))
-            .child(Icon::new(IconName::Menu).xsmall().text_color(muted))
-            .child(Icon::new(chevron).xsmall().text_color(muted))
-            .child(
-                gpui::div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(i18n::t("cockpit-milestones-header")),
-            )
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(muted.opacity(0.6))
-                    .child(i18n::t(hint_key)),
-            );
-        if hidden {
-            return v_flex().w_full().gap_1().child(header).into_any_element();
-        }
-        // Render the most recent completed milestone plus a collapsed summary
-        // of any earlier ones, so a long list of done steps doesn't drown out
-        // the live one. The cockpit only ever marks Pending/InProgress, so the
-        // completed/failed branches are forward-compat render paths.
-        let mut completed_tail: Option<&Milestone> = None;
-        let mut completed_count = 0usize;
-        for m in &self.cockpit_milestones {
-            if m.status == MilestoneStatus::Completed {
-                completed_count += 1;
-                completed_tail = Some(m);
-            }
-        }
-        let mut section = v_flex().w_full().gap_1().child(header);
-        for m in &self.cockpit_milestones {
-            if m.status == MilestoneStatus::Completed && Some(m) != completed_tail {
-                continue;
-            }
-            section = section.child(self.render_milestone_row(m, theme));
-        }
-        if completed_count > 1 {
-            section = section.child(gpui::div().pl(px(12.)).text_xs().text_color(muted).child(
-                i18n::t_count("cockpit-completed-summary", (completed_count - 1) as i64),
-            ));
-        }
-        section.into_any_element()
-    }
-
-    /// One milestone row: status glyph + title (+blocked-by note). The
-    /// in-progress step is foreground-bold; others are muted so the live step
-    /// stands out.
-    fn render_milestone_row(&self, m: &Milestone, theme: &Theme) -> AnyElement {
-        let muted = theme.muted_foreground;
-        let (glyph, glyph_color) = match m.status {
-            MilestoneStatus::Pending => ("◻", muted),
-            MilestoneStatus::InProgress => ("▶", theme.foreground),
-            MilestoneStatus::Blocked { .. } => ("⏳", theme.warning),
-            MilestoneStatus::Completed => ("✔", muted.opacity(0.7)),
-            MilestoneStatus::Failed => ("✕", theme.danger),
-        };
-        let (title_color, weight) = match m.status {
-            MilestoneStatus::InProgress => (theme.foreground, gpui::FontWeight::SEMIBOLD),
-            _ => (muted, gpui::FontWeight::NORMAL),
-        };
-        let mut title = m.title.clone();
-        if let MilestoneStatus::Blocked { by } = &m.status
-            && !by.is_empty()
-        {
-            let deps: Vec<String> = by.iter().map(|i| format!("#{i}")).collect();
-            title.push(' ');
-            title.push_str(&i18n::t_str(
-                "cockpit-blocked-by",
-                &[("deps", &deps.join(", "))],
-            ));
-        }
-        h_flex()
-            .w_full()
-            .pl(px(12.))
-            .gap_1()
-            .items_center()
-            .text_xs()
-            .child(
-                gpui::div()
-                    .text_color(glyph_color)
-                    .min_w(px(14.))
-                    .child(SharedString::from(glyph)),
-            )
-            .child(
-                gpui::div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_color(title_color)
-                    .font_weight(weight)
-                    .child(SharedString::from(title)),
-            )
-            .into_any_element()
-    }
-
     /// Rendered bare — no card border, fill, or rounding — so it shares the
     /// page background with the message list and reads as the same layer.
     /// The `Input` has no appearance of its own; the only visual separator
@@ -3670,7 +3097,6 @@ impl Workspace {
         let queue = self.render_queued_follow_ups(theme, cx);
         let plus = self.render_plus_button(cx);
         let project_chip = self.render_project_chip(theme, cx);
-        let worktree_chip = self.render_worktree_chip(theme, cx);
         let plan_chip = self.render_plan_chip(theme, cx);
         let goal_chip = self.render_goal_chip(theme, cx);
         let team_chip = self.render_team_chip(theme, cx);
@@ -3758,7 +3184,6 @@ impl Workspace {
                             .min_w_0()
                             .child(plus)
                             .child(project_chip)
-                            .when_some(worktree_chip, |el, chip| el.child(chip))
                             .when_some(plan_chip, |el, chip| el.child(chip))
                             .when_some(goal_chip, |el, chip| el.child(chip))
                             .when_some(team_chip, |el, chip| el.child(chip))
@@ -3858,61 +3283,6 @@ impl Workspace {
             );
         }
         rows
-    }
-
-    /// Access chip + 3-tier approval popover.
-    ///
-    /// The chip is a mode-aware pill rendered next to the composer send button.
-    /// Each `ApprovalMode` gets its own icon + accent color (green thumbs-up for
-    /// `OnRequest`, blue bot for `AutoReview`, red triangle for `Yolo`) so the
-    /// current permission posture is legible at a glance — a 1-line summary of
-    /// what the model is allowed to do without prompting.
-    ///
-    /// Clicking the chip opens a `PopupMenu` mirroring the header:
-    /// a question row with a "Learn more" link, three selectable rows (icon +
-    /// title + subtitle, check on the right), a hairline, and a 4th non-clickable
-    /// row pointing at `config.toml` for users who want a fully custom policy.
-    /// The popover is `max_w(360)` to fit the longest bilingual subtitle
-    /// ("Unrestricted access to the internet and any file on your computer")
-    /// without wrapping.
-    /// Worktree status chip — shown only while the thread is inside a git
-    /// worktree. Displays the branch name; clicking exits the worktree with
-    /// `action=keep` (cwd restored, worktree + branch left on disk for
-    /// re-entry). For removal, the model calls `exit_worktree` with
-    /// `action=remove` directly.
-    fn render_worktree_chip(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let branch = self.thread.read(cx).worktree().map(|w| w.branch.clone())?;
-        let label: SharedString = branch.into();
-        let theme_bg = theme.secondary;
-        let theme_border = theme.border;
-        let theme_fg = theme.foreground;
-        let theme_muted = theme.muted_foreground;
-
-        Some(
-            h_flex()
-                .id("worktree-chip")
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .rounded(theme.radius)
-                .bg(theme_bg)
-                .border_1()
-                .border_color(theme_border)
-                .cursor_pointer()
-                .child(Icon::new(IconName::Github).xsmall().text_color(theme_muted))
-                .child(gpui::div().text_xs().text_color(theme_fg).child(label))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.thread.update(cx, |t, cx| {
-                        let _ = t.exit_worktree(cx);
-                    });
-                }))
-                .into_any_element(),
-        )
     }
 
     /// Plan-mode chip — shown only while the thread is in plan mode. A
@@ -4232,6 +3602,21 @@ impl Workspace {
         )
     }
 
+    /// Access chip + 3-tier approval popover.
+    ///
+    /// The chip is a mode-aware pill rendered next to the composer send button.
+    /// Each `ApprovalMode` gets its own icon + accent color (green thumbs-up for
+    /// `OnRequest`, blue bot for `AutoReview`, red triangle for `Yolo`) so the
+    /// current permission posture is legible at a glance — a 1-line summary of
+    /// what the model is allowed to do without prompting.
+    ///
+    /// Clicking the chip opens a `PopupMenu` mirroring the header:
+    /// a question row with a "Learn more" link, three selectable rows (icon +
+    /// title + subtitle, check on the right), a hairline, and a 4th non-clickable
+    /// row pointing at `config.toml` for users who want a fully custom policy.
+    /// The popover is `max_w(360)` to fit the longest bilingual subtitle
+    /// ("Unrestricted access to the internet and any file on your computer")
+    /// without wrapping.
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.thread.read(cx).approval_mode();
         let open = self.access_open;
@@ -5035,7 +4420,10 @@ impl Render for Workspace {
                 }))
                 .on_action(
                     cx.listener(|this, _: &crate::ToggleCockpitTasks, _window, cx| {
-                        this.cockpit_hide_tasks = !this.cockpit_hide_tasks;
+                        this.context_rail.update(cx, |r, cx| {
+                            r.cockpit_hide_tasks = !r.cockpit_hide_tasks;
+                            cx.notify();
+                        });
                         cx.notify();
                     }),
                 )
@@ -5429,23 +4817,13 @@ impl Render for Workspace {
             // Left sidebar with a draggable divider on its right edge.
             .child(self.sidebar.clone())
             .child(sidebar_divider)
-            // Main column
+            // Center conversation column: hero / message list / composer / overlay
+            // plus the title-bar overlay. This is the middle of the three-column
+            // top-level layout (sidebar | conversation | context rail). The
+            // composer lives at the bottom of this column and never spans
+            // underneath the rail, so it stays the natural tail of the
+            // conversation surface.
             .child({
-                // The env card floats across the top-right of the conversation
-                // area and reserves `ENV_CONTENT_INSET` of right gutter on the
-                // message list when shown. It is default-off and mounts only
-                // once the main-column body is at least `ENV_CARD_MIN_MAIN_W`
-                // wide — below that the card stays hidden and the messages +
-                // composer use the full width. The body width is derived from
-                // the live window size (sidebar + its divider are the only
-                // siblings when the editor pane is closed, which the
-                // `!editor_open` term already guarantees).
-                let main_body_w =
-                    window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
-                let show_env = !editor_open
-                    && !first_screen
-                    && self.thread.read(cx).has_interacted()
-                    && main_body_w >= px(ENV_CARD_MIN_MAIN_W);
                 v_flex()
                     .flex_1()
                     .h_full()
@@ -5456,13 +4834,6 @@ impl Render for Workspace {
                     // panel edge. `pt` reserves space for the title-bar overlay
                     // (last child below); the overlay paints after the body so
                     // the "..." menu isn't covered by the conversation list.
-                    //
-                    // The env-card gutter is NOT applied here. The card floats
-                    // only across the top of the conversation area and never
-                    // reaches the composer at the bottom, so reserving its width
-                    // on the whole body would needlessly starve the composer.
-                    // The gutter is applied to the message-list region only,
-                    // where the card actually overlaps.
                     .child(
                         v_flex()
                             .flex_1()
@@ -5543,18 +4914,14 @@ impl Render for Workspace {
                                     .min_h_0()
                                     .min_w_0()
                                     .child(list_el);
-                                // Outline rail (left) + flat message column (right)
-                                // share the list region's height. The env-card
-                                // gutter is reserved here (not on the whole body)
-                                // so the top messages don't hide behind the card
-                                // while the composer below keeps the full width.
+                                // Outline rail (left) + flat message column (right) share
+                                // the list region's height.
                                 h_flex()
                                     .flex_1()
                                     .w_full()
                                     .min_h_0()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .when(show_env, |this| this.pr(px(ENV_CONTENT_INSET)))
                                     .children(outline)
                                     .child(list_wrap)
                             }))
@@ -5562,7 +4929,7 @@ impl Render for Workspace {
                             // Approval overlay (if any)
                             .children(overlay),
                     )
-                    // Title-bar overlay: absolute top of the main column,
+                    // Title-bar overlay: absolute top of the conversation column,
                     // painted after the body so the "..." menu isn't covered
                     // by the conversation list.
                     .child(
@@ -5595,10 +4962,34 @@ impl Render for Workspace {
                                     .child(h_flex()),
                             ),
                     )
-                    // Environment info card: floats absolute, top-right of the
-                    // conversation area. Hidden on the empty first screen, while
-                    // the editor pane is open, and until the thread has interacted.
-                    .children(show_env.then(|| self.render_environment_panel(&theme, cx)))
+            })
+            // Right context rail: a stable sidecar sibling of the conversation
+            // column (not an overlay). Mounts inline once the main-column body
+            // is wide enough; below the narrow breakpoint it folds into a
+            // drawer and the conversation column takes the full body. Hidden on
+            // the empty first screen, while the editor pane is open, and until
+            // the thread has interacted — same gates as the old floating env card
+            // so behavior carries over unchanged.
+            .children({
+                let main_body_w =
+                    window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
+                let show_rail = !editor_open
+                    && !first_screen
+                    && self.thread.read(cx).has_interacted()
+                    && crate::views::context_rail::ContextRail::rail_width_for(main_body_w)
+                        .is_some();
+                show_rail.then(|| {
+                    let w = crate::views::context_rail::ContextRail::rail_width_for(
+                        window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH),
+                    )
+                    .map(px)
+                    .unwrap_or(px(crate::views::context_rail::RAIL_DESKTOP_WIDTH));
+                    gpui::div()
+                        .w(w)
+                        .h_full()
+                        .flex_shrink_0()
+                        .child(self.context_rail.clone())
+                })
             })
             .when(right_pane_open, |this| {
                 this.child(editor_divider).child(editor_pane)
@@ -6020,47 +5411,6 @@ impl Workspace {
     }
 }
 
-// ── Environment panel helpers ──────────────────────────────────────────────
-//
-// Helpers for `Workspace::render_environment_panel`.
-
-fn env_row(
-    icon: IconName,
-    label: SharedString,
-    trailing: Option<AnyElement>,
-    theme: &Theme,
-) -> AnyElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .child(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
-        .child(
-            gpui::div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(label),
-        )
-        .children(trailing)
-        .into_any_element()
-}
-
-/// Clamp a model id so the env card never wraps it. Ids up to
-/// `ENV_MODEL_ID_MAX` ("MiniMax/MiniMax-M3[1m]") render in full; longer ones
-/// are cut to the cap, trimmed by 3 chars, then suffixed with "..." — so the
-/// result is exactly `ENV_MODEL_ID_MAX` chars (e.g. "MiniMax/MiniMax-M3[...").
-fn truncate_env_model_id(id: String) -> String {
-    let chars: Vec<char> = id.chars().collect();
-    if chars.len() <= ENV_MODEL_ID_MAX {
-        return id;
-    }
-    let head: String = chars.into_iter().take(ENV_MODEL_ID_MAX - 3).collect();
-    format!("{head}...")
-}
-
 /// Cap a queued follow-up's text for the compact queue row so long pastes
 /// don't blow out the composer chrome. Trailing whitespace is trimmed and an
 /// ellipsis marks a truncation.
@@ -6073,68 +5423,4 @@ fn truncate_follow_up(s: &str) -> String {
     let mut t: String = s.chars().take(MAX).collect();
     t.push('…');
     t
-}
-
-/// Compact token count display: `1m,357k`, `168k,653`, `999`.
-fn format_tokens(n: u64) -> String {
-    const MILLION: u64 = 1_000_000;
-    const THOUSAND: u64 = 1_000;
-    if n >= MILLION {
-        let m = n / MILLION;
-        let r = (n % MILLION) / THOUSAND;
-        if r == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m,{r}k")
-        }
-    } else if n >= THOUSAND {
-        let k = n / THOUSAND;
-        let r = n % THOUSAND;
-        if r == 0 {
-            format!("{k}k")
-        } else {
-            format!("{k}k,{r}")
-        }
-    } else {
-        n.to_string()
-    }
-}
-
-/// Scoreboard-style token counter: linearly interpolates the displayed
-/// integer from `from` to `to` over 600ms with `ease_out_quint`, then
-/// formats it via [`format_tokens`]. The animation id embeds the cell's
-/// `field` identity plus `gen`; bumping `gen` on every value delta forces
-/// gpui to fire a fresh 0→1 tween, while a stable `gen` reuses the cached
-/// end-state and renders the value statically.
-///
-/// `arrow` is `&'static str` (`"↑"` / `"↓"`) so the closure stays
-/// `'static` without copying the arrow into a `SharedString` on every
-/// frame. `field` is also `&'static str` for the same reason — only the
-/// four canonical field names ever flow through here.
-///
-/// The visible text_color cascades from the parent `h_flex` row (which
-/// sets `text_color(muted)`), so this helper only owns the interpolated
-/// value text.
-fn counter_animated(
-    arrow: &'static str,
-    from: u64,
-    to: u64,
-    field: &'static str,
-    gen_: u64,
-) -> AnyElement {
-    let anim_id = format!("env-counter-{field}-{gen_}");
-    let from_f = from as f64;
-    let to_f = to as f64;
-    gpui::div()
-        .with_animation(
-            anim_id,
-            Animation::new(Duration::from_millis(600)).with_easing(ease_out_quint()),
-            move |el, t| {
-                let v = (from_f + (to_f - from_f) * t as f64) as u64;
-                el.child(SharedString::from(
-                    format!("{}{}", arrow, format_tokens(v),),
-                ))
-            },
-        )
-        .into_any_element()
 }
