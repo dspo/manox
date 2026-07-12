@@ -484,6 +484,16 @@ workspace-env-cache-write = Cache write
 workspace-env-cache-hit-rate = cache {$pct}%
 workspace-env-sources = Sources
 workspace-env-no-sources = No sources yet
+workspace-env-git-unavailable = git unavailable
+workspace-env-git-not-a-repo = Not a git repo
+workspace-env-git-detached = detached
+workspace-env-git-worktree-suffix = (worktree)
+workspace-env-git-copy-branch = Copy branch name
+workspace-env-git-copy-path = Copy worktree path
+workspace-env-git-exit-worktree = Exit worktree
+workspace-env-git-copied-branch = Copied branch name
+workspace-env-git-copied-path = Copied worktree path
+workspace-env-git-exited-worktree = Exited worktree
 
 # ── Context rail (right sidecar) ────────────────────────────────────────
 context-rail-title = Context

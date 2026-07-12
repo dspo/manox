@@ -350,6 +350,12 @@ pub struct Workspace {
     /// spread apart, tapering off with distance. `None` when the cursor is off
     /// the rail.
     outline_hover: Option<usize>,
+    /// Generation counter for the debounced git-status refresh. Bumped on every
+    /// refresh trigger (thread attach, terminal stop, enter/exit worktree) so
+    /// a prior in-flight refresh self-cancels instead of overwriting newer
+    /// state. The refresh runs on the global tokio runtime and delivers its
+    /// result back via `async_channel`, the same bridge the worktree tool uses.
+    git_status_gen: u64,
 }
 
 /// Top-level rendering mode of the Workspace window. `Settings` and
@@ -535,6 +541,7 @@ impl Workspace {
             terminal_view: None,
             context_rail,
             outline_hover: None,
+            git_status_gen: 0,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
         ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
@@ -680,6 +687,9 @@ impl Workspace {
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
                         this.flush_queued_follow_ups(cx);
+                        // A turn's worth of file writes just landed; refresh
+                        // the rail's change/branch stats.
+                        this.spawn_git_status_refresh(cx);
                     }
                     cx.notify();
                 }
@@ -1467,6 +1477,9 @@ impl Workspace {
         // carried from a prior background completion.
         let store = agent::thread_store_global();
         store.update(cx, |s, cx| s.set_unread(&id, false, cx));
+        // The incoming thread's cwd / worktree may differ from the outgoing
+        // one; refresh the rail's git stats/branch display for it.
+        self.spawn_git_status_refresh(cx);
         cx.notify();
     }
 
@@ -1492,6 +1505,50 @@ impl Workspace {
                 }
                 entity.update(cx, |_, cx| cx.notify());
             }
+        })
+        .detach();
+    }
+
+    /// Debounced git-status refresh. Bumps `git_status_gen` (invalidating any
+    /// prior in-flight refresh), waits 400ms so a burst of tool results
+    /// coalesces into one git call, then shells out to `git diff --numstat`
+    /// / `branch --show-current` on the global tokio runtime. The result is
+    /// delivered back to the gpui side via `async_channel` and pushed onto the
+    /// `ContextRail`. Cancelled (superseded) refreshes self-terminate by
+    /// comparing their captured gen to the live one.
+    ///
+    /// Uses `cx.background_executor().timer()` — never `tokio::time` on the
+    /// gpui foreground (that panics: no current tokio runtime).
+    fn spawn_git_status_refresh(&mut self, cx: &mut Context<Self>) {
+        self.git_status_gen = self.git_status_gen.wrapping_add(1);
+        let entity = cx.entity().clone();
+        let refresh_gen = self.git_status_gen;
+        let rail = self.context_rail.clone();
+        let cwd = self.thread.read(cx).cwd().to_path_buf();
+        let worktree_branch = self.thread.read(cx).worktree().map(|w| w.branch.clone());
+        cx.spawn(async move |_this, cx| {
+            // Debounce: coalesce a burst of tool results / a turn's worth of
+            // file writes into a single git call.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(400))
+                .await;
+            // Superseded by a newer trigger — let the newer refresh win.
+            let stale = entity.read_with(cx, |this, _| this.git_status_gen != refresh_gen);
+            if stale {
+                return;
+            }
+            let result = crate::git_status::gather_bridged(cwd, worktree_branch).await;
+            // The refresh may have been superseded while the git call was in
+            // flight; drop the result if so.
+            let still_current = entity.read_with(cx, |this, _| this.git_status_gen == refresh_gen);
+            if !still_current {
+                return;
+            }
+            let (stats, display) = match result {
+                Some(v) => (Some(v.0), Some(v.1)),
+                None => (None, None),
+            };
+            rail.update(cx, |r, cx| r.set_git_status(stats, display, cx));
         })
         .detach();
     }

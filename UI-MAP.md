@@ -23,7 +23,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### ContextRail
 
-- [ContextRail](#contextrail) · [ContextRailPanel](#contextrailpanel) · [ContextRailCollapseBtn](#contextrailcollapsebtn)
+- [ContextRail](#contextrail) · [ContextRailPanel](#contextrailpanel) · [ContextRailCollapseBtn](#contextrailcollapsebtn) · [ContextRailChangesRow](#contextrailchangesrow) · [ContextRailBranchRow](#contextrailbranchrow) · [ContextRailBranchMenu](#contextrailbranchmenu)
 
 ### Hero
 
@@ -566,7 +566,7 @@ Vertical flex container, `bg:background`, left border. Owns `Entity<Thread>` and
 
 #### ContextRailPanel
 
-Scrollable panel body. Migrated verbatim from the old `render_environment_panel` (only the field-read entry points and placement changed; the internal rows are unchanged and are the targets of later δ/ε tracks).
+Scrollable panel body. The conversation-info rows (title, status, changes, branch) sit above the usage tree; the milestone section and context budget render from cockpit state owned by the rail.
 
 Contents, top to bottom:
 
@@ -574,8 +574,8 @@ Contents, top to bottom:
 - **Status block** (`cockpit_status_block`): a multi-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2, and an optional xs muted truncate tool-title line 3 when `cockpit_phase == RunningTool`. Elapsed refreshes per-second via the thinking ticker.
 - **Context budget row**: `context_budget_pct` reads `Thread::latest_reported_request_token_usage` (stable during turn warmup) against `MIN_COMPACTION_CONTEXT_WINDOW` and the `cockpit_auto_compact_threshold` cached on the rail. Shows a muted "waiting for usage" placeholder (i18n `cockpit-context-waiting`) when no usage has landed yet — never a fake 100%. Trailing element renders explicit `current / cap` token counts (e.g. `396k / 900k`) alongside the "estimate" note; warning-colored within 10% of the trigger.
 - **Milestone section** (collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): plan steps parsed from the approved `exit_plan_mode` plan. All `Pending` outside a turn; the first is promoted to `InProgress` while the thread runs, demoted back to `Pending` on terminal stop.
-- **Changes row**: `env_row` with `Frame` icon, "Changes" label, and a trailing `+0 / -0` placeholder (TODO — δ track).
-- **Branch row**: `env_row` with `Github` icon and the branch label — `"main"` when a project is bound, "No project" otherwise.
+- **Changes row**: [ContextRailChangesRow](#contextrailchangesrow).
+- **Branch row**: [ContextRailBranchRow](#contextrailbranchrow).
 - **Usage section** (`render_usage_section`): `MemoryStick` icon + "Usage" header, then per-model blocks (sorted by total tokens desc; empty for unused models). Each block is:
   - Model id line (truncated to `ENV_MODEL_ID_MAX` chars) + trailing `cache {pct}%` hit-rate badge (i18n `workspace-env-cache-hit-rate`) computed by `cockpit::cache_read_ratio` (denominator = uncached input + cache-read).
   - Four explicit labeled rows (`usage_row`): non-cached input (`workspace-env-noncached-input`), output (`workspace-env-output`), cache read (`workspace-env-cache-read`), cache write (`workspace-env-cache-write`). Each row's counter animates via `counter_animated`.
@@ -591,6 +591,49 @@ Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` 
 Ghost `xsmall` button in the panel header, `IconName::PanelRightClose`, tooltip i18n `context-rail-collapse`. Folds the rail into a drawer when narrow (the drawer's open affordance uses `context-rail-drawer-open` / `context-rail-expand`).
 
 > Source: `agent-ui/src/views/context_rail.rs`
+
+#### ContextRailChangesRow
+
+Working-tree diff stat line in the panel body. `env_row` with `Frame` icon, "Changes" label, and a trailing `+added` (green) / `-deleted` (red) / `?untracked` (muted) cluster from `GitChangeStats`. Before the first git refresh lands (or when no project is bound) the trailing slot shows `--` / "No project" so the row keeps its height instead of flickering.
+
+Stats come from `git diff --numstat HEAD` (binary rows `-`/`-` skipped) plus `git ls-files --others --exclude-standard` for untracked, shelled out via [`crate::git_status`](#git_status) on the global tokio runtime. Refreshed (debounced 400ms) by `Workspace` on thread attach, terminal `Stop`, and enter/exit worktree.
+
+> Source: `agent-ui/src/views/context_rail.rs` (`render_changes_row`)
+
+#### ContextRailBranchRow
+
+Resolved git identity line in the panel body. `env_row_clickable` with `Github` icon — the whole row is a pointer cursor that opens [ContextRailBranchMenu](#contextrailbranchmenu). The label shows:
+
+- The branch name when on a normal branch.
+- The short sha + "(detached)" hint when in detached HEAD.
+- "(worktree)" suffix when the thread is inside a git worktree.
+- "Not a git repo" when `git rev-parse --show-toplevel` fails.
+- "git unavailable" when the `git` binary is missing.
+- "--" before the first refresh lands; "No project" when no project is bound.
+
+Branch resolution prefers `Thread::worktree().branch` when inside a worktree; otherwise shells out to `git branch --show-current`, falling back to `git rev-parse --short HEAD` for detached HEAD. All via [`crate::git_status`](#git_status).
+
+> Source: `agent-ui/src/views/context_rail.rs` (`render_branch_row`)
+
+#### ContextRailBranchMenu
+
+`PopupMenu` anchored under the branch row. Mirrors the title-menu / model-selector pattern: the menu entity + its `DismissEvent` subscription are created lazily on open, dropped on close. Items:
+
+- **Copy branch name** (i18n `workspace-env-git-copy-branch`) — shown when a branch resolved; writes to the clipboard silently.
+- **Copy worktree path** (i18n `workspace-env-git-copy-path`) — shown when the thread is inside a worktree.
+- **Exit worktree** (i18n `workspace-env-git-exit-worktree`) — shown only inside a worktree, behind a separator; calls `Thread::exit_worktree` (the branch row never exits directly, so a stray click cannot destroy the isolation context).
+
+> Source: `agent-ui/src/views/context_rail.rs` (`render_branch_row`)
+
+#### git_status
+
+Pure parsing + tokio-bridged IO module backing [ContextRailChangesRow](#contextrailchangesrow) / [ContextRailBranchRow](#contextrailbranchrow). Shells out to the system `git` binary (never `git2` — banned by project rule) on the global tokio runtime via `agent::runtime::handle`, delivering results back through an `async_channel` (the same bridge the worktree tool uses).
+
+- `parse_numstat` / `parse_branch` / `parse_short_sha` / `count_untracked` — pure value-type parsers (unit-tested without a real repo).
+- `gather` — runs `git rev-parse --show-toplevel`, `git branch --show-current` / `git rev-parse --short HEAD`, `git diff --numstat HEAD`, `git ls-files --others --exclude-standard` in one background task; returns `None` when the cwd is not under git.
+- `gather_bridged` — spawns `gather` on the tokio runtime and awaits the result from a gpui `cx.spawn`.
+
+> Source: `agent-ui/src/git_status.rs`
 
 ### 3.4 EditorPane
 
