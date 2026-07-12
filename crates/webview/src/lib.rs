@@ -976,13 +976,13 @@ pub mod ipc {
     // fire-and-forget and never read the body, and cross-origin (https page →
     // manox scheme) fetches need the header or WKWebView rejects the response.
     pub(crate) fn handle_browser_protocol(
-        _webview_id: WebViewId<'_>,
+        webview_id: WebViewId<'_>,
         request: http::Request<Vec<u8>>,
     ) -> http::Response<Vec<u8>> {
         let path = request.uri().path();
         let body_value: serde_json::Value =
             serde_json::from_slice(request.body()).unwrap_or(serde_json::Value::Null);
-        let label = _webview_id.to_string();
+        let label = webview_id.to_string();
         match path {
             "/notify" => {
                 let type_str = body_value
@@ -994,8 +994,15 @@ pub mod ipc {
                     .get("payload")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                if let Some(notification) = parse_notification(&type_str, payload) {
-                    let _ = dispatch_notify_on_main_thread(label, notification);
+                match parse_notification(&type_str, payload) {
+                    Some(notification) => {
+                        let _ = dispatch_notify_on_main_thread(label, notification);
+                    }
+                    None => {
+                        eprintln!(
+                            "[webview] dropped unknown notify type `{type_str}` from {label}"
+                        );
+                    }
                 }
             }
             "/request" => {
