@@ -36,7 +36,9 @@ impl AgentTool for WebExploreCloseTool {
         let Some(host) = crate::webview_host::host() else {
             return Task::ready(Err("browser host not available".to_string()));
         };
-        host.close_tab(parsed.tab_id, cx);
-        Task::ready(Ok(format!("closed tab {}", parsed.tab_id)))
+        match host.close_tab(parsed.tab_id, cx) {
+            Ok(()) => Task::ready(Ok(format!("closed tab {}", parsed.tab_id))),
+            Err(e) => Task::ready(Err(e)),
+        }
     }
 }
