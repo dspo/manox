@@ -11,11 +11,11 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### 顶层
 
-- [Window](#window) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Plugins](#viewmodeplugins) · [ViewMode::Terminal](#viewmodeterminal)
+- [Window](#window) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Plugins](#viewmodeplugins) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
 
 ### Sidebar
 
-- [Sidebar](#sidebar) · [SidebarScrollBody](#sidebarscrollbody) · [SidebarMenuSection](#sidebarmenusection) · [SidebarMenuItem](#sidebarmenuitem) · [SidebarProjectsSection](#sidebarprojectssection) · [SidebarProjectGroup](#sidebarprojectgroup) · [SidebarConversationsSection](#sidebarconversationssection) · [SidebarThreadItem](#sidebarhreaditem) · [SidebarDivider](#sidebardivider)
+- [Sidebar](#sidebar) · [SidebarScrollBody](#sidebarscrollbody) · [SidebarMenuSection](#sidebarmenusection) · [SidebarMenuItem](#sidebarmenuitem) · [SidebarProjectsSection](#sidebarprojectssection) · [SidebarProjectGroup](#sidebarprojectgroup) · [SidebarConversationsSection](#sidebarconversationssection) · [SidebarNewSessionMenu](#sidebarnewsessionmenu) · [SidebarThreadItem](#sidebarhreaditem) · [SidebarExternalSection](#sidebarexternalsection) · [SidebarExternalSessionItem](#sidebarexternalsessionitem) · [SidebarDivider](#sidebardivider)
 
 ### MainColumn
 
@@ -97,7 +97,7 @@ Root container, horizontal flex (`h_flex`), owns all sub-views.
 
 ### 2.1 ViewMode
 
-`Workspace` switches between four mutually exclusive full-window modes:
+`Workspace` switches between five mutually exclusive full-window modes:
 
 #### ViewMode::Workspace
 Default — sidebar + conversation + composer.
@@ -110,6 +110,9 @@ Full-window plugin/skill/MCP manager.
 
 #### ViewMode::Terminal
 Full-window terminal emulator.
+
+#### ViewMode::ExternalSession
+Full-window external agent CLI session (claude / codex / copilot). Renders the active `ExternalSession`'s `TerminalView` (the agent's TUI) in place of the conversation, with a TitleBar showing the agent kind + provider/model and a `×` that kills the session. Lives in memory only — never persisted; closing the session removes its sidebar row.
 
 ---
 
@@ -168,13 +171,31 @@ Collapsible folder: chevron + folder icon + project name, indented thread list.
 
 #### SidebarConversationsSection
 
-Bottom section: loose (non-project) threads.
+Bottom section: loose (non-project) threads. The header's `+` button opens the `SidebarNewSessionMenu` popup.
+
+> Source: `agent-ui/src/views/sidebar.rs`
+
+#### SidebarNewSessionMenu
+
+`PopupMenu` anchored below the "Conversations" header `+`. Four rows: Manox Thread (emits `NewThread`), Claude Code / Codex / GitHub Copilot (emit `NewExternalSession(SessionKind)`). Phase 4 spawns the external rows immediately with the first supporting model; Phase 5 replaces that with a provider→model wizard.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
 #### SidebarThreadItem
 
 Single thread row: unread red dot (8px, `theme.danger`, shown when `summary.has_unread`), pinned star, title, short-id tag (shimmer if running), token count, time, archive btn. Hover/active/selected wash uses the thread's last saved approval-mode color. The red dot marks a thread that finished a turn while the user was viewing another thread; it clears when the user switches into the thread.
+
+> Source: `agent-ui/src/views/sidebar.rs`
+
+#### SidebarExternalSection
+
+Section below "Conversations" listing live external agent sessions (claude / codex / copilot). Rendered only when at least one `ExternalSession` is live. The sidebar holds a `Vec<ExternalSessionSummary>` projection pushed by the Workspace — it never owns the PTY-bearing `ExternalSession` structs.
+
+> Source: `agent-ui/src/views/sidebar.rs`
+
+#### SidebarExternalSessionItem
+
+Single external-session row: kind icon (Bot/Cpu/Github) + kind label + muted "provider · model" subtitle + trailing `×` that emits `CloseExternalSession(id)` (kills the agent). Clicking the row emits `OpenExternalSession(id)`. Simpler than a thread row — no slide-wash (external rows live in their own section and don't participate in the conversation selection slide).
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
