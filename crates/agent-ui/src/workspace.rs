@@ -1210,8 +1210,8 @@ impl Workspace {
     }
 
     /// Close the terminal tab and return to the conversation pane. Dropping
-    /// the `TerminalView` drops the underlying `Terminal`, whose `PtyHandle`
-    /// kills the child and joins the reader/waiter threads.
+    /// the `TerminalView` drops the underlying `Terminal`, whose `PtySource`
+    /// kills the child and detaches the reader/waiter threads.
     pub fn close_terminal_tab(&mut self, cx: &mut Context<Self>) {
         self.terminal_view = None;
         self.focus_conversation(cx);
