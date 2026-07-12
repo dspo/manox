@@ -20,6 +20,13 @@ pub struct MessageUiMetadata {
     /// message schema to enum names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<i64>,
+    /// Set when this user message was injected mid-turn via the steer queue
+    /// (drained by the turn loop), rather than starting a fresh turn. The tag
+    /// is applied at drain time so it marks messages the running turn actually
+    /// absorbed — letting the UI and historical replay distinguish a true steer
+    /// from an ordinary follow-up turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steered: Option<bool>,
 }
 
 /// A single conversation message.

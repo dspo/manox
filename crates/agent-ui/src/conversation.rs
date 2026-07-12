@@ -31,6 +31,12 @@ pub struct UserTurnMeta {
     pub timestamp: i64,
     pub model_id: String,
     pub approval_mode: Option<ApprovalMode>,
+    /// True when this user message entered the message list via the steer
+    /// queue drain (mid-turn injection) rather than starting a fresh turn.
+    /// Mirrors `MessageUiMetadata::steered`; set by the drain-driven enqueue
+    /// path so `render_user` can show a "steered" badge and historical reload
+    /// keeps the marker.
+    pub steered: bool,
 }
 
 impl UserTurnMeta {
@@ -39,6 +45,7 @@ impl UserTurnMeta {
             timestamp,
             model_id,
             approval_mode,
+            steered: false,
         }
     }
 
@@ -48,6 +55,7 @@ impl UserTurnMeta {
             timestamp: message.timestamp,
             model_id: ui.and_then(|m| m.model_id.clone()).unwrap_or_default(),
             approval_mode: ui.and_then(|m| m.approval_mode).map(ApprovalMode::from_i64),
+            steered: ui.and_then(|m| m.steered).unwrap_or(false),
         }
     }
 }
@@ -449,6 +457,11 @@ impl ConversationState {
             // summarization is in flight); the conversation list renders nothing
             // for it. The workspace flips the cockpit phase on this event.
             | ThreadEvent::CompactionStarted { .. } => ApplyOutcome::None,
+            // `SteerInjected` is fired by the turn loop at drain time. The
+            // workspace owns the queue→list transition (it pairs the event with
+            // the matching `SteerPending` queue card and pushes the bubble here
+            // via `push_user`); the conversation list takes no direct action.
+            | ThreadEvent::SteerInjected { .. } => ApplyOutcome::None,
             // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
             // workspace to light the sidebar running indicator; it carries no
             // conversation content.

@@ -358,9 +358,9 @@ Centered wrapper around the input row + chips.
 
 #### QueuedFollowUps
 
-Compact stack of follow-up items parked above the input while a turn is running — one row each: truncated summary + optional Steer badge + Steer / Remove / More icon buttons. Rendered only while `queued_follow_ups` is non-empty; the Steer action promotes an item to a mid-turn injection, Remove drops it, and `⌘ + ⌥ + /` (`UndoLastQueued`) pops the tail.
+Compact stack of follow-up items parked above the input while a turn is running — one row each, rendered by a four-state machine: **Queued** (truncated summary + Steer / Remove / More icon buttons), **SteerPending** (summary + a bouncing up-arrow + 「待引导」 badge + Remove; the Steer has been enqueued but the running turn has not yet drained it), and **Failed** (red wash + 「引导失败·turn 已结束」 badge + Retry-Steer / Remove; a stranded steer whose turn aborted/errored before draining). The bounce is a 1Hz `gpui::Animation` lifting an absolutely-positioned `ArrowUp` icon ~3px and back, mounted only in SteerPending so idle cards pay no animation cost. Steer does **not** push the bubble into the message list immediately — that transition is drain-driven: when the turn loop's `drain_pending_steer` pushes the message into `Thread.messages` (just before the next `build_completion_request`), it fires `ThreadEvent::SteerInjected { message_id }`, which the workspace pairs to the matching SteerPending card, removes the card, and pushes the bubble into `ConversationState` at the turn the model actually sees it. The bubble then carries a persistent 「已引导」 badge (`MessageUiMetadata::steered`, written at drain time, so reload keeps the marker). Retry with no running turn degrades to a fresh ordinary turn. `⌘ + ⌥ + /` (`UndoLastQueued`) pops the tail.
 
-> Source: `agent-ui/src/workspace.rs` (`render_queued_follow_ups`)
+> Source: `agent-ui/src/workspace.rs` (`render_queued_follow_ups`, `steer_follow_up`, `consume_steered_follow_up`, `mark_stranded_steers_failed`); badge render in `agent-ui/src/views/message.rs` (`render_user`); drain + event in `agent/src/thread.rs` (`drain_pending_steer`, `ThreadEvent::SteerInjected`); persisted marker in `agent/src/message.rs` (`MessageUiMetadata::steered`).
 
 #### ComposerDivider
 

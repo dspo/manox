@@ -212,6 +212,13 @@ pub enum ThreadEvent {
     /// turns. The thread also received a user-role message carrying the same
     /// content (so the model sees it); this event is the UI-side mirror.
     PeerMessage { from: String, content: String },
+    /// A queued steer follow-up was drained into `messages` at the next safe
+    /// join point — the running turn has now absorbed it and will see it on
+    /// its next round. The UI moves the matching queued card into the
+    /// conversation at this moment so the bubble's stream position marks the
+    /// turn that was actually steered. Carries the drained message's id so the
+    /// UI can correlate it back to the parked queue item.
+    SteerInjected { message_id: String },
 }
 
 /// UI metadata for a pending tool-call authorization. Stored alongside the
@@ -1521,20 +1528,42 @@ impl Thread {
         content: Vec<MessageContent>,
         ui: Option<crate::MessageUiMetadata>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> String {
         let mut message = Message::user_with_content(content);
         message.ui = ui;
+        let id = message.id.clone();
         self.pending_steer.push_back(message);
         cx.notify();
+        id
+    }
+
+    /// Ids of steer follow-ups still parked in the queue (not yet drained).
+    /// Read at terminal `Stop`/`Error` so the UI can mark the matching parked
+    /// queue cards as failed (stranded — the running turn exited without
+    /// absorbing them) and offer a retry rather than leaving them spinning.
+    pub fn pending_steer_ids(&self) -> Vec<String> {
+        self.pending_steer.iter().map(|m| m.id.clone()).collect()
     }
 
     /// Flush every queued steer follow-up onto `messages` in submission order.
     /// Returns whether any message was drained, so the caller can decide to
     /// continue the turn loop rather than ending on an unconsumed steer.
-    fn drain_pending_steer(&mut self) -> bool {
+    /// Each drained message is tagged `steered` (marking it as a true
+    /// mid-turn injection) and announced via `ThreadEvent::SteerInjected` so
+    /// the UI moves the parked queue card into the conversation at the exact
+    /// stream position the model will next see it.
+    fn drain_pending_steer(&mut self, cx: &mut Context<Self>) -> bool {
         let mut drained = false;
-        while let Some(msg) = self.pending_steer.pop_front() {
+        while let Some(mut msg) = self.pending_steer.pop_front() {
+            // Tag at drain time — only messages the running turn actually
+            // absorbs count as steered; enqueued-but-never-drained stragglers
+            // stay untagged so the historical replay distinguishes a true steer
+            // from an ordinary follow-up turn.
+            let ui = msg.ui.get_or_insert_with(Default::default);
+            ui.steered = Some(true);
+            let id = msg.id.clone();
             self.messages.push(msg);
+            cx.emit(ThreadEvent::SteerInjected { message_id: id });
             drained = true;
         }
         drained
@@ -2048,7 +2077,7 @@ impl Thread {
                 // last and `reconcile_tool_uses` skips the pairing, shipping an
                 // unpaired `tool_use` to the provider (Anthropic 400).
                 this.reconcile_tool_uses(cx);
-                this.drain_pending_steer();
+                this.drain_pending_steer(cx);
                 this.build_completion_request()
             })?;
 
