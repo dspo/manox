@@ -1,17 +1,21 @@
-//! Repro tests for the two-concurrent-threads crash. Both are `#[ignore]`-gated:
-//! they need the real provider config at `~/.config/cx/` and (for the live
-//! variant) `MANOX_RUN_LIVE=1`. Run with `cargo test -p agent-ui -- --ignored`.
+//! Repro tests for the two-concurrent-threads crash + live external-session
+//! lifecycle. All are `#[ignore]`-gated: they need the real provider config at
+//! `~/.config/cx/` and (for live variants) `MANOX_RUN_LIVE=1`. Run with
+//! `cargo test -p agent-ui --features debug -- --ignored`.
 
 #![cfg(all(test, feature = "debug"))]
 
 use std::time::Duration;
 
 use agent::language_model::{LanguageModelCompletionEvent, StopReason};
+use agent::provider::registry;
 use agent::{ThreadEvent, ToolCallStatus};
+
 use serde_json::json;
 
 use super::test_support::{ReplayModel, build_workspace, setup};
 use super::{Harness, IdleState, await_idle_sync};
+use crate::external_session::SessionKind;
 
 #[gpui::test]
 async fn direct_messages_route_pending_plan_and_ask_inline(cx: &mut gpui::TestAppContext) {
@@ -44,9 +48,9 @@ async fn direct_messages_route_pending_plan_and_ask_inline(cx: &mut gpui::TestAp
     let plan_card = conversation["items"]
         .as_array()
         .and_then(|items| {
-            items.iter().find_map(|item| {
-                (item["kind"] == "tool_call" && item["name"] == "exit_plan_mode").then_some(item)
-            })
+            items
+                .iter()
+                .find(|item| item["kind"] == "tool_call" && item["name"] == "exit_plan_mode")
         })
         .expect("plan card is in the conversation");
     assert_eq!(plan_card["status"], "PendingApproval");
@@ -171,4 +175,138 @@ async fn two_concurrent_threads_live(cx: &mut gpui::TestAppContext) {
     assert_ne!(s1, IdleState::StillRunning, "ws1 live turn did not finish");
     assert_ne!(s2, IdleState::StillRunning, "ws2 live turn did not finish");
     drop(guard);
+}
+
+/// Live spawn-success path: drive a real `claude` launch through
+/// `cx::AgentBuilder` (the Phase 5 spawn primitive the cascade wizard invokes)
+/// with a raw model id, assert it succeeds, then kill + reap. Verifies the spawn
+/// wiring end-to-end — binary discovery, BYOK env injection, PTY setup — with the
+/// model-id form production must pass (`m.name()`, the bare id; the pre-fix
+/// `m.id()` key form is rejected by cx with "provider X 下未找到支持 claude 的
+/// model"). Routed as a direct `AgentBuilder::spawn()` (not the sidebar event)
+/// because a successfully-spawned interactive CLI streams continuous TUI output,
+/// which keeps the gpui test executor from parking — so any `cx.update` after a
+/// successful spawn would hang. The kill+reap here is the reduction of both the
+/// × path and the natural-exit path. Gated by `MANOX_RUN_LIVE`.
+#[gpui::test]
+#[ignore = "live external CLI + MANOX_RUN_LIVE required; spawns real claude"]
+async fn external_session_spawn_ok_live(cx: &mut gpui::TestAppContext) {
+    if std::env::var("MANOX_RUN_LIVE").is_err() {
+        return;
+    }
+    let guard = setup(cx);
+    let (provider, model) =
+        first_anthropic_model().expect("an anthropic-wire model in the provider config");
+
+    let handle = cx::AgentBuilder::new()
+        .agent(SessionKind::ClaudeCode.agent())
+        .pty(true)
+        .provider(provider)
+        .model(model)
+        .spawn()
+        .expect("claude spawn succeeds with a real anthropic-wire provider/model");
+
+    // Both production exit paths reduce to kill + reap: × (close_external_session)
+    // kills then drops; natural-exit (ChildExit) lets the waiter reap. Assert the
+    // handle is killable and reapable — the contract ExternalSession relies on.
+    let _ = handle.kill();
+    assert!(handle.wait().is_ok(), "wait reaps the killed child");
+    drop(guard);
+}
+
+/// Live error path: emitting `SpawnExternalSession` against a provider that does
+/// not exist must not add a session (the spawn `Err` arm pushes a notification
+/// and returns before touching `external_sessions`). Asserts the sidebar stays
+/// empty rather than panicking or orphaning a half-session. Routed through the
+/// sidebar event (not a direct `spawn_external_session` call) so it also covers
+/// the Phase 4–5 wiring: `SidebarEvent::SpawnExternalSession` →
+/// `subscribe_in` handler → `spawn_external_session` → `push_notification`. The
+/// error arm returns before any CLI streams, so the executor parks and the test
+/// does not hang. Gated by `MANOX_RUN_LIVE`.
+#[gpui::test]
+#[ignore = "live MANOX_RUN_LIVE required; exercises spawn error path"]
+async fn external_session_spawn_error_live(cx: &mut gpui::TestAppContext) {
+    if std::env::var("MANOX_RUN_LIVE").is_err() {
+        return;
+    }
+    let guard = setup(cx);
+    let ws = build_workspace_with_window(cx);
+    emit_spawn(
+        cx,
+        &ws,
+        SessionKind::ClaudeCode,
+        "nonexistent-provider".into(),
+        "nonexistent-model".into(),
+    );
+    cx.update(|cx| {
+        assert!(
+            ws.read(cx).external_sessions.is_empty(),
+            "failed spawn must not add a session"
+        );
+    });
+    drop(guard);
+}
+
+/// Emit `SidebarEvent::SpawnExternalSession` on the workspace's sidebar and pump
+/// the executor so the `subscribe_in` handler runs `spawn_external_session`
+/// outside any `window.update` (its `push_notification` error arm re-enters
+/// `Root::update` and cannot run nested). This mirrors the production cascade-
+/// wizard path, not a direct method call.
+fn emit_spawn(
+    cx: &mut gpui::TestAppContext,
+    ws: &gpui::Entity<crate::workspace::Workspace>,
+    kind: SessionKind,
+    provider: String,
+    model: String,
+) {
+    let sidebar = cx.update(|cx| ws.read(cx).sidebar.clone());
+    cx.update(|cx| {
+        sidebar.update(cx, |_, cx| {
+            cx.emit(crate::views::sidebar::SidebarEvent::SpawnExternalSession(
+                kind, provider, model,
+            ));
+        });
+    });
+    cx.run_until_parked();
+}
+
+/// Pick the first anthropic-wire model in the registry, returning its
+/// `(provider_name, raw_model_id)`. `raw_model_id` is the model's bare id
+/// (`m.name()`), NOT the manox stable key (`m.id()` = `provider/model/wire`) —
+/// `cx::AgentBuilder::spawn()` matches `ResolvedModel.id` (bare id), so the raw
+/// form is what production must pass. Used to feed the live spawn test a real
+/// provider/model `AgentBuilder` can spawn `claude` against (claude is an
+/// anthropic-wire agent).
+///
+/// NOTE: this deliberately bypasses the cascade wizard's `visible_agents` filter.
+/// manox's `visible_agents` (cx-providers `from_config`, "manox semantics") only
+/// surfaces endpoint-level `agents`, dropping model-level `agents`; the user's
+/// config marks models via model-level `agents`, so `visible_agents` is currently
+/// empty across the registry and the cascade shows "no model" for every agent.
+/// That is a separate cx-providers gap (cx's own `effective_agents_for_model`
+/// unions endpoint + model agents; manox semantics do not) — a Phase 7 dogfood
+/// finding, not a spawn-lifecycle concern.
+fn first_anthropic_model() -> Option<(String, String)> {
+    use agent::provider::WireApi;
+    registry::global()
+        .models()
+        .iter()
+        .find_map(|m| (m.wire_api() == WireApi::Anthropic).then(|| (m.provider_name(), m.name())))
+}
+
+/// Open a Workspace in a test window for the live external-session tests. The
+/// window is kept alive by the test app (its `subscribe_in` dispatch needs a
+/// real window); the tests drive spawning by emitting `SpawnExternalSession` on
+/// the sidebar, not by holding the window handle. Pins a no-op replay model onto
+/// the thread — the external-session tests never start a manox turn, so the
+/// thread's model is unused, it just needs *some* model for `Workspace::new`.
+fn build_workspace_with_window(
+    cx: &mut gpui::TestAppContext,
+) -> gpui::Entity<crate::workspace::Workspace> {
+    use agent::language_model::{AnyLanguageModel, LanguageModelCompletionEvent};
+    let dummy: AnyLanguageModel = ReplayModel::build(
+        "test/external-unused",
+        Vec::<LanguageModelCompletionEvent>::new(),
+    );
+    build_workspace(cx, dummy)
 }

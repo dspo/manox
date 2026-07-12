@@ -212,7 +212,7 @@ pub struct Workspace {
     /// carries a minimal subscription so a terminal `Stop`/`Error` arriving
     /// while parked marks the thread unread for the sidebar red dot.
     background_threads: Vec<BackgroundThread>,
-    sidebar: Entity<Sidebar>,
+    pub(crate) sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
     /// Per-thread unsent composer text, keyed by thread id. Saved when
@@ -409,7 +409,7 @@ pub struct Workspace {
     /// the sidebar `+` menu. In-memory only — never persisted. Each owns its
     /// `TerminalView` plus a shared `Arc<SessionHandle>` so the close path can
     /// `kill` the agent explicitly.
-    external_sessions: Vec<crate::external_session::ExternalSession>,
+    pub(crate) external_sessions: Vec<crate::external_session::ExternalSession>,
     /// The currently-displayed external session id when
     /// `view_mode == ExternalSession`. Mirrors `terminal_view`'s "one at a
     /// time" model; switching away parks the session (its terminal keeps
