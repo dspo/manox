@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use portable_pty::ExitStatus as PtyExitStatus;
+use portable_pty::{ChildKiller, ExitStatus as PtyExitStatus};
 
 use crate::relay::ipc::IpcServer;
 use crate::relay::pty::{PtySession, spawn_pty};
@@ -240,6 +240,11 @@ pub struct SessionResult {
 /// resize, and reap from shared references.
 pub struct SessionHandle {
     child: Mutex<Option<Box<dyn portable_pty::Child + Send>>>,
+    /// Independent signal sender cloned from the child at spawn, so a library
+    /// caller can `kill` the agent without racing the waiter thread's
+    /// `child.lock().take()` reap. `ChildKiller::kill` is `&mut self`, hence
+    /// the `Mutex` (a caller holds the handle behind `Arc`).
+    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     reader: Mutex<Box<dyn Read + Send>>,
     writer_tx: Mutex<mpsc::Sender<WriteReq>>,
     resize_flag: Arc<AtomicBool>,
@@ -275,6 +280,10 @@ impl SessionHandle {
             reader,
             writer,
         } = pty;
+
+        // Clone the killer before `child` moves into its Mutex, so a library
+        // caller can signal kill through `&self` without touching the child.
+        let killer = child.clone_killer();
 
         let (tx, rx) = mpsc::channel::<WriteReq>();
 
@@ -315,6 +324,7 @@ impl SessionHandle {
 
         Ok(Self {
             child: Mutex::new(Some(child)),
+            killer: Mutex::new(killer),
             reader: Mutex::new(reader),
             writer_tx: Mutex::new(tx),
             resize_flag,
@@ -348,6 +358,18 @@ impl SessionHandle {
             .lock()
             .expect("writer_tx mutex poisoned")
             .send(WriteReq::Bytes(bytes))
+            .map_err(|_| anyhow!("agent 已退出，写入失败"))
+    }
+
+    /// Write raw bytes to the agent's PTY master verbatim — no trailing
+    /// newline. A library host driving the agent's TUI keystroke-by-keystroke
+    /// (arrow keys, Ctrl+C, paste) uses this; `write` is for line-based
+    /// injection. Returns an error only if the writer thread has exited.
+    pub fn write_bytes(&self, bytes: &[u8]) -> Result<()> {
+        self.writer_tx
+            .lock()
+            .expect("writer_tx mutex poisoned")
+            .send(WriteReq::Bytes(bytes.to_vec()))
             .map_err(|_| anyhow!("agent 已退出，写入失败"))
     }
 
@@ -400,6 +422,14 @@ impl SessionHandle {
             .wait()
             .unwrap_or_else(|_| PtyExitStatus::with_exit_code(1));
         Ok(self.finalize(&status))
+    }
+
+    /// Signal the agent to terminate (SIGKILL on Unix). Non-blocking: the waiter
+    /// thread (if running `wait`) reaps the child; otherwise `wait`/`Drop` does.
+    /// Safe to call from a thread that does not own the child, since it goes
+    /// through the cloned `ChildKiller` rather than the `child` Mutex.
+    pub fn kill(&self) -> io::Result<()> {
+        self.killer.lock().expect("killer mutex poisoned").kill()
     }
 
     /// Kill the child, reap it, finalize, and return the outcome. Used by the
