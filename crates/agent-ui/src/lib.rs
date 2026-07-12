@@ -33,6 +33,8 @@ gpui::actions!(
         CloseTerminalTab,
         FocusTerminal,
         FocusConversation,
+        OpenBrowserGoNoGo,
+        CloseBrowserGoNoGo,
         CompletionUp,
         CompletionDown,
         CompletionConfirm,

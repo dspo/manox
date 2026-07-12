@@ -45,6 +45,7 @@ use crate::cockpit::{
     CockpitPhase, Milestone, MilestoneStatus, context_budget_pct, parse_milestones,
 };
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
+use crate::views::browser_view::BrowserView;
 use crate::views::centered;
 use crate::views::completion::{
     CompletionState, SelectHandler, build_replacement, detect, mention_source, render_completion,
@@ -57,7 +58,10 @@ use crate::views::member_panel::MemberPanel;
 use crate::views::plugin_manager::{PluginManagerEvent, PluginManagerView};
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
-use crate::{CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab, OpenSettings};
+use crate::{
+    CloseBrowserGoNoGo, CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab,
+    OpenBrowserGoNoGo, OpenSettings,
+};
 use terminal::Terminal;
 use terminal_ui::TerminalView;
 
@@ -390,6 +394,11 @@ pub struct Workspace {
     /// The terminal tab's view, lazily created on the first `FocusTerminal` /
     /// `NewTerminalTab`. `None` until then. Dropped on `CloseTerminalTab`.
     terminal_view: Option<Entity<TerminalView>>,
+    /// Embedded native webview, opened via `OpenBrowserGoNoGo` for the step-1
+    /// embed check. `None` until then. Dropped on `CloseBrowserGoNoGo`.
+    /// Step 5 replaces this single overlay with proper `RightTab::Browser`
+    /// tabs; the field stays as the home for the live browser view(s).
+    browser_view: Option<Entity<BrowserView>>,
     /// Ordinal of the outline tick currently under the cursor, if any. Drives
     /// the "wave" hover effect: the hovered tick and its neighbors lengthen and
     /// spread apart, tapering off with distance. `None` when the cursor is off
@@ -594,6 +603,7 @@ impl Workspace {
             plugin_manager_view: None,
             plugin_manager_sub: None,
             terminal_view: None,
+            browser_view: None,
             outline_hover: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
@@ -1215,6 +1225,22 @@ impl Workspace {
     pub fn close_terminal_tab(&mut self, cx: &mut Context<Self>) {
         self.terminal_view = None;
         self.focus_conversation(cx);
+    }
+
+    /// Open the embedded browser overlay for the step-1 go/no-go embed check.
+    /// Builds a native webview parented to this window and renders it as a
+    /// full-bleed overlay. Step 5 turns this into a proper `RightTab::Browser`.
+    pub fn open_browser_gonogo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| BrowserView::new(None, window, cx));
+        self.browser_view = Some(view);
+        cx.notify();
+    }
+
+    /// Close the browser overlay. Dropping the `BrowserView` drops the
+    /// underlying `WebView`, whose `Drop` hides and detaches the native view.
+    pub fn close_browser_gonogo(&mut self, cx: &mut Context<Self>) {
+        self.browser_view = None;
+        cx.notify();
     }
 
     fn subscribe_input(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
@@ -5341,6 +5367,56 @@ impl Render for Workspace {
                         .child(v_flex().flex_1().h_full().w_full().child(terminal)),
                 );
         }
+        // Browser go/no-go overlay: sidebar (for switching back) + a full-bleed
+        // embedded webview filling the main column. Step 5 replaces this with a
+        // proper `RightTab::Browser` tab; for now it proves the embed renders +
+        // resizes against manox's gpui revision.
+        if let Some(browser) = self.browser_view.clone() {
+            let theme = cx.theme().clone();
+            return h_flex()
+                .size_full()
+                .bg(theme.background)
+                .text_color(theme.foreground)
+                .on_action(cx.listener(|this, _: &CloseBrowserGoNoGo, _window, cx| {
+                    this.close_browser_gonogo(cx);
+                }))
+                .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
+                    this.close_browser_gonogo(cx);
+                }))
+                .child(self.sidebar.clone())
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .h_full()
+                        .relative()
+                        .child(
+                            TitleBar::new().child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(Icon::new(IconName::Globe))
+                                    .child(
+                                        gpui::div()
+                                            .text_sm()
+                                            .text_left()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(SharedString::from("manox browser (go/no-go)")),
+                                    )
+                                    .child(
+                                        Button::new("close-browser")
+                                            .small()
+                                            .ghost()
+                                            .icon(IconName::Close)
+                                            .on_click(cx.listener(|this, _, _window, cx| {
+                                                this.close_browser_gonogo(cx);
+                                            })),
+                                    ),
+                            ),
+                        )
+                        .child(v_flex().flex_1().h_full().w_full().child(browser)),
+                );
+        }
         let theme = cx.theme().clone();
         let running = self.thread.read(cx).is_running();
 
@@ -5670,6 +5746,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
                 this.close_terminal_tab(cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenBrowserGoNoGo, window, cx| {
+                this.open_browser_gonogo(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseBrowserGoNoGo, _window, cx| {
+                this.close_browser_gonogo(cx);
             }))
             .on_action(cx.listener(|this, _: &crate::UndoLastQueued, _window, cx| {
                 this.undo_last_queued(cx);

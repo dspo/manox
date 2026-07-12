@@ -28,6 +28,7 @@ agent.workspace = true
 terminal.workspace = true
 terminal-ui.workspace = true
 manox-components.workspace = true
+manox-webview.workspace = true
 
 [features]
 # In-process debug Harness + the `manox --mcp` server build on it. Off by

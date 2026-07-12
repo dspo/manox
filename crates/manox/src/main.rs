@@ -167,6 +167,17 @@ fn main() {
             gpui::KeyBinding::new("ctrl-shift-t", agent_ui::FocusTerminal, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-c", agent_ui::FocusConversation, None),
+            // Built-in browser go/no-go embed check. cmd-b opens the embedded
+            // webview overlay, cmd-shift-b closes it. Step 5 turns this into a
+            // proper browser tab as a right-pane `RightTab::Browser` citizen.
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-b", agent_ui::OpenBrowserGoNoGo, None),
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-shift-b", agent_ui::CloseBrowserGoNoGo, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-b", agent_ui::OpenBrowserGoNoGo, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-shift-b", agent_ui::CloseBrowserGoNoGo, None),
             // Pop the last follow-up parked above the composer while a turn is
             // running (mirrors the per-item Remove affordance for the tail).
             #[cfg(target_os = "macos")]
@@ -293,6 +304,32 @@ fn main() {
                 if let (Some(workspace), Some(handle)) = (workspace, handle) {
                     let _ = handle.update(cx, |_, _window, cx| {
                         workspace.update(cx, |ws, cx| ws.close_terminal_tab(cx));
+                    });
+                }
+            });
+        });
+        cx.on_action(|_: &agent_ui::OpenBrowserGoNoGo, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        workspace.update(cx, |ws, cx| ws.open_browser_gonogo(window, cx));
+                    });
+                }
+            });
+        });
+        cx.on_action(|_: &agent_ui::CloseBrowserGoNoGo, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, _window, cx| {
+                        workspace.update(cx, |ws, cx| ws.close_browser_gonogo(cx));
                     });
                 }
             });
