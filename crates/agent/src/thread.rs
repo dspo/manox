@@ -1638,6 +1638,14 @@ impl Thread {
                     // A slash command's tool filter lasts only for its turn; clear it
                     // so a subsequent free-form message inherits the full tool set.
                     this.turn_tool_filter = None;
+                    // The turn is now truly over (the loop only returns once the
+                    // EndTurn-break's drain guard sees an empty queue, or on
+                    // cancel/error/max-turns). Any steer still queued here was
+                    // never absorbed — it is stranded. Drop it so a later turn
+                    // does not silently drain it into the model; the UI already
+                    // marked the matching parked cards `Failed` via the terminal
+                    // `Stop`/`Error` event, and the user retries from those cards.
+                    this.pending_steer.clear();
                     // A natural (non-cancelled) turn end is the trigger point for
                     // title re-evaluation. `maybe_generate_title` self-gates on
                     // depth, cadence, and dedup; cancelled turns skip it.
@@ -5285,6 +5293,90 @@ mod tests {
             cx.update(|cx| thread.read_with(cx, |t, _| t.auto_compaction_target())),
             None,
             "None auto_compact_window must fall back to max_token_count (below MIN), not use 0.8 threshold"
+        );
+    }
+
+    /// `enqueue_steer` returns the queued message's id so the UI can pair a
+    /// parked card to the drained message; `pending_steer_ids` exposes every
+    /// still-queued id so the UI's terminal-Stop dead-letter check can spot
+    /// stranded steers; `cancel_pending_steer` drops one by id so removing a
+    /// SteerPending card cancels the injection (no invisible steer).
+    #[test]
+    fn enqueue_steer_ids_and_cancel_pending_steer() {
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-steer-ids", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let id = cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.enqueue_steer(vec![MessageContent::Text("note".into())], None, cx)
+            })
+        });
+        assert!(
+            cx.update(|cx| thread.read_with(cx, |t, _| t.pending_steer_ids()))
+                .contains(&id),
+            "pending_steer_ids must report the just-enqueued steer"
+        );
+        let removed = cx.update(|cx| thread.update(cx, |t, _| t.cancel_pending_steer(&id)));
+        assert!(
+            removed,
+            "cancel_pending_steer must report it removed the message"
+        );
+        assert!(
+            !cx.update(|cx| thread.read_with(cx, |t, _| t.pending_steer_ids()))
+                .contains(&id),
+            "cancel_pending_steer must pull the message out of the steer queue"
+        );
+        // Cancelling an unknown id is a no-op, not a panic.
+        assert!(
+            !cx.update(|cx| thread.update(cx, |t, _| t.cancel_pending_steer("nope"))),
+            "cancel_pending_steer on a missing id must return false"
+        );
+    }
+
+    /// `drain_pending_steer` must move the message onto `messages` AND tag it
+    /// `ui.steered` at drain time (not enqueue) — the marker is the persisted
+    /// receipt that the running turn actually absorbed the steer, so a stranded
+    /// enqueue never gets a badge.
+    #[test]
+    fn drain_pending_steer_tags_drained_message_steered() {
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-steer-drain", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let id = cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.enqueue_steer(vec![MessageContent::Text("note".into())], None, cx)
+            })
+        });
+        let drained = cx.update(|cx| thread.update(cx, |t, cx| t.drain_pending_steer(cx)));
+        assert!(
+            drained,
+            "drain_pending_steer must report it drained a message"
+        );
+        let steered = cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                t.messages
+                    .iter()
+                    .find(|m| m.id == id)
+                    .and_then(|m| m.ui.as_ref())
+                    .and_then(|ui| ui.steered)
+            })
+        });
+        assert_eq!(
+            steered,
+            Some(true),
+            "drained steer must be tagged steered (persisted receipt of injection)"
         );
     }
 }
