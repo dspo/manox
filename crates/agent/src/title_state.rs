@@ -119,6 +119,25 @@ impl TitleState {
         let entity = cx.entity();
         cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = crate::title::stream_thread_title(&model, request, cx).await;
+            // Surface every title-generation outcome. A failure here used to be
+            // swallowed by the `if let Ok` below, so an empty title (the symptom:
+            // the Bot row falls back to the mechanical summary) left no trace.
+            // `warn` on error / empty-text so the default log level shows it;
+            // `debug` for the benign unchanged / success paths.
+            match &result {
+                Ok(title) if title.is_empty() => {
+                    tracing::warn!("title generation produced no usable text")
+                }
+                Ok(title) if crate::title::is_unchanged(title) => {
+                    tracing::debug!("title unchanged by model");
+                }
+                Ok(title) => {
+                    tracing::debug!(title = %title, "title updated");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:?}"), "title generation stream failed")
+                }
+            }
             let mut changed = false;
             this.update(cx, |t, cx| {
                 t.title_state.in_flight = false;

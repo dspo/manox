@@ -9,10 +9,14 @@
 //! against. Writes to cockpit state flow through `Workspace` →
 //! `self.context_rail.update(cx, |r, cx| …)`.
 //!
-//! Layout: a fixed-width (responsive, collapsible) column with a scrollable
-//! inner panel. Unlike the old floating env card this is a normal flex child
-//! of the top-level three-column layout, so it never overlaps the conversation
-//! and the composer never spans underneath it.
+//! Layout: a fixed-width card that floats over the conversation column's
+//! top-right as an absolute overlay — a peer in the z-stack, not a flex
+//! column and not a flush rail. The conversation body reserves the card's
+//! width as right padding so the message list never hides behind it. A shared
+//! title bar spans the whole conversation column over both the message list
+//! and this card's slot. The editor pane is a third top-level column outside
+//! the conversation, and while it is open the card stays hidden so the
+//! conversation reclaims its width.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,7 +29,7 @@ use gpui::{
     SharedString, Window, deferred, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
+    ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
@@ -37,17 +41,17 @@ use crate::git_status::{GitBranchDisplay, GitChangeStats};
 
 // ── Geometry ─────────────────────────────────────────────────────────────
 
-/// Desktop rail width. Wide enough for the per-model usage block: model id
-/// (plus trailing cache-hit badge) on the top line, four labeled token rows
-/// underneath (input / output / cache read / cache write), each with an
-/// animated counter.
-pub(crate) const RAIL_DESKTOP_WIDTH: f32 = 300.;
-/// Narrowed rail width once the window drops below [`RAIL_NARROW_BREAK`].
-/// Keeps the rail visible while leaving the conversation more room.
-const RAIL_NARROW_WIDTH: f32 = 280.;
-/// Below this main-column width the rail folds into a drawer and the
-/// conversation column takes the full body. Matches the old env-card gate so
-/// a narrow window never crowds the conversation.
+/// Floating card width. Wide enough for the per-model usage block: model id
+/// (plus trailing cache-hit badge) on the top line, `├── 穿透` (input /
+/// output) and `└── 缓存` (cache create / cache read) tree rows underneath,
+/// each with `↑↓` animated counters.
+pub(crate) const ENV_CARD_WIDTH: f32 = 260.;
+/// Right inset the conversation body reserves for the floating card: the
+/// card width plus a gutter so the message list clears the card's shadow.
+pub(crate) const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
+/// Below this main-column width the card folds away and the conversation
+/// column takes the full body. Matches the old env-card gate so a narrow
+/// window never crowds the conversation.
 const RAIL_NARROW_BREAK: f32 = 900.;
 
 /// Longest model id rendered in full, calibrated to "MiniMax/MiniMax-M3[1m]"
@@ -122,17 +126,14 @@ impl ContextRail {
         }
     }
 
-    /// Width the rail column takes on the top-level h_flex at the given
-    /// main-column body width. `None` means the window is too narrow: the rail
-    /// folds into a drawer and the conversation column takes the full body.
+    /// Whether the floating context card is shown at the given main-column
+    /// body width. `None` means the window is too narrow: the card folds away
+    /// and the conversation column takes the full body.
     pub(crate) fn rail_width_for(main_body_w: gpui::Pixels) -> Option<f32> {
         if main_body_w < px(RAIL_NARROW_BREAK) {
-            return None;
-        }
-        if main_body_w < px(RAIL_NARROW_BREAK + 160.) {
-            Some(RAIL_NARROW_WIDTH)
+            None
         } else {
-            Some(RAIL_DESKTOP_WIDTH)
+            Some(ENV_CARD_WIDTH)
         }
     }
 
@@ -243,9 +244,10 @@ impl ContextRail {
 
     // ── Rendering ─────────────────────────────────────────────────────────
 
-    /// The rail body: a scrollable panel with the conversation-info card.
-    /// Rendered as a normal flex child (no `absolute()`), so it occupies its
-    /// own column and never overlaps the conversation or the composer.
+    /// The floating context card's body: the conversation-info chrome (border,
+    /// rounded corners, drop shadow, background) plus its content rows. The
+    /// `Render` impl positions this as an absolute overlay over the
+    /// conversation column's top-right; this fn only paints the card itself.
     fn render_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         // Approval mode used to live in the card's "Modes" section (now removed);
         // the per-mode chip in the composer footer reads it directly, so we
@@ -260,10 +262,17 @@ impl ContextRail {
 
         v_flex()
             .w_full()
-            .h_full()
             .min_h_0()
             .p_3()
             .gap_2()
+            .border_1()
+            .border_color(theme.border)
+            .rounded(theme.radius)
+            .bg(theme.background)
+            .shadow(std::vec![
+                gpui::BoxShadow::new(px(-3.), px(6.), gpui::hsla(0., 0., 0., 0.22))
+                    .blur_radius(px(10.)),
+            ])
             .child(
                 h_flex()
                     .items_center()
@@ -316,12 +325,13 @@ impl ContextRail {
             .into_any_element()
     }
 
-    /// Per-model token usage as four explicit labeled rows (non-cached input,
-    /// output, cache read, cache write) with the cache-hit ratio beside the
-    /// model name. Supersedes the old two-row "Throughput ↑in ↓out / Cache
-    /// ↑cce ↓ccr" tree, which hid the cache-read share behind a generic
-    /// "Throughput" label. Counter animation state is diffed and rebuilt here
-    /// so the per-cell `gen` bumps on every value delta (see `env_counter_state`).
+    /// Per-model token usage as a two-row tree: `├── 穿透` (input / output) and
+    /// `└── 缓存` (cache create / cache read), each with `↑↓` animated counters.
+    /// The throughput / cache split keeps the cache-read share legible as a
+    /// branch rather than burying it among four flat rows. A cache-hit ratio
+    /// rides beside the model name when the model has any cache-readable input.
+    /// Counter animation state is diffed and rebuilt here so the per-cell `gen`
+    /// bumps on every value delta (see `env_counter_state`).
     fn render_usage_section(
         &mut self,
         theme: &Theme,
@@ -335,20 +345,15 @@ impl ContextRail {
             .collect();
         model_rows.sort_by_key(|b| std::cmp::Reverse(b.1.total_tokens()));
 
-        let input_label = i18n::t("workspace-env-noncached-input");
-        let output_label = i18n::t("workspace-env-output");
-        let cache_read_label = i18n::t("workspace-env-cache-read");
-        let cache_write_label = i18n::t("workspace-env-cache-write");
+        let throughput_label = i18n::t("workspace-env-throughput");
+        let cache_label = i18n::t("workspace-env-cache");
 
         let mut new_state: HashMap<String, (u64, u64)> = HashMap::new();
-        let mut model_blocks: Vec<(
-            String,
-            Option<SharedString>,
-            gpui::Div,
-            gpui::Div,
-            gpui::Div,
-            gpui::Div,
-        )> = Vec::with_capacity(model_rows.len());
+        // Each model block carries: model id text + the two tree rows
+        // (throughput, cache). The capture-based build keeps the closure
+        // machinery out of the outer builder.
+        let mut model_blocks: Vec<(String, Option<SharedString>, gpui::Div, gpui::Div)> =
+            Vec::with_capacity(model_rows.len());
 
         for (model_name, usage) in model_rows {
             let model_display = truncate_env_model_id(model_name.clone());
@@ -361,8 +366,8 @@ impl ContextRail {
             let cells: [(&str, u64); 4] = [
                 ("in", usage.input_tokens),
                 ("out", usage.output_tokens),
-                ("cache_read", usage.cache_read_input_tokens),
                 ("cache_create", usage.cache_creation_input_tokens),
+                ("cache_read", usage.cache_read_input_tokens),
             ];
             let mut from_to_gen: [(u64, u64, u64); 4] = [(0, 0, 0); 4];
             for (i, (field, value)) in cells.iter().enumerate() {
@@ -377,30 +382,38 @@ impl ContextRail {
             }
             let (in_f, in_t, in_g) = from_to_gen[0];
             let (out_f, out_t, out_g) = from_to_gen[1];
-            let (cr_f, cr_t, cr_g) = from_to_gen[2];
-            let (cc_f, cc_t, cc_g) = from_to_gen[3];
+            let (cce_f, cce_t, cce_g) = from_to_gen[2];
+            let (ccr_f, ccr_t, ccr_g) = from_to_gen[3];
 
-            let input_row = usage_row(&input_label, counter_animated("", in_f, in_t, "in", in_g));
-            let output_row = usage_row(
-                &output_label,
-                counter_animated("", out_f, out_t, "out", out_g),
-            );
-            let cache_read_row = usage_row(
-                &cache_read_label,
-                counter_animated("", cr_f, cr_t, "cache_read", cr_g),
-            );
-            let cache_write_row = usage_row(
-                &cache_write_label,
-                counter_animated("", cc_f, cc_t, "cache_create", cc_g),
-            );
-            model_blocks.push((
-                model_display,
-                hit_rate,
-                input_row,
-                output_row,
-                cache_read_row,
-                cache_write_row,
-            ));
+            // Tree prefix glyph (`├── ` / `└── `) painted slightly muted so it
+            // reads as chrome rather than data.
+            let branch_prefix = |glyph: &'static str| -> gpui::Div {
+                gpui::div()
+                    .text_xs()
+                    .text_color(muted.opacity(0.55))
+                    .child(SharedString::from(glyph))
+            };
+            let throughput_row = h_flex()
+                .pl(px(12.))
+                .gap_1()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .child(branch_prefix("├── "))
+                .child(throughput_label.clone())
+                .child(counter_animated("↑", in_f, in_t, "in", in_g))
+                .child(counter_animated("↓", out_f, out_t, "out", out_g));
+            let cache_row = h_flex()
+                .pl(px(12.))
+                .gap_1()
+                .items_center()
+                .text_xs()
+                .text_color(muted)
+                .child(branch_prefix("└── "))
+                .child(cache_label.clone())
+                .child(counter_animated("↑", cce_f, cce_t, "cache_create", cce_g))
+                .child(counter_animated("↓", ccr_f, ccr_t, "cache_read", ccr_g));
+            model_blocks.push((model_display, hit_rate, throughput_row, cache_row));
         }
         self.env_counter_state = new_state;
 
@@ -422,14 +435,7 @@ impl ContextRail {
                     ),
             )
             .children(model_blocks.into_iter().map(
-                |(
-                    model_display,
-                    hit_rate,
-                    input_row,
-                    output_row,
-                    cache_read_row,
-                    cache_write_row,
-                )| {
+                |(model_display, hit_rate, throughput_row, cache_row)| {
                     v_flex()
                         .w_full()
                         .gap_0p5()
@@ -454,10 +460,8 @@ impl ContextRail {
                                         .into_any_element()
                                 })),
                         )
-                        .child(input_row)
-                        .child(output_row)
-                        .child(cache_read_row)
-                        .child(cache_write_row)
+                        .child(throughput_row)
+                        .child(cache_row)
                         .into_any_element()
                 },
             ))
@@ -925,26 +929,19 @@ impl ContextRail {
 impl Render for ContextRail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // The context panel floats over the conversation column's top-right as
+        // an absolute overlay: `top` clears the shared title bar, `right` +
+        // the conversation body's right padding keep the message list clear of
+        // the card. `occlude()` captures pointer hits so drags meant for the
+        // card don't fall through to the conversation. Content height, not
+        // full height — a compact floating card, not a flush column.
         v_flex()
-            .w_full()
-            .h_full()
-            .min_h_0()
-            .bg(theme.background)
-            .border_l_1()
-            .border_color(theme.border)
-            .child(
-                // `min_h_0` lets the panel shrink below its content height so
-                // `overflow_y_scroll` actually engages; without it the flex item's
-                // min-height defaults to content and the panel grows past the
-                // viewport instead of scrolling.
-                gpui::div()
-                    .id("context-rail-body")
-                    .w_full()
-                    .h_full()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(self.render_panel(&theme, cx)),
-            )
+            .absolute()
+            .top(TITLE_BAR_HEIGHT + px(16.))
+            .right(px(16.))
+            .w(px(ENV_CARD_WIDTH))
+            .occlude()
+            .child(self.render_panel(&theme, cx))
     }
 }
 
@@ -1125,24 +1122,4 @@ fn counter_animated(
             },
         )
         .into_any_element()
-}
-
-/// One labeled usage row: label on the left (flex-1, indented), animated
-/// counter on the right. The indented label aligns under the model name so
-/// the four rows read as a column belonging to that model. Text color
-/// cascades from the caller (muted).
-fn usage_row(label: &SharedString, counter: AnyElement) -> gpui::Div {
-    h_flex()
-        .pl(px(12.))
-        .gap_1()
-        .items_center()
-        .text_xs()
-        .child(
-            gpui::div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .child(label.clone()),
-        )
-        .child(counter)
 }

@@ -120,15 +120,20 @@ Full-window terminal emulator.
 
 ## 3. ViewMode::Workspace Layout
 
-The default mode. Two top-level slots divided by a 6px [SidebarDivider](#sidebardivider): left = [Sidebar](#sidebar), right = the middle column — an `h_flex` that holds [MainColumn](#maincolumn) (the conversation column) and [ContextRail](#contextrail) as flex siblings. [EditorPane](#editordpane) opens as a third top-level column to the right of the middle column when any right-pane tab is active; ContextRail folds into a drawer below `RAIL_NARROW_BREAK` (900px middle-column width), in which case the conversation column fills the middle column.
+The default mode. Two top-level slots divided by a 6px [SidebarDivider](#sidebardivider): left = [Sidebar](#sidebar), right = the middle column — a relative `v_flex` that holds a shared [TitleBar](#titlebar) overlay on top (spanning the whole middle column) and the conversation column underneath. The [ContextRail](#contextrail) is NOT a flex sibling column — it is an absolute overlay floating over the conversation column's top-right (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`), content height (never full-height), with the conversation body reserving `ENV_CONTENT_INSET` right padding so the message list never hides behind the card. [EditorPane](#editordpane) opens as a third top-level column to the right of the middle column when any right-pane tab is active; while it is open the card stays hidden so the conversation reclaims its width. The card also folds away below `RAIL_NARROW_BREAK` (900px middle-column width), in which case the conversation column fills the middle column.
 
 ```
 ┌──────────┬──┬──────────────────────────────┐
-│          │  │  MiddleColumn (h_flex)       │
-│ Sidebar  │▌│ ┌───────────────┬──────────┐ │
-│          │  │ │ MainColumn    │ContextRail│ │
-│          │  │ │(conversation) │(flex sib.)│ │
-│          │  │ └───────────────┴──────────┘ │
+│          │  │  MiddleColumn (v_flex.relative)│
+│ Sidebar  │▌ │ ┌──────────────────────────┐  │
+│          │  │ │ TitleBar (shared overlay) │  │
+│          │  ├──────────────────────────┤  │
+│          │  │ MainColumn (conversation) │  │
+│          │  │                ┌─────────┐ │  │
+│          │  │                │Context  │ │  │
+│          │  │                │Rail card│ │  │
+│          │  │                │(float)  │ │  │
+│          │  │                └─────────┘ │  │
 └──────────┴──┴──────────────────────────────┘
 ```
 
@@ -192,7 +197,7 @@ Single thread row: unread red dot (8px, `theme.danger`, shown when `summary.has_
 
 ### 3.2 MainColumn
 
-Central conversation column, flex-1, relative positioning. A flex sibling of [ContextRail](#contextrail) inside the Workspace's middle-column `h_flex` (not a top-level column itself); the composer no longer spans underneath the rail.
+Central conversation column, flex-1. The sole flex child of the middle column under the shared [TitleBar](#titlebar) overlay that spans the whole middle column (not a top-level column itself). The [ContextRail](#contextrail) floats over this column's top-right as an absolute overlay (not a flex sibling); the conversation body reserves `ENV_CONTENT_INSET` right padding when the card is shown so the message list clears it. The composer no longer spans underneath the card.
 
 #### MainColumn
 
@@ -202,7 +207,7 @@ Vertical flex container, fills remaining width.
 
 #### TitleBar
 
-Absolute-positioned top bar, height `TITLE_BAR_HEIGHT`, contains thread title and "..." menu.
+Absolute-positioned top bar at the middle-column level (not the conversation column), height `TITLE_BAR_HEIGHT`, spans both [MainColumn](#maincolumn) and the [ContextRail](#contextrail) card so the pair reads as one middle column under a single bar. Contains thread title and "..." menu.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -556,21 +561,21 @@ Trigger: "Create blank project" from [ProjectMenu](#projectmenu). Centered modal
 
 ### 3.3 ContextRail
 
-Right-side context sidecar inside the Workspace's middle-column `h_flex` — a flex sibling of [MainColumn](#maincolumn) (no longer the old floating `EnvironmentCard`), so it never overlaps the conversation and the composer never spans underneath it. Owned by `Workspace` as `Entity<ContextRail>`; the rail owns the cockpit state (run phase, milestones, per-cell counter animation) that used to live on `Workspace`.
+Right-side context panel that floats over the Workspace's conversation column top-right as an absolute overlay — NOT a flex sibling of [MainColumn](#maincolumn). The `Render` impl positions it (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`); the panel body (`render_panel`) carries the card chrome (`border_1` / `rounded(theme.radius)` / drop shadow / `bg:background` + `p_3`/`gap_2`). Content height, never full-height — a compact floating card, not a flush column or a second title bar. The conversation body reserves `ENV_CONTENT_INSET` (card width + 36px gutter) right padding so the message list never hides behind the card. Owned by `Workspace` as `Entity<ContextRail>`; the rail owns the cockpit state (run phase, milestones, per-cell counter animation) that used to live on `Workspace`.
 
-Width is responsive to the main-column body width (`ContextRail::rail_width_for`): `RAIL_DESKTOP_WIDTH` (300px) at wide windows, `RAIL_NARROW_WIDTH` (280px) just above the breakpoint, and folded into a drawer (absent from the h_flex, surfaced via a [ContextRailCollapseBtn](#contextrailcollapsebtn) affordance) below `RAIL_NARROW_BREAK` (900px). The collapse state stays local to the view; it is not persisted into thread messages.
+Visibility is gated on the main-column body width (`ContextRail::rail_width_for`): shown as `Some(ENV_CARD_WIDTH)` (260px) at/above `RAIL_NARROW_BREAK` (900px), folded away (`None`) below it. The card's `top` clears the shared [TitleBar](#titlebar) overlay.
 
-The rail stays mounted while the [EditorPane](#editorpane) is open — it is a peer of the conversation, not the editor's replacement, so opening the right pane no longer hides the conversation info. The editor-divider drag clamp reserves the rail's width alongside `MAIN_MIN_WIDTH` so a wide editor cannot squeeze the conversation column to zero; the rail itself is `flex_shrink_0`, the conversation column is `flex_1`/`min_w_0`.
+The card stays **hidden while the [EditorPane](#editorpane) is open** — opening the right pane reclaims the card's width for the conversation — and on the empty first screen / before the thread has interacted. It is not the editor's replacement; the editor is a third top-level column outside the middle. Because the card is absent while the editor is open, the editor-divider drag clamp reserves only `MAIN_MIN_WIDTH` (no card width) — the conversation alone holds the middle column while the editor is open. The card floats as an absolute overlay (content height); the conversation column is `flex_1`/`min_w_0` and reserves `ENV_CONTENT_INSET` right padding when the card is shown.
 
 #### ContextRail
 
-Vertical flex container, `bg:background`, left border. Owns `Entity<Thread>` and renders the panel body in a stateful scrollable inner div (`overflow_y_scroll`).
+Floating absolute card over the conversation column's top-right (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`). Owns `Entity<Thread>` and renders the panel body (`render_panel`) which carries the card chrome (border / rounded / shadow / background + `p_3`/`gap_2`) at content height.
 
 > Source: `agent-ui/src/views/context_rail.rs`
 
 #### ContextRailPanel
 
-Scrollable panel body. The conversation-info rows (title, status, changes, branch) sit above the usage tree; the milestone section and context budget render from cockpit state owned by the rail.
+Panel body (the card's content, content height — no internal scroll surface). The conversation-info rows (title, status, changes, branch) sit above the usage tree; the milestone section and context budget render from cockpit state owned by the rail.
 
 Contents, top to bottom:
 
@@ -582,7 +587,7 @@ Contents, top to bottom:
 - **Branch row**: [ContextRailBranchRow](#contextrailbranchrow).
 - **Usage section** (`render_usage_section`): `MemoryStick` icon + "Usage" header, then per-model blocks (sorted by total tokens desc; empty for unused models). Each block is:
   - Model id line (truncated to `ENV_MODEL_ID_MAX` chars) + trailing `cache {pct}%` hit-rate badge (i18n `workspace-env-cache-hit-rate`) computed by `cockpit::cache_read_ratio` (denominator = uncached input + cache-read).
-  - Four explicit labeled rows (`usage_row`): non-cached input (`workspace-env-noncached-input`), output (`workspace-env-output`), cache read (`workspace-env-cache-read`), cache write (`workspace-env-cache-write`). Each row's counter animates via `counter_animated`.
+  - A two-row tree: `├── 穿透` (i18n `workspace-env-throughput`) carrying `↑{input}` / `↓{output}` animated counters, and `└── 缓存` (i18n `workspace-env-cache`) carrying `↑{cache_create}` / `↓{cache_read}`. The throughput / cache split keeps the cache-read share legible as a branch rather than buried among flat rows. Tree prefixes (`├── ` / `└── `) are painted at `muted.opacity(0.55)` so they read as chrome.
 - **Hairline divider**.
 - **Sources section**: `Sources` label + "No sources yet" placeholder (ε track).
 
