@@ -178,10 +178,65 @@ pub struct Invoke {
 pub type InvokeHandler =
     Arc<dyn Fn(Invoke) -> Option<http::Response<Vec<u8>>> + Send + Sync + 'static>;
 
+/// Trust regime a webview operates under.
+///
+/// `Trusted` is the manos/Tauri default: the page is served by manox itself, so
+/// the full `__TAURI_INTERNALS__` bundle, plugin command surface, and IPC
+/// postMessage handler are injected — the page can invoke Rust commands.
+///
+/// `Untrusted` is for arbitrary remote pages: only a minimal, closed-enum
+/// notify bridge (`window.__manox_notify__`) and an inbound-write request
+/// bridge (`window.__manox_request_write__`) are injected. The page can tell
+/// manox "something happened" but cannot name a command to execute; inbound
+/// writes always go through a mandatory confirmation that ignores ApprovalMode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrustMode {
+    #[default]
+    Trusted,
+    Untrusted,
+}
+
+/// A closed-enum notification an untrusted page sends back to manox via
+/// `window.__manox_notify__(type, payload)`. The `type` string is parsed into
+/// this enum on the Rust side; unknown types are dropped — the page cannot
+/// synthesize arbitrary events.
+#[derive(Clone, Debug)]
+pub enum BrowserNotification {
+    /// Page finished loading (DOMContentLoaded-equivalent).
+    PageLoaded,
+    /// DOM mutation observed.
+    DomChanged,
+    /// Top-level navigation to `url`.
+    Navigation(String),
+    /// User handed control back to manox (e.g. after a login handshake).
+    UserHandback,
+    /// Result of an injected eval script, correlated by `request_id`.
+    /// `payload` is whatever the injected script returned as JSON.
+    EvalResult {
+        request_id: u64,
+        payload: serde_json::Value,
+    },
+}
+
+/// An inbound write request from an untrusted page via
+/// `window.__manox_request_write__(intent, payload)`. This is NOT executed
+/// directly — it is routed through a mandatory confirmation overlay that does
+/// not read ApprovalMode (the inbound axis is orthogonal to outbound approval).
+/// No `intent` is registered yet; the architecture is in place for future
+/// write surfaces.
+#[derive(Clone, Debug)]
+pub struct BrowserInboundWrite {
+    pub intent: String,
+    pub payload: serde_json::Value,
+}
+
 pub struct Builder<'a> {
     builder: WebViewBuilder<'a>,
     webview_id: WebViewId<'a>,
+    trust_mode: TrustMode,
     invoke_handler: Option<InvokeHandler>,
+    on_notify: Option<Arc<dyn Fn(String, BrowserNotification) + Send + Sync + 'static>>,
+    on_inbound_write: Option<Arc<dyn Fn(String, BrowserInboundWrite) + Send + Sync + 'static>>,
     handlers: HashMap<String, IpcHandler>,
 }
 
@@ -227,13 +282,49 @@ impl<'a> Builder<'a> {
         Builder {
             builder: WebViewBuilder::new(),
             webview_id: WebViewId::default(),
+            trust_mode: TrustMode::default(),
             invoke_handler: None,
+            on_notify: None,
+            on_inbound_write: None,
             handlers,
         }
     }
 
     pub fn with_webview_id(mut self, webview_id: WebViewId<'a>) -> Self {
         self.webview_id = webview_id;
+        self
+    }
+
+    /// Set the trust regime. Default is `Trusted` (manos/Tauri behavior).
+    /// `Untrusted` is for arbitrary remote pages: minimal notify/request bridge,
+    /// zero command surface.
+    pub fn trust_mode(mut self, mode: TrustMode) -> Self {
+        self.trust_mode = mode;
+        self
+    }
+
+    /// Register a handler invoked on the gpui main thread when an untrusted
+    /// page calls `window.__manox_notify__(type, payload)`. `webview_label`
+    /// identifies which webview sent the notification. Only meaningful under
+    /// `TrustMode::Untrusted`; ignored otherwise.
+    pub fn on_notify<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(String, BrowserNotification) + Send + Sync + 'static,
+    {
+        self.on_notify = Some(Arc::new(handler));
+        self
+    }
+
+    /// Register a handler invoked on the gpui main thread when an untrusted
+    /// page calls `window.__manox_request_write__(intent, payload)`. The
+    /// handler must NOT execute the write directly — it routes through a
+    /// mandatory confirmation that ignores ApprovalMode. Only meaningful under
+    /// `TrustMode::Untrusted`; ignored otherwise.
+    pub fn on_inbound_write<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(String, BrowserInboundWrite) + Send + Sync + 'static,
+    {
+        self.on_inbound_write = Some(Arc::new(handler));
         self
     }
 
@@ -292,11 +383,56 @@ impl<'a> Builder<'a> {
 
         let window_handle = window.window_handle()?;
         let webview_id = self.webview_id;
-        self.with_initialization_script_for_main_only()
-            .with_apis()
-            .builder
-            .with_id(webview_id)
-            .build_as_child(&window_handle)
+        match self.trust_mode {
+            // manos/Tauri default: full __TAURI_INTERNALS__ bundle + plugin
+            // command surface + IPC postMessage handler.
+            TrustMode::Trusted => self
+                .with_initialization_script_for_main_only()
+                .with_apis()
+                .builder
+                .with_id(webview_id)
+                .build_as_child(&window_handle),
+            // Arbitrary remote pages: minimal notify/request bridge only, zero
+            // command surface. The bridges fetch the `manox://` custom protocol,
+            // which routes to the on_notify/on_inbound_write handlers.
+            TrustMode::Untrusted => self
+                .with_browser_bridge()
+                .builder
+                .with_id(webview_id)
+                .build_as_child(&window_handle),
+        }
+    }
+
+    /// Wire the untrusted-mode bridges: publish the notify/inbound handlers to
+    /// the process-wide registry, inject notify.js + request.js as init scripts,
+    /// and register the `manox://` custom protocol the bridges fetch.
+    fn with_browser_bridge(mut self) -> Self {
+        if let Some(h) = self.on_notify.take() {
+            let _ = ipc::NOTIFY_HANDLER.set(h);
+        }
+        if let Some(h) = self.on_inbound_write.take() {
+            let _ = ipc::INBOUND_HANDLER.set(h);
+        }
+
+        self.apply(|b| {
+            b.with_initialization_script_for_main_only(
+                include_str!("scripts/browser/notify.js"),
+                true,
+            )
+            .with_initialization_script_for_main_only(
+                include_str!("scripts/browser/request.js"),
+                true,
+            )
+        })
+        .apply(|b| {
+            b.with_asynchronous_custom_protocol(
+                "manox".into(),
+                move |webview_id, request, responder| {
+                    let response = ipc::handle_browser_protocol(webview_id, request);
+                    responder.respond(response);
+                },
+            )
+        })
     }
 
     pub fn webview_builder(self) -> WebViewBuilder<'a> {
@@ -635,6 +771,18 @@ pub mod ipc {
     static CHANNEL_DATA_COUNTER: AtomicU32 = AtomicU32::new(0);
     static CHANNEL_DATA_QUEUE: OnceLock<Mutex<ChannelDataQueue>> = OnceLock::new();
 
+    // Untrusted-mode bridges. Set once per process from the first untrusted
+    // Builder; all untrusted webviews share the same routing handler and
+    // dispatch by webview_label. OnceLock::set is a no-op after the first call,
+    // so a later Builder's handler is ignored — the bridges are process-wide
+    // by design (the host owns the routing, not individual webviews).
+    pub(crate) static NOTIFY_HANDLER: OnceLock<
+        Arc<dyn Fn(String, super::BrowserNotification) + Send + Sync + 'static>,
+    > = OnceLock::new();
+    pub(crate) static INBOUND_HANDLER: OnceLock<
+        Arc<dyn Fn(String, super::BrowserInboundWrite) + Send + Sync + 'static>,
+    > = OnceLock::new();
+
     #[derive(Debug)]
     struct ChannelDataEntry {
         inserted_at: Instant,
@@ -721,7 +869,173 @@ pub mod ipc {
         Ok(())
     }
 
-    // The Err variant is an `http::Response<Vec<u8>>` because the Tauri-style IPC
+    // Marshal a `__manox_notify__` payload to the gpui main thread and hand it
+    // to the process-wide NOTIFY_HANDLER. The notify path is fire-and-forget
+    // from the page's perspective, so there is no response channel — unknown
+    // types and missing handlers are logged and dropped, never propagated back.
+    fn dispatch_notify_on_main_thread(
+        webview_label: String,
+        notification: super::BrowserNotification,
+    ) -> std::result::Result<(), String> {
+        let dispatcher = PLATFORM_DISPATCHER.get().cloned().ok_or_else(|| {
+            "gpui platform dispatcher is not initialized (create a manox_webview::webview::WebView first)"
+                .to_string()
+        })?;
+
+        let (runnable, task) = async_task::Builder::new()
+            .metadata(gpui::RunnableMeta::new_with_callers_location())
+            .spawn(
+                move |_| async move {
+                    if let Some(handler) = NOTIFY_HANDLER.get() {
+                        handler(webview_label, notification);
+                    } else {
+                        eprintln!(
+                            "[webview] notify arrived but no on_notify handler is registered"
+                        );
+                    }
+                },
+                move |runnable| {
+                    dispatcher.dispatch_on_main_thread(runnable, gpui::Priority::default())
+                },
+            );
+
+        runnable.schedule();
+        task.detach();
+        Ok(())
+    }
+
+    // Marshal an inbound `__manox_request_write__` payload to the main thread.
+    // The handler is responsible for surfacing the confirmation overlay — this
+    // dispatch never executes the intent, it only hands it to the host.
+    fn dispatch_inbound_on_main_thread(
+        webview_label: String,
+        write: super::BrowserInboundWrite,
+    ) -> std::result::Result<(), String> {
+        let dispatcher = PLATFORM_DISPATCHER.get().cloned().ok_or_else(|| {
+            "gpui platform dispatcher is not initialized (create a manox_webview::webview::WebView first)"
+                .to_string()
+        })?;
+
+        let (runnable, task) = async_task::Builder::new()
+            .metadata(gpui::RunnableMeta::new_with_callers_location())
+            .spawn(
+                move |_| {
+                    async move {
+                        if let Some(handler) = INBOUND_HANDLER.get() {
+                            handler(webview_label, write);
+                        } else {
+                            eprintln!(
+                                "[webview] inbound write arrived but no on_inbound_write handler is registered"
+                            );
+                        }
+                    }
+                },
+                move |runnable| dispatcher.dispatch_on_main_thread(runnable, gpui::Priority::default()),
+            );
+
+        runnable.schedule();
+        task.detach();
+        Ok(())
+    }
+
+    // Decode a notify `type` + `payload` pair into the closed
+    // `BrowserNotification` enum. Unknown types yield None and are dropped by
+    // the caller — the page cannot invent new notification kinds.
+    fn parse_notification(
+        type_str: &str,
+        payload: serde_json::Value,
+    ) -> Option<super::BrowserNotification> {
+        use super::BrowserNotification;
+        match type_str {
+            "page_loaded" => Some(BrowserNotification::PageLoaded),
+            "dom_changed" => Some(BrowserNotification::DomChanged),
+            "navigation" => Some(BrowserNotification::Navigation(
+                payload.as_str().unwrap_or("").to_string(),
+            )),
+            "user_handback" => Some(BrowserNotification::UserHandback),
+            "eval_result" => {
+                let request_id = payload
+                    .get("request_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let inner = payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                Some(BrowserNotification::EvalResult {
+                    request_id,
+                    payload: inner,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    // Route a `manox://` request to the notify or inbound-write dispatch. The
+    // response is always 200 with permissive CORS: the bridges fetch
+    // fire-and-forget and never read the body, and cross-origin (https page →
+    // manox scheme) fetches need the header or WKWebView rejects the response.
+    pub(crate) fn handle_browser_protocol(
+        webview_id: WebViewId<'_>,
+        request: http::Request<Vec<u8>>,
+    ) -> http::Response<Vec<u8>> {
+        let path = request.uri().path();
+        let body_value: serde_json::Value =
+            serde_json::from_slice(request.body()).unwrap_or(serde_json::Value::Null);
+        let label = webview_id.to_string();
+        match path {
+            "/notify" => {
+                let type_str = body_value
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let payload = body_value
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                match parse_notification(&type_str, payload) {
+                    Some(notification) => {
+                        let _ = dispatch_notify_on_main_thread(label, notification);
+                    }
+                    None => {
+                        eprintln!(
+                            "[webview] dropped unknown notify type `{type_str}` from {label}"
+                        );
+                    }
+                }
+            }
+            "/request" => {
+                let intent = body_value
+                    .get("intent")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let payload = body_value
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let _ = dispatch_inbound_on_main_thread(
+                    label,
+                    super::BrowserInboundWrite { intent, payload },
+                );
+            }
+            _ => {
+                return bad_request(format!("unknown manox protocol path: {path}"));
+            }
+        }
+        bridge_ok()
+    }
+
+    fn bridge_ok() -> http::Response<Vec<u8>> {
+        http::Response::builder()
+            .status(http::StatusCode::OK)
+            .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(CONTENT_TYPE, "application/json")
+            .body(b"{}".to_vec())
+            .unwrap()
+    }
+
     // validation layer returns the HTTP error response it wants sent back to the
     // webview caller directly as the Err — callers propagate it with `?` to the
     // custom-protocol handler. Boxing would force an unwrap at every call site for
