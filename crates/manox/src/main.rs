@@ -167,17 +167,16 @@ fn main() {
             gpui::KeyBinding::new("ctrl-shift-t", agent_ui::FocusTerminal, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-c", agent_ui::FocusConversation, None),
-            // Built-in browser go/no-go embed check. cmd-b opens the embedded
-            // webview overlay, cmd-shift-b closes it. Step 5 turns this into a
-            // proper browser tab as a right-pane `RightTab::Browser` citizen.
+            // Built-in browser. cmd-b opens a new browser tab in the right
+            // pane, cmd-shift-b closes the active browser tab.
             #[cfg(target_os = "macos")]
-            gpui::KeyBinding::new("cmd-b", agent_ui::OpenBrowserGoNoGo, None),
+            gpui::KeyBinding::new("cmd-b", agent_ui::OpenBrowserTab, None),
             #[cfg(target_os = "macos")]
-            gpui::KeyBinding::new("cmd-shift-b", agent_ui::CloseBrowserGoNoGo, None),
+            gpui::KeyBinding::new("cmd-shift-b", agent_ui::CloseBrowserTab, None),
             #[cfg(not(target_os = "macos"))]
-            gpui::KeyBinding::new("ctrl-b", agent_ui::OpenBrowserGoNoGo, None),
+            gpui::KeyBinding::new("ctrl-b", agent_ui::OpenBrowserTab, None),
             #[cfg(not(target_os = "macos"))]
-            gpui::KeyBinding::new("ctrl-shift-b", agent_ui::CloseBrowserGoNoGo, None),
+            gpui::KeyBinding::new("ctrl-shift-b", agent_ui::CloseBrowserTab, None),
             // Pop the last follow-up parked above the composer while a turn is
             // running (mirrors the per-item Remove affordance for the tail).
             #[cfg(target_os = "macos")]
@@ -308,7 +307,7 @@ fn main() {
                 }
             });
         });
-        cx.on_action(|_: &agent_ui::OpenBrowserGoNoGo, cx: &mut App| {
+        cx.on_action(|_: &agent_ui::OpenBrowserTab, cx: &mut App| {
             let (workspace, handle) = (
                 agent_ui::dispatch::workspace_global(),
                 agent_ui::dispatch::window_global(),
@@ -316,12 +315,18 @@ fn main() {
             cx.defer(move |cx| {
                 if let (Some(workspace), Some(handle)) = (workspace, handle) {
                     let _ = handle.update(cx, |_, window, cx| {
-                        workspace.update(cx, |ws, cx| ws.open_browser_gonogo(window, cx));
+                        workspace.update(cx, |ws, cx| {
+                            ws.open_browser_tab(
+                                agent_ui::views::browser_view::DEFAULT_URL,
+                                window,
+                                cx,
+                            );
+                        });
                     });
                 }
             });
         });
-        cx.on_action(|_: &agent_ui::CloseBrowserGoNoGo, cx: &mut App| {
+        cx.on_action(|_: &agent_ui::CloseBrowserTab, cx: &mut App| {
             let (workspace, handle) = (
                 agent_ui::dispatch::workspace_global(),
                 agent_ui::dispatch::window_global(),
@@ -329,7 +334,7 @@ fn main() {
             cx.defer(move |cx| {
                 if let (Some(workspace), Some(handle)) = (workspace, handle) {
                     let _ = handle.update(cx, |_, _window, cx| {
-                        workspace.update(cx, |ws, cx| ws.close_browser_gonogo(cx));
+                        workspace.update(cx, |ws, cx| ws.close_active_browser_tab(cx));
                     });
                 }
             });

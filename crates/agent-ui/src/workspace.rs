@@ -19,6 +19,7 @@ use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::settings;
 use agent::thread::ApprovalMode;
+use agent::webview_host::BrowserTabId;
 use agent::{
     PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId, i18n,
     save_thread,
@@ -62,19 +63,21 @@ use crate::views::plugin_manager::{PluginManagerEvent, PluginManagerView};
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::{
-    CloseBrowserGoNoGo, CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab,
-    OpenBrowserGoNoGo, OpenSettings,
+    CloseBrowserTab, CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab,
+    OpenBrowserTab, OpenSettings,
 };
 use terminal::Terminal;
 use terminal_ui::TerminalView;
 
 /// A tab in the right observation pane. `Editor` is the markdown composer
 /// (Write/Preview); `Member(name)` is a read-only [`MemberPanel`] over a team
-/// worker's conversation + tasks.
+/// worker's conversation + tasks; `Browser(id)` is an untrusted embedded
+/// webview (see [`BrowserView`]).
 #[derive(Clone, Debug)]
 enum RightTab {
     Editor,
     Member(String),
+    Browser(BrowserTabId),
 }
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
@@ -234,6 +237,11 @@ pub struct Workspace {
     /// Lazily-built MemberPanel entities, keyed by member name. A member tab
     /// keeps its panel across tab switches; dropped when the tab closes.
     member_panels: BTreeMap<String, Entity<MemberPanel>>,
+    /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
+    /// tab keeps its `BrowserView` (and the underlying native webview) across
+    /// tab switches; dropped when the tab closes, which detaches the native
+    /// view via [`manox_webview::webview::WebView`]'s `Drop`.
+    browser_views: BTreeMap<BrowserTabId, Entity<BrowserView>>,
     /// Editor pane width, driven by dragging the divider. In-memory only.
     editor_width: Pixels,
     /// Sidebar width, driven by dragging the divider on its right edge.
@@ -407,11 +415,6 @@ pub struct Workspace {
     /// time" model; switching away parks the session (its terminal keeps
     /// running) rather than killing it.
     active_external: Option<String>,
-    /// Embedded native webview, opened via `OpenBrowserGoNoGo` for the step-1
-    /// embed check. `None` until then. Dropped on `CloseBrowserGoNoGo`.
-    /// Step 5 replaces this single overlay with proper `RightTab::Browser`
-    /// tabs; the field stays as the home for the live browser view(s).
-    browser_view: Option<Entity<BrowserView>>,
     /// Ordinal of the outline tick currently under the cursor, if any. Drives
     /// the "wave" hover effect: the hovered tick and its neighbors lengthen and
     /// spread apart, tapering off with distance. `None` when the cursor is off
@@ -561,6 +564,7 @@ impl Workspace {
             right_tabs: Vec::new(),
             active_right_tab: 0,
             member_panels: BTreeMap::new(),
+            browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
             pending_auths: Vec::new(),
@@ -620,7 +624,6 @@ impl Workspace {
             terminal_view: None,
             external_sessions: Vec::new(),
             active_external: None,
-            browser_view: None,
             outline_hover: None,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
@@ -1368,19 +1371,50 @@ impl Workspace {
             .update(cx, |s, cx| s.set_external_sessions(summaries, cx));
     }
 
-    /// Open the embedded browser overlay for the step-1 go/no-go embed check.
-    /// Builds a native webview parented to this window and renders it as a
-    /// full-bleed overlay. Step 5 turns this into a proper `RightTab::Browser`.
-    pub fn open_browser_gonogo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| BrowserView::new(None, window, cx));
-        self.browser_view = Some(view);
-        cx.notify();
+    /// Open a browser tab navigating to `url` (defaulting to
+    /// [`crate::views::browser_view::DEFAULT_URL`] when empty) and focus it.
+    /// Returns the allocated `BrowserTabId` so callers (the host, tool
+    /// surface) can drive the tab afterwards. The webview is built untrusted:
+    /// no Tauri command surface, only the notify/inbound bridges.
+    pub fn open_browser_tab(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> BrowserTabId {
+        let url = if url.is_empty() {
+            crate::views::browser_view::DEFAULT_URL
+        } else {
+            url
+        };
+        let tab_id = crate::views::browser_view::allocate_tab_id();
+        let view =
+            cx.new(|cx| crate::views::browser_view::BrowserView::new(tab_id, url, window, cx));
+        self.browser_views.insert(tab_id, view);
+        self.right_tabs.push(RightTab::Browser(tab_id));
+        self.set_active_right_tab(self.right_tabs.len() - 1, cx);
+        tab_id
     }
 
-    /// Close the browser overlay. Dropping the `BrowserView` drops the
-    /// underlying `WebView`, whose `Drop` hides and detaches the native view.
-    pub fn close_browser_gonogo(&mut self, cx: &mut Context<Self>) {
-        self.browser_view = None;
+    /// Close and recycle a browser tab by id. Dropping the `BrowserView`
+    /// drops the underlying native webview, whose `Drop` hides and detaches
+    /// the platform view. No-op if the id is not live.
+    pub fn close_browser_tab(&mut self, tab_id: BrowserTabId, cx: &mut Context<Self>) {
+        if self.browser_views.remove(&tab_id).is_none() {
+            return;
+        }
+        if let Some(ix) = self
+            .right_tabs
+            .iter()
+            .position(|t| matches!(t, RightTab::Browser(id) if *id == tab_id))
+        {
+            self.right_tabs.remove(ix);
+            self.reseat_active_after_close(ix);
+            self.editor_open = self
+                .right_tabs
+                .get(self.active_right_tab)
+                .is_some_and(|t| matches!(t, RightTab::Editor));
+        }
         cx.notify();
     }
 
@@ -2382,6 +2416,19 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Keep `active_right_tab` pointing at the same tab after the tab at
+    /// `removed_ix` was just removed from `right_tabs`. Tabs after
+    /// `removed_ix` shift left by one, so a still-live active tab to the right
+    /// must decrement; the active tab itself being removed (and being the
+    /// last) falls back to the new last tab.
+    fn reseat_active_after_close(&mut self, removed_ix: usize) {
+        if self.active_right_tab > removed_ix {
+            self.active_right_tab -= 1;
+        } else if self.active_right_tab >= self.right_tabs.len() {
+            self.active_right_tab = self.right_tabs.len().saturating_sub(1);
+        }
+    }
+
     /// Open the markdown editor: hide the inline composer and transfer its draft
     /// into the editor so writing continues there. If an Editor tab is already
     /// present, just focus it. Submit from the editor with Cmd-Enter; close with
@@ -2422,9 +2469,7 @@ impl Workspace {
         });
         self.editor_state
             .update(cx, |s, cx| s.set_value("", window, cx));
-        if self.active_right_tab >= self.right_tabs.len() {
-            self.active_right_tab = self.right_tabs.len().saturating_sub(1);
-        }
+        self.reseat_active_after_close(ix);
         self.editor_open = self
             .right_tabs
             .get(self.active_right_tab)
@@ -2473,7 +2518,7 @@ impl Workspace {
 
     /// Close a right-pane tab by index. The Editor tab routes through
     /// `close_editor` to preserve draft-transfer semantics; a Member tab drops
-    /// its panel.
+    /// its panel; a Browser tab drops its webview.
     fn close_right_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.right_tabs.get(ix), Some(RightTab::Editor)) {
             self.close_editor(window, cx);
@@ -2482,14 +2527,24 @@ impl Workspace {
         if let Some(RightTab::Member(name)) = self.right_tabs.get(ix).cloned() {
             self.right_tabs.remove(ix);
             self.member_panels.remove(&name);
-            if self.active_right_tab >= self.right_tabs.len() {
-                self.active_right_tab = self.right_tabs.len().saturating_sub(1);
-            }
+            self.reseat_active_after_close(ix);
             self.editor_open = self
                 .right_tabs
                 .get(self.active_right_tab)
                 .is_some_and(|t| matches!(t, RightTab::Editor));
             cx.notify();
+        }
+        if let Some(RightTab::Browser(id)) = self.right_tabs.get(ix).cloned() {
+            self.close_browser_tab(id, cx);
+        }
+    }
+
+    /// Close the active right-pane tab if it is a browser tab. No-op
+    /// otherwise (the keybinding is global; it should not close Editor or
+    /// Member tabs that happen to be active).
+    pub fn close_active_browser_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(RightTab::Browser(id)) = self.right_tabs.get(self.active_right_tab).cloned() {
+            self.close_browser_tab(id, cx);
         }
     }
 
@@ -5594,56 +5649,6 @@ impl Render for Workspace {
                         .child(v_flex().flex_1().h_full().w_full().child(terminal)),
                 );
         }
-        // Browser go/no-go overlay: sidebar (for switching back) + a full-bleed
-        // embedded webview filling the main column. Step 5 replaces this with a
-        // proper `RightTab::Browser` tab; for now it proves the embed renders +
-        // resizes against manox's gpui revision.
-        if let Some(browser) = self.browser_view.clone() {
-            let theme = cx.theme().clone();
-            return h_flex()
-                .size_full()
-                .bg(theme.background)
-                .text_color(theme.foreground)
-                .on_action(cx.listener(|this, _: &CloseBrowserGoNoGo, _window, cx| {
-                    this.close_browser_gonogo(cx);
-                }))
-                .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
-                    this.close_browser_gonogo(cx);
-                }))
-                .child(self.sidebar.clone())
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .h_full()
-                        .relative()
-                        .child(
-                            TitleBar::new().child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(Icon::new(IconName::Globe))
-                                    .child(
-                                        gpui::div()
-                                            .text_sm()
-                                            .text_left()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(SharedString::from("manox browser (go/no-go)")),
-                                    )
-                                    .child(
-                                        Button::new("close-browser")
-                                            .small()
-                                            .ghost()
-                                            .icon(IconName::Close)
-                                            .on_click(cx.listener(|this, _, _window, cx| {
-                                                this.close_browser_gonogo(cx);
-                                            })),
-                                    ),
-                            ),
-                        )
-                        .child(v_flex().flex_1().h_full().w_full().child(browser)),
-                );
-        }
         let theme = cx.theme().clone();
         let running = self.thread.read(cx).is_running();
 
@@ -5836,11 +5841,20 @@ impl Render for Workspace {
                     RightTab::Member(name) => {
                         Tab::new().label(i18n::t_str("member-tab", &[("name", name)]))
                     }
+                    RightTab::Browser(id) => {
+                        let url = self
+                            .browser_views
+                            .get(id)
+                            .map(|v| v.read(cx).url().to_string())
+                            .unwrap_or_default();
+                        Tab::new().label(i18n::t_str("browser-tab", &[("url", &url)]))
+                    }
                 };
-                // Only member tabs carry a close affordance; the Editor tab
-                // keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
+                // Member and Browser tabs carry a close affordance; the
+                // Editor tab keeps its keyboard toggle (`ToggleEditor` /
+                // `CloseEditor`).
                 match tab {
-                    RightTab::Member(_) => base.suffix(
+                    RightTab::Member(_) | RightTab::Browser(_) => base.suffix(
                         gpui::div()
                             .id(("right-tab-close", ix))
                             .cursor_pointer()
@@ -5940,6 +5954,11 @@ impl Render for Workspace {
                             .get(&name)
                             .map(|p| p.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
+                        Some(RightTab::Browser(id)) => self
+                            .browser_views
+                            .get(&id)
+                            .map(|v| v.clone().into_any_element())
+                            .unwrap_or_else(|| gpui::div().into_any_element()),
                         None => gpui::div().into_any_element(),
                     }),
             );
@@ -5974,11 +5993,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
                 this.close_terminal_tab(cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenBrowserGoNoGo, window, cx| {
-                this.open_browser_gonogo(window, cx);
+            .on_action(cx.listener(|this, _: &OpenBrowserTab, window, cx| {
+                this.open_browser_tab(crate::views::browser_view::DEFAULT_URL, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &CloseBrowserGoNoGo, _window, cx| {
-                this.close_browser_gonogo(cx);
+            .on_action(cx.listener(|this, _: &CloseBrowserTab, _window, cx| {
+                this.close_active_browser_tab(cx);
             }))
             .on_action(cx.listener(|this, _: &crate::UndoLastQueued, _window, cx| {
                 this.undo_last_queued(cx);

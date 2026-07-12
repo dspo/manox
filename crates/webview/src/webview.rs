@@ -77,6 +77,16 @@ impl WebView {
         Ok(self.webview.evaluate_script("history.back();")?)
     }
 
+    /// Go forward in the webview history.
+    pub fn forward(&mut self) -> anyhow::Result<()> {
+        Ok(self.webview.evaluate_script("history.forward();")?)
+    }
+
+    /// Reload the current page.
+    pub fn reload(&mut self) -> anyhow::Result<()> {
+        Ok(self.webview.evaluate_script("location.reload();")?)
+    }
+
     pub fn load_url(&mut self, url: &str) {
         self.webview.load_url(url).unwrap();
     }
