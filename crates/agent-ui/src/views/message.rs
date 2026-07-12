@@ -483,13 +483,36 @@ pub fn render_user(
         .map(|mode| approval_mode_color(mode, theme))
         .unwrap_or(theme.accent);
 
+    // A persistent "steered" marker for user messages that entered the list
+    // via the steer-queue drain (mid-turn injection) rather than starting a
+    // fresh turn. Survives reload because it is read back from
+    // `MessageUiMetadata::steered` in `from_message`.
+    let steered_badge = meta.filter(|m| m.steered).map(|_| {
+        gpui::div()
+            .px_1()
+            .py_0p5()
+            .rounded(theme.radius)
+            .bg(accent.opacity(0.15))
+            .text_xs()
+            .text_color(accent)
+            .child(i18n::t("message-steered-badge"))
+    });
+
+    let mut header_el = h_flex()
+        .items_center()
+        .gap_1()
+        .child(SharedString::from(header));
+    if let Some(badge) = steered_badge {
+        header_el = header_el.child(badge);
+    }
+
     TurnFrame::new(theme)
         .group(group.clone())
         .accent(accent)
         .header(
             gpui::div()
                 .text_color(theme.muted_foreground)
-                .child(SharedString::from(header)),
+                .child(header_el),
         )
         .trailing(copy_button_hoverable(
             ix,
