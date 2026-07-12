@@ -3,6 +3,7 @@
 //! Workspace top-level view + `ConversationState` + views. Holds an
 //! `Entity<agent::Thread>` and subscribes to `ThreadEvent` for incremental rendering.
 
+pub mod browser_host;
 pub mod cockpit;
 pub mod conversation;
 pub mod dispatch;

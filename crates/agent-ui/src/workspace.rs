@@ -241,7 +241,7 @@ pub struct Workspace {
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
     /// view via [`manox_webview::webview::WebView`]'s `Drop`.
-    browser_views: BTreeMap<BrowserTabId, Entity<BrowserView>>,
+    pub(crate) browser_views: BTreeMap<BrowserTabId, Entity<BrowserView>>,
     /// Editor pane width, driven by dragging the divider. In-memory only.
     editor_width: Pixels,
     /// Sidebar width, driven by dragging the divider on its right edge.

@@ -60,9 +60,15 @@ impl BrowserView {
         cx: &mut Context<Self>,
     ) -> Self {
         let label = webview_label_for(tab_id);
-        let wry = manox_webview::Builder::default()
+        let builder = manox_webview::Builder::default()
             .with_webview_id(label.as_str())
-            .trust_mode(manox_webview::TrustMode::Untrusted)
+            .trust_mode(manox_webview::TrustMode::Untrusted);
+        // Attach the process-wide notify/inbound bridges. The host is the
+        // single owner of routing; the webview crate's OnceLock keeps the
+        // first-attached closures, so every BrowserView attaches the same
+        // host-owned closures (a later open never finds a stale handler).
+        let builder = crate::browser_host::WorkspaceBrowserHost::attach_to_builder(builder);
+        let wry = builder
             .apply(|b| b.with_url(url))
             .build_as_child(window)
             .expect("manox-webview: build_as_child failed");

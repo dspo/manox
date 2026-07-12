@@ -975,6 +975,12 @@ impl ConversationState {
                 }));
                 ApplyOutcome::Appended
             }
+            ThreadEvent::BrowserNotification { .. } | ThreadEvent::InboundAuthorization { .. } => {
+                // Browser-axis signals are routed for the UI chrome (overlay,
+                // hint, tab state), not rendered as conversation items. The
+                // owning Workspace subscriber handles the surface.
+                ApplyOutcome::None
+            }
         };
 
         // Reconcile the list state with the stale `Retry` badge we popped at

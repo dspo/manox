@@ -365,6 +365,19 @@ fn main() {
                 .expect("failed to open window");
             agent_ui::dispatch::set_window(handle);
 
+            // Wire the process-wide browser host: bind it to the main
+            // Workspace, register it in both the agent trait registry (so the
+            // `web_explore_*` tools reach it via `agent::webview_host::host()`)
+            // and the agent-ui concrete registry (so `BrowserView` attaches the
+            // notify/inbound bridges at build), then spawn the notify/inbound
+            // drainer on the Workspace — a notify ships through the OnceLock
+            // closure with no `&mut App`, so the drainer (which owns an
+            // `AsyncApp`) is the cx-bearing sink that emits onto the owning
+            // thread.
+            if let Some(workspace) = agent_ui::dispatch::workspace_global() {
+                agent_ui::browser_host::WorkspaceBrowserHost::install(workspace.clone(), cx);
+            }
+
             // MCP mode: serve the debug Harness over stdio on the tokio runtime,
             // bridged to the gpui-side dispatcher via an async_channel. The
             // window stays visible. When stdio closes (the agent disconnected),
