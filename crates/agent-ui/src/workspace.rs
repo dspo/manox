@@ -31,11 +31,12 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT, Theme,
-    TitleBar,
+    TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Paste, RopeExt},
     menu::{PopupMenu, PopupMenuItem},
+    notification::Notification,
     tab::{Tab, TabBar},
     tag::{Tag, TagVariant},
     v_flex,
@@ -1099,8 +1100,8 @@ impl Workspace {
                 }
                 SidebarEvent::OpenPlugins => this.enter_plugins(cx),
                 SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
-                SidebarEvent::NewExternalSession(kind) => {
-                    this.spawn_external_session(*kind, cx);
+                SidebarEvent::SpawnExternalSession(kind, provider, model) => {
+                    this.spawn_external_session(*kind, provider.clone(), model.clone(), window, cx);
                 }
                 SidebarEvent::OpenExternalSession(id) => {
                     this.attach_external_session(id, cx);
@@ -1252,25 +1253,22 @@ impl Workspace {
         self.focus_conversation(cx);
     }
 
-    /// Launch a new external agent CLI session (`claude` / `codex` / `copilot`).
-    /// Phase 4 picks the first model whose `visible_agents` declares support
-    /// for the agent's id; Phase 5 replaces this with a provider→model wizard.
-    /// The shared `SessionHandle` backs a `CxSessionSource` PTY source that
-    /// drives a `Terminal`/`TerminalView`, and is also held by the
-    /// `ExternalSession` so the close path can `kill` the agent explicitly.
-    pub fn spawn_external_session(&mut self, kind: SessionKind, cx: &mut Context<Self>) {
+    /// Launch a new external agent CLI session (`claude` / `codex` / `copilot`)
+    /// with a user-picked provider + model (from the sidebar `+` wizard
+    /// cascade). The shared `SessionHandle` backs a `CxSessionSource` PTY
+    /// source that drives a `Terminal`/`TerminalView`, and is also held by the
+    /// `ExternalSession` so the close path can `kill` the agent explicitly. A
+    /// spawn failure (binary missing / apikey parse / unsupported combo) pushes
+    /// an error notification and leaves the sidebar untouched.
+    pub fn spawn_external_session(
+        &mut self,
+        kind: SessionKind,
+        provider_name: String,
+        model_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let agent_id = kind.agent_id();
-        let (provider_name, model_id) = match registry::global()
-            .models()
-            .iter()
-            .find(|m| m.visible_agents().iter().any(|a| a == agent_id))
-        {
-            Some(m) => (m.provider_name().to_string(), m.id().to_string()),
-            None => {
-                tracing::error!(agent = agent_id, "no model configured for external agent");
-                return;
-            }
-        };
         let handle = match cx::AgentBuilder::new()
             .agent(kind.agent())
             .pty(true)
@@ -1281,6 +1279,13 @@ impl Workspace {
             Ok(h) => Arc::new(h),
             Err(e) => {
                 tracing::error!(error = %e, agent = agent_id, "external agent spawn failed");
+                window.push_notification(
+                    Notification::error(format!(
+                        "{}: {e}",
+                        i18n::t("external-session-start-failed")
+                    )),
+                    cx,
+                );
                 return;
             }
         };
@@ -1291,6 +1296,13 @@ impl Workspace {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to create terminal for external session");
+                    window.push_notification(
+                        Notification::error(format!(
+                            "{}: {e}",
+                            i18n::t("external-session-start-failed")
+                        )),
+                        cx,
+                    );
                     return;
                 }
             };
