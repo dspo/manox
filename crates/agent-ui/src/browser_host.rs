@@ -688,7 +688,7 @@ impl BrowserHost for WorkspaceBrowserHost {
         })
     }
 
-    fn close_tab(&self, id: BrowserTabId, cx: &mut App) {
+    fn close_tab(&self, id: BrowserTabId, cx: &mut App) -> Result<(), String> {
         // Reclaim the routing state first so any in-flight notify for this tab
         // finds no entry and is dropped (no orphaned oneshot resolution).
         let label = self
@@ -698,15 +698,19 @@ impl BrowserHost for WorkspaceBrowserHost {
             .expect("routes lock poisoned")
             .remove(&id)
             .map(|t| t.label);
-        if let Some(label) = label {
-            self.routes
-                .label_to_tab
-                .lock()
-                .expect("routes lock poisoned")
-                .remove(&label);
-        }
+        // A tab id absent from the routes table is unknown — surfacing it as an
+        // error stops a stale id from producing a false "closed" confirmation.
+        let Some(label) = label else {
+            return Err(format!("browser host: no tab with id {id}"));
+        };
+        self.routes
+            .label_to_tab
+            .lock()
+            .expect("routes lock poisoned")
+            .remove(&label);
         if let Some(ws) = self.weak_ws.upgrade() {
             ws.update(cx, |ws, cx| ws.close_browser_tab(id, cx));
         }
+        Ok(())
     }
 }

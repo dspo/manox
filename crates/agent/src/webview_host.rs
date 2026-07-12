@@ -104,8 +104,10 @@ pub trait BrowserHost: Send + Sync {
     /// Yield control of the tab to the user (e.g. for a login handshake). The
     /// returned `Task` resolves once the user triggers `UserHandback`.
     fn yield_to_user(&self, id: BrowserTabId, cx: &mut App) -> Task<Result<(), String>>;
-    /// Close and reclaim the tab.
-    fn close_tab(&self, id: BrowserTabId, cx: &mut App);
+    /// Close and reclaim the tab. Returns `Err` if `id` does not identify an
+    /// open tab, so a stale id surfaces as a tool error rather than a silent
+    /// no-op confirmation.
+    fn close_tab(&self, id: BrowserTabId, cx: &mut App) -> Result<(), String>;
 }
 
 static HOST: OnceLock<Arc<dyn BrowserHost>> = OnceLock::new();

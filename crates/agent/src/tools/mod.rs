@@ -21,6 +21,7 @@ pub mod monitor;
 pub mod read_file;
 pub mod self_info;
 pub mod skill;
+pub mod web_explore;
 pub mod worktree;
 pub mod write_file;
 
@@ -295,6 +296,16 @@ pub fn main_registry_with_policy(
     // Thread's cwd and rebuild its tool registry on enter/exit.
     reg.register(Arc::new(worktree::EnterWorktreeTool::new(parent.clone())) as AnyAgentTool);
     reg.register(Arc::new(worktree::ExitWorktreeTool::new(parent.clone())) as AnyAgentTool);
+
+    // Built-in browser tools (`web_explore_*`): main-thread-only. They reach
+    // the browser host through `webview_host::host()`, registered at App
+    // startup by agent-ui; sub-agents never see these, and plan mode filters
+    // out the write variants via `is_read_only` (leaving read_text / read_dom /
+    // screenshot exposed). One-time registration — the tool-spec fingerprint
+    // settles once across turns, so the provider prefix cache is unaffected.
+    for tool in web_explore::all_tools() {
+        reg.register(tool);
+    }
 
     // Team coordination tools (shared by the leader and every worker member).
     // Registering here is a one-time tool-spec fingerprint change — stable
