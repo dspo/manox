@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use gpui::Entity;
+use gpui::{Entity, Subscription};
 
 use terminal_ui::TerminalView;
 
@@ -58,6 +58,13 @@ impl SessionKind {
 ///
 /// The `id` is namespaced `external:<kind>:<uuid>` so it never collides with a
 /// manox thread UUID in the sidebar's selection namespace.
+///
+/// `_exit_sub` observes the terminal's `ChildExit` event so a natural CLI exit
+/// (e.g. `/exit` in claude) tears the session down without the user clicking ×.
+/// It lives on the session so an explicit close detaches it first; once
+/// detached, the killed child's eventual reap emits `ChildExit` into a
+/// listener set that no longer holds this observer, so the close path is the
+/// sole remover and there is no double-removal.
 pub struct ExternalSession {
     pub id: String,
     pub kind: SessionKind,
@@ -65,6 +72,7 @@ pub struct ExternalSession {
     pub model_id: String,
     pub terminal_view: Entity<TerminalView>,
     pub handle: Arc<cx::SessionHandle>,
+    pub _exit_sub: Subscription,
 }
 
 impl ExternalSession {

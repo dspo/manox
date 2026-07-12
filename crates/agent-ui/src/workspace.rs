@@ -1309,6 +1309,18 @@ impl Workspace {
                     return;
                 }
             };
+        // Tear the session down when the CLI exits on its own (e.g. `/exit`),
+        // without waiting for the user to click ×. The subscription lives on
+        // the session so a later close detaches it before any spurious event.
+        let exit_id = id.clone();
+        let exit_sub = cx.subscribe(
+            &terminal,
+            move |this, _terminal, ev: &terminal::event::TerminalEvent, cx| {
+                if let terminal::event::TerminalEvent::ChildExit(_) = ev {
+                    this.remove_external_session(&exit_id, cx);
+                }
+            },
+        );
         let view = TerminalView::new(terminal, cx);
         self.external_sessions.push(ExternalSession {
             id: id.clone(),
@@ -1317,6 +1329,7 @@ impl Workspace {
             model_id,
             terminal_view: view,
             handle,
+            _exit_sub: exit_sub,
         });
         self.sync_sidebar_external(cx);
         self.attach_external_session(&id, cx);
@@ -1337,25 +1350,37 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Kill an external session and remove it. If it was the active session,
-    /// fall back to the conversation pane. Dropping the `ExternalSession` drops
-    /// its `TerminalView` (and thus the `Terminal` + `CxSessionSource`); the
-    /// explicit `handle.kill()` ensures the child is terminated even if the
-    /// reader thread is mid-`read`.
+    /// Kill an external session and remove it (the sidebar `×` path). The
+    /// explicit `handle.kill()` unblocks the reader thread even mid-`read`, so
+    /// the terminal drains instead of hanging on a dead PTY; `kill` on an
+    /// already-dead child is best-effort (warn-logged). Removal itself —
+    /// including sidebar sync + fallback-to-conversation — is shared with the
+    /// natural-exit path in [`remove_external_session`].
     pub fn close_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
-        let pos = self.external_sessions.iter().position(|s| s.id == id);
-        let Some(pos) = pos else {
-            return;
-        };
-        let session = self.external_sessions.remove(pos);
-        if let Err(e) = session.handle.kill() {
-            // Best-effort: the child may already be dead (natural exit). Log and
-            // continue with the rest of the cleanup rather than stranding the
-            // sidebar row.
+        let kill_handle = self
+            .external_sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| Arc::clone(&s.handle));
+        if let Some(handle) = kill_handle
+            && let Err(e) = handle.kill()
+        {
             tracing::warn!(error = %e, id, "external session kill failed");
         }
-        drop(session);
-        if self.active_external.as_deref() == Some(id) {
+        self.remove_external_session(id, cx);
+    }
+
+    /// Remove an external session without killing the child — the natural-exit
+    /// path (the `ChildExit` subscription fired because the CLI already exited).
+    /// Dropping the `ExternalSession` drops its `TerminalView` (and thus the
+    /// `Terminal` + `CxSessionSource`); the last `Arc<SessionHandle>` ref then
+    /// drops, and cx's `SessionHandle::Drop` does best-effort reap + socket
+    /// cleanup. If the removed session was the active one, fall back to the
+    /// conversation pane.
+    fn remove_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        let was_active = self.active_external.as_deref() == Some(id);
+        self.external_sessions.retain(|s| s.id != id);
+        if was_active {
             self.active_external = None;
             self.focus_conversation(cx);
         }
