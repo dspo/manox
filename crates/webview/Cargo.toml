@@ -1,0 +1,18 @@
+[package]
+name = "manox-webview"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "manox_webview"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+wry.workspace = true
+raw-window-handle.workspace = true
+
+[lints.clippy]
+dbg_macro = "deny"
