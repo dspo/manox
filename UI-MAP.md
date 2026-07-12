@@ -112,7 +112,7 @@ Full-window plugin/skill/MCP manager.
 Full-window terminal emulator.
 
 #### ViewMode::ExternalSession
-Full-window external agent CLI session (claude / codex / copilot). Renders the active `ExternalSession`'s `TerminalView` (the agent's TUI) in place of the conversation, with a TitleBar showing the agent kind + provider/model and a `×` that kills the session. Lives in memory only — never persisted; closing the session removes its sidebar row.
+Full-window external agent CLI session (claude / codex / copilot). Renders the active `ExternalSession`'s `TerminalView` (the agent's TUI) in place of the conversation, with a TitleBar showing the agent kind + provider/model and a `×` that kills the session. Lives in memory only — never persisted; the sidebar row is removed both on `×` (explicit kill) and when the CLI exits on its own (a `ChildExit` subscription on the terminal tears the session down without user action). If the removed session was the active one, the view falls back to the conversation pane.
 
 ---
 
