@@ -654,12 +654,43 @@ fn is_function_call_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("function_call")
 }
 
+/// Normalize an OpenAI Responses `usage` object into manox's `TokenUsage`.
+///
+/// Wire semantics (per OpenAI Responses API docs): `input_tokens` **includes**
+/// the cached subset — `input_tokens_details.cached_tokens` is the portion of
+/// `input_tokens` served from the prompt cache, not an additional count. manox's
+/// `TokenUsage.input_tokens` field means *non-cached* input, so we subtract the
+/// cached tokens out; otherwise `total_tokens()` (which sums input, output,
+/// cache_read and cache_creation) would double-count the cached tokens in both
+/// `input_tokens` and `cache_read_input_tokens`.
 fn update_responses_usage(usage: &mut TokenUsage, value: &Value) {
-    if let Some(v) = value.get("input_tokens").and_then(Value::as_u64) {
-        usage.input_tokens = v;
-    }
-    if let Some(v) = value.get("output_tokens").and_then(Value::as_u64) {
+    let raw_input = value.get("input_tokens").and_then(Value::as_u64);
+    let cached = value
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64);
+    let output = value.get("output_tokens").and_then(Value::as_u64);
+
+    if let Some(v) = output {
         usage.output_tokens = v;
+    }
+    match (raw_input, cached) {
+        (Some(input), Some(c)) => {
+            // input_tokens includes cached_tokens; split into non-cached input
+            // and cache-read so neither field double-counts the cached subset.
+            usage.input_tokens = input.saturating_sub(c);
+            usage.cache_read_input_tokens = c;
+        }
+        (Some(input), None) => {
+            // No cache details reported: input_tokens is already non-cached.
+            usage.input_tokens = input;
+        }
+        (None, Some(c)) => {
+            // No top-level input_tokens but cached_tokens present: treat the
+            // entire reported input as cached (non-cached input = 0).
+            usage.cache_read_input_tokens = c;
+        }
+        (None, None) => {}
     }
 }
 
@@ -956,5 +987,66 @@ mod tests {
         }
         assert!(texts > 0, "应至少收到一个 Text 事件");
         assert!(stopped, "应收到 Stop 事件");
+    }
+
+    /// OpenAI Responses `input_tokens` *includes* `cached_tokens`; the parser
+    /// must split them so `total_tokens()` does not double-count the cached
+    /// subset in both `input_tokens` and `cache_read_input_tokens`.
+    #[test]
+    fn update_responses_usage_splits_cached_tokens_no_double_count() {
+        let mut usage = TokenUsage::default();
+        let value = json!({
+            "input_tokens": 1000,
+            "input_tokens_details": { "cached_tokens": 800 },
+            "output_tokens": 200
+        });
+        update_responses_usage(&mut usage, &value);
+        // Non-cached input = 1000 - 800; cache-read = the cached subset.
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 800);
+        assert_eq!(usage.output_tokens, 200);
+        // The cached subset is not counted in both input and cache_read.
+        assert_eq!(
+            usage.input_tokens + usage.cache_read_input_tokens,
+            1000,
+            "input + cache_read must reconstruct the wire input_tokens"
+        );
+        // total_tokens() must not double-count cached tokens.
+        assert_eq!(
+            usage.total_tokens(),
+            200 + 200 + 800,
+            "total_tokens must equal non-cached input + output + cache_read"
+        );
+    }
+
+    /// Endpoints that report `input_tokens` without `input_tokens_details` (or
+    /// with a non-numeric `cached_tokens`) must not panic and must keep
+    /// `input_tokens` as the full non-cached count.
+    #[test]
+    fn update_responses_usage_without_cached_details_no_panic() {
+        let mut usage = TokenUsage::default();
+        let value = json!({
+            "input_tokens": 500,
+            "output_tokens": 50
+        });
+        update_responses_usage(&mut usage, &value);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.total_tokens(), 550);
+    }
+
+    /// `input_tokens_details` present but missing `cached_tokens` must not panic.
+    #[test]
+    fn update_responses_usage_with_details_but_no_cached_field_no_panic() {
+        let mut usage = TokenUsage::default();
+        let value = json!({
+            "input_tokens": 500,
+            "input_tokens_details": {},
+            "output_tokens": 50
+        });
+        update_responses_usage(&mut usage, &value);
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.cache_read_input_tokens, 0);
     }
 }
