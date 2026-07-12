@@ -133,6 +133,44 @@ impl TokenMeter {
         }
         self.current_request = TokenUsage::default();
     }
+
+    /// Fold a side-LLM call's usage (e.g. a compaction summarization pass) into
+    /// the cumulative and per-model totals only. The call has no triggering
+    /// user message, so it must not touch `current_request` — otherwise the
+    /// next `finalize_request` would stamp the side-call tokens onto whatever
+    /// user message follows, and the next turn's delta would diff against the
+    /// side call's running total instead of zero.
+    pub fn accumulate_side_call_usage(&mut self, new: TokenUsage, model: &str) {
+        self.cumulative = TokenUsage {
+            input_tokens: self
+                .cumulative
+                .input_tokens
+                .saturating_add(new.input_tokens),
+            output_tokens: self
+                .cumulative
+                .output_tokens
+                .saturating_add(new.output_tokens),
+            cache_creation_input_tokens: self
+                .cumulative
+                .cache_creation_input_tokens
+                .saturating_add(new.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cumulative
+                .cache_read_input_tokens
+                .saturating_add(new.cache_read_input_tokens),
+        };
+        let entry = self.per_model.entry(model.to_owned()).or_default();
+        *entry = TokenUsage {
+            input_tokens: entry.input_tokens.saturating_add(new.input_tokens),
+            output_tokens: entry.output_tokens.saturating_add(new.output_tokens),
+            cache_creation_input_tokens: entry
+                .cache_creation_input_tokens
+                .saturating_add(new.cache_creation_input_tokens),
+            cache_read_input_tokens: entry
+                .cache_read_input_tokens
+                .saturating_add(new.cache_read_input_tokens),
+        };
+    }
 }
 
 #[cfg(test)]
@@ -233,5 +271,67 @@ mod tests {
         // Cumulative tracks the overall total.
         assert_eq!(m.cumulative.input_tokens, 350);
         assert_eq!(m.cumulative.output_tokens, 80);
+    }
+
+    /// A side-LLM call (e.g. compaction summarization) has no triggering user
+    /// message. Its usage accrues to cumulative + per-model but must not touch
+    /// `current_request` or `per_request` — otherwise the next `finalize_request`
+    /// stamps the side-call tokens onto the following user message and the next
+    /// turn diffs against the side call's running total instead of zero.
+    #[test]
+    fn accumulate_side_call_does_not_pollute_current_or_per_request() {
+        let mut m = TokenMeter::default();
+
+        // A prior turn finalized a user message's usage.
+        m.accumulate_for_model(
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                ..Default::default()
+            },
+            "model-a",
+        );
+        m.finalize_request(Some("uid-1"));
+        assert_eq!(m.current_request, TokenUsage::default());
+
+        // Side-call usage lands (e.g. a compaction summarization pass).
+        let side = TokenUsage {
+            input_tokens: 5_000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        m.accumulate_side_call_usage(side, "model-a");
+
+        // Cumulative + per-model pick it up.
+        assert_eq!(m.cumulative.input_tokens, 5_100);
+        assert_eq!(m.cumulative.output_tokens, 510);
+        assert_eq!(m.per_model.get("model-a").unwrap().input_tokens, 5_100);
+        assert_eq!(m.per_model.get("model-a").unwrap().output_tokens, 510);
+
+        // current_request stays zero — the next turn diffs from zero.
+        assert_eq!(m.current_request, TokenUsage::default());
+
+        // per_request for the finalized user message is unchanged — the side
+        // call is not attributed to it, and no new per_request entry appears.
+        assert_eq!(
+            m.per_request.get("uid-1").copied(),
+            Some(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                ..Default::default()
+            })
+        );
+        assert_eq!(m.per_request.len(), 1);
+
+        // The next real turn's delta is computed against zero, not the side call.
+        let next = TokenUsage {
+            input_tokens: 200,
+            output_tokens: 20,
+            ..Default::default()
+        };
+        m.accumulate_for_model(next, "model-a");
+        // Delta = 200 in, 20 out — not 200 - 5_000.
+        assert_eq!(m.cumulative.input_tokens, 5_300);
+        assert_eq!(m.cumulative.output_tokens, 530);
     }
 }

@@ -1304,6 +1304,19 @@ impl Thread {
         self.token_meter.last_request(self.last_user_message_id())
     }
 
+    /// The most recent user message's reported usage, skipping a trailing
+    /// just-submitted prompt that has no usage yet. Stable while a new turn
+    /// warms up — the cockpit budget display reads this so it holds the last
+    /// real budget instead of falling back to a fake 100%. Uses the same rule
+    /// as `auto_compaction_target` so the trigger and the display agree.
+    pub fn latest_reported_request_token_usage(&self) -> Option<TokenUsage> {
+        crate::compact::latest_reported_request_usage(
+            &self.messages,
+            self.token_meter.per_request(),
+        )
+        .map(|(_, u)| u)
+    }
+
     /// Per-model cumulative token usage, keyed by model display name.
     pub fn per_model_token_usage(&self) -> &HashMap<String, TokenUsage> {
         self.token_meter.per_model()
@@ -1859,11 +1872,17 @@ impl Thread {
             .read_with(cx, |this, _| insertion_ix.min(this.messages.len()))
             .unwrap_or(insertion_ix);
         this.update(cx, |this, cx| {
-            // Attribute the side call's tokens to the cumulative meter (no
-            // per-user-message attribution — the call has no triggering user
-            // message). Emitted so the UI counter reflects the spend.
+            // Attribute the side call's tokens to the cumulative + per-model
+            // meter only — no per-user-message attribution, and never touch
+            // `current_request` (the call has no triggering user message, so
+            // stamping its tokens there would let the next `finalize_request`
+            // mis-attribute them to the following user message). Emitted so the
+            // UI counter reflects the spend.
             if let Some(u) = usage {
-                this.accumulate_token_usage(u);
+                if let Some(model) = this.model.as_ref() {
+                    this.token_meter
+                        .accumulate_side_call_usage(u, &model.name());
+                }
                 cx.emit(ThreadEvent::TokenUsageUpdated(
                     this.cumulative_token_usage(),
                 ));
@@ -5244,4 +5263,3 @@ mod tests {
         );
     }
 }
-
