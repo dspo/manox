@@ -320,9 +320,8 @@ impl WorkspaceBrowserHost {
             // JoinHandle is then polled here on the gpui background executor —
             // polling a JoinHandle needs no reactor context, unlike
             // tokio::time itself.
-            let join = agent::runtime::handle().spawn(async move {
-                tokio::time::timeout(Duration::from_secs(60), rx).await
-            });
+            let join = agent::runtime::handle()
+                .spawn(async move { tokio::time::timeout(Duration::from_secs(60), rx).await });
             let result = match join.await {
                 Ok(Ok(Ok(payload))) => {
                     if let Some(msg) = payload.get("__error").and_then(|v| v.as_str()) {
@@ -331,12 +330,12 @@ impl WorkspaceBrowserHost {
                         Ok(stringify_value(&payload))
                     }
                 }
-                Ok(Ok(Err(_))) => Err(
-                    "browser host: eval was cancelled before the page responded".to_string(),
-                ),
-                Ok(Err(_)) => Err(
-                    "browser host: eval timed out (60s) — the page did not respond".to_string(),
-                ),
+                Ok(Ok(Err(_))) => {
+                    Err("browser host: eval was cancelled before the page responded".to_string())
+                }
+                Ok(Err(_)) => {
+                    Err("browser host: eval timed out (60s) — the page did not respond".to_string())
+                }
                 Err(_) => Err("browser host: eval task failed".to_string()),
             };
             // The notify handler already removed the sender on success; on the
@@ -385,13 +384,12 @@ fn handle_notify(routes: &Arc<Routes>, tx: &Sender<HostMessage>, label: String, 
         None => return, // stale label — the tab was closed before the notify landed
     };
     match &n {
-        WvNotification::EvalResult { request_id, .. } => {
+        WvNotification::EvalResult {
+            request_id,
+            payload,
+        } => {
             let req_id = *request_id;
-            let payload = if let WvNotification::EvalResult { payload, .. } = &n {
-                payload.clone()
-            } else {
-                unreachable!()
-            };
+            let payload = payload.clone();
             if let Some(tab) = routes
                 .tabs
                 .lock()
