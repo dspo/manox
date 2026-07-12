@@ -9,11 +9,11 @@
 // JSON 信封字段: v, agent, event, session_id, cwd, project（+ 可选扩展字段）
 
 use serde::Serialize;
-use std::cell::Cell;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 检查当前终端是否支持 Warp CLI agent 协议。
 fn is_warp_terminal() -> bool {
@@ -47,16 +47,16 @@ struct AgentEvent {
 ///
 /// 实现 `Drop`：当 `WarpSession` 被丢弃时（包括 panic 导致的提前退出），
 /// 自动发出 `stop` 事件，确保 Warp 侧边栏不会残留 "running" 状态。
-pub struct WarpSession {
+pub(crate) struct WarpSession {
     agent_id: String,
     session_id: String,
     model: Option<String>,
-    stopped: Cell<bool>,
+    stopped: AtomicBool,
 }
 
 impl WarpSession {
     /// 返回 session ID，供传递给子进程环境变量使用。
-    pub fn session_id(&self) -> &str {
+    pub(crate) fn session_id(&self) -> &str {
         &self.session_id
     }
 
@@ -64,11 +64,11 @@ impl WarpSession {
     ///
     /// 幂等：多次调用只发出一次事件。
     /// `exit_code` 为 agent 进程的退出码；异常退出（信号终止等）时为 `None`。
-    pub fn emit_stop(&self, exit_code: Option<i32>) {
-        if self.stopped.get() {
+    pub(crate) fn emit_stop(&self, exit_code: Option<i32>) {
+        if self.stopped.load(Ordering::Relaxed) {
             return;
         }
-        self.stopped.set(true);
+        self.stopped.store(true, Ordering::Relaxed);
         emit_event(&AgentEvent {
             v: 1,
             agent: self.agent_id.clone(),
@@ -84,7 +84,7 @@ impl WarpSession {
 
 impl Drop for WarpSession {
     fn drop(&mut self) {
-        if !self.stopped.get() {
+        if !self.stopped.load(Ordering::Relaxed) {
             emit_event(&AgentEvent {
                 v: 1,
                 agent: self.agent_id.clone(),
@@ -99,11 +99,21 @@ impl Drop for WarpSession {
     }
 }
 
+/// Compile-time guarantee that `WarpSession` is shareable across threads,
+/// mirroring the `SessionHandle` invariant: `emit_stop` may run on a finalizer
+/// thread while `Drop` runs on whichever thread drops the last ref.
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _f() {
+        _assert_send_sync::<WarpSession>();
+    }
+};
+
 /// 如果运行在 Warp 终端中，发出 session_start 事件并返回会话句柄。
 ///
 /// 返回的 `WarpSession` 可用于后续发出 stop 事件。
 /// 非 Warp 环境或 `/dev/tty` 不可用时返回 `None`。
-pub fn maybe_emit_session_start(agent_id: &str, model: Option<&str>) -> Option<WarpSession> {
+pub(crate) fn maybe_emit_session_start(agent_id: &str, model: Option<&str>) -> Option<WarpSession> {
     if !is_warp_terminal() {
         return None;
     }
@@ -113,7 +123,7 @@ pub fn maybe_emit_session_start(agent_id: &str, model: Option<&str>) -> Option<W
         agent_id: agent_id.to_string(),
         session_id,
         model: model.map(|s| s.to_string()),
-        stopped: Cell::new(false),
+        stopped: AtomicBool::new(false),
     };
 
     emit_event(&AgentEvent {

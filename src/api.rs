@@ -234,10 +234,14 @@ pub struct SessionResult {
 /// writer channel rather than touching the master directly. The child, reader,
 /// writer channel, injection socket, and Warp/warp stop bookkeeping all live
 /// here so `wait` / `Drop` can finalize them without `process::exit`.
+///
+/// `child` and `finalized` are guarded so `wait`/`kill_wait` take `&self`:
+/// a library caller can hold the handle behind `Arc` and still read, write,
+/// resize, and reap from shared references.
 pub struct SessionHandle {
-    child: Option<Box<dyn portable_pty::Child + Send>>,
+    child: Mutex<Option<Box<dyn portable_pty::Child + Send>>>,
     reader: Mutex<Box<dyn Read + Send>>,
-    writer_tx: mpsc::Sender<WriteReq>,
+    writer_tx: Mutex<mpsc::Sender<WriteReq>>,
     resize_flag: Arc<AtomicBool>,
     accept_shutdown: Arc<AtomicBool>,
     session_id: String,
@@ -251,7 +255,7 @@ pub struct SessionHandle {
     model_id: Option<String>,
     warp_session: Option<WarpSession>,
     started_at: Instant,
-    finalized: bool,
+    finalized: AtomicBool,
 }
 
 impl SessionHandle {
@@ -310,9 +314,9 @@ impl SessionHandle {
         writer_loop(writer, rx, master, resize_flag.clone());
 
         Ok(Self {
-            child: Some(child),
+            child: Mutex::new(Some(child)),
             reader: Mutex::new(reader),
-            writer_tx: tx,
+            writer_tx: Mutex::new(tx),
             resize_flag,
             accept_shutdown,
             session_id,
@@ -323,7 +327,7 @@ impl SessionHandle {
             model_id: spec.model_id.clone(),
             warp_session,
             started_at,
-            finalized: false,
+            finalized: AtomicBool::new(false),
         })
     }
 
@@ -341,6 +345,8 @@ impl SessionHandle {
         let mut bytes = text.as_bytes().to_vec();
         bytes.push(b'\n');
         self.writer_tx
+            .lock()
+            .expect("writer_tx mutex poisoned")
             .send(WriteReq::Bytes(bytes))
             .map_err(|_| anyhow!("agent 已退出，写入失败"))
     }
@@ -357,6 +363,8 @@ impl SessionHandle {
     /// not `Sync`.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.writer_tx
+            .lock()
+            .expect("writer_tx mutex poisoned")
             .send(WriteReq::Resize(cols, rows))
             .map_err(|_| anyhow!("agent 已退出，resize 失败"))
     }
@@ -367,14 +375,27 @@ impl SessionHandle {
         self.resize_flag.clone()
     }
 
-    pub(crate) fn writer_tx(&self) -> &mpsc::Sender<WriteReq> {
-        &self.writer_tx
+    pub(crate) fn writer_tx(&self) -> mpsc::Sender<WriteReq> {
+        self.writer_tx
+            .lock()
+            .expect("writer_tx mutex poisoned")
+            .clone()
     }
 
     /// Block until the agent exits naturally, then clean up (IPC socket +
     /// registry, Warp stop event) and return the outcome. Does not print or exit.
-    pub fn wait(mut self) -> Result<SessionResult> {
-        let mut child = self.child.take().context("child already reaped")?;
+    ///
+    /// Takes `&self` so a caller sharing the handle behind `Arc` can reap it
+    /// from a background thread without giving up ownership. The child is taken
+    /// out of its `Mutex` and reaped here; a second call returns
+    /// `child already reaped`.
+    pub fn wait(&self) -> Result<SessionResult> {
+        let mut child = self
+            .child
+            .lock()
+            .expect("child mutex poisoned")
+            .take()
+            .context("child already reaped")?;
         let status = child
             .wait()
             .unwrap_or_else(|_| PtyExitStatus::with_exit_code(1));
@@ -383,8 +404,8 @@ impl SessionHandle {
 
     /// Kill the child, reap it, finalize, and return the outcome. Used by the
     /// CLI on the raw-mode-failure path where the agent must be torn down.
-    pub(crate) fn kill_wait(mut self) -> SessionResult {
-        let status = match self.child.take() {
+    pub(crate) fn kill_wait(&self) -> SessionResult {
+        let status = match self.child.lock().expect("child mutex poisoned").take() {
             Some(mut child) => {
                 let _ = child.kill();
                 child
@@ -398,7 +419,7 @@ impl SessionHandle {
 
     /// Compute exit code/termination, remove the IPC socket + registry, emit the
     /// Warp stop, and mark finalized so `Drop` is a no-op. Returns the result.
-    fn finalize(&mut self, status: &PtyExitStatus) -> SessionResult {
+    fn finalize(&self, status: &PtyExitStatus) -> SessionResult {
         let exit_code = crate::relay::pty_exit_code(status);
         let termination = if status.success() && exit_code == 0 {
             None
@@ -422,7 +443,7 @@ impl SessionHandle {
             ws.emit_stop(Some(exit_code));
         }
 
-        self.finalized = true;
+        self.finalized.store(true, Ordering::Relaxed);
         SessionResult {
             exit_code,
             termination,
@@ -439,9 +460,9 @@ impl Drop for SessionHandle {
         // Only when the caller dropped without `wait`/`kill_wait`: best-effort
         // kill + reap so the child is not orphaned, then remove session files.
         // The Warp stop is handled by `WarpSession`'s own Drop (exit_code None).
-        if !self.finalized {
+        if !self.finalized.load(Ordering::Relaxed) {
             self.accept_shutdown.store(true, Ordering::Relaxed);
-            if let Some(mut child) = self.child.take() {
+            if let Some(mut child) = self.child.lock().expect("child mutex poisoned").take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -452,6 +473,16 @@ impl Drop for SessionHandle {
         }
     }
 }
+
+/// Compile-time guarantee that a `SessionHandle` is shareable behind `Arc`
+/// across threads — a host (manox) reads from a background thread, writes /
+/// resizes from the UI thread, and reaps from a waiter thread.
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _f() {
+        _assert_send_sync::<SessionHandle>();
+    }
+};
 
 #[cfg(test)]
 mod tests {

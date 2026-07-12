@@ -34,6 +34,7 @@ use transfer::stdin_forward;
 /// spawn/IPC/writer lifecycle is delegated to `SessionHandle`.
 pub(crate) fn run(spec: &LaunchSpec, warp_session: Option<WarpSession>) -> ! {
     let started_sys = SystemTime::now();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     // Launch banner in cooked mode before raw mode swallows the newlines. The
     // socket line is appended once the handle has bound its IPC socket (below),
@@ -69,7 +70,7 @@ pub(crate) fn run(spec: &LaunchSpec, warp_session: Option<WarpSession>) -> ! {
     if let Err(e) = enable_raw_mode() {
         eprintln!("cx: 进入 raw mode 失败: {e}");
         let res = handle.kill_wait();
-        print_exit_summary(&res, started_sys);
+        print_exit_summary(&res, started_sys, &cwd);
         std::process::exit(res.exit_code);
     }
     let _raw_guard = RawGuard;
@@ -80,7 +81,7 @@ pub(crate) fn run(spec: &LaunchSpec, warp_session: Option<WarpSession>) -> ! {
         eprintln!("cx: 注册 SIGWINCH 失败（窗口缩放将不生效）: {e}");
     }
 
-    stdin_forward(handle.writer_tx().clone());
+    stdin_forward(handle.writer_tx());
 
     // Pump master output to stdout, flushing per write so the agent's TUI renders
     // without buffering stalls. EOF (read 0) means the agent closed its stdout.
@@ -113,14 +114,14 @@ pub(crate) fn run(spec: &LaunchSpec, warp_session: Option<WarpSession>) -> ! {
         }
     };
     let _ = disable_raw_mode();
-    print_exit_summary(&res, started_sys);
+    print_exit_summary(&res, started_sys, &cwd);
     std::process::exit(res.exit_code);
 }
 
 /// Print the inline exit summary (agent/provider/model/duration/tokens/termination),
 /// matching `finalize_exit_common`'s formatting for the direct-launch path.
-fn print_exit_summary(res: &crate::SessionResult, started_sys: SystemTime) {
-    let tokens = crate::stats::count_recent_session_tokens(&res.agent_id, started_sys);
+fn print_exit_summary(res: &crate::SessionResult, started_sys: SystemTime, cwd: &std::path::Path) {
+    let tokens = crate::stats::count_recent_session_tokens(&res.agent_id, started_sys, cwd);
     println!();
     println!(
         "{}",

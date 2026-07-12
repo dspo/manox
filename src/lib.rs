@@ -2118,6 +2118,7 @@ fn finalize_agent_exit(
         exit_code,
         termination.as_deref(),
         warp_session,
+        cwd,
         None,
     )
 }
@@ -2138,6 +2139,7 @@ pub(crate) fn finalize_exit_common(
     exit_code: i32,
     termination: Option<&str>,
     warp_session: &Option<warp::WarpSession>,
+    cwd: &Path,
     session_id: Option<&str>,
 ) -> ! {
     let duration = started_at.elapsed();

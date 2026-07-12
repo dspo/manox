@@ -3,6 +3,10 @@ name = "cx"
 version = "0.2.0"
 edition = "2024"
 
+[lib]
+name = "cx"
+path = "src/lib.rs"
+
 [workspace]
 members = ["crates/cx-providers"]
 
