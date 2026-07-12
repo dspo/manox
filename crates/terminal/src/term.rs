@@ -1,8 +1,8 @@
 //! `Terminal` Entity — the gpui state machine wrapping an alacritty `Term`.
 //!
 //! `Terminal` owns an `Arc<FairMutex<ManoxTerm>>` (the alacritty grid/ANSI
-//! engine), a `PtyHandle`, and a gpui task that drains the event channel:
-//! `PtyOutput` is fed back into the Term under the lock; the rest are
+//! engine), a `Box<dyn PtySource>`, and a gpui task that drains the event
+//! channel: `PtyOutput` is fed back into the Term under the lock; the rest are
 //! re-emitted via `EventEmitter<TerminalEvent>` for the view layer.
 //!
 //! The Term lock is taken only on the gpui side. The PTY reader/writer
@@ -23,7 +23,7 @@ use anyhow::Result;
 use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Context, Entity, EventEmitter, Task};
 
 use crate::event::{ManoxListener, TerminalEvent};
-use crate::pty;
+use crate::pty_source::PtySource;
 use crate::settings::{BellMode, CursorShapeSetting, Osc52Access, TerminalSettings};
 
 pub(crate) type ManoxTerm = Term<ManoxListener>;
@@ -85,7 +85,7 @@ pub struct Terminal {
     pub cols: usize,
     pub rows: usize,
     term: Arc<ManoxTermLock>,
-    pty: pty::PtyHandle,
+    pty: Box<dyn PtySource>,
     output_processor: Processor<StdSyncHandler>,
     pub child_exited: Option<i32>,
     pub title: Option<String>,
@@ -97,14 +97,17 @@ pub struct Terminal {
 impl EventEmitter<TerminalEvent> for Terminal {}
 
 impl Terminal {
-    /// Create a Terminal running the user's shell in `cwd`. Shell, font,
-    /// scrollback, cursor, bell, and OSC 52 policy come from
-    /// `[terminal]` in `settings.toml`.
+    /// Create a Terminal running the given `pty` source in `cwd`. Font,
+    /// scrollback, cursor, bell, and OSC 52 policy come from `[terminal]` in
+    /// settings.toml; the PTY itself (shell, env) is supplied by the caller via
+    /// the `PtySource`. The source is started here — its reader / waiter
+    /// threads begin emitting events onto the channel the gpui task drains.
     pub fn new(
         id: String,
         cwd: PathBuf,
         cols: usize,
         rows: usize,
+        mut pty: Box<dyn PtySource>,
         cx: &mut App,
     ) -> Result<Entity<Self>> {
         let settings = crate::settings::load();
@@ -113,16 +116,11 @@ impl Terminal {
         let cfg = build_config(&settings);
         let size = TermSize { cols, rows };
         let term = Arc::new(FairMutex::new(Term::new(cfg, &size, listener)));
-        let shell = settings.shell.as_deref();
-        let pty = pty::spawn(
-            &cwd,
-            cols as u16,
-            rows as u16,
-            shell,
-            &settings.env,
-            event_tx.clone(),
-        )?;
         let bell = settings.bell;
+
+        // Move the reader fd / child handle into the source's reader / waiter
+        // threads before the gpui task drains the channel.
+        pty.start(event_tx.clone());
 
         let entity = cx.new(|cx| {
             let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
@@ -405,8 +403,9 @@ mod tests {
         let cfg = Config::default();
         let size = TermSize { cols: 80, rows: 24 };
         let term = Arc::new(FairMutex::new(Term::new(cfg, &size, listener)));
-        let pty = pty::spawn(&PathBuf::from("/tmp"), 80, 24, None, &[], event_tx.clone())
-            .expect("spawn pty");
+        let mut pty =
+            crate::pty::open(&PathBuf::from("/tmp"), 80, 24, None, &[]).expect("open pty");
+        pty.start(event_tx.clone());
 
         // Let the shell start, then send a command.
         std::thread::sleep(Duration::from_millis(150));
@@ -434,7 +433,7 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        // Drop kills the child and joins both threads.
+        // Drop kills the child and detaches both threads.
         drop(pty);
     }
 }

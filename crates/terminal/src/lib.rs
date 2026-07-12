@@ -14,6 +14,7 @@
 pub mod event;
 pub mod mappings;
 pub mod pty;
+pub mod pty_source;
 pub mod settings;
 pub mod store;
 pub mod term;

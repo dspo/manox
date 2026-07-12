@@ -1183,7 +1183,14 @@ impl Workspace {
     pub fn focus_terminal(&mut self, cx: &mut Context<Self>) {
         if self.terminal_view.is_none() {
             let id = uuid::Uuid::new_v4().to_string();
-            let terminal = match Terminal::new(id, self.cwd.clone(), 80, 24, cx) {
+            let pty = match terminal::pty::default_source(&self.cwd, 80, 24) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to open terminal pty");
+                    return;
+                }
+            };
+            let terminal = match Terminal::new(id, self.cwd.clone(), 80, 24, pty, cx) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to spawn terminal");
