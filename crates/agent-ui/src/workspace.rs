@@ -23,7 +23,8 @@ use agent::{
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle, DismissEvent,
-    DragMoveEvent, Entity, FollowMode, ListAlignment, ListOffset, ListState, MouseButton,
+    DragMoveEvent, Entity, FollowMode, ListAlignment, ListOffset, ListSizingBehavior, ListState,
+    MouseButton,
     MouseUpEvent, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
     ease_out_quint, prelude::*, px,
 };
@@ -4989,8 +4990,8 @@ impl Render for Workspace {
                                         None => gpui::div().into_any_element(),
                                     }
                                 })
+                                .with_sizing_behavior(ListSizingBehavior::Infer)
                                 .w_full()
-                                .h_full()
                                 .min_h_0()
                                 .min_w_0()
                                 // Body typeface: Lilex Light. Every message row (assistant,
@@ -4999,19 +5000,23 @@ impl Render for Workspace {
                                 // italic syntax and tool-card overrides hit the italic cuts.
                                 .font_family(theme.mono_font_family.clone())
                                 .font_weight(gpui::FontWeight::LIGHT);
-                                // Outer column fills the list region. `h_full()` is load-
-                                // bearing: the region is an `h_flex()` row (items_center,
-                                // not stretch), so without it the wrapper shrinks to
-                                // content height and the list has no room to fill. The
-                                // list fills the region; short conversations top-align
-                                // (standard virtualized-list behavior) instead of the old
-                                // bottom-justify — the trade-off for not measuring every
-                                // item up front.
+                                // Outer column fills the list region and bottom-anchors its
+                                // child. `h_full()` is load-bearing: the region is an
+                                // `h_flex()` row (items_center, not stretch), so without it
+                                // the wrapper shrinks to content height and the list has no
+                                // room to fill. The list uses `Infer` sizing — it takes its
+                                // content height when shorter than the region and caps at the
+                                // region height when longer — so `justify_end` pins short
+                                // conversations just above the composer while long threads
+                                // still fill and scroll (`FollowMode::Tail` re-pins to the
+                                // bottom on new content). Virtualization is preserved: only
+                                // visible + overdraw items render/measure.
                                 let list_wrap = v_flex()
                                     .flex_1()
                                     .h_full()
                                     .min_h_0()
                                     .min_w_0()
+                                    .justify_end()
                                     .child(list_el);
                                 // Outline rail (left) + flat message column (right) share
                                 // the list region's height.
