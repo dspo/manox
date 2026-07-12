@@ -6,6 +6,7 @@
 pub mod cockpit;
 pub mod conversation;
 pub mod dispatch;
+pub mod git_status;
 #[cfg(feature = "debug")]
 pub mod harness;
 pub mod slash_command;
