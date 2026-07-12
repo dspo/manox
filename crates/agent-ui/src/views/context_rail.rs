@@ -608,11 +608,7 @@ impl ContextRail {
                                 ))
                                 .on_click(move |_, _, cx| {
                                     let _ = r.update(cx, |this, cx| {
-                                        this.copy_to_clipboard(
-                                            "workspace-env-git-copied-branch",
-                                            b.clone(),
-                                            cx,
-                                        );
+                                        this.copy_to_clipboard(b.clone(), cx);
                                         this.close_branch_menu();
                                         cx.notify();
                                     });
@@ -628,11 +624,7 @@ impl ContextRail {
                                 ))
                                 .on_click(move |_, _, cx| {
                                     let _ = r.update(cx, |this, cx| {
-                                        this.copy_to_clipboard(
-                                            "workspace-env-git-copied-path",
-                                            p.display().to_string(),
-                                            cx,
-                                        );
+                                        this.copy_to_clipboard(p.display().to_string(), cx);
                                         this.close_branch_menu();
                                         cx.notify();
                                     });
@@ -699,7 +691,7 @@ impl ContextRail {
 
     /// Copy a string to the clipboard. Silent success — clipboard writes need
     /// no separate UI feedback; the branch menu closes on click.
-    fn copy_to_clipboard(&self, _label_key: &str, value: String, cx: &mut Context<Self>) {
+    fn copy_to_clipboard(&self, value: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(value));
     }
 

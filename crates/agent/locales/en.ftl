@@ -45,7 +45,6 @@ member-tasks-unassigned = Unassigned
 member-no-tasks = No tasks
 member-tab = { $name }
 member-editor-tab = Editor
-member-close-tab = Close tab
 team-chip = team · { $count }
 team-drawer-title = Team
 team-drawer-empty = No members
@@ -474,7 +473,6 @@ titlebar-unarchive-notice = Conversation unarchived.
 titlebar-not-implemented = Not implemented yet.
 
 # ── Environment info panel ──────────────────────────────────────────────
-workspace-env-title = Conversation info
 workspace-env-changes = Changes
 workspace-env-no-project = No project
 workspace-env-usage = Usage
@@ -492,15 +490,10 @@ workspace-env-git-worktree-suffix = (worktree)
 workspace-env-git-copy-branch = Copy branch name
 workspace-env-git-copy-path = Copy worktree path
 workspace-env-git-exit-worktree = Exit worktree
-workspace-env-git-copied-branch = Copied branch name
-workspace-env-git-copied-path = Copied worktree path
-workspace-env-git-exited-worktree = Exited worktree
 
 # ── Context rail (right sidecar) ────────────────────────────────────────
 context-rail-title = Context
 context-rail-collapse = Collapse context rail
-context-rail-expand = Expand context rail
-context-rail-drawer-open = Open context rail
 
 # ── Cockpit (run status / milestones / context budget) ──────────────────
 # The multi-line run-status block. {$elapsed} is a pre-formatted duration,

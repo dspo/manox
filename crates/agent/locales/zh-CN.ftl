@@ -32,7 +32,6 @@ member-tasks-unassigned = 未分配
 member-no-tasks = 暂无任务
 member-tab = { $name }
 member-editor-tab = 编辑器
-member-close-tab = 关闭标签页
 team-chip = 团队 · { $count }
 team-drawer-title = 团队
 team-drawer-empty = 暂无成员
@@ -87,7 +86,7 @@ settings-item-environment = 环境
 settings-item-worktrees = 工作树
 settings-group-archived = 已归档
 settings-item-archived = 已归档对话
-settings-item-chat-settings = Chat Settings
+settings-item-chat-settings = 聊天设置
 settings-search-placeholder = 搜索设置…
 settings-back = 返回应用
 settings-title = 设置
@@ -434,7 +433,6 @@ titlebar-unarchive-notice = 会话已取消归档。
 titlebar-not-implemented = 尚未实现。
 
 # ── 环境信息面板 ──────────────────────────────────────────────────────
-workspace-env-title = 对话信息
 workspace-env-changes = 变更
 workspace-env-no-project = 暂无项目
 workspace-env-usage = 消费
@@ -452,15 +450,10 @@ workspace-env-git-worktree-suffix = (工作区)
 workspace-env-git-copy-branch = 复制分支名
 workspace-env-git-copy-path = 复制工作区路径
 workspace-env-git-exit-worktree = 退出工作区
-workspace-env-git-copied-branch = 已复制分支名
-workspace-env-git-copied-path = 已复制工作区路径
-workspace-env-git-exited-worktree = 已退出工作区
 
 # ── 上下文栏（右侧边栏）────────────────────────────────────────────────
 context-rail-title = 上下文
 context-rail-collapse = 折叠上下文栏
-context-rail-expand = 展开上下文栏
-context-rail-drawer-open = 打开上下文栏
 
 # ── Cockpit（运行状态 / 里程碑 / 上下文预算）──────────────────────────
 # 多行运行状态块。{$elapsed} 为预格式化的时长，{$tokens} 为预格式化的 token 计数（如 "22.7k"）。阶段标签单独渲染为加粗行，位于本行之上。
