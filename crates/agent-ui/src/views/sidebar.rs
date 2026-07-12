@@ -686,7 +686,12 @@ fn build_agent_model_cascade(
         menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
             let mut submenu = submenu;
             for m in &models {
-                let model_id = m.id().to_string();
+                // `cx::AgentBuilder` matches the raw `ResolvedModel.id` (bare model
+                // id like `glm-5.2[1m]`), NOT the manox stable key
+                // (`provider/model/wire` = `m.id()`). `name()` returns that bare id;
+                // passing `id()` here makes every spawn fail with "provider X 下未
+                // 找到支持 Y 的 model `<key>`".
+                let model_id = m.name().to_string();
                 let model_name = m.name().to_string();
                 let prov = m.provider_name().to_string();
                 let sidebar = sidebar.clone();
