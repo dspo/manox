@@ -10,9 +10,9 @@ use gpui::App;
 
 use crate::language_model::AnyLanguageModel;
 use crate::provider::anthropic::{AnthropicModel, AnthropicModelConfig};
-use crate::provider::completions::CompletionsModel;
+use crate::provider::completions::{CompletionsModel, CompletionsModelConfig};
 use crate::provider::resolve_apikey;
-use crate::provider::responses::ResponsesModel;
+use crate::provider::responses::{ResponsesModel, ResponsesModelConfig};
 use crate::provider::{CxConfig, ResolvedModel, WireApi};
 
 /// Global provider registry.
@@ -73,25 +73,28 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             api_key,
             max_token_count: max_tokens,
             auto_compact_window,
+            visible_agents: resolved.visible_agents.clone(),
         })),
-        WireApi::Responses => Arc::new(ResponsesModel::new(
-            resolved.key(),
-            resolved.id.clone(),
-            resolved.provider_name.clone(),
-            resolved.api_model_id(),
-            resolved.endpoint_url.clone(),
+        WireApi::Responses => Arc::new(ResponsesModel::new(ResponsesModelConfig {
+            id: resolved.key(),
+            name: resolved.id.clone(),
+            provider_name: resolved.provider_name.clone(),
+            api_model_id: resolved.api_model_id(),
+            endpoint_url: resolved.endpoint_url.clone(),
             api_key,
-            max_tokens,
-        )),
-        WireApi::Completions => Arc::new(CompletionsModel::new(
-            resolved.key(),
-            resolved.id.clone(),
-            resolved.provider_name.clone(),
-            resolved.api_model_id(),
-            resolved.endpoint_url.clone(),
+            max_token_count: max_tokens,
+            visible_agents: resolved.visible_agents.clone(),
+        })),
+        WireApi::Completions => Arc::new(CompletionsModel::new(CompletionsModelConfig {
+            id: resolved.key(),
+            name: resolved.id.clone(),
+            provider_name: resolved.provider_name.clone(),
+            api_model_id: resolved.api_model_id(),
+            endpoint_url: resolved.endpoint_url.clone(),
             api_key,
-            max_tokens,
-        )),
+            max_token_count: max_tokens,
+            visible_agents: resolved.visible_agents.clone(),
+        })),
         WireApi::Unavailable => {
             anyhow::bail!("wire_api {:?} is unavailable", resolved.wire_api)
         }
