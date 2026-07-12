@@ -125,9 +125,11 @@ impl Markdown {
     }
 
     /// Cross-block text selection + Cmd+C copy. Currently a no-op at the
-    /// document level — per-block selection lives inside `RichText` mounts
-    /// (code/diff blocks are selectable by default); this toggle is reserved
-    /// for a future cross-block selection layer.
+    /// document level — selection is wired per-block inside each text-bearing
+    /// `RichText` mount (paragraph, heading, list item, table cell, blockquote,
+    /// plus the existing code/diff/conflict blocks). Drag-selection and copy
+    /// therefore work within any single block; this toggle is reserved for a
+    /// future cross-block selection layer that spans block boundaries.
     pub fn selectable(self, _selectable: bool) -> Self {
         self
     }
@@ -214,15 +216,15 @@ fn render_block(
     streaming_tail: bool,
 ) -> AnyElement {
     match block {
-        Block::Paragraph(runs) => paragraph(&runs, styles, streaming_tail),
-        Block::Heading { runs, depth } => heading(&runs, mode, depth, styles),
+        Block::Paragraph(runs) => paragraph(&runs, styles, streaming_tail, idx),
+        Block::Heading { runs, depth } => heading(&runs, mode, depth, styles, idx),
         Block::Code { lang, value } => {
             code_block(&value, lang.as_deref(), styles, idx, streaming_tail)
         }
         Block::Diff { value } => diff_block(&value, styles, idx),
         Block::Conflict { value } => conflict_block(&value, styles, idx),
-        Block::Blockquote(inner) => blockquote(inner, styles, mode),
-        Block::List { ordered, items } => list_block(ordered, items, styles, mode),
+        Block::Blockquote(inner) => blockquote(inner, styles, mode, idx),
+        Block::List { ordered, items } => list_block(ordered, items, styles, mode, idx),
         Block::Table { rows, align } => table_block(rows, align, styles, idx),
         Block::ThematicBreak => div()
             .w_full()
@@ -250,7 +252,7 @@ fn code_spans(runs: &InlineRuns, styles: &MdStyles) -> Vec<CodeSpan> {
 /// mid-stream document) the cursor `▌` is appended to the paragraph text so
 /// it lands at the end of the visible content. The cursor is plain text rather
 /// than a separate element so it wraps with the paragraph flow.
-fn paragraph(runs: &InlineRuns, styles: &MdStyles, streaming_tail: bool) -> AnyElement {
+fn paragraph(runs: &InlineRuns, styles: &MdStyles, streaming_tail: bool, idx: usize) -> AnyElement {
     let text = if streaming_tail {
         format!("{}▌", runs.text)
     } else {
@@ -262,9 +264,14 @@ fn paragraph(runs: &InlineRuns, styles: &MdStyles, streaming_tail: bool) -> AnyE
         .overflow_hidden()
         .text_sm()
         .child(
-            RichText::anonymous(text)
+            // Selectable so the user can drag-select and copy body text. The id
+            // is unique within the document via the block index plus any
+            // enclosing container id (list item / blockquote / table row), so
+            // selection state never collides across siblings.
+            RichText::new(("md-para", idx), text)
                 .highlights(runs.highlights.clone())
-                .code_spans(code_spans(runs, styles)),
+                .code_spans(code_spans(runs, styles))
+                .selectable(styles.selection_bg),
         )
         .into_any_element()
 }
@@ -370,13 +377,20 @@ impl HeadingSpec {
 /// the renderer applies), so this function is mode-agnostic. The base color is
 /// inherited from the parent div — same contract as `paragraph`, so
 /// streaming→finalized never recolors.
-fn heading(runs: &InlineRuns, mode: HeadingMode, depth: u8, styles: &MdStyles) -> AnyElement {
+fn heading(
+    runs: &InlineRuns,
+    mode: HeadingMode,
+    depth: u8,
+    styles: &MdStyles,
+    idx: usize,
+) -> AnyElement {
     mode.spec(depth)
         .apply(div().w_full().min_w_0().overflow_hidden())
         .child(
-            RichText::anonymous(runs.text.clone())
+            RichText::new(("md-head", idx), runs.text.clone())
                 .highlights(runs.highlights.clone())
-                .code_spans(code_spans(runs, styles)),
+                .code_spans(code_spans(runs, styles))
+                .selectable(styles.selection_bg),
         )
         .into_any_element()
 }
@@ -724,8 +738,9 @@ fn conflict_block(value: &str, styles: &MdStyles, idx: usize) -> AnyElement {
         .into_any_element()
 }
 
-fn blockquote(inner: Vec<Block>, styles: &MdStyles, mode: HeadingMode) -> AnyElement {
+fn blockquote(inner: Vec<Block>, styles: &MdStyles, mode: HeadingMode, idx: usize) -> AnyElement {
     let mut col = v_flex()
+        .id(("md-bq", idx))
         .w_full()
         .min_w_0()
         .border_l_2()
@@ -762,7 +777,11 @@ fn table_block(
         // producing the split "double bottom border" per row. Stretching every
         // cell to the row's max height makes the per-cell `border_b` land on
         // one shared baseline, so each row shows a single aligned border.
-        let mut row_flex = h_flex().min_w_0().w_full().items_stretch();
+        let mut row_flex = h_flex()
+            .id(("md-row", r))
+            .min_w_0()
+            .w_full()
+            .items_stretch();
         for (c, cell) in row.into_iter().enumerate() {
             let mut cell_div = div()
                 .flex_1()
@@ -774,9 +793,10 @@ fn table_block(
                 .border_b_1()
                 .border_color(styles.border)
                 .child(
-                    RichText::anonymous(cell.text.clone())
+                    RichText::new(("md-cell", c), cell.text.clone())
                         .highlights(cell.highlights.clone())
-                        .code_spans(code_spans(&cell, styles)),
+                        .code_spans(code_spans(&cell, styles))
+                        .selectable(styles.selection_bg),
                 );
             cell_div = match align.get(c).copied().unwrap_or_default() {
                 TableAlign::Center => cell_div.text_center(),
@@ -808,8 +828,9 @@ fn list_block(
     items: Vec<ListItem>,
     styles: &MdStyles,
     mode: HeadingMode,
+    idx: usize,
 ) -> AnyElement {
-    let mut col = v_flex().w_full().min_w_0().gap_1();
+    let mut col = v_flex().id(("md-list", idx)).w_full().min_w_0().gap_1();
     for (i, item) in items.into_iter().enumerate() {
         let mut item_col = v_flex().flex_1().min_w_0().gap_1();
         for (j, b) in item.blocks.into_iter().enumerate() {
@@ -817,6 +838,7 @@ fn list_block(
         }
         col = col.child(
             h_flex()
+                .id(("md-li", i))
                 .w_full()
                 .min_w_0()
                 .gap_2()
