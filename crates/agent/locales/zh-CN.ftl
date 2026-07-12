@@ -7,7 +7,6 @@
 sidebar-new-chat = 新对话
 sidebar-search = 搜索
 sidebar-scheduled = 已安排
-sidebar-plugins = 插件
 sidebar-section-projects = 项目
 sidebar-section-conversations = 对话
 sidebar-empty-summary = (新对话)
@@ -75,6 +74,7 @@ settings-item-pets = 宠物
 settings-item-keyboard = 键盘快捷键
 settings-group-integrations = 集成
 settings-item-snapshots = 应用快照
+settings-item-plugins = 插件
 settings-item-mcp = MCP 服务器
 settings-item-browser = 浏览器
 settings-item-computer = 电脑操控
@@ -452,7 +452,7 @@ workspace-env-git-copy-path = 复制工作区路径
 workspace-env-git-exit-worktree = 退出工作区
 
 # ── 上下文栏（右侧边栏）────────────────────────────────────────────────
-context-rail-title = 上下文
+context-rail-title = 对话信息
 context-rail-collapse = 折叠上下文栏
 
 # ── Cockpit（运行状态 / 里程碑 / 上下文预算）──────────────────────────
@@ -477,7 +477,6 @@ cockpit-completed-summary = +{$count} 已完成
 cockpit-context-until-auto-summary = {$pct}% 距自动压缩
 cockpit-context-of-window = {$pct}% 上下文
 cockpit-context-estimate = 估算
-cockpit-context-waiting = 等待用量
 # 里程碑区段标题末尾的隐藏/显示提示。通用——标题也可点击切换。
 cockpit-hide-tasks-hint = 点击折叠
 cockpit-show-tasks-hint = 点击展开

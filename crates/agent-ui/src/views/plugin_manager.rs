@@ -6,10 +6,7 @@ use agent::{
     plugin::PluginManager,
     skill::{self, SkillOrigin, UserSkillDraft},
 };
-use gpui::{
-    AnyElement, Context, Entity, EventEmitter, Hsla, Render, SharedString, Window, div, prelude::*,
-    px,
-};
+use gpui::{AnyElement, Context, Entity, Hsla, Render, SharedString, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
@@ -20,11 +17,6 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
-
-#[derive(Clone)]
-pub enum PluginManagerEvent {
-    Exit,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PluginManagerTab {
@@ -57,8 +49,6 @@ struct Notice {
     text: SharedString,
     is_error: bool,
 }
-
-impl EventEmitter<PluginManagerEvent> for PluginManagerView {}
 
 impl PluginManagerView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -358,13 +348,10 @@ impl Render for PluginManagerView {
         let busy = self.busy;
         let search = self.search.clone();
 
-        // Unified window chrome: the management-shell TitleBar carries the
-        // macOS traffic-light inset and a drag region (the old hand-rolled
-        // 56px header had neither), with the back control and page title on
-        // the leading side and the search field on the trailing side.
-        let on_back = cx.listener(|_this, _ev, _window, cx| {
-            cx.emit(PluginManagerEvent::Exit);
-        });
+        // The settings shell owns the window TitleBar (drag region + traffic
+        // lights + section title); this view fills the content area below it.
+        // The search field sits at the trailing edge of the tab row so a long
+        // marketplace list can be filtered without a separate header band.
         let search_box = h_flex()
             .w(px(280.))
             .min_w_0()
@@ -390,32 +377,32 @@ impl Render for PluginManagerView {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            .child(crate::views::management_shell::titlebar(
-                &theme,
-                i18n::t("settings-back"),
-                on_back,
-                i18n::t("plugins-title"),
-                Some(search_box.into_any_element()),
-            ))
             .child(
-                h_flex().px_5().pt_3().child(
-                    TabBar::new("plugin-manager-tabs")
-                        .underline()
-                        .selected_index(tab_ix)
-                        .on_click(cx.listener(|this, ix: &usize, _window, cx| {
-                            this.tab = match *ix {
-                                0 => PluginManagerTab::Marketplace,
-                                1 => PluginManagerTab::Plugin,
-                                2 => PluginManagerTab::Skill,
-                                _ => PluginManagerTab::Mcp,
-                            };
-                            cx.notify();
-                        }))
-                        .child(i18n::t("plugins-tab-marketplace"))
-                        .child(i18n::t("plugins-tab-plugin"))
-                        .child(i18n::t("plugins-tab-skill"))
-                        .child(i18n::t("plugins-tab-mcp")),
-                ),
+                h_flex()
+                    .px_5()
+                    .pt_3()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        TabBar::new("plugin-manager-tabs")
+                            .underline()
+                            .selected_index(tab_ix)
+                            .on_click(cx.listener(|this, ix: &usize, _window, cx| {
+                                this.tab = match *ix {
+                                    0 => PluginManagerTab::Marketplace,
+                                    1 => PluginManagerTab::Plugin,
+                                    2 => PluginManagerTab::Skill,
+                                    _ => PluginManagerTab::Mcp,
+                                };
+                                cx.notify();
+                            }))
+                            .child(i18n::t("plugins-tab-marketplace"))
+                            .child(i18n::t("plugins-tab-plugin"))
+                            .child(i18n::t("plugins-tab-skill"))
+                            .child(i18n::t("plugins-tab-mcp")),
+                    )
+                    .child(search_box),
             )
             .children(notice.map(|notice| notice_banner(notice, &theme)))
             .when(busy, |el| {

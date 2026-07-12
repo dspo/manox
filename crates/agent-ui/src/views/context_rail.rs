@@ -22,7 +22,7 @@ use agent::compact::MIN_COMPACTION_CONTEXT_WINDOW;
 use agent::{Thread, ThreadEvent, i18n};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, Entity, Render,
-    SharedString, Window, ease_out_quint, prelude::*, px,
+    SharedString, Window, deferred, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
@@ -67,9 +67,6 @@ pub(crate) struct ContextRail {
     /// routed here by `Workspace`; the per-second thinking ticker's
     /// `cx.notify()` also refreshes the elapsed display.
     pub(crate) cockpit_phase: CockpitPhase,
-    /// Title of the most recently running tool, surfaced in the status row
-    /// when the phase is `RunningTool`. Cleared on terminal stop.
-    pub(crate) cockpit_running_tool_title: Option<String>,
     /// Plan steps parsed from the approved `exit_plan_mode` plan. All
     /// `Pending` outside a turn; the first is promoted to `InProgress` while
     /// the thread runs, demoted back to `Pending` on terminal stop.
@@ -113,7 +110,6 @@ impl ContextRail {
         Self {
             thread,
             cockpit_phase: CockpitPhase::Idle,
-            cockpit_running_tool_title: None,
             cockpit_milestones: Vec::new(),
             cockpit_hide_tasks: false,
             cockpit_auto_compact_enabled: auto_compact_enabled,
@@ -152,7 +148,6 @@ impl ContextRail {
         } else {
             CockpitPhase::Idle
         };
-        self.cockpit_running_tool_title = None;
         self.cockpit_milestones = Vec::new();
         self.git_change_stats = None;
         self.git_branch_display = None;
@@ -179,11 +174,11 @@ impl ContextRail {
         self.branch_menu_sub = None;
     }
 
-    /// Update `cockpit_phase` and `cockpit_running_tool_title` for the
-    /// streaming/tool variants that flow through the generic catch-all arm.
-    /// `Error`, `Stop`, `TurnStarted`, and `ToolCallAuthorization` are handled
-    /// in their dedicated arms on `Workspace`; this only covers the residual
-    /// transitions routed here from the workspace event handler.
+    /// Update `cockpit_phase` for the streaming/tool variants that flow through
+    /// the generic catch-all arm. `Error`, `Stop`, `TurnStarted`, and
+    /// `ToolCallAuthorization` are handled in their dedicated arms on `Workspace`;
+    /// this only covers the residual transitions routed here from the workspace
+    /// event handler.
     pub(crate) fn update_cockpit_phase(&mut self, ev: &ThreadEvent, cx: &mut Context<Self>) {
         match ev {
             ThreadEvent::AgentText(_) => {
@@ -192,10 +187,9 @@ impl ContextRail {
             ThreadEvent::AgentThinking(_) => {
                 self.cockpit_phase = CockpitPhase::Thinking;
             }
-            ThreadEvent::ToolCall { status, title, .. } => match status {
+            ThreadEvent::ToolCall { status, .. } => match status {
                 agent::thread::ToolCallStatus::Running => {
                     self.cockpit_phase = CockpitPhase::RunningTool;
-                    self.cockpit_running_tool_title = Some(title.clone());
                 }
                 // A non-running terminal/intermediate status means the model
                 // is back to streaming the next assistant segment.
@@ -674,17 +668,23 @@ impl ContextRail {
             .branch_menu
             .clone()
             .expect("branch_menu exists when open");
+        // `deferred` + `with_priority(1)` paints the dropdown after the whole
+        // rail panel tree, so it floats above the usage/budget/milestone rows
+        // that follow the branch row instead of being overpainted by them.
         gpui::div()
             .relative()
             .child(trigger)
             .child(
-                gpui::div()
-                    .id("branch-dropdown")
-                    .absolute()
-                    .top_full()
-                    .left_0()
-                    .occlude()
-                    .child(menu),
+                deferred(
+                    gpui::div()
+                        .id("branch-dropdown")
+                        .absolute()
+                        .top_full()
+                        .left_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1),
             )
             .into_any_element()
     }
@@ -720,10 +720,6 @@ impl ContextRail {
             "cockpit-run-status-meta",
             &[("elapsed", elapsed.as_str()), ("tokens", tokens.as_str())],
         );
-        let tool_title = self
-            .cockpit_running_tool_title
-            .as_deref()
-            .filter(|t| !t.is_empty());
         let icon = match self.cockpit_phase {
             CockpitPhase::Thinking | CockpitPhase::Streaming | CockpitPhase::Summarizing => {
                 IconName::LoaderCircle
@@ -734,37 +730,28 @@ impl ContextRail {
             CockpitPhase::Failed => IconName::CircleX,
             CockpitPhase::Idle => IconName::Dash,
         };
-        cockpit_status_block(
-            icon,
-            phase_label.into(),
-            meta,
-            tool_title.map(Into::into),
-            theme,
-        )
+        cockpit_status_block(icon, phase_label.into(), meta, theme)
     }
 
-    /// Context-budget row. Reads `latest_reported_request_token_usage` so the
-    /// display holds the last real budget during turn warmup instead of
-    /// flashing a fake 100%. When no usage exists at all (fresh thread) it
-    /// shows a muted "waiting for usage" placeholder — never a fake full bar.
-    /// The trailing element renders the explicit `current / cap` token counts
-    /// so the user can read the absolute numbers behind the percentage.
+    /// Context-budget row. Reads the thread's cumulative usage so the display
+    /// reflects the conversation's token spend and stays stable across turn
+    /// warm-up — never a "waiting" placeholder. Hidden (no row) only when the
+    /// thread has no model with a known window. The trailing element renders
+    /// the explicit `current / cap` token counts so the user can read the
+    /// absolute numbers behind the percentage.
     fn render_cockpit_context_budget(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let thread = self.thread.read(cx);
         let max_input = thread.model().map(|m| m.max_token_count()).unwrap_or(0);
         let budget = context_budget_pct(
             max_input,
-            thread.latest_reported_request_token_usage(),
+            thread.cumulative_token_usage(),
             self.cockpit_auto_compact_enabled,
             self.cockpit_auto_compact_threshold,
         );
         let Some(budget) = budget else {
-            return env_row(
-                IconName::BatteryFull,
-                i18n::t("cockpit-context-waiting"),
-                None,
-                theme,
-            );
+            // No model / zero window: nothing honest to show, so omit the row
+            // rather than invent a placeholder.
+            return gpui::div().into_any_element();
         };
         let pct = (budget.remaining_pct.round() as i64).clamp(0, 100);
         let key = if self.cockpit_auto_compact_enabled && max_input >= MIN_COMPACTION_CONTEXT_WINDOW
@@ -988,14 +975,14 @@ fn env_row(
 }
 
 /// Multi-line run-status block. Replaces the single-line `env_row` the status
-/// row used to occupy: phase on a semibold line, a xs muted meta line
-/// (elapsed + tokens), and an optional xs truncate tool-title line so a long
-/// tool title no longer truncates the phase. The icon anchors the left column.
+/// row used to occupy: phase on a semibold line, an xs muted meta line
+/// (elapsed + tokens). The tool title is intentionally omitted — a long title
+/// never fits one line, so the row stays a phase + meta summary only. The icon
+/// anchors the left column.
 fn cockpit_status_block(
     icon: IconName,
     phase: SharedString,
     meta: SharedString,
-    tool_title: Option<SharedString>,
     theme: &Theme,
 ) -> AnyElement {
     h_flex()
@@ -1020,16 +1007,7 @@ fn cockpit_status_block(
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(meta),
-                )
-                .children(tool_title.map(|t| {
-                    gpui::div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(t)
-                        .into_any_element()
-                })),
+                ),
         )
         .into_any_element()
 }

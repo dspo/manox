@@ -8,7 +8,6 @@
 sidebar-new-chat = New chat
 sidebar-search = Search
 sidebar-scheduled = Scheduled
-sidebar-plugins = Plugins
 sidebar-section-projects = Projects
 sidebar-section-conversations = Conversations
 sidebar-empty-summary = (New chat)
@@ -112,6 +111,7 @@ settings-item-pets = Pets
 settings-item-keyboard = Keyboard shortcuts
 settings-group-integrations = Integrations
 settings-item-snapshots = App snapshots
+settings-item-plugins = Plugins
 settings-item-mcp = MCP servers
 settings-item-browser = Browser
 settings-item-computer = Computer control
@@ -492,7 +492,7 @@ workspace-env-git-copy-path = Copy worktree path
 workspace-env-git-exit-worktree = Exit worktree
 
 # ── Context rail (right sidecar) ────────────────────────────────────────
-context-rail-title = Context
+context-rail-title = Conversation info
 context-rail-collapse = Collapse context rail
 
 # ── Cockpit (run status / milestones / context budget) ──────────────────
@@ -519,7 +519,6 @@ cockpit-completed-summary = +{$count} completed
 cockpit-context-until-auto-summary = {$pct}% until auto-summary
 cockpit-context-of-window = {$pct}% of context
 cockpit-context-estimate = estimate
-cockpit-context-waiting = waiting for usage
 # Hide/show tasks hint appended to the milestone section header. Generic —
 # the header is also clickable to toggle.
 cockpit-hide-tasks-hint = click to collapse

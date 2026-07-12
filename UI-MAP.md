@@ -11,7 +11,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### 顶层
 
-- [Window](#window) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Plugins](#viewmodeplugins) · [ViewMode::Terminal](#viewmodeterminal)
+- [Window](#window) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal)
 
 ### Sidebar
 
@@ -63,7 +63,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### ManagementShell
 
-- [ManagementShellTitleBar](#managementshelltitlebar) · [ManagementBackControl](#managementbackcontrol)
+- [ManagementBackControl](#managementbackcontrol)
 
 ### Settings
 
@@ -71,7 +71,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### PluginManager
 
-- [PluginManagerView](#pluginmanagerview) · [PluginManagerHeader](#pluginmanagerheader) · [PluginManagerTabBar](#pluginmanagertabbar) · [PluginManagerNoticeBanner](#pluginmanagernoticebanner) · [PluginManagerBusyIndicator](#pluginmanagerbusyindicator) · [PluginManagerTabContent](#pluginmanagertabcontent) · [MarketplaceTab](#marketplacetab) · [PluginTab](#plugintab) · [SkillTab](#skilltab) · [McpTab](#mcptab) · [PluginCard](#plugincard) · [SkillCard](#skillcard) · [McpServerCard](#mcpservercard) · [FormCard](#formcard)
+- [PluginManagerView](#pluginmanagerview) · [PluginManagerTabBar](#pluginmanagertabbar) · [PluginManagerNoticeBanner](#pluginmanagernoticebanner) · [PluginManagerBusyIndicator](#pluginmanagerbusyindicator) · [PluginManagerTabContent](#pluginmanagertabcontent) · [MarketplaceTab](#marketplacetab) · [PluginTab](#plugintab) · [SkillTab](#skilltab) · [McpTab](#mcptab) · [PluginCard](#plugincard) · [SkillCard](#skillcard) · [McpServerCard](#mcpservercard) · [FormCard](#formcard)
 
 ### Terminal
 
@@ -105,16 +105,13 @@ Root container, horizontal flex (`h_flex`), owns all sub-views.
 
 ### 2.1 ViewMode
 
-`Workspace` switches between four mutually exclusive full-window modes:
+`Workspace` switches between three mutually exclusive full-window modes:
 
 #### ViewMode::Workspace
 Default — sidebar + conversation + composer.
 
 #### ViewMode::Settings
-Full-window settings overlay with slide-in animation.
-
-#### ViewMode::Plugins
-Full-window plugin/skill/MCP manager.
+Full-window settings overlay with slide-in animation. Plugin/skill/MCP management lives under Settings → Integrations → Plugins (rendered in the right pane, not a separate mode).
 
 #### ViewMode::Terminal
 Full-window terminal emulator.
@@ -123,15 +120,16 @@ Full-window terminal emulator.
 
 ## 3. ViewMode::Workspace Layout
 
-The default mode. Three horizontal slots: Sidebar, MainColumn (conversation column), ContextRail. The EditorPane overlays the conversation column when open; ContextRail folds into a drawer below `RAIL_NARROW_BREAK` (900px main-column width).
+The default mode. Two top-level slots divided by a 6px [SidebarDivider](#sidebardivider): left = [Sidebar](#sidebar), right = the middle column — an `h_flex` that holds [MainColumn](#maincolumn) (the conversation column) and [ContextRail](#contextrail) as flex siblings. [EditorPane](#editordpane) opens as a third top-level column to the right of the middle column when any right-pane tab is active; ContextRail folds into a drawer below `RAIL_NARROW_BREAK` (900px middle-column width), in which case the conversation column fills the middle column.
 
 ```
-┌──────────┬──┬─────────────────────────┬──────────────┐
-│          │  │                         │              │
-│ Sidebar  │▌│     MainColumn           │ ContextRail  │
-│          │  │  (conversation column)  │  (flex sib.) │
-│          │  │                         │              │
-└──────────┴──┴─────────────────────────┴──────────────┘
+┌──────────┬──┬──────────────────────────────┐
+│          │  │  MiddleColumn (h_flex)       │
+│ Sidebar  │▌│ ┌───────────────┬──────────┐ │
+│          │  │ │ MainColumn    │ContextRail│ │
+│          │  │ │(conversation) │(flex sib.)│ │
+│          │  │ └───────────────┴──────────┘ │
+└──────────┴──┴──────────────────────────────┘
 ```
 
 ### 3.1 Sidebar
@@ -152,7 +150,7 @@ Scrollable body inside Sidebar, `overflow_y_scroll`.
 
 #### SidebarMenuSection
 
-Top section: New Thread, Search, Scheduled, Plugins menu items.
+Top section: New Thread, Search, Scheduled menu items.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -194,7 +192,7 @@ Single thread row: unread red dot (8px, `theme.danger`, shown when `summary.has_
 
 ### 3.2 MainColumn
 
-Central conversation column, flex-1, relative positioning. Has the [ContextRail](#contextrail) as a flex sibling to its right (not a child); the composer no longer spans underneath the rail.
+Central conversation column, flex-1, relative positioning. A flex sibling of [ContextRail](#contextrail) inside the Workspace's middle-column `h_flex` (not a top-level column itself); the composer no longer spans underneath the rail.
 
 #### MainColumn
 
@@ -558,7 +556,7 @@ Trigger: "Create blank project" from [ProjectMenu](#projectmenu). Centered modal
 
 ### 3.3 ContextRail
 
-Right-side context sidecar. A normal flex sibling of [MainColumn](#maincolumn) (no longer the old floating `EnvironmentCard`), so it never overlaps the conversation and the composer never spans underneath it. Owned by `Workspace` as `Entity<ContextRail>`; the rail owns the cockpit state (run phase, milestones, per-cell counter animation) that used to live on `Workspace`.
+Right-side context sidecar inside the Workspace's middle-column `h_flex` — a flex sibling of [MainColumn](#maincolumn) (no longer the old floating `EnvironmentCard`), so it never overlaps the conversation and the composer never spans underneath it. Owned by `Workspace` as `Entity<ContextRail>`; the rail owns the cockpit state (run phase, milestones, per-cell counter animation) that used to live on `Workspace`.
 
 Width is responsive to the main-column body width (`ContextRail::rail_width_for`): `RAIL_DESKTOP_WIDTH` (300px) at wide windows, `RAIL_NARROW_WIDTH` (280px) just above the breakpoint, and folded into a drawer (absent from the h_flex, surfaced via a [ContextRailCollapseBtn](#contextrailcollapsebtn) affordance) below `RAIL_NARROW_BREAK` (900px). The collapse state stays local to the view; it is not persisted into thread messages.
 
@@ -575,8 +573,8 @@ Scrollable panel body. The conversation-info rows (title, status, changes, branc
 Contents, top to bottom:
 
 - **Header**: bold title (i18n `context-rail-title`) + a [ContextRailCollapseBtn](#contextrailcollapsebtn) ghost button.
-- **Status block** (`cockpit_status_block`): a multi-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2, and an optional xs muted truncate tool-title line 3 when `cockpit_phase == RunningTool`. Elapsed refreshes per-second via the thinking ticker.
-- **Context budget row**: `context_budget_pct` reads `Thread::latest_reported_request_token_usage` (stable during turn warmup) against `MIN_COMPACTION_CONTEXT_WINDOW` and the `cockpit_auto_compact_threshold` cached on the rail. Shows a muted "waiting for usage" placeholder (i18n `cockpit-context-waiting`) when no usage has landed yet — never a fake 100%. Trailing element renders explicit `current / cap` token counts (e.g. `396k / 900k`) alongside the "estimate" note; warning-colored within 10% of the trigger.
+- **Status block** (`cockpit_status_block`): a two-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2. Elapsed refreshes per-second via the thinking ticker.
+- **Context budget row**: `context_budget_pct` reads `Thread::cumulative_token_usage` (cross-turn cumulative, always available — never `None`) against `MIN_COMPACTION_CONTEXT_WINDOW` and the `cockpit_auto_compact_threshold` cached on the rail. Always renders a percentage bar + explicit `current / cap` token counts (e.g. `396k / 900k`); warning-colored within 10% of the trigger. No "waiting for usage" state — the row is hidden entirely only when no model is configured.
 - **Milestone section** (collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): plan steps parsed from the approved `exit_plan_mode` plan. All `Pending` outside a turn; the first is promoted to `InProgress` while the thread runs, demoted back to `Pending` on terminal stop.
 - **Changes row**: [ContextRailChangesRow](#contextrailchangesrow).
 - **Branch row**: [ContextRailBranchRow](#contextrailbranchrow).
@@ -621,7 +619,7 @@ Branch resolution prefers `Thread::worktree().branch` when inside a worktree; ot
 
 #### ContextRailBranchMenu
 
-`PopupMenu` anchored under the branch row. Mirrors the title-menu / model-selector pattern: the menu entity + its `DismissEvent` subscription are created lazily on open, dropped on close. Items:
+`PopupMenu` anchored under the branch row, rendered as a `deferred(...).with_priority(1)` overlay so it paints on top of the entire workspace tree and is never occluded by the rail's later-painted siblings (usage/budget/milestone rows) nor clipped by the rail's scroll container. Mirrors the title-menu / model-selector pattern: the menu entity + its `DismissEvent` subscription are created lazily on open, dropped on close. Items:
 
 - **Copy branch name** (i18n `workspace-env-git-copy-branch`) — shown when a branch resolved; writes to the clipboard silently.
 - **Copy worktree path** (i18n `workspace-env-git-copy-path`) — shown when the thread is inside a worktree.
@@ -703,33 +701,27 @@ Popover above the composer: a thin roster of worker members (name / role / statu
 
 Full-window settings overlay. Slides in from left (180ms), slides out to right (200ms).
 
-#### ManagementShellTitleBar
-
-Shared window `TitleBar` (`h(TITLE_BAR_HEIGHT)`) mounted as the first child of every management page (Settings, Plugin Manager). Leading side: back control + page title (truncating). Trailing side: optional search/actions slot. Carries the macOS traffic-light inset and the window drag region, so window-drag and traffic-light avoidance match the main workspace across management modes.
-
-> Source: `agent-ui/src/views/management_shell.rs`
-
 #### ManagementBackControl
 
-Unified "back to app" control — `ArrowLeft` + label row mirroring `sidebar::menu_item` density (px_2/py_1p5/gap_2, accent hover wash, `theme.radius`). Mounted on the leading side of `ManagementShellTitleBar` by both Settings and Plugin Manager so the back affordance is identical across modes.
+Unified "back to app" control — `ArrowLeft` + label row mirroring `sidebar::menu_item` density (px_2/py_1p5/gap_2, accent hover wash, `theme.radius`). Mounted as the first row of the [SettingsLeftNav](#settingsleftnav) (above the search input and group list) so the back affordance reads as a peer of the sidebar menu items, not an isolated button. The settings page no longer ships a shared management TitleBar — each management surface reuses the app-page scaffold (sidebar + overlay TitleBar in the main column), and the back control lives in the sidebar.
 
 > Source: `agent-ui/src/views/management_shell.rs`
 
 #### SettingsView
 
-Root of settings overlay, `size_full`, `bg:background`.
+Root of settings overlay, `size_full`, `bg:background`. Mirrors the app-page scaffold: an `h_flex` of `[SettingsLeftNav][main column]`, where the main column is a relative `v_flex` with an absolute [SettingsTitleBar](#settingstitlebar) overlay on top and [SettingsRightPane](#settingsrightpane) content below `pt(TITLE_BAR_HEIGHT)`.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
 #### SettingsTitleBar
 
-Shared `management_shell::titlebar` window TitleBar: back control + "Settings" page title on the leading side. Provides window-drag region and macOS traffic-light avoidance.
+Absolute-positioned `TitleBar` overlay (`h(TITLE_BAR_HEIGHT)`, `top_0/left_0/right_0`) in the settings main column — same chrome as the conversation column's TitleBar. Shows the currently-selected settings item's localized label (truncating) on the leading side; falls back to the generic "Settings" title when nothing is selected. Carries the window-drag region and macOS traffic-light avoidance. No back button — back lives in [SettingsLeftNav](#settingsleftnav).
 
-> Source: `agent-ui/src/views/management_shell.rs` (mounted by `agent-ui/src/views/settings/mod.rs`)
+> Source: `agent-ui/src/views/settings/mod.rs`
 
 #### SettingsLeftNav
 
-260px sidebar: search input + scrollable group list.
+260px sidebar (`bg:background`, right border) mirroring the app [Sidebar](#sidebar): no standalone TitleBar, the macOS traffic-light buttons float over its transparent top (`pt(top_inset)`, 28px on macOS / 8px elsewhere). Body is a scrollable `v_flex` (`overflow_y_scroll`) holding, top to bottom: the [ManagementBackControl](#managementbackcontrol) ("Back to app" → emits `SettingsEvent::Exit` → returns to [ViewMode::Workspace](#viewmodeworkspace-layout)), the [SettingsSearchInput](#settingssearchinput), and the [SettingsGroupList](#settingsgrouplist).
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
@@ -759,7 +751,7 @@ Single settings row: icon + label, clickable, highlights when selected.
 
 #### SettingsRightPane
 
-Right content area, `overflow_y_scroll`, `p_4`, dispatches to panel renderers.
+Right content area, dispatches to panel renderers (and to the [PluginManagerView](#pluginmanagerview) when the Integrations → Plugins item is selected). Each panel/content view owns its own scroll and padding.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
@@ -795,25 +787,19 @@ Small bold label for a subsection.
 
 ---
 
-## 5. ViewMode::Plugins
+## 5. PluginManager (in Settings)
 
-Full-window plugin/skill/MCP management view.
+Plugin/skill/MCP management, rendered as the right-pane content of [ViewMode::Settings](#viewmodesettings) when the Integrations → Plugins item is selected — no longer a standalone full-window mode. The settings shell owns the window TitleBar (drag region + traffic-light avoidance) and the back affordance; this view fills the right pane with its tab bar + tab content.
 
 #### PluginManagerView
 
-Root view, `size_full`.
+View rendered inside [SettingsRightPane](#settingsrightpane) when `settings-item-plugins` is selected.
 
 > Source: `agent-ui/src/views/plugin_manager.rs`
 
-#### PluginManagerHeader
-
-Shared `management_shell::titlebar` window TitleBar: back control + page title on the leading side, search input (280px) on the trailing side. Provides window-drag region and macOS traffic-light avoidance.
-
-> Source: `agent-ui/src/views/management_shell.rs` (mounted by `agent-ui/src/views/plugin_manager.rs`)
-
 #### PluginManagerTabBar
 
-Four tabs: Marketplace, Plugin, Skill, MCP.
+Four tabs: Marketplace, Plugin, Skill, MCP. The filter search input sits on the trailing side of this tab bar row (moved out of the former management TitleBar, which no longer exists).
 
 > Source: `agent-ui/src/views/plugin_manager.rs`
 

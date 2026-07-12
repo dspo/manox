@@ -127,22 +127,25 @@ fn strip_list_marker(line: &str) -> Option<&str> {
     }
 }
 
-/// Estimate the remaining context budget. `None` when no usage has been
-/// reported yet (first turn, model warming) or the window is zero — the
-/// cockpit hides the indicator in that case. When auto-summary is enabled and
-/// the window qualifies (≥ [`MIN_COMPACTION_CONTEXT_WINDOW`]), the budget is
-/// measured against the trigger threshold; otherwise against the raw window.
+/// Estimate the remaining context budget. `None` only when the window is zero
+/// — the caller always supplies a usage value (the thread's cumulative usage),
+/// so the indicator never falls back to a placeholder. When auto-summary is
+/// enabled and the window qualifies (≥ [`MIN_COMPACTION_CONTEXT_WINDOW`]), the
+/// budget is measured against the trigger threshold; otherwise against the raw
+/// window. The active token count is the conversation's cumulative spend, not
+/// the per-request fill, so the percentage reads as "share of one window's
+/// worth of tokens the conversation has consumed" and stays stable across
+/// turn warm-up.
 pub fn context_budget_pct(
     max_input_tokens: u64,
-    last_usage: Option<TokenUsage>,
+    last_usage: TokenUsage,
     auto_compact_enabled: bool,
     threshold: f64,
 ) -> Option<ContextBudget> {
     if max_input_tokens == 0 {
         return None;
     }
-    let usage = last_usage?;
-    let active = active_tokens(usage) as f64;
+    let active = active_tokens(last_usage) as f64;
     let cap = max_input_tokens as f64;
     let trigger = if auto_compact_enabled && max_input_tokens >= MIN_COMPACTION_CONTEXT_WINDOW {
         cap * threshold
@@ -268,15 +271,10 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        let b = context_budget_pct(200_000, Some(usage), true, 0.9).unwrap();
+        let b = context_budget_pct(200_000, usage, true, 0.9).unwrap();
         // remaining = (180k - 90k)/180k = 50%
         assert!((b.remaining_pct - 50.0).abs() < 0.01);
         assert!(b.is_estimate);
-    }
-
-    #[test]
-    fn context_budget_pct_no_usage_yet() {
-        assert_eq!(context_budget_pct(200_000, None, true, 0.9), None);
     }
 
     #[test]
@@ -287,7 +285,7 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        assert_eq!(context_budget_pct(0, Some(usage), true, 0.9), None);
+        assert_eq!(context_budget_pct(0, usage, true, 0.9), None);
     }
 
     #[test]
@@ -299,7 +297,7 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        let b = context_budget_pct(50_000, Some(usage), true, 0.9).unwrap();
+        let b = context_budget_pct(50_000, usage, true, 0.9).unwrap();
         // remaining = (50k - 40k)/50k = 20%
         assert!((b.remaining_pct - 20.0).abs() < 0.01);
     }
@@ -312,7 +310,7 @@ mod tests {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         };
-        let b = context_budget_pct(200_000, Some(usage), true, 0.9).unwrap();
+        let b = context_budget_pct(200_000, usage, true, 0.9).unwrap();
         assert_eq!(b.remaining_pct, 0.0);
     }
 

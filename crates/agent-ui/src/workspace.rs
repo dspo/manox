@@ -51,7 +51,6 @@ use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
 };
 use crate::views::member_panel::MemberPanel;
-use crate::views::plugin_manager::{PluginManagerEvent, PluginManagerView};
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::{CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab, OpenSettings};
@@ -335,8 +334,6 @@ pub struct Workspace {
     /// cost when the user never opens Settings.
     settings_view: Option<Entity<SettingsView>>,
     settings_sub: Option<Subscription>,
-    plugin_manager_view: Option<Entity<PluginManagerView>>,
-    plugin_manager_sub: Option<Subscription>,
     /// The terminal tab's view, lazily created on the first `FocusTerminal` /
     /// `NewTerminalTab`. `None` until then. Dropped on `CloseTerminalTab`.
     terminal_view: Option<Entity<TerminalView>>,
@@ -367,7 +364,6 @@ enum ViewMode {
     #[default]
     Workspace,
     Settings,
-    Plugins,
     Terminal,
 }
 
@@ -536,8 +532,6 @@ impl Workspace {
             thinking_ticker_gen: 0,
             settings_view: None,
             settings_sub: None,
-            plugin_manager_view: None,
-            plugin_manager_sub: None,
             terminal_view: None,
             context_rail,
             outline_hover: None,
@@ -680,7 +674,6 @@ impl Workspace {
                         this.turn_active = false;
                         this.context_rail.update(cx, |r, cx| {
                             r.cockpit_phase = CockpitPhase::Stopped;
-                            r.cockpit_running_tool_title = None;
                             r.demote_milestones_to_pending(cx);
                         });
                         // Clean up background reference if this thread was parked.
@@ -749,7 +742,6 @@ impl Workspace {
                         this.pending_plan = None;
                         this.context_rail.update(cx, |r, cx| {
                             r.cockpit_phase = CockpitPhase::Failed;
-                            r.cockpit_running_tool_title = None;
                             r.demote_milestones_to_pending(cx);
                         });
                         // Persist the error card so a reloaded thread reproduces
@@ -1016,7 +1008,6 @@ impl Workspace {
                 SidebarEvent::NewThreadWithProject(dir) => {
                     this.start_new_thread(Some(dir.clone()), window, cx);
                 }
-                SidebarEvent::OpenPlugins => this.enter_plugins(cx),
                 SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
                 SidebarEvent::ArchiveThread(id, archived) => {
                     let store = agent::thread_store_global();
@@ -1084,35 +1075,6 @@ impl Workspace {
                     });
                 })
                 .detach();
-            }
-        })
-    }
-
-    /// Switch into the plugin/marketplace/skill/MCP management pane.
-    pub fn enter_plugins(&mut self, cx: &mut Context<Self>) {
-        self.view_mode = ViewMode::Plugins;
-        cx.notify();
-    }
-
-    fn ensure_plugins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.plugin_manager_view.is_some() {
-            return;
-        }
-        let plugins = cx.new(|cx| PluginManagerView::new(window, cx));
-        let sub = self.subscribe_plugins(&plugins, cx);
-        self.plugin_manager_view = Some(plugins);
-        self.plugin_manager_sub = Some(sub);
-    }
-
-    fn subscribe_plugins(
-        &self,
-        plugins: &Entity<PluginManagerView>,
-        cx: &mut Context<Self>,
-    ) -> Subscription {
-        cx.subscribe(plugins, |this, _plugins, ev: &PluginManagerEvent, cx| {
-            if matches!(ev, PluginManagerEvent::Exit) {
-                this.view_mode = ViewMode::default();
-                cx.notify();
             }
         })
     }
@@ -4474,15 +4436,6 @@ impl Render for Workspace {
             );
             return h_flex().size_full().child(anim_el);
         }
-        if matches!(self.view_mode, ViewMode::Plugins) {
-            self.ensure_plugins(window, cx);
-            let plugins = self
-                .plugin_manager_view
-                .as_ref()
-                .expect("view_mode == Plugins implies plugin manager view is set")
-                .clone();
-            return h_flex().size_full().child(plugins);
-        }
         // Terminal pane: sidebar (for tab switching) + a full-bleed terminal
         // view filling the main column. The terminal view owns its PTY and
         // grid; this branch only mounts it. Resize/scrollback/selection are
@@ -4916,184 +4869,203 @@ impl Render for Workspace {
             // Left sidebar with a draggable divider on its right edge.
             .child(self.sidebar.clone())
             .child(sidebar_divider)
-            // Center conversation column: hero / message list / composer / overlay
-            // plus the title-bar overlay. This is the middle of the three-column
-            // top-level layout (sidebar | conversation | context rail). The
-            // composer lives at the bottom of this column and never spans
-            // underneath the rail, so it stays the natural tail of the
-            // conversation surface.
+            // Middle column: the conversation column and the context rail
+            // share one h_flex so the rail is the conversation's sidecar
+            // (sidebar | middle[conversation + rail] | right editor pane).
+            // The composer lives at the bottom of the conversation column and
+            // never spans underneath the rail.
             .child({
-                v_flex()
+                h_flex()
                     .flex_1()
                     .h_full()
                     .min_w_0()
-                    .relative()
-                    // Body wrapper: hero / list / footer / overlay share a common
-                    // horizontal inset so conversation content doesn't kiss the
-                    // panel edge. `pt` reserves space for the title-bar overlay
-                    // (last child below); the overlay paints after the body so
-                    // the "..." menu isn't covered by the conversation list.
-                    .child(
+                    .overflow_hidden()
+                    .child({
+                        // Center conversation column: hero / message list /
+                        // composer / overlay plus the title-bar overlay.
                         v_flex()
                             .flex_1()
-                            .min_h_0()
+                            .h_full()
                             .min_w_0()
-                            .w_full()
-                            .overflow_hidden()
-                            .pt(TITLE_BAR_HEIGHT)
-                            .pb_2()
-                            // Empty first screen shows the centered hero in place of
-                            // the (empty) message list; otherwise a virtualized, tail-
-                            // following conversation column. Each item is its own
-                            // `Entity<MessageItem>`, so a streaming delta only marks
-                            // that item's entity dirty; the `list` reconciles its
-                            // per-item height cache via `remeasure_items` so the
-                            // synchronous renderer's deterministic heights never
-                            // desync.
-                            .children(hero)
-                            .children((!first_screen).then(|| {
-                                let conv = self.conversation.clone();
-                                // Virtualized variable-height message list. The gpui
-                                // `list` only lays out — and only syntax-highlights, via
-                                // the synchronous renderer — the items in the viewport
-                                // plus `MSG_LIST_OVERDRAW`, so a long thread's first frame
-                                // pays only for the visible turn, not every code block.
-                                // `FollowMode::Tail` on the ListState replaces the
-                                // hand-rolled stick-to-bottom: it re-pins to the end each
-                                // layout while following, disengages on upward scroll, and
-                                // re-arms at the bottom. Item heights are deterministic
-                                // per-frame (sync markdown), so the per-item height cache
-                                // the list maintains never falls out of sync with async
-                                // parsing — the root cause of the old overlap bug. Count
-                                // and height changes are reconciled from the ThreadEvent
-                                // handler and the `push_*` sites via `splice`/
-                                // `remeasure_items`.
-                                let list_state = self.list_state.clone();
-                                let list_el = gpui::list(list_state, move |ix, _window, cx| {
-                                    let item = conv.read(cx).items().get(ix).cloned();
-                                    match item {
-                                        // `flex_shrink_0` pins each row to its true content
-                                        // height so the list's per-item height cache stays
-                                        // honest and markdown never paints outside its row.
-                                        Some(item) => v_flex()
-                                            .w_full()
-                                            .pt_1()
-                                            .pb_4()
-                                            .flex_shrink_0()
-                                            .min_w_0()
-                                            .child(item)
-                                            .into_any_element(),
-                                        // Index out of range mid-splice (count changed
-                                        // between a layout pass and the render closure):
-                                        // render an empty row rather than panic.
-                                        None => gpui::div().into_any_element(),
-                                    }
-                                })
-                                .with_sizing_behavior(ListSizingBehavior::Infer)
-                                .w_full()
-                                .min_h_0()
-                                .min_w_0()
-                                // Body typeface: Lilex Light. Every message row (assistant,
-                                // user, reasoning, tool cards, notices) inherits from here;
-                                // markdown bold/headings resolve to Medium via nearest-weight,
-                                // italic syntax and tool-card overrides hit the italic cuts.
-                                .font_family(theme.mono_font_family.clone())
-                                .font_weight(gpui::FontWeight::LIGHT);
-                                // Outer column fills the list region and bottom-anchors its
-                                // child. `h_full()` is load-bearing: the region is an
-                                // `h_flex()` row (items_center, not stretch), so without it
-                                // the wrapper shrinks to content height and the list has no
-                                // room to fill. The list uses `Infer` sizing — it takes its
-                                // content height when shorter than the region and caps at the
-                                // region height when longer — so `justify_end` pins short
-                                // conversations just above the composer while long threads
-                                // still fill and scroll (`FollowMode::Tail` re-pins to the
-                                // bottom on new content). Virtualization is preserved: only
-                                // visible + overdraw items render/measure.
-                                let list_wrap = v_flex()
-                                    .flex_1()
-                                    .h_full()
-                                    .min_h_0()
-                                    .min_w_0()
-                                    .justify_end()
-                                    .child(list_el);
-                                // Outline rail (left) + flat message column (right) share
-                                // the list region's height.
-                                h_flex()
-                                    .flex_1()
-                                    .w_full()
-                                    .min_h_0()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .children(outline)
-                                    .child(list_wrap)
-                            }))
-                            .children(footer)
-                            // Approval overlay (if any)
-                            .children(overlay),
-                    )
-                    // Title-bar overlay: absolute top of the conversation column,
-                    // painted after the body so the "..." menu isn't covered
-                    // by the conversation list.
-                    .child(
-                        gpui::div()
-                            .absolute()
-                            .top(px(0.))
-                            .left(px(0.))
-                            .right(px(0.))
-                            .h(TITLE_BAR_HEIGHT)
+                            .relative()
+                            // Body wrapper: hero / list / footer / overlay share a common
+                            // horizontal inset so conversation content doesn't kiss the
+                            // panel edge. `pt` reserves space for the title-bar overlay
+                            // (last child below); the overlay paints after the body so
+                            // the "..." menu isn't covered by the conversation list.
                             .child(
-                                TitleBar::new()
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .flex_1()
+                                v_flex()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .min_w_0()
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .pt(TITLE_BAR_HEIGHT)
+                                    .pb_2()
+                                    // Empty first screen shows the centered hero in place of
+                                    // the (empty) message list; otherwise a virtualized, tail-
+                                    // following conversation column. Each item is its own
+                                    // `Entity<MessageItem>`, so a streaming delta only marks
+                                    // that item's entity dirty; the `list` reconciles its
+                                    // per-item height cache via `remeasure_items` so the
+                                    // synchronous renderer's deterministic heights never
+                                    // desync.
+                                    .children(hero)
+                                    .children((!first_screen).then(|| {
+                                        let conv = self.conversation.clone();
+                                        // Virtualized variable-height message list. The gpui
+                                        // `list` only lays out — and only syntax-highlights, via
+                                        // the synchronous renderer — the items in the viewport
+                                        // plus `MSG_LIST_OVERDRAW`, so a long thread's first frame
+                                        // pays only for the visible turn, not every code block.
+                                        // `FollowMode::Tail` on the ListState replaces the
+                                        // hand-rolled stick-to-bottom: it re-pins to the end each
+                                        // layout while following, disengages on upward scroll, and
+                                        // re-arms at the bottom. Item heights are deterministic
+                                        // per-frame (sync markdown), so the per-item height cache
+                                        // the list maintains never falls out of sync with async
+                                        // parsing — the root cause of the old overlap bug. Count
+                                        // and height changes are reconciled from the ThreadEvent
+                                        // handler and the `push_*` sites via `splice`/
+                                        // `remeasure_items`.
+                                        let list_state = self.list_state.clone();
+                                        let list_el =
+                                            gpui::list(list_state, move |ix, _window, cx| {
+                                                let item = conv.read(cx).items().get(ix).cloned();
+                                                match item {
+                                                    // `flex_shrink_0` pins each row to its true content
+                                                    // height so the list's per-item height cache stays
+                                                    // honest and markdown never paints outside its row.
+                                                    Some(item) => v_flex()
+                                                        .w_full()
+                                                        .pt_1()
+                                                        .pb_4()
+                                                        .flex_shrink_0()
+                                                        .min_w_0()
+                                                        .child(item)
+                                                        .into_any_element(),
+                                                    // Index out of range mid-splice (count changed
+                                                    // between a layout pass and the render closure):
+                                                    // render an empty row rather than panic.
+                                                    None => gpui::div().into_any_element(),
+                                                }
+                                            })
+                                            .with_sizing_behavior(ListSizingBehavior::Infer)
+                                            .w_full()
+                                            .min_h_0()
                                             .min_w_0()
-                                            .child(Icon::new(IconName::Bot).small())
+                                            // Body typeface: Lilex Light. Every message row (assistant,
+                                            // user, reasoning, tool cards, notices) inherits from here;
+                                            // markdown bold/headings resolve to Medium via nearest-weight,
+                                            // italic syntax and tool-card overrides hit the italic cuts.
+                                            .font_family(theme.mono_font_family.clone())
+                                            .font_weight(gpui::FontWeight::LIGHT);
+                                        // Outer column fills the list region and bottom-anchors its
+                                        // child. `h_full()` is load-bearing: the region is an
+                                        // `h_flex()` row (items_center, not stretch), so without it
+                                        // the wrapper shrinks to content height and the list has no
+                                        // room to fill. The list uses `Infer` sizing — it takes its
+                                        // content height when shorter than the region and caps at the
+                                        // region height when longer — so `justify_end` pins short
+                                        // conversations just above the composer while long threads
+                                        // still fill and scroll (`FollowMode::Tail` re-pins to the
+                                        // bottom on new content). Virtualization is preserved: only
+                                        // visible + overdraw items render/measure.
+                                        let list_wrap = v_flex()
+                                            .flex_1()
+                                            .h_full()
+                                            .min_h_0()
+                                            .min_w_0()
+                                            .justify_end()
+                                            .child(list_el);
+                                        // Outline rail (left) + flat message column (right) share
+                                        // the list region's height.
+                                        h_flex()
+                                            .flex_1()
+                                            .w_full()
+                                            .min_h_0()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .children(outline)
+                                            .child(list_wrap)
+                                    }))
+                                    .children(footer)
+                                    // Approval overlay (if any)
+                                    .children(overlay),
+                            )
+                            // Title-bar overlay: absolute top of the conversation column,
+                            // painted after the body so the "..." menu isn't covered
+                            // by the conversation list.
+                            .child(
+                                gpui::div()
+                                    .absolute()
+                                    .top(px(0.))
+                                    .left(px(0.))
+                                    .right(px(0.))
+                                    .h(TITLE_BAR_HEIGHT)
+                                    .child(
+                                        TitleBar::new()
                                             .child(
-                                                gpui::div()
-                                                    .text_sm()
-                                                    .text_left()
+                                                h_flex()
+                                                    .gap_2()
+                                                    .items_center()
                                                     .flex_1()
                                                     .min_w_0()
-                                                    .truncate()
-                                                    .child(title_text),
+                                                    .child(Icon::new(IconName::Bot).small())
+                                                    .child(
+                                                        gpui::div()
+                                                            .text_sm()
+                                                            .text_left()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .child(title_text),
+                                                    )
+                                                    .child(
+                                                        self.render_title_menu_trigger(&theme, cx),
+                                                    ),
                                             )
-                                            .child(self.render_title_menu_trigger(&theme, cx)),
-                                    )
-                                    .child(h_flex()),
-                            ),
-                    )
+                                            .child(h_flex()),
+                                    ),
+                            )
+                    })
+                    // Context rail: a stable sidecar of the conversation column within
+                    // the middle h_flex (not an overlay, not the rightmost column — the
+                    // editor pane sits right of the whole middle column). Mounts inline
+                    // once the middle column is wide enough; below the narrow breakpoint
+                    // it folds into a drawer and the conversation column takes the full
+                    // middle width. Hidden on the empty first screen, while the editor
+                    // pane is open, and until the thread has interacted — same gates as
+                    // the old floating env card so behavior carries over unchanged.
+                    .children({
+                        let main_body_w = window.bounds().size.width
+                            - self.sidebar_width
+                            - px(SIDEBAR_DIVIDER_WIDTH);
+                        let show_rail = !editor_open
+                            && !first_screen
+                            && self.thread.read(cx).has_interacted()
+                            && crate::views::context_rail::ContextRail::rail_width_for(main_body_w)
+                                .is_some();
+                        show_rail.then(|| {
+                            let w = crate::views::context_rail::ContextRail::rail_width_for(
+                                window.bounds().size.width
+                                    - self.sidebar_width
+                                    - px(SIDEBAR_DIVIDER_WIDTH),
+                            )
+                            .map(px)
+                            .unwrap_or(px(crate::views::context_rail::RAIL_DESKTOP_WIDTH));
+                            gpui::div()
+                                .w(w)
+                                .h_full()
+                                .flex_shrink_0()
+                                .child(self.context_rail.clone())
+                        })
+                    })
             })
-            // Right context rail: a stable sidecar sibling of the conversation
-            // column (not an overlay). Mounts inline once the main-column body
-            // is wide enough; below the narrow breakpoint it folds into a
-            // drawer and the conversation column takes the full body. Hidden on
-            // the empty first screen, while the editor pane is open, and until
-            // the thread has interacted — same gates as the old floating env card
-            // so behavior carries over unchanged.
-            .children({
-                let main_body_w =
-                    window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
-                let show_rail = !editor_open
-                    && !first_screen
-                    && self.thread.read(cx).has_interacted()
-                    && crate::views::context_rail::ContextRail::rail_width_for(main_body_w)
-                        .is_some();
-                show_rail.then(|| {
-                    let w = crate::views::context_rail::ContextRail::rail_width_for(
-                        window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH),
-                    )
-                    .map(px)
-                    .unwrap_or(px(crate::views::context_rail::RAIL_DESKTOP_WIDTH));
-                    gpui::div()
-                        .w(w)
-                        .h_full()
-                        .flex_shrink_0()
-                        .child(self.context_rail.clone())
-                })
-            })
+            // Right editor pane: a third top-level column when an editor is
+            // open (browser/terminal tabs will join it as future right-pane
+            // surfaces). Sits outside the middle column so it is not a sibling
+            // of the conversation+rail pair.
             .when(right_pane_open, |this| {
                 this.child(editor_divider).child(editor_pane)
             })

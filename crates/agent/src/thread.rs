@@ -1309,19 +1309,6 @@ impl Thread {
         self.token_meter.last_request(self.last_user_message_id())
     }
 
-    /// The most recent user message's reported usage, skipping a trailing
-    /// just-submitted prompt that has no usage yet. Stable while a new turn
-    /// warms up — the cockpit budget display reads this so it holds the last
-    /// real budget instead of falling back to a fake 100%. Uses the same rule
-    /// as `auto_compaction_target` so the trigger and the display agree.
-    pub fn latest_reported_request_token_usage(&self) -> Option<TokenUsage> {
-        crate::compact::latest_reported_request_usage(
-            &self.messages,
-            self.token_meter.per_request(),
-        )
-        .map(|(_, u)| u)
-    }
-
     /// Per-model cumulative token usage, keyed by model display name.
     pub fn per_model_token_usage(&self) -> &HashMap<String, TokenUsage> {
         self.token_meter.per_model()
