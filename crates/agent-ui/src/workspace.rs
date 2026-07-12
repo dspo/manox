@@ -2082,13 +2082,25 @@ impl Workspace {
     }
 
     fn delete_follow_up(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if self.queued_follow_ups.remove(idx).is_some() {
+        if let Some(item) = self.queued_follow_ups.remove(idx) {
+            // A SteerPending card has already been handed to the thread's steer
+            // queue; removing the UI card alone would leave the message queued
+            // for drain, so the steer would fire invisibly. Cancel it in the
+            // thread too.
+            if let FollowUpState::SteerPending { message_id } = &item.state {
+                self.thread
+                    .update(cx, |thread, _cx| thread.cancel_pending_steer(message_id));
+            }
             cx.notify();
         }
     }
 
     fn undo_last_queued(&mut self, cx: &mut Context<Self>) {
-        if self.queued_follow_ups.pop_back().is_some() {
+        if let Some(item) = self.queued_follow_ups.pop_back() {
+            if let FollowUpState::SteerPending { message_id } = &item.state {
+                self.thread
+                    .update(cx, |thread, _cx| thread.cancel_pending_steer(message_id));
+            }
             cx.notify();
         }
     }

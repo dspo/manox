@@ -1545,6 +1545,21 @@ impl Thread {
         self.pending_steer.iter().map(|m| m.id.clone()).collect()
     }
 
+    /// Drop a single queued steer follow-up by message id. Cancelling the UI
+    /// card for a `SteerPending` steer must also pull the message out of the
+    /// thread's steer queue — otherwise the running turn drains it anyway and
+    /// feeds it to the model with no matching UI card, so the steer takes
+    /// effect invisibly (the user clicked "remove" but it still went through).
+    /// Returns whether a message was actually removed.
+    pub fn cancel_pending_steer(&mut self, id: &str) -> bool {
+        if let Some(pos) = self.pending_steer.iter().position(|m| m.id == id) {
+            self.pending_steer.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Flush every queued steer follow-up onto `messages` in submission order.
     /// Returns whether any message was drained, so the caller can decide to
     /// continue the turn loop rather than ending on an unconsumed steer.
