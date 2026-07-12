@@ -41,6 +41,8 @@ pub struct AnthropicModel {
     /// Anthropic-compatible wire do not — gating avoids a 400 and keeps the
     /// effort selector a no-op for them (same as today).
     supports_effort: bool,
+    /// cx agent ids this model can drive (from the endpoint `agents:` list).
+    visible_agents: Vec<String>,
 }
 
 /// Construction inputs for [`AnthropicModel`]. Bundled into a struct so the
@@ -55,6 +57,7 @@ pub struct AnthropicModelConfig {
     pub api_key: String,
     pub max_token_count: u64,
     pub auto_compact_window: Option<u64>,
+    pub visible_agents: Vec<String>,
 }
 
 impl AnthropicModel {
@@ -69,6 +72,7 @@ impl AnthropicModel {
             api_key,
             max_token_count,
             auto_compact_window,
+            visible_agents,
         } = cfg;
         let long_ttl = crate::provider::anthropic_cache::supports_long_ttl(
             crate::provider::anthropic_cache::resolve_prompt_caching_policy(
@@ -92,6 +96,7 @@ impl AnthropicModel {
             auto_compact_window,
             long_ttl,
             supports_effort,
+            visible_agents,
         }
     }
 }
@@ -111,6 +116,9 @@ impl LanguageModel for AnthropicModel {
     }
     fn wire_api(&self) -> crate::provider::WireApi {
         crate::provider::WireApi::Anthropic
+    }
+    fn visible_agents(&self) -> &[String] {
+        &self.visible_agents
     }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
@@ -697,6 +705,7 @@ mod tests {
             api_key: "k".into(),
             max_token_count: 1024 * 1024,
             auto_compact_window: None,
+            visible_agents: Vec::new(),
         });
         assert_eq!(
             big.max_output_tokens,
@@ -711,6 +720,7 @@ mod tests {
             api_key: "k".into(),
             max_token_count: 4_096,
             auto_compact_window: None,
+            visible_agents: Vec::new(),
         });
         assert_eq!(tiny.max_output_tokens, 8_192);
     }
@@ -729,6 +739,7 @@ mod tests {
             api_key: "k".into(),
             max_token_count: 8_192,
             auto_compact_window: Some(202_745),
+            visible_agents: Vec::new(),
         });
         assert_eq!(with_override.auto_compact_window, Some(202_745));
 
@@ -741,6 +752,7 @@ mod tests {
             api_key: "k".into(),
             max_token_count: 8_192,
             auto_compact_window: None,
+            visible_agents: Vec::new(),
         });
         assert_eq!(without_override.auto_compact_window, None);
     }

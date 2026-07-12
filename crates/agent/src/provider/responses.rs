@@ -40,18 +40,36 @@ pub struct ResponsesModel {
     /// Whether the endpoint is official OpenAI (api.openai.com) and thus
     /// eligible for `prompt_cache_retention:"24h"`.
     long_ttl: bool,
+    /// cx agent ids this model can drive (from the endpoint `agents:` list).
+    visible_agents: Vec<String>,
+}
+
+/// Construction inputs for [`ResponsesModel`]. Bundled into a struct so the
+/// builder stays under clippy's `too_many_arguments` threshold without an
+/// `#[allow]`, and so call sites name fields instead of counting positions.
+pub struct ResponsesModelConfig {
+    pub id: String,
+    pub name: String,
+    pub provider_name: String,
+    pub api_model_id: String,
+    pub endpoint_url: String,
+    pub api_key: String,
+    pub max_token_count: u64,
+    pub visible_agents: Vec<String>,
 }
 
 impl ResponsesModel {
-    pub fn new(
-        id: String,
-        name: String,
-        provider_name: String,
-        api_model_id: String,
-        endpoint_url: String,
-        api_key: String,
-        max_token_count: u64,
-    ) -> Self {
+    pub fn new(cfg: ResponsesModelConfig) -> Self {
+        let ResponsesModelConfig {
+            id,
+            name,
+            provider_name,
+            api_model_id,
+            endpoint_url,
+            api_key,
+            max_token_count,
+            visible_agents,
+        } = cfg;
         Self {
             id,
             name,
@@ -64,6 +82,7 @@ impl ResponsesModel {
             ),
             max_token_count,
             long_ttl: crate::provider::openai_long_ttl(&endpoint_url),
+            visible_agents,
         }
     }
 }
@@ -83,6 +102,9 @@ impl LanguageModel for ResponsesModel {
     }
     fn wire_api(&self) -> crate::provider::WireApi {
         crate::provider::WireApi::Responses
+    }
+    fn visible_agents(&self) -> &[String] {
+        &self.visible_agents
     }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
