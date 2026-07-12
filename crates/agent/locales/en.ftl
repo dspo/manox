@@ -127,6 +127,7 @@ settings-item-archived = Archived chats
 settings-item-chat-settings = Chat Settings
 settings-search-placeholder = Search settings…
 settings-back = Back to app
+settings-title = Settings
 settings-coming-soon = Coming soon…
 settings-coming-soon-label = Coming soon… {$label}
 

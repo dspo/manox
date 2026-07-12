@@ -13,7 +13,7 @@ use gpui::{
     Window, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, TitleBar, h_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, h_flex,
     input::{Input, InputState},
     v_flex,
 };
@@ -422,10 +422,18 @@ impl Render for SettingsView {
             .w_full()
             .h_full()
             .bg(theme.background)
-            // Title bar spans the full window width: it carries the macOS
-            // traffic-light inset and gives the user a drag handle to move the
-            // window while Settings is mounted.
-            .child(TitleBar::new().h(TITLE_BAR_HEIGHT))
+            // Unified window chrome: the management-shell TitleBar carries
+            // the macOS traffic-light inset and a drag region, with the back
+            // control and page title on the leading side. The back control
+            // therefore lives in the same place as the Plugin Manager's, not
+            // as a hand-rolled row inside the sidebar.
+            .child(crate::views::management_shell::titlebar(
+                &theme,
+                i18n::t("settings-back"),
+                on_back,
+                i18n::t("settings-title"),
+                None,
+            ))
             .child(
                 h_flex()
                     .flex_1()
@@ -439,47 +447,27 @@ impl Render for SettingsView {
                             .border_r_1()
                             .border_color(theme.border)
                             .child(
-                                v_flex()
-                                    .w_full()
-                                    .p_2()
-                                    .gap_1()
-                                    .child(
-                                        h_flex()
-                                            .id("settings-back")
-                                            .items_center()
-                                            .gap_2()
-                                            .px_2()
-                                            .py_1p5()
-                                            .rounded(theme.radius)
-                                            .text_sm()
-                                            .text_color(theme.foreground)
-                                            .hover(|s| s.bg(theme.accent.opacity(0.08)))
-                                            .cursor_pointer()
-                                            .on_click(on_back)
-                                            .child(Icon::new(IconName::ArrowLeft).small())
-                                            .child(i18n::t("settings-back")),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .w_full()
-                                            .items_center()
-                                            .gap_2()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded(theme.radius)
-                                            .bg(theme.secondary)
-                                            .child(
-                                                Icon::new(IconName::Search)
-                                                    .small()
-                                                    .text_color(theme.muted_foreground),
-                                            )
-                                            .child(
-                                                Input::new(&search)
-                                                    .appearance(false)
-                                                    .bordered(false)
-                                                    .focus_bordered(false),
-                                            ),
-                                    ),
+                                v_flex().w_full().p_2().gap_1().child(
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(theme.radius)
+                                        .bg(theme.secondary)
+                                        .child(
+                                            Icon::new(IconName::Search)
+                                                .small()
+                                                .text_color(theme.muted_foreground),
+                                        )
+                                        .child(
+                                            Input::new(&search)
+                                                .appearance(false)
+                                                .bordered(false)
+                                                .focus_bordered(false),
+                                        ),
+                                ),
                             )
                             .child(
                                 v_flex()

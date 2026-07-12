@@ -61,6 +61,10 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 - [TeamChip](#teamchip) · [TeamDrawer](#teamdrawer)
 
+### ManagementShell
+
+- [ManagementShellTitleBar](#managementshelltitlebar) · [ManagementBackControl](#managementbackcontrol)
+
 ### Settings
 
 - [SettingsView](#settingsview) · [SettingsTitleBar](#settingstitlebar) · [SettingsLeftNav](#settingsleftnav) · [SettingsSearchInput](#settingssearchinput) · [SettingsGroupList](#settingsgrouplist) · [SettingsGroup](#settingsgroup) · [SettingsItem](#settingsitem) · [SettingsRightPane](#settingsrightpane) · [SettingsPanel](#settingspanel) · [SettingsSectionCard](#settingssectioncard) · [SettingsRow](#settingsrow) · [SettingsSectionHeader](#settingssectionheader) · [SettingsHairline](#settingshairline)
@@ -699,6 +703,18 @@ Popover above the composer: a thin roster of worker members (name / role / statu
 
 Full-window settings overlay. Slides in from left (180ms), slides out to right (200ms).
 
+#### ManagementShellTitleBar
+
+Shared window `TitleBar` (`h(TITLE_BAR_HEIGHT)`) mounted as the first child of every management page (Settings, Plugin Manager). Leading side: back control + page title (truncating). Trailing side: optional search/actions slot. Carries the macOS traffic-light inset and the window drag region, so window-drag and traffic-light avoidance match the main workspace across management modes.
+
+> Source: `agent-ui/src/views/management_shell.rs`
+
+#### ManagementBackControl
+
+Unified "back to app" control — `ArrowLeft` + label row mirroring `sidebar::menu_item` density (px_2/py_1p5/gap_2, accent hover wash, `theme.radius`). Mounted on the leading side of `ManagementShellTitleBar` by both Settings and Plugin Manager so the back affordance is identical across modes.
+
+> Source: `agent-ui/src/views/management_shell.rs`
+
 #### SettingsView
 
 Root of settings overlay, `size_full`, `bg:background`.
@@ -707,13 +723,13 @@ Root of settings overlay, `size_full`, `bg:background`.
 
 #### SettingsTitleBar
 
-Top bar with back button.
+Shared `management_shell::titlebar` window TitleBar: back control + "Settings" page title on the leading side. Provides window-drag region and macOS traffic-light avoidance.
 
-> Source: `agent-ui/src/views/settings/mod.rs`
+> Source: `agent-ui/src/views/management_shell.rs` (mounted by `agent-ui/src/views/settings/mod.rs`)
 
 #### SettingsLeftNav
 
-260px sidebar: back btn + search input + scrollable group list.
+260px sidebar: search input + scrollable group list.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
@@ -791,9 +807,9 @@ Root view, `size_full`.
 
 #### PluginManagerHeader
 
-Top bar: back btn + title + search input (280px).
+Shared `management_shell::titlebar` window TitleBar: back control + page title on the leading side, search input (280px) on the trailing side. Provides window-drag region and macOS traffic-light avoidance.
 
-> Source: `agent-ui/src/views/plugin_manager.rs`
+> Source: `agent-ui/src/views/management_shell.rs` (mounted by `agent-ui/src/views/plugin_manager.rs`)
 
 #### PluginManagerTabBar
 
