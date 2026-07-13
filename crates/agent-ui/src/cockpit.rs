@@ -128,14 +128,13 @@ fn strip_list_marker(line: &str) -> Option<&str> {
 }
 
 /// Estimate the remaining context budget. `None` only when the window is zero
-/// — the caller always supplies a usage value (the thread's cumulative usage),
-/// so the indicator never falls back to a placeholder. When auto-summary is
-/// enabled and the window qualifies (≥ [`MIN_COMPACTION_CONTEXT_WINDOW`]), the
-/// budget is measured against the trigger threshold; otherwise against the raw
-/// window. The active token count is the conversation's cumulative spend, not
-/// the per-request fill, so the percentage reads as "share of one window's
-/// worth of tokens the conversation has consumed" and stays stable across
-/// turn warm-up.
+/// — the caller always supplies a usage value (the latest single request's
+/// fill), so the indicator never falls back to a placeholder. When auto-summary
+/// is enabled and the window qualifies (≥ [`MIN_COMPACTION_CONTEXT_WINDOW`]),
+/// the budget is measured against the trigger threshold; otherwise against the
+/// raw window. The active token count is the latest request's fill, matching
+/// the auto-compaction trigger's notion of "current" usage, so the percentage
+/// reads as "share of the context window the latest request occupies".
 pub fn context_budget_pct(
     max_input_tokens: u64,
     last_usage: TokenUsage,

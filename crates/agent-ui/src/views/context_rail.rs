@@ -441,8 +441,8 @@ impl ContextRail {
                 .text_color(muted)
                 .child(branch_prefix("└── "))
                 .child(cache_label.clone())
-                .child(counter_animated("↑", cce_f, cce_t, "cache_create", cce_g))
-                .child(counter_animated("↓", ccr_f, ccr_t, "cache_read", ccr_g));
+                .child(counter_animated("+", cce_f, cce_t, "cache_create", cce_g))
+                .child(counter_animated("=", ccr_f, ccr_t, "cache_read", ccr_g));
             model_blocks.push((model_display, hit_rate, throughput_row, cache_row));
         }
         self.env_counter_state = new_state;
@@ -801,7 +801,7 @@ impl ContextRail {
         let max_input = thread.model().map(|m| m.max_token_count()).unwrap_or(0);
         let budget = context_budget_pct(
             max_input,
-            thread.cumulative_token_usage(),
+            thread.latest_request_usage().unwrap_or_default(),
             self.cockpit_auto_compact_enabled,
             self.cockpit_auto_compact_threshold,
         );
