@@ -3460,7 +3460,7 @@ impl Workspace {
                         .occlude()
                         .child(menu),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }
@@ -3553,7 +3553,7 @@ impl Workspace {
                         .occlude()
                         .child(menu),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }
@@ -4229,7 +4229,7 @@ impl Workspace {
                                 cx.notify();
                             })),
                     )
-                    .with_priority(1)
+                    .with_priority(1),
                 )
                 .into_any_element(),
         )
@@ -4394,7 +4394,7 @@ impl Workspace {
                                 cx.notify();
                             })),
                     )
-                    .with_priority(1)
+                    .with_priority(1),
                 )
                 .into_any_element(),
         )
@@ -4496,7 +4496,7 @@ impl Workspace {
                             cx.notify();
                         })),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }
@@ -4534,7 +4534,7 @@ impl Workspace {
                         .occlude()
                         .child(menu),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }
@@ -4981,7 +4981,7 @@ impl Workspace {
                         .occlude()
                         .child(menu),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }
