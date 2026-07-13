@@ -1457,7 +1457,13 @@ impl Workspace {
         // cached auto-compact knobs in case the user edited settings while
         // viewing another thread — cheap, and keeps the budget accurate.
         let auto_compact = settings::load().auto_compact;
+        let new_thread_for_rail = self.thread.clone();
         self.context_rail.update(cx, |r, cx| {
+            // Rebind the rail to the incoming thread. Without this the rail
+            // keeps reading the construction-time thread's `per_model` usage /
+            // project / display_title, so a freshly loaded thread with real
+            // usage data renders an empty "消费" section (no per-model tree).
+            r.thread = new_thread_for_rail;
             r.reset_for_thread_switch(running, cx);
             r.cockpit_auto_compact_enabled = auto_compact.enabled;
             r.cockpit_auto_compact_threshold = auto_compact.threshold;
