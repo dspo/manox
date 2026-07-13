@@ -1776,6 +1776,13 @@ impl Workspace {
         // while waiting for tool approval), re-surface them so the overlay
         // appears immediately upon switching back.
         self.resurface_pending_auths(cx);
+        // Symmetric to the auth resurface: if the incoming thread is parked on
+        // an `exit_plan_mode` approval, restore `pending_plan` so the plan card
+        // re-arms its Approve/Continue buttons and the parked oneshot can be
+        // resolved. Without this, `attach_thread`'s `pending_plan = None`
+        // above leaves a parked plan with no UI to approve it — the turn hangs
+        // until the user cancels.
+        self.resurface_pending_plan(cx);
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
         // The user is now viewing this thread: clear any unread red dot it
@@ -1886,6 +1893,28 @@ impl Workspace {
             });
         }
         if !self.pending_auths.is_empty() {
+            cx.notify();
+        }
+    }
+
+    /// Restore `pending_plan` if the incoming thread is parked on an
+    /// `exit_plan_mode` approval. Mirrors `resurface_pending_auths`: the thread
+    /// kept its parked oneshot alive in the background, and stored the plan text
+    /// alongside it; `attach_thread` cleared the workspace's `pending_plan`, so
+    /// without this the plan card re-renders without Approve/Continue buttons
+    /// and the parked turn hangs until cancelled.
+    fn resurface_pending_plan(&mut self, cx: &mut Context<Self>) {
+        if self.pending_plan.is_some() {
+            return;
+        }
+        if let Some((id, plan_text)) = self
+            .thread
+            .read(cx)
+            .pending_plan_entries()
+            .into_iter()
+            .last()
+        {
+            self.pending_plan = Some(PendingPlan { id, plan_text });
             cx.notify();
         }
     }

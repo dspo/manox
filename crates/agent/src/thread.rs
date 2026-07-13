@@ -275,6 +275,15 @@ pub struct PendingAuthMeta {
     pub input: serde_json::Value,
 }
 
+/// UI metadata for a pending plan approval. The plan text lives here, not on
+/// the oneshot sender, so a thread backgrounded while parked on
+/// `exit_plan_mode` can hand the plan back to the workspace when the user
+/// switches back — the workspace's `pending_plan` would otherwise be lost on
+/// `attach_thread`, leaving the parked oneshot unresolvable.
+pub struct PendingPlanMeta {
+    pub plan_text: String,
+}
+
 /// Session-scoped goal-mode state. Not persisted — a goal is an ephemeral
 /// autonomy directive tied to the live session, so a reloaded thread always
 /// starts with no goal (mirrors the `worktree` session-scoped pattern, and
@@ -449,6 +458,11 @@ pub struct Thread {
     /// Pending plan-approval oneshots, keyed by the `exit_plan_mode` tool_use
     /// id. Mirrors `pending_authorizations` exactly.
     pending_plan_approval: HashMap<String, tokio::sync::oneshot::Sender<PlanApprovalResponse>>,
+    /// Plan text for each pending plan approval, keyed by the same tool_use id.
+    /// Mirrors `pending_auth_meta`: `run_plan_approval` stores the plan here when
+    /// it parks, so `attach_thread` can restore the workspace's `pending_plan`
+    /// after a background→foreground round-trip.
+    pending_plan_meta: HashMap<String, PendingPlanMeta>,
     /// Pending inbound-write authorization oneshots for the browser axis,
     /// keyed by the inbound request id allocated by the host. Resolved by
     /// `respond_inbound` with an allow/deny decision; orthogonal to
@@ -671,6 +685,7 @@ impl Thread {
                 plan_mode: false,
                 reasoning_effort: ReasoningEffort::default(),
                 pending_plan_approval: HashMap::new(),
+                pending_plan_meta: HashMap::new(),
                 goal: None,
                 goal_cancel: None,
                 title_state: TitleState::default(),
@@ -756,6 +771,7 @@ impl Thread {
                 plan_mode: false,
                 reasoning_effort: ReasoningEffort::from_i64(rec.reasoning_effort),
                 pending_plan_approval: HashMap::new(),
+                pending_plan_meta: HashMap::new(),
                 goal: None,
                 goal_cancel: None,
                 title_state: TitleState::restore(
@@ -845,6 +861,7 @@ impl Thread {
                 plan_mode: false,
                 reasoning_effort,
                 pending_plan_approval: HashMap::new(),
+                pending_plan_meta: HashMap::new(),
                 goal: None,
                 goal_cancel: None,
                 title_state: TitleState::default(),
@@ -1264,6 +1281,11 @@ impl Thread {
         cx: &mut Context<Self>,
     ) {
         if let Some(tx) = self.pending_plan_approval.remove(id) {
+            // Drop the plan metadata alongside the sender, mirroring
+            // `respond_authorization`: the post-select resolve block in
+            // `run_plan_approval` also removes it, but clearing here keeps the
+            // two maps in lockstep at the moment the response is sent.
+            self.pending_plan_meta.remove(id);
             let _ = tx.send(response);
         }
         let _ = cx;
@@ -1590,6 +1612,22 @@ impl Thread {
                 self.pending_auth_meta
                     .get(id)
                     .map(|meta| (id.clone(), meta))
+            })
+            .collect()
+    }
+
+    /// Return the id and plan text for each pending plan approval. Used by the
+    /// workspace to restore its `pending_plan` when switching back to a thread
+    /// that was parked on `exit_plan_mode` — the workspace's copy is cleared by
+    /// `attach_thread`, so without this the parked oneshot has no UI to resolve
+    /// it and the turn hangs until cancelled.
+    pub fn pending_plan_entries(&self) -> Vec<(String, String)> {
+        self.pending_plan_approval
+            .keys()
+            .filter_map(|id| {
+                self.pending_plan_meta
+                    .get(id)
+                    .map(|meta| (id.clone(), meta.plan_text.clone()))
             })
             .collect()
     }
@@ -2095,6 +2133,7 @@ impl Thread {
             // stays parked until the entity is dropped, and a late
             // `respond_plan_approval` from the UI silently no-ops.
             self.pending_plan_approval.clear();
+            self.pending_plan_meta.clear();
             // Symmetric cleanup of pending tool-authorization oneshots. A
             // cancelled turn resolves in-flight approvals via the cancellation
             // token's `select!` arms, but the senders must also be dropped so a
@@ -2969,6 +3008,12 @@ impl Thread {
         let (tx, rx) = tokio::sync::oneshot::channel();
         this.update(cx, |this, _cx| {
             this.pending_plan_approval.insert(id.clone(), tx);
+            this.pending_plan_meta.insert(
+                id.clone(),
+                PendingPlanMeta {
+                    plan_text: plan_text.clone(),
+                },
+            );
         })?;
         this.update(cx, |_, cx| {
             cx.emit(ThreadEvent::PlanProposed {
@@ -2983,6 +3028,7 @@ impl Thread {
         };
         this.update(cx, |this, _cx| {
             this.pending_plan_approval.remove(&id);
+            this.pending_plan_meta.remove(&id);
         })?;
 
         match response {
@@ -4240,6 +4286,94 @@ mod tests {
                     tr.content
                 );
             });
+        });
+    }
+
+    /// While `run_plan_approval` is parked, the plan text must be queryable via
+    /// `pending_plan_entries` so the workspace can restore its `pending_plan`
+    /// after a background→foreground round-trip, and the entry must be gone
+    /// once the approval resolves. Regression for the hang where a backgrounded
+    /// plan approval lost its UI on reclaim.
+    #[test]
+    fn pending_plan_entries_present_while_parked_and_cleared_after_resolve() {
+        use crate::language_model::LanguageModelToolUse;
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-plan-resurface", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        let tu = LanguageModelToolUse {
+            id: "tu_plan_resurface".to_string(),
+            name: Arc::from("exit_plan_mode"),
+            raw_input: r#"{"plan":"the plan body"}"#.to_string(),
+            input: serde_json::json!({"plan": "the plan body"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.plan_mode = true;
+            });
+        });
+
+        let weak = thread.downgrade();
+        let cancel = CancellationToken::new();
+        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let r = result.clone();
+
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *r.lock().unwrap() =
+                    Some(super::Thread::run_plan_approval(weak, tu, cancel, &mut cx).await);
+            }
+        })
+        .detach();
+
+        cx.run_until_parked();
+
+        // While parked: the plan is queryable for the workspace to restore.
+        cx.update(|cx| {
+            let entries = thread.read(cx).pending_plan_entries();
+            assert_eq!(entries.len(), 1, "exactly one pending plan while parked");
+            assert_eq!(entries[0].0, "tu_plan_resurface");
+            assert_eq!(entries[0].1, "the plan body");
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.respond_plan_approval(
+                    "tu_plan_resurface",
+                    crate::tool::PlanApprovalResponse::Approve,
+                    cx,
+                );
+            });
+        });
+
+        cx.run_until_parked();
+
+        let res = result
+            .lock()
+            .unwrap()
+            .take()
+            .expect("run_plan_approval did not complete");
+        assert!(res.is_ok(), "run_plan_approval failed: {:?}", res.err());
+
+        // After resolve: no dangling plan metadata for the workspace to pick up.
+        cx.update(|cx| {
+            assert!(
+                thread.read(cx).pending_plan_entries().is_empty(),
+                "pending plan entries must be cleared after resolve"
+            );
         });
     }
 
