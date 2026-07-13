@@ -748,7 +748,7 @@ impl ContextRail {
         let max_input = thread.model().map(|m| m.max_token_count()).unwrap_or(0);
         let budget = context_budget_pct(
             max_input,
-            thread.cumulative_token_usage(),
+            thread.latest_request_usage().unwrap_or_default(),
             self.cockpit_auto_compact_enabled,
             self.cockpit_auto_compact_threshold,
         );

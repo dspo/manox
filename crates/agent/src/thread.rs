@@ -1381,6 +1381,15 @@ impl Thread {
         self.token_meter.cumulative()
     }
 
+    /// Usage of the most recent user message that already has a reported usage
+    /// — the latest *single* request's fill, not the cross-turn cumulative. This
+    /// mirrors the selection the auto-compaction trigger uses, so the cockpit
+    /// budget display and the trigger agree on what "current" means.
+    pub fn latest_request_usage(&self) -> Option<TokenUsage> {
+        crate::compact::latest_reported_request_usage(&self.messages, self.token_meter.per_request())
+            .map(|(_, usage)| usage)
+    }
+
     /// Per-user-message usage, keyed by `Message::id`.
     pub fn request_token_usage(&self) -> &HashMap<String, TokenUsage> {
         self.token_meter.per_request()
