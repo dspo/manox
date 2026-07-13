@@ -1299,21 +1299,20 @@ impl Workspace {
         let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
         let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
         let cwd = project_cwd.unwrap_or_else(|| self.cwd.clone());
-        let terminal =
-            match Terminal::new(id.clone(), cwd, 80, 24, Box::new(source), cx) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::error!(error = %e, "failed to create terminal for external session");
-                    window.push_notification(
-                        Notification::error(format!(
-                            "{}: {e}",
-                            i18n::t("external-session-start-failed")
-                        )),
-                        cx,
-                    );
-                    return;
-                }
-            };
+        let terminal = match Terminal::new(id.clone(), cwd, 80, 24, Box::new(source), cx) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create terminal for external session");
+                window.push_notification(
+                    Notification::error(format!(
+                        "{}: {e}",
+                        i18n::t("external-session-start-failed")
+                    )),
+                    cx,
+                );
+                return;
+            }
+        };
         // Tear the session down when the CLI exits on its own (e.g. `/exit`),
         // without waiting for the user to click ×. The subscription lives on
         // the session so a later close detaches it before any spurious event.
