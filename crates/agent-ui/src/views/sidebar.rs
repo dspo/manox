@@ -204,8 +204,8 @@ impl Sidebar {
                 &theme,
                 move |_, _window, cx| {
                     let _ = sidebar_manox.update(cx, |this, cx| {
-                        this.close_new_session_menu();
                         let project = this.new_session_project.take();
+                        this.close_new_session_menu();
                         if let Some(p) = project {
                             cx.emit(SidebarEvent::NewThreadWithProject(p));
                         } else {
