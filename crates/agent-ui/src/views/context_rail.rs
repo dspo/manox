@@ -83,6 +83,11 @@ pub(crate) struct ContextRail {
     /// per-frame file read in the context-budget render.
     pub(crate) cockpit_auto_compact_enabled: bool,
     pub(crate) cockpit_auto_compact_threshold: f64,
+    /// In-flight sub-agent tool-use ids, fed by `SubagentProgress` events.
+    /// An id is inserted while its status is non-terminal and removed once the
+    /// child thread reports `Success` / `Error`. Drives the cockpit's
+    /// "Running N Explore agents…" aggregation row.
+    pub(crate) active_agents: std::collections::HashSet<String>,
     /// Per-cell scoreboard state, keyed by `"{model_name}|{field}"` where
     /// `field ∈ {in, out, cache_create, cache_read}`. Stored as
     /// `(gen, last_value)`: `gen` is bumped on every value delta so the
@@ -118,6 +123,7 @@ impl ContextRail {
             cockpit_hide_tasks: false,
             cockpit_auto_compact_enabled: auto_compact_enabled,
             cockpit_auto_compact_threshold: auto_compact_threshold,
+            active_agents: std::collections::HashSet::new(),
             env_counter_state: HashMap::new(),
             git_change_stats: None,
             git_branch_display: None,
@@ -144,6 +150,7 @@ impl ContextRail {
     /// placeholders until its own refresh lands.
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.env_counter_state.clear();
+        self.active_agents.clear();
         self.cockpit_phase = if running {
             CockpitPhase::Streaming
         } else {
@@ -208,6 +215,28 @@ impl ContextRail {
             _ => {}
         }
         cx.notify();
+    }
+
+    /// Track an in-flight sub-agent for the cockpit's "Running N Explore
+    /// agents…" aggregation row. Non-terminal statuses insert the id; a
+    /// terminal `Success` / `Error` / `Denied` / `Cancelled` removes it so
+    /// the count reflects only children still working.
+    pub(crate) fn record_subagent_progress(
+        &mut self,
+        id: &str,
+        status: agent::ToolCallStatus,
+        cx: &mut Context<Self>,
+    ) {
+        use agent::ToolCallStatus as S;
+        let terminal = matches!(status, S::Success | S::Error | S::Denied | S::Cancelled);
+        let changed = if terminal {
+            self.active_agents.remove(id)
+        } else {
+            self.active_agents.insert(id.to_string())
+        };
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Mark the first `Pending` milestone `InProgress` so the panel signals
@@ -293,6 +322,7 @@ impl ContextRail {
                     ),
             )
             .child(self.render_cockpit_status_row(theme, cx))
+            .children(self.render_active_agents_row(theme))
             .child(env_row(
                 IconName::Bot,
                 self.thread.read(cx).display_title().into(),
@@ -697,6 +727,29 @@ impl ContextRail {
     /// no separate UI feedback; the branch menu closes on click.
     fn copy_to_clipboard(&self, value: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(value));
+    }
+
+    /// Aggregation row shown while sub-agents are in flight: "Running N
+    /// Explore agents…". Rendered only when `active_agents` is non-empty, so
+    /// the row vanishes the moment the last child reports a terminal status.
+    fn render_active_agents_row(&self, theme: &Theme) -> Option<AnyElement> {
+        let n = self.active_agents.len();
+        if n == 0 {
+            return None;
+        }
+        Some(
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .child(Icon::new(IconName::Bot).text_color(theme.primary).size_3())
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(i18n::t_count("agent-metrics-running-agents", n as i64)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Run-status row: phase label + elapsed (per-second refresh via the

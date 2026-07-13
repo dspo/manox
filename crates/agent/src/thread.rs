@@ -47,7 +47,8 @@ use crate::tools;
 pub struct ThreadId(pub String);
 
 /// Tool call status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ToolCallStatus {
     PendingApproval,
     Running,
@@ -131,6 +132,21 @@ pub enum ThreadEvent {
     /// Accumulated into the matching tool-call item's `output` until the
     /// final `ToolResult` overwrites it with the canonical (truncated) text.
     ToolOutput { id: String, chunk: String },
+    /// A spawned sub-agent's aggregated progress, forwarded to the parent so
+    /// the UI can render tool-use / token counters on the agent task card
+    /// while the sub-agent runs. UI-only: never enters the model's message
+    /// history. `id` is the parent-side `agent` tool_use_id, so the UI maps the
+    /// update to the right `AgentTaskItem`. Emitted by `SpawnAgentTool`'s
+    /// subscription on the child thread's `ToolCall` / `ToolResult` /
+    /// `TokenUsageUpdated` events.
+    SubagentProgress {
+        id: String,
+        subagent_type: String,
+        tool_uses: u32,
+        token_usage: crate::language_model::TokenUsage,
+        latest_activity: Option<String>,
+        status: ToolCallStatus,
+    },
     /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with a `ToolAuthorizationResponse` (a decision, or — for `AskUserQuestion` — the user's answers).
     ToolCallAuthorization {
         id: String,
@@ -1100,6 +1116,11 @@ impl Thread {
             input,
         });
     }
+
+    // `SubagentProgress` is emitted directly by `SpawnAgentTool`'s
+    // `forward_progress` helper via `cx.emit` on the parent entity — see
+    // `tools/agent.rs`. Kept off `Thread` so the event stays a pure emit
+    // without a many-argument forwarding method.
 
     pub fn depth(&self) -> u32 {
         self.depth
@@ -3694,6 +3715,26 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
             } else {
                 format!("AskUserQuestion: {trimmed}")
             }
+        }
+        // `web_fetch` and the read-side browser tools surface the target URL so
+        // the activity line reads like a Claude Code Fetch/Read action.
+        "web_fetch" => {
+            let u = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            format!("Fetch {u}")
+        }
+        "web_explore_open" | "web_explore_navigate" => {
+            let u = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{name} {u}")
+        }
+        "web_explore_read_text" | "web_explore_read_dom" | "web_explore_screenshot" => {
+            // Tab-scoped reads surface the tab id when present; fall back to the
+            // tool name so a tab-less historical entry still reads cleanly.
+            let tab = input
+                .get("tab_id")
+                .and_then(|v| v.as_u64())
+                .map(|t| format!("tab {t}"))
+                .unwrap_or_else(|| name.to_string());
+            format!("{name} {tab}")
         }
         _ => name.to_string(),
     }
