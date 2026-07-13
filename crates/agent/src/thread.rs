@@ -401,6 +401,15 @@ pub struct Thread {
     /// continues to feed the failure back to the model instead of ending the
     /// turn dead on an orphaned error result (thread 76aef71a).
     pending_parse_error: bool,
+    /// The error string of a stream that broke mid-turn — a
+    /// `LanguageModelCompletionEvent::Err` arrived after the handshake. The
+    /// empty-tool-use branch nudges the model to retry or wrap up instead of
+    /// ending the turn dead on a half-finished assistant message (thread
+    /// 0b80401d: the final summary round-trip was lost to a mid-stream failure
+    /// with no recovery). Handshake-level failures (`stream_completion` itself
+    /// returns `Err`) inject the nudge directly at the call site — no event
+    /// was ever produced, so this flag is not needed for that path.
+    pending_stream_error: Option<String>,
     /// Recovery continuations this turn (parse error or max-tokens truncation).
     /// Bumped on each retry and capped by `MAX_RECOVERY_ATTEMPTS`. Reset at
     /// `run_turn_loop` entry — it accumulates within a single turn's retries,
@@ -660,6 +669,7 @@ impl Thread {
                 turn_count: 0,
                 cap_summary_injected: false,
                 pending_parse_error: false,
+                pending_stream_error: None,
                 recovery_retries: 0,
                 last_stop_reason: None,
                 stop_after_plan_reject: false,
@@ -745,6 +755,7 @@ impl Thread {
                 turn_count: 0,
                 cap_summary_injected: false,
                 pending_parse_error: false,
+                pending_stream_error: None,
                 recovery_retries: 0,
                 last_stop_reason: None,
                 stop_after_plan_reject: false,
@@ -834,6 +845,7 @@ impl Thread {
                 turn_count: 0,
                 cap_summary_injected: false,
                 pending_parse_error: false,
+                pending_stream_error: None,
                 recovery_retries: 0,
                 last_stop_reason: None,
                 stop_after_plan_reject: false,
@@ -1196,7 +1208,18 @@ impl Thread {
         if on && self.goal.is_some() {
             self.clear_goal(cx);
         }
+        let entering = on && !self.plan_mode;
         self.plan_mode = on;
+        if entering {
+            // Inject the plan-mode directive as a user message so the system
+            // prompt stays byte-stable across the mode switch — `system` no
+            // longer gains/loses `PLAN_MODE_ADDENDUM` on plan on/off, so the
+            // provider prefix cache keeps its system+tools head intact (thread
+            // 0b80401d: the plan-exit round lost its 34万 cache_read because
+            // the switch rewrote the system head). The directive rides in
+            // history (append-only); the model sees it each round-trip.
+            self.insert_user_message(crate::system_prompt::PLAN_MODE_ADDENDUM.to_string(), cx);
+        }
         cx.notify();
     }
 
@@ -2187,6 +2210,7 @@ impl Thread {
             // counter is turn-scoped — it accumulates across this turn's
             // recovery round-trips, then resets here on the next user turn.
             this.pending_parse_error = false;
+            this.pending_stream_error = None;
             this.recovery_retries = 0;
             this.last_stop_reason = None;
         })?;
@@ -2201,6 +2225,7 @@ impl Thread {
             this.update(cx, |this, _| {
                 this.turn_count += 1;
                 this.pending_parse_error = false;
+                this.pending_stream_error = None;
                 this.last_stop_reason = None;
             })?;
 
@@ -2245,7 +2270,59 @@ impl Thread {
             })?;
 
             let mut stream = tokio::select! {
-                s = model.stream_completion(request, cx) => s?,
+                // A handshake failure (network drop after retries, auth error,
+                // etc.) does not end the turn dead: no event was ever produced,
+                // so `tool_uses` stays empty and the empty-tool-use branch below
+                // picks up `pending_stream_error` to nudge the model to retry or
+                // wrap up — mirroring the parse-error / max-tokens recovery, and
+                // capped by the same per-turn retry budget (thread 0b80401d).
+                s = model.stream_completion(request, cx) => match s {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let abort_err = this.update(cx, |this, cx| {
+                            this.recovery_retries += 1;
+                            let round = this.turn_count;
+                            if this.recovery_retries > MAX_RECOVERY_ATTEMPTS {
+                                tracing::warn!(
+                                    round,
+                                    error = %e,
+                                    kind = "handshake",
+                                    "stream_completion failed; recovery retries exhausted, aborting turn"
+                                );
+                                this.last_stop_reason = None;
+                                Some(anyhow::anyhow!(
+                                    "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (stream errors); last error: {e}"
+                                ))
+                            } else {
+                                tracing::warn!(
+                                    round,
+                                    error = %e,
+                                    kind = "handshake",
+                                    "stream_completion failed; recovery nudge injected"
+                                );
+                                // The handshake produced no event, so no
+                                // assistant message started and the empty-tool-
+                                // use branch below never runs this round. Inject
+                                // the nudge directly here so the next round-trip
+                                // carries it (append-only, prefix cache intact).
+                                this.insert_user_message(
+                                    format!(
+                                        "The previous model request failed: {e}. \
+                                         Retry the last step, or summarize the current progress \
+                                         and deliver the result if the work is done."
+                                    ),
+                                    cx,
+                                );
+                                this.last_stop_reason = None;
+                                None
+                            }
+                        })?;
+                        if let Some(err) = abort_err {
+                            return Err(err);
+                        }
+                        continue;
+                    }
+                },
                 _ = cancel.cancelled() => break,
             };
             let mut cancelled = false;
@@ -2408,12 +2485,17 @@ impl Thread {
                 // loop forever (the main thread has no `max_turns` guard).
                 let recovery = this.update(cx, |this, cx| {
                     let parse_err = this.pending_parse_error;
+                    // `take()` so the flag does not outlive this recovery: a
+                    // nudge is appended once, and the flag must not bleed into a
+                    // later round-trip that already produced executable tools.
+                    let stream_err = this.pending_stream_error.take();
                     let max_tok = this.last_stop_reason == Some(StopReason::MaxTokens);
                     // Degenerate empty turn: no tool_use and no visible
                     // assistant text (only empty Thinking). Distinct from
-                    // parse_err / max_tok — the model produced nothing useful
-                    // and the turn would otherwise end silently.
+                    // parse_err / stream_err / max_tok — the model produced
+                    // nothing useful and the turn would otherwise end silently.
                     let degenerate = !parse_err
+                        && stream_err.is_none()
                         && !max_tok
                         && match this.messages.last() {
                             Some(m) if m.role == Role::Assistant => !m
@@ -2422,15 +2504,16 @@ impl Thread {
                                 .any(|c| matches!(c, MessageContent::Text(t) if !t.is_empty())),
                             _ => false,
                         };
-                    if !parse_err && !max_tok && !degenerate {
+                    if !parse_err && stream_err.is_none() && !max_tok && !degenerate {
                         return RecoveryAction::Done;
                     }
                     this.recovery_retries += 1;
                     if this.recovery_retries > MAX_RECOVERY_ATTEMPTS {
                         cx.emit(ThreadEvent::Error(anyhow::anyhow!(
-                            "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (tool_use JSON parse error / max_output_tokens truncation / degenerate empty turn)"
+                            "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (stream error / tool_use JSON parse error / max_output_tokens truncation / degenerate empty turn)"
                         )));
                         this.pending_parse_error = false;
+                        this.pending_stream_error = None;
                         this.last_stop_reason = None;
                         return RecoveryAction::Abort;
                     }
@@ -2438,6 +2521,21 @@ impl Thread {
                         // The error tool_result is already in history from
                         // `handle_completion_event`; the model retries from it.
                         // Nothing to append.
+                    } else if let Some(reason) = stream_err {
+                        // Mid-stream failure: the assistant message (if any) is
+                        // half-finished. Nudge the model to retry the last step
+                        // or wrap up and deliver, so a transient transport
+                        // failure does not end the turn mid-work. Handshake
+                        // failures never reach here — they nudge at the call
+                        // site, before any assistant message starts.
+                        this.insert_user_message(
+                            format!(
+                                "The previous model request failed: {reason}. \
+                                 Retry the last step, or summarize the current progress \
+                                 and deliver the result if the work is done."
+                            ),
+                            cx,
+                        );
                     } else if max_tok {
                         // MaxTokens: append a "redo compactly" directive so the
                         // model shortens the next attempt to fit the budget.
@@ -2454,6 +2552,7 @@ impl Thread {
                         );
                     }
                     this.pending_parse_error = false;
+                    this.pending_stream_error = None;
                     this.last_stop_reason = None;
                     RecoveryAction::Continue
                 })?;
@@ -2914,10 +3013,6 @@ impl Thread {
         let name = "enter_plan_mode".to_string();
         let title = "Enter plan mode".to_string();
 
-        this.update(cx, |this, cx| {
-            this.set_plan_mode(true, cx);
-        })?;
-
         let msg = "Entered plan mode. Research the codebase with read-only tools and the `agent` tool (delegate to the `plan`/`explore` sub-agents for isolated-context exploration). Do not implement. When the plan is ready, call `exit_plan_mode` with it.".to_string();
 
         this.update(cx, |_, cx| {
@@ -2931,6 +3026,15 @@ impl Thread {
         })?;
         Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
         Self::append_tool_result(&this, tu, msg, false, cx)?;
+        // Flip plan mode after the tool result lands, so the adjacent user
+        // messages coalesce as [tool_result, directive] — the model sees the
+        // enter confirmation first, then the detailed plan-mode contract, in
+        // natural reading order. Ordering the flip after `append_tool_result`
+        // also keeps the flag unset if that append fails, so a failed enter
+        // never leaves the thread half-switched into plan mode.
+        this.update(cx, |this, cx| {
+            this.set_plan_mode(true, cx);
+        })?;
         Ok(())
     }
 
@@ -3220,6 +3324,17 @@ impl Thread {
                 self.pending_parse_error = true;
             }
             Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    kind = "mid-stream",
+                    "completion stream error mid-turn; recovery nudge follows if no tool_use was produced"
+                );
+                // Flag the round-trip so the empty-tool-use branch nudges the
+                // model to retry or wrap up, instead of ending the turn dead on
+                // a half-finished assistant message (thread 0b80401d). When a
+                // tool_use was already produced the flag is moot — the tool path
+                // runs and the loop re-requests; it is cleared at round-trip top.
+                self.pending_stream_error = Some(format!("{e}"));
                 cx.emit(ThreadEvent::Error(e));
             }
         }
@@ -3461,15 +3576,12 @@ impl Thread {
                 ));
             }
         }
-        // In plan mode, append the read-only-constraint addendum so the model
-        // knows it must submit a plan via `exit_plan_mode` rather than act.
-        if self.plan_mode {
-            system.push_str(crate::system_prompt::PLAN_MODE_ADDENDUM);
-        }
-        // Goal mode appends its autonomy directive. Plan and goal are mutually
-        // exclusive (`set_goal` exits plan mode), so at most one addendum
-        // lands here; both are compile-time constants, so the prefix stays
-        // byte-stable across turns regardless of which mode is active.
+        // Goal mode appends its autonomy directive. Unlike plan mode (whose
+        // directive is injected as a user message on `set_plan_mode(true)` to
+        // keep the system prefix byte-stable across the on/off switch), goal
+        // mode still rewrites the system head — a known prefix-cache hit on
+        // goal enter/exit, accepted because goal mode is entered far less often
+        // than plan mode and rarely mid-thread.
         if self.goal.is_some() {
             system.push_str(crate::system_prompt::GOAL_MODE_ADDENDUM);
         }
@@ -4907,6 +5019,334 @@ mod tests {
         );
     }
 
+    /// A model whose `stream_completion` always fails the handshake. Exercises
+    /// the recovery nudge for handshake-level failures (network drop, auth
+    /// error): without it the turn ended dead on the first error and the final
+    /// summary round-trip was lost (thread 0b80401d).
+    struct HandshakeErrorMockModel {
+        id: Arc<str>,
+        calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl crate::language_model::LanguageModel for HandshakeErrorMockModel {
+        fn id(&self) -> String {
+            self.id.to_string()
+        }
+        fn name(&self) -> String {
+            self.id.to_string()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let _ = calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!(
+                    "synthetic handshake failure: connection reset"
+                ))
+            })
+        }
+    }
+
+    /// A model whose stream emits one Text chunk then an `Err` mid-stream.
+    /// Exercises the recovery nudge for mid-stream failures (SSE truncation,
+    /// malformed event): the assistant message is half-finished and, with no
+    /// tool_use produced, the empty-tool-use branch must nudge the model to
+    /// retry or wrap up instead of ending the turn dead (thread 0b80401d).
+    struct MidStreamErrorMockModel {
+        id: Arc<str>,
+        calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl crate::language_model::LanguageModel for MidStreamErrorMockModel {
+        fn id(&self) -> String {
+            self.id.to_string()
+        }
+        fn name(&self) -> String {
+            self.id.to_string()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                use futures::StreamExt as _;
+                use std::sync::atomic::Ordering;
+                let _ = calls.fetch_add(1, Ordering::SeqCst);
+                let events: Vec<anyhow::Result<LanguageModelCompletionEvent>> = vec![
+                    Ok(LanguageModelCompletionEvent::Text("partial work".into())),
+                    Err(anyhow::anyhow!(
+                        "synthetic mid-stream failure: SSE truncated"
+                    )),
+                ];
+                Ok(futures::stream::iter(events).boxed())
+            })
+        }
+    }
+
+    /// Recovery for a handshake-level `stream_completion` failure: each error
+    /// injects a user nudge (append-only, prefix cache stays intact) and the
+    /// loop re-requests until `MAX_RECOVERY_ATTEMPTS` aborts — instead of ending
+    /// the turn dead on the first failure.
+    #[test]
+    fn run_turn_recovers_handshake_stream_error() {
+        use crate::language_model::{MessageContent, Role};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open mem db"),
+        );
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db, cx);
+        });
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(HandshakeErrorMockModel {
+            id: "test/handshake-err".into(),
+            calls: calls.clone(),
+        });
+
+        let thread_id = "reg-handshake-stream-error";
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("summarize the work and deliver".into())],
+            );
+            // Pin the title and run as a sub-agent (depth 1) so
+            // `maybe_generate_title` bails on its `depth != 0` guard — the
+            // appended recovery nudge is a user-role text message that
+            // increments the user-message count, which would otherwise trip a
+            // topic-shift re-eval and pollute the call counter.
+            rec.title = Some("regression".into());
+            let thread = super::Thread::restore(rec, Some(model), cx);
+            thread.update(cx, |t, _| t.depth = 1);
+            thread
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+
+        // 1 initial call + MAX_RECOVERY_ATTEMPTS re-requests: each handshake
+        // failure injects a recovery nudge instead of ending the turn dead.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + super::MAX_RECOVERY_ATTEMPTS as u64,
+            "handshake stream error must be recovered via nudge, not end the turn on the first failure"
+        );
+
+        // A recovery nudge must be appended on each continued retry (one fewer
+        // than the call count — the final abort round appends nothing).
+        let nudge_count = cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                t.messages
+                    .iter()
+                    .filter(|m| m.role == Role::User)
+                    .fold(0, |acc, m| {
+                        let has_nudge = m.content.iter().any(|c| match c {
+                            MessageContent::Text(t) => t.contains("previous model request failed"),
+                            _ => false,
+                        });
+                        if has_nudge { acc + 1 } else { acc }
+                    })
+            })
+        });
+        assert_eq!(
+            nudge_count,
+            super::MAX_RECOVERY_ATTEMPTS as usize,
+            "a recovery nudge must be appended on each continued handshake-error retry"
+        );
+    }
+
+    /// Recovery for a mid-stream `LanguageModelCompletionEvent::Err`: the
+    /// assistant message is half-finished (one Text chunk, no tool_use), so the
+    /// empty-tool-use branch must pick up the stream-error flag and nudge the
+    /// model to retry or wrap up — instead of ending the turn dead on the
+    /// partial message (thread 0b80401d).
+    #[test]
+    fn run_turn_recovers_mid_stream_error() {
+        use crate::language_model::{MessageContent, Role};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open mem db"),
+        );
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db, cx);
+        });
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(MidStreamErrorMockModel {
+            id: "test/mid-stream-err".into(),
+            calls: calls.clone(),
+        });
+
+        let thread_id = "reg-mid-stream-error";
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("summarize the work and deliver".into())],
+            );
+            rec.title = Some("regression".into());
+            let thread = super::Thread::restore(rec, Some(model), cx);
+            thread.update(cx, |t, _| t.depth = 1);
+            thread
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+
+        // 1 initial call + MAX_RECOVERY_ATTEMPTS re-requests: each mid-stream
+        // failure injects a recovery nudge instead of ending the turn dead on
+        // the half-finished assistant message.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1 + super::MAX_RECOVERY_ATTEMPTS as u64,
+            "mid-stream error must be recovered via nudge, not end the turn on the half-finished message"
+        );
+
+        // Every round's partial assistant message survives (append-only), one
+        // per call — proving the half-finished messages are retained, not
+        // dropped-and-rewritten.
+        let (assistant_count, nudge_count) = cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                let assistant_count = t
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == Role::Assistant)
+                    .count();
+                let nudge_count =
+                    t.messages
+                        .iter()
+                        .filter(|m| m.role == Role::User)
+                        .fold(0, |acc, m| {
+                            let has_nudge = m.content.iter().any(|c| match c {
+                                MessageContent::Text(t) => {
+                                    t.contains("previous model request failed")
+                                }
+                                _ => false,
+                            });
+                            if has_nudge { acc + 1 } else { acc }
+                        });
+                (assistant_count, nudge_count)
+            })
+        });
+        assert_eq!(
+            assistant_count,
+            (1 + super::MAX_RECOVERY_ATTEMPTS) as usize,
+            "append-only recovery must retain every round's half-finished assistant message"
+        );
+        assert_eq!(
+            nudge_count,
+            super::MAX_RECOVERY_ATTEMPTS as usize,
+            "a recovery nudge must be appended on each continued mid-stream-error retry"
+        );
+    }
+
     /// `run_enter_plan_mode` flips `plan_mode` on, emits a success ToolCall,
     /// produces text but ends WITHOUT a `MessageStop` (provider hiccup,
     /// non-SSE compatibility response) leaves the assistant text only in
@@ -5166,15 +5606,21 @@ mod tests {
                     t.plan_mode,
                     "plan_mode should be true after enter_plan_mode"
                 );
-                let last = t.messages.last().expect("no message after enter_plan_mode");
-                let tr = last
-                    .content
+                // The tool result is no longer the final message: enter flips
+                // plan mode (injecting the directive) *after* appending the
+                // tool result, so the plan-mode directive lands last. Scan back
+                // from the tail for the ToolResult instead of assuming `last()`.
+                let tr = t
+                    .messages
                     .iter()
-                    .find_map(|c| match c {
-                        MessageContent::ToolResult(tr) => Some(tr),
-                        _ => None,
+                    .rev()
+                    .find_map(|m| {
+                        m.content.iter().find_map(|c| match c {
+                            MessageContent::ToolResult(tr) => Some(tr),
+                            _ => None,
+                        })
                     })
-                    .expect("no ToolResult in last message");
+                    .expect("no ToolResult after enter_plan_mode");
                 assert_eq!(tr.tool_use_id.as_str(), "tu_enter_1");
                 assert!(
                     !tr.is_error,
@@ -5267,6 +5713,61 @@ mod tests {
         assert!(
             !names.contains(&"enter_plan_mode"),
             "a whitelisted turn must not advertise enter_plan_mode, got: {names:?}"
+        );
+    }
+
+    /// Plan on/off must not rewrite the system head — the plan directive is a
+    /// user message, so the provider prefix cache keeps its system+tools head
+    /// intact across the switch. Before this fix, `set_plan_mode(true)`
+    /// appended `PLAN_MODE_ADDENDUM` to `system` and `set_plan_mode(false)`
+    /// removed it, so every plan enter/exit round-trip broke the cached system
+    /// prefix (thread 0b80401d: the plan-exit round lost its 34万 cache_read).
+    #[test]
+    fn build_completion_request_system_stable_across_plan_switch() {
+        use crate::language_model::{MessageContent, Role};
+
+        crate::agent_def::init();
+        let mut cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-plan-system-stable", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        let system_text = |cx: &mut gpui::TestAppContext| -> String {
+            cx.update(|cx| {
+                let req = thread.read(cx).build_completion_request();
+                req.messages
+                    .iter()
+                    .find(|m| m.role == Role::System)
+                    .and_then(|m| {
+                        m.content.iter().find_map(|c| match c {
+                            MessageContent::Text(t) => Some(t.clone()),
+                            _ => None,
+                        })
+                    })
+            })
+            .expect("system message present")
+        };
+
+        let baseline = system_text(&mut cx);
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.set_plan_mode(true, cx));
+        });
+        let after_enter = system_text(&mut cx);
+        assert_eq!(
+            baseline, after_enter,
+            "system head must be byte-stable across plan enter (directive is a user message, not a system addendum)"
+        );
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.set_plan_mode(false, cx));
+        });
+        let after_exit = system_text(&mut cx);
+        assert_eq!(
+            baseline, after_exit,
+            "system head must be byte-stable across plan exit"
         );
     }
 

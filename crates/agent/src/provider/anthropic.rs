@@ -923,4 +923,192 @@ mod tests {
         .unwrap();
         assert!(body.get("output_config").is_none());
     }
+
+    // --- Live cache semantics probes (Bailian anthropic wire) ---
+    // Require MANOX_RUN_LIVE=1 and the DASHSCOPE_API_KEY in the macOS Keychain
+    // (per the configured glm-5.2[1m] anthropic model). They answer three
+    // questions about how Bailian's anthropic-compatible endpoint treats
+    // explicit `cache_control` breakpoints:
+    //   1. Does a breakpoint on the last *tool* (manox's current
+    //      LastBreakpointOnly policy output) produce a cache_read on the second
+    //      identical-prefix request?
+    //   2. Does a breakpoint on the *system* block (Bailian's documented
+    //      pattern) produce a cache_read?
+    //   3. Does Bailian honor *multiple* breakpoints, or only the last one?
+
+    async fn bailian_anthropic_endpoint() -> Option<(String, String, String)> {
+        if std::env::var("MANOX_RUN_LIVE").is_err() {
+            return None;
+        }
+        let config = crate::provider::CxConfig::load_default().ok()?;
+        let model = config.resolve_all_models().into_iter().find(|m| {
+            m.provider_name == "百炼"
+                && m.id.contains("glm-5.2")
+                && m.wire_api == WireApi::Anthropic
+        })?;
+        let api_key = crate::provider::resolve_apikey(
+            model
+                .apikey_source
+                .as_deref()
+                .unwrap_or("env:DASHSCOPE_API_KEY"),
+        )
+        .ok()?;
+        let url = messages_url(&model.endpoint_url);
+        Some((url, api_key, model.api_model_id()))
+    }
+
+    /// A prefix well above Bailian's 1024-token minimum cacheable block.
+    fn cacheable_prefix() -> String {
+        "The quick brown fox jumps over the lazy dog. ".repeat(150)
+    }
+
+    /// Send a hand-built Anthropic Messages body and collect the max
+    /// `input_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens`
+    /// reported across SSE usage events. Bypasses `apply_prompt_caching` so the
+    /// caller controls breakpoint placement exactly.
+    async fn probe_cache(
+        url: &str,
+        api_key: &str,
+        model: &str,
+        mut body: serde_json::Value,
+    ) -> (u64, u64, u64) {
+        use futures::StreamExt;
+        body["model"] = serde_json::json!(model);
+        body["max_tokens"] = serde_json::json!(64);
+        body["stream"] = serde_json::json!(true);
+        let client = reqwest::Client::builder().build().expect("client");
+        let resp = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .header("x-api-key", api_key)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            panic!("HTTP {status}: {text}");
+        }
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        let mut input = 0u64;
+        let mut creation = 0u64;
+        let mut read = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("chunk");
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(nl) = buf.find('\n') {
+                let line = buf[..nl].trim_end_matches('\r').to_string();
+                buf = buf[nl + 1..].to_string();
+                let Some(data) = extract_data_line(&line) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                if let Some(u) = v.get("usage") {
+                    if let Some(n) = u.get("input_tokens").and_then(|n| n.as_u64()) {
+                        input = input.max(n);
+                    }
+                    if let Some(n) = u
+                        .get("cache_creation_input_tokens")
+                        .and_then(|n| n.as_u64())
+                    {
+                        creation = creation.max(n);
+                    }
+                    if let Some(n) = u.get("cache_read_input_tokens").and_then(|n| n.as_u64()) {
+                        read = read.max(n);
+                    }
+                }
+            }
+        }
+        eprintln!("[PROBE] input={input} creation={creation} read={read}");
+        (input, creation, read)
+    }
+
+    /// Probe 1: manox's current LastBreakpointOnly policy places the breakpoint
+    /// on the last *tool* and leaves `system` a bare string (no cache_control).
+    /// Does Bailian honor a tool-block breakpoint — i.e. does the second
+    /// identical-prefix request show cache_read > 0?
+    #[tokio::test]
+    async fn live_anthropic_cache_last_tool_breakpoint() {
+        let Some((url, key, model)) = bailian_anthropic_endpoint().await else {
+            return;
+        };
+        let prefix = cacheable_prefix();
+        let body_for = |user: &str| {
+            serde_json::json!({
+                "system": prefix,
+                "tools": [{
+                    "name": "dummy",
+                    "description": "placeholder tool to host a cache_control breakpoint",
+                    "input_schema": {"type":"object","properties":{}},
+                    "cache_control": {"type":"ephemeral"}
+                }],
+                "messages": [{"role":"user","content":user}],
+            })
+        };
+        let (_, _, read1) =
+            probe_cache(&url, &key, &model, body_for("what is the code about?")).await;
+        let (_, _, read2) =
+            probe_cache(&url, &key, &model, body_for("how to optimize the code?")).await;
+        eprintln!(
+            "[PROBE1 last-tool] read1={read1} read2={read2} (read2>0 → Bailian honors tool-block breakpoint)"
+        );
+    }
+
+    /// Probe 2: Bailian's documented pattern — breakpoint on the *system* block,
+    /// no tools. Does the second request show cache_read > 0?
+    #[tokio::test]
+    async fn live_anthropic_cache_system_breakpoint() {
+        let Some((url, key, model)) = bailian_anthropic_endpoint().await else {
+            return;
+        };
+        let prefix = cacheable_prefix();
+        let body_for = |user: &str| {
+            serde_json::json!({
+                "system": [{"type":"text","text":prefix,"cache_control":{"type":"ephemeral"}}],
+                "messages": [{"role":"user","content":user}],
+            })
+        };
+        let (_, _, read1) =
+            probe_cache(&url, &key, &model, body_for("what is the code about?")).await;
+        let (_, _, read2) =
+            probe_cache(&url, &key, &model, body_for("how to optimize the code?")).await;
+        eprintln!(
+            "[PROBE2 system] read1={read1} read2={read2} (read2>0 → Bailian honors system-block breakpoint)"
+        );
+    }
+
+    /// Probe 3: two breakpoints (system block + a prefix user message). Does
+    /// Bailian honor both, or only the last one? system alone is ~1500 tokens;
+    /// the shared context-prefix is ~10 tokens — so read2 magnitude tells both
+    // (~1510) vs last-only (~10).
+    #[tokio::test]
+    async fn live_anthropic_cache_multi_breakpoint() {
+        let Some((url, key, model)) = bailian_anthropic_endpoint().await else {
+            return;
+        };
+        let prefix = cacheable_prefix();
+        let body_for = |user: &str| {
+            serde_json::json!({
+                "system": [{"type":"text","text":prefix,"cache_control":{"type":"ephemeral"}}],
+                "messages": [
+                    {"role":"user","content":[{"type":"text","text":"shared context prefix","cache_control":{"type":"ephemeral"}}]},
+                    {"role":"assistant","content":"ack"},
+                    {"role":"user","content":user}
+                ],
+            })
+        };
+        let (_, _, read1) =
+            probe_cache(&url, &key, &model, body_for("what is the code about?")).await;
+        let (_, _, read2) =
+            probe_cache(&url, &key, &model, body_for("how to optimize the code?")).await;
+        eprintln!(
+            "[PROBE3 multi] read1={read1} read2={read2} (read2≈1500 → both honored; read2≈10 → last-only)"
+        );
+    }
 }
