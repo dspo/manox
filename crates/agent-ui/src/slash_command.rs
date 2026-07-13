@@ -14,7 +14,9 @@
 //! bypass approvals + unsandboxed bash, see [`YoloCommand`]) and `/plan`
 //! (enter/exit plan mode, see [`PlanCommand`]). Markdown prompt-macros
 //! (`/gitwork:deliver`, etc.) are mirrored in at runtime via the
-//! [`MarkdownSlashCommand`] adapter.
+//! [`MarkdownSlashCommand`] adapter, and plugin/user skills via the
+//! [`SkillSlashCommand`] adapter — so `/<plugin>:<skill>` is slash-invocable
+//! the way it is in Claude Code.
 
 use std::sync::{Arc, OnceLock};
 
@@ -22,7 +24,9 @@ use gpui::{App, Context, SharedString, Window};
 
 use agent::command::CommandDefinition;
 use agent::i18n;
+use agent::skill::SkillDefinition;
 
+use crate::views::completion::CompletionKind;
 use crate::workspace::Workspace;
 
 /// Result of dispatching a slash command.
@@ -60,6 +64,12 @@ pub trait SlashCommand: Send + Sync {
     /// built-in commands; markdown-defined commands return their frontmatter
     /// description verbatim (author-chosen language).
     fn description(&self) -> SharedString;
+    /// Kind shown as the row icon + tag in the `⁄` popover. Defaults to
+    /// `Command`; `SkillSlashCommand` overrides to `Skill` so plugin skills
+    /// mirrored into the registry render with the skill icon.
+    fn kind(&self) -> CompletionKind {
+        CompletionKind::Command
+    }
     /// Execute the command. `args` is the trailing text after the command name.
     fn execute(
         &self,
@@ -104,7 +114,7 @@ impl SlashCommandRegistry {
 
 /// Register the built-in slash commands. Call once during app startup, before
 /// any workspace is created — and after `agent::init`, which populates the
-/// markdown command registry the macro adapters mirror. Idempotent via
+/// markdown command and skill registries the adapters mirror. Idempotent via
 /// `OnceLock::set`.
 pub fn init(_cx: &mut App) {
     let mut commands: Vec<Box<dyn SlashCommand>> = vec![
@@ -116,22 +126,53 @@ pub fn init(_cx: &mut App) {
         Box::new(GoalCommand),
         Box::new(CompactCommand),
     ];
+    // Names already claimed by built-ins and (below) markdown macros, so a
+    // skill sharing one is skipped — keeps one popover row per name and routes
+    // dispatch to the higher-priority command/built-in.
+    let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from([
+        "yolo".to_string(),
+        "plan".to_string(),
+        "goal".to_string(),
+        "compact".to_string(),
+    ]);
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
     // The adapter delegates to `Workspace::run_command_turn`, which substitutes
     // `$ARGUMENTS` and applies `allowed-tools` via `Thread::submit_command`.
     // `agent::command::try_global` is `None` only before `agent::init` (which
     // `main` calls before us); fall back to no macros rather than panicking.
-    commands.extend(
-        agent::command::try_global()
-            .map(|r| r.entries())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(key, def)| {
-                Box::new(MarkdownSlashCommand::new(key.clone(), def.clone()))
-                    as Box<dyn SlashCommand>
-            }),
-    );
+    for (key, def) in agent::command::try_global()
+        .map(|r| r.entries())
+        .unwrap_or_default()
+    {
+        // A macro sharing a built-in name (e.g. `commands/yolo.md`) is skipped —
+        // the built-in wins, mirroring the skill-skip rule below, so the popover
+        // never shows two rows for the same name.
+        if command_keys.contains(key.as_str()) {
+            continue;
+        }
+        command_keys.insert(key.clone());
+        commands.push(
+            Box::new(MarkdownSlashCommand::new(key.clone(), def.clone())) as Box<dyn SlashCommand>,
+        );
+    }
+    // Mirror every loaded skill (`/gitwork:deliver`, bare `/skill`, etc.) the
+    // same way. Skills dispatch to `Workspace::run_skill_turn` →
+    // `Thread::submit_skill`, which injects the skill body as the turn's user
+    // message. A command and a skill may share a key (`gitwork:deliver`); the
+    // command wins — skip a skill whose key an already-registered command owns,
+    // so the popover shows one row and `parse`/`dispatch` hit the command path.
+    for (key, def) in agent::skill::try_global()
+        .map(|r| r.entries())
+        .unwrap_or_default()
+    {
+        if command_keys.contains(key.as_str()) {
+            continue;
+        }
+        commands.push(
+            Box::new(SkillSlashCommand::new(key.clone(), def.clone())) as Box<dyn SlashCommand>
+        );
+    }
     let _ = REGISTRY.set(SlashCommandRegistry::new(commands));
 }
 
@@ -252,7 +293,45 @@ impl SlashCommand for MarkdownSlashCommand {
     }
 }
 
-/// `/plan` — enter or exit plan mode.
+/// Adapter wrapping a `SkillDefinition` as a `SlashCommand`, so a plugin skill
+/// (`/gitwork:deliver`) or user-authored skill (`/myskill`) is slash-invocable
+/// the way it is in Claude Code. The `key` is the full registry lookup name
+/// (`plugin:skill` or bare `skill`), matching what the user types and what
+/// `parse` looks up. `execute` delegates to `Workspace::run_skill_turn`, which
+/// pushes the display bubble and injects the skill body as the turn's user
+/// message via `Thread::submit_skill`.
+struct SkillSlashCommand {
+    key: String,
+    def: Arc<SkillDefinition>,
+}
+
+impl SkillSlashCommand {
+    fn new(key: String, def: Arc<SkillDefinition>) -> Self {
+        Self { key, def }
+    }
+}
+
+impl SlashCommand for SkillSlashCommand {
+    fn name(&self) -> &str {
+        &self.key
+    }
+    fn description(&self) -> SharedString {
+        SharedString::from(self.def.description.clone())
+    }
+    fn kind(&self) -> CompletionKind {
+        CompletionKind::Skill
+    }
+    fn execute(
+        &self,
+        args: &str,
+        workspace: &mut Workspace,
+        _window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        workspace.run_skill_turn(&self.key, args, cx);
+        SlashResult::Handled
+    }
+}
 ///
 /// - No args: toggle plan mode and consume the input (nothing sent to the
 ///   model). The state change is reflected in the access chip.
@@ -369,6 +448,7 @@ impl SlashCommand for CompactCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn parse_basic_command() {
@@ -457,6 +537,76 @@ mod tests {
         let p = parse("/compact").unwrap();
         assert_eq!(p.name, "compact");
         assert_eq!(p.args, "");
+    }
+
+    #[test]
+    fn skill_adapter_name_and_kind() {
+        // A mirrored skill surfaces under its full registry key and renders with
+        // the Skill kind so the `⁄` popover picks the skill icon. The description
+        // is the skill's own (author language, not i18n).
+        let def = Arc::new(SkillDefinition {
+            name: "deliver".to_string(),
+            description: "deliver a PR".to_string(),
+            body: "body".to_string(),
+            source: PathBuf::new(),
+        });
+        let cmd = SkillSlashCommand::new("gitwork:deliver".to_string(), def);
+        assert_eq!(cmd.name(), "gitwork:deliver");
+        assert_eq!(cmd.kind(), CompletionKind::Skill);
+        assert_eq!(cmd.description().as_ref(), "deliver a PR");
+    }
+
+    #[test]
+    fn registry_lookup_finds_mirrored_skill() {
+        // `init` mirrors skills into the same registry `parse` consults; verify
+        // a registry holding a SkillSlashCommand resolves the namespaced key and
+        // reports the Skill kind (command-wins-on-collision is exercised by init
+        // ordering, not by this lookup).
+        let def = Arc::new(SkillDefinition {
+            name: "deliver".to_string(),
+            description: "deliver a PR".to_string(),
+            body: "body".to_string(),
+            source: PathBuf::new(),
+        });
+        let reg = SlashCommandRegistry::new(vec![Box::new(SkillSlashCommand::new(
+            "gitwork:deliver".to_string(),
+            def,
+        )) as Box<dyn SlashCommand>]);
+        let found = reg.get("gitwork:deliver").expect("skill key resolves");
+        assert_eq!(found.name(), "gitwork:deliver");
+        assert_eq!(found.kind(), CompletionKind::Skill);
+    }
+
+    #[test]
+    fn registry_command_wins_over_same_key_skill() {
+        // `init` skips a skill whose key a command/built-in already owns. Model
+        // the post-init ordering directly: command pushed before a same-key skill
+        // → `get` (first match) returns the command, so dispatch never lands on
+        // the shadowed skill.
+        let cmd_def = Arc::new(CommandDefinition {
+            name: "yolo".to_string(),
+            description: "macro yolo".to_string(),
+            argument_hint: None,
+            allowed_tools: Vec::new(),
+            disable_model_invocation: false,
+            body: "body".to_string(),
+            source: PathBuf::new(),
+        });
+        let skill_def = Arc::new(SkillDefinition {
+            name: "yolo".to_string(),
+            description: "skill yolo".to_string(),
+            body: "body".to_string(),
+            source: PathBuf::new(),
+        });
+        let reg = SlashCommandRegistry::new(vec![
+            Box::new(MarkdownSlashCommand::new("yolo".to_string(), cmd_def))
+                as Box<dyn SlashCommand>,
+            Box::new(SkillSlashCommand::new("yolo".to_string(), skill_def))
+                as Box<dyn SlashCommand>,
+        ]);
+        let found = reg.get("yolo").expect("key resolves");
+        assert_eq!(found.kind(), CompletionKind::Command);
+        assert_eq!(found.description().as_ref(), "macro yolo");
     }
 
     /// Ensure the registry is populated for tests (idempotent).

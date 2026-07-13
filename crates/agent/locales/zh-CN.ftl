@@ -341,6 +341,7 @@ settings-tag-dspo = dspo
 workspace-input-placeholder = 输入消息，点击发送以开始使用
 workspace-composer-placeholder = 编写 markdown…（Cmd-Enter 发送）
 workspace-unknown-command = 未知命令：/{$name}（用 `/` 菜单查看已安装命令）
+workspace-unknown-skill = 未知技能：/{$name}（用 `/` 菜单查看已安装技能）
 workspace-no-model = 未配置模型
 workspace-approval-title = 工具调用审批
 workspace-approval-tool = 工具：{$name}
