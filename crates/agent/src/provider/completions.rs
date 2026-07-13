@@ -276,6 +276,11 @@ fn build_request_body(
         "max_tokens": max_tokens,
         "stream": true,
         "prompt_cache_key": cache_key,
+        // OpenAI-compatible servers only emit `usage` on the final chunk when
+        // this flag is set; without it the token meter sees no billable tokens
+        // from compatible-mode endpoints (e.g. Bailian). DashScope-native and
+        // standard OpenAI both honor it as a harmless opt-in.
+        "stream_options": {"include_usage": true},
     });
     if long_ttl {
         body["prompt_cache_retention"] = Value::String("24h".to_string());
@@ -319,7 +324,13 @@ fn messages_to_openai(messages: &[LanguageModelRequestMessage]) -> Vec<Value> {
                 // See anthropic.rs: rewritten to Text upstream, but emit the
                 // summary as text if reached untransformed.
                 MessageContent::Compaction(t) => text_buf.push_str(t),
-                MessageContent::Thinking { text, .. } => text_buf.push_str(text),
+                // OpenAI-compatible wire carries no reasoning in history:
+                // assistant turns surface only final content, never the prior
+                // reasoning trace (the "history stores content, not
+                // reasoning_content" convention). Dropping it keeps prior
+                // turns out of the request and avoids billing for reasoning
+                // tokens that the model never needs re-sent.
+                MessageContent::Thinking { .. } => {}
                 MessageContent::ToolUse(tu) => tool_uses.push(tu),
                 MessageContent::ToolResult(tr) => tool_results.push(tr),
                 MessageContent::Image { data, mime_type } => images.push((data, mime_type)),
@@ -754,6 +765,15 @@ mod tests {
     }
 
     #[test]
+    fn build_request_body_includes_stream_options_include_usage() {
+        // Compatible-mode endpoints (e.g. Bailian) only emit `usage` on the
+        // final chunk when `include_usage` is set; without it the token meter
+        // never sees billable tokens.
+        let body = build_request_body("m", 64, &req_with_tool(), "test-key", false);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
     fn messages_to_openai_emits_tool_calls_and_tool_role() {
         let tu = LanguageModelToolUse {
             id: "call_1".to_string(),
@@ -807,6 +827,50 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["role"], "user");
         assert_eq!(out[0]["content"], "hello");
+    }
+
+    /// A prior assistant turn whose only content was reasoning must drop out of
+    /// the OpenAI-compatible history entirely — no `assistant` message with
+    /// empty/null content, no leaked reasoning text. History carries final
+    /// content only, never the reasoning trace.
+    #[test]
+    fn messages_to_openai_drops_thinking_from_history() {
+        let messages = vec![LanguageModelRequestMessage {
+            role: Role::Assistant,
+            content: vec![MessageContent::Thinking {
+                text: "let me think".to_string(),
+                signature: None,
+            }],
+            cache: false,
+        }];
+        let out = messages_to_openai(&messages);
+        assert!(
+            out.is_empty(),
+            "thinking-only assistant turn must not emit a message: {out:?}"
+        );
+    }
+
+    /// When reasoning and final text share a turn, only the final text
+    /// survives into history — the reasoning trace must not leak into the
+    /// assistant `content`. Regression guard for the has_text + Thinking
+    /// discard interaction.
+    #[test]
+    fn messages_to_openai_keeps_text_when_mixed_with_thinking() {
+        let messages = vec![LanguageModelRequestMessage {
+            role: Role::Assistant,
+            content: vec![
+                MessageContent::Thinking {
+                    text: "let me think".to_string(),
+                    signature: None,
+                },
+                MessageContent::Text("the answer".to_string()),
+            ],
+            cache: false,
+        }];
+        let out = messages_to_openai(&messages);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"], "the answer");
     }
 
     fn make_tool_delta(
