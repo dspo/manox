@@ -129,6 +129,19 @@ thinking-other = { $count ->
     [one] {$count} other tool
    *[other] {$count} other tools
 }
+thinking-rounds = { $count ->
+    [one] thought {$count} round
+   *[other] thought {$count} rounds
+}
+thinking-files-read = { $count ->
+    [one] read {$count} file
+   *[other] read {$count} files
+}
+thinking-tool-calls = { $count ->
+    [one] ran {$count} tool call
+   *[other] ran {$count} tool calls
+}
+thinking-duration = { $count }s
 
 ### views/settings.rs
 settings-group-general = General
