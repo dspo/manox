@@ -449,16 +449,17 @@ struct CompletionsUsage {
     prompt_cache_hit_tokens: Option<u64>,
     #[serde(default)]
     prompt_cache_miss_tokens: Option<u64>,
-    /// Bailian/DashScope OpenAI-compat extension: the cache-hit count lives
-    /// in `prompt_tokens_details.cached_tokens`, distinct from DeepSeek's
-    /// flat `prompt_cache_hit_tokens`. Both are parsed and `.or()`-merged at
-    /// use; the two endpoints never co-occur on the same wire.
+    /// OpenAI-standard per-prompt token breakdown; `cached_tokens` is the
+    /// cache-read count. Standard OpenAI-compat endpoints (native OpenAI,
+    /// Azure, Bailian, …) report hits here, distinct from DeepSeek's flat
+    /// private `prompt_cache_hit_tokens`. Both are parsed and `.or()`-merged
+    /// at use; the two never co-occur on the same wire.
     #[serde(default)]
     prompt_tokens_details: Option<CompletionsPromptTokensDetails>,
 }
 
-/// Bailian per-prompt token breakdown. Only `cached_tokens` is consumed
-/// (cache-read count).
+/// Per-prompt token breakdown (OpenAI standard). Only `cached_tokens` is
+/// consumed (cache-read count).
 #[derive(Debug, Default, Deserialize)]
 struct CompletionsPromptTokensDetails {
     #[serde(default)]
@@ -576,9 +577,10 @@ impl CompletionsEventMapper {
                 self.stop_emitted = true;
             }
         }
-        // DeepSeek extends usage with `prompt_cache_hit_tokens` /
-        // `prompt_cache_miss_tokens`; Bailian reports the cache-hit count as
-        // `prompt_tokens_details.cached_tokens`. Per both docs, `prompt_tokens`
+        // DeepSeek extends usage with the private `prompt_cache_hit_tokens` /
+        // `prompt_cache_miss_tokens`; the OpenAI-standard
+        // `prompt_tokens_details.cached_tokens` carries the cache-hit count for
+        // standard OpenAI-compat endpoints. Per both docs, `prompt_tokens`
         // *includes* the cached subset, so manox's `TokenUsage.input_tokens`
         // (non-cached input) subtracts the hit out — otherwise `total_tokens()`
         // (= input + output + cache_read + cache_creation) would double-count
@@ -1080,13 +1082,13 @@ mod tests {
         );
     }
 
-    /// Bailian's OpenAI-compat endpoint reports cache hits as
-    /// `prompt_tokens_details.cached_tokens` (not DeepSeek's
-    /// `prompt_cache_hit_tokens`). It must surface as a `UsageUpdate` with
-    /// `cache_read_input_tokens` populated and `input_tokens` = prompt − hit
-    /// so `total_tokens()` does not double-count the hit subset.
+    /// Standard OpenAI-compat endpoints report cache hits as the
+    /// OpenAI-standard `prompt_tokens_details.cached_tokens` (not DeepSeek's
+    /// private `prompt_cache_hit_tokens`). It must surface as a `UsageUpdate`
+    /// with `cache_read_input_tokens` populated and `input_tokens` = prompt −
+    /// hit so `total_tokens()` does not double-count the hit subset.
     #[test]
-    fn map_chunk_emits_usage_update_with_bailian_cached_tokens() {
+    fn map_chunk_emits_usage_update_with_prompt_tokens_details_cached_tokens() {
         let mut mapper = CompletionsEventMapper::new();
         let chunk = serde_json::json!({
             "choices": [{"delta": {}, "finish_reason": "stop"}],
