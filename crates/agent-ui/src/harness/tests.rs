@@ -301,7 +301,7 @@ fn emit_spawn(
     cx.update(|cx| {
         sidebar.update(cx, |_, cx| {
             cx.emit(crate::views::sidebar::SidebarEvent::SpawnExternalSession(
-                kind, provider, model,
+                kind, provider, model, None,
             ));
         });
     });
