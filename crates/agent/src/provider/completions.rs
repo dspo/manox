@@ -449,6 +449,20 @@ struct CompletionsUsage {
     prompt_cache_hit_tokens: Option<u64>,
     #[serde(default)]
     prompt_cache_miss_tokens: Option<u64>,
+    /// Bailian/DashScope OpenAI-compat extension: the cache-hit count lives
+    /// in `prompt_tokens_details.cached_tokens`, distinct from DeepSeek's
+    /// flat `prompt_cache_hit_tokens`. Both are parsed and `.or()`-merged at
+    /// use; the two endpoints never co-occur on the same wire.
+    #[serde(default)]
+    prompt_tokens_details: Option<CompletionsPromptTokensDetails>,
+}
+
+/// Bailian per-prompt token breakdown. Only `cached_tokens` is consumed
+/// (cache-read count).
+#[derive(Debug, Default, Deserialize)]
+struct CompletionsPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -562,19 +576,23 @@ impl CompletionsEventMapper {
                 self.stop_emitted = true;
             }
         }
-        // DeepSeek extends the standard OpenAI usage with
-        // `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`. Per DeepSeek's
-        // API docs, `prompt_tokens` **equals** `prompt_cache_hit_tokens +
-        // prompt_cache_miss_tokens` — i.e. the wire `prompt_tokens` *includes*
-        // the cached subset. manox's `TokenUsage.input_tokens` field means
-        // *non-cached* input, so we subtract the hit tokens out; otherwise
-        // `total_tokens()` (= input + output + cache_read + cache_creation)
-        // would double-count the hit tokens in both `input_tokens` and
-        // `cache_read_input_tokens`. Standard OpenAI-compat endpoints without
-        // these fields simply emit nothing extra.
+        // DeepSeek extends usage with `prompt_cache_hit_tokens` /
+        // `prompt_cache_miss_tokens`; Bailian reports the cache-hit count as
+        // `prompt_tokens_details.cached_tokens`. Per both docs, `prompt_tokens`
+        // *includes* the cached subset, so manox's `TokenUsage.input_tokens`
+        // (non-cached input) subtracts the hit out — otherwise `total_tokens()`
+        // (= input + output + cache_read + cache_creation) would double-count
+        // the hit in both `input_tokens` and `cache_read_input_tokens`. The two
+        // cache fields never co-occur on the same wire, so `.or()` merges them.
         if let Some(usage) = chunk.usage {
             let prompt = usage.prompt_tokens.unwrap_or(0);
-            let hit = usage.prompt_cache_hit_tokens.unwrap_or(0);
+            let hit = usage
+                .prompt_cache_hit_tokens
+                .or(usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .and_then(|d| d.cached_tokens))
+                .unwrap_or(0);
             // `saturating_sub`: a malformed payload where hit > prompt must not
             // underflow and fabricate a huge non-cached count.
             let non_cached_input = prompt.saturating_sub(hit);
@@ -1055,6 +1073,41 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, 80);
         assert_eq!(usage.cache_creation_input_tokens, 20);
         // input_tokens + cache_read must reconstruct the wire prompt_tokens.
+        assert_eq!(
+            usage.input_tokens + usage.cache_read_input_tokens,
+            100,
+            "non-cached input + cache-read must reconstruct the wire prompt_tokens"
+        );
+    }
+
+    /// Bailian's OpenAI-compat endpoint reports cache hits as
+    /// `prompt_tokens_details.cached_tokens` (not DeepSeek's
+    /// `prompt_cache_hit_tokens`). It must surface as a `UsageUpdate` with
+    /// `cache_read_input_tokens` populated and `input_tokens` = prompt − hit
+    /// so `total_tokens()` does not double-count the hit subset.
+    #[test]
+    fn map_chunk_emits_usage_update_with_bailian_cached_tokens() {
+        let mut mapper = CompletionsEventMapper::new();
+        let chunk = serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 80, "text_tokens": 20}
+            }
+        });
+        let events = mapper.map_chunk(&chunk);
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(LanguageModelCompletionEvent::UsageUpdate(u)) => Some(*u),
+                _ => None,
+            })
+            .expect("UsageUpdate emitted");
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 80);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
         assert_eq!(
             usage.input_tokens + usage.cache_read_input_tokens,
             100,
