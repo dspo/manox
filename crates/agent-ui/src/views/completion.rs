@@ -94,7 +94,10 @@ pub fn detect(value: &str, cursor: usize) -> Option<Detection> {
     })
 }
 
-/// All registered slash commands, filtered + sorted by `query`.
+/// All registered slash commands (built-ins, markdown macros, and mirrored
+/// skills), filtered + sorted by `query`. Skills mirrored into the registry by
+/// `slash_command::init` surface here with `CompletionKind::Skill` via each
+/// adapter's `kind()`, so `/git` lists `gitwork:deliver` with the skill icon.
 pub fn slash_source(query: &str) -> Vec<CompletionItem> {
     let Some(reg) = SlashCommandRegistry::global() else {
         return Vec::new();
@@ -104,7 +107,7 @@ pub fn slash_source(query: &str) -> Vec<CompletionItem> {
         .map(|cmd| CompletionItem {
             name: cmd.name().to_string().into(),
             description: cmd.description().to_string().into(),
-            kind: CompletionKind::Command,
+            kind: cmd.kind(),
         })
         .collect();
     filter_sort(items, query)

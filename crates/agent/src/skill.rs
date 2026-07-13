@@ -102,6 +102,14 @@ impl SkillRegistry {
         self.skills.values().collect()
     }
 
+    /// `(registry_key, definition)` pairs. The key is the full lookup name
+    /// (`plugin:skill` or bare `skill`), distinct from `SkillDefinition::name`
+    /// (the bare frontmatter name) — needed by callers that mirror skills into
+    /// other registries keyed by the lookup form (e.g. the slash-command mirror).
+    pub fn entries(&self) -> Vec<(&String, &Arc<SkillDefinition>)> {
+        self.skills.iter().collect()
+    }
+
     /// One-line summaries (`- name: description`) for the system prompt, so the
     /// model knows which skills exist without their full bodies in context.
     pub fn summary_block(&self) -> String {
@@ -193,6 +201,13 @@ pub fn init() {
 
 pub fn global() -> &'static SkillRegistry {
     REGISTRY.get().expect("skill registry not initialized")
+}
+
+/// Non-panicking accessor mirroring `command::try_global`, for callers that may
+/// run before `agent::init` (e.g. the UI slash-command registry init, which
+/// `main` calls after `agent::init` but is safer not to assume).
+pub fn try_global() -> Option<&'static SkillRegistry> {
+    REGISTRY.get()
 }
 
 /// Freshly scan the filesystem and return a UI-friendly list of skills,

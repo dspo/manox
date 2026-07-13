@@ -1975,6 +1975,10 @@ impl Workspace {
         // into the same registry as `MarkdownSlashCommand` adapters and dispatch
         // into `run_command_turn` → `Thread::submit_command`, which substitutes
         // `$ARGUMENTS` and applies the command's `allowed-tools` filter.
+        // Plugin/user skills are mirrored as `SkillSlashCommand` adapters too,
+        // dispatching into `run_skill_turn` → `Thread::submit_skill`, which injects
+        // the skill body as the turn's user message — so `/gitwork:deliver` works
+        // even though gitwork ships it as a skill, not a command.
         // Slash commands only dispatch while idle — a `/name [args]` typed
         // while a turn is running is parked in the follow-up queue as raw text
         // rather than interrupting the run (e.g. `/clear` mid-turn would race
@@ -2079,6 +2083,39 @@ impl Workspace {
             });
         }
         // Persist on command submit so the sidebar shows the new entry immediately.
+        save_thread(self.thread.clone(), true, cx);
+        cx.notify();
+    }
+
+    /// Run a skill slash-command turn (`/gitwork:deliver args`). The display
+    /// text (`/key args`) is shown as the user bubble; `Thread::submit_skill`
+    /// injects the skill body (plus the appended args) as the turn's user
+    /// message. An unknown skill (adapter registered but the data registry
+    /// miss — shouldn't normally happen) surfaces an error and drops the turn.
+    pub(crate) fn run_skill_turn(&mut self, key: &str, args: &str, cx: &mut Context<Self>) {
+        let display_text = if args.is_empty() {
+            format!("/{key}")
+        } else {
+            format!("/{key} {args}")
+        };
+        let meta = self.user_turn_meta(cx);
+        let weak = cx.weak_entity();
+        self.conversation.update(cx, |c, cx| {
+            c.push_user(display_text, Vec::new(), meta, weak, cx)
+        });
+        self.sync_list_count(cx);
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        let hit = self
+            .thread
+            .update(cx, |thread, cx| thread.submit_skill(key, args, cx));
+        if !hit {
+            self.thread.update(cx, |_, cx| {
+                cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
+                    "{}",
+                    i18n::t_str("workspace-unknown-skill", &[("name", key)])
+                )));
+            });
+        }
         save_thread(self.thread.clone(), true, cx);
         cx.notify();
     }
@@ -3431,7 +3468,7 @@ impl Workspace {
                         .occlude()
                         .child(menu),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }
@@ -3524,7 +3561,7 @@ impl Workspace {
                         .occlude()
                         .child(menu),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }
@@ -4200,7 +4237,7 @@ impl Workspace {
                                 cx.notify();
                             })),
                     )
-                    .with_priority(1)
+                    .with_priority(1),
                 )
                 .into_any_element(),
         )
@@ -4365,7 +4402,7 @@ impl Workspace {
                                 cx.notify();
                             })),
                     )
-                    .with_priority(1)
+                    .with_priority(1),
                 )
                 .into_any_element(),
         )
@@ -4467,7 +4504,7 @@ impl Workspace {
                             cx.notify();
                         })),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }
@@ -4505,7 +4542,7 @@ impl Workspace {
                         .occlude()
                         .child(menu),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }
@@ -4952,7 +4989,7 @@ impl Workspace {
                         .occlude()
                         .child(menu),
                 )
-                .with_priority(1)
+                .with_priority(1),
             )
             .into_any_element()
     }

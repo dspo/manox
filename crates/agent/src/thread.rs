@@ -1718,7 +1718,29 @@ impl Thread {
         true
     }
 
-    /// Start a completion turn. No-ops when a turn is already running or there is no model.
+    /// Start a skill turn: inject the named skill's body (with the user's args
+    /// appended) as a user message and run. Mirrors `submit_command` but for
+    /// skills — skills carry no `allowed-tools` filter or `$ARGUMENTS` template,
+    /// so the body is emitted verbatim (description prefix + body, matching the
+    /// `skill` tool's output) with `args` appended as the turn's task.
+    pub fn submit_skill(&mut self, key: &str, args: &str, cx: &mut Context<Self>) -> bool {
+        let Some(s) = crate::skill::global().get(key).cloned() else {
+            return false;
+        };
+        let mut rendered = String::new();
+        if !s.description.is_empty() {
+            rendered.push_str(&s.description);
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str(&s.body);
+        if !args.is_empty() {
+            rendered.push_str("\n\n");
+            rendered.push_str(args);
+        }
+        self.insert_user_message(rendered, cx);
+        self.run_turn(cx);
+        true
+    }
     pub fn run_turn(&mut self, cx: &mut Context<Self>) {
         if self.running_turn.is_some() {
             return;
