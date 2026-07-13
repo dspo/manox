@@ -27,12 +27,10 @@ pub(super) fn date_field(value: Option<&Value>) -> Option<String> {
 /// Parse an ISO 8601 timestamp string into Unix seconds since epoch.
 /// Returns `None` if the string cannot be parsed or yields a pre-1970 timestamp.
 pub(super) fn timestamp_secs_from_iso(s: &str) -> Option<u64> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .and_then(|dt| {
-            let secs = dt.timestamp();
-            if secs >= 0 { Some(secs as u64) } else { None }
-        })
+    DateTime::parse_from_rfc3339(s).ok().and_then(|dt| {
+        let secs = dt.timestamp();
+        if secs >= 0 { Some(secs as u64) } else { None }
+    })
 }
 
 /// Unix seconds → `"YYYY-MM-DD"` (UTC).

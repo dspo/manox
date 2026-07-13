@@ -32,8 +32,8 @@ use url::Url;
 use cx_providers::{
     AgentConfig, ApiKeySourceKind, CopilotAuth, CxConfig, EndpointConfig, ModelConfig,
     PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec, ProviderModelConfig,
-    ResolvedModel, WireApi, active_provider_config_path, cx_state_dir, read_config_file,
-    resolve_apikey,
+    ResolvedAgent, ResolvedModel, WireApi, active_provider_config_path, canonical_agent_id,
+    cx_state_dir, effective_agents_for_model, read_config_file, resolve_apikey, resolved_agents,
 };
 
 mod codex_app;
@@ -253,14 +253,6 @@ fn model_header_row() -> Line<'static> {
     ])
 }
 
-fn canonical_agent_id(agent_id: &str) -> &str {
-    match agent_id {
-        // Backward-compat for legacy config entries only; the CLI no longer proxies `codex app`.
-        "codex-app" => "codex",
-        _ => agent_id,
-    }
-}
-
 /// Normalize a CLI-supplied agent name: case-insensitive, with alias collapsing.
 ///
 /// `CoDex.App` / `codexapp` / `codex_app` all resolve to the `Codex.app` agent; the
@@ -279,63 +271,6 @@ fn find_agent(config: &CxConfig, agent_id: &str) -> Option<ResolvedAgent> {
     resolved_agents(config)
         .into_iter()
         .find(|agent| agent.id == agent_id)
-}
-
-fn normalize_agent_ids(agent_ids: &[String]) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for agent_id in agent_ids {
-        let canonical = canonical_agent_id(agent_id).to_string();
-        if !normalized.iter().any(|existing| existing == &canonical) {
-            normalized.push(canonical);
-        }
-    }
-    normalized
-}
-
-fn default_wire_apis_for_agent(agent_id: &str) -> Vec<WireApi> {
-    match canonical_agent_id(agent_id) {
-        "copilot" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
-        "claude" => vec![WireApi::Anthropic],
-        "codex" | "Codex.app" => vec![WireApi::Responses],
-        // codex+ 是 codex 的分叉，额外支持 anthropic / completions。
-        // 仅 `cx codex+` 显式调用时进入；不写入默认 agents 列表（见 resolved_agents 追加逻辑）。
-        "codex+" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
-        _ => Vec::new(),
-    }
-}
-
-fn resolve_agent_wire_apis(agent_id: &str, _configured: &[String]) -> Vec<WireApi> {
-    // Agent wire_apis are hardcoded; config file's wire_apis field is ignored.
-    default_wire_apis_for_agent(agent_id)
-}
-
-fn all_compatible_agents(config: &CxConfig, endpoint: &EndpointConfig) -> Vec<String> {
-    let wire_api = WireApi::from_str(&endpoint.wire_api);
-    resolved_agents(config)
-        .into_iter()
-        .filter(|agent| agent.supports_wire_api(wire_api))
-        .map(|agent| agent.id)
-        .collect()
-}
-
-fn effective_agents_for_model(
-    config: &CxConfig,
-    _provider: &ProviderConfig,
-    endpoint: &EndpointConfig,
-    model: &ModelConfig,
-) -> Vec<String> {
-    let mut resolved = all_compatible_agents(config, endpoint);
-
-    for filter in [&endpoint.agents, &model.agents] {
-        if filter.is_empty() {
-            continue;
-        }
-
-        let allowed = normalize_agent_ids(filter);
-        resolved.retain(|agent_id| allowed.iter().any(|allowed_id| allowed_id == agent_id));
-    }
-
-    resolved
 }
 
 /// Map a `WireApi` to the launch vocabulary used by copilot's `COPILOT_PROVIDER_WIRE_API`.
@@ -388,102 +323,6 @@ struct Selection {
     /// 首个元素为默认模型（写入 config.toml 的 `model =`，并在注入脚本里标记 `isDefault`）。
     /// 非 Codex.app agent 始终为空 Vec。
     injected_models: Vec<ResolvedModel>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedAgent {
-    id: String,
-    binary: String,
-    args: Vec<String>,
-    supported_wire_apis: Vec<WireApi>,
-    env: BTreeMap<String, String>,
-    /// 内置隐藏 agent（如 codex+）：不显示在默认 agents 列表，
-    /// 仅当用户显式 `cx <id>` 时才进入。由 resolved_agents 追加，不写入用户配置。
-    hidden: bool,
-}
-
-impl ResolvedAgent {
-    fn supports_wire_api(&self, wire_api: WireApi) -> bool {
-        self.supported_wire_apis.contains(&wire_api)
-    }
-}
-
-/// 内置隐藏 agent 注册表：这些 agent 不写入用户配置 YAML，由 `resolved_agents`
-/// 无条件追加（若用户未自定义同名条目）。它们不出现在默认 agents 列表，
-/// 仅当用户显式 `cx <id>` 调用时才命中并进入对应启动流程。
-fn builtin_hidden_agent_configs() -> Vec<AgentConfig> {
-    vec![AgentConfig {
-        id: "codex+".into(),
-        binary: "codex+".into(),
-        args: Vec::new(),
-        wire_apis: vec!["anthropic".into(), "responses".into(), "completions".into()],
-        env: BTreeMap::new(),
-    }]
-}
-
-fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
-    let mut agents = Vec::new();
-    for agent in &config.agents {
-        let id = canonical_agent_id(&agent.id).to_string();
-        if agents
-            .iter()
-            .any(|existing: &ResolvedAgent| existing.id == id)
-        {
-            continue;
-        }
-        let supported_wire_apis = resolve_agent_wire_apis(&id, &agent.wire_apis);
-
-        if id == "codex" {
-            // codex 配置展开为 CLI 和 Desktop App 两条入口
-            agents.push(ResolvedAgent {
-                id: "codex".into(),
-                binary: "codex".into(),
-                args: vec![],
-                supported_wire_apis: supported_wire_apis.clone(),
-                env: agent.env.clone(),
-                hidden: false,
-            });
-            agents.push(ResolvedAgent {
-                id: "Codex.app".into(),
-                binary: "codex".into(),
-                args: vec!["app".into()],
-                supported_wire_apis,
-                env: agent.env.clone(),
-                hidden: false,
-            });
-        } else {
-            agents.push(ResolvedAgent {
-                id,
-                binary: agent.binary.clone(),
-                args: agent.args.clone(),
-                supported_wire_apis,
-                env: agent.env.clone(),
-                hidden: false,
-            });
-        }
-    }
-
-    // 追加内置隐藏 agent（不写入用户配置 YAML）。若用户已自定义同名条目则跳过，
-    // 以尊重用户的显式配置（此时该 agent 不再隐藏）。
-    for builtin in builtin_hidden_agent_configs() {
-        let id = canonical_agent_id(&builtin.id).to_string();
-        if agents
-            .iter()
-            .any(|existing: &ResolvedAgent| existing.id == id)
-        {
-            continue;
-        }
-        agents.push(ResolvedAgent {
-            id: id.clone(),
-            binary: builtin.binary.clone(),
-            args: builtin.args.clone(),
-            supported_wire_apis: default_wire_apis_for_agent(&id),
-            env: builtin.env.clone(),
-            hidden: true,
-        });
-    }
-
-    agents
 }
 
 fn default_agent_configs() -> Vec<AgentConfig> {

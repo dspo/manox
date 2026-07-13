@@ -365,10 +365,7 @@ pub(crate) fn count_recent_session_tokens(
             // Only count entries that were created during this session.
             // Entries without a timestamp (parsers that don't extract it) are
             // counted unconditionally for backward compatibility.
-            if entry
-                .timestamp_secs
-                .map_or(true, |ts| ts >= since_secs)
-            {
+            if entry.timestamp_secs.map_or(true, |ts| ts >= since_secs) {
                 tokens.input += entry.input_tokens;
                 tokens.output += entry.output_tokens;
                 tokens.cache_read += entry.cache_read_input_tokens;

@@ -314,11 +314,15 @@ pub struct ResolvedModel {
 }
 
 impl ResolvedModel {
-    /// Build a resolved model with manox semantics: `visible_agents` = endpoint agents,
-    /// `env` = provider base env + model overrides (model takes precedence), defaults empty.
-    /// cx post-processes (agent filtering, env merge) in its own `build_all_models`
-    /// because its TUI needs cross-model agent compatibility.
+    /// Build a resolved model with shared semantics: `visible_agents` is the
+    /// effective set for this model (wire_api-compatible agents, filtered by the
+    /// endpoint + model `agents` lists, empty filter = no restriction), `env`
+    /// merges provider base + model overrides (model takes precedence), defaults
+    /// empty. This is the single source of truth — cx and manox both resolve
+    /// through it, so the cascade wizard (manox) and cx's TUI see the same
+    /// agent/model compatibility.
     fn from_config(
+        config: &CxConfig,
         provider: &ProviderConfig,
         endpoint: &EndpointConfig,
         model: &ModelConfig,
@@ -347,7 +351,7 @@ impl ResolvedModel {
             model_wire_apis,
             provider_name: provider.name.clone(),
             endpoint_url: endpoint.url.clone(),
-            visible_agents: endpoint.agents.clone(),
+            visible_agents: effective_agents_for_model(config, provider, endpoint, model),
             copilot_auth: CopilotAuth::from_endpoint(endpoint),
             env: merged_env,
             apikey_source: provider.apikey_source.clone(),
@@ -487,7 +491,7 @@ impl CxConfig {
         for provider in &self.providers {
             for endpoint in provider.normalized_endpoints() {
                 for model in &endpoint.models {
-                    out.push(ResolvedModel::from_config(provider, &endpoint, model));
+                    out.push(ResolvedModel::from_config(self, provider, &endpoint, model));
                 }
             }
         }
@@ -615,6 +619,200 @@ fn keychain_secret(service: &str) -> Result<String> {
         .to_string())
 }
 
+// ══════════════════════════════════════════════════
+// Agent resolution
+// ══════════════════════════════════════════════════
+
+/// A fully resolved, launchable agent. Built from `AgentConfig` (user YAML) plus
+/// built-in hidden agents (e.g. `codex+`) that `resolved_agents` appends
+/// unconditionally. `cx` consumes this for TUI selection + launch wiring; the
+/// `visible_agents` field of `ResolvedModel` is derived from it via
+/// `effective_agents_for_model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAgent {
+    pub id: String,
+    pub binary: String,
+    pub args: Vec<String>,
+    pub supported_wire_apis: Vec<WireApi>,
+    pub env: BTreeMap<String, String>,
+    /// Built-in hidden agent (e.g. `codex+`): not shown in the default agent list,
+    /// surfaced only on explicit `cx <id>`. Appended by `resolved_agents`, never
+    /// written to user config.
+    pub hidden: bool,
+}
+
+impl ResolvedAgent {
+    pub fn supports_wire_api(&self, wire_api: WireApi) -> bool {
+        self.supported_wire_apis.contains(&wire_api)
+    }
+}
+
+/// Canonicalize a config/registry agent id. The only remap is the legacy
+/// `codex-app` → `codex` (the CLI no longer proxies `cx codex app`).
+pub fn canonical_agent_id(agent_id: &str) -> &str {
+    match agent_id {
+        // Backward-compat for legacy config entries only; the CLI no longer proxies `codex app`.
+        "codex-app" => "codex",
+        _ => agent_id,
+    }
+}
+
+/// Normalize a list of agent ids: apply `canonical_agent_id`, dedupe preserving
+/// first-seen order. Used by `effective_agents_for_model` to compare filters.
+pub fn normalize_agent_ids(agent_ids: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for agent_id in agent_ids {
+        let canonical = canonical_agent_id(agent_id).to_string();
+        if !normalized.iter().any(|existing| existing == &canonical) {
+            normalized.push(canonical);
+        }
+    }
+    normalized
+}
+
+/// Hardcoded wire_apis each built-in agent supports. The config file's per-agent
+/// `wire_apis` field is ignored — these are the source of truth.
+pub fn default_wire_apis_for_agent(agent_id: &str) -> Vec<WireApi> {
+    match canonical_agent_id(agent_id) {
+        "copilot" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
+        "claude" => vec![WireApi::Anthropic],
+        "codex" | "Codex.app" => vec![WireApi::Responses],
+        // codex+ is a codex fork that additionally supports anthropic / completions.
+        // Only entered on explicit `cx codex+`; not written to the default agents list.
+        "codex+" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve an agent's wire_apis. Configured `wire_apis` are ignored in favor of
+/// the hardcoded `default_wire_apis_for_agent`.
+pub fn resolve_agent_wire_apis(agent_id: &str, _configured: &[String]) -> Vec<WireApi> {
+    default_wire_apis_for_agent(agent_id)
+}
+
+/// Built-in hidden agents: not written to user YAML, appended unconditionally by
+/// `resolved_agents` (unless the user already defined a same-named entry, which
+/// takes precedence and un-hides it).
+pub fn builtin_hidden_agent_configs() -> Vec<AgentConfig> {
+    vec![AgentConfig {
+        id: "codex+".into(),
+        binary: "codex+".into(),
+        args: Vec::new(),
+        wire_apis: vec!["anthropic".into(), "responses".into(), "completions".into()],
+        env: BTreeMap::new(),
+    }]
+}
+
+/// All resolved agents: user-configured agents (with `codex` expanded into `codex`
+/// CLI + `Codex.app` desktop entries) plus built-in hidden agents appended
+/// unconditionally (skipped if the user already defined a same-named entry).
+pub fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
+    let mut agents = Vec::new();
+    for agent in &config.agents {
+        let id = canonical_agent_id(&agent.id).to_string();
+        if agents
+            .iter()
+            .any(|existing: &ResolvedAgent| existing.id == id)
+        {
+            continue;
+        }
+        let supported_wire_apis = resolve_agent_wire_apis(&id, &agent.wire_apis);
+
+        if id == "codex" {
+            // codex expands into a CLI entry and a Desktop App entry.
+            agents.push(ResolvedAgent {
+                id: "codex".into(),
+                binary: "codex".into(),
+                args: vec![],
+                supported_wire_apis: supported_wire_apis.clone(),
+                env: agent.env.clone(),
+                hidden: false,
+            });
+            agents.push(ResolvedAgent {
+                id: "Codex.app".into(),
+                binary: "codex".into(),
+                args: vec!["app".into()],
+                supported_wire_apis,
+                env: agent.env.clone(),
+                hidden: false,
+            });
+        } else {
+            agents.push(ResolvedAgent {
+                id,
+                binary: agent.binary.clone(),
+                args: agent.args.clone(),
+                supported_wire_apis,
+                env: agent.env.clone(),
+                hidden: false,
+            });
+        }
+    }
+
+    // Append built-in hidden agents (not in user YAML). Skip if the user already
+    // defined a same-named entry, to respect their explicit config (which un-hides it).
+    for builtin in builtin_hidden_agent_configs() {
+        let id = canonical_agent_id(&builtin.id).to_string();
+        if agents
+            .iter()
+            .any(|existing: &ResolvedAgent| existing.id == id)
+        {
+            continue;
+        }
+        agents.push(ResolvedAgent {
+            id: id.clone(),
+            binary: builtin.binary.clone(),
+            args: builtin.args.clone(),
+            supported_wire_apis: default_wire_apis_for_agent(&id),
+            env: builtin.env.clone(),
+            hidden: true,
+        });
+    }
+
+    agents
+}
+
+/// Agents whose wire_apis include the endpoint's `wire_api`. The compatibility
+/// baseline for `effective_agents_for_model` before the endpoint/model filters apply.
+pub fn all_compatible_agents(config: &CxConfig, endpoint: &EndpointConfig) -> Vec<String> {
+    let wire_api = WireApi::from_str(&endpoint.wire_api);
+    resolved_agents(config)
+        .into_iter()
+        .filter(|agent| agent.supports_wire_api(wire_api))
+        .map(|agent| agent.id)
+        .collect()
+}
+
+/// The effective set of agents a model supports — the single source of truth
+/// consumed by `ResolvedModel.visible_agents`.
+///
+/// Starts from `all_compatible_agents` (agents whose hardcoded wire_apis match
+/// the endpoint's wire_api), then applies two optional allow-list filters in
+/// order: the endpoint's `agents`, then the model's `agents`. An empty filter is
+/// **not** a restriction — it is skipped (no-op), meaning "no explicit allow-list,
+/// inherit the prior set". A non-empty filter retains only the listed agents. This
+/// makes a model with neither endpoint nor model `agents` support every
+/// wire_api-compatible agent, while a model with `agents: [claude]` narrows to
+/// claude only.
+pub fn effective_agents_for_model(
+    config: &CxConfig,
+    _provider: &ProviderConfig,
+    endpoint: &EndpointConfig,
+    model: &ModelConfig,
+) -> Vec<String> {
+    let mut resolved = all_compatible_agents(config, endpoint);
+
+    for filter in [&endpoint.agents, &model.agents] {
+        if filter.is_empty() {
+            continue;
+        }
+
+        let allowed = normalize_agent_ids(filter);
+        resolved.retain(|agent_id| allowed.iter().any(|allowed_id| allowed_id == agent_id));
+    }
+
+    resolved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,9 +863,15 @@ providers:
         let resolved = config.resolve_all_models();
         assert_eq!(resolved.len(), 1);
         // Model env overrides provider env for shared key
-        assert_eq!(resolved[0].env.get("SHARED"), Some(&"from-model".to_string()));
+        assert_eq!(
+            resolved[0].env.get("SHARED"),
+            Some(&"from-model".to_string())
+        );
         // Both unique keys are present
-        assert_eq!(resolved[0].env.get("PROVIDER_ONLY"), Some(&"pv".to_string()));
+        assert_eq!(
+            resolved[0].env.get("PROVIDER_ONLY"),
+            Some(&"pv".to_string())
+        );
         assert_eq!(resolved[0].env.get("MODEL_ONLY"), Some(&"mv".to_string()));
     }
 
@@ -824,5 +1028,119 @@ providers:
     #[test]
     fn resolve_unsupported() {
         assert!(resolve_apikey("foo:bar").is_err());
+    }
+
+    /// `visible_agents` reflects the effective agent set, not just
+    /// `endpoint.agents`. A model-level `agents: [claude]` with an empty endpoint
+    /// `agents` must resolve to `[claude]` — the pre-fix "manox semantics" copied
+    /// only `endpoint.agents` and yielded `[]`, hiding every model from the
+    /// cascade wizard.
+    #[test]
+    fn visible_agents_model_level_filter_narrows_to_claude() {
+        let yaml = r#"
+providers:
+- name: test
+  models:
+    m1:
+      wire_apis: [anthropic]
+      agents: [claude]
+  endpoints:
+    anthropic:
+      url: https://example.com
+agents:
+- id: claude
+  binary: claude
+  wire_apis: [anthropic]
+- id: codex
+  binary: codex
+  wire_apis: [responses]
+- id: copilot
+  binary: copilot
+  wire_apis: [anthropic, responses, completions]
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].visible_agents,
+            vec!["claude".to_string()],
+            "model-level agents: [claude] narrows the effective set to [claude]"
+        );
+    }
+
+    /// With neither endpoint nor model `agents`, a model supports every
+    /// wire_api-compatible agent (empty filter = no restriction, not "no agents").
+    /// The pre-fix semantics returned `[]` here too.
+    #[test]
+    fn visible_agents_empty_filters_mean_all_compatible() {
+        let yaml = r#"
+providers:
+- name: test
+  models:
+    m1:
+      wire_apis: [anthropic]
+  endpoints:
+    anthropic:
+      url: https://example.com
+agents:
+- id: claude
+  binary: claude
+  wire_apis: [anthropic]
+- id: codex
+  binary: codex
+  wire_apis: [responses]
+- id: copilot
+  binary: copilot
+  wire_apis: [anthropic, responses, completions]
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        // claude + copilot support the anthropic wire; codex (responses-only) does not.
+        // codex+ (builtin hidden) also supports anthropic, so it appears too.
+        assert!(
+            resolved[0].visible_agents.contains(&"claude".to_string()),
+            "empty filters must not zero out visible_agents; got {:?}",
+            resolved[0].visible_agents
+        );
+        assert!(
+            !resolved[0].visible_agents.is_empty(),
+            "empty filters mean all wire_api-compatible agents, not none"
+        );
+        assert!(
+            !resolved[0].visible_agents.contains(&"codex".to_string()),
+            "codex (responses-only) must not be compatible with the anthropic endpoint"
+        );
+    }
+
+    /// An endpoint-level `agents` filter restricts every model on that endpoint.
+    #[test]
+    fn visible_agents_endpoint_filter_restricts_models() {
+        let yaml = r#"
+providers:
+- name: test
+  models:
+    m1:
+      wire_apis: [anthropic]
+  endpoints:
+    anthropic:
+      url: https://example.com
+      agents: [claude]
+agents:
+- id: claude
+  binary: claude
+  wire_apis: [anthropic]
+- id: copilot
+  binary: copilot
+  wire_apis: [anthropic, responses, completions]
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].visible_agents,
+            vec!["claude".to_string()],
+            "endpoint agents: [claude] restricts the effective set to [claude]"
+        );
     }
 }
