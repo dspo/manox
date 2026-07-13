@@ -1124,8 +1124,15 @@ impl Workspace {
                     this.start_new_thread(Some(dir.clone()), window, cx);
                 }
                 SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
-                SidebarEvent::SpawnExternalSession(kind, provider, model) => {
-                    this.spawn_external_session(*kind, provider.clone(), model.clone(), window, cx);
+                SidebarEvent::SpawnExternalSession(kind, provider, model, project) => {
+                    this.spawn_external_session(
+                        *kind,
+                        provider.clone(),
+                        model.clone(),
+                        project.clone(),
+                        window,
+                        cx,
+                    );
                 }
                 SidebarEvent::OpenExternalSession(id) => {
                     this.attach_external_session(id, cx);
@@ -1255,11 +1262,16 @@ impl Workspace {
     /// `ExternalSession` so the close path can `kill` the agent explicitly. A
     /// spawn failure (binary missing / apikey parse / unsupported combo) pushes
     /// an error notification and leaves the sidebar untouched.
+    ///
+    /// `project_cwd` is `Some(path)` when launched from a project folder's `+`
+    /// button — the CLI runs in that project's directory. `None` uses the
+    /// workspace's default cwd.
     pub fn spawn_external_session(
         &mut self,
         kind: SessionKind,
         provider_name: String,
         model_id: String,
+        project_cwd: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1286,8 +1298,9 @@ impl Workspace {
         };
         let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
         let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
+        let cwd = project_cwd.unwrap_or_else(|| self.cwd.clone());
         let terminal =
-            match Terminal::new(id.clone(), self.cwd.clone(), 80, 24, Box::new(source), cx) {
+            match Terminal::new(id.clone(), cwd, 80, 24, Box::new(source), cx) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(error = %e, "failed to create terminal for external session");

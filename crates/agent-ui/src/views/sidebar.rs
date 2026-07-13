@@ -1,9 +1,9 @@
 //! Conversation history sidebar.
 //!
 //! A standalone gpui Entity that subscribes to `ThreadStore` and lists past threads. Clicking a
-//! conversation entry emits `OpenThread(id)`; the "+" button on each project folder header emits
-//! `NewThreadWithProject(path)`; the "+" button on the "Conversations" section emits `NewThread`.
-//! Workspace subscribes to these events.
+//! conversation entry emits `OpenThread(id)`; the "+" button on each project folder header and
+//! the "Conversations" section header opens a new-session popup menu (Manox Thread / Claude Code /
+//! Codex / GitHub Copilot). Workspace subscribes to these events.
 //!
 //! Threads bound to a project (chosen on the first screen) are grouped under a collapsible folder
 //! in the "Projects" section, keyed by project path; the rest fall under "Conversations". The top
@@ -17,8 +17,8 @@ use agent::provider::registry;
 use agent::{ThreadStore, ThreadStoreEvent, i18n, thread::ApprovalMode};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
-    EventEmitter, Pixels, Render, SharedString, Subscription, WeakEntity, Window, ease_in_out,
-    prelude::*, px,
+    EventEmitter, Pixels, Render, SharedString, Subscription, WeakEntity, Window, deferred,
+    ease_in_out, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme,
@@ -77,8 +77,14 @@ pub enum SidebarEvent {
     /// Launch an external agent CLI session with a user-picked provider + model
     /// (the cascade wizard's terminal action). The kind identifies the agent
     /// (`claude` / `codex` / `copilot`); the two strings are provider name +
-    /// model id.
-    SpawnExternalSession(crate::external_session::SessionKind, String, String),
+    /// model id; the optional PathBuf is the project path to use as the CLI's
+    /// cwd (when launched from a project folder's `+` button).
+    SpawnExternalSession(
+        crate::external_session::SessionKind,
+        String,
+        String,
+        Option<PathBuf>,
+    ),
     /// Switch the main area to an already-running external session.
     OpenExternalSession(String),
     /// Close an external session (× on the row): kill the agent and drop it
@@ -104,10 +110,16 @@ pub struct Sidebar {
     /// `selected` highlights the active one.
     external_sessions: Vec<crate::external_session::ExternalSessionSummary>,
     /// Whether the new-session `PopupMenu` (Manox Thread / Claude Code / Codex /
-    /// GitHub Copilot) is open off the "Conversations" header `+`.
+    /// GitHub Copilot) is open.
     new_session_open: bool,
     new_session_menu: Option<Entity<PopupMenu>>,
     new_session_menu_sub: Option<Subscription>,
+    /// The project path the new-session menu was opened from. `None` when
+    /// opened from the Conversations header; `Some` when opened from a project
+    /// folder's `+` button. The menu closures read this to decide whether to
+    /// emit `NewThread` vs `NewThreadWithProject`, and to pass the project path
+    /// as the CWD for external CLI sessions.
+    new_session_project: Option<PathBuf>,
     /// Live width driven by dragging the divider on the right edge. Updated
     /// from the owning `Workspace` on every drag-move tick.
     width: Pixels,
@@ -120,11 +132,6 @@ impl Sidebar {
     pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
         let store = agent::thread_store_global();
         let sub = cx.subscribe(&store, |_this, _store, ev: &ThreadStoreEvent, cx| {
-            // `SummariesUpdated` re-renders the whole list (a thread was
-            // created/saved/deleted). `RunningChanged` flips the running
-            // indicator on affected rows; `cx.notify()` is enough — the
-            // per-row `running` bool is recomputed in `render` from the store's
-            // `is_running` and the shimmer animation starts/stops accordingly.
             match ev {
                 ThreadStoreEvent::SummariesUpdated | ThreadStoreEvent::RunningChanged => {
                     cx.notify();
@@ -141,6 +148,7 @@ impl Sidebar {
             new_session_open: false,
             new_session_menu: None,
             new_session_menu_sub: None,
+            new_session_project: None,
             width,
             _sub: sub,
         }
@@ -172,13 +180,17 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Open the new-session `PopupMenu` off the "Conversations" header `+`.
-    /// One flat row (Manox Thread → `NewThread`) plus one submenu per external
-    /// agent kind. Each agent submenu is a provider→model cascade built from
-    /// `registry::global().models()` filtered by the agent's id; picking a
-    /// model emits `SpawnExternalSession(kind, provider, model)`. An agent with
-    /// no supporting model renders a muted "no model" label row.
-    fn open_new_session_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open the new-session `PopupMenu`. `project` is `None` when opened from
+    /// the Conversations header, `Some(path)` when opened from a project
+    /// folder's `+` button — the path determines the CWD for external CLI
+    /// sessions and whether "Manox Thread" binds to the project.
+    fn open_new_session_menu(
+        &mut self,
+        project: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_session_project = project.clone();
         let theme = cx.theme().clone();
         let sidebar = cx.entity().downgrade();
         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
@@ -192,8 +204,13 @@ impl Sidebar {
                 &theme,
                 move |_, _window, cx| {
                     let _ = sidebar_manox.update(cx, |this, cx| {
+                        let project = this.new_session_project.take();
                         this.close_new_session_menu();
-                        cx.emit(SidebarEvent::NewThread);
+                        if let Some(p) = project {
+                            cx.emit(SidebarEvent::NewThreadWithProject(p));
+                        } else {
+                            cx.emit(SidebarEvent::NewThread);
+                        }
                         cx.notify();
                     });
                 },
@@ -237,6 +254,7 @@ impl Sidebar {
         self.new_session_open = false;
         self.new_session_menu = None;
         self.new_session_menu_sub = None;
+        self.new_session_project = None;
     }
 
     /// Mark the currently selected thread id (back-filled by Workspace on switch/new, for highlight).
@@ -244,9 +262,6 @@ impl Sidebar {
         if self.selected == id {
             return;
         }
-        // The outgoing selection becomes the previous one so its row can play
-        // the fade-out half of the slide; bump the generation so both rows'
-        // wash animations retrigger.
         self.prev_selected = self.selected.take();
         self.selected = id;
         self.select_gen = self.select_gen.wrapping_add(1);
@@ -254,7 +269,9 @@ impl Sidebar {
     }
 
     /// A collapsible project folder: a clickable header (chevron + folder icon +
-    /// basename) over its indented conversation rows when expanded.
+    /// basename) over its indented conversation rows when expanded. The `+`
+    /// button opens the new-session popup menu with the project path so the
+    /// workspace can set the CWD for external CLI sessions.
     fn render_project_group(
         &self,
         path: &str,
@@ -264,10 +281,6 @@ impl Sidebar {
         slide: &SlideCtx,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Owned clone so the row-mapping closure can borrow `theme` without
-        // holding an immutable borrow of `*cx` (which would clash with the
-        // `&mut cx` the closure also passes into each row). Cheap: Theme's
-        // heavy fields are Arc/Rc refcount bumps.
         let theme = cx.theme().clone();
         let expanded = !self.collapsed.contains(path);
         let name = std::path::Path::new(path)
@@ -317,11 +330,18 @@ impl Sidebar {
                     .tooltip(i18n::t("sidebar-new-chat"))
                     .on_click(cx.listener({
                         let path = path.to_string();
-                        move |_this, _ev, _window, cx| {
+                        move |this, _ev, window, cx| {
                             cx.stop_propagation();
-                            cx.emit(SidebarEvent::NewThreadWithProject(PathBuf::from(
-                                path.clone(),
-                            )));
+                            if this.new_session_open {
+                                this.close_new_session_menu();
+                            } else {
+                                this.open_new_session_menu(
+                                    Some(PathBuf::from(path.clone())),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            cx.notify();
                         }
                     })),
             )
@@ -336,12 +356,6 @@ impl Sidebar {
             }));
 
         let rows = expanded.then(|| {
-            // `w_full` keeps this v_flex stretching to the project group's
-            // width; without it the v_flex collapses to its content's max
-            // width, and at narrow sidebar widths the inner title div gets
-            // 0 px of horizontal space — `overflow_hidden` then clips the
-            // title text completely, so the row only renders the tag/tokens
-            // strip below.
             v_flex().w_full().gap_0p5().children(group.iter().map(|s| {
                 render_thread_item(
                     s,
@@ -371,9 +385,6 @@ impl Render for Sidebar {
         let selected = self.selected.clone();
         let store = self.store.clone();
 
-        // Partition into project-bound groups (keyed by project path, first-seen
-        // order preserved) and the projectless remainder. `summaries` is already
-        // newest-first, so both keep that ordering.
         let mut projects: Vec<(String, Vec<agent::ThreadSummary>)> = Vec::new();
         let mut loose: Vec<agent::ThreadSummary> = Vec::new();
         for s in &summaries {
@@ -386,9 +397,6 @@ impl Render for Sidebar {
             }
         }
 
-        // Build the flat, render-order list of visible thread ids to derive the
-        // slide direction between the previous and the new selection. Collapsed
-        // project groups contribute nothing; their rows aren't on screen.
         let mut flat_ids: Vec<String> = Vec::new();
         for (path, group) in &projects {
             if !self.collapsed.contains(path.as_str()) {
@@ -417,7 +425,6 @@ impl Render for Sidebar {
             gen_id: self.select_gen,
         };
 
-        // Leave room for the macOS traffic-light buttons that float over the transparent titlebar.
         let top_inset = if cfg!(target_os = "macos") {
             px(28.)
         } else {
@@ -430,18 +437,12 @@ impl Render for Sidebar {
             .bg(theme.background)
             .border_r_1()
             .border_color(theme.border)
-            // Scrollable body: top menu + projects + conversations. The body
-            // owns the macOS traffic-light inset now that the top tab switcher
-            // is gone.
+            .relative()
             .child(
                 v_flex()
                     .id("sidebar-body")
                     .flex_1()
                     .w_full()
-                    // `min_h_0` lets the body shrink below its content height so
-                    // `overflow_y_scroll` actually engages; without it the flex
-                    // item's min-height defaults to content and the list grows
-                    // past the viewport instead of scrolling.
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
@@ -495,21 +496,11 @@ impl Render for Sidebar {
                                             if this.new_session_open {
                                                 this.close_new_session_menu();
                                             } else {
-                                                this.open_new_session_menu(window, cx);
+                                                this.open_new_session_menu(None, window, cx);
                                             }
                                             cx.notify();
                                         })),
                                 )
-                                .children(self.new_session_menu.clone().map(|menu| {
-                                    gpui::div()
-                                        .id("new-session-dropdown")
-                                        .absolute()
-                                        .top_full()
-                                        .right_0()
-                                        .occlude()
-                                        .child(menu)
-                                        .into_any_element()
-                                }))
                                 .into_any_element(),
                         ),
                     ))
@@ -540,10 +531,27 @@ impl Render for Sidebar {
                         }),
                     )),
             )
+            // Render the new-session dropdown outside the scrollable body so it
+            // is not clipped by `overflow_y_scroll`. `deferred` + `with_priority(1)`
+            // paints it after the whole sidebar tree, floating above the scroll
+            // container — same pattern as ContextRail's branch dropdown.
+            .children(self.new_session_menu.clone().map(|menu| {
+                deferred(
+                    gpui::div()
+                        .id("new-session-dropdown")
+                        .absolute()
+                        .top_full()
+                        .right_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1)
+                .into_any_element()
+            }))
     }
 }
 
-/// A clickable top-level menu row. When `on_click` is `None` the row is static decoration.
+/// A clickable top-level menu row.
 fn menu_item(
     id: &'static str,
     icon: IconName,
@@ -589,10 +597,6 @@ fn static_menu_item(
     )
 }
 
-/// A group header (section label). Text size matches the menu items and
-/// thread titles below it so the section reads as a peer of its children
-/// rather than a smaller-label category. `action` is an optional trailing
-/// element (e.g. a "+" button) rendered to the right of the label.
 fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>) -> AnyElement {
     let mut row = h_flex()
         .px_2()
@@ -611,10 +615,7 @@ fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>
     row.into_any_element()
 }
 
-/// One row of the new-session `PopupMenu`: icon + label. Brand names
-/// (`kind.label()`) are passed through `i18n::t` which falls back to the
-/// literal string when no fluent key matches, so "Claude Code" etc. render
-/// verbatim without needing a translation entry.
+/// One row of the new-session `PopupMenu`: icon + label.
 fn new_session_item(
     icon: IconName,
     label: impl Into<SharedString>,
@@ -639,10 +640,10 @@ fn new_session_item(
 /// Build the provider→model cascade inside an external-agent submenu. Models
 /// are drawn from `registry::global().models()` filtered by the agent's id
 /// (`visible_agents`); they are grouped by provider, each provider a nested
-/// submenu. Picking a model emits `SpawnExternalSession(kind, provider, model)`
-/// to the sidebar; the top-level menu's `DismissEvent` closes the popup stack.
-/// An agent with no supporting model renders a muted "no model" label instead
-/// of empty submenus, so the dogfooder sees what to configure.
+/// submenu. Picking a model emits `SpawnExternalSession(kind, provider, model,
+/// project)` to the sidebar — the project path (if any) is read from the
+/// sidebar's `new_session_project` field so the workspace can set the CWD for
+/// external CLI sessions.
 fn build_agent_model_cascade(
     menu: PopupMenu,
     kind: crate::external_session::SessionKind,
@@ -676,11 +677,6 @@ fn build_agent_model_cascade(
         menu = menu.submenu(prov_name, window, cx, move |submenu, _window, _cx| {
             let mut submenu = submenu;
             for m in &models {
-                // `cx::AgentBuilder` matches the raw `ResolvedModel.id` (bare model
-                // id like `glm-5.2[1m]`), NOT the manox stable key
-                // (`provider/model/wire` = `m.id()`). `name()` returns that bare id;
-                // passing `id()` here makes every spawn fail with "provider X 下未
-                // 找到支持 Y 的 model `<key>`".
                 let model_id = m.name().to_string();
                 let model_name = m.name().to_string();
                 let prov = m.provider_name().to_string();
@@ -693,11 +689,13 @@ fn build_agent_model_cascade(
                             .into_any_element()
                     })
                     .on_click(move |_, _, cx: &mut App| {
-                        let _ = sidebar.update(cx, |_this, cx| {
+                        let _ = sidebar.update(cx, |this, cx| {
+                            let project = this.new_session_project.clone();
                             cx.emit(SidebarEvent::SpawnExternalSession(
                                 kind,
                                 prov.clone(),
                                 model_id.clone(),
+                                project,
                             ));
                             cx.notify();
                         });
@@ -710,11 +708,7 @@ fn build_agent_model_cascade(
     menu
 }
 
-/// Render one external-session row in the "External" section. Simpler than a
-/// thread row — no slide-wash (external sessions live in their own section and
-/// don't participate in the conversation selection slide), just an icon + kind
-/// label + muted provider/model subtitle + a trailing `×` that emits
-/// `CloseExternalSession(id)`. Clicking the row emits `OpenExternalSession(id)`.
+/// Render one external-session row in the "External" section.
 fn render_external_session_item(
     summary: &crate::external_session::ExternalSessionSummary,
     selected: bool,
@@ -782,16 +776,7 @@ fn render_external_session_item(
     row.into_any_element()
 }
 
-/// Render one conversation row. `indent` adds left padding so rows nested under
-/// a project folder align below its label. Two-row layout: title on top, tag +
-/// total tokens + relative time + archive action on bottom. The
-/// thread-id tag is clickable to copy the full thread id (F1); while `running`
-/// is true a highlight band sweeps across the tag (F2).
-///
-/// Element ids and the hover `group` key are derived from the thread's UUID, not
-/// a per-list enumerate index — the project groups and the loose list each
-/// enumerate from 0, so an index-keyed id collided across groups and routed
-/// clicks to the wrong row. The UUID is unique by construction.
+/// Render one conversation row.
 fn render_thread_item(
     summary: &agent::ThreadSummary,
     selected: bool,
@@ -814,10 +799,6 @@ fn render_thread_item(
     };
     let updated = format_relative(summary.interacted_at);
     let tokens = format_tokens(summary.cumulative_total_tokens);
-    // The active row's surface is painted by the sliding wash overlay below,
-    // not by a static row background. Keeping the row itself transparent lets
-    // the wash cross-fade between the deselecting and selecting rows without a
-    // double-fill, and leaves hover/active free to tint only non-selected rows.
     let role = if slide.selecting_id.as_deref() == Some(id.as_str()) {
         AnimRole::Selecting
     } else if slide.deselecting_id.as_deref() == Some(id.as_str()) {
@@ -825,10 +806,6 @@ fn render_thread_item(
     } else {
         AnimRole::None
     };
-    // dir_sign orients the slide along the selection's travel direction: Down
-    // (new row below the old) moves the wash downward, Up moves it upward. None
-    // (initial load, no prior row) zeroes the translation so the wash simply
-    // fades in place.
     let dir_sign: f32 = match slide.dir {
         SlideDir::Down => 1.0,
         SlideDir::Up => -1.0,
@@ -836,8 +813,6 @@ fn render_thread_item(
     };
     let wash = approval_mode_color(summary.approval_mode, theme);
     let slide_gen = slide.gen_id;
-    // The wash overlay is attached only to rows participating in the transition.
-    // Idle rows (AnimRole::None) carry no overlay and pay no animation cost.
     let wash_overlay: Option<AnyElement> = if role != AnimRole::None {
         let anim_role = role;
         let anim_id = format!("thread-sel-wash-{id}-{slide_gen}");
@@ -851,18 +826,11 @@ fn render_thread_item(
                     anim_id,
                     Animation::new(Duration::from_millis(160)).with_easing(ease_in_out),
                     move |el, t| {
-                        // Selecting: wash fades in (0->1) while settling into
-                        // place from the prior row's direction. Deselecting:
-                        // wash fades out (1->0) while continuing past this row
-                        // off the opposite edge.
                         let (opacity, ty) = if anim_role == AnimRole::Selecting {
                             (t, -dir_sign * SELECT_SLIDE_PX * (1.0 - t))
                         } else {
                             (1.0 - t, dir_sign * SELECT_SLIDE_PX * t)
                         };
-                        // top+bottom shifted by equal-and-opposite offsets moves
-                        // the rect without resizing it; overflow_hidden on the
-                        // row clips the wash as it enters and exits.
                         el.bg(wash.opacity(0.18 * opacity))
                             .top(px(ty))
                             .bottom(px(-ty))
@@ -873,27 +841,15 @@ fn render_thread_item(
     } else {
         None
     };
-    // Selected title stays foreground (strong, full contrast) — the wash alone
-    // carries the active signal; tinting the title accent-on-accent crushed
-    // contrast and made the active row read as disabled.
     let title_color = theme.foreground;
     let group = gpui::SharedString::from(format!("thread-row-{id}"));
-    // Short thread ID: first 8 chars of the UUID. Char-based so a non-ASCII
-    // id (defensive — ids are hex today) cannot panic on a char boundary.
     let short_id: String = summary.id.chars().take(8).collect();
-    // Running threads share the selected (Primary) tag tint so the indicator
-    // reads as "active" even before the sweep animation paints.
     let tag_variant = if selected || running {
         TagVariant::Primary
     } else {
         TagVariant::Secondary
     };
 
-    // F1: the tag sits inside a ghost Button so gpui-component's managed
-    // tooltip (only exposed on its own components) is available, and the
-    // click copies the full thread id. `stop_propagation` keeps the click
-    // from bubbling into the row's `OpenThread` handler. The Tag remains the
-    // visual; the Button contributes no box of its own in ghost mode.
     let tag_button = Button::new(format!("thread-id-tag-{id}"))
         .ghost()
         .xsmall()
@@ -912,15 +868,8 @@ fn render_thread_item(
             cx.write_to_clipboard(ClipboardItem::new_string(id_copy.clone()));
         });
 
-    // F2: a relative+overflow-hidden wrapper around the tag so a sweeping
-    // highlight band — clipped to the wrapper — reads as light passing over
-    // the tag while the turn is live. `Animation::repeat` loops forever; the
-    // band is only attached when `running`, so idle rows pay no animation cost.
     let tag_wrapper = gpui::div().relative().overflow_hidden().child(tag_button);
     let tag_element: AnyElement = if running {
-        // `accent` is `Copy` (`Hsla`); lift it out of the `&Theme` borrow so the
-        // `'static` animator closure (which rebuilds the band each frame) can
-        // own a copy instead of borrowing `theme` past the function body.
         let accent = theme.accent;
         tag_wrapper
             .with_animation(
@@ -962,21 +911,13 @@ fn render_thread_item(
         .on_click(cx.listener(move |_this, _ev, _window, cx| {
             cx.emit(SidebarEvent::OpenThread(id_open.clone()));
         }))
-        // The wash sits behind the content (painted first, clipped to the row)
-        // so the selection surface slides between rows without covering text.
         .when_some(wash_overlay, |this, overlay| this.child(overlay))
-        // Two-row layout: title on top, metadata on bottom. `gap_1` separates
-        // the two rows clearly so a multi-line title doesn't visually run into
-        // the tag/token row below.
         .child(
             v_flex()
                 .w_full()
                 .gap_1()
                 .flex_1()
                 .min_w_0()
-                // Row 1: title (full width, no inline tag clutter). A small
-                // pin star sits inline when the thread is pinned, so the
-                // floating-to-top ordering has a visible marker.
                 .child(
                     h_flex()
                         .w_full()
@@ -1005,17 +946,12 @@ fn render_thread_item(
                                 .child(title),
                         ),
                 )
-                // Row 2: tag + tokens + relative time, with the archive
-                // action taking their place on hover.
                 .child(
                     h_flex()
                         .w_full()
                         .gap_1()
                         .items_center()
                         .child(tag_element)
-                        // Tokens + relative time, hidden on hover so the action
-                        // button can take their place. `min_w_0` + overflow
-                        // hidden so a narrow sidebar clips rather than overflows.
                         .child(
                             h_flex()
                                 .gap_1()
@@ -1028,7 +964,6 @@ fn render_thread_item(
                                 .child(gpui::div().child(tokens))
                                 .child(gpui::div().child(updated)),
                         )
-                        // Archive action, revealed on hover.
                         .child(
                             h_flex()
                                 .gap_0p5()
@@ -1053,7 +988,6 @@ fn render_thread_item(
         .into_any_element()
 }
 
-/// Compact token count: 1234 -> "1.2k", 1234567 -> "1.2M".
 fn format_tokens(n: u64) -> String {
     if n < 1000 {
         n.to_string()
@@ -1072,8 +1006,6 @@ fn approval_mode_color(mode: i64, theme: &Theme) -> gpui::Hsla {
     }
 }
 
-/// Format epoch seconds as a coarse relative time, locale-aware via fluent
-/// plural rules (en distinguishes one/other; zh-CN has no plural distinction).
 fn format_relative(epoch: i64) -> String {
     let now = chrono::Local::now().timestamp();
     let diff = (now - epoch).max(0);
