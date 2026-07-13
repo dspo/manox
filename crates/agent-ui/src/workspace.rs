@@ -2149,6 +2149,7 @@ impl Workspace {
         &mut self,
         turn: DeferredUserTurn,
         weak: WeakEntity<Workspace>,
+        follow_tail: bool,
         cx: &mut Context<Self>,
     ) {
         use agent::language_model::MessageContent;
@@ -2158,7 +2159,9 @@ impl Workspace {
         // Splice the new user item in and re-engage tail-follow so the
         // streaming reply stays pinned as it grows.
         self.sync_list_count(cx);
-        self.list_state.set_follow_mode(FollowMode::Tail);
+        if follow_tail {
+            self.list_state.set_follow_mode(FollowMode::Tail);
+        }
         self.thread.update(cx, |thread, cx| {
             if turn.images.is_empty() {
                 thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui), cx);
@@ -2207,7 +2210,7 @@ impl Workspace {
         weak: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) {
-        self.append_user_turn(turn, weak, cx);
+        self.append_user_turn(turn, weak, true, cx);
         self.thread.update(cx, |thread, cx| thread.run_turn(cx));
         // Persist on submit so the sidebar shows the new entry immediately.
         save_thread(self.thread.clone(), true, cx);
@@ -2234,7 +2237,12 @@ impl Workspace {
         while let Some(item) = self.queued_follow_ups.pop_front() {
             match item.state {
                 FollowUpState::Queued => {
-                    self.append_user_turn(item.turn, weak.clone(), cx);
+                    self.append_user_turn(
+                        item.turn,
+                        weak.clone(),
+                        self.list_state.is_following_tail(),
+                        cx,
+                    );
                     drained = true;
                 }
                 _ => retain.push(item),
@@ -2311,7 +2319,12 @@ impl Workspace {
             c.push_user(turn.text, turn.user_images, turn.meta, weak, cx)
         });
         self.sync_list_count(cx);
-        self.list_state.set_follow_mode(FollowMode::Tail);
+        // Only re-engage tail-follow if the user hasn't scrolled away —
+        // a steer injection is event-driven, not user-initiated, so it
+        // should not yank the viewport back to the bottom.
+        if self.list_state.is_following_tail() {
+            self.list_state.set_follow_mode(FollowMode::Tail);
+        }
         cx.notify();
     }
 
@@ -3409,13 +3422,16 @@ impl Workspace {
             .relative()
             .child(trigger)
             .child(
-                gpui::div()
-                    .id("reasoning-effort-dropdown")
-                    .absolute()
-                    .bottom_full()
-                    .right_0()
-                    .occlude()
-                    .child(menu),
+                deferred(
+                    gpui::div()
+                        .id("reasoning-effort-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .right_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1)
             )
             .into_any_element()
     }
@@ -3499,13 +3515,16 @@ impl Workspace {
                 // PopupMenu has its own bg/border/shadow and on_mouse_down_out.
                 // `.occlude()` renders the dropdown above all non-occluded elements
                 // (footer borders, message list, etc.).
-                gpui::div()
-                    .id("model-dropdown")
-                    .absolute()
-                    .bottom_full()
-                    .right_0()
-                    .occlude()
-                    .child(menu),
+                deferred(
+                    gpui::div()
+                        .id("model-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .right_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1)
             )
             .into_any_element()
     }
@@ -4166,19 +4185,22 @@ impl Workspace {
                 .relative()
                 .child(trigger)
                 .child(
-                    gpui::div()
-                        .id("goal-dropdown")
-                        .absolute()
-                        .bottom_full()
-                        .left_0()
-                        .occlude()
-                        .w(gpui::px(360.))
-                        .popover_style(cx)
-                        .child(popover)
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.goal_popover_open = false;
-                            cx.notify();
-                        })),
+                    deferred(
+                        gpui::div()
+                            .id("goal-dropdown")
+                            .absolute()
+                            .bottom_full()
+                            .left_0()
+                            .occlude()
+                            .w(gpui::px(360.))
+                            .popover_style(cx)
+                            .child(popover)
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                this.goal_popover_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .with_priority(1)
                 )
                 .into_any_element(),
         )
@@ -4328,19 +4350,22 @@ impl Workspace {
                 .relative()
                 .child(trigger)
                 .child(
-                    gpui::div()
-                        .id("team-dropdown")
-                        .absolute()
-                        .bottom_full()
-                        .left_0()
-                        .occlude()
-                        .w(px(320.))
-                        .popover_style(cx)
-                        .child(popover)
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.team_chip_open = false;
-                            cx.notify();
-                        })),
+                    deferred(
+                        gpui::div()
+                            .id("team-dropdown")
+                            .absolute()
+                            .bottom_full()
+                            .left_0()
+                            .occlude()
+                            .w(px(320.))
+                            .popover_style(cx)
+                            .child(popover)
+                            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                                this.team_chip_open = false;
+                                cx.notify();
+                            })),
+                    )
+                    .with_priority(1)
                 )
                 .into_any_element(),
         )
@@ -4427,19 +4452,22 @@ impl Workspace {
             .relative()
             .child(trigger)
             .child(
-                gpui::div()
-                    .id("access-dropdown")
-                    .absolute()
-                    .bottom_full()
-                    .left_0()
-                    .occlude()
-                    .w(gpui::px(360.))
-                    .popover_style(cx)
-                    .child(content)
-                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                        this.close_access_menu();
-                        cx.notify();
-                    })),
+                deferred(
+                    gpui::div()
+                        .id("access-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .left_0()
+                        .occlude()
+                        .w(gpui::px(360.))
+                        .popover_style(cx)
+                        .child(content)
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.close_access_menu();
+                            cx.notify();
+                        })),
+                )
+                .with_priority(1)
             )
             .into_any_element()
     }
@@ -4468,13 +4496,16 @@ impl Workspace {
             .relative()
             .child(trigger)
             .child(
-                gpui::div()
-                    .id("plus-dropdown")
-                    .absolute()
-                    .bottom_full()
-                    .left_0()
-                    .occlude()
-                    .child(menu),
+                deferred(
+                    gpui::div()
+                        .id("plus-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .left_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1)
             )
             .into_any_element()
     }
@@ -4638,14 +4669,17 @@ impl Workspace {
         let on_select: SelectHandler =
             std::rc::Rc::new(move |ix, window, cx| on_select(&ix, window, cx));
         Some(
-            gpui::div()
-                .id("completion-dropdown")
-                .absolute()
-                .bottom_full()
-                .left_0()
-                .occlude()
-                .child(render_completion(state, &theme, on_select))
-                .into_any_element(),
+            deferred(
+                gpui::div()
+                    .id("completion-dropdown")
+                    .absolute()
+                    .bottom_full()
+                    .left_0()
+                    .occlude()
+                    .child(render_completion(state, &theme, on_select)),
+            )
+            .with_priority(1)
+            .into_any_element(),
         )
     }
 
@@ -4909,13 +4943,16 @@ impl Workspace {
             .relative()
             .child(trigger)
             .child(
-                gpui::div()
-                    .id("project-chip-dropdown")
-                    .absolute()
-                    .bottom_full()
-                    .left_0()
-                    .occlude()
-                    .child(menu),
+                deferred(
+                    gpui::div()
+                        .id("project-chip-dropdown")
+                        .absolute()
+                        .bottom_full()
+                        .left_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1)
             )
             .into_any_element()
     }
