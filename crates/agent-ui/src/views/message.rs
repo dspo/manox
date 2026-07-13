@@ -1161,7 +1161,7 @@ pub fn render_thinking(
             v_flex().pl_3().gap_0p5().children(
                 visible
                     .into_iter()
-                    .map(|(eix, e)| render_activity_entry(e, eix, total, theme, tool_ctx)),
+                    .map(|(eix, e)| render_activity_entry(e, eix, total, ix, theme, tool_ctx)),
             ),
         );
     }
@@ -1179,6 +1179,7 @@ fn render_activity_entry(
     e: &ActivityEntry,
     eix: usize,
     total: usize,
+    cix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
@@ -1195,6 +1196,7 @@ fn render_activity_entry(
             *user_toggled,
             eix,
             total,
+            cix,
             theme,
             tool_ctx,
         ),
@@ -1212,6 +1214,7 @@ fn render_reasoning_entry(
     _user_toggled: bool,
     eix: usize,
     total: usize,
+    cix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
@@ -1237,10 +1240,11 @@ fn render_reasoning_entry(
                 let _ = weak.update(cx, |w, cx| {
                     let conv = w.conversation.clone();
                     conv.update(cx, |c, cx| {
-                        // Find this reasoning entry by position within the
-                        // last Thinking container and toggle its collapse.
-                        for item in c.items().iter().rev() {
-                            let found = item.update(cx, |item, cx| {
+                        // Toggle the specific container's reasoning entry by
+                        // index. `cix` is the container's position in the
+                        // conversation items list, captured at render time.
+                        if let Some(item) = c.items().get(cix) {
+                            item.update(cx, |item, cx| {
                                 if let ConvItem::Thinking(t) = item.kind_mut()
                                     && let Some(ActivityEntry::Reasoning {
                                         collapsed,
@@ -1250,14 +1254,9 @@ fn render_reasoning_entry(
                                 {
                                     *collapsed = !*collapsed;
                                     *user_toggled = true;
-                                    cx.notify();
-                                    return true;
                                 }
-                                false
+                                cx.notify();
                             });
-                            if found {
-                                break;
-                            }
                         }
                     });
                     cx.notify();
