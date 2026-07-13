@@ -353,6 +353,10 @@ fn register_selection_listeners(
                             cx.write_to_clipboard(ClipboardItem::new_string(
                                 text[s..e].to_string(),
                             ));
+                            // Stop the keystroke from reaching the composer Input's
+                            // Copy action, which would overwrite the clipboard with
+                            // the Input's (empty or stale) selection.
+                            cx.stop_propagation();
                         }
                     }
                 }
