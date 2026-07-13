@@ -399,7 +399,10 @@ fn is_ipc_request_type(ty: &Type) -> bool {
 /// 2. The function pointer with the correct type
 ///
 /// # Example
-/// ```
+///
+/// ```rust,ignore
+/// // Proc-macro crates can't self-invoke in a doctest; see `tests/macros.rs`
+/// // for a compiled invocation against a real request.
 /// fn my_handler(req: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> { todo!() }
 ///
 /// let (handler_name, handler) = api_handler!(my_handler);
@@ -430,11 +433,14 @@ pub fn api_handler(input: TokenStream) -> TokenStream {
 /// - Returns a vector ready to be registered into a router
 ///
 /// # Example
-/// ```
+///
+/// ```rust,ignore
+/// // Proc-macro crates can't self-invoke in a doctest; see `tests/macros.rs`
+/// // for a compiled invocation against a real request.
 /// fn foo(req: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> { todo!() }
 /// fn bar(req: http::Request<Vec<u8>>) -> http::Response<Vec<u8>> { todo!() }
 ///
-/// let handlers = api_handler![foo, bar];
+/// let handlers = api_handlers![foo, bar];
 /// // handlers: Vec<(String, fn(http::Request<Vec<u8>>) -> http::Response<Vec<u8>>)>
 /// ```
 #[proc_macro]
@@ -473,7 +479,9 @@ pub fn api_handlers(input: TokenStream) -> TokenStream {
 ///
 /// ## Example
 ///
-/// ```rust
+/// ```rust,ignore
+/// // Proc-macro crates can't self-invoke in a doctest; see `tests/macros.rs`
+/// // for a compiled invocation against a real request.
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Deserialize)]
@@ -612,7 +620,9 @@ pub fn command_handler(input: TokenStream) -> TokenStream {
 ///
 /// ## Example
 ///
-/// ```rust
+/// ```rust,ignore
+/// // Proc-macro crates can't self-invoke in a doctest; see `tests/macros.rs`
+/// // for a compiled invocation against a real request.
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Deserialize)]
@@ -634,17 +644,7 @@ pub fn command_handler(input: TokenStream) -> TokenStream {
 /// }
 ///
 /// // Convert multiple functions into HTTP handlers
-/// fn view(window: &mut gpui::Window, app: &mut App) -> Entity<WebView> {
-///     app.new(|cx: &mut Context<WebView>| {
-///         let webview = gpui_wry::Builder::new()
-///             .with_webview_id(WebViewId::from("greet"))
-///             .serve_static(String::from("examples/apps/greet/dist"))
-///             .invoke_handler(command_handlers![my_function1, my_function2])
-///             .build_as_child(window)
-///             .unwrap();
-///         WebView::new(webview, window, cx)
-///     })
-/// }
+/// let handlers = command_handlers![my_function1, my_function2];
 /// ```
 ///
 /// # Generated Code Overview
