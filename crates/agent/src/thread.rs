@@ -1386,8 +1386,11 @@ impl Thread {
     /// mirrors the selection the auto-compaction trigger uses, so the cockpit
     /// budget display and the trigger agree on what "current" means.
     pub fn latest_request_usage(&self) -> Option<TokenUsage> {
-        crate::compact::latest_reported_request_usage(&self.messages, self.token_meter.per_request())
-            .map(|(_, usage)| usage)
+        crate::compact::latest_reported_request_usage(
+            &self.messages,
+            self.token_meter.per_request(),
+        )
+        .map(|(_, usage)| usage)
     }
 
     /// Per-user-message usage, keyed by `Message::id`.
