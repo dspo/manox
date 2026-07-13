@@ -32,6 +32,7 @@ async fn direct_messages_route_pending_plan_and_ask_inline(cx: &mut gpui::TestAp
                 name: "exit_plan_mode".to_string(),
                 title: "Submit plan".to_string(),
                 status: ToolCallStatus::PendingApproval,
+                input: Some(serde_json::json!({})),
             });
             cx.emit(ThreadEvent::PlanProposed {
                 id: "plan_1".to_string(),

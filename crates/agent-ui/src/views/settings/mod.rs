@@ -23,6 +23,9 @@ use agent::{
     settings::{self as user_settings, FollowUpBehavior},
 };
 
+use crate::views::management_shell::back_control;
+use crate::views::plugin_manager::PluginManagerView;
+
 mod panels;
 
 const SIDEBAR_W: f32 = 260.;
@@ -60,6 +63,7 @@ const GROUPS: &[SettingsGroup] = &[
         title: "settings-group-integrations",
         items: &[
             SettingsItem::new(IconName::Bot, "settings-item-snapshots", None),
+            SettingsItem::new(IconName::Frame, "settings-item-plugins", None),
             SettingsItem::new(IconName::ChartPie, "settings-item-mcp", None),
             SettingsItem::new(IconName::Globe, "settings-item-browser", None),
             SettingsItem::new(IconName::Ellipsis, "settings-item-computer", None),
@@ -138,6 +142,11 @@ const MOCK_PROJECTS: &[MockProject] = &[
 
 pub struct SettingsView {
     search: Entity<InputState>,
+
+    /// Plugin/marketplace/skill/MCP management view, rendered in the right pane
+    /// when the "Plugins" item is selected. Owned here rather than as a
+    /// top-level Workspace mode so plugins live under Settings → Integrations.
+    plugins: Entity<PluginManagerView>,
 
     /// Sidebar item currently highlighted. Stable fluent message id (e.g.
     /// `"settings-item-general"`) so it survives locale switches.
@@ -229,6 +238,7 @@ impl SettingsView {
 
         Self {
             search,
+            plugins: cx.new(|cx| PluginManagerView::new(window, cx)),
             selected: None,
             click_gen: 0,
             custom_instructions_input,
@@ -418,82 +428,111 @@ impl Render for SettingsView {
             groups.push(column.into_any_element());
         }
 
-        v_flex()
+        // macOS traffic-light buttons float over the sidebar's transparent top.
+        let top_inset = if cfg!(target_os = "macos") {
+            px(28.)
+        } else {
+            px(8.)
+        };
+
+        // Right-column TitleBar shows the currently-selected item's label,
+        // falling back to the generic settings title when nothing is selected.
+        let section_title: SharedString = match selected.as_deref() {
+            Some(label) => i18n::t(label),
+            None => i18n::t("settings-title"),
+        };
+
+        h_flex()
             .w_full()
             .h_full()
             .bg(theme.background)
-            // Title bar spans the full window width: it carries the macOS
-            // traffic-light inset and gives the user a drag handle to move the
-            // window while Settings is mounted.
-            .child(TitleBar::new().h(TITLE_BAR_HEIGHT))
+            // Settings sidebar — mirrors the app sidebar: no standalone TitleBar,
+            // traffic-light inset at top, back control as the first row.
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
+                v_flex()
+                    .h_full()
+                    .w(px(SIDEBAR_W))
+                    .bg(theme.background)
+                    .border_r_1()
+                    .border_color(theme.border)
                     .child(
                         v_flex()
-                            .h_full()
-                            .w(px(SIDEBAR_W))
-                            .bg(theme.background)
-                            .border_r_1()
-                            .border_color(theme.border)
+                            .id("settings-sidebar-body")
+                            .flex_1()
+                            .w_full()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .px_2()
+                            .pt(top_inset)
+                            .pb_2()
+                            .gap_2()
+                            .child(back_control(&theme, i18n::t("settings-back"), on_back))
                             .child(
-                                v_flex()
+                                h_flex()
                                     .w_full()
-                                    .p_2()
-                                    .gap_1()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(theme.radius)
+                                    .bg(theme.secondary)
                                     .child(
-                                        h_flex()
-                                            .id("settings-back")
-                                            .items_center()
-                                            .gap_2()
-                                            .px_2()
-                                            .py_1p5()
-                                            .rounded(theme.radius)
-                                            .text_sm()
-                                            .text_color(theme.foreground)
-                                            .hover(|s| s.bg(theme.accent.opacity(0.08)))
-                                            .cursor_pointer()
-                                            .on_click(on_back)
-                                            .child(Icon::new(IconName::ArrowLeft).small())
-                                            .child(i18n::t("settings-back")),
+                                        Icon::new(IconName::Search)
+                                            .small()
+                                            .text_color(theme.muted_foreground),
                                     )
                                     .child(
-                                        h_flex()
-                                            .w_full()
-                                            .items_center()
-                                            .gap_2()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded(theme.radius)
-                                            .bg(theme.secondary)
-                                            .child(
-                                                Icon::new(IconName::Search)
-                                                    .small()
-                                                    .text_color(theme.muted_foreground),
-                                            )
-                                            .child(
-                                                Input::new(&search)
-                                                    .appearance(false)
-                                                    .bordered(false)
-                                                    .focus_bordered(false),
-                                            ),
+                                        Input::new(&search)
+                                            .appearance(false)
+                                            .bordered(false)
+                                            .focus_bordered(false),
                                     ),
                             )
-                            .child(
-                                v_flex()
-                                    .id("settings-groups")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .px_2()
-                                    .pb_2()
-                                    .gap_3()
-                                    .children(groups),
-                            ),
+                            .children(groups),
+                    ),
+            )
+            // Main column: same overlay scaffold as the conversation column —
+            // content sits below TITLE_BAR_HEIGHT, TitleBar floats absolute
+            // on top carrying only the section title (no back button).
+            .child(
+                v_flex()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .relative()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_hidden()
+                            .pt(TITLE_BAR_HEIGHT)
+                            .child(self.render_right_pane(&theme, cx)),
                     )
-                    .child(self.render_right_pane(&theme, cx)),
+                    .child(
+                        gpui::div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(TITLE_BAR_HEIGHT)
+                            .child(
+                                TitleBar::new()
+                                    .child(
+                                        h_flex().flex_1().min_w_0().items_center().gap_2().child(
+                                            gpui::div()
+                                                .text_base()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(theme.foreground)
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(section_title),
+                                        ),
+                                    )
+                                    .child(h_flex()),
+                            ),
+                    ),
             )
     }
 }
@@ -519,6 +558,7 @@ impl SettingsView {
             Some("settings-item-environment") => {
                 panels::render_environment(self, cx).into_any_element()
             }
+            Some("settings-item-plugins") => self.plugins.clone().into_any_element(),
             _ => {
                 let coming_label: SharedString = match key {
                     Some(label) => {

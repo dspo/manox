@@ -86,6 +86,24 @@ fn is_compaction(m: &Message) -> bool {
             .any(|c| matches!(c, MessageContent::Compaction(_)))
 }
 
+/// The most recent `Role::User` message that already has reported usage, keyed
+/// by `Message::id` in `per_request`. Scans from the end so a trailing
+/// just-submitted prompt (no usage yet) is skipped — the caller sees the last
+/// request's real usage, not `None` while the new turn warms up. Auto-compaction
+/// and the cockpit budget display share this rule so the trigger and the UI
+/// agree on which usage is "current".
+pub fn latest_reported_request_usage(
+    messages: &[Message],
+    per_request: &HashMap<String, TokenUsage>,
+) -> Option<(usize, TokenUsage)> {
+    messages.iter().enumerate().rev().find_map(|(ix, m)| {
+        if m.role != Role::User {
+            return None;
+        }
+        per_request.get(&m.id).copied().map(|u| (ix, u))
+    })
+}
+
 /// Decide whether an auto-compaction should fire and where to insert it.
 ///
 /// Returns the insertion index when all hold:
@@ -115,13 +133,9 @@ pub fn auto_compaction_target_ix(
         return None;
     }
     // Most recent user message that already has reported usage — the last
-    // request's token count is the trigger signal.
-    let (usage_ix, usage) = messages.iter().enumerate().rev().find_map(|(ix, m)| {
-        if m.role != Role::User {
-            return None;
-        }
-        per_request.get(&m.id).copied().map(|u| (ix, u))
-    })?;
+    // request's token count is the trigger signal. Shared with the cockpit
+    // budget display so the UI and the trigger agree on "current" usage.
+    let (usage_ix, usage) = latest_reported_request_usage(messages, per_request)?;
     // If a compaction already covers the region past the usage point, the
     // post-compaction tail has not re-filled yet — nothing to do.
     if let Some(c_ix) = latest_compaction_ix(messages, messages.len())
@@ -553,6 +567,59 @@ mod tests {
             auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
             None
         );
+    }
+
+    #[test]
+    fn latest_reported_usage_skips_trailing_untracked_prompt() {
+        // u1 reported usage; u2 is just-submitted with no usage yet. The helper
+        // returns u1, not None — the cockpit keeps showing the last real budget
+        // while the new turn warms up.
+        let msgs = vec![user("u1", "old"), user("u2", "new")];
+        let mut per = HashMap::new();
+        per.insert("u1".to_string(), huge_usage());
+        let (ix, usage) = latest_reported_request_usage(&msgs, &per).unwrap();
+        assert_eq!(ix, 0);
+        assert_eq!(usage, huge_usage());
+    }
+
+    #[test]
+    fn latest_reported_usage_picks_most_recent_tracked() {
+        // Multiple user messages all have usage; the last tracked one wins.
+        let msgs = vec![user("u1", "a"), user("u2", "b"), user("u3", "c")];
+        let mut per = HashMap::new();
+        per.insert(
+            "u1".to_string(),
+            TokenUsage {
+                input_tokens: 10_000,
+                ..Default::default()
+            },
+        );
+        per.insert("u3".to_string(), huge_usage());
+        let (ix, _) = latest_reported_request_usage(&msgs, &per).unwrap();
+        assert_eq!(ix, 2);
+    }
+
+    #[test]
+    fn latest_reported_usage_none_when_no_user_message_tracked() {
+        // Only assistant messages or no usage at all → None.
+        let msgs = vec![user("u1", "a")];
+        assert_eq!(latest_reported_request_usage(&msgs, &HashMap::new()), None);
+        let msgs = vec![Message::assistant(vec![])];
+        assert_eq!(latest_reported_request_usage(&msgs, &HashMap::new()), None);
+    }
+
+    #[test]
+    fn latest_reported_usage_ignores_assistant_messages() {
+        // A trailing assistant reply must not shadow an earlier tracked user
+        // message — assistant messages never carry per-request usage.
+        let msgs = vec![
+            user("u1", "prompt"),
+            Message::assistant(vec![MessageContent::Text("reply".into())]),
+        ];
+        let mut per = HashMap::new();
+        per.insert("u1".to_string(), huge_usage());
+        let (ix, _) = latest_reported_request_usage(&msgs, &per).unwrap();
+        assert_eq!(ix, 0);
     }
 
     #[test]

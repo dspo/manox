@@ -8,7 +8,6 @@
 sidebar-new-chat = New chat
 sidebar-search = Search
 sidebar-scheduled = Scheduled
-sidebar-plugins = Plugins
 sidebar-section-projects = Projects
 sidebar-section-conversations = Conversations
 sidebar-section-external = External
@@ -124,6 +123,7 @@ settings-item-pets = Pets
 settings-item-keyboard = Keyboard shortcuts
 settings-group-integrations = Integrations
 settings-item-snapshots = App snapshots
+settings-item-plugins = Plugins
 settings-item-mcp = MCP servers
 settings-item-browser = Browser
 settings-item-computer = Computer control
@@ -138,6 +138,7 @@ settings-item-archived = Archived chats
 settings-item-chat-settings = Chat Settings
 settings-search-placeholder = Search settings…
 settings-back = Back to app
+settings-title = Settings
 settings-coming-soon = Coming soon…
 settings-coming-soon-label = Coming soon… {$label}
 
@@ -489,20 +490,31 @@ titlebar-unarchive-notice = Conversation unarchived.
 titlebar-not-implemented = Not implemented yet.
 
 # ── Environment info panel ──────────────────────────────────────────────
-workspace-env-title = Conversation info
 workspace-env-changes = Changes
 workspace-env-no-project = No project
 workspace-env-usage = Usage
 workspace-env-throughput = Throughput
 workspace-env-cache = Cache
+workspace-env-cache-hit-rate = cache {$pct}%
 workspace-env-sources = Sources
 workspace-env-no-sources = No sources yet
+workspace-env-git-unavailable = git unavailable
+workspace-env-git-not-a-repo = Not a git repo
+workspace-env-git-detached = detached
+workspace-env-git-worktree-suffix = (worktree)
+workspace-env-git-copy-branch = Copy branch name
+workspace-env-git-copy-path = Copy worktree path
+workspace-env-git-exit-worktree = Exit worktree
+
+# ── Context rail (right sidecar) ────────────────────────────────────────
+context-rail-title = Conversation info
+context-rail-collapse = Collapse context rail
 
 # ── Cockpit (run status / milestones / context budget) ──────────────────
-# The "Conversation info" card's run-status row. {$phase} is a localized
-# phase label, {$elapsed} a pre-formatted duration, {$tokens} a pre-formatted
-# token count (e.g. "22.7k").
-cockpit-run-status = {$phase} · {$elapsed} · ↓ {$tokens}
+# The multi-line run-status block. {$elapsed} is a pre-formatted duration,
+# {$tokens} a pre-formatted token count (e.g. "22.7k"). The phase label is
+# rendered on its own semibold line above this meta line.
+cockpit-run-status-meta = {$elapsed} · {$tokens}
 # Phase labels for the run-status row.
 cockpit-status-idle = Idle
 cockpit-status-thinking = Thinking

@@ -188,6 +188,16 @@ impl Element for RichText {
         if self.selectable
             && let (Some(gid), Some(hitbox)) = (global_id, hitbox.as_ref())
         {
+            if debug_selection() {
+                eprintln!(
+                    "[selection] paint id={:?} bounds=({:?}, {:?}, {:?}, {:?})",
+                    self.id,
+                    bounds.origin.x,
+                    bounds.origin.y,
+                    bounds.size.width,
+                    bounds.size.height,
+                );
+            }
             let selection_bg = self.selection_bg;
             let text = self.text.clone();
             window.with_element_state::<RichTextState, _>(gid, |state, window| {
@@ -234,17 +244,33 @@ fn register_selection_listeners(
     hitbox: Hitbox,
     window: &mut Window,
 ) {
-    // MouseDown: begin a selection at the clicked glyph.
+    // MouseDown: begin a selection at the clicked glyph. Hit-test against the
+    // hitbox bounds directly rather than `is_hovered`, which can return false
+    // when an occluding BlockMouse hitbox is painted above this element — the
+    // text still sits under the cursor and should still be selectable.
     window.on_mouse_event({
         let selection = state.selection.clone();
         let dragging = state.dragging.clone();
         let layout = layout.clone();
         let hitbox = hitbox.clone();
         move |event: &MouseDownEvent, phase, window, _cx| {
-            if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
+            if debug_selection() {
+                eprintln!(
+                    "[selection] mousedown fired phase={:?} pos=({:?}, {:?}) hovered={} bounds_contains={}",
+                    phase,
+                    event.position.x,
+                    event.position.y,
+                    hitbox.is_hovered(window),
+                    hitbox.bounds.contains(&event.position),
+                );
+            }
+            if phase != DispatchPhase::Bubble || !hitbox.bounds.contains(&event.position) {
                 return;
             }
             let ix = index_at(&layout, event.position);
+            if debug_selection() {
+                eprintln!("[selection] mousedown start ix={ix}");
+            }
             dragging.set(true);
             selection.replace(Some((ix, ix)));
             window.refresh();
@@ -261,6 +287,9 @@ fn register_selection_listeners(
                 return;
             }
             let ix = index_at(&layout, event.position);
+            if debug_selection() {
+                eprintln!("[selection] mousemove extending ix={ix}");
+            }
             if let Some(pair) = selection.borrow_mut().as_mut() {
                 pair.1 = ix;
             }
@@ -279,6 +308,9 @@ fn register_selection_listeners(
             }
             dragging.set(false);
             let clear = (*selection.borrow()).map(|(a, b)| a == b).unwrap_or(true);
+            if debug_selection() {
+                eprintln!("[selection] mouseup clear={clear}");
+            }
             if clear {
                 selection.replace(None);
             }
@@ -287,18 +319,21 @@ fn register_selection_listeners(
     });
 
     // Cmd/Ctrl+C: copy the active (non-empty) selection. Fires only for blocks
-    // with a live selection, and only while the cursor rests over this block's
-    // hitbox — so a selection that persists after mouse-up doesn't steal Cmd+C
-    // from the composer input, whose `Copy` action travels a separate dispatch
-    // channel and would otherwise be overwritten by a stray clipboard write.
+    // with a live selection — so a selection that persists after mouse-up
+    // doesn't steal Cmd+C from the composer input, whose `Copy` action travels
+    // a separate dispatch channel and would otherwise be overwritten by a stray
+    // clipboard write.
+    //
+    // No `is_hovered` gate here: a keyboard Cmd+C flips `last_input_was_keyboard`,
+    // which makes `HitboxId::is_hovered` always return false and would silently
+    // kill every copy. The `has_selection` gate above is the real scope limiter.
     let has_selection = (*state.selection.borrow())
         .map(|(a, b)| a != b)
         .unwrap_or(false);
     if has_selection {
         window.on_key_event::<KeyDownEvent>({
             let selection = state.selection.clone();
-            let hitbox = hitbox.clone();
-            move |event: &KeyDownEvent, phase, window, cx| {
+            move |event: &KeyDownEvent, phase, _window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
@@ -306,10 +341,10 @@ fn register_selection_listeners(
                 if !((k.modifiers.platform || k.modifiers.control) && k.key == "c") {
                     return;
                 }
-                if !hitbox.is_hovered(window) {
-                    return;
-                }
                 if let Some((a, b)) = *selection.borrow() {
+                    if debug_selection() {
+                        eprintln!("[selection] copy a={a} b={b} text_len={}", text.len());
+                    }
                     let (s, e) = (a.min(b), a.max(b));
                     if s < e && e <= text.len() {
                         let s = floor_char_boundary(&text, s);
@@ -324,6 +359,14 @@ fn register_selection_listeners(
             }
         });
     }
+}
+
+/// Whether to emit selection diagnostics to stderr. Set `MANOX_DEBUG_SELECTION`
+/// to trace mouse/keyboard events through the per-block selection state machine
+/// — intended for blind-fix verification, off by default in normal builds.
+fn debug_selection() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("MANOX_DEBUG_SELECTION").is_ok())
 }
 
 /// Byte index of the glyph under a window-coordinate point, clamped to the

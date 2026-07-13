@@ -551,16 +551,27 @@ impl CompletionsEventMapper {
                 self.stop_emitted = true;
             }
         }
-        // DeepSeek reports cache hit/miss token counts on the final chunk;
-        // surface them so the UI's `cache: NN%` chip can cross-check the
-        // stability ratio against real cache hits. Standard OpenAI-compat
-        // endpoints without these fields simply emit nothing extra.
+        // DeepSeek extends the standard OpenAI usage with
+        // `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`. Per DeepSeek's
+        // API docs, `prompt_tokens` **equals** `prompt_cache_hit_tokens +
+        // prompt_cache_miss_tokens` — i.e. the wire `prompt_tokens` *includes*
+        // the cached subset. manox's `TokenUsage.input_tokens` field means
+        // *non-cached* input, so we subtract the hit tokens out; otherwise
+        // `total_tokens()` (= input + output + cache_read + cache_creation)
+        // would double-count the hit tokens in both `input_tokens` and
+        // `cache_read_input_tokens`. Standard OpenAI-compat endpoints without
+        // these fields simply emit nothing extra.
         if let Some(usage) = chunk.usage {
+            let prompt = usage.prompt_tokens.unwrap_or(0);
+            let hit = usage.prompt_cache_hit_tokens.unwrap_or(0);
+            // `saturating_sub`: a malformed payload where hit > prompt must not
+            // underflow and fabricate a huge non-cached count.
+            let non_cached_input = prompt.saturating_sub(hit);
             out.push(Ok(LanguageModelCompletionEvent::UsageUpdate(
                 crate::language_model::TokenUsage {
-                    input_tokens: usage.prompt_tokens.unwrap_or(0),
+                    input_tokens: non_cached_input,
                     output_tokens: usage.completion_tokens.unwrap_or(0),
-                    cache_read_input_tokens: usage.prompt_cache_hit_tokens.unwrap_or(0),
+                    cache_read_input_tokens: hit,
                     cache_creation_input_tokens: usage.prompt_cache_miss_tokens.unwrap_or(0),
                 },
             )));
@@ -945,8 +956,11 @@ mod tests {
     }
 
     /// DeepSeek's `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` must
-    /// surface as a `UsageUpdate` with the cache columns populated so the UI's
-    /// cache chip can cross-check the stability ratio against real hits.
+    /// surface as a `UsageUpdate` with the cache columns populated. Per DeepSeek
+    /// wire semantics `prompt_tokens == hit + miss`, so the hit subset must be
+    /// subtracted out of `input_tokens` (manox's non-cached input) to avoid
+    /// `total_tokens()` double-counting the hit tokens in both `input_tokens`
+    /// and `cache_read_input_tokens`.
     #[test]
     fn map_chunk_emits_usage_update_with_deepseek_cache_tokens() {
         let mut mapper = CompletionsEventMapper::new();
@@ -970,10 +984,48 @@ mod tests {
                 _ => None,
             })
             .expect("UsageUpdate emitted");
-        assert_eq!(usage.input_tokens, 100);
+        // Non-cached input = prompt_tokens - hit = 100 - 80; the hit subset
+        // lives only in cache_read so it is not double-counted.
+        assert_eq!(usage.input_tokens, 20);
         assert_eq!(usage.output_tokens, 20);
         assert_eq!(usage.cache_read_input_tokens, 80);
         assert_eq!(usage.cache_creation_input_tokens, 20);
+        // input_tokens + cache_read must reconstruct the wire prompt_tokens.
+        assert_eq!(
+            usage.input_tokens + usage.cache_read_input_tokens,
+            100,
+            "non-cached input + cache-read must reconstruct the wire prompt_tokens"
+        );
+    }
+
+    /// A payload with `prompt_tokens` but no cache fields must not panic and
+    /// must keep `input_tokens` as the full non-cached count.
+    #[test]
+    fn map_chunk_usage_without_cache_fields_no_panic() {
+        let mut mapper = CompletionsEventMapper::new();
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 50
+            }
+        });
+        let events = mapper.map_chunk(&chunk);
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(LanguageModelCompletionEvent::UsageUpdate(u)) => Some(*u),
+                _ => None,
+            })
+            .expect("UsageUpdate emitted");
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.total_tokens(), 550);
     }
 
     /// Endpoints that omit the `usage` field (standard OpenAI completions) must

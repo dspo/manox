@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent::db::{UiNoteKind, UiNoteRecord};
-use agent::language_model::{MessageContent, Role};
+use agent::language_model::{MessageContent, Role, StopReason};
 use agent::thread::ApprovalMode;
 use agent::{Message, ThreadEvent, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, WeakEntity};
@@ -82,14 +82,15 @@ pub enum ConvItem {
         collapsed: bool,
         user_toggled: bool,
     },
-    /// A batch of tool calls from one model response, folded into a single
-    /// Claude Code–style status line: a live summary ("Thinking for Xs,
-    /// reading 2 files, running 1 shell command…") over an expandable `⎿`
-    /// list of the batch's tool calls. Collapsed shows only the summary plus
-    /// the most recent entry; expanded lists every entry, each itself
-    /// expandable to its full tool output. `streaming` is true while any entry
-    /// is still non-terminal; `Stop` flips it off and freezes the elapsed time
-    /// ("Thought for Xs").
+    /// One contiguous activity segment within a user turn: a Claude Code–style
+    /// status line ("Thought for 28s, read 1 file, edited 2 files, ran 3
+    /// commands") over an expandable `⎿` list of the segment's tool calls. A
+    /// segment spans the whole tool-use loop of a turn — `StopReason::ToolUse`
+    /// (the model paused to run a tool) does NOT close it; only a terminal stop
+    /// (`EndTurn`/`MaxTokens`/`Refusal`/cancel/error) freezes the segment.
+    /// Collapsed + frozen shows only the summary; collapsed + streaming also
+    /// shows the running/latest entry; expanded lists every entry, each itself
+    /// expandable to its full tool output.
     Thinking(ThinkingContainer),
     /// A plan card for `exit_plan_mode` — the plan body is the card's whole
     /// point, so it stays a top-level item rather than folding into a
@@ -146,6 +147,12 @@ pub struct ToolCallItem {
     pub status: ToolCallStatus,
     pub output: String,
     pub is_error: bool,
+    /// The structured tool input, used for aggregate counts by target (file
+    /// path / command / pattern) without re-parsing the localized title.
+    /// Populated from `ThreadEvent::ToolCall` (live) or the persisted
+    /// `MessageContent::ToolUse` (history rebuild). Empty for orphan
+    /// `ToolResult`s with no matching `ToolCall`.
+    pub input: serde_json::Value,
     /// True while live `ToolOutput` chunks are still streaming in; flipped to
     /// false once the final `ToolResult` lands the canonical output.
     pub streaming: bool,
@@ -161,31 +168,43 @@ pub struct ToolCallItem {
     pub user_toggled: bool,
 }
 
-/// A folded batch of tool calls rendered as one Claude Code–style Thinking
-/// status line. Entries are `ToolCallItem`s (reused for their per-tool
-/// status/output/collapse state); the container owns the batch-level summary,
-/// collapse, and elapsed-time state.
+/// One contiguous activity segment within a user turn, rendered as a Claude
+/// Code–style Thinking status line. Entries are `ToolCallItem`s (reused for
+/// their per-tool status/output/collapse state); the container owns the
+/// segment-level summary, collapse, and elapsed-time state.
+///
+/// A segment spans the full tool-use loop of a user turn: a `StopReason::ToolUse`
+/// (the model paused to execute a tool) does NOT close it — `accepting_entries`
+/// stays true so the next model response's tool calls fold into the same
+/// segment. Only a terminal stop (`EndTurn`/`MaxTokens`/`Refusal`/cancel/error)
+/// flips `accepting_entries` off and freezes the elapsed time.
 #[derive(Debug, Clone)]
 pub struct ThinkingContainer {
-    /// The batch's tool calls in arrival order. Each is one `⎿` entry.
+    /// The segment's tool calls in arrival order. Each is one `⎿` entry.
     pub entries: Vec<ToolCallItem>,
-    /// True while any entry is still streaming or in a non-terminal status.
-    /// Drives the spinner + "Thinking for Xs" label vs the frozen "Thought for
-    /// Xs".
+    /// True while the turn is still in progress — new `ToolCall` events fold
+    /// into this segment rather than opening a fresh one. `StopReason::ToolUse`
+    /// keeps it true; a terminal `Stop` flips it off. Independent of whether
+    /// any individual entry is currently live.
+    pub accepting_entries: bool,
+    /// True while the segment is live (turn running) OR any entry is still
+    /// streaming / non-terminal. Drives the spinner + "Thinking for Xs" label
+    /// vs the frozen "Thought for Xs".
     pub streaming: bool,
-    /// True ⇒ only the summary line plus the most recent entry render. False ⇒
-    /// every entry renders. Auto-flipped to true on terminal `Stop` unless the
-    /// user toggled.
+    /// True ⇒ collapsed shows only the summary line (frozen) or the summary
+    /// plus the running/latest entry (streaming). False ⇒ every entry renders.
+    /// Auto-flipped to true on terminal `Stop` unless the user toggled.
     pub collapsed: bool,
     pub user_toggled: bool,
-    /// When the container was created; the live "for Xs" is
+    /// When the segment started; the live "for Xs" is
     /// `started_at.elapsed().as_secs()`, recomputed each render while the
-    /// ticker fires.
+    /// ticker fires. Seeded from the turn's start time so the duration covers
+    /// the whole turn, not just from the first `ToolCall`.
     pub started_at: Instant,
-    /// The elapsed seconds captured when the batch went terminal (`Stop`). Once
-    /// set, "Thought for Xs" renders this fixed value instead of re-reading
+    /// The elapsed seconds captured when the segment went terminal. Once set,
+    /// "Thought for Xs" renders this fixed value instead of re-reading
     /// `started_at` (which would keep growing on every later re-render). `None`
-    /// for freshly rebuilt historical containers, where the duration is unknown
+    /// for freshly rebuilt historical segments, where the duration is unknown
     /// and the label degrades to a bare "Thought".
     pub frozen_secs: Option<u64>,
 }
@@ -194,6 +213,7 @@ impl ThinkingContainer {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            accepting_entries: true,
             streaming: true,
             collapsed: false,
             user_toggled: false,
@@ -202,31 +222,45 @@ impl ThinkingContainer {
         }
     }
 
-    /// Re-derive `streaming` from the entries' live flags + statuses. Call
-    /// after any entry mutation that may have flipped a status or streaming
-    /// flag. On the live→frozen transition (the batch's last entry just went
-    /// terminal) the elapsed is pinned here, at the real per-batch completion
-    /// moment — not deferred to the next `Stop`, which fires only after the
-    /// following response's stream and would over-count by that stream's
-    /// duration. Idempotent: a later `finalize_streaming` re-derives the same
-    /// `false` but leaves an already-pinned value untouched.
+    /// Re-derive `streaming` from `accepting_entries` and the entries' live
+    /// flags + statuses. Call after any entry mutation that may have flipped a
+    /// status or streaming flag. The segment stays live (`streaming == true`)
+    /// as long as it is still accepting entries — even if every entry is
+    /// terminal — because a `StopReason::ToolUse` means the turn continues and
+    /// more tool calls will arrive. Once `accepting_entries` is false (terminal
+    /// stop) and all entries are terminal, `streaming` goes false and the
+    /// elapsed is pinned here at the real turn-completion moment. Idempotent:
+    /// a later call re-derives the same `false` but leaves an already-pinned
+    /// value untouched.
     pub fn recompute_streaming(&mut self) {
         let was_streaming = self.streaming;
-        self.streaming = self.entries.iter().any(|e| {
+        let any_entry_live = self.entries.iter().any(|e| {
             e.streaming
                 || matches!(
                     e.status,
                     ToolCallStatus::Running | ToolCallStatus::PendingApproval
                 )
         });
+        self.streaming = self.accepting_entries || any_entry_live;
         if was_streaming && !self.streaming && self.frozen_secs.is_none() {
             self.frozen_secs = Some(self.started_at.elapsed().as_secs());
         }
     }
 
+    /// Freeze the segment for a terminal stop (`EndTurn`/`MaxTokens`/`Refusal`/
+    /// cancel/error). Stops accepting entries, flips `streaming` off, and pins
+    /// the elapsed time. Idempotent.
+    pub fn finalize_segment(&mut self) {
+        self.accepting_entries = false;
+        if self.frozen_secs.is_none() {
+            self.frozen_secs = Some(self.started_at.elapsed().as_secs());
+        }
+        self.streaming = false;
+    }
+
     /// True when at least one entry has produced output worth showing (the
-    /// `⎿` list is non-vacuous even while collapsed — the most recent entry's
-    /// summary is the "what's happening right now" line).
+    /// `⎿` list is non-vacuous even while collapsed — the running/latest
+    /// entry's summary is the "what's happening right now" line).
     pub fn has_entries(&self) -> bool {
         !self.entries.is_empty()
     }
@@ -269,9 +303,25 @@ pub enum ApplyOutcome {
     RemovedTail,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConversationState {
     items: Vec<Entity<MessageItem>>,
+    /// The start instant of the current (or most recent) user turn, captured on
+    /// `ThreadEvent::TurnStarted`. Seeded into each new activity segment's
+    /// `started_at` so the elapsed covers the whole turn — reasoning warmup,
+    /// model latency, and every tool-use loop iteration — not just from the
+    /// first `ToolCall`. Falls back to `Instant::now()` for the rebuild path
+    /// (where durations are unknown anyway).
+    turn_started_at: Instant,
+}
+
+impl Default for ConversationState {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            turn_started_at: Instant::now(),
+        }
+    }
 }
 
 impl ConversationState {
@@ -355,14 +405,15 @@ impl ConversationState {
         None
     }
 
-    /// The index of the trailing `Thinking` container that is still streaming
-    /// — i.e. the active batch a new `ToolCall` should fold into. `None` when
-    /// the previous batch finalized (all entries terminal) or no batch exists
-    /// yet, in which case the caller opens a fresh container.
-    fn find_trailing_thinking(&self, cx: &App) -> Option<usize> {
-        self.items
-            .iter()
-            .rposition(|e| matches!(e.read(cx).kind(), ConvItem::Thinking(t) if t.streaming))
+    /// The index of the active activity segment — a `Thinking` container that
+    /// is still accepting entries (the turn is in progress, surviving
+    /// `StopReason::ToolUse`). A new `ToolCall` folds into this segment; `None`
+    /// when no live segment exists, in which case the caller opens a fresh one.
+    /// Scans from the tail so the most recent live segment wins.
+    fn find_active_activity_segment(&self, cx: &App) -> Option<usize> {
+        self.items.iter().rposition(
+            |e| matches!(e.read(cx).kind(), ConvItem::Thinking(t) if t.accepting_entries),
+        )
     }
 
     /// Feed the child `Thread`'s full message list into the matching agent task,
@@ -464,8 +515,14 @@ impl ConversationState {
             | ThreadEvent::SteerInjected { .. } => ApplyOutcome::None,
             // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
             // workspace to light the sidebar running indicator; it carries no
-            // conversation content.
-            ThreadEvent::TurnStarted => ApplyOutcome::None,
+            // conversation content. We capture the turn's start instant here so
+            // the first activity segment's elapsed covers the whole turn
+            // (reasoning warmup + model latency), not just from the first
+            // `ToolCall`.
+            ThreadEvent::TurnStarted => {
+                self.turn_started_at = Instant::now();
+                ApplyOutcome::None
+            }
             // Goal lifecycle is surfaced by the composer chip + status popover,
             // not as a conversation item.
             ThreadEvent::GoalChanged { .. } | ThreadEvent::GoalEvaluated { .. } => {
@@ -577,6 +634,7 @@ impl ConversationState {
                 name,
                 title,
                 status,
+                input,
             } => {
                 if name == "agent" {
                     if let Some(ix) = self.find_agent_task(id, cx) {
@@ -610,7 +668,7 @@ impl ConversationState {
                         ApplyOutcome::Appended
                     }
                 } else if name == "exit_plan_mode" || name == "AskUserQuestion" {
-                    // Top-level card, never folded into a Thinking batch. The
+                    // Top-level card, never folded into an activity segment. The
                     // plan card (`exit_plan_mode`) keeps its body expanded —
                     // the verdict rides on the status icon; `PlanProposed`
                     // backfills the body. `AskUserQuestion` drives an inline
@@ -637,6 +695,7 @@ impl ConversationState {
                                     status: *status,
                                     output: String::new(),
                                     is_error: false,
+                                    input: input.clone().unwrap_or(serde_json::Value::Null),
                                     streaming: matches!(*status, ToolCallStatus::Running),
                                     collapsed: false,
                                     user_toggled: false,
@@ -649,19 +708,23 @@ impl ConversationState {
                         ApplyOutcome::Appended
                     }
                 } else {
-                    // Ordinary tool call: fold into the trailing Thinking
-                    // batch. A fresh batch opens when the previous one
-                    // finalized (all entries terminal) or no batch exists
-                    // yet — so parallel tool calls in one model response
-                    // aggregate into one status line, while a new response
-                    // after the batch completes opens a new line.
-                    let cix = match self.find_trailing_thinking(cx) {
+                    // Ordinary tool call: fold into the active activity
+                    // segment. A fresh segment opens when the previous one
+                    // went terminal (turn ended) or no segment exists yet —
+                    // so parallel tool calls in one model response AND tool
+                    // calls across the whole turn's tool-use loop aggregate
+                    // into one status line. The segment is seeded with the
+                    // turn's start time so the elapsed covers the whole turn.
+                    let turn_started_at = self.turn_started_at;
+                    let cix = match self.find_active_activity_segment(cx) {
                         Some(i) => i,
                         None => {
                             let i = self.items.len();
                             self.items.push(cx.new(|_| {
+                                let mut container = ThinkingContainer::new();
+                                container.started_at = turn_started_at;
                                 MessageItem::new(
-                                    ConvItem::Thinking(ThinkingContainer::new()),
+                                    ConvItem::Thinking(container),
                                     role.to_string(),
                                     i,
                                     weak,
@@ -674,12 +737,14 @@ impl ConversationState {
                     let name = name.clone();
                     let title = title.clone();
                     let status = *status;
+                    let entry_input = input.clone().unwrap_or(serde_json::Value::Null);
                     self.items[cix].update(cx, |item, cx| {
                         if let ConvItem::Thinking(t) = item.kind_mut() {
                             if let Some(entry) = t.entries.iter_mut().find(|e| e.id == id) {
                                 entry.title = title;
                                 entry.name = name;
                                 entry.status = status;
+                                entry.input = entry_input;
                                 if matches!(
                                     status,
                                     ToolCallStatus::Success
@@ -697,6 +762,7 @@ impl ConversationState {
                                     status,
                                     output: String::new(),
                                     is_error: false,
+                                    input: entry_input,
                                     streaming: matches!(status, ToolCallStatus::Running),
                                     collapsed: false,
                                     user_toggled: false,
@@ -778,13 +844,12 @@ impl ConversationState {
                                 entry.status = status;
                                 entry.collapsed = !entry.user_toggled;
                             }
-                            // A finalized entry may close the whole batch; if so,
-                            // auto-collapse the container unless the user pinned
-                            // it open.
+                            // A finalized entry does NOT close the segment —
+                            // `accepting_entries` stays true across the
+                            // tool-use loop. Only a terminal `Stop` freezes
+                            // the segment (see the `Stop` arm). The container
+                            // collapses only when the whole turn goes terminal.
                             t.recompute_streaming();
-                            if !t.streaming {
-                                t.collapsed = !t.user_toggled;
-                            }
                         }
                         cx.notify();
                     });
@@ -817,7 +882,7 @@ impl ConversationState {
                     ApplyOutcome::Remeasure(ix)
                 } else {
                     // No matching entry; insert as a finalized single-entry
-                    // Thinking batch so the orphan result still renders as a
+                    // activity segment so the orphan result still renders as a
                     // `⎿` line rather than a bare ToolCall card.
                     let ix = self.items.len();
                     let entry = ToolCallItem {
@@ -827,6 +892,7 @@ impl ConversationState {
                         status,
                         output: output.clone(),
                         is_error: *is_error,
+                        input: serde_json::Value::Null,
                         streaming: false,
                         collapsed: !matches!(
                             status,
@@ -835,6 +901,7 @@ impl ConversationState {
                         user_toggled: false,
                     };
                     let mut container = ThinkingContainer::new();
+                    container.accepting_entries = false;
                     container.streaming = false;
                     container.collapsed = false;
                     container.entries.push(entry);
@@ -848,10 +915,17 @@ impl ConversationState {
                 // Handled by `Workspace` as a prompt overlay; not part of the conversation flow.
                 ApplyOutcome::None
             }
-            ThreadEvent::Stop(_) => {
+            ThreadEvent::Stop(reason) => {
+                // `StopReason::ToolUse` is mid-turn: the model paused to
+                // execute a tool. Only finalize assistant/reasoning text
+                // streaming; the activity segment stays open so the next
+                // model response's tool calls fold into the same segment.
+                // A terminal stop (`EndTurn`/`MaxTokens`/`Refusal`) freezes
+                // the segment and auto-collapses everything.
+                let terminal = !matches!(reason, StopReason::ToolUse);
                 for e in &self.items {
                     e.update(cx, |item, cx| {
-                        item.finalize_streaming();
+                        item.finalize_streaming(terminal);
                         cx.notify();
                     });
                 }
@@ -1063,7 +1137,10 @@ impl ConversationState {
                 })
             })
             .collect();
-        Self { items }
+        Self {
+            items,
+            turn_started_at: Instant::now(),
+        }
     }
 }
 
@@ -1552,5 +1629,49 @@ mod tests {
             }
             _ => panic!("trailing item is an assistant bubble"),
         }
+    }
+
+    /// `StopReason::ToolUse` does NOT freeze the activity segment: after a
+    /// ToolUse stop, `accepting_entries` stays true and `streaming` stays
+    /// true so the next model response's tool calls fold into the same
+    /// segment. Only a terminal stop (`EndTurn`) freezes it. This exercises
+    /// the `ThinkingContainer` state transitions that the `Stop` arm drives
+    /// via `finalize_streaming(terminal)` + `recompute_streaming`.
+    #[test]
+    fn tool_use_stop_does_not_freeze_segment() {
+        let mut t = ThinkingContainer::new();
+        t.entries.push(ToolCallItem {
+            id: "1".into(),
+            name: "read_file".into(),
+            title: String::new(),
+            status: ToolCallStatus::Success,
+            output: String::new(),
+            is_error: false,
+            input: serde_json::Value::Null,
+            streaming: false,
+            collapsed: false,
+            user_toggled: false,
+        });
+        // All entries terminal, but segment is still accepting (turn in progress).
+        t.recompute_streaming();
+        assert!(t.accepting_entries, "segment still accepting entries");
+        assert!(t.streaming, "segment stays live while accepting entries");
+        assert!(t.frozen_secs.is_none(), "elapsed not pinned mid-turn");
+
+        // Simulate the Stop(ToolUse) path: finalize_streaming(false) only
+        // finalizes text streaming, leaves the segment live.
+        // (The full `MessageItem::finalize_streaming` needs an entity; we
+        // exercise the segment-level invariant directly.)
+        t.recompute_streaming();
+        assert!(t.accepting_entries);
+        assert!(t.streaming);
+        assert!(t.frozen_secs.is_none());
+
+        // Now the terminal stop path: finalize_segment freezes.
+        t.finalize_segment();
+        t.recompute_streaming();
+        assert!(!t.accepting_entries, "segment closed on terminal stop");
+        assert!(!t.streaming, "segment frozen on terminal stop");
+        assert!(t.frozen_secs.is_some(), "elapsed pinned on terminal stop");
     }
 }

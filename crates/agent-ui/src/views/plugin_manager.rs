@@ -6,10 +6,7 @@ use agent::{
     plugin::PluginManager,
     skill::{self, SkillOrigin, UserSkillDraft},
 };
-use gpui::{
-    AnyElement, Context, Entity, EventEmitter, Hsla, Render, SharedString, Window, div, prelude::*,
-    px,
-};
+use gpui::{AnyElement, Context, Entity, Hsla, Render, SharedString, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
@@ -20,11 +17,6 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
-
-#[derive(Clone)]
-pub enum PluginManagerEvent {
-    Exit,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PluginManagerTab {
@@ -57,8 +49,6 @@ struct Notice {
     text: SharedString,
     is_error: bool,
 }
-
-impl EventEmitter<PluginManagerEvent> for PluginManagerView {}
 
 impl PluginManagerView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -358,80 +348,61 @@ impl Render for PluginManagerView {
         let busy = self.busy;
         let search = self.search.clone();
 
+        // The settings shell owns the window TitleBar (drag region + traffic
+        // lights + section title); this view fills the content area below it.
+        // The search field sits at the trailing edge of the tab row so a long
+        // marketplace list can be filtered without a separate header band.
+        let search_box = h_flex()
+            .w(px(280.))
+            .min_w_0()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.secondary)
+            .child(
+                Icon::new(IconName::Search)
+                    .small()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                Input::new(&search)
+                    .appearance(false)
+                    .bordered(false)
+                    .focus_bordered(false),
+            );
+
         v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(
                 h_flex()
-                    .h(px(56.))
                     .px_5()
+                    .pt_3()
                     .items_center()
                     .justify_between()
-                    .border_b_1()
-                    .border_color(theme.border)
+                    .gap_2()
                     .child(
-                        h_flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                Button::new("plugin-manager-back")
-                                    .ghost()
-                                    .small()
-                                    .icon(Icon::new(IconName::ArrowLeft))
-                                    .label(i18n::t("settings-back"))
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(PluginManagerEvent::Exit);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(gpui::FontWeight::BLACK)
-                                    .child(i18n::t("plugins-title")),
-                            ),
+                        TabBar::new("plugin-manager-tabs")
+                            .underline()
+                            .selected_index(tab_ix)
+                            .on_click(cx.listener(|this, ix: &usize, _window, cx| {
+                                this.tab = match *ix {
+                                    0 => PluginManagerTab::Marketplace,
+                                    1 => PluginManagerTab::Plugin,
+                                    2 => PluginManagerTab::Skill,
+                                    _ => PluginManagerTab::Mcp,
+                                };
+                                cx.notify();
+                            }))
+                            .child(i18n::t("plugins-tab-marketplace"))
+                            .child(i18n::t("plugins-tab-plugin"))
+                            .child(i18n::t("plugins-tab-skill"))
+                            .child(i18n::t("plugins-tab-mcp")),
                     )
-                    .child(
-                        h_flex()
-                            .w(px(280.))
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded(theme.radius)
-                            .bg(theme.secondary)
-                            .child(
-                                Icon::new(IconName::Search)
-                                    .small()
-                                    .text_color(theme.muted_foreground),
-                            )
-                            .child(
-                                Input::new(&search)
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .focus_bordered(false),
-                            ),
-                    ),
-            )
-            .child(
-                h_flex().px_5().pt_3().child(
-                    TabBar::new("plugin-manager-tabs")
-                        .underline()
-                        .selected_index(tab_ix)
-                        .on_click(cx.listener(|this, ix: &usize, _window, cx| {
-                            this.tab = match *ix {
-                                0 => PluginManagerTab::Marketplace,
-                                1 => PluginManagerTab::Plugin,
-                                2 => PluginManagerTab::Skill,
-                                _ => PluginManagerTab::Mcp,
-                            };
-                            cx.notify();
-                        }))
-                        .child(i18n::t("plugins-tab-marketplace"))
-                        .child(i18n::t("plugins-tab-plugin"))
-                        .child(i18n::t("plugins-tab-skill"))
-                        .child(i18n::t("plugins-tab-mcp")),
-                ),
+                    .child(search_box),
             )
             .children(notice.map(|notice| notice_banner(notice, &theme)))
             .when(busy, |el| {
@@ -495,6 +466,7 @@ impl PluginManagerView {
                             .label(i18n::t("plugins-add-marketplace"))
                             .icon(Icon::new(IconName::Plus))
                             .disabled(self.busy)
+                            .flex_shrink_0()
                             .on_click(cx.listener(|this, _, _, cx| this.add_marketplace(cx))),
                     ),
             )
@@ -816,6 +788,7 @@ fn marketplace_card(
                 ))
                 .child(
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .child(
                             Button::new(format!("select-marketplace-{}", record.slug))
@@ -871,6 +844,7 @@ fn marketplace_plugin_card(
                 .child(item_text(name, plugin.source, plugin.description, &theme))
                 .child(
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .child(status_tag(
                             if installed {
@@ -937,6 +911,7 @@ fn installed_plugin_card(
                 ))
                 .child(
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .children(can_update.then(|| {
                             Button::new(format!("update-installed-{}", name_update))
@@ -994,6 +969,7 @@ fn skill_card(
                 .child(item_text(record.key, origin, Some(source), &theme))
                 .child(
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .child(
                             Button::new(format!("edit-skill-{}", action_key))
@@ -1045,6 +1021,7 @@ fn mcp_card(
                 .child(item_text(name, summary, None, &theme))
                 .children((!readonly).then(|| {
                     h_flex()
+                        .flex_shrink_0()
                         .gap_1()
                         .child(
                             Button::new(format!("edit-mcp-{}", edit_name))
@@ -1129,18 +1106,27 @@ fn item_text(
             div()
                 .text_sm()
                 .font_weight(gpui::FontWeight::SEMIBOLD)
+                .min_w_0()
+                .truncate()
                 .child(title.into()),
         )
         .child(
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .min_w_0()
+                // Subtitle often carries a Git URL or filesystem path —
+                // truncate so a long incompressible run can't blow the row
+                // out under a narrow window. Description below wraps instead,
+                // since it is prose the user may want to read in full.
+                .truncate()
                 .child(subtitle.into()),
         )
         .children(description.filter(|s| !s.is_empty()).map(|description| {
             div()
                 .text_xs()
                 .text_color(theme.muted_foreground)
+                .min_w_0()
                 .child(description)
         }))
         .into_any_element()

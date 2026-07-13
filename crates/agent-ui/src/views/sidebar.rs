@@ -72,7 +72,6 @@ pub enum SidebarEvent {
     NewThread,
     /// New thread bound to a specific project path.
     NewThreadWithProject(PathBuf),
-    OpenPlugins,
     /// User clicked archive/unarchive. The bool is the new archived state.
     ArchiveThread(String, bool),
     /// Launch an external agent CLI session with a user-picked provider + model
@@ -463,15 +462,6 @@ impl Render for Sidebar {
                                 IconName::Calendar,
                                 i18n::t("sidebar-scheduled"),
                                 &theme,
-                            ))
-                            .child(menu_item(
-                                "plugins",
-                                IconName::Frame,
-                                i18n::t("sidebar-plugins"),
-                                &theme,
-                                Some(cx.listener(|_this, _ev, _window, cx| {
-                                    cx.emit(SidebarEvent::OpenPlugins);
-                                })),
                             )),
                     )
                     .children(

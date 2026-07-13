@@ -3,6 +3,8 @@
 pub mod browser_view;
 pub mod completion;
 pub mod composer_menu;
+pub mod context_rail;
+pub mod management_shell;
 pub mod member_panel;
 pub mod message;
 pub mod outline;

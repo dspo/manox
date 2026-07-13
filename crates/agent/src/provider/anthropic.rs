@@ -539,6 +539,18 @@ impl AnthropicEventMapper {
         match event {
             AnthropicEvent::MessageStart { message } => {
                 if let Some(u) = message.usage {
+                    // Surface the raw usage the upstream returned so a provider
+                    // that never populates Anthropic prompt-caching stats (most
+                    // non-Claude Anthropic-compatible gateways) is visible: the
+                    // "消费" card's 缓存 branch stays 0 not because manox dropped
+                    // the field, but because the gateway never sent it.
+                    tracing::debug!(
+                        input = ?u.input_tokens,
+                        output = ?u.output_tokens,
+                        cache_creation = ?u.cache_creation_input_tokens,
+                        cache_read = ?u.cache_read_input_tokens,
+                        "anthropic MessageStart usage",
+                    );
                     update_usage(&mut self.usage, &u);
                 }
                 vec![Ok(LanguageModelCompletionEvent::UsageUpdate(self.usage))]

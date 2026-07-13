@@ -7,7 +7,6 @@
 sidebar-new-chat = 新对话
 sidebar-search = 搜索
 sidebar-scheduled = 已安排
-sidebar-plugins = 插件
 sidebar-section-projects = 项目
 sidebar-section-conversations = 对话
 sidebar-section-external = 外部
@@ -87,6 +86,7 @@ settings-item-pets = 宠物
 settings-item-keyboard = 键盘快捷键
 settings-group-integrations = 集成
 settings-item-snapshots = 应用快照
+settings-item-plugins = 插件
 settings-item-mcp = MCP 服务器
 settings-item-browser = 浏览器
 settings-item-computer = 电脑操控
@@ -98,9 +98,10 @@ settings-item-environment = 环境
 settings-item-worktrees = 工作树
 settings-group-archived = 已归档
 settings-item-archived = 已归档对话
-settings-item-chat-settings = Chat Settings
+settings-item-chat-settings = 聊天设置
 settings-search-placeholder = 搜索设置…
 settings-back = 返回应用
+settings-title = 设置
 settings-coming-soon = Coming soon…
 settings-coming-soon-label = Coming soon… {$label}
 
@@ -449,18 +450,29 @@ titlebar-unarchive-notice = 会话已取消归档。
 titlebar-not-implemented = 尚未实现。
 
 # ── 环境信息面板 ──────────────────────────────────────────────────────
-workspace-env-title = 对话信息
 workspace-env-changes = 变更
 workspace-env-no-project = 暂无项目
 workspace-env-usage = 消费
 workspace-env-throughput = 穿透
 workspace-env-cache = 缓存
+workspace-env-cache-hit-rate = 缓存 {$pct}%
 workspace-env-sources = 来源
 workspace-env-no-sources = 暂无来源
+workspace-env-git-unavailable = git 不可用
+workspace-env-git-not-a-repo = 非 git 仓库
+workspace-env-git-detached = 分离头指针
+workspace-env-git-worktree-suffix = (工作区)
+workspace-env-git-copy-branch = 复制分支名
+workspace-env-git-copy-path = 复制工作区路径
+workspace-env-git-exit-worktree = 退出工作区
+
+# ── 上下文栏（右侧边栏）────────────────────────────────────────────────
+context-rail-title = 对话信息
+context-rail-collapse = 折叠上下文栏
 
 # ── Cockpit（运行状态 / 里程碑 / 上下文预算）──────────────────────────
-# 「对话信息」卡片的运行状态行。{$phase} 为本地化的阶段标签，{$elapsed} 为预格式化的时长，{$tokens} 为预格式化的 token 计数（如 "22.7k"）。
-cockpit-run-status = {$phase} · {$elapsed} · ↓ {$tokens}
+# 多行运行状态块。{$elapsed} 为预格式化的时长，{$tokens} 为预格式化的 token 计数（如 "22.7k"）。阶段标签单独渲染为加粗行，位于本行之上。
+cockpit-run-status-meta = {$elapsed} · {$tokens}
 # 运行状态行的阶段标签。
 cockpit-status-idle = 空闲
 cockpit-status-thinking = 思考中

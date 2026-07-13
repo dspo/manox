@@ -11,7 +11,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### 顶层
 
-- [Window](#window) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Plugins](#viewmodeplugins) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
+- [Window](#window) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
 
 ### Sidebar
 
@@ -19,7 +19,11 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### MainColumn
 
-- [MainColumn](#maincolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarGoalChip](#titlebargoalchip) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body) · [EnvironmentCard](#environmentcard)
+- [MainColumn](#maincolumn) · [TitleBar](#titlebar) · [TitleBarThreadTitle](#titlebarthreadtitle) · [TitleBarGoalChip](#titlebargoalchip) · [TitleBarMenuButton](#titlebarmenubutton) · [Body](#body)
+
+### ContextRail
+
+- [ContextRail](#contextrail) · [ContextRailPanel](#contextrailpanel) · [ContextRailCollapseBtn](#contextrailcollapsebtn) · [ContextRailChangesRow](#contextrailchangesrow) · [ContextRailBranchRow](#contextrailbranchrow) · [ContextRailBranchMenu](#contextrailbranchmenu)
 
 ### Hero
 
@@ -57,13 +61,17 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 - [TeamChip](#teamchip) · [TeamDrawer](#teamdrawer)
 
+### ManagementShell
+
+- [ManagementBackControl](#managementbackcontrol)
+
 ### Settings
 
 - [SettingsView](#settingsview) · [SettingsTitleBar](#settingstitlebar) · [SettingsLeftNav](#settingsleftnav) · [SettingsSearchInput](#settingssearchinput) · [SettingsGroupList](#settingsgrouplist) · [SettingsGroup](#settingsgroup) · [SettingsItem](#settingsitem) · [SettingsRightPane](#settingsrightpane) · [SettingsPanel](#settingspanel) · [SettingsSectionCard](#settingssectioncard) · [SettingsRow](#settingsrow) · [SettingsSectionHeader](#settingssectionheader) · [SettingsHairline](#settingshairline)
 
 ### PluginManager
 
-- [PluginManagerView](#pluginmanagerview) · [PluginManagerHeader](#pluginmanagerheader) · [PluginManagerTabBar](#pluginmanagertabbar) · [PluginManagerNoticeBanner](#pluginmanagernoticebanner) · [PluginManagerBusyIndicator](#pluginmanagerbusyindicator) · [PluginManagerTabContent](#pluginmanagertabcontent) · [MarketplaceTab](#marketplacetab) · [PluginTab](#plugintab) · [SkillTab](#skilltab) · [McpTab](#mcptab) · [PluginCard](#plugincard) · [SkillCard](#skillcard) · [McpServerCard](#mcpservercard) · [FormCard](#formcard)
+- [PluginManagerView](#pluginmanagerview) · [PluginManagerTabBar](#pluginmanagertabbar) · [PluginManagerNoticeBanner](#pluginmanagernoticebanner) · [PluginManagerBusyIndicator](#pluginmanagerbusyindicator) · [PluginManagerTabContent](#pluginmanagertabcontent) · [MarketplaceTab](#marketplacetab) · [PluginTab](#plugintab) · [SkillTab](#skilltab) · [McpTab](#mcptab) · [PluginCard](#plugincard) · [SkillCard](#skillcard) · [McpServerCard](#mcpservercard) · [FormCard](#formcard)
 
 ### Terminal
 
@@ -97,16 +105,13 @@ Root container, horizontal flex (`h_flex`), owns all sub-views.
 
 ### 2.1 ViewMode
 
-`Workspace` switches between five mutually exclusive full-window modes:
+`Workspace` switches between four mutually exclusive full-window modes:
 
 #### ViewMode::Workspace
 Default — sidebar + conversation + composer.
 
 #### ViewMode::Settings
-Full-window settings overlay with slide-in animation.
-
-#### ViewMode::Plugins
-Full-window plugin/skill/MCP manager.
+Full-window settings overlay with slide-in animation. Plugin/skill/MCP management lives under Settings → Integrations → Plugins (rendered in the right pane, not a separate mode).
 
 #### ViewMode::Terminal
 Full-window terminal emulator.
@@ -118,15 +123,21 @@ Full-window external agent CLI session (claude / codex / copilot). Renders the a
 
 ## 3. ViewMode::Workspace Layout
 
-The default mode. Three horizontal slots: Sidebar, MainColumn, EditorPane.
+The default mode. Two top-level slots divided by a 6px [SidebarDivider](#sidebardivider): left = [Sidebar](#sidebar), right = the middle column — a relative `v_flex` that holds a shared [TitleBar](#titlebar) overlay on top (spanning the whole middle column) and the conversation column underneath. The [ContextRail](#contextrail) is NOT a flex sibling column — it is an absolute overlay floating over the conversation column's top-right (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`), content height (never full-height), with the conversation body reserving `ENV_CONTENT_INSET` right padding so the message list never hides behind the card. [EditorPane](#editordpane) opens as a third top-level column to the right of the middle column when any right-pane tab is active; while it is open the card stays hidden so the conversation reclaims its width. The card also folds away below `RAIL_NARROW_BREAK` (900px middle-column width), in which case the conversation column fills the middle column.
 
 ```
-┌──────────┬──┬─────────────────────────┬──┬──────────────┐
-│          │  │                         │  │              │
-│ Sidebar  │▌│     MainColumn           │▌│ EditorPane   │
-│          │  │                         │  │ (conditional)│
-│          │  │                         │  │              │
-└──────────┴──┴─────────────────────────┴──┴──────────────┘
+┌──────────┬──┬──────────────────────────────┐
+│          │  │  MiddleColumn (v_flex.relative)│
+│ Sidebar  │▌ │ ┌──────────────────────────┐  │
+│          │  │ │ TitleBar (shared overlay) │  │
+│          │  ├──────────────────────────┤  │
+│          │  │ MainColumn (conversation) │  │
+│          │  │                ┌─────────┐ │  │
+│          │  │                │Context  │ │  │
+│          │  │                │Rail card│ │  │
+│          │  │                │(float)  │ │  │
+│          │  │                └─────────┘ │  │
+└──────────┴──┴──────────────────────────────┘
 ```
 
 ### 3.1 Sidebar
@@ -147,7 +158,7 @@ Scrollable body inside Sidebar, `overflow_y_scroll`.
 
 #### SidebarMenuSection
 
-Top section: New Thread, Search, Scheduled, Plugins menu items.
+Top section: New Thread, Search, Scheduled menu items.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -207,7 +218,7 @@ Single external-session row: kind icon (Bot/Cpu/Github) + kind label + muted "pr
 
 ### 3.2 MainColumn
 
-Central area, flex-1, relative positioning.
+Central conversation column, flex-1. The sole flex child of the middle column under the shared [TitleBar](#titlebar) overlay that spans the whole middle column (not a top-level column itself). The [ContextRail](#contextrail) floats over this column's top-right as an absolute overlay (not a flex sibling); the conversation body reserves `ENV_CONTENT_INSET` right padding when the card is shown so the message list clears it. The composer no longer spans underneath the card.
 
 #### MainColumn
 
@@ -217,7 +228,7 @@ Vertical flex container, fills remaining width.
 
 #### TitleBar
 
-Absolute-positioned top bar, height `TITLE_BAR_HEIGHT`, contains thread title and "..." menu.
+Absolute-positioned top bar at the middle-column level (not the conversation column), height `TITLE_BAR_HEIGHT`, spans both [MainColumn](#maincolumn) and the [ContextRail](#contextrail) card so the pair reads as one middle column under a single bar. Contains thread title and "..." menu.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -569,29 +580,92 @@ Trigger: "Create blank project" from [ProjectMenu](#projectmenu). Centered modal
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### 3.2.6 EnvironmentCard
+### 3.3 ContextRail
 
-Floating card at the top-right of the conversation area, only mounted when all of:
-editor pane closed, thread has interacted, main column ≥ `ENV_CARD_MIN_MAIN_W` (900px). Width `ENV_CARD_WIDTH` (260px). `occlude()` so it paints above the message list.
+Right-side context panel that floats over the Workspace's conversation column top-right as an absolute overlay — NOT a flex sibling of [MainColumn](#maincolumn). The `Render` impl positions it (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`); the panel body (`render_panel`) carries the card chrome (`border_1` / `rounded(theme.radius)` / drop shadow / `bg:background` + `p_3`/`gap_2`). Content height, never full-height — a compact floating card, not a flush column or a second title bar. The conversation body reserves `ENV_CONTENT_INSET` (card width + 36px gutter) right padding so the message list never hides behind the card. Owned by `Workspace` as `Entity<ContextRail>`; the rail owns the cockpit state (run phase, milestones, per-cell counter animation) that used to live on `Workspace`.
+
+Visibility is gated on the main-column body width (`ContextRail::rail_width_for`): shown as `Some(ENV_CARD_WIDTH)` (260px) at/above `RAIL_NARROW_BREAK` (900px), folded away (`None`) below it. The card's `top` clears the shared [TitleBar](#titlebar) overlay.
+
+The card stays **hidden while the [EditorPane](#editorpane) is open** — opening the right pane reclaims the card's width for the conversation — and on the empty first screen / before the thread has interacted. It is not the editor's replacement; the editor is a third top-level column outside the middle. Because the card is absent while the editor is open, the editor-divider drag clamp reserves only `MAIN_MIN_WIDTH` (no card width) — the conversation alone holds the middle column while the editor is open. The card floats as an absolute overlay (content height); the conversation column is `flex_1`/`min_w_0` and reserves `ENV_CONTENT_INSET` right padding when the card is shown.
+
+#### ContextRail
+
+Floating absolute card over the conversation column's top-right (`absolute().top(TITLE_BAR_HEIGHT + 16).right(16).w(ENV_CARD_WIDTH).occlude()`). Owns `Entity<Thread>` and renders the panel body (`render_panel`) which carries the card chrome (border / rounded / shadow / background + `p_3`/`gap_2`) at content height.
+
+> Source: `agent-ui/src/views/context_rail.rs`
+
+#### ContextRailPanel
+
+Panel body (the card's content, content height — no internal scroll surface). The conversation-info rows (title, status, changes, branch) sit above the usage tree; the milestone section and context budget render from cockpit state owned by the rail.
 
 Contents, top to bottom:
 
-- **Header**: bold "Environment info" title + a `+` ghost button (no behavior yet).
-- **Changes row**: `env_row` with `Frame` icon, "Changes" label, and a trailing `+0 / -0` placeholder (TODO).
-- **Branch row**: `env_row` with `Github` icon and the branch label — `"main"` when a project is bound, "No project" otherwise.
-- **Usage section header**: `MemoryStick` icon + "Usage" label.
-- **Per-model tree blocks** (sorted by total tokens desc; empty for unused models):
-  - Model id (truncated to `ENV_MODEL_ID_MAX` chars).
-  - `├── Throughput ↑<in> ↓<out>` — input / output tokens.
-  - `└── Cache ↑<cache_create> ↓<cache_read>` — cache creation / cache read.
+- **Header**: bold title (i18n `context-rail-title`) + a [ContextRailCollapseBtn](#contextrailcollapsebtn) ghost button.
+- **Status block** (`cockpit_status_block`): a two-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2. Elapsed refreshes per-second via the thinking ticker.
+- **Context budget row**: `context_budget_pct` reads `Thread::cumulative_token_usage` (cross-turn cumulative, always available — never `None`) against `MIN_COMPACTION_CONTEXT_WINDOW` and the `cockpit_auto_compact_threshold` cached on the rail. Always renders a percentage bar + explicit `current / cap` token counts (e.g. `396k / 900k`); warning-colored within 10% of the trigger. No "waiting for usage" state — the row is hidden entirely only when no model is configured.
+- **Milestone section** (collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): plan steps parsed from the approved `exit_plan_mode` plan. All `Pending` outside a turn; the first is promoted to `InProgress` while the thread runs, demoted back to `Pending` on terminal stop.
+- **Changes row**: [ContextRailChangesRow](#contextrailchangesrow).
+- **Branch row**: [ContextRailBranchRow](#contextrailbranchrow).
+- **Usage section** (`render_usage_section`): `MemoryStick` icon + "Usage" header, then per-model blocks (sorted by total tokens desc; empty for unused models). Each block is:
+  - Model id line (truncated to `ENV_MODEL_ID_MAX` chars) + trailing `cache {pct}%` hit-rate badge (i18n `workspace-env-cache-hit-rate`) computed by `cockpit::cache_read_ratio` (denominator = uncached input + cache-read).
+  - A two-row tree: `├── 穿透` (i18n `workspace-env-throughput`) carrying `↑{input}` / `↓{output}` animated counters, and `└── 缓存` (i18n `workspace-env-cache`) carrying `↑{cache_create}` / `↓{cache_read}`. The throughput / cache split keeps the cache-read share legible as a branch rather than buried among flat rows. Tree prefixes (`├── ` / `└── `) are painted at `muted.opacity(0.55)` so they read as chrome.
 - **Hairline divider**.
-- **Sources section**: `Sources` label + "No sources yet" placeholder.
+- **Sources section**: `Sources` label + "No sources yet" placeholder (ε track).
 
-Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `Workspace`, rebuilt every render to auto-prune cells whose model disappeared.
+Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `ContextRail`, rebuilt every render inside `render_usage_section` to auto-prune cells whose model disappeared.
 
-> Source: `agent-ui/src/workspace.rs` (`render_environment_panel`)
+> Source: `agent-ui/src/views/context_rail.rs` (`render_panel`)
 
-### 3.3 EditorPane
+#### ContextRailCollapseBtn
+
+Ghost `xsmall` button in the panel header, `IconName::PanelRightClose`, tooltip i18n `context-rail-collapse`. Folds the rail into a drawer when narrow (the drawer's open affordance uses `context-rail-drawer-open` / `context-rail-expand`).
+
+> Source: `agent-ui/src/views/context_rail.rs`
+
+#### ContextRailChangesRow
+
+Working-tree diff stat line in the panel body. `env_row` with `Frame` icon, "Changes" label, and a trailing `+added` (green) / `-deleted` (red) / `?untracked` (muted) cluster from `GitChangeStats`. Before the first git refresh lands (or when no project is bound) the trailing slot shows `--` / "No project" so the row keeps its height instead of flickering.
+
+Stats come from `git diff --numstat HEAD` (binary rows `-`/`-` skipped) plus `git ls-files --others --exclude-standard` for untracked, shelled out via [`crate::git_status`](#git_status) on the global tokio runtime. Refreshed (debounced 400ms) by `Workspace` on thread attach, terminal `Stop`, and enter/exit worktree.
+
+> Source: `agent-ui/src/views/context_rail.rs` (`render_changes_row`)
+
+#### ContextRailBranchRow
+
+Resolved git identity line in the panel body. `env_row_clickable` with `Github` icon — the whole row is a pointer cursor that opens [ContextRailBranchMenu](#contextrailbranchmenu). The label shows:
+
+- The branch name when on a normal branch.
+- The short sha + "(detached)" hint when in detached HEAD.
+- "(worktree)" suffix when the thread is inside a git worktree.
+- "Not a git repo" when `git rev-parse --show-toplevel` fails.
+- "git unavailable" when the `git` binary is missing.
+- "--" before the first refresh lands; "No project" when no project is bound.
+
+Branch resolution prefers `Thread::worktree().branch` when inside a worktree; otherwise shells out to `git branch --show-current`, falling back to `git rev-parse --short HEAD` for detached HEAD. All via [`crate::git_status`](#git_status).
+
+> Source: `agent-ui/src/views/context_rail.rs` (`render_branch_row`)
+
+#### ContextRailBranchMenu
+
+`PopupMenu` anchored under the branch row, rendered as a `deferred(...).with_priority(1)` overlay so it paints on top of the entire workspace tree and is never occluded by the rail's later-painted siblings (usage/budget/milestone rows) nor clipped by the rail's scroll container. Mirrors the title-menu / model-selector pattern: the menu entity + its `DismissEvent` subscription are created lazily on open, dropped on close. Items:
+
+- **Copy branch name** (i18n `workspace-env-git-copy-branch`) — shown when a branch resolved; writes to the clipboard silently.
+- **Copy worktree path** (i18n `workspace-env-git-copy-path`) — shown when the thread is inside a worktree.
+- **Exit worktree** (i18n `workspace-env-git-exit-worktree`) — shown only inside a worktree, behind a separator; calls `Thread::exit_worktree` (the branch row never exits directly, so a stray click cannot destroy the isolation context).
+
+> Source: `agent-ui/src/views/context_rail.rs` (`render_branch_row`)
+
+#### git_status
+
+Pure parsing + tokio-bridged IO module backing [ContextRailChangesRow](#contextrailchangesrow) / [ContextRailBranchRow](#contextrailbranchrow). Shells out to the system `git` binary (never `git2` — banned by project rule) on the global tokio runtime via `agent::runtime::handle`, delivering results back through an `async_channel` (the same bridge the worktree tool uses).
+
+- `parse_numstat` / `parse_branch` / `parse_short_sha` / `count_untracked` — pure value-type parsers (unit-tested without a real repo).
+- `gather` — runs `git rev-parse --show-toplevel`, `git branch --show-current` / `git rev-parse --short HEAD`, `git diff --numstat HEAD`, `git ls-files --others --exclude-standard` in one background task; returns `None` when the cwd is not under git.
+- `gather_bridged` — spawns `gather` on the tokio runtime and awaits the result from a gpui `cx.spawn`.
+
+> Source: `agent-ui/src/git_status.rs`
+
+### 3.4 EditorPane
 
 Right-side panel, shown when `editor_open` is true. 640px default (320–960 draggable).
 
@@ -672,21 +746,27 @@ Popover above the composer: a thin roster of worker members (name / role / statu
 
 Full-window settings overlay. Slides in from left (180ms), slides out to right (200ms).
 
+#### ManagementBackControl
+
+Unified "back to app" control — `ArrowLeft` + label row mirroring `sidebar::menu_item` density (px_2/py_1p5/gap_2, accent hover wash, `theme.radius`). Mounted as the first row of the [SettingsLeftNav](#settingsleftnav) (above the search input and group list) so the back affordance reads as a peer of the sidebar menu items, not an isolated button. The settings page no longer ships a shared management TitleBar — each management surface reuses the app-page scaffold (sidebar + overlay TitleBar in the main column), and the back control lives in the sidebar.
+
+> Source: `agent-ui/src/views/management_shell.rs`
+
 #### SettingsView
 
-Root of settings overlay, `size_full`, `bg:background`.
+Root of settings overlay, `size_full`, `bg:background`. Mirrors the app-page scaffold: an `h_flex` of `[SettingsLeftNav][main column]`, where the main column is a relative `v_flex` with an absolute [SettingsTitleBar](#settingstitlebar) overlay on top and [SettingsRightPane](#settingsrightpane) content below `pt(TITLE_BAR_HEIGHT)`.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
 #### SettingsTitleBar
 
-Top bar with back button.
+Absolute-positioned `TitleBar` overlay (`h(TITLE_BAR_HEIGHT)`, `top_0/left_0/right_0`) in the settings main column — same chrome as the conversation column's TitleBar. Shows the currently-selected settings item's localized label (truncating) on the leading side; falls back to the generic "Settings" title when nothing is selected. Carries the window-drag region and macOS traffic-light avoidance. No back button — back lives in [SettingsLeftNav](#settingsleftnav).
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
 #### SettingsLeftNav
 
-260px sidebar: back btn + search input + scrollable group list.
+260px sidebar (`bg:background`, right border) mirroring the app [Sidebar](#sidebar): no standalone TitleBar, the macOS traffic-light buttons float over its transparent top (`pt(top_inset)`, 28px on macOS / 8px elsewhere). Body is a scrollable `v_flex` (`overflow_y_scroll`) holding, top to bottom: the [ManagementBackControl](#managementbackcontrol) ("Back to app" → emits `SettingsEvent::Exit` → returns to [ViewMode::Workspace](#viewmodeworkspace-layout)), the [SettingsSearchInput](#settingssearchinput), and the [SettingsGroupList](#settingsgrouplist).
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
@@ -716,7 +796,7 @@ Single settings row: icon + label, clickable, highlights when selected.
 
 #### SettingsRightPane
 
-Right content area, `overflow_y_scroll`, `p_4`, dispatches to panel renderers.
+Right content area, dispatches to panel renderers (and to the [PluginManagerView](#pluginmanagerview) when the Integrations → Plugins item is selected). Each panel/content view owns its own scroll and padding.
 
 > Source: `agent-ui/src/views/settings/mod.rs`
 
@@ -752,25 +832,19 @@ Small bold label for a subsection.
 
 ---
 
-## 5. ViewMode::Plugins
+## 5. PluginManager (in Settings)
 
-Full-window plugin/skill/MCP management view.
+Plugin/skill/MCP management, rendered as the right-pane content of [ViewMode::Settings](#viewmodesettings) when the Integrations → Plugins item is selected — no longer a standalone full-window mode. The settings shell owns the window TitleBar (drag region + traffic-light avoidance) and the back affordance; this view fills the right pane with its tab bar + tab content.
 
 #### PluginManagerView
 
-Root view, `size_full`.
-
-> Source: `agent-ui/src/views/plugin_manager.rs`
-
-#### PluginManagerHeader
-
-Top bar: back btn + title + search input (280px).
+View rendered inside [SettingsRightPane](#settingsrightpane) when `settings-item-plugins` is selected.
 
 > Source: `agent-ui/src/views/plugin_manager.rs`
 
 #### PluginManagerTabBar
 
-Four tabs: Marketplace, Plugin, Skill, MCP.
+Four tabs: Marketplace, Plugin, Skill, MCP. The filter search input sits on the trailing side of this tab bar row (moved out of the former management TitleBar, which no longer exists).
 
 > Source: `agent-ui/src/views/plugin_manager.rs`
 

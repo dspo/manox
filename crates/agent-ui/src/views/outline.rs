@@ -128,6 +128,7 @@ mod tests {
             status: ToolCallStatus::Success,
             output: String::new(),
             is_error: false,
+            input: serde_json::Value::Null,
             streaming: false,
             collapsed: true,
             user_toggled: false,
