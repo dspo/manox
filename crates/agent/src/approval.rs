@@ -73,19 +73,23 @@ struct VerdictPayload {
 const REVIEWER_FIELD_CAP: usize = 2048;
 
 /// Deep-clone a `serde_json::Value`, replacing any string field longer than
-/// [`REVIEWER_FIELD_CAP`] with a truncated form (first `REVIEWER_FIELD_CAP`
-/// bytes plus a length marker). The original value is left intact — only the
-/// reviewer's serialized view is affected.
+/// [`REVIEWER_FIELD_CAP`] with a truncated form: the longest char-aligned
+/// prefix not exceeding [`REVIEWER_FIELD_CAP`] bytes, plus a byte-length
+/// marker. The original value is left intact — only the reviewer's serialized
+/// view is affected.
 fn truncate_tool_input(v: &serde_json::Value) -> serde_json::Value {
     match v {
         serde_json::Value::String(s) => {
             if s.len() <= REVIEWER_FIELD_CAP {
                 v.clone()
             } else {
-                let head = &s[..REVIEWER_FIELD_CAP];
+                // Snap the cut to the nearest preceding char boundary so a
+                // multi-byte UTF-8 sequence is never split mid-character.
+                let head_end = s.floor_char_boundary(REVIEWER_FIELD_CAP);
+                let head = &s[..head_end];
                 serde_json::Value::String(format!(
-                    "{head}…[truncated {} chars]",
-                    s.len() - REVIEWER_FIELD_CAP
+                    "{head}…[truncated {} bytes]",
+                    s.len() - head_end
                 ))
             }
         }
@@ -335,5 +339,20 @@ mod tests {
         let arr = out["list"].as_array().unwrap();
         assert_eq!(arr[0], "short");
         assert!(arr[1].as_str().unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn truncate_tool_input_truncates_multibyte_at_char_boundary() {
+        // REVIEWER_FIELD_CAP (2048) is not divisible by 3, so byte-slicing a
+        // long CJK string would land mid-character and panic. The cut must
+        // snap to the preceding char boundary instead.
+        let big = "文".repeat(4_000); // 12_000 bytes
+        let out = truncate_tool_input(&serde_json::json!({ "content": big }));
+        let content = out["content"].as_str().unwrap();
+        assert!(content.starts_with('文'));
+        assert!(content.contains("…[truncated "));
+        let head_end = content.find('…').unwrap();
+        assert!(head_end <= REVIEWER_FIELD_CAP);
+        assert!(content.is_char_boundary(head_end));
     }
 }
