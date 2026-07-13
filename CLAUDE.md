@@ -94,6 +94,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 - LLM：`cx.providers.config.yaml`（格式见 `provider/config.rs`）；SQLite：`cx/manox/threads.db`；设置：`cx/manox/settings.toml`
 - 子 agent：`cx/manox/agents/*.md`（frontmatter name/description/tools/model/max_turns/allow_nesting + 正文）；MCP：`cx/manox/mcp.toml`（stdio command/args/env/cwd 或 HTTP url/headers）
 - 插件：`cx/manox/plugins/`（marketplace cache 在 `cx/manox/marketplace-cache/`）；API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）
+- **百炼 anthropic 兼容端点**（`*.maas.aliyuncs.com/apps/anthropic`）：不报 `cache_creation_input_tokens`（所有轮次恒 0），只报 `cache_read_input_tokens`。manox 的 `cache_creation` 记账对该端点恒 0 属预期，非解析/累加/持久化 bug——解析（`anthropic.rs` message_start + message_delta）、`token_meter.rs` 累加、DB 持久化链路均正确，记录的就是端点报的 0。`LastBreakpointOnly` policy 对该端点有效（last-tool breakpoint 百炼认，read 正常命中）。结论由 `provider/anthropic.rs` 的三个 `MANOX_RUN_LIVE` 门控探针确证。
 
 ## GPUI 依赖版本锁定
 

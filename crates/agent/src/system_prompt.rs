@@ -183,11 +183,13 @@ pub fn max_tokens_directive() -> &'static str {
 }
 
 /// Appended to the system prompt while the thread is in plan mode. Tells the
-/// model to delegate research to the read-only `plan`/`explore` sub-agents
-/// (isolated context) and then submit its plan via `exit_plan_mode`. Kept in
+/// Injected as a user message when plan mode is entered (`set_plan_mode(true)`),
+/// so the system prompt stays byte-stable across the plan on/off switch — the
+/// provider prefix cache keeps its system+tools head intact. The directive
+/// rides in history (append-only); the model sees it each round-trip. Kept in
 /// code (not in `system_prompt.md`) for the same reason as
 /// `max_turns_summary_prompt`: a short, templated instruction, not prose.
-pub const PLAN_MODE_ADDENDUM: &str = "\n\n## Plan mode\n\
+pub const PLAN_MODE_ADDENDUM: &str = "## Plan mode\n\
 You are currently in plan mode: research the codebase and produce a plan, but do not implement.\n\
 - You have read-only tools plus the `agent` tool. Delegate codebase research to the `plan` sub-agent (`agent` tool, `subagent_type=plan`) so the exploration stays in an isolated context and does not bloat this conversation. For a focused lookup (\"where is X defined\", \"which files reference Y\"), delegate to the `explore` sub-agent instead.\n\
 - The sub-agent returns only its final conclusion; synthesize that into a complete plan. If research is inconclusive, delegate again with a sharper prompt rather than guessing.\n\
