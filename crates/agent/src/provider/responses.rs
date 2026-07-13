@@ -323,7 +323,13 @@ fn build_input(messages: &[LanguageModelRequestMessage]) -> (Vec<Value>, String)
                 // See anthropic.rs: rewritten to Text upstream, but emit the
                 // summary as text if reached untransformed.
                 MessageContent::Compaction(t) => text_buf.push_str(t),
-                MessageContent::Thinking { text, .. } => text_buf.push_str(text),
+                // OpenAI-compatible wire carries no reasoning in history:
+                // assistant turns surface only final content, never the prior
+                // reasoning trace (the "history stores content, not
+                // reasoning_content" convention). Dropping it keeps prior
+                // turns out of the request and avoids billing for reasoning
+                // tokens that the model never needs re-sent.
+                MessageContent::Thinking { .. } => {}
                 MessageContent::ToolUse(tu) => tool_uses.push(tu),
                 MessageContent::ToolResult(tr) => tool_results.push(tr),
                 MessageContent::Image { data, mime_type } => images.push((data, mime_type)),
@@ -816,6 +822,54 @@ mod tests {
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[1]["output"], "file.rs");
+    }
+
+    /// A prior assistant turn whose only content was reasoning must drop out of
+    /// the Responses-wire history entirely — no `message` item with empty
+    /// content, no leaked reasoning text. History carries final content only,
+    /// never the reasoning trace.
+    #[test]
+    fn build_input_drops_thinking_from_history() {
+        let messages = vec![LanguageModelRequestMessage {
+            role: Role::Assistant,
+            content: vec![MessageContent::Thinking {
+                text: "let me think".to_string(),
+                signature: None,
+            }],
+            cache: false,
+        }];
+        let (input, instructions) = build_input(&messages);
+        assert!(instructions.is_empty());
+        assert!(
+            input.is_empty(),
+            "thinking-only assistant turn must not emit an item: {input:?}"
+        );
+    }
+
+    /// When reasoning and final text share a turn, only the final text
+    /// survives into history — the reasoning trace must not leak into the
+    /// assistant message content. Regression guard for the has_text + Thinking
+    /// discard interaction.
+    #[test]
+    fn build_input_keeps_text_when_mixed_with_thinking() {
+        let messages = vec![LanguageModelRequestMessage {
+            role: Role::Assistant,
+            content: vec![
+                MessageContent::Thinking {
+                    text: "let me think".to_string(),
+                    signature: None,
+                },
+                MessageContent::Text("the answer".to_string()),
+            ],
+            cache: false,
+        }];
+        let (input, instructions) = build_input(&messages);
+        assert!(instructions.is_empty());
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[0]["content"][0]["type"], "output_text");
+        assert_eq!(input[0]["content"][0]["text"], "the answer");
     }
 
     #[test]
