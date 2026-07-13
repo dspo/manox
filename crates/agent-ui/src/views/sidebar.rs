@@ -131,13 +131,14 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 impl Sidebar {
     pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
         let store = agent::thread_store_global();
-        let sub = cx.subscribe(&store, |_this, _store, ev: &ThreadStoreEvent, cx| {
-            match ev {
+        let sub = cx.subscribe(
+            &store,
+            |_this, _store, ev: &ThreadStoreEvent, cx| match ev {
                 ThreadStoreEvent::SummariesUpdated | ThreadStoreEvent::RunningChanged => {
                     cx.notify();
                 }
-            }
-        });
+            },
+        );
         Self {
             store,
             selected: None,
@@ -798,7 +799,6 @@ fn render_thread_item(
         truncate(display, 24)
     };
     let updated = format_relative(summary.interacted_at);
-    let tokens = format_tokens(summary.cumulative_total_tokens);
     let role = if slide.selecting_id.as_deref() == Some(id.as_str()) {
         AnimRole::Selecting
     } else if slide.deselecting_id.as_deref() == Some(id.as_str()) {
@@ -954,14 +954,12 @@ fn render_thread_item(
                         .child(tag_element)
                         .child(
                             h_flex()
-                                .gap_1()
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .group_hover(group.clone(), |s| s.invisible())
-                                .child(gpui::div().child(tokens))
                                 .child(gpui::div().child(updated)),
                         )
                         .child(
@@ -986,16 +984,6 @@ fn render_thread_item(
                 ),
         )
         .into_any_element()
-}
-
-fn format_tokens(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
 }
 
 fn approval_mode_color(mode: i64, theme: &Theme) -> gpui::Hsla {
