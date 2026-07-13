@@ -21,14 +21,14 @@ use std::sync::atomic::AtomicBool;
 
 use gpui::{App, AppContext, AsyncApp, Task, WeakEntity};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_def::{self, AgentDefinition, AgentDefinitionFile};
-use crate::language_model::{AnyLanguageModel, MessageContent, Role, StopReason};
+use crate::language_model::{AnyLanguageModel, MessageContent, Role, StopReason, TokenUsage};
 use crate::message::Message;
 use crate::provider::registry;
-use crate::thread::{Thread, ThreadEvent};
+use crate::thread::{self, Thread, ThreadEvent, ToolCallStatus};
 use crate::tool::permission::PermissionCache;
 use crate::tool::{AgentTool as AgentToolTrait, AnyAgentTool, ToolOutputSink, ToolRegistry};
 
@@ -148,6 +148,7 @@ impl AgentToolTrait for SpawnAgentTool {
         let child = setup.child;
         let done_rx = setup.done_rx;
         let child_errored = setup.child_errored;
+        let metrics = setup.metrics;
         let sub = setup.sub;
 
         cx.spawn(async move |cx: &mut AsyncApp| {
@@ -172,11 +173,26 @@ impl AgentToolTrait for SpawnAgentTool {
                 || final_text == NO_FINAL_SENTINEL;
             drop(sub);
 
-            // The tool result is a JSON envelope {"final":..., "messages":[...]}.
-            // The envelope in the parent's ToolResult is the single source of
-            // truth: build_completion_request strips it to `final` for the model
-            // (context isolation), and the UI parses `messages` from it for the
-            // expandable panel — both live and after reload. No separate in-memory
+            // Stamp the terminal status into the telemetry snapshot so the
+            // persisted envelope carries the final verdict (the live
+            // `SubagentProgress` stream already relayed status transitions while
+            // the child ran; this pins the last one).
+            let final_metrics = {
+                let mut acc = metrics.lock().expect("subagent metrics poisoned");
+                acc.metrics.status = Some(if errored {
+                    ToolCallStatus::Error
+                } else {
+                    ToolCallStatus::Success
+                });
+                acc.metrics.clone()
+            };
+
+            // The tool result is a JSON envelope {"final":..., "messages":[...],
+            // "metrics":...}. The envelope in the parent's ToolResult is the
+            // single source of truth: build_completion_request strips it to
+            // `final` for the model (context isolation), and the UI parses
+            // `messages` / `metrics` from it for the expandable panel + header
+            // counters — both live and after reload. No separate in-memory
             // snapshot map is kept, so there is nothing to leak across a long
             // session with many sub-agent calls.
             //
@@ -184,10 +200,15 @@ impl AgentToolTrait for SpawnAgentTool {
             // sub-agent errored or produced no final message routes through
             // `Thread::run_tool_inner`'s `Err(e) => (e, true)` arm — the ToolResult
             // keeps the envelope as its content (so the UI panel and the
-            // `agent_final_text`/`agent_sub_messages` parsers still work) but is
-            // flagged `is_error: true`, so the parent model sees the failure
-            // instead of mistaking a non-reply for success (thread 6cd3d096).
-            let payload = serde_json::json!({ "final": final_text, "messages": msgs });
+            // `agent_final_text`/`agent_sub_messages`/`agent_metrics` parsers
+            // still work) but is flagged `is_error: true`, so the parent model
+            // sees the failure instead of mistaking a non-reply for success
+            // (thread 6cd3d096).
+            let payload = serde_json::json!({
+                "final": final_text,
+                "messages": msgs,
+                "metrics": final_metrics,
+            });
             if errored {
                 Err(payload.to_string())
             } else {
@@ -200,12 +221,23 @@ impl AgentToolTrait for SpawnAgentTool {
 /// Everything `run_streaming` builds synchronously before spawning the await
 /// task. `child` and `sub` are moved into that task; `done_rx` resolves when
 /// the sub-agent emits `Stop`; `child_errored` is set by the subscription when
-/// the sub-agent emits `ThreadEvent::Error`.
+/// the sub-agent emits `ThreadEvent::Error`; `metrics` accumulates the child's
+/// tool-use / token / activity telemetry so `run_streaming` can stamp the final
+/// snapshot into the result envelope.
 struct SubagentSetup {
     child: gpui::Entity<Thread>,
     done_rx: async_channel::Receiver<()>,
     child_errored: Arc<AtomicBool>,
+    metrics: Arc<std::sync::Mutex<ProgressAccumulator>>,
     sub: gpui::Subscription,
+}
+
+/// Transient accumulator for one sub-agent's UI telemetry. `seen_tools` dedupes
+/// the child's `ToolCall` status-transition events so `tool_uses` counts distinct
+/// tool invocations, not status changes. `metrics` is the persistable snapshot.
+struct ProgressAccumulator {
+    metrics: SubagentMetrics,
+    seen_tools: std::collections::HashSet<String>,
 }
 
 /// Parse input, resolve the definition/model, construct the child `Thread`,
@@ -338,6 +370,13 @@ fn setup_child(
     // crashed is a failure, not a silent success).
     let (done_tx, done_rx) = async_channel::bounded(1);
     let child_errored = Arc::new(AtomicBool::new(false));
+    let metrics = Arc::new(std::sync::Mutex::new(ProgressAccumulator {
+        metrics: SubagentMetrics {
+            status: Some(ToolCallStatus::Running),
+            ..Default::default()
+        },
+        seen_tools: std::collections::HashSet::new(),
+    }));
     let sink_cb = sink.clone();
     let parent_cb = parent.clone();
     let ptu_cb = ptu.to_string();
@@ -347,6 +386,7 @@ fn setup_child(
     let subagent_type_cb = def.name.clone();
     let child_weak = child.downgrade();
     let errored_cb = child_errored.clone();
+    let metrics_cb = metrics.clone();
     let sub = cx.subscribe(
         &child,
         move |_child, ev: &ThreadEvent, cx: &mut App| match ev {
@@ -358,7 +398,63 @@ fn setup_child(
                 sink_cb.try_emit(&e.to_string());
                 // A sub-agent error is terminal: unblock the parent so it can
                 // collect whatever partial output was produced.
+                forward_progress(
+                    &parent_cb,
+                    &ptu_cb,
+                    &subagent_type_cb,
+                    &metrics_cb,
+                    Some(ToolCallStatus::Error),
+                    cx,
+                );
                 let _ = done_tx.try_send(());
+            }
+            ThreadEvent::ToolCall {
+                id: child_id,
+                name,
+                title,
+                status,
+                input,
+            } => {
+                // The child's `ToolCall` title is already the human-readable
+                // action (computed via `tool_title` on the child side); fall
+                // back to recomputing it from the structured input only if the
+                // child left it empty (historical rebuild path).
+                let activity = if !title.is_empty() {
+                    title.clone()
+                } else {
+                    thread::tool_title(name, input.as_ref().unwrap_or(&serde_json::Value::Null))
+                };
+                let is_new = {
+                    let mut acc = metrics_cb.lock().expect("subagent metrics poisoned");
+                    let fresh = acc.seen_tools.insert(child_id.clone());
+                    if fresh {
+                        acc.metrics.record_tool_call(activity.clone());
+                    }
+                    fresh
+                };
+                let _ = is_new; // status forwarding happens regardless of novelty
+                forward_progress(
+                    &parent_cb,
+                    &ptu_cb,
+                    &subagent_type_cb,
+                    &metrics_cb,
+                    Some(*status),
+                    cx,
+                );
+            }
+            ThreadEvent::TokenUsageUpdated(usage) => {
+                {
+                    let mut acc = metrics_cb.lock().expect("subagent metrics poisoned");
+                    acc.metrics.token_usage = *usage;
+                }
+                forward_progress(
+                    &parent_cb,
+                    &ptu_cb,
+                    &subagent_type_cb,
+                    &metrics_cb,
+                    Some(ToolCallStatus::Running),
+                    cx,
+                );
             }
             ThreadEvent::ToolCallAuthorization {
                 id: child_id,
@@ -393,6 +489,14 @@ fn setup_child(
             ThreadEvent::Stop(StopReason::EndTurn)
             | ThreadEvent::Stop(StopReason::MaxTokens)
             | ThreadEvent::Stop(StopReason::Refusal) => {
+                forward_progress(
+                    &parent_cb,
+                    &ptu_cb,
+                    &subagent_type_cb,
+                    &metrics_cb,
+                    Some(ToolCallStatus::Success),
+                    cx,
+                );
                 let _ = done_tx.try_send(());
             }
             ThreadEvent::Stop(StopReason::ToolUse) => {}
@@ -409,8 +513,43 @@ fn setup_child(
         child,
         done_rx,
         child_errored,
+        metrics,
         sub,
     })
+}
+
+/// Snapshot the accumulator, set the lifecycle `status` (when given), and
+/// forward a `SubagentProgress` event to the parent thread's UI subscribers.
+/// Holding the metrics lock only long enough to clone + stamp the status keeps
+/// the critical section off the gpui notify path.
+fn forward_progress(
+    parent: &WeakEntity<Thread>,
+    ptu: &str,
+    subagent_type: &str,
+    metrics: &Arc<std::sync::Mutex<ProgressAccumulator>>,
+    status: Option<ToolCallStatus>,
+    cx: &mut App,
+) {
+    let Some(p) = parent.upgrade() else {
+        return;
+    };
+    let snapshot = {
+        let mut acc = metrics.lock().expect("subagent metrics poisoned");
+        if let Some(s) = status {
+            acc.metrics.status = Some(s);
+        }
+        acc.metrics.clone()
+    };
+    p.update(cx, |_t, cx| {
+        cx.emit(ThreadEvent::SubagentProgress {
+            id: ptu.to_string(),
+            subagent_type: subagent_type.to_string(),
+            tool_uses: snapshot.tool_uses,
+            token_usage: snapshot.token_usage,
+            latest_activity: snapshot.latest_activity,
+            status: snapshot.status.unwrap_or(ToolCallStatus::Running),
+        });
+    });
 }
 
 /// Resolve the sub-agent's model: the definition's `model` id if set (resolved
@@ -468,13 +607,48 @@ fn last_assistant_text(msgs: &[Message]) -> String {
 /// envelope is the canonical ToolResult content (persisted to DB, used by the UI
 /// to rebuild `sub_messages`); `build_completion_request` strips it to `final`
 /// before the request reaches the model, so the sub-conversation never leaks
-/// into the parent's context.
+/// into the parent's context. `metrics` carries the aggregated sub-agent
+/// telemetry (tool-use count, token usage, latest activity, terminal status) so
+/// the agent task card's header counters survive a reload too — absent on older
+/// envelopes, which the UI treats as empty metrics.
 #[derive(Deserialize)]
 pub(crate) struct AgentToolResultPayload {
     #[serde(rename = "final")]
     final_text: String,
     #[serde(default)]
     messages: Vec<Message>,
+    #[serde(default)]
+    metrics: Option<SubagentMetrics>,
+}
+
+/// Aggregated telemetry for one `agent` tool invocation, surfaced to the UI
+/// while the sub-agent runs (via `ThreadEvent::SubagentProgress`) and persisted
+/// in the result envelope so the header counters survive a reload. Never enters
+/// the model's message history — the parent model still only sees the `final`
+/// text. `status` is `None` until the sub-agent's lifecycle pins it.
+///
+/// Modeled on the `AgentProgress` shape (toolCount / tokens / recentTools /
+/// currentTool) used by the pi/oh-my-pi coding-agent, kept lean: the
+/// activity-summary text the cockpit renders is derived from the same shared
+/// summarizer the `ThinkingContainer` uses, so only the aggregate counts + a
+/// single latest-activity line need to travel here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubagentMetrics {
+    pub tool_uses: u32,
+    pub token_usage: TokenUsage,
+    pub latest_activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ToolCallStatus>,
+}
+
+impl SubagentMetrics {
+    /// A new child tool call started. `tool_uses` counts distinct child tool ids,
+    /// not status-change events (one tool emits several `ToolCall` events as its
+    /// status transitions), so the caller must gate on id novelty.
+    fn record_tool_call(&mut self, title: String) {
+        self.tool_uses = self.tool_uses.saturating_add(1);
+        self.latest_activity = Some(title);
+    }
 }
 
 /// The model-facing final text from an `agent` tool result. Parses the JSON
@@ -494,6 +668,15 @@ pub fn agent_sub_messages(content: &str) -> Option<Vec<Message>> {
     serde_json::from_str::<AgentToolResultPayload>(content)
         .ok()
         .map(|p| p.messages)
+}
+
+/// The persisted sub-agent telemetry, when the content is the JSON envelope.
+/// `None` on legacy envelopes written before `metrics` existed — the UI renders
+/// empty counters in that case.
+pub fn agent_metrics(content: &str) -> Option<SubagentMetrics> {
+    serde_json::from_str::<AgentToolResultPayload>(content)
+        .ok()
+        .and_then(|p| p.metrics)
 }
 
 /// Whether `name` passes the definition's `tools`/`disallowed_tools` filters.
@@ -961,5 +1144,64 @@ mod tests {
             last_assistant_text(&msgs),
             "sub-agent ended without producing a final message"
         );
+    }
+
+    #[test]
+    fn metrics_round_trip_preserves_counts() {
+        let m = SubagentMetrics {
+            tool_uses: 28,
+            token_usage: TokenUsage {
+                input_tokens: 12000,
+                output_tokens: 5300,
+                ..Default::default()
+            },
+            latest_activity: Some("read_file src/lib.rs".to_string()),
+            status: Some(ToolCallStatus::Success),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: SubagentMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tool_uses, 28);
+        assert_eq!(back.token_usage.input_tokens, 12000);
+        assert_eq!(back.token_usage.output_tokens, 5300);
+        assert_eq!(
+            back.latest_activity.as_deref(),
+            Some("read_file src/lib.rs")
+        );
+        assert_eq!(back.status, Some(ToolCallStatus::Success));
+    }
+
+    #[test]
+    fn envelope_carries_metrics_for_new_envelopes() {
+        let envelope = serde_json::json!({
+            "final": "done",
+            "messages": <Vec<Message>>::new(),
+            "metrics": SubagentMetrics {
+                tool_uses: 3,
+                token_usage: TokenUsage { input_tokens: 100, ..Default::default() },
+                latest_activity: Some("grep foo".to_string()),
+                status: Some(ToolCallStatus::Success),
+            }
+        })
+        .to_string();
+        let m = agent_metrics(&envelope).expect("metrics should parse");
+        assert_eq!(m.tool_uses, 3);
+        assert_eq!(m.token_usage.input_tokens, 100);
+        assert_eq!(m.latest_activity.as_deref(), Some("grep foo"));
+        assert_eq!(m.status, Some(ToolCallStatus::Success));
+        // The model-facing final text still parses from the same envelope.
+        assert_eq!(agent_final_text(&envelope), "done");
+    }
+
+    #[test]
+    fn envelope_without_metrics_parses_as_none() {
+        // Legacy envelopes written before telemetry existed have no `metrics`
+        // key. The UI treats that as empty counters, never a parse failure.
+        let legacy = serde_json::json!({
+            "final": "old",
+            "messages": <Vec<Message>>::new()
+        })
+        .to_string();
+        assert!(agent_metrics(&legacy).is_none());
+        assert_eq!(agent_final_text(&legacy), "old");
     }
 }

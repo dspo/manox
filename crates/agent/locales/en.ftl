@@ -77,6 +77,15 @@ status-cancelled = Cancelled
 
 ### views/message.rs — Thinking status row
 thinking-live = Thinking for { $count }s
+agent-metrics-tools = { $count ->
+    [one] {$count} tool
+   *[other] {$count} tools
+}
+agent-metrics-tokens = {$count} tokens
+agent-metrics-running-agents = { $count ->
+    [one] Running {$count} Explore agent…
+   *[other] Running {$count} Explore agents…
+}
 thinking-done = Thought for { $count }s
 thinking-done-label = Thought
 thinking-tool-result = tool result
@@ -95,6 +104,14 @@ thinking-editing = { $count ->
 thinking-running = { $count ->
     [one] running {$count} shell command
    *[other] running {$count} shell commands
+}
+thinking-fetching = { $count ->
+    [one] fetching {$count} page
+   *[other] fetching {$count} pages
+}
+thinking-browsing = { $count ->
+    [one] browsing {$count} action
+   *[other] browsing {$count} actions
 }
 thinking-searching = { $count ->
     [one] searching {$count} pattern

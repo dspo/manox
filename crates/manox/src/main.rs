@@ -172,9 +172,15 @@ fn main() {
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-shift-b", agent_ui::CloseBrowserTab, None),
             #[cfg(not(target_os = "macos"))]
-            gpui::KeyBinding::new("ctrl-b", agent_ui::OpenBrowserTab, None),
+            gpui::KeyBinding::new("ctrl-alt-b", agent_ui::OpenBrowserTab, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-b", agent_ui::CloseBrowserTab, None),
+            // Park the active running thread into the background and open a
+            // fresh empty thread in the same project — the explicit "background
+            // this task" gesture. No-op when idle. cmd-b stays the browser key
+            // on macOS, so ctrl-b is free there; on other platforms the browser
+            // tab moved to ctrl-alt-b to free ctrl-b for this action.
+            gpui::KeyBinding::new("ctrl-b", agent_ui::BackgroundCurrentThread, None),
             // Pop the last follow-up parked above the composer while a turn is
             // running (mirrors the per-item Remove affordance for the tail).
             #[cfg(target_os = "macos")]

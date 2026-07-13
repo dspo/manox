@@ -22,6 +22,7 @@ pub mod read_file;
 pub mod self_info;
 pub mod skill;
 pub mod web_explore;
+pub mod web_fetch;
 pub mod worktree;
 pub mod write_file;
 
@@ -243,6 +244,11 @@ pub(crate) fn base_tools_with_policy(
         }),
         Arc::new(ask_user::AskUserQuestionTool),
         Arc::new(skill::SkillTool),
+        // Lightweight HTTP GET for public docs. Read-only and shared with
+        // sub-agents so a read-only `explore`/`plan` sub-agent can pull docs
+        // without the full browser. The JS/auth-gated counterpart stays in the
+        // main-thread-only `web_explore_*` set.
+        Arc::new(web_fetch::WebFetchTool) as AnyAgentTool,
     ];
 
     // LSP code-intel is a read-only axis shared with sub-agents (unlike MCP,
@@ -348,9 +354,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_tools_has_nine_tools() {
+    fn base_tools_has_ten_tools() {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
@@ -361,6 +367,7 @@ mod tests {
         assert!(names.contains(&"glob"));
         assert!(names.contains(&"AskUserQuestion"));
         assert!(names.contains(&"skill"));
+        assert!(names.contains(&"web_fetch"));
         // The sub-agent tool is registered by `main_registry`, not `base_tools`.
         assert!(!names.contains(&"agent"));
     }
@@ -494,6 +501,7 @@ mod tests {
             "glob",
             "AskUserQuestion",
             "skill",
+            "web_fetch",
         ] {
             assert!(by_name(n).is_read_only(), "{n} should be read-only");
         }

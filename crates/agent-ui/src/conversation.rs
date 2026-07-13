@@ -14,6 +14,7 @@ use std::time::Instant;
 use agent::db::{UiNoteKind, UiNoteRecord};
 use agent::language_model::{MessageContent, Role, StopReason};
 use agent::thread::ApprovalMode;
+use agent::tools::agent::SubagentMetrics;
 use agent::{Message, ThreadEvent, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, WeakEntity};
 
@@ -287,6 +288,11 @@ pub struct AgentTaskItem {
     pub sub_messages: Vec<Message>,
     pub final_text: String,
     pub is_error: bool,
+    /// Aggregated sub-agent telemetry forwarded while the child ran
+    /// (`SubagentProgress`) and persisted in the result envelope. `None` until
+    /// the first progress event arrives and on legacy envelopes (the header
+    /// renders empty counters then). Never seen by the parent model.
+    pub metrics: Option<SubagentMetrics>,
 }
 
 /// What `apply` did to the item list, so the caller can keep the `ListState`
@@ -659,6 +665,7 @@ impl ConversationState {
                                     sub_messages: Vec::new(),
                                     final_text: String::new(),
                                     is_error: false,
+                                    metrics: None,
                                 }),
                                 role.to_string(),
                                 ix,
@@ -815,10 +822,12 @@ impl ConversationState {
                     self.items[ix].update(cx, |item, cx| {
                         if let ConvItem::AgentTask(t) = item.kind_mut() {
                             // The live event carries the JSON envelope; extract the
-                            // final text for the collapsed view. `sub_messages` is
+                            // final text for the collapsed view and the aggregated
+                            // telemetry for the header counters. `sub_messages` is
                             // filled separately from the in-memory snapshot by the
                             // workspace, so don't touch it here.
                             t.final_text = agent::tools::agent::agent_final_text(output);
+                            t.metrics = agent::tools::agent::agent_metrics(output);
                             let next_status = if !*is_error && t.status == ToolCallStatus::Continued
                             {
                                 ToolCallStatus::Continued
@@ -1048,6 +1057,36 @@ impl ConversationState {
                     )
                 }));
                 ApplyOutcome::Appended
+            }
+            ThreadEvent::SubagentProgress {
+                id,
+                subagent_type: _,
+                tool_uses,
+                token_usage,
+                latest_activity,
+                status,
+            } => {
+                // Forward the aggregated child telemetry onto the matching agent
+                // task card so the header counters stay live while the sub-agent
+                // runs. The `ToolCall` event for the `agent` tool already
+                // created the item; a progress event that wins the race before
+                // that lands is a no-op (the terminal `ToolResult` envelope
+                // carries the final metrics for the rebuild path anyway).
+                if let Some(ix) = self.find_agent_task(id, cx) {
+                    self.items[ix].update(cx, |item, cx| {
+                        if let ConvItem::AgentTask(t) = item.kind_mut() {
+                            let m = t.metrics.get_or_insert_with(SubagentMetrics::default);
+                            m.tool_uses = *tool_uses;
+                            m.token_usage = *token_usage;
+                            m.latest_activity = latest_activity.clone();
+                            m.status = Some(*status);
+                        }
+                        cx.notify();
+                    });
+                    ApplyOutcome::Remeasure(ix)
+                } else {
+                    ApplyOutcome::None
+                }
             }
             ThreadEvent::BrowserNotification { .. } | ThreadEvent::InboundAuthorization { .. } => {
                 // Browser-axis signals are routed for the UI chrome (overlay,
@@ -1525,6 +1564,63 @@ mod tests {
         assert_eq!(task.final_text, "found 3 files");
         assert_eq!(task.sub_messages.len(), 2);
         assert_eq!(task.sub_messages[1].content.len(), 1);
+        // An envelope without `metrics` (the one above) restores `None` so the
+        // header renders empty counters rather than a phantom zero.
+        assert!(task.metrics.is_none());
+    }
+
+    /// A reloaded `agent` tool result carrying telemetry in its envelope restores
+    /// the header counters (tool-uses, token total, latest activity, status).
+    #[test]
+    fn rebuild_restores_agent_metrics_from_envelope() {
+        let metrics = SubagentMetrics {
+            tool_uses: 28,
+            token_usage: TokenUsage {
+                input_tokens: 12000,
+                output_tokens: 5300,
+                ..Default::default()
+            },
+            latest_activity: Some("read_file src/lib.rs".to_string()),
+            status: Some(ToolCallStatus::Success),
+        };
+        let envelope = serde_json::json!({
+            "final": "done",
+            "messages": <Vec<Message>>::new(),
+            "metrics": metrics,
+        })
+        .to_string();
+        let messages = vec![
+            Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
+                id: "tu_agent".to_string(),
+                name: Arc::from("agent"),
+                raw_input: String::new(),
+                input: serde_json::json!({"subagent_type": "explore", "prompt": "x"}),
+                is_input_complete: true,
+                thought_signature: None,
+            })]),
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tu_agent".to_string(),
+                tool_name: Arc::from("agent"),
+                is_error: false,
+                content: envelope,
+            })]),
+        ];
+        let items = build_items(&messages, &HashMap::new(), false);
+        let task = items
+            .iter()
+            .find_map(|i| match i {
+                ConvItem::AgentTask(t) if t.id == "tu_agent" => Some(t),
+                _ => None,
+            })
+            .expect("agent task item present");
+        let m = task
+            .metrics
+            .as_ref()
+            .expect("metrics restored from envelope");
+        assert_eq!(m.tool_uses, 28);
+        assert_eq!(m.token_usage.total_tokens(), 17300);
+        assert_eq!(m.latest_activity.as_deref(), Some("read_file src/lib.rs"));
+        assert_eq!(m.status, Some(ToolCallStatus::Success));
     }
 
     /// A legacy `agent` tool result (plain text, no JSON envelope) must still

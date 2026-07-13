@@ -234,7 +234,7 @@ async fn external_session_cascade_resolves_models_live(cx: &mut gpui::TestAppCon
         return;
     }
     let guard = setup(cx);
-    let claude_models = cx.update(|cx| {
+    let claude_models = cx.update(|_cx| {
         registry::global()
             .models()
             .iter()

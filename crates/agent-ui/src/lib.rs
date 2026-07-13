@@ -43,6 +43,7 @@ gpui::actions!(
         CompletionConfirm,
         CompletionDismiss,
         UndoLastQueued,
-        ToggleCockpitTasks
+        ToggleCockpitTasks,
+        BackgroundCurrentThread
     ]
 );

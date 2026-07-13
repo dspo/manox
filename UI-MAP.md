@@ -342,7 +342,7 @@ Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see
 
 #### AgentTaskCard
 
-Expandable sub-agent card: title + status + collapsed tail / expanded nested conversation.
+Expandable sub-agent card: title + status + collapsed tail / expanded nested conversation. Header carries a metrics chip — tool-use count + token count + latest activity — populated from the agent tool result envelope's optional `metrics` field (live during the run via `SubagentProgress`, restamped on terminal `ToolResult`, restored on reload).
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -602,6 +602,7 @@ Contents, top to bottom:
 
 - **Header**: bold title (i18n `context-rail-title`) + a [ContextRailCollapseBtn](#contextrailcollapsebtn) ghost button.
 - **Status block** (`cockpit_status_block`): a two-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2. Elapsed refreshes per-second via the thinking ticker.
+- **Active agents row** (rendered only when `active_agents` is non-empty): a `Bot` icon + i18n `agent-metrics-running-agents` plural ("Running N Explore agents…"). Driven by in-flight subagent tool_use ids — `record_subagent_progress` inserts on non-terminal status, removes on terminal (Success/Error/Denied/Cancelled); cleared on thread switch. Vanishes the moment the last child reports a terminal status.
 - **Context budget row**: `context_budget_pct` reads `Thread::cumulative_token_usage` (cross-turn cumulative, always available — never `None`) against `MIN_COMPACTION_CONTEXT_WINDOW` and the `cockpit_auto_compact_threshold` cached on the rail. Always renders a percentage bar + explicit `current / cap` token counts (e.g. `396k / 900k`); warning-colored within 10% of the trigger. No "waiting for usage" state — the row is hidden entirely only when no model is configured.
 - **Milestone section** (collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): plan steps parsed from the approved `exit_plan_mode` plan. All `Pending` outside a turn; the first is promoted to `InProgress` while the thread runs, demoted back to `Pending` on terminal stop.
 - **Changes row**: [ContextRailChangesRow](#contextrailchangesrow).

@@ -64,6 +64,15 @@ status-cancelled = 已取消
 
 ### views/message.rs — Thinking 状态行
 thinking-live = 思考 { $count } 秒
+agent-metrics-tools = { $count ->
+    [one] {$count} 个工具
+   *[other] {$count} 个工具
+}
+agent-metrics-tokens = {$count} tokens
+agent-metrics-running-agents = { $count ->
+    [one] 运行 {$count} 个 Explore agent…
+   *[other] 运行 {$count} 个 Explore agent…
+}
 thinking-done = 思考了 { $count } 秒
 thinking-done-label = 已思考
 thinking-tool-result = 工具结果
@@ -71,6 +80,8 @@ thinking-reading = 读取 { $count } 个文件
 thinking-writing = 写入 { $count } 个文件
 thinking-editing = 编辑 { $count } 个文件
 thinking-running = 运行 { $count } 条命令
+thinking-fetching = 抓取 { $count } 个页面
+thinking-browsing = 浏览器 { $count } 个动作
 thinking-searching = 搜索 { $count } 个模式
 thinking-globbing = 匹配 { $count } 个 glob
 thinking-listing = 列出 { $count } 个目录

@@ -867,6 +867,14 @@ impl Workspace {
                     // Streaming; text/thinking deltas mark Thinking/Streaming.
                     this.context_rail
                         .update(cx, |r, cx| r.update_cockpit_phase(ev, cx));
+                    // Sub-agent telemetry: the cockpit's "Running N Explore
+                    // agents…" row tracks in-flight child ids. The AgentTask
+                    // card's per-agent metrics are fed separately in the
+                    // conversation apply below.
+                    if let agent::ThreadEvent::SubagentProgress { id, status, .. } = ev {
+                        this.context_rail
+                            .update(cx, |r, cx| r.record_subagent_progress(id, *status, cx));
+                    }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
@@ -1882,6 +1890,21 @@ impl Workspace {
             new.update(cx, |t, cx| t.set_project(dir, cx));
         }
         self.attach_thread(new, window, cx);
+    }
+
+    /// Park the active thread into the background (preserving its run + event
+    /// subscriptions) and open a fresh empty thread in the same project — the
+    /// explicit "background this task, switch to a new one" gesture, bound to
+    /// `ctrl-b`. No-op when the active thread is idle so the shortcut can't
+    /// spam empty threads. `attach_thread` does the actual parking: a running
+    /// thread is moved into `background_threads` with a terminal-`Stop`/`Error`
+    /// subscription that flips its sidebar row to idle + unread when it lands.
+    fn background_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.thread.read(cx).is_running() {
+            return;
+        }
+        let project = self.thread.read(cx).project().cloned();
+        self.start_new_thread(project, window, cx);
     }
 
     fn open_thread(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -5634,6 +5657,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CloseBrowserTab, _window, cx| {
                 this.close_active_browser_tab(cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::BackgroundCurrentThread, window, cx| {
+                    this.background_current_thread(window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &crate::UndoLastQueued, _window, cx| {
                 this.undo_last_queued(cx);
             }))

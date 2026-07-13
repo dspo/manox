@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::thread::ApprovalMode;
-use agent::tools::agent::{agent_final_text, agent_sub_messages};
+use agent::tools::agent::{agent_final_text, agent_metrics, agent_sub_messages};
 use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
@@ -1289,6 +1289,8 @@ fn thinking_summary(entries: &[ToolCallItem]) -> String {
     let mut globs: BTreeSet<String> = BTreeSet::new();
     let mut lists: BTreeSet<String> = BTreeSet::new();
     let mut running = 0u32;
+    let mut fetching = 0u32;
+    let mut browsing = 0u32;
     let mut other = 0u32;
     for e in entries {
         match e.name.as_str() {
@@ -1360,6 +1362,26 @@ fn thinking_summary(entries: &[ToolCallItem]) -> String {
                     .to_string();
                 globs.insert(p);
             }
+            "web_fetch"
+            | "web_explore_read_text"
+            | "web_explore_read_dom"
+            | "web_explore_screenshot" => {
+                // Read-side network activity: fetching a doc URL or reading a
+                // browser tab's content. Counted by invocation.
+                fetching += 1;
+            }
+            "web_explore_open"
+            | "web_explore_navigate"
+            | "web_explore_click"
+            | "web_explore_type"
+            | "web_explore_scroll"
+            | "web_explore_yield"
+            | "web_explore_read_wait"
+            | "web_explore_write"
+            | "web_explore_close" => {
+                // Driving the browser tab itself — navigation and interaction.
+                browsing += 1;
+            }
             _ => {
                 other += 1;
             }
@@ -1378,6 +1400,8 @@ fn thinking_summary(entries: &[ToolCallItem]) -> String {
     push(globs.len() as u32, "thinking-globbing", &mut parts);
     push(lists.len() as u32, "thinking-listing", &mut parts);
     push(running, "thinking-running", &mut parts);
+    push(fetching, "thinking-fetching", &mut parts);
+    push(browsing, "thinking-browsing", &mut parts);
     push(other, "thinking-other", &mut parts);
     if parts.is_empty() {
         String::new()
@@ -2077,6 +2101,44 @@ fn render_tool_output(
 /// messages into a nested conversation and renders each item recursively.
 /// `tool_ctx` is forwarded to recursive `render_item` calls so any nested
 /// tool-call cards keep their own collapse state.
+/// Compact the sub-agent's aggregate telemetry into a header chip:
+/// `{n} tools · {tokens} tokens · {latest activity}`. `None` until the first
+/// `SubagentProgress` event arrives and on legacy envelopes, so the header
+/// stays clean for a freshly-spawned or pre-telemetry task. The activity line
+/// is the same `tool_title` text the cockpit's current-activity row uses.
+fn agent_metrics_chip(item: &AgentTaskItem, theme: &Theme) -> Option<gpui::AnyElement> {
+    let m = item.metrics.as_ref()?;
+    let tool_label = i18n::t_count("agent-metrics-tools", m.tool_uses as i64);
+    let token_total = m.token_usage.total_tokens();
+    let token_label = i18n::t_str(
+        "agent-metrics-tokens",
+        &[("count", format_tokens(token_total).as_str())],
+    );
+    let core = format!("{tool_label} · {token_label}");
+    let full = match m.latest_activity.as_deref() {
+        Some(a) if !a.is_empty() => format!("{core} · {}", truncate(a, 40)),
+        _ => core,
+    };
+    Some(
+        gpui::div()
+            .text_xs()
+            .font_family(theme.mono_font_family.clone())
+            .text_color(theme.muted_foreground)
+            .child(full)
+            .into_any_element(),
+    )
+}
+
+/// Render a token count with a `k` suffix above 999 (one decimal), matching the
+/// density of Claude Code's activity line. 17300 → "17.3k", 512 → "512".
+fn format_tokens(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 pub fn render_agent_task(
     item: &AgentTaskItem,
     ix: usize,
@@ -2108,6 +2170,8 @@ pub fn render_agent_task(
     } else {
         item.final_text.clone()
     };
+
+    let metrics_chip = agent_metrics_chip(item, theme);
 
     let mut card = v_flex()
         .group(format!("agent-{ix}"))
@@ -2156,6 +2220,7 @@ pub fn render_agent_task(
                     format!("agent-{ix}"),
                     copy_text,
                 ))
+                .children(metrics_chip)
                 .child(
                     gpui::div()
                         .text_xs()
@@ -2399,6 +2464,7 @@ pub fn build_items(
                                     sub_messages: Vec::new(),
                                     final_text: String::new(),
                                     is_error: false,
+                                    metrics: None,
                                 }));
                             } else if tu.name.as_ref() == "AskUserQuestion" {
                                 // An inline clarify card: stays a top-level
@@ -2593,6 +2659,7 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
             // sub-conversation from the persisted JSON envelope.
             t.final_text = agent_final_text(&tr.content);
             t.sub_messages = agent_sub_messages(&tr.content).unwrap_or_default();
+            t.metrics = agent_metrics(&tr.content);
             t.is_error = tr.is_error;
             t.status = status;
         }
