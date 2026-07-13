@@ -70,27 +70,29 @@ impl LanguageModel for ReplayModel {
     }
 }
 
-/// Releases the test `ThreadStore` entity on drop so gpui's leaked-handle
-/// check at teardown passes. Hold alive for the test's duration.
+/// Releases the test `ThreadStore` + `TerminalStore` entities on drop so gpui's
+/// leaked-handle check at teardown passes. Hold alive for the test's duration.
 pub(crate) struct StoreGuard;
 impl Drop for StoreGuard {
     fn drop(&mut self) {
         agent::thread_store::drop_for_test();
+        terminal::store::drop_for_test();
     }
 }
 
 /// Initialize the full agent stack (runtime, i18n, provider registry, agent
-/// defs) and override the `ThreadStore` with an in-memory db. Reads the real
-/// provider config at `~/.config/cx/cx.providers.config.yaml`, so tests that
-/// need a model require that file present — they are `#[ignore]`-gated.
+/// defs) and override the `ThreadStore` + `TerminalStore` with a shared
+/// in-memory db. Reads the real provider config at
+/// `~/.config/cx/cx.providers.config.yaml`, so tests that need a model require
+/// that file present — they are `#[ignore]`-gated.
 pub(crate) fn setup(cx: &mut TestAppContext) -> StoreGuard {
     cx.update(gpui_component::init);
     cx.update(agent::init);
-    cx.update(terminal::init);
     cx.update(terminal_ui::init);
     let db =
         Arc::new(ThreadsDatabase::open(std::path::Path::new(":memory:")).expect("open mem db"));
-    cx.update(|cx| agent::thread_store::init_for_test(db, cx));
+    cx.update(|cx| agent::thread_store::init_for_test(db.clone(), cx));
+    cx.update(|cx| terminal::store::init_for_test(db, cx));
     StoreGuard
 }
 
