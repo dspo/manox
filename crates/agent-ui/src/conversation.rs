@@ -169,10 +169,29 @@ pub struct ToolCallItem {
     pub user_toggled: bool,
 }
 
+/// An entry within a `ThinkingContainer`'s activity segment. A segment mixes
+/// reasoning rounds (model thinking text) and tool calls into one unified tree
+/// so the collapsed header can summarize the whole turn's activity.
+#[derive(Debug, Clone)]
+pub enum ActivityEntry {
+    /// One reasoning round: a contiguous run of `AgentThinking` deltas. A new
+    /// round starts when thinking resumes after being interrupted by a tool
+    /// call, assistant text, or terminal stop. Auto-collapses when streaming
+    /// ends unless the user manually expanded it.
+    Reasoning {
+        text: String,
+        streaming: bool,
+        collapsed: bool,
+        user_toggled: bool,
+    },
+    /// One tool invocation (reuses `ToolCallItem` for status/output/collapse).
+    Tool(ToolCallItem),
+}
+
 /// One contiguous activity segment within a user turn, rendered as a Claude
-/// Code–style Thinking status line. Entries are `ToolCallItem`s (reused for
-/// their per-tool status/output/collapse state); the container owns the
-/// segment-level summary, collapse, and elapsed-time state.
+/// Code–style Thinking status line. Entries are `ActivityEntry` (reasoning
+/// rounds + tool calls); the container owns the segment-level summary,
+/// collapse, and elapsed-time state.
 ///
 /// A segment spans the full tool-use loop of a user turn: a `StopReason::ToolUse`
 /// (the model paused to execute a tool) does NOT close it — `accepting_entries`
@@ -181,8 +200,9 @@ pub struct ToolCallItem {
 /// flips `accepting_entries` off and freezes the elapsed time.
 #[derive(Debug, Clone)]
 pub struct ThinkingContainer {
-    /// The segment's tool calls in arrival order. Each is one `⎿` entry.
-    pub entries: Vec<ToolCallItem>,
+    /// The segment's activity entries in arrival order: reasoning rounds and
+    /// tool calls interleaved as they occurred during the turn.
+    pub entries: Vec<ActivityEntry>,
     /// True while the turn is still in progress — new `ToolCall` events fold
     /// into this segment rather than opening a fresh one. `StopReason::ToolUse`
     /// keeps it true; a terminal `Stop` flips it off. Independent of whether
@@ -235,12 +255,15 @@ impl ThinkingContainer {
     /// value untouched.
     pub fn recompute_streaming(&mut self) {
         let was_streaming = self.streaming;
-        let any_entry_live = self.entries.iter().any(|e| {
-            e.streaming
-                || matches!(
-                    e.status,
-                    ToolCallStatus::Running | ToolCallStatus::PendingApproval
-                )
+        let any_entry_live = self.entries.iter().any(|e| match e {
+            ActivityEntry::Reasoning { streaming, .. } => *streaming,
+            ActivityEntry::Tool(t) => {
+                t.streaming
+                    || matches!(
+                        t.status,
+                        ToolCallStatus::Running | ToolCallStatus::PendingApproval
+                    )
+            }
         });
         self.streaming = self.accepting_entries || any_entry_live;
         if was_streaming && !self.streaming && self.frozen_secs.is_none() {
@@ -264,6 +287,37 @@ impl ThinkingContainer {
     /// entry's summary is the "what's happening right now" line).
     pub fn has_entries(&self) -> bool {
         !self.entries.is_empty()
+    }
+
+    /// Find a tool entry by id. Returns its index within `entries`.
+    pub fn find_tool_entry_index(&self, id: &str) -> Option<usize> {
+        self.entries.iter().position(|e| match e {
+            ActivityEntry::Tool(t) => t.id == id,
+            _ => false,
+        })
+    }
+
+    /// Get a mutable reference to a tool entry by id.
+    pub fn get_tool_entry_mut(&mut self, id: &str) -> Option<&mut ToolCallItem> {
+        self.entries.iter_mut().find_map(|e| match e {
+            ActivityEntry::Tool(t) if t.id == id => Some(t),
+            _ => None,
+        })
+    }
+
+    /// Get a reference to the last reasoning entry if it is still streaming.
+    /// Used by `apply()` to decide whether to append deltas to the existing
+    /// reasoning round or start a new one.
+    pub fn last_streaming_reasoning_index(&self) -> Option<usize> {
+        self.entries.iter().rposition(|e| {
+            matches!(
+                e,
+                ActivityEntry::Reasoning {
+                    streaming: true,
+                    ..
+                }
+            )
+        })
     }
 }
 
@@ -396,14 +450,14 @@ impl ConversationState {
             .position(|e| matches!(e.read(cx).kind(), ConvItem::AgentTask(t) if t.id == id))
     }
 
-    /// Locate a `Thinking` container's entry by tool id. Returns
+    /// Locate a `Thinking` container's tool entry by id. Returns
     /// `(container_index, entry_index)` so the caller can update the entry in
     /// place. Scans every container in arrival order so an id always resolves
     /// to its owning batch regardless of which trailing container is active.
     pub fn find_thinking_entry(&self, id: &str, cx: &App) -> Option<(usize, usize)> {
         for (cix, e) in self.items.iter().enumerate() {
             if let ConvItem::Thinking(t) = e.read(cx).kind()
-                && let Some(eix) = t.entries.iter().position(|en| en.id == id)
+                && let Some(eix) = t.find_tool_entry_index(id)
             {
                 return Some((cix, eix));
             }
@@ -587,53 +641,52 @@ impl ConversationState {
                 }
             }
             ThreadEvent::AgentThinking(delta) => {
-                let needs_new = match self.items.last() {
-                    Some(e) => !matches!(
-                        e.read(cx).kind(),
-                        ConvItem::Reasoning {
-                            streaming: true,
-                            ..
-                        }
-                    ),
-                    None => true,
+                // Fold reasoning into the active activity segment. A contiguous
+                // run of deltas appends to the last streaming reasoning entry;
+                // a gap (interrupted by a tool call or new turn) starts a
+                // fresh round. If no segment exists yet, open one.
+                let turn_started_at = self.turn_started_at;
+                let cix = match self.find_active_activity_segment(cx) {
+                    Some(i) => i,
+                    None => {
+                        let i = self.items.len();
+                        self.items.push(cx.new(|_| {
+                            let mut container = ThinkingContainer::new();
+                            container.started_at = turn_started_at;
+                            MessageItem::new(
+                                ConvItem::Thinking(container),
+                                role.to_string(),
+                                i,
+                                weak.clone(),
+                            )
+                        }));
+                        i
+                    }
                 };
-                if needs_new {
-                    let id = self.items.len();
-                    self.items.push(cx.new(|cx| {
-                        let mut item = MessageItem::new(
-                            ConvItem::Reasoning {
-                                text: delta.clone(),
+                let delta = delta.clone();
+                self.items[cix].update(cx, |item, cx| {
+                    if let ConvItem::Thinking(t) = item.kind_mut() {
+                        if let Some(eix) = t.last_streaming_reasoning_index() {
+                            // Append to the existing streaming reasoning round.
+                            if let ActivityEntry::Reasoning { text, .. } =
+                                &mut t.entries[eix]
+                            {
+                                text.push_str(&delta);
+                            }
+                        } else {
+                            // Start a new reasoning round.
+                            t.entries.push(ActivityEntry::Reasoning {
+                                text: delta,
                                 streaming: true,
                                 collapsed: false,
                                 user_toggled: false,
-                            },
-                            role.to_string(),
-                            id,
-                            weak,
-                        );
-                        item.update_text(delta);
-                        item.schedule_parse(delta.to_string(), cx);
-                        item
-                    }));
-                    ApplyOutcome::Appended
-                } else {
-                    let ix = self.items.len() - 1;
-                    self.items[ix].update(cx, |item, cx| {
-                        // Snapshot after appending — see the `AgentText` branch
-                        // for why a pre-append snapshot drops the last delta.
-                        let full_text = match item.kind_mut() {
-                            ConvItem::Reasoning { text, .. } => {
-                                text.push_str(delta);
-                                text.clone()
-                            }
-                            _ => return,
-                        };
-                        item.update_text(&full_text);
-                        item.schedule_parse(full_text, cx);
-                        cx.notify();
-                    });
-                    ApplyOutcome::Remeasure(ix)
-                }
+                            });
+                        }
+                        t.recompute_streaming();
+                    }
+                    cx.notify();
+                });
+                ApplyOutcome::Remeasure(cix)
             }
             ThreadEvent::ToolCall {
                 id,
@@ -747,7 +800,7 @@ impl ConversationState {
                     let entry_input = input.clone().unwrap_or(serde_json::Value::Null);
                     self.items[cix].update(cx, |item, cx| {
                         if let ConvItem::Thinking(t) = item.kind_mut() {
-                            if let Some(entry) = t.entries.iter_mut().find(|e| e.id == id) {
+                            if let Some(entry) = t.get_tool_entry_mut(&id) {
                                 entry.title = title;
                                 entry.name = name;
                                 entry.status = status;
@@ -762,7 +815,7 @@ impl ConversationState {
                                     entry.collapsed = !entry.user_toggled;
                                 }
                             } else {
-                                t.entries.push(ToolCallItem {
+                                t.entries.push(ActivityEntry::Tool(ToolCallItem {
                                     id,
                                     name,
                                     title,
@@ -773,7 +826,7 @@ impl ConversationState {
                                     streaming: matches!(status, ToolCallStatus::Running),
                                     collapsed: false,
                                     user_toggled: false,
-                                });
+                                }));
                             }
                             t.recompute_streaming();
                         }
@@ -795,7 +848,7 @@ impl ConversationState {
                 } else if let Some((cix, eix)) = self.find_thinking_entry(id, cx) {
                     self.items[cix].update(cx, |item, cx| {
                         if let ConvItem::Thinking(t) = item.kind_mut() {
-                            if let Some(entry) = t.entries.get_mut(eix) {
+                            if let Some(ActivityEntry::Tool(entry)) = t.entries.get_mut(eix) {
                                 entry.output.push_str(chunk);
                                 entry.streaming = true;
                             }
@@ -846,7 +899,7 @@ impl ConversationState {
                     let entry_is_error = *is_error;
                     self.items[cix].update(cx, |item, cx| {
                         if let ConvItem::Thinking(t) = item.kind_mut() {
-                            if let Some(entry) = t.entries.get_mut(eix) {
+                            if let Some(ActivityEntry::Tool(entry)) = t.entries.get_mut(eix) {
                                 entry.output = entry_output;
                                 entry.is_error = entry_is_error;
                                 entry.streaming = false;
@@ -913,7 +966,7 @@ impl ConversationState {
                     container.accepting_entries = false;
                     container.streaming = false;
                     container.collapsed = false;
-                    container.entries.push(entry);
+                    container.entries.push(ActivityEntry::Tool(entry));
                     self.items.push(cx.new(|_| {
                         MessageItem::new(ConvItem::Thinking(container), role.to_string(), ix, weak)
                     }));
@@ -1518,7 +1571,10 @@ mod tests {
     /// `ToolCall` items.
     fn find_thinking_entry<'a>(items: &'a [ConvItem], id: &str) -> Option<&'a ToolCallItem> {
         items.iter().find_map(|i| match i {
-            ConvItem::Thinking(t) => t.entries.iter().find(|e| e.id == id),
+            ConvItem::Thinking(t) => t.entries.iter().find_map(|e| match e {
+                ActivityEntry::Tool(tool) if tool.id == id => Some(tool),
+                _ => None,
+            }),
             _ => None,
         })
     }
@@ -1694,10 +1750,14 @@ mod tests {
         assert!(!t.streaming);
         assert!(t.collapsed, "historical container auto-folds");
         assert_eq!(t.entries.len(), 2);
-        assert_eq!(t.entries[0].id, "tu_a");
-        assert_eq!(t.entries[0].output, "a");
-        assert_eq!(t.entries[1].id, "tu_b");
-        assert_eq!(t.entries[1].output, "b");
+        let (ActivityEntry::Tool(e0), ActivityEntry::Tool(e1)) = (&t.entries[0], &t.entries[1])
+        else {
+            panic!("expected tool entries");
+        };
+        assert_eq!(e0.id, "tu_a");
+        assert_eq!(e0.output, "a");
+        assert_eq!(e1.id, "tu_b");
+        assert_eq!(e1.output, "b");
         // Prose precedes the container.
         assert!(matches!(items.first(), Some(ConvItem::User { .. })));
     }
@@ -1736,7 +1796,7 @@ mod tests {
     #[test]
     fn tool_use_stop_does_not_freeze_segment() {
         let mut t = ThinkingContainer::new();
-        t.entries.push(ToolCallItem {
+        t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "1".into(),
             name: "read_file".into(),
             title: String::new(),
@@ -1747,7 +1807,7 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
-        });
+        }));
         // All entries terminal, but segment is still accepting (turn in progress).
         t.recompute_streaming();
         assert!(t.accepting_entries, "segment still accepting entries");
@@ -1769,5 +1829,73 @@ mod tests {
         assert!(!t.accepting_entries, "segment closed on terminal stop");
         assert!(!t.streaming, "segment frozen on terminal stop");
         assert!(t.frozen_secs.is_some(), "elapsed pinned on terminal stop");
+    }
+
+    /// `last_streaming_reasoning_index` returns the index of the last streaming
+    /// reasoning entry, or `None` when no reasoning is active.
+    #[test]
+    fn last_streaming_reasoning_index_finds_active_round() {
+        let mut t = ThinkingContainer::new();
+        assert!(t.last_streaming_reasoning_index().is_none());
+
+        // Push a non-streaming reasoning entry.
+        t.entries.push(ActivityEntry::Reasoning {
+            text: "done".into(),
+            streaming: false,
+            collapsed: true,
+            user_toggled: false,
+        });
+        assert!(t.last_streaming_reasoning_index().is_none());
+
+        // Push a streaming reasoning entry.
+        t.entries.push(ActivityEntry::Reasoning {
+            text: "active".into(),
+            streaming: true,
+            collapsed: false,
+            user_toggled: false,
+        });
+        assert_eq!(t.last_streaming_reasoning_index(), Some(1));
+
+        // A tool entry after it does not affect the search.
+        t.entries.push(ActivityEntry::Tool(ToolCallItem {
+            id: "t1".into(),
+            name: "bash".into(),
+            title: String::new(),
+            status: ToolCallStatus::Running,
+            output: String::new(),
+            is_error: false,
+            input: serde_json::Value::Null,
+            streaming: true,
+            collapsed: false,
+            user_toggled: false,
+        }));
+        // Still finds the streaming reasoning at index 1.
+        assert_eq!(t.last_streaming_reasoning_index(), Some(1));
+    }
+
+    /// `get_tool_entry_mut` finds tool entries by id and skips reasoning entries.
+    #[test]
+    fn get_tool_entry_mut_skips_reasoning() {
+        let mut t = ThinkingContainer::new();
+        t.entries.push(ActivityEntry::Reasoning {
+            text: "thinking".into(),
+            streaming: false,
+            collapsed: true,
+            user_toggled: false,
+        });
+        t.entries.push(ActivityEntry::Tool(ToolCallItem {
+            id: "tu_1".into(),
+            name: "read_file".into(),
+            title: String::new(),
+            status: ToolCallStatus::Success,
+            output: String::new(),
+            is_error: false,
+            input: serde_json::Value::Null,
+            streaming: false,
+            collapsed: false,
+            user_toggled: false,
+        }));
+        assert!(t.get_tool_entry_mut("tu_1").is_some());
+        assert!(t.get_tool_entry_mut("nonexistent").is_none());
     }
 }
