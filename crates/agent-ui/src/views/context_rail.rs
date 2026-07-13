@@ -411,8 +411,8 @@ impl ContextRail {
                 .text_color(muted)
                 .child(branch_prefix("└── "))
                 .child(cache_label.clone())
-                .child(counter_animated("↑", cce_f, cce_t, "cache_create", cce_g))
-                .child(counter_animated("↓", ccr_f, ccr_t, "cache_read", ccr_g));
+                .child(counter_animated("+", cce_f, cce_t, "cache_create", cce_g))
+                .child(counter_animated("=", ccr_f, ccr_t, "cache_read", ccr_g));
             model_blocks.push((model_display, hit_rate, throughput_row, cache_row));
         }
         self.env_counter_state = new_state;
