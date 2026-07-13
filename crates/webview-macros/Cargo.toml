@@ -1,0 +1,15 @@
+[package]
+name = "manox-webview-macros"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "1.0", features = ["full", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+serde = { version = "1.0", optional = true }
+http.workspace = true

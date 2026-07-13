@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent::language_model::StopReason;
@@ -17,6 +18,7 @@ use agent::provider::WireApi;
 use agent::provider::registry;
 use agent::settings;
 use agent::thread::ApprovalMode;
+use agent::webview_host::BrowserTabId;
 use agent::{
     PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId, i18n,
     save_thread,
@@ -29,11 +31,12 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
-    TITLE_BAR_HEIGHT, Theme, TitleBar,
+    TITLE_BAR_HEIGHT, Theme, TitleBar, WindowExt as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Paste, RopeExt},
     menu::{PopupMenu, PopupMenuItem},
+    notification::Notification,
     tab::{Tab, TabBar},
     tag::{Tag, TagVariant},
     v_flex,
@@ -42,6 +45,8 @@ use manox_components::markdown::Markdown;
 
 use crate::cockpit::CockpitPhase;
 use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
+use crate::external_session::{ExternalSession, SessionKind};
+use crate::views::browser_view::BrowserView;
 use crate::views::centered;
 use crate::views::completion::{
     CompletionState, SelectHandler, build_replacement, detect, mention_source, render_completion,
@@ -53,17 +58,22 @@ use crate::views::composer_menu::{
 use crate::views::member_panel::MemberPanel;
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
-use crate::{CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab, OpenSettings};
+use crate::{
+    CloseBrowserTab, CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab,
+    OpenBrowserTab, OpenSettings,
+};
 use terminal::Terminal;
 use terminal_ui::TerminalView;
 
 /// A tab in the right observation pane. `Editor` is the markdown composer
 /// (Write/Preview); `Member(name)` is a read-only [`MemberPanel`] over a team
-/// worker's conversation + tasks.
+/// worker's conversation + tasks; `Browser(id)` is an untrusted embedded
+/// webview (see [`BrowserView`]).
 #[derive(Clone, Debug)]
 enum RightTab {
     Editor,
     Member(String),
+    Browser(BrowserTabId),
 }
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
@@ -86,6 +96,17 @@ struct PendingAuth {
 struct PendingPlan {
     id: String,
     plan_text: String,
+}
+
+/// A pending inbound-write request from a built-in browser tab, surfaced by
+/// `ThreadEvent::InboundAuthorization`. Unlike outbound tool approval this
+/// axis is `ApprovalMode`-blind — a web page must never gain a write path
+/// because the agent runs in Yolo — so the overlay always shows and the
+/// decision always routes through `Thread::respond_inbound`, not the outbound
+/// approval pipeline.
+struct PendingInbound {
+    id: String,
+    intent: String,
 }
 
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
@@ -198,7 +219,7 @@ pub struct Workspace {
     /// carries a minimal subscription so a terminal `Stop`/`Error` arriving
     /// while parked marks the thread unread for the sidebar red dot.
     background_threads: Vec<BackgroundThread>,
-    sidebar: Entity<Sidebar>,
+    pub(crate) sidebar: Entity<Sidebar>,
     pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
     /// Per-thread unsent composer text, keyed by thread id. Saved when
@@ -223,6 +244,11 @@ pub struct Workspace {
     /// Lazily-built MemberPanel entities, keyed by member name. A member tab
     /// keeps its panel across tab switches; dropped when the tab closes.
     member_panels: BTreeMap<String, Entity<MemberPanel>>,
+    /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
+    /// tab keeps its `BrowserView` (and the underlying native webview) across
+    /// tab switches; dropped when the tab closes, which detaches the native
+    /// view via [`manox_webview::webview::WebView`]'s `Drop`.
+    pub(crate) browser_views: BTreeMap<BrowserTabId, Entity<BrowserView>>,
     /// Editor pane width, driven by dragging the divider. In-memory only.
     editor_width: Pixels,
     /// Sidebar width, driven by dragging the divider on its right edge.
@@ -234,6 +260,10 @@ pub struct Workspace {
     /// approval request — the overlay shows the most recent and queues the rest,
     /// resolving them one at a time so no `oneshot` is stranded by overwrite.
     pending_auths: Vec<PendingAuth>,
+    /// Pending inbound-write requests from built-in browser tabs. Stacked
+    /// like `pending_auths`; the overlay shows the most recent and queues the
+    /// rest. Each carries its own `Thread::respond_inbound` id.
+    pending_inbounds: Vec<PendingInbound>,
     /// A pending `AskUserQuestion` card rendered inline in the message list.
     pending_ask: Option<PendingAsk>,
     /// Current question index in the ask drawer (0-based).
@@ -361,6 +391,16 @@ pub struct Workspace {
     /// `Workspace`, plus strong handles to the active thread and conversation
     /// it renders against. Writes flow through `self.context_rail.update`.
     context_rail: Entity<crate::views::context_rail::ContextRail>,
+    /// Live external agent CLI sessions (claude / codex / copilot) launched from
+    /// the sidebar `+` menu. In-memory only — never persisted. Each owns its
+    /// `TerminalView` plus a shared `Arc<SessionHandle>` so the close path can
+    /// `kill` the agent explicitly.
+    pub(crate) external_sessions: Vec<crate::external_session::ExternalSession>,
+    /// The currently-displayed external session id when
+    /// `view_mode == ExternalSession`. Mirrors `terminal_view`'s "one at a
+    /// time" model; switching away parks the session (its terminal keeps
+    /// running) rather than killing it.
+    active_external: Option<String>,
     /// Ordinal of the outline tick currently under the cursor, if any. Drives
     /// the "wave" hover effect: the hovered tick and its neighbors lengthen and
     /// spread apart, tapering off with distance. `None` when the cursor is off
@@ -376,14 +416,16 @@ pub struct Workspace {
 
 /// Top-level rendering mode of the Workspace window. `Settings` and
 /// `Terminal` are full-pane switches off the default `Workspace` (conversation)
-/// mode; future overlays can extend this enum rather than carrying parallel
-/// `bool` flags.
+/// mode; `ExternalSession` shows an external agent CLI's TUI terminal in place
+/// of the conversation. Future overlays can extend this enum rather than
+/// carrying parallel `bool` flags.
 #[derive(Default)]
 enum ViewMode {
     #[default]
     Workspace,
     Settings,
     Terminal,
+    ExternalSession,
 }
 
 /// Right-side composer width. Wide enough for rendered markdown
@@ -504,9 +546,11 @@ impl Workspace {
             right_tabs: Vec::new(),
             active_right_tab: 0,
             member_panels: BTreeMap::new(),
+            browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
             pending_auths: Vec::new(),
+            pending_inbounds: Vec::new(),
             pending_ask: None,
             ask_step: 0,
             ask_transition_gen: 0,
@@ -553,6 +597,8 @@ impl Workspace {
             settings_sub: None,
             terminal_view: None,
             context_rail,
+            external_sessions: Vec::new(),
+            active_external: None,
             outline_hover: None,
             git_status_gen: 0,
         };
@@ -685,6 +731,14 @@ impl Workspace {
                         // `exit_plan_mode` call dropped the overlay because this
                         // cleared `pending_plan` before the approval arm ran).
                         this.pending_plan = None;
+                        // A terminal stop abandons any parked browser yield
+                        // (the parked Task is cancelled on the thread side)
+                        // and dismisses stranded inbound-write overlays whose
+                        // decision oneshot the thread just dropped.
+                        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
+                            host.clear_yields_for_thread(&this.thread, cx);
+                        }
+                        this.pending_inbounds.clear();
                         let thread_id = this.thread.read(cx).id.0.clone();
                         save_thread(this.thread.clone(), true, cx);
                         // Terminal stop → this thread is no longer running.
@@ -756,6 +810,18 @@ impl Workspace {
                     // bubble's placement marks the turn that was steered.
                     this.consume_steered_follow_up(message_id, cx);
                 }
+                ThreadEvent::InboundAuthorization { id, intent, .. } => {
+                    // A built-in browser tab requested an inbound write. This
+                    // axis ignores `ApprovalMode` — always confirm, never let
+                    // a page drive the agent unprompted — so it is stacked
+                    // separately from `pending_auths` and resolved through
+                    // `Thread::respond_inbound`, not the outbound pipeline.
+                    this.pending_inbounds.push(PendingInbound {
+                        id: id.clone(),
+                        intent: intent.clone(),
+                    });
+                    cx.notify();
+                }
                 _ => {
                     // `Error` is a terminal signal symmetric to a terminal
                     // `Stop`: the turn aborted, so this thread is no longer
@@ -773,6 +839,13 @@ impl Workspace {
                         // `Stop`: the turn aborted, so any pending plan overlay
                         // is now stale and must not linger over an idle thread.
                         this.pending_plan = None;
+                        // Symmetric to the terminal `Stop` arm: retire parked
+                        // browser yields + stranded inbound overlays so an
+                        // aborted turn leaves no stale banner behind.
+                        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
+                            host.clear_yields_for_thread(&this.thread, cx);
+                        }
+                        this.pending_inbounds.clear();
                         this.context_rail.update(cx, |r, cx| {
                             r.cockpit_phase = CockpitPhase::Failed;
                             r.demote_milestones_to_pending(cx);
@@ -1043,6 +1116,15 @@ impl Workspace {
                     this.start_new_thread(Some(dir.clone()), window, cx);
                 }
                 SidebarEvent::OpenThread(id) => this.open_thread(id.clone(), window, cx),
+                SidebarEvent::SpawnExternalSession(kind, provider, model) => {
+                    this.spawn_external_session(*kind, provider.clone(), model.clone(), window, cx);
+                }
+                SidebarEvent::OpenExternalSession(id) => {
+                    this.attach_external_session(id, cx);
+                }
+                SidebarEvent::CloseExternalSession(id) => {
+                    this.close_external_session(id, cx);
+                }
                 SidebarEvent::ArchiveThread(id, archived) => {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
@@ -1124,7 +1206,14 @@ impl Workspace {
     pub fn focus_terminal(&mut self, cx: &mut Context<Self>) {
         if self.terminal_view.is_none() {
             let id = uuid::Uuid::new_v4().to_string();
-            let terminal = match Terminal::new(id, self.cwd.clone(), 80, 24, cx) {
+            let pty = match terminal::pty::default_source(&self.cwd, 80, 24) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(error = ?e, "failed to open terminal pty");
+                    return;
+                }
+            };
+            let terminal = match Terminal::new(id, self.cwd.clone(), 80, 24, pty, cx) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to spawn terminal");
@@ -1144,11 +1233,205 @@ impl Workspace {
     }
 
     /// Close the terminal tab and return to the conversation pane. Dropping
-    /// the `TerminalView` drops the underlying `Terminal`, whose `PtyHandle`
-    /// kills the child and joins the reader/waiter threads.
+    /// the `TerminalView` drops the underlying `Terminal`, whose `PtySource`
+    /// kills the child and detaches the reader/waiter threads.
     pub fn close_terminal_tab(&mut self, cx: &mut Context<Self>) {
         self.terminal_view = None;
         self.focus_conversation(cx);
+    }
+
+    /// Launch a new external agent CLI session (`claude` / `codex` / `copilot`)
+    /// with a user-picked provider + model (from the sidebar `+` wizard
+    /// cascade). The shared `SessionHandle` backs a `CxSessionSource` PTY
+    /// source that drives a `Terminal`/`TerminalView`, and is also held by the
+    /// `ExternalSession` so the close path can `kill` the agent explicitly. A
+    /// spawn failure (binary missing / apikey parse / unsupported combo) pushes
+    /// an error notification and leaves the sidebar untouched.
+    pub fn spawn_external_session(
+        &mut self,
+        kind: SessionKind,
+        provider_name: String,
+        model_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let agent_id = kind.agent_id();
+        let handle = match cx::AgentBuilder::new()
+            .agent(kind.agent())
+            .pty(true)
+            .provider(provider_name.clone())
+            .model(model_id.clone())
+            .spawn()
+        {
+            Ok(h) => Arc::new(h),
+            Err(e) => {
+                tracing::error!(error = %e, agent = agent_id, "external agent spawn failed");
+                window.push_notification(
+                    Notification::error(format!(
+                        "{}: {e}",
+                        i18n::t("external-session-start-failed")
+                    )),
+                    cx,
+                );
+                return;
+            }
+        };
+        let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
+        let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
+        let terminal =
+            match Terminal::new(id.clone(), self.cwd.clone(), 80, 24, Box::new(source), cx) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to create terminal for external session");
+                    window.push_notification(
+                        Notification::error(format!(
+                            "{}: {e}",
+                            i18n::t("external-session-start-failed")
+                        )),
+                        cx,
+                    );
+                    return;
+                }
+            };
+        // Tear the session down when the CLI exits on its own (e.g. `/exit`),
+        // without waiting for the user to click ×. The subscription lives on
+        // the session so a later close detaches it before any spurious event.
+        let exit_id = id.clone();
+        let exit_sub = cx.subscribe(
+            &terminal,
+            move |this, _terminal, ev: &terminal::event::TerminalEvent, cx| {
+                if let terminal::event::TerminalEvent::ChildExit(_) = ev {
+                    this.remove_external_session(&exit_id, cx);
+                }
+            },
+        );
+        let view = TerminalView::new(terminal, cx);
+        self.external_sessions.push(ExternalSession {
+            id: id.clone(),
+            kind,
+            provider_name,
+            model_id,
+            terminal_view: view,
+            handle,
+            _exit_sub: exit_sub,
+        });
+        self.sync_sidebar_external(cx);
+        self.attach_external_session(&id, cx);
+    }
+
+    /// Display an already-running external session in the main area. Does not
+    /// touch the foreground `Thread` (the thread entity stays mounted; only the
+    /// view mode flips) — the session's terminal keeps running across switches
+    /// because the `ExternalSession` owns the live `TerminalView` + handle.
+    pub fn attach_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.external_sessions.iter().any(|s| s.id == id) {
+            return;
+        }
+        self.active_external = Some(id.to_string());
+        self.view_mode = ViewMode::ExternalSession;
+        self.sidebar
+            .update(cx, |s, cx| s.set_selected(Some(id.to_string()), cx));
+        cx.notify();
+    }
+
+    /// Kill an external session and remove it (the sidebar `×` path). The
+    /// explicit `handle.kill()` unblocks the reader thread even mid-`read`, so
+    /// the terminal drains instead of hanging on a dead PTY; `kill` on an
+    /// already-dead child is best-effort (warn-logged). Removal itself —
+    /// including sidebar sync + fallback-to-conversation — is shared with the
+    /// natural-exit path in [`remove_external_session`].
+    pub fn close_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        let kill_handle = self
+            .external_sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| Arc::clone(&s.handle));
+        if let Some(handle) = kill_handle
+            && let Err(e) = handle.kill()
+        {
+            tracing::warn!(error = %e, id, "external session kill failed");
+        }
+        self.remove_external_session(id, cx);
+    }
+
+    /// Remove an external session without killing the child — the natural-exit
+    /// path (the `ChildExit` subscription fired because the CLI already exited).
+    /// Dropping the `ExternalSession` drops its `TerminalView` (and thus the
+    /// `Terminal` + `CxSessionSource`); the last `Arc<SessionHandle>` ref then
+    /// drops, and cx's `SessionHandle::Drop` does best-effort reap + socket
+    /// cleanup. If the removed session was the active one, fall back to the
+    /// conversation pane.
+    fn remove_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        let was_active = self.active_external.as_deref() == Some(id);
+        self.external_sessions.retain(|s| s.id != id);
+        if was_active {
+            self.active_external = None;
+            self.focus_conversation(cx);
+        }
+        self.sync_sidebar_external(cx);
+    }
+
+    /// Push a fresh projection of the live external sessions to the sidebar so
+    /// its "External" section reflects spawns / closes without owning the
+    /// PTY-bearing structs.
+    fn sync_sidebar_external(&mut self, cx: &mut Context<Self>) {
+        let summaries: Vec<_> = self.external_sessions.iter().map(|s| s.summary()).collect();
+        self.sidebar
+            .update(cx, |s, cx| s.set_external_sessions(summaries, cx));
+    }
+
+    /// Open a browser tab navigating to `url` (defaulting to
+    /// [`crate::views::browser_view::DEFAULT_URL`] when empty) and focus it.
+    /// Returns the allocated `BrowserTabId` so callers (the host, tool
+    /// surface) can drive the tab afterwards. The webview is built untrusted:
+    /// no Tauri command surface, only the notify/inbound bridges.
+    pub fn open_browser_tab(
+        &mut self,
+        url: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> BrowserTabId {
+        let url = if url.is_empty() {
+            crate::views::browser_view::DEFAULT_URL
+        } else {
+            url
+        };
+        let tab_id = crate::views::browser_view::allocate_tab_id();
+        let view =
+            cx.new(|cx| crate::views::browser_view::BrowserView::new(tab_id, url, window, cx));
+        self.browser_views.insert(tab_id, view);
+        self.right_tabs.push(RightTab::Browser(tab_id));
+        self.set_active_right_tab(self.right_tabs.len() - 1, cx);
+        tab_id
+    }
+
+    /// Close and recycle a browser tab by id. Dropping the `BrowserView`
+    /// drops the underlying native webview, whose `Drop` hides and detaches
+    /// the platform view. No-op if the id is not live.
+    pub fn close_browser_tab(&mut self, tab_id: BrowserTabId, cx: &mut Context<Self>) {
+        if self.browser_views.remove(&tab_id).is_none() {
+            return;
+        }
+        // Reclaim the host's routing entry so a late notify for this tab finds
+        // no route (no orphaned oneshot). `close_tab` reclaims first then calls
+        // us — in that direction `reclaim_routes` is a no-op; this call covers
+        // the UI-close direction.
+        if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
+            host.reclaim_routes(tab_id);
+        }
+        if let Some(ix) = self
+            .right_tabs
+            .iter()
+            .position(|t| matches!(t, RightTab::Browser(id) if *id == tab_id))
+        {
+            self.right_tabs.remove(ix);
+            self.reseat_active_after_close(ix);
+            self.editor_open = self
+                .right_tabs
+                .get(self.active_right_tab)
+                .is_some_and(|t| matches!(t, RightTab::Editor));
+        }
+        cx.notify();
     }
 
     fn subscribe_input(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
@@ -2137,6 +2420,19 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Keep `active_right_tab` pointing at the same tab after the tab at
+    /// `removed_ix` was just removed from `right_tabs`. Tabs after
+    /// `removed_ix` shift left by one, so a still-live active tab to the right
+    /// must decrement; the active tab itself being removed (and being the
+    /// last) falls back to the new last tab.
+    fn reseat_active_after_close(&mut self, removed_ix: usize) {
+        if self.active_right_tab > removed_ix {
+            self.active_right_tab -= 1;
+        } else if self.active_right_tab >= self.right_tabs.len() {
+            self.active_right_tab = self.right_tabs.len().saturating_sub(1);
+        }
+    }
+
     /// Open the markdown editor: hide the inline composer and transfer its draft
     /// into the editor so writing continues there. If an Editor tab is already
     /// present, just focus it. Submit from the editor with Cmd-Enter; close with
@@ -2177,9 +2473,7 @@ impl Workspace {
         });
         self.editor_state
             .update(cx, |s, cx| s.set_value("", window, cx));
-        if self.active_right_tab >= self.right_tabs.len() {
-            self.active_right_tab = self.right_tabs.len().saturating_sub(1);
-        }
+        self.reseat_active_after_close(ix);
         self.editor_open = self
             .right_tabs
             .get(self.active_right_tab)
@@ -2228,7 +2522,7 @@ impl Workspace {
 
     /// Close a right-pane tab by index. The Editor tab routes through
     /// `close_editor` to preserve draft-transfer semantics; a Member tab drops
-    /// its panel.
+    /// its panel; a Browser tab drops its webview.
     fn close_right_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.right_tabs.get(ix), Some(RightTab::Editor)) {
             self.close_editor(window, cx);
@@ -2237,14 +2531,24 @@ impl Workspace {
         if let Some(RightTab::Member(name)) = self.right_tabs.get(ix).cloned() {
             self.right_tabs.remove(ix);
             self.member_panels.remove(&name);
-            if self.active_right_tab >= self.right_tabs.len() {
-                self.active_right_tab = self.right_tabs.len().saturating_sub(1);
-            }
+            self.reseat_active_after_close(ix);
             self.editor_open = self
                 .right_tabs
                 .get(self.active_right_tab)
                 .is_some_and(|t| matches!(t, RightTab::Editor));
             cx.notify();
+        }
+        if let Some(RightTab::Browser(id)) = self.right_tabs.get(ix).cloned() {
+            self.close_browser_tab(id, cx);
+        }
+    }
+
+    /// Close the active right-pane tab if it is a browser tab. No-op
+    /// otherwise (the keybinding is global; it should not close Editor or
+    /// Member tabs that happen to be active).
+    pub fn close_active_browser_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(RightTab::Browser(id)) = self.right_tabs.get(self.active_right_tab).cloned() {
+            self.close_browser_tab(id, cx);
         }
     }
 
@@ -2493,6 +2797,20 @@ impl Workspace {
                 agent::ToolAuthorizationResponse::Decision(decision),
                 cx,
             );
+        });
+        cx.notify();
+    }
+
+    /// Resolve the most-recent inbound-write request from a built-in browser
+    /// tab. Routed through `Thread::respond_inbound` — separate from the
+    /// outbound `resolve_auth` pipeline because this axis is `ApprovalMode`-
+    /// blind by design.
+    pub(crate) fn resolve_inbound(&mut self, allowed: bool, cx: &mut Context<Self>) {
+        let Some(req) = self.pending_inbounds.pop() else {
+            return;
+        };
+        self.thread.update(cx, |thread, cx| {
+            thread.respond_inbound(&req.id, allowed, cx);
         });
         cx.notify();
     }
@@ -2849,6 +3167,105 @@ impl Workspace {
                                                     PermissionDecision::AllowOnce,
                                                     cx,
                                                 );
+                                            }
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Confirmation overlay for an inbound-write request from a built-in
+    /// browser tab. Mirrors `render_auth_overlay`'s scrim + card layout but
+    /// resolves through `respond_inbound` (the `ApprovalMode`-blind axis).
+    fn render_inbound_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let req = self.pending_inbounds.last()?;
+        let intent = req.intent.clone();
+        let queued = self.pending_inbounds.len().saturating_sub(1);
+        Some(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.foreground.opacity(0.6))
+                .child(
+                    v_flex()
+                        .w(px(420.))
+                        .p_4()
+                        .gap_3()
+                        .rounded(theme.radius)
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::TriangleAlert)
+                                        .small()
+                                        .text_color(theme.danger),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(i18n::t("workspace-inbound-title")),
+                                ),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(i18n::t_str(
+                                    "workspace-inbound-intent",
+                                    &[("intent", intent.as_str())],
+                                )),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(i18n::t("workspace-inbound-note")),
+                        )
+                        .children(if queued > 0 {
+                            Some(
+                                gpui::div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(i18n::t_count("workspace-queued", queued as i64)),
+                            )
+                        } else {
+                            None
+                        })
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("inbound-deny")
+                                        .ghost()
+                                        .small()
+                                        .label(i18n::t("workspace-inbound-deny"))
+                                        .on_click(cx.listener({
+                                            move |this, _, _, cx| {
+                                                this.resolve_inbound(false, cx);
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new("inbound-allow")
+                                        .primary()
+                                        .small()
+                                        .label(i18n::t("workspace-inbound-allow"))
+                                        .on_click(cx.listener({
+                                            move |this, _, _, cx| {
+                                                this.resolve_inbound(true, cx);
                                             }
                                         })),
                                 ),
@@ -4780,6 +5197,92 @@ impl Render for Workspace {
                         .child(v_flex().flex_1().h_full().w_full().child(terminal)),
                 );
         }
+        // External agent CLI session: render the active session's terminal TUI
+        // in place of the conversation. Mirrors the Terminal branch — sidebar on
+        // the left, a TitleBar + the terminal filling the main column — but the
+        // bar shows the agent kind + provider/model and a `×` that kills the
+        // session and removes it from the sidebar.
+        if matches!(self.view_mode, ViewMode::ExternalSession) {
+            let theme = cx.theme().clone();
+            let active = self
+                .active_external
+                .as_deref()
+                .and_then(|id| self.external_sessions.iter().find(|s| s.id == id));
+            let Some(session) = active else {
+                // No live session matches the recorded id (closed underneath
+                // us). Fall back to the conversation pane.
+                self.view_mode = ViewMode::Workspace;
+                cx.notify();
+                return h_flex().size_full().child(self.sidebar.clone());
+            };
+            let kind = session.kind;
+            let title = session.kind.label();
+            let subtitle = format!("{} · {}", session.provider_name, session.model_id);
+            let terminal = session.terminal_view.clone();
+            let close_id = session.id.clone();
+            return h_flex()
+                .size_full()
+                .bg(theme.background)
+                .text_color(theme.foreground)
+                .on_action(cx.listener(|this, _: &FocusConversation, _window, cx| {
+                    this.focus_conversation(cx);
+                }))
+                .child(self.sidebar.clone())
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .h_full()
+                        .relative()
+                        .child(
+                            TitleBar::new().child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(
+                                        Icon::new(match kind {
+                                            crate::external_session::SessionKind::ClaudeCode => {
+                                                IconName::Bot
+                                            }
+                                            crate::external_session::SessionKind::Codex => {
+                                                IconName::Cpu
+                                            }
+                                            crate::external_session::SessionKind::GithubCopilot => {
+                                                IconName::Github
+                                            }
+                                        })
+                                        .small(),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .text_sm()
+                                            .text_left()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(title)
+                                            .child(
+                                                gpui::div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(subtitle),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("close-external")
+                                            .small()
+                                            .ghost()
+                                            .icon(IconName::Close)
+                                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                                this.close_external_session(&close_id.clone(), cx);
+                                            })),
+                                    ),
+                            ),
+                        )
+                        .child(v_flex().flex_1().h_full().w_full().child(terminal)),
+                );
+        }
         let theme = cx.theme().clone();
         let running = self.thread.read(cx).is_running();
 
@@ -4788,6 +5291,7 @@ impl Render for Workspace {
 
         let overlay = self
             .render_auth_overlay(&theme, cx)
+            .or_else(|| self.render_inbound_overlay(&theme, cx))
             .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
 
         let editor_open = self.editor_open;
@@ -4972,11 +5476,20 @@ impl Render for Workspace {
                     RightTab::Member(name) => {
                         Tab::new().label(i18n::t_str("member-tab", &[("name", name)]))
                     }
+                    RightTab::Browser(id) => {
+                        let url = self
+                            .browser_views
+                            .get(id)
+                            .map(|v| v.read(cx).url().to_string())
+                            .unwrap_or_default();
+                        Tab::new().label(i18n::t_str("browser-tab", &[("url", &url)]))
+                    }
                 };
-                // Only member tabs carry a close affordance; the Editor tab
-                // keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
+                // Member and Browser tabs carry a close affordance; the
+                // Editor tab keeps its keyboard toggle (`ToggleEditor` /
+                // `CloseEditor`).
                 match tab {
-                    RightTab::Member(_) => base.suffix(
+                    RightTab::Member(_) | RightTab::Browser(_) => base.suffix(
                         gpui::div()
                             .id(("right-tab-close", ix))
                             .cursor_pointer()
@@ -5076,6 +5589,11 @@ impl Render for Workspace {
                             .get(&name)
                             .map(|p| p.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
+                        Some(RightTab::Browser(id)) => self
+                            .browser_views
+                            .get(&id)
+                            .map(|v| v.clone().into_any_element())
+                            .unwrap_or_else(|| gpui::div().into_any_element()),
                         None => gpui::div().into_any_element(),
                     }),
             );
@@ -5109,6 +5627,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &CloseTerminalTab, _window, cx| {
                 this.close_terminal_tab(cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenBrowserTab, window, cx| {
+                this.open_browser_tab(crate::views::browser_view::DEFAULT_URL, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseBrowserTab, _window, cx| {
+                this.close_active_browser_tab(cx);
             }))
             .on_action(cx.listener(|this, _: &crate::UndoLastQueued, _window, cx| {
                 this.undo_last_queued(cx);

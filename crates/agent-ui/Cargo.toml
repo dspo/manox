@@ -28,6 +28,11 @@ agent.workspace = true
 terminal.workspace = true
 terminal-ui.workspace = true
 manox-components.workspace = true
+manox-webview.workspace = true
+
+# cx library —— `AgentBuilder` / `SessionHandle` to spawn external agent CLIs
+# (claude/codex/copilot) and hold the PTY handle for an `ExternalSession`.
+cx.workspace = true
 
 [features]
 # In-process debug Harness + the `manox --mcp` server build on it. Off by

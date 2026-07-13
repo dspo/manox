@@ -224,6 +224,30 @@ pub enum ThreadEvent {
     /// turn that was actually steered. Carries the drained message's id so the
     /// UI can correlate it back to the parked queue item.
     SteerInjected { message_id: String },
+    /// A page-state notification from a built-in browser tab routed to the
+    /// owning thread. `EvalResult` and `UserHandback` are resolved in the host
+    /// (against pending oneshots) and never reach here; this event carries the
+    /// page-state variants (`PageLoaded` / `DomChanged` / `Navigation`) so the
+    /// conversation/UI can observe the tab the agent is driving. The host
+    /// binds a tab to its owning thread at `open_tab` time, so a notification
+    /// always lands on the thread that opened the tab, even after the active
+    /// conversation switches.
+    BrowserNotification {
+        tab_id: crate::webview_host::BrowserTabId,
+        notification: crate::webview_host::BrowserNotification,
+    },
+    /// An untrusted page requested an inbound write via
+    /// `__manox_request_write__(intent, payload)`. This is orthogonal to the
+    /// outbound `ApprovalMode` axis: every inbound request surfaces a
+    /// confirmation overlay regardless of mode (a page must never gain a write
+    /// path into manox just because the agent runs in Yolo). The UI resolves
+    /// the prompt and calls `Thread::respond_inbound` with the decision; the
+    /// host's parked oneshot — stored in `pending_inbound` — is the sink.
+    InboundAuthorization {
+        id: String,
+        intent: String,
+        payload: serde_json::Value,
+    },
 }
 
 /// UI metadata for a pending tool-call authorization. Stored alongside the
@@ -409,6 +433,11 @@ pub struct Thread {
     /// Pending plan-approval oneshots, keyed by the `exit_plan_mode` tool_use
     /// id. Mirrors `pending_authorizations` exactly.
     pending_plan_approval: HashMap<String, tokio::sync::oneshot::Sender<PlanApprovalResponse>>,
+    /// Pending inbound-write authorization oneshots for the browser axis,
+    /// keyed by the inbound request id allocated by the host. Resolved by
+    /// `respond_inbound` with an allow/deny decision; orthogonal to
+    /// `approval_mode` (a page's write request is never auto-allowed).
+    pending_inbound: HashMap<String, tokio::sync::oneshot::Sender<bool>>,
     /// Active goal state. `None` unless the user set a completion condition via
     /// `/goal <condition>`. While `Some`, after each natural turn end the
     /// thread runs a lightweight evaluator; an unsatisfied goal auto-continues
@@ -606,6 +635,7 @@ impl Thread {
                 pending_steer: std::collections::VecDeque::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
+                pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
                 depth: 0,
@@ -690,6 +720,7 @@ impl Thread {
                 pending_steer: std::collections::VecDeque::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
+                pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
                 depth: rec.depth as u32,
@@ -778,6 +809,7 @@ impl Thread {
                 pending_steer: std::collections::VecDeque::new(),
                 pending_authorizations: HashMap::new(),
                 pending_auth_meta: HashMap::new(),
+                pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: Some(system),
                 depth,
@@ -992,6 +1024,51 @@ impl Thread {
             return;
         }
         let _ = cx;
+    }
+
+    /// Register a pending inbound-write request and surface its confirmation
+    /// overlay. The host allocates the request id, creates the oneshot, parks
+    /// the `Sender` here, and emits `ThreadEvent::InboundAuthorization` so the
+    /// UI can prompt; the parked `Receiver` is awaited in the host. Resolution
+    /// arrives via [`respond_inbound`](Self::respond_inbound).
+    pub fn register_inbound(
+        &mut self,
+        id: String,
+        intent: String,
+        payload: serde_json::Value,
+        responder: tokio::sync::oneshot::Sender<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        // The confirmation overlay that resolves these is wired in a later
+        // step; until then a flooding page could grow this map unbounded
+        // until the thread is cancelled / released. Cap it: a request past
+        // the cap is dropped (the responder is dropped here → the host's
+        // parked await unparks with a cancellation).
+        const MAX_PENDING_INBOUND: usize = 64;
+        if self.pending_inbound.len() >= MAX_PENDING_INBOUND {
+            tracing::warn!(
+                pending = self.pending_inbound.len(),
+                id = %id,
+                "browser inbound queue saturated; dropping inbound-write request"
+            );
+            return;
+        }
+        self.pending_inbound.insert(id.clone(), responder);
+        cx.emit(ThreadEvent::InboundAuthorization {
+            id,
+            intent,
+            payload,
+        });
+    }
+
+    /// Resolve a pending inbound-write request by id with an allow/deny
+    /// decision. The host's parked `Receiver` unparks; a stale or unknown id
+    /// silently no-ops (the request was cancelled, resolved, or the tab was
+    /// closed and the sender dropped).
+    pub fn respond_inbound(&mut self, id: &str, allowed: bool, _cx: &mut Context<Self>) {
+        if let Some(tx) = self.pending_inbound.remove(id) {
+            let _ = tx.send(allowed);
+        }
     }
 
     /// Register a sub-agent's authorization request under a composite id and
@@ -1992,6 +2069,11 @@ impl Thread {
             // of panicking on a closed channel.
             self.pending_authorizations.clear();
             self.pending_auth_meta.clear();
+            // Inbound-write oneshots are not turn-scoped (a page can request a
+            // write at any time), but a cancel still drops them so a late
+            // `respond_inbound` no-ops rather than panicking on a closed
+            // channel. A fresh request re-registers a fresh oneshot.
+            self.pending_inbound.clear();
             // Drop bubbled sub-agent auth routes too: a parent cancel must
             // unwind child-authorization routing so a late composite-id
             // response no-ops at the parent instead of traversing to a child

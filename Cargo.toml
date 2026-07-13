@@ -18,6 +18,8 @@ members = [
     "crates/components",
     "crates/supervisor",
     "crates/lsp",
+    "crates/webview",
+    "crates/webview-macros",
 ]
 resolver = "2"
 
@@ -37,6 +39,8 @@ terminal-ui = { path = "crates/terminal-ui" }
 manox-components = { path = "crates/components" }
 supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
+manox-webview = { path = "crates/webview" }
+manox-webview-macros = { path = "crates/webview-macros" }
 
 anyhow = "1"
 async-channel = "2"
@@ -81,12 +85,36 @@ lsp-types = "0.97"
 toml = "0.8"
 http = "1"
 
+# wry stack — native webview embedded as a child of a gpui window. raw-window-handle
+# is already pulled transitively by gpui (0.6.x); pinned here so the webview crate
+# resolves the same major as the gpui WindowHandle it parents to.
+wry = "0.53"
+raw-window-handle = { version = "0.6", features = ["std"] }
+
+# webview crate extras — Tauri-style IPC layer + plugins ported from manos.
+# serialize-to-javascript embeds the Tauri IPC bundle + init scripts as
+# `&[u8]` JS literals; async-task backs the PlatformDispatcher main-thread
+# marshal; the rest are plugin backends (clipboard/dialog/opener) the
+# Trusted-mode webview can invoke.
+serialize-to-javascript = "0.1.2"
+mime_guess = "2.0"
+pollster = "0.4"
+async-task = "4.7.1"
+rfd = "0.15"
+arboard = "3"
+open = "5"
+
 # i18n —— fluent + BCP47 LanguageIdentifier。仅 UI chrome 走 t!()；模型面向字符串一律英文，不经此栈。
 fluent = "0.17"
 unic-langid = "0.9"
 
 # cx-providers —— provider 配置解析的单一事实来源（与 cx 共享）。锁 cx 仓库已合并的确定 rev。
-cx-providers = { git = "https://github.com/dspo/cx.git", rev = "7c811864aa2cd810dbe90bb5110d3dcb16203a42" }
+cx-providers = { git = "https://github.com/dspo/cx.git", rev = "47ae96e9e8cfc3dcdf1e19928506d1bd59baea86" }
+
+# cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library。SessionHandle 暴露
+# PTY 的 read/write_bytes/resize/socket_path/kill/wait，manox 经 CxSessionSource
+# 驱动 CLI TUI 渲染到 Terminal。与 cx-providers 同 rev 锁定（同一仓库）。
+cx = { git = "https://github.com/dspo/cx.git", rev = "47ae96e9e8cfc3dcdf1e19928506d1bd59baea86" }
 
 # GPUI 栈 —— git 仓库地址（规则允许）。gpui-component 锁定 zed rev 1d217ee，三者必须一致。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }

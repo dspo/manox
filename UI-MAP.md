@@ -11,11 +11,11 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### 顶层
 
-- [Window](#window) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal)
+- [Window](#window) · [Workspace](#workspace) · [ViewMode](#viewmode) · [ViewMode::Workspace](#viewmodeworkspace-layout) · [ViewMode::Settings](#viewmodesettings) · [ViewMode::Terminal](#viewmodeterminal) · [ViewMode::ExternalSession](#viewmodeexternalsession)
 
 ### Sidebar
 
-- [Sidebar](#sidebar) · [SidebarScrollBody](#sidebarscrollbody) · [SidebarMenuSection](#sidebarmenusection) · [SidebarMenuItem](#sidebarmenuitem) · [SidebarProjectsSection](#sidebarprojectssection) · [SidebarProjectGroup](#sidebarprojectgroup) · [SidebarConversationsSection](#sidebarconversationssection) · [SidebarThreadItem](#sidebarhreaditem) · [SidebarDivider](#sidebardivider)
+- [Sidebar](#sidebar) · [SidebarScrollBody](#sidebarscrollbody) · [SidebarMenuSection](#sidebarmenusection) · [SidebarMenuItem](#sidebarmenuitem) · [SidebarProjectsSection](#sidebarprojectssection) · [SidebarProjectGroup](#sidebarprojectgroup) · [SidebarConversationsSection](#sidebarconversationssection) · [SidebarNewSessionMenu](#sidebarnewsessionmenu) · [SidebarThreadItem](#sidebarhreaditem) · [SidebarExternalSection](#sidebarexternalsection) · [SidebarExternalSessionItem](#sidebarexternalsessionitem) · [SidebarDivider](#sidebardivider)
 
 ### MainColumn
 
@@ -51,11 +51,11 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Overlays
 
-- [ApprovalOverlay](#approvaloverlay) · [PlanApprovalOverlay](#planapprovaloverlay) · [BlankProjectOverlay](#blankprojectoverlay)
+- [ApprovalOverlay](#approvaloverlay) · [PlanApprovalOverlay](#planapprovaloverlay) · [InboundWriteOverlay](#inboundwriteoverlay) · [BlankProjectOverlay](#blankprojectoverlay)
 
 ### EditorPane
 
-- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [MemberTab](#membertab) · [MemberPanel](#memberpanel)
+- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [MemberTab](#membertab) · [MemberPanel](#memberpanel) · [BrowserView](#browserview)
 
 ### Composer (team)
 
@@ -105,7 +105,7 @@ Root container, horizontal flex (`h_flex`), owns all sub-views.
 
 ### 2.1 ViewMode
 
-`Workspace` switches between three mutually exclusive full-window modes:
+`Workspace` switches between four mutually exclusive full-window modes:
 
 #### ViewMode::Workspace
 Default — sidebar + conversation + composer.
@@ -115,6 +115,9 @@ Full-window settings overlay with slide-in animation. Plugin/skill/MCP managemen
 
 #### ViewMode::Terminal
 Full-window terminal emulator.
+
+#### ViewMode::ExternalSession
+Full-window external agent CLI session (claude / codex / copilot). Renders the active `ExternalSession`'s `TerminalView` (the agent's TUI) in place of the conversation, with a TitleBar showing the agent kind + provider/model and a `×` that kills the session. Lives in memory only — never persisted; the sidebar row is removed both on `×` (explicit kill) and when the CLI exits on its own (a `ChildExit` subscription on the terminal tears the session down without user action). If the removed session was the active one, the view falls back to the conversation pane.
 
 ---
 
@@ -179,13 +182,31 @@ Collapsible folder: chevron + folder icon + project name, indented thread list.
 
 #### SidebarConversationsSection
 
-Bottom section: loose (non-project) threads.
+Bottom section: loose (non-project) threads. The header's `+` button opens the `SidebarNewSessionMenu` popup.
+
+> Source: `agent-ui/src/views/sidebar.rs`
+
+#### SidebarNewSessionMenu
+
+`PopupMenu` anchored below the "Conversations" header `+`. One flat row (Manox Thread → `NewThread`) plus one `submenu_with_icon` per external agent kind (Claude Code / Codex / GitHub Copilot). Each agent submenu is a provider→model cascade: models from `registry::global().models()` filtered by the agent's `visible_agents()`, grouped by `provider_name()` into provider submenus, each listing its supported models. Picking a model emits `SpawnExternalSession(kind, provider, model)`. An agent with no supporting model renders a muted "no model configured" label row instead of provider submenus.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
 #### SidebarThreadItem
 
 Single thread row: unread red dot (8px, `theme.danger`, shown when `summary.has_unread`), pinned star, title, short-id tag (shimmer if running), token count, time, archive btn. Hover/active/selected wash uses the thread's last saved approval-mode color. The red dot marks a thread that finished a turn while the user was viewing another thread; it clears when the user switches into the thread.
+
+> Source: `agent-ui/src/views/sidebar.rs`
+
+#### SidebarExternalSection
+
+Section below "Conversations" listing live external agent sessions (claude / codex / copilot). Rendered only when at least one `ExternalSession` is live. The sidebar holds a `Vec<ExternalSessionSummary>` projection pushed by the Workspace — it never owns the PTY-bearing `ExternalSession` structs.
+
+> Source: `agent-ui/src/views/sidebar.rs`
+
+#### SidebarExternalSessionItem
+
+Single external-session row: kind icon (Bot/Cpu/Github) + kind label + muted "provider · model" subtitle + trailing `×` that emits `CloseExternalSession(id)` (kills the agent). Clicking the row emits `OpenExternalSession(id)`. Simpler than a thread row — no slide-wash (external rows live in their own section and don't participate in the conversation selection slide).
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -662,7 +683,7 @@ Vertical flex, right panel. A tab container holding one Editor slot (the markdow
 
 #### RightTabBar
 
-Top-level underline tab bar over `right_tabs`: `[Editor] [member:plan] [member:expl] …`. Selecting a tab switches `active_right_tab`. Member tabs carry a `×` suffix that closes the tab (click stops propagation so it does not also select). The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
+Top-level underline tab bar over `right_tabs`: `[Editor] [member:plan] [member:expl] [browser:url] …`. Selecting a tab switches `active_right_tab`. Member and Browser tabs carry a `×` suffix that closes the tab (click stops propagation so it does not also select). The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -689,6 +710,23 @@ A right-pane tab observing one team worker member. Content is the [MemberPanel](
 Read-only observation panel for a single team worker member. Subscribes to the member `Thread`'s events and feeds them into a private [ConversationState](#conversation-state), reusing the full [message](#message) rendering pipeline (agent text, reasoning folds, tool-call cards, peer-message bubbles). Header: member name + status dot (idle/running/gone) + role. A compact task board shows this member's owned tasks plus the unassigned pool, read from the shared team `TaskList`. No composer — the leader is the sole input face.
 
 > Source: `agent-ui/src/views/member_panel.rs`
+
+#### BrowserView
+
+A right-pane tab hosting an untrusted embedded native webview (`RightTab::Browser(BrowserTabId)`, an equal citizen of the right tab bar alongside `Editor` / `Member`). Chrome row is pure GPUI: back / forward buttons + a single-line address bar whose `Enter` navigates (re-submitting the current URL reloads). The content area is the native `WebViewElement` from `manox-webview`, which tracks the gpui layout via `set_bounds`. Built with `TrustMode::Untrusted`: only the closed-enum notify bridge and the inbound-write request bridge are injected — the page has no Tauri command surface. Tabs are opened via the `OpenBrowserTab` action (`cmd-b`) and closed via the tab's × affordance or `CloseBrowserTab` (`cmd-shift-b`, closes the active browser tab). `tab_id`s are process-unique and woven into the webview label so the host can route inbound notifications back to their tab.
+
+Two transient banners render between the chrome row and the content area, both driven by flags the `BrowserHost` sets on the view (cleared on navigation / resolution):
+
+- **Yield banner** — shown while a `web_explore_yield` call is parked. A "Done" button resolves the parked Task via `WorkspaceBrowserHost::resolve_handback` (the page-side `user_handback` notify is ignored by design — an untrusted page must not resume a parked yield). Retired by the "Done" click, by navigation, or by Stop/Error cleanup (`clear_yields_for_thread`).
+- **Read hint** — a muted one-liner shown after `read_text` / `read_dom` / `screenshot` / `eval_script` extracts content from an `https://` origin, signalling that logged-in page content was exposed to the agent.
+
+> Source: `agent-ui/src/views/browser_view.rs`
+
+#### InboundWriteOverlay
+
+A scrim + card modal mirroring the [ApprovalOverlay](#approvaloverlay), surfaced by `ThreadEvent::InboundAuthorization` when a built-in browser tab calls `window.__manox_request_write__`. Unlike outbound tool approval this axis is `ApprovalMode`-blind — a web page must never gain a write path because the agent runs in Yolo — so the overlay always shows and resolves through `Thread::respond_inbound`, not the outbound approval pipeline (`pending_auths` / `resolve_auth`). Stacked in `pending_inbounds` (LIFO); queued behind any open outbound approval overlay so only one modal shows at a time. Cleared on terminal `Stop` / `Error`.
+
+> Source: `agent-ui/src/workspace.rs`
 
 #### TeamChip
 

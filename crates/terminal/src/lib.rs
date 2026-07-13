@@ -11,9 +11,11 @@
 //! The terminal crate is pure logic and does not depend on gpui-component;
 //! the GPUI `Element` rendering layer lives in the `terminal-ui` crate.
 
+pub mod cx_session;
 pub mod event;
 pub mod mappings;
 pub mod pty;
+pub mod pty_source;
 pub mod settings;
 pub mod store;
 pub mod term;

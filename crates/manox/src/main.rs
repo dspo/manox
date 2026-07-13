@@ -165,6 +165,16 @@ fn main() {
             gpui::KeyBinding::new("ctrl-shift-t", agent_ui::FocusTerminal, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-shift-c", agent_ui::FocusConversation, None),
+            // Built-in browser. cmd-b opens a new browser tab in the right
+            // pane, cmd-shift-b closes the active browser tab.
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-b", agent_ui::OpenBrowserTab, None),
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-shift-b", agent_ui::CloseBrowserTab, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-b", agent_ui::OpenBrowserTab, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-shift-b", agent_ui::CloseBrowserTab, None),
             // Pop the last follow-up parked above the composer while a turn is
             // running (mirrors the per-item Remove affordance for the tail).
             #[cfg(target_os = "macos")]
@@ -295,6 +305,38 @@ fn main() {
                 }
             });
         });
+        cx.on_action(|_: &agent_ui::OpenBrowserTab, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        workspace.update(cx, |ws, cx| {
+                            ws.open_browser_tab(
+                                agent_ui::views::browser_view::DEFAULT_URL,
+                                window,
+                                cx,
+                            );
+                        });
+                    });
+                }
+            });
+        });
+        cx.on_action(|_: &agent_ui::CloseBrowserTab, cx: &mut App| {
+            let (workspace, handle) = (
+                agent_ui::dispatch::workspace_global(),
+                agent_ui::dispatch::window_global(),
+            );
+            cx.defer(move |cx| {
+                if let (Some(workspace), Some(handle)) = (workspace, handle) {
+                    let _ = handle.update(cx, |_, _window, cx| {
+                        workspace.update(cx, |ws, cx| ws.close_active_browser_tab(cx));
+                    });
+                }
+            });
+        });
 
         cx.set_menus(build_app_menus());
 
@@ -320,6 +362,19 @@ fn main() {
                 })
                 .expect("failed to open window");
             agent_ui::dispatch::set_window(handle);
+
+            // Wire the process-wide browser host: bind it to the main
+            // Workspace, register it in both the agent trait registry (so the
+            // `web_explore_*` tools reach it via `agent::webview_host::host()`)
+            // and the agent-ui concrete registry (so `BrowserView` attaches the
+            // notify/inbound bridges at build), then spawn the notify/inbound
+            // drainer on the Workspace — a notify ships through the OnceLock
+            // closure with no `&mut App`, so the drainer (which owns an
+            // `AsyncApp`) is the cx-bearing sink that emits onto the owning
+            // thread.
+            if let Some(workspace) = agent_ui::dispatch::workspace_global() {
+                agent_ui::browser_host::WorkspaceBrowserHost::install(workspace.clone(), cx);
+            }
 
             // MCP mode: serve the debug Harness over stdio on the tokio runtime,
             // bridged to the gpui-side dispatcher via an async_channel. The

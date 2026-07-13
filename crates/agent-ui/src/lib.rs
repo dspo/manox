@@ -3,9 +3,11 @@
 //! Workspace top-level view + `ConversationState` + views. Holds an
 //! `Entity<agent::Thread>` and subscribes to `ThreadEvent` for incremental rendering.
 
+pub mod browser_host;
 pub mod cockpit;
 pub mod conversation;
 pub mod dispatch;
+pub mod external_session;
 pub mod git_status;
 #[cfg(feature = "debug")]
 pub mod harness;
@@ -34,6 +36,8 @@ gpui::actions!(
         CloseTerminalTab,
         FocusTerminal,
         FocusConversation,
+        OpenBrowserTab,
+        CloseBrowserTab,
         CompletionUp,
         CompletionDown,
         CompletionConfirm,

@@ -36,18 +36,36 @@ pub struct CompletionsModel {
     /// Whether the endpoint is official OpenAI (api.openai.com) and thus
     /// eligible for `prompt_cache_retention:"24h"`.
     long_ttl: bool,
+    /// cx agent ids this model can drive (from the endpoint `agents:` list).
+    visible_agents: Vec<String>,
+}
+
+/// Construction inputs for [`CompletionsModel`]. Bundled into a struct so the
+/// builder stays under clippy's `too_many_arguments` threshold without an
+/// `#[allow]`, and so call sites name fields instead of counting positions.
+pub struct CompletionsModelConfig {
+    pub id: String,
+    pub name: String,
+    pub provider_name: String,
+    pub api_model_id: String,
+    pub endpoint_url: String,
+    pub api_key: String,
+    pub max_token_count: u64,
+    pub visible_agents: Vec<String>,
 }
 
 impl CompletionsModel {
-    pub fn new(
-        id: String,
-        name: String,
-        provider_name: String,
-        api_model_id: String,
-        endpoint_url: String,
-        api_key: String,
-        max_token_count: u64,
-    ) -> Self {
+    pub fn new(cfg: CompletionsModelConfig) -> Self {
+        let CompletionsModelConfig {
+            id,
+            name,
+            provider_name,
+            api_model_id,
+            endpoint_url,
+            api_key,
+            max_token_count,
+            visible_agents,
+        } = cfg;
         Self {
             id,
             name,
@@ -60,6 +78,7 @@ impl CompletionsModel {
             ),
             max_token_count,
             long_ttl: crate::provider::openai_long_ttl(&endpoint_url),
+            visible_agents,
         }
     }
 }
@@ -79,6 +98,9 @@ impl LanguageModel for CompletionsModel {
     }
     fn wire_api(&self) -> crate::provider::WireApi {
         crate::provider::WireApi::Completions
+    }
+    fn visible_agents(&self) -> &[String] {
+        &self.visible_agents
     }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
@@ -677,28 +699,30 @@ mod tests {
     /// minimum. Mirrors the anthropic wire's assertion.
     #[test]
     fn new_clamps_max_output_tokens_to_budget() {
-        let big = CompletionsModel::new(
-            "p/m/completions".into(),
-            "m[1m]".into(),
-            "p".into(),
-            "m".into(),
-            "https://example.invalid".into(),
-            "k".into(),
-            1024 * 1024,
-        );
+        let big = CompletionsModel::new(CompletionsModelConfig {
+            id: "p/m/completions".into(),
+            name: "m[1m]".into(),
+            provider_name: "p".into(),
+            api_model_id: "m".into(),
+            endpoint_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+            max_token_count: 1024 * 1024,
+            visible_agents: Vec::new(),
+        });
         assert_eq!(
             big.max_output_tokens,
             crate::provider::registry::MAX_OUTPUT_TOKENS_CAP
         );
-        let tiny = CompletionsModel::new(
-            "p/m/completions".into(),
-            "m".into(),
-            "p".into(),
-            "m".into(),
-            "https://example.invalid".into(),
-            "k".into(),
-            4_096,
-        );
+        let tiny = CompletionsModel::new(CompletionsModelConfig {
+            id: "p/m/completions".into(),
+            name: "m".into(),
+            provider_name: "p".into(),
+            api_model_id: "m".into(),
+            endpoint_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+            max_token_count: 4_096,
+            visible_agents: Vec::new(),
+        });
         assert_eq!(tiny.max_output_tokens, 8_192);
     }
 

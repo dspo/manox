@@ -374,6 +374,14 @@ pub trait LanguageModel: Send + Sync {
     fn provider_name(&self) -> String;
     fn wire_api(&self) -> WireApi;
 
+    /// cx agent ids this model can drive (`claude` / `codex` / `copilot` / …),
+    /// sourced from the provider config's endpoint `agents:` list. Empty means
+    /// no external-agent coupling — a plain manox-thread model. The new-session
+    /// wizard filters the model list by the chosen agent's id.
+    fn visible_agents(&self) -> &[String] {
+        &[]
+    }
+
     fn supports_thinking(&self) -> bool {
         false
     }
