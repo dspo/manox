@@ -215,6 +215,43 @@ async fn external_session_spawn_ok_live(cx: &mut gpui::TestAppContext) {
     drop(guard);
 }
 
+/// Live regression test for the `visible_agents` gap: the cascade wizard
+/// (`sidebar.rs::build_agent_model_cascade`) filters `registry::global().models()`
+/// by each model's `visible_agents()`. Before the cx-providers fix (cx PR #71),
+/// `visible_agents` was `endpoint.agents.clone()` — endpoint-only, dropping
+/// model-level `agents` — so a config that marks models via model-level `agents`
+/// (empty endpoint `agents`) yielded `visible_agents == []` for every model and
+/// the wizard showed "no model configured" for every agent. After the fix,
+/// `visible_agents` is `effective_agents_for_model(...)` (wire_api-compatible
+/// baseline, filtered by endpoint + model `agents`, empty = no restriction).
+/// This asserts at least one anthropic-wire model now lists `claude` in its
+/// `visible_agents` — the data contract the cascade wizard relies on. Gated by
+/// `MANOX_RUN_LIVE` (reads the real provider config).
+#[gpui::test]
+#[ignore = "live MANOX_RUN_LIVE required; reads real provider config"]
+async fn external_session_cascade_resolves_models_live(cx: &mut gpui::TestAppContext) {
+    if std::env::var("MANOX_RUN_LIVE").is_err() {
+        return;
+    }
+    let guard = setup(cx);
+    let claude_models = cx.update(|cx| {
+        registry::global()
+            .models()
+            .iter()
+            .filter(|m| {
+                m.visible_agents().iter().any(|a| a == "claude")
+                    && m.wire_api() == agent::provider::WireApi::Anthropic
+            })
+            .count()
+    });
+    assert!(
+        claude_models > 0,
+        "no anthropic-wire model lists `claude` in visible_agents — \
+         the cascade wizard would show \"no model\" for Claude Code"
+    );
+    drop(guard);
+}
+
 /// Live error path: emitting `SpawnExternalSession` against a provider that does
 /// not exist must not add a session (the spawn `Err` arm pushes a notification
 /// and returns before touching `external_sessions`). Asserts the sidebar stays
@@ -279,14 +316,15 @@ fn emit_spawn(
 /// provider/model `AgentBuilder` can spawn `claude` against (claude is an
 /// anthropic-wire agent).
 ///
-/// NOTE: this deliberately bypasses the cascade wizard's `visible_agents` filter.
-/// manox's `visible_agents` (cx-providers `from_config`, "manox semantics") only
-/// surfaces endpoint-level `agents`, dropping model-level `agents`; the user's
-/// config marks models via model-level `agents`, so `visible_agents` is currently
-/// empty across the registry and the cascade shows "no model" for every agent.
-/// That is a separate cx-providers gap (cx's own `effective_agents_for_model`
-/// unions endpoint + model agents; manox semantics do not) — a Phase 7 dogfood
-/// finding, not a spawn-lifecycle concern.
+/// Deliberately bypasses the cascade wizard's `visible_agents` filter so the
+/// spawn test is not coupled to the user's agent-marking config (it spawns
+/// against any anthropic-wire model, regardless of whether the config marks it
+/// for `claude`). The `visible_agents` data contract the cascade wizard relies
+/// on is locked separately by `external_session_cascade_resolves_models_live`.
+/// Historically that contract was broken — cx-providers `from_config` filled
+/// `visible_agents` with `endpoint.agents.clone()` (endpoint-only, dropping
+/// model-level `agents`), so the wizard showed "no model" for every agent.
+/// Fixed in cx PR #71 (rev `e2dd576`), which this Cargo.toml pins.
 fn first_anthropic_model() -> Option<(String, String)> {
     use agent::provider::WireApi;
     registry::global()

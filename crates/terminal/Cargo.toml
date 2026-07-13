@@ -34,5 +34,11 @@ cx.workspace = true
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 
+[features]
+# Enables `store::init_for_test` / `drop_for_test` so cross-crate harness tests
+# (agent-ui) can prime an in-memory `TerminalStore` and release it before
+# teardown. Mirrors agent's `test-support` feature.
+test-support = []
+
 [lints.clippy]
 dbg_macro = "deny"

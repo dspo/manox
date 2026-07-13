@@ -69,6 +69,11 @@ pub fn init(cx: &mut App) {
     // call). Runs after MCP so the registry is settled before the first
     // `main_registry` build picks up LSP tools.
     lsp::init();
+    // The store opens the real `threads.db` into an un-clearable `OnceLock`,
+    // which leaks the entity in the first test to call init. Tests use
+    // `thread_store::init_for_test` (a clearable `TEST_OVERRIDE`) instead, so
+    // skip the production init in test-support builds.
+    #[cfg(not(feature = "test-support"))]
     thread_store::init(cx);
     hashline::init();
     agent_def::init();

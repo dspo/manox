@@ -42,6 +42,7 @@ debug = []
 
 [dev-dependencies]
 agent = { workspace = true, features = ["test-support"] }
+terminal = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 
 [lints.clippy]

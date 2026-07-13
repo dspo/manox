@@ -30,6 +30,14 @@ impl EventEmitter<TerminalStoreEvent> for TerminalStore {}
 
 static GLOBAL: OnceLock<Entity<TerminalStore>> = OnceLock::new();
 
+/// Test-only override of the process-global `TerminalStore`. `init_for_test`
+/// stores an in-memory-db-backed entity here so persistence-bearing tests
+/// don't touch the real `~/.config/cx/manox/threads.db`; `drop_for_test`
+/// clears it so gpui's leaked-handle check at teardown doesn't trip on an
+/// entity held alive by a process-global `OnceLock`. Mirrors `thread_store`.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_OVERRIDE: std::sync::Mutex<Option<Entity<TerminalStore>>> = std::sync::Mutex::new(None);
+
 /// Open the db, load the session list, and register the global `Entity`. Call at App startup.
 pub fn init(cx: &mut App) {
     let path = default_db_path().expect("resolve threads.db path");
@@ -52,10 +60,38 @@ pub fn init(cx: &mut App) {
 
 /// Returns the global `TerminalStore` `Entity`. Panics if `init` was not called.
 pub fn global() -> Entity<TerminalStore> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(entity) = TEST_OVERRIDE.lock().unwrap().clone() {
+        return entity;
+    }
     GLOBAL
         .get()
         .expect("TerminalStore not initialized, call terminal::init first")
         .clone()
+}
+
+/// Test-only initializer that primes the process-global `TerminalStore` with a
+/// caller-provided db (typically `:memory:`) so persistence-bearing tests
+/// don't touch the real `~/.config/cx/manox/threads.db`. The override lives in
+/// `TEST_OVERRIDE` (not `GLOBAL`) precisely so `drop_for_test` can release the
+/// entity before teardown — a `OnceLock` can't be cleared, which would trip
+/// gpui's leaked-handle check. Pair every call with `drop_for_test`.
+#[cfg(any(test, feature = "test-support"))]
+pub fn init_for_test(db: Arc<ThreadsDatabase>, cx: &mut App) {
+    let summaries = db.list_terminal_sessions().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "load terminal sessions failed, starting empty");
+        Vec::new()
+    });
+    let entity = cx.new(|_cx| TerminalStore { db, summaries });
+    *TEST_OVERRIDE.lock().unwrap() = Some(entity);
+}
+
+/// Release the test-only `TerminalStore` entity so its gpui handle is dropped
+/// before `TestAppContext` tears down. Call this at the end of any test that
+/// used `init_for_test` (a Drop guard is the robust pattern).
+#[cfg(any(test, feature = "test-support"))]
+pub fn drop_for_test() {
+    *TEST_OVERRIDE.lock().unwrap() = None;
 }
 
 impl TerminalStore {
