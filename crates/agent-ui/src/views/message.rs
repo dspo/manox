@@ -599,9 +599,12 @@ pub fn render_assistant(
     v_flex()
         .group(format!("assistant-{ix}"))
         .w_full()
+        .min_w_0()
         .gap_1()
         .child(
             h_flex()
+                .w_full()
+                .min_w_0()
                 .gap_1()
                 .items_center()
                 .child(
@@ -618,13 +621,19 @@ pub fn render_assistant(
                     text.to_string(),
                 )),
         )
-        .child(render_text_body(
-            text,
-            streaming,
-            ("assistant", ix),
-            theme,
-            blocks,
-        ))
+        .child(
+            gpui::div()
+                .w_full()
+                .min_w_0()
+                .overflow_x_hidden()
+                .child(render_text_body(
+                    text,
+                    streaming,
+                    ("assistant", ix),
+                    theme,
+                    blocks,
+                )),
+        )
         .into_any_element()
 }
 
@@ -681,10 +690,13 @@ pub fn render_reasoning(
     let mut block = v_flex()
         .group(format!("reasoning-{ix}"))
         .w_full()
+        .min_w_0()
         .gap_1()
         .child(
             h_flex()
                 .id(("reasoning-header", ix))
+                .w_full()
+                .min_w_0()
                 .gap_1p5()
                 .items_center()
                 .cursor_pointer()
@@ -730,6 +742,9 @@ pub fn render_reasoning(
         let body = render_text_body(text, streaming, ("reasoning", ix), theme, blocks);
         block = block.child(
             gpui::div()
+                .w_full()
+                .min_w_0()
+                .overflow_x_hidden()
                 .pl_3()
                 .border_l_1()
                 .border_color(theme.border)
@@ -775,7 +790,14 @@ fn render_banner(
     collapsible: Option<CollapsibleBanner>,
 ) -> gpui::AnyElement {
     let group = group.into();
-    let mut left = h_flex().items_center().gap_1().text_xs().text_color(accent);
+    let mut left = h_flex()
+        .flex_1()
+        .min_w_0()
+        .overflow_x_hidden()
+        .items_center()
+        .gap_1()
+        .text_xs()
+        .text_color(accent);
     if let Some(c) = &collapsible {
         let chevron = if c.collapsed {
             IconName::ChevronRight
@@ -789,6 +811,7 @@ fn render_banner(
 
     let label_row = h_flex()
         .w_full()
+        .min_w_0()
         .justify_between()
         .items_center()
         .child(left)
@@ -817,6 +840,7 @@ fn render_banner(
     let mut card = v_flex()
         .group(group)
         .w_full()
+        .min_w_0()
         .gap_1()
         .px_3()
         .py_2()
@@ -826,6 +850,8 @@ fn render_banner(
     if show_body {
         card = card.child(
             gpui::div()
+                .w_full()
+                .min_w_0()
                 .text_sm()
                 .text_color(theme.foreground)
                 .child(body),
@@ -1081,6 +1107,8 @@ pub fn render_thinking(
 
     let mut header = h_flex()
         .id(("thinking-header", ix))
+        .w_full()
+        .min_w_0()
         .gap_1p5()
         .items_center()
         .cursor_pointer()
@@ -1120,14 +1148,18 @@ pub fn render_thinking(
                 .bg(theme.muted_foreground.opacity(0.5)),
         );
     }
-    if !summary.is_empty() {
-        header = header.child(gpui::div().child(summary));
-    }
-    header = header.child(gpui::div().flex_1());
+    header = header.child(
+        gpui::div()
+            .flex_1()
+            .min_w_0()
+            .overflow_x_hidden()
+            .child(summary),
+    );
 
     let mut block = v_flex()
         .group(format!("thinking-{ix}"))
         .w_full()
+        .min_w_0()
         .gap_1()
         .child(header);
 
@@ -1178,6 +1210,10 @@ fn render_activity_tree(
     let rail_color = theme.border.opacity(0.6);
 
     v_flex()
+        .w_full()
+        .min_w_0()
+        .overflow_x_hidden()
+        .debug_selector(|| format!("message-overflow-activity-tree-{cix}"))
         .pl_3()
         .gap_0()
         .children(
@@ -1207,6 +1243,7 @@ fn render_activity_entry(
         .h(px(1.))
         .bg(theme.border.opacity(0.6))
         .flex_shrink_0()
+        .mt_2()
         .ml_neg_1();
 
     let entry = match e {
@@ -1229,10 +1266,21 @@ fn render_activity_entry(
     };
 
     h_flex()
-        .items_center()
+        .w_full()
+        .min_w_0()
+        .overflow_x_hidden()
+        .debug_selector(|| format!("message-overflow-activity-entry-{cix}-{eix}"))
+        .items_start()
         .gap_1()
         .child(branch)
-        .child(entry)
+        .child(
+            gpui::div()
+                .flex_1()
+                .min_w_0()
+                .overflow_x_hidden()
+                .debug_selector(|| format!("message-overflow-activity-entry-body-{cix}-{eix}"))
+                .child(entry),
+        )
         .into_any_element()
 }
 
@@ -1254,10 +1302,11 @@ fn render_reasoning_entry(
     let label = format!("{} {}", i18n::t("message-reasoning"), eix + 1);
     let show_body = streaming || !collapsed;
 
-    let mut row = v_flex().flex_1().child(
+    let mut row = v_flex().w_full().min_w_0().flex_1().child(
         h_flex()
             .id(("reasoning-entry", eix))
             .w_full()
+            .min_w_0()
             .px_2()
             .py_0p5()
             .gap_1p5()
@@ -1308,6 +1357,7 @@ fn render_reasoning_entry(
                 gpui::div()
                     .flex_1()
                     .min_w_0()
+                    .overflow_x_hidden()
                     .text_xs()
                     .italic()
                     .text_color(theme.muted_foreground)
@@ -1318,6 +1368,8 @@ fn render_reasoning_entry(
     if show_body && !text.is_empty() {
         row = row.child(
             gpui::div()
+                .w_full()
+                .min_w_0()
                 .pl_6()
                 .py_1()
                 .text_xs()
@@ -1362,10 +1414,11 @@ fn render_tool_entry(
     let id_for_toggle = e.id.clone();
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
 
-    let mut row = v_flex().flex_1().italic().child(
+    let mut row = v_flex().w_full().min_w_0().flex_1().italic().child(
         h_flex()
             .id(("act-header", eix))
             .w_full()
+            .min_w_0()
             .px_2()
             .py_0p5()
             .gap_1p5()
@@ -1404,6 +1457,7 @@ fn render_tool_entry(
                 gpui::div()
                     .flex_1()
                     .min_w_0()
+                    .overflow_x_hidden()
                     .text_xs()
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)
@@ -1636,11 +1690,16 @@ fn render_ask_user_card(
     let can_next = step + 1 < total;
 
     let header = h_flex()
+        .w_full()
+        .min_w_0()
         .gap_2()
         .items_center()
         .justify_between()
         .child(
             h_flex()
+                .flex_1()
+                .min_w_0()
+                .overflow_x_hidden()
                 .gap_2()
                 .items_center()
                 .child(Icon::new(IconName::Info).small().text_color(theme.primary))
@@ -1658,6 +1717,8 @@ fn render_ask_user_card(
         );
 
     let question_row = h_flex()
+        .w_full()
+        .min_w_0()
         .gap_2()
         .items_center()
         .child(
@@ -1668,12 +1729,15 @@ fn render_ask_user_card(
         )
         .child(
             gpui::div()
+                .flex_1()
+                .min_w_0()
+                .overflow_x_hidden()
                 .text_sm()
                 .text_color(theme.foreground)
                 .child(snapshot.question.question.clone()),
         );
 
-    let mut options_block = v_flex().gap_1p5();
+    let mut options_block = v_flex().w_full().min_w_0().gap_1p5();
     for (oi, opt) in snapshot.question.options.iter().enumerate() {
         let selected = snapshot.selections.get(oi).copied().unwrap_or(false);
         let indicator_size = px(16.);
@@ -1717,6 +1781,8 @@ fn render_ask_user_card(
         };
         let weak_for_option = weak.clone();
         let option_row = h_flex()
+            .w_full()
+            .min_w_0()
             .gap_2()
             .items_start()
             .id(gpui::SharedString::from(format!(
@@ -1732,6 +1798,8 @@ fn render_ask_user_card(
             .child(
                 h_flex()
                     .flex_1()
+                    .min_w_0()
+                    .overflow_x_hidden()
                     .gap_1()
                     .items_center()
                     .child(
@@ -1837,6 +1905,7 @@ fn render_ask_user_card(
         ))
         .key_context("AskDrawer")
         .w_full()
+        .min_w_0()
         .gap_3()
         .p_3()
         .rounded(theme.radius)
@@ -1897,11 +1966,13 @@ pub fn render_tool_call(
     let mut card = v_flex()
         .group(format!("tool-{ix}"))
         .w_full()
+        .min_w_0()
         .italic()
         .child(
             h_flex()
                 .id(("tool-header", ix))
                 .w_full()
+                .min_w_0()
                 .px_2()
                 .py_1()
                 .gap_1p5()
@@ -1940,6 +2011,8 @@ pub fn render_tool_call(
                 .child(
                     gpui::div()
                         .flex_1()
+                        .min_w_0()
+                        .overflow_x_hidden()
                         .text_xs()
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.muted_foreground)
@@ -2042,6 +2115,8 @@ fn render_plan_card(
 
     let mut card = v_flex()
         .w_full()
+        .min_w_0()
+        .debug_selector(|| format!("message-overflow-plan-card-{ix}"))
         .rounded(theme.radius)
         .border_1()
         .border_color(theme.border)
@@ -2051,6 +2126,8 @@ fn render_plan_card(
             h_flex()
                 .id(("plan-header", ix))
                 .w_full()
+                .min_w_0()
+                .debug_selector(|| format!("message-overflow-plan-header-{ix}"))
                 .px_3()
                 .py_1p5()
                 .gap_2()
@@ -2092,6 +2169,9 @@ fn render_plan_card(
                 .child(
                     gpui::div()
                         .flex_1()
+                        .min_w_0()
+                        .overflow_x_hidden()
+                        .debug_selector(|| format!("message-overflow-plan-title-{ix}"))
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(theme.foreground)
@@ -2112,6 +2192,10 @@ fn render_plan_card(
     if show_body && !item.output.is_empty() {
         card = card.child(
             gpui::div()
+                .w_full()
+                .min_w_0()
+                .overflow_x_hidden()
+                .debug_selector(|| format!("message-overflow-plan-body-{ix}"))
                 .px_3()
                 .py_2()
                 .border_t_1()
@@ -2134,6 +2218,8 @@ fn render_plan_card(
         let weak_approve = tool_ctx.map(|c| c.weak.clone());
         card = card.child(
             h_flex()
+                .w_full()
+                .min_w_0()
                 .gap_2()
                 .justify_end()
                 .px_3()
@@ -2241,6 +2327,9 @@ fn render_tool_output(
 ) -> gpui::AnyElement {
     let container = gpui::div()
         .id(("tool-output", ix))
+        .w_full()
+        .min_w_0()
+        .debug_selector(|| format!("message-overflow-tool-output-{ix}"))
         .h(px(220.))
         .overflow_hidden()
         .px_3()
@@ -2271,13 +2360,18 @@ fn render_tool_output(
             .child(
                 gpui::div()
                     .id(("tool-output-vscroll", ix))
+                    .w_full()
                     .h_full()
                     .min_h_0()
+                    .min_w_0()
+                    .debug_selector(|| format!("message-overflow-tool-output-vscroll-{ix}"))
                     .overflow_y_scroll()
                     .child(
                         gpui::div()
                             .id(("tool-output-hscroll", ix))
+                            .w_full()
                             .min_w_0()
+                            .debug_selector(|| format!("message-overflow-tool-output-hscroll-{ix}"))
                             .overflow_x_scroll()
                             .children(display.split('\n').map(|line| {
                                 gpui::div().whitespace_nowrap().child(line.to_string())
@@ -2379,6 +2473,7 @@ pub fn render_agent_task(
     let mut card = v_flex()
         .group(format!("agent-{ix}"))
         .w_full()
+        .min_w_0()
         // A sub-agent task is tool-call kin, so its chrome and nested output
         // render as Lilex italic alongside tool-call cards.
         .italic()
@@ -2386,6 +2481,7 @@ pub fn render_agent_task(
             h_flex()
                 .id(("agent-header", ix))
                 .w_full()
+                .min_w_0()
                 .px_2()
                 .py_1()
                 .gap_1p5()
@@ -2412,6 +2508,8 @@ pub fn render_agent_task(
                 .child(
                     gpui::div()
                         .flex_1()
+                        .min_w_0()
+                        .overflow_x_hidden()
                         .text_xs()
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.muted_foreground)
@@ -2452,6 +2550,8 @@ pub fn render_agent_task(
         } else {
             card = card.child(
                 v_flex()
+                    .w_full()
+                    .min_w_0()
                     .border_t_1()
                     .border_color(theme.border)
                     .px_3()
@@ -2477,6 +2577,8 @@ fn render_agent_body(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
     let code = format!("```\n{text}\n```");
     gpui::div()
         .id(("agent-body", ix))
+        .w_full()
+        .min_w_0()
         .max_h(px(220.))
         .overflow_y_scroll()
         .px_3()
@@ -2941,6 +3043,9 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
 mod tests {
     use super::*;
     use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
+    use gpui::{
+        AnyWindowHandle, Bounds, Pixels, Render, TestAppContext, VisualTestContext, Window, size,
+    };
 
     /// A reloaded `exit_plan_mode` ToolUse with no paired ToolResult (plan was
     /// pending approval at save time) still renders the plan body, expanded —
@@ -3038,6 +3143,145 @@ mod tests {
         assert!(out.starts_with(&i18n::t("message-omitted-prefix").to_string()));
         // The retained tail must be valid UTF-8 (would have panicked before).
         assert!(out.contains('中'));
+    }
+
+    struct MessageOverflowProbe;
+
+    impl Render for MessageOverflowProbe {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let mut thinking = ThinkingContainer::new();
+            thinking.collapsed = false;
+            thinking.streaming = false;
+            thinking.entries.push(ActivityEntry::Reasoning {
+                text: "reasoning ".repeat(300),
+                streaming: false,
+                collapsed: false,
+                user_toggled: true,
+            });
+            thinking.entries.push(ActivityEntry::Tool(ToolCallItem {
+                id: "tool-long-final-output".into(),
+                name: "bash".into(),
+                title: "bash: a very long final command title that should never force the message list wider than its host".into(),
+                status: ToolCallStatus::Success,
+                output: format!("{}\n{}", "x".repeat(2048), "y".repeat(2048)),
+                is_error: false,
+                input: serde_json::json!({"command": "printf"}),
+                streaming: false,
+                collapsed: false,
+                user_toggled: true,
+            }));
+            thinking.entries.push(ActivityEntry::Tool(ToolCallItem {
+                id: "tool-long-streaming-output".into(),
+                name: "bash".into(),
+                title: "bash: a very long streaming command title that should keep horizontal scroll local".into(),
+                status: ToolCallStatus::Running,
+                output: format!("{}\n{}", "z".repeat(2048), "w".repeat(2048)),
+                is_error: false,
+                input: serde_json::json!({"command": "printf"}),
+                streaming: true,
+                collapsed: false,
+                user_toggled: true,
+            }));
+
+            let thinking_item = ConvItem::Thinking(thinking);
+            let plan_item = ConvItem::ToolCall(ToolCallItem {
+                id: "tool-long-plan".into(),
+                name: "exit_plan_mode".into(),
+                title: "Submit a very long plan title that should stay inside the message list width even when pending approval".into(),
+                status: ToolCallStatus::PendingApproval,
+                output: format!(
+                    "## Plan\n\n{}\n\n```text\n{}\n```",
+                    "ordinary plan prose ".repeat(200),
+                    "p".repeat(2048)
+                ),
+                is_error: false,
+                input: serde_json::json!({"plan": "test"}),
+                streaming: false,
+                collapsed: false,
+                user_toggled: true,
+            });
+            let theme = cx.theme().clone();
+            gpui::div()
+                .id("message-overflow-probe")
+                .w(px(260.))
+                .min_w_0()
+                .overflow_x_hidden()
+                .debug_selector(|| "message-overflow-host".into())
+                .child(
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .gap_2()
+                        .debug_selector(|| "message-overflow-item".into())
+                        .child(render_item(
+                            &thinking_item,
+                            0,
+                            "test-model",
+                            &theme,
+                            None,
+                            None,
+                            None,
+                        ))
+                        .child(render_item(
+                            &plan_item,
+                            1,
+                            "test-model",
+                            &theme,
+                            None,
+                            None,
+                            None,
+                        )),
+                )
+        }
+    }
+
+    fn assert_width_within(bounds: Bounds<Pixels>, max_width: Pixels, label: &str) {
+        assert!(
+            bounds.size.width <= max_width,
+            "{label} should stay within the narrow host, got {:?}",
+            bounds.size.width
+        );
+    }
+
+    #[gpui::test]
+    fn message_overflow_activity_tree_stays_within_narrow_width(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.open_window(size(px(320.), px(520.)), move |_, _| MessageOverflowProbe);
+        cx.run_until_parked();
+        let any: AnyWindowHandle = window.into();
+        let mut cx = VisualTestContext::from_window(any, cx);
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        for selector in [
+            "message-overflow-host",
+            "message-overflow-item",
+            "message-overflow-activity-tree-0",
+            "message-overflow-activity-entry-0-0",
+            "message-overflow-activity-entry-body-0-0",
+            "message-overflow-activity-entry-0-1",
+            "message-overflow-activity-entry-body-0-1",
+            "message-overflow-tool-output-1",
+            "message-overflow-activity-entry-0-2",
+            "message-overflow-activity-entry-body-0-2",
+            "message-overflow-tool-output-2",
+            "message-overflow-tool-output-vscroll-2",
+            "message-overflow-tool-output-hscroll-2",
+            "message-overflow-plan-card-1",
+            "message-overflow-plan-header-1",
+            "message-overflow-plan-title-1",
+            "message-overflow-plan-body-1",
+        ] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing debug bounds for {selector}"));
+            assert_width_within(bounds, px(260.), selector);
+        }
     }
 
     /// Helper: build a `MessageContent::ToolUse` for a tool name + JSON input.
