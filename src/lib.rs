@@ -19,8 +19,6 @@ use std::io::{self, Write as IoWrite};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
-use std::os::unix::net::UnixStream;
-#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(windows)]
 use std::os::windows::fs::{symlink_dir, symlink_file};
@@ -46,6 +44,22 @@ mod warp;
 /// Programmatic agent launch API (builder + live session handle).
 pub mod api;
 pub use api::{Agent, AgentBuilder, SessionHandle, SessionResult};
+
+/// Out-of-process message injection into a running session (`cx send` core).
+pub mod send;
+pub use send::{CLEAR_INPUT_BYTE, SendSelector, SendTarget, send};
+
+const SEND_AFTER_HELP: &str = "\
+示例:
+  cx send \"hi\"                                    注入到最近的 session
+  cx send --session claude \"hi\"                   注入到最近的 claude session
+  cx send --session <ID> \"hi\"                     按 session id 精确定位
+  cx send --session claude --clear-buffer          清空最近 claude session 的输入区
+  cx send --session claude --clear-buffer \"新任务\" 清空后覆盖写入并提交
+
+协议: 经 session socket 发送 line-JSON {\"text\":...}，relay 转写为 text + 回车。
+--clear-buffer 在 text 前拼接 Ctrl+U(0x15)，实测在 claude code 中可清空输入区。
+";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const LAUNCH_HOME_DIR_NAME: &str = "cx-launch-homes";
@@ -1116,18 +1130,16 @@ enum CxCommand {
         period: Option<String>,
     },
     /// 向运行中的 cx agent session 注入一条消息（当作用户输入提交）
+    #[command(after_help = SEND_AFTER_HELP)]
     Send {
-        /// 精确指定目标 session id
-        #[arg(long, value_name = "ID")]
+        /// 目标 session：<ID> 精确定位 / latest 最近一个 / claude|codex|copilot 取该 agent 最近一个
+        #[arg(long, value_name = "ID|latest|claude|codex|copilot")]
         session: Option<String>,
-        /// 按 agent 过滤（取最新）
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-        /// 选择最新启动的 session
+        /// 注入前先送 Ctrl+U(0x15) 清空输入区；text 为空=仅清空，非空=清空后覆盖写入并提交
         #[arg(long)]
-        latest: bool,
-        /// 要注入的文本
-        text: String,
+        clear_buffer: bool,
+        /// 要注入的文本（与 --clear-buffer 至少传其一）
+        text: Option<String>,
     },
 }
 
@@ -1151,9 +1163,8 @@ enum DispatchCommand {
     },
     Send {
         session: Option<String>,
-        agent: Option<String>,
-        latest: bool,
-        text: String,
+        clear_buffer: bool,
+        text: Option<String>,
     },
     Launch {
         args: Vec<String>,
@@ -1216,13 +1227,11 @@ fn dispatch_command(raw_args: &[String]) -> Result<DispatchCommand> {
             }),
             Some(CxCommand::Send {
                 session,
-                agent,
-                latest,
+                clear_buffer,
                 text,
             }) => Ok(DispatchCommand::Send {
                 session,
-                agent,
-                latest,
+                clear_buffer,
                 text,
             }),
             None => Ok(DispatchCommand::Launch {
@@ -1314,10 +1323,9 @@ pub fn run() -> Result<()> {
         }
         DispatchCommand::Send {
             session,
-            agent,
-            latest,
+            clear_buffer,
             text,
-        } => run_send(session, agent, latest, text),
+        } => run_send(session, clear_buffer, text),
         DispatchCommand::Launch { args, pty, socket } => {
             // `--` separated cx flags from agent args; the first arg, if it names a
             // known agent, is consumed as the hint and dropped from passthrough.
@@ -1384,59 +1392,10 @@ fn run_launcher(
 
 /// `cx send`：向运行中的 cx agent session 注入一条消息。
 ///
-/// 扫描 `~/.config/cx/sessions/*.json` 注册表，按选择器挑一个存活会话，
-/// 经其 Unix socket 发送 line-JSON `{"text": ...}`，由 relay 转写为 agent 输入。
-fn run_send(
-    session: Option<String>,
-    agent: Option<String>,
-    latest: bool,
-    text: String,
-) -> Result<()> {
-    let mut alive: Vec<_> = session::list_registries()
-        .into_iter()
-        .filter(|r| Path::new(&r.socket).exists() && session::socket_alive(Path::new(&r.socket)))
-        .collect();
-    if let Some(a) = &agent {
-        alive.retain(|r| &r.agent == a);
-    }
-    if let Some(id) = &session {
-        alive.retain(|r| &r.id == id);
-    }
-
-    let target = if session.is_some() || agent.is_some() {
-        alive
-            .into_iter()
-            .next()
-            .context("未找到匹配的活跃 session（用 `cx` 启动一个 agent 后再 send）")?
-    } else if latest {
-        alive.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-        alive
-            .into_iter()
-            .next()
-            .context("没有活跃 session（用 `cx` 启动一个 agent 后再 send）")?
-    } else if alive.len() == 1 {
-        alive.into_iter().next().unwrap()
-    } else if alive.is_empty() {
-        bail!("没有活跃 session（用 `cx` 启动一个 agent 后再 send）");
-    } else {
-        eprintln!("多个活跃 session，请指定目标：");
-        for r in &alive {
-            eprintln!(
-                "  --session {}  (agent={}, started={})",
-                r.id, r.agent, r.started_at
-            );
-        }
-        bail!("请用 --session <ID> / --agent <NAME> / --latest 指定目标");
-    };
-
-    let mut stream = UnixStream::connect(&target.socket)
-        .with_context(|| format!("连接 session socket 失败: {}", target.socket))?;
-    let line = serde_json::to_string(&serde_json::json!({ "text": text }))
-        .context("序列化注入消息失败")?;
-    stream
-        .write_all(format!("{line}\n").as_bytes())
-        .context("写入 session socket 失败")?;
-    stream.flush().context("flush session socket 失败")?;
+/// 薄封装：把 `--session` 字符串解析成 `SendSelector`，委托 `send::send` 完成扫描/连接/写入。
+fn run_send(session: Option<String>, clear_buffer: bool, text: Option<String>) -> Result<()> {
+    let selector = send::parse_selector(session.as_deref());
+    let target = send::send(&selector, text.as_deref(), clear_buffer)?;
     println!("已注入到 session {} ({})", target.id, target.agent);
     Ok(())
 }

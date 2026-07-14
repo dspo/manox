@@ -361,6 +361,19 @@ impl SessionHandle {
             .map_err(|_| anyhow!("agent 已退出，写入失败"))
     }
 
+    /// Clear the agent's current input area. Sends Ctrl+U then enter; an empty
+    /// submit is ignored by claude code, so the net effect is a cleared box.
+    /// Equivalent to `cx send --clear-buffer` (no text).
+    pub fn clear_buffer(&self) -> Result<()> {
+        self.write(crate::send::CLEAR_INPUT)
+    }
+
+    /// Clear the input area, then overwrite it with `text` and submit. Equivalent
+    /// to `cx send --clear-buffer <text>`.
+    pub fn write_over(&self, text: &str) -> Result<()> {
+        self.write(&format!("{}{text}", crate::send::CLEAR_INPUT))
+    }
+
     /// Write raw bytes to the agent's PTY master verbatim — no trailing
     /// newline. A library host driving the agent's TUI keystroke-by-keystroke
     /// (arrow keys, Ctrl+C, paste) uses this; `write` is for line-based
