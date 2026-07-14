@@ -1058,9 +1058,11 @@ fn disclosure_icon(collapsed: bool, theme: &Theme) -> gpui::AnyElement {
 }
 
 /// Render one activity segment as a compact summary header over an expandable
-/// tree of reasoning rounds and tool calls. The header shows aggregated counts
-/// ("思考了 2 轮次 · 读取了 3 个文件 · 执行了 5 次工具调用 · 28 秒") and
-/// toggles between summary-only and full tree view.
+/// visual tree of reasoning rounds and tool calls. The header shows aggregated
+/// counts ("思考了 2 轮次 · 读取了 3 个文件 · 执行了 5 次工具调用 · 28 秒")
+/// and toggles between summary-only and full tree view. The tree itself uses a
+/// thin left rail with short branch connectors drawn via GPUI layout, replacing
+/// the older Unicode `├─`/`└─` characters.
 ///
 /// Collapsed visibility rules:
 /// - frozen + collapsed: only the summary header.
@@ -1130,7 +1132,6 @@ pub fn render_thinking(
         .child(header);
 
     // Determine visible entries based on collapse state.
-    let total = t.entries.len();
     let visible: Vec<(usize, &ActivityEntry)> = if !t.collapsed {
         t.entries.iter().enumerate().collect()
     } else if t.streaming {
@@ -1157,33 +1158,58 @@ pub fn render_thinking(
     };
 
     if !visible.is_empty() {
-        block = block.child(
-            v_flex().pl_3().gap_0p5().children(
-                visible
-                    .into_iter()
-                    .map(|(eix, e)| render_activity_entry(e, eix, total, ix, theme, tool_ctx)),
-            ),
-        );
+        // Wrap visible entries in a rail-and-branch tree structure: a thin
+        // left border (the "rail") with each entry drawing a short horizontal
+        // branch connector via GPUI layout rather than Unicode `├─`/`└─`.
+        block = block.child(render_activity_tree(&visible, ix, theme, tool_ctx));
     }
     block.into_any_element()
 }
 
-/// Tree connector prefix for an entry at position `eix` out of `total`.
-/// Last entry gets `└─`, others get `├─`.
-fn tree_line(eix: usize, total: usize) -> &'static str {
-    if eix + 1 == total { "└─" } else { "├─" }
-}
-
-/// Dispatch rendering for one activity entry (reasoning or tool).
-fn render_activity_entry(
-    e: &ActivityEntry,
-    eix: usize,
-    total: usize,
+/// Render the activity entries inside a visual tree: a thin left rail with
+/// short horizontal branch connectors for each entry. Replaces the old
+/// Unicode `├─`/`└─` prefix with proper GPUI layout elements.
+fn render_activity_tree(
+    visible: &[(usize, &ActivityEntry)],
     cix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
-    match e {
+    let rail_color = theme.border.opacity(0.6);
+
+    v_flex()
+        .pl_3()
+        .gap_0()
+        .children(
+            visible
+                .iter()
+                .map(|(eix, e)| render_activity_entry(e, *eix, cix, theme, tool_ctx)),
+        )
+        .border_l_1()
+        .border_color(rail_color)
+        .ml_1()
+        .into_any_element()
+}
+
+/// Dispatch rendering for one activity entry (reasoning or tool). Each entry
+/// gets a short horizontal branch connector drawn with GPUI layout, replacing
+/// the old Unicode `├─`/`└─` prefix.
+fn render_activity_entry(
+    e: &ActivityEntry,
+    eix: usize,
+    cix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+) -> gpui::AnyElement {
+    // Short horizontal branch connector from the rail to the entry content.
+    let branch = gpui::div()
+        .w(px(8.))
+        .h(px(1.))
+        .bg(theme.border.opacity(0.6))
+        .flex_shrink_0()
+        .ml_neg_1();
+
+    let entry = match e {
         ActivityEntry::Reasoning {
             text,
             streaming,
@@ -1195,17 +1221,24 @@ fn render_activity_entry(
             *collapsed,
             *user_toggled,
             eix,
-            total,
             cix,
             theme,
             tool_ctx,
         ),
-        ActivityEntry::Tool(tool) => render_tool_entry(tool, eix, total, theme, tool_ctx),
-    }
+        ActivityEntry::Tool(tool) => render_tool_entry(tool, eix, theme, tool_ctx),
+    };
+
+    h_flex()
+        .items_center()
+        .gap_1()
+        .child(branch)
+        .child(entry)
+        .into_any_element()
 }
 
-/// Render a reasoning round entry in the activity tree: a collapsible row
-/// labeled "思考 #N" that expands to show the raw thinking text.
+/// Render a reasoning round entry in the activity tree: a lightweight node
+/// labeled "思考 #N" that expands to show the raw thinking text. No card
+/// chrome — just a subtle hover affordance and muted styling.
 #[allow(clippy::too_many_arguments)]
 fn render_reasoning_entry(
     text: &str,
@@ -1213,7 +1246,6 @@ fn render_reasoning_entry(
     collapsed: bool,
     _user_toggled: bool,
     eix: usize,
-    total: usize,
     cix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
@@ -1222,7 +1254,7 @@ fn render_reasoning_entry(
     let label = format!("{} {}", i18n::t("message-reasoning"), eix + 1);
     let show_body = streaming || !collapsed;
 
-    let mut row = v_flex().w_full().child(
+    let mut row = v_flex().flex_1().child(
         h_flex()
             .id(("reasoning-entry", eix))
             .w_full()
@@ -1232,7 +1264,7 @@ fn render_reasoning_entry(
             .items_center()
             .rounded(theme.radius)
             .cursor_pointer()
-            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+            .hover(|s| s.bg(theme.secondary.opacity(0.3)))
             .on_click(move |_, _window, cx: &mut App| {
                 let Some(weak) = weak_workspace.clone() else {
                     return;
@@ -1263,11 +1295,6 @@ fn render_reasoning_entry(
                 });
             })
             .child(disclosure_icon(collapsed, theme))
-            .child(
-                gpui::div()
-                    .text_color(theme.muted_foreground)
-                    .child(tree_line(eix, total)),
-            )
             .child(
                 Icon::new(if streaming {
                     IconName::LoaderCircle
@@ -1304,12 +1331,12 @@ fn render_reasoning_entry(
     row.into_any_element()
 }
 
-/// Render a tool entry in the activity tree: the existing `⎿` row with
-/// tree-line prefix, status icon, and expandable output.
+/// Render a tool entry in the activity tree: a compact execution node with
+/// status icon, tool name, and expandable output. No card chrome — just a
+/// lightweight row with a subtle hover affordance.
 fn render_tool_entry(
     e: &ToolCallItem,
     eix: usize,
-    total: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
 ) -> gpui::AnyElement {
@@ -1335,7 +1362,7 @@ fn render_tool_entry(
     let id_for_toggle = e.id.clone();
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
 
-    let mut row = v_flex().w_full().italic().child(
+    let mut row = v_flex().flex_1().italic().child(
         h_flex()
             .id(("act-header", eix))
             .w_full()
@@ -1345,7 +1372,7 @@ fn render_tool_entry(
             .items_center()
             .rounded(theme.radius)
             .cursor_pointer()
-            .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+            .hover(|s| s.bg(theme.secondary.opacity(0.3)))
             .on_click(move |_, _window, cx: &mut App| {
                 let Some(weak) = weak_workspace.clone() else {
                     return;
@@ -1372,11 +1399,6 @@ fn render_tool_entry(
                 });
             })
             .child(disclosure_icon(e.collapsed, theme))
-            .child(
-                gpui::div()
-                    .text_color(theme.muted_foreground)
-                    .child(tree_line(eix, total)),
-            )
             .child(Icon::new(status_icon).xsmall().text_color(status_color))
             .child(
                 gpui::div()
