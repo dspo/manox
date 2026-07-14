@@ -258,6 +258,26 @@ impl Sidebar {
         self.new_session_project = None;
     }
 
+    /// Build the new-session dropdown anchored below the `+` button that
+    /// opened it. Deferred so it paints above sibling rows; `top_full()` is
+    /// 100% of the wrapping `.relative()` div, so the menu sits just under the
+    /// button rather than at the sidebar's bottom edge.
+    fn render_new_session_dropdown(&self, id: SharedString) -> Option<AnyElement> {
+        self.new_session_menu.clone().map(|menu| {
+            deferred(
+                gpui::div()
+                    .id(id)
+                    .absolute()
+                    .top_full()
+                    .right_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .with_priority(1)
+            .into_any_element()
+        })
+    }
+
     /// Mark the currently selected thread id (back-filled by Workspace on switch/new, for highlight).
     pub fn set_selected(&mut self, id: Option<String>, cx: &mut Context<Self>) {
         if self.selected == id {
@@ -324,27 +344,46 @@ impl Sidebar {
                     .child(name),
             )
             .child(
-                Button::new(format!("new-thread-in-project-{key}"))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Plus)
-                    .tooltip(i18n::t("sidebar-new-chat"))
-                    .on_click(cx.listener({
-                        let path = path.to_string();
-                        move |this, _ev, window, cx| {
-                            cx.stop_propagation();
-                            if this.new_session_open {
-                                this.close_new_session_menu();
-                            } else {
-                                this.open_new_session_menu(
-                                    Some(PathBuf::from(path.clone())),
-                                    window,
-                                    cx,
-                                );
-                            }
-                            cx.notify();
-                        }
-                    })),
+                gpui::div()
+                    .relative()
+                    .child(
+                        Button::new(format!("new-thread-in-project-{key}"))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Plus)
+                            .tooltip(i18n::t("sidebar-new-chat"))
+                            .on_click(cx.listener({
+                                let path = path.to_string();
+                                move |this, _ev, window, cx| {
+                                    cx.stop_propagation();
+                                    if this.new_session_open {
+                                        this.close_new_session_menu();
+                                    } else {
+                                        this.open_new_session_menu(
+                                            Some(PathBuf::from(path.clone())),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    // Only render the dropdown here when the menu was opened
+                    // from *this* project folder's `+` button, so the menu
+                    // anchors below the clicked button instead of the
+                    // Conversations header's `+`.
+                    .children(
+                        (self.new_session_open
+                            && self.new_session_project.as_deref()
+                                == Some(std::path::Path::new(path)))
+                        .then(|| {
+                            self.render_new_session_dropdown(
+                                format!("new-session-dropdown-{path}").into(),
+                            )
+                        })
+                        .flatten(),
+                    ),
             )
             .on_click(cx.listener({
                 let path = path.to_string();
@@ -502,6 +541,18 @@ impl Render for Sidebar {
                                             cx.notify();
                                         })),
                                 )
+                                // Dropdown is deferred inside this relative wrapper so it paints
+                                // after sibling rows (z-order) while staying positioned just below
+                                // the button (`top_full()` is 100% of this wrapper's height).
+                                .children(
+                                    (self.new_session_open && self.new_session_project.is_none())
+                                        .then(|| {
+                                            self.render_new_session_dropdown(
+                                                "new-session-dropdown".into(),
+                                            )
+                                        })
+                                        .flatten(),
+                                )
                                 .into_any_element(),
                         ),
                     ))
@@ -532,23 +583,6 @@ impl Render for Sidebar {
                         }),
                     )),
             )
-            // Render the new-session dropdown outside the scrollable body so it
-            // is not clipped by `overflow_y_scroll`. `deferred` + `with_priority(1)`
-            // paints it after the whole sidebar tree, floating above the scroll
-            // container — same pattern as ContextRail's branch dropdown.
-            .children(self.new_session_menu.clone().map(|menu| {
-                deferred(
-                    gpui::div()
-                        .id("new-session-dropdown")
-                        .absolute()
-                        .top_full()
-                        .right_0()
-                        .occlude()
-                        .child(menu),
-                )
-                .with_priority(1)
-                .into_any_element()
-            }))
     }
 }
 

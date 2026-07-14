@@ -5345,8 +5345,10 @@ impl Render for Workspace {
         // External agent CLI session: render the active session's terminal TUI
         // in place of the conversation. Mirrors the Terminal branch — sidebar on
         // the left, a TitleBar + the terminal filling the main column — but the
-        // bar shows the agent kind + provider/model and a `×` that kills the
-        // session and removes it from the sidebar.
+        // bar shows only the agent kind label (e.g. "Claude Code"). The
+        // provider/model picked at spawn is intentionally omitted: the user can
+        // switch models mid-session inside the TUI (`/model`), and manox cannot
+        // observe that change, so showing the spawn-time model would mislead.
         if matches!(self.view_mode, ViewMode::ExternalSession) {
             let theme = cx.theme().clone();
             let active = self
@@ -5362,7 +5364,6 @@ impl Render for Workspace {
             };
             let kind = session.kind;
             let title = session.kind.label();
-            let subtitle = format!("{} · {}", session.provider_name, session.model_id);
             let terminal = session.terminal_view.clone();
             let close_id = session.id.clone();
             return h_flex()
@@ -5406,13 +5407,7 @@ impl Render for Workspace {
                                             .flex_1()
                                             .min_w_0()
                                             .truncate()
-                                            .child(title)
-                                            .child(
-                                                gpui::div()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child(subtitle),
-                                            ),
+                                            .child(title),
                                     )
                                     .child(
                                         Button::new("close-external")
