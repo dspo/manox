@@ -67,9 +67,9 @@ enum AnimRole {
 
 /// A row in the Conversations list — either a manox thread or an external
 /// agent CLI session, unified so the two can be merged and ordered by recency
-/// instead of living in separate sections. External rows do not participate
-/// in the selection-slide (they have no `ThreadSummary` and are not part of
-/// the slide's flat-id ordering); their renderer ignores `SlideCtx`.
+/// instead of living in separate sections. Both row kinds share the
+/// selection-slide: their ids join one `flat_ids` ordering and `render_thread_item`
+/// applies the same `SlideCtx` wash to either.
 enum SidebarRow {
     Thread(agent::ThreadSummary),
     External(crate::external_session::ExternalSessionSummary),

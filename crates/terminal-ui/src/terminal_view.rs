@@ -289,9 +289,7 @@ impl TerminalView {
             });
             return;
         }
-        if lines != 0 {
-            self.terminal.update(cx, |t, cx| t.scroll(lines, cx));
-        }
+        self.terminal.update(cx, |t, cx| t.scroll(lines, cx));
     }
 
     /// Map an element-relative pixel position to `(row, col)` grid coords by
