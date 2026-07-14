@@ -486,6 +486,7 @@ impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let summaries = self.store.read(cx).summaries().to_vec();
+        let known_projects = self.store.read(cx).known_projects().to_vec();
         let selected = self.selected.clone();
         let store = self.store.clone();
 
@@ -498,6 +499,14 @@ impl Render for Sidebar {
                 entry.1.push(s.clone());
             } else {
                 projects.push((s.project.clone(), vec![s.clone()]));
+            }
+        }
+        // Merge registered projects that have no active threads — they still
+        // appear as empty folders so the user can start a new conversation
+        // in the project without losing the folder reference.
+        for kp in &known_projects {
+            if !projects.iter().any(|(p, _)| p == kp) {
+                projects.push((kp.clone(), Vec::new()));
             }
         }
         // External sessions not bound to a project stay in the loose

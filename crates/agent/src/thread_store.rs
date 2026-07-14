@@ -31,6 +31,10 @@ pub enum ThreadStoreEvent {
 pub struct ThreadStore {
     db: Arc<ThreadsDatabase>,
     summaries: Vec<ThreadSummary>,
+    /// Project paths registered in the `projects` table. The sidebar renders
+    /// a folder for every path here, even when no active thread references it,
+    /// so projects persist across archival of all their threads.
+    known_projects: Vec<String>,
     /// Thread ids currently running a turn. Multiple threads can run concurrently;
     /// the sidebar shows a running indicator on every row whose id is in this set.
     running: HashSet<String>,
@@ -57,13 +61,28 @@ pub fn init(cx: &mut App) {
         tracing::warn!(error = %e, "Failed to load thread summaries, starting with empty list");
         Vec::new()
     });
+    // Load known projects from the `projects` table. On first run (empty table),
+    // seed from existing thread summaries so the sidebar immediately shows
+    // projects the user already has threads for.
+    let mut known_projects = db.list_projects().unwrap_or_default();
+    if known_projects.is_empty() {
+        let mut seen = HashSet::new();
+        for s in &summaries {
+            if !s.project.is_empty() && seen.insert(s.project.clone()) {
+                known_projects.push(s.project.clone());
+                let _ = db.register_project(&s.project);
+            }
+        }
+    }
     tracing::info!(
         count = summaries.len(),
+        projects = known_projects.len(),
         "ThreadStore initialized, loaded thread summaries"
     );
     let entity = cx.new(|_cx| ThreadStore {
         db: Arc::new(db),
         summaries,
+        known_projects,
         running: HashSet::new(),
     });
     let _ = GLOBAL.set(entity);
@@ -84,6 +103,34 @@ pub fn global() -> Entity<ThreadStore> {
 impl ThreadStore {
     pub fn summaries(&self) -> &[ThreadSummary] {
         &self.summaries
+    }
+
+    /// All registered project paths. The sidebar iterates this to render
+    /// project folders, regardless of whether each has active threads.
+    pub fn known_projects(&self) -> &[String] {
+        &self.known_projects
+    }
+
+    /// Register a project path in both the in-memory list and the db.
+    /// Idempotent: no-ops if the path is already known.
+    pub fn register_project(&mut self, path: String, cx: &mut Context<Self>) {
+        if path.is_empty() || self.known_projects.contains(&path) {
+            return;
+        }
+        self.known_projects.push(path.clone());
+        cx.emit(ThreadStoreEvent::SummariesUpdated);
+        cx.notify();
+        let db = self.db.clone();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { db.register_project(&path) })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "Failed to register project");
+            }
+        })
+        .detach();
     }
 
     /// Whether the given thread id is currently running a turn.
@@ -356,6 +403,12 @@ pub fn save_thread(thread: Entity<Thread>, touch: bool, cx: &mut App) {
     let Some(rec) = thread.read(cx).snapshot() else {
         return;
     };
+    // Register the thread's project so the sidebar retains the folder even
+    // when all threads in that project are archived.
+    if !rec.project.is_empty() {
+        let project = rec.project.clone();
+        store.update(cx, |s, cx| s.register_project(project, cx));
+    }
     cx.spawn(async move |cx: &mut AsyncApp| {
         let db = db;
         let res = cx
@@ -385,6 +438,7 @@ pub fn init_for_test(db: Arc<ThreadsDatabase>, cx: &mut App) {
     let entity = cx.new(|_cx| ThreadStore {
         db,
         summaries: Vec::new(),
+        known_projects: Vec::new(),
         running: HashSet::new(),
     });
     *TEST_OVERRIDE.lock().unwrap() = Some(entity);
