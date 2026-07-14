@@ -736,7 +736,7 @@ impl Workspace {
                         // and dismisses stranded inbound-write overlays whose
                         // decision oneshot the thread just dropped.
                         if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
-                            host.clear_yields_for_thread(&this.thread, cx);
+                            host.clear_yields_for_thread(this, cx);
                         }
                         this.pending_inbounds.clear();
                         let thread_id = this.thread.read(cx).id.0.clone();
@@ -843,7 +843,7 @@ impl Workspace {
                         // browser yields + stranded inbound overlays so an
                         // aborted turn leaves no stale banner behind.
                         if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
-                            host.clear_yields_for_thread(&this.thread, cx);
+                            host.clear_yields_for_thread(this, cx);
                         }
                         this.pending_inbounds.clear();
                         this.context_rail.update(cx, |r, cx| {
