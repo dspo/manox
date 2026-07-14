@@ -203,6 +203,22 @@ pub struct ModelConfig {
     pub agents: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Maximum tokens a single response may emit. When unset, the consumer
+    /// derives a heuristic from the context window.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// Model context window size in tokens. Numeric counterpart to the display
+    /// `context` string; takes precedence for request sizing when present.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    /// Whether the model accepts tool definitions. Defaults to `true` at
+    /// resolution time so existing reasoning/chat models keep tool access.
+    #[serde(default)]
+    pub supports_tools: Option<bool>,
+    /// Whether the model can ingest image content. Defaults to `false` at
+    /// resolution time so models must opt in to vision.
+    #[serde(default)]
+    pub supports_images: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -221,6 +237,14 @@ pub struct ProviderModelConfig {
     pub agents: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub supports_tools: Option<bool>,
+    #[serde(default)]
+    pub supports_images: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -273,6 +297,10 @@ impl ProviderConfig {
                         wire_apis: model.wire_apis.clone(),
                         agents: model.agents.clone(),
                         env: model.env.clone(),
+                        max_output_tokens: model.max_output_tokens,
+                        max_tokens: model.max_tokens,
+                        supports_tools: model.supports_tools,
+                        supports_images: model.supports_images,
                     })
                     .collect();
 
@@ -311,6 +339,18 @@ pub struct ResolvedModel {
     pub env: BTreeMap<String, String>,
     /// apikey resolution source from the provider (`keychain:SERVICE` / `env:VAR` / `literal:` / `$(shell ...)`).
     pub apikey_source: Option<String>,
+    /// Maximum tokens a single response may emit. `None` = consumer derives
+    /// a heuristic from the context window.
+    pub max_output_tokens: Option<u64>,
+    /// Model context window size in tokens. `None` = consumer falls back to the
+    /// `context` display string or id bracket suffix.
+    pub max_tokens: Option<u64>,
+    /// Whether the model accepts tool definitions. `true` when the model did
+    /// not opt out, so existing models keep tool access by default.
+    pub supports_tools: bool,
+    /// Whether the model can ingest image content. `false` unless the model
+    /// opts in, so models must declare vision explicitly.
+    pub supports_images: bool,
 }
 
 impl ResolvedModel {
@@ -355,6 +395,10 @@ impl ResolvedModel {
             copilot_auth: CopilotAuth::from_endpoint(endpoint),
             env: merged_env,
             apikey_source: provider.apikey_source.clone(),
+            max_output_tokens: model.max_output_tokens,
+            max_tokens: model.max_tokens,
+            supports_tools: model.supports_tools.unwrap_or(true),
+            supports_images: model.supports_images.unwrap_or(false),
         }
     }
 
@@ -1142,5 +1186,57 @@ agents:
             vec!["claude".to_string()],
             "endpoint agents: [claude] restricts the effective set to [claude]"
         );
+    }
+
+    /// Explicit capability/sizing fields on a model flow through to the
+    /// resolved model verbatim, so manox can read ground-truth modality and
+    /// token budgets instead of relying on model self-report or heuristics.
+    #[test]
+    fn resolve_propagates_capability_fields() {
+        let yaml = r#"
+providers:
+- name: test
+  models:
+    m1:
+      wire_apis: [anthropic]
+      max_output_tokens: 8192
+      max_tokens: 200000
+      supports_tools: false
+      supports_images: true
+  endpoints:
+    anthropic:
+      url: https://example.com
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].max_output_tokens, Some(8192));
+        assert_eq!(resolved[0].max_tokens, Some(200_000));
+        assert!(!resolved[0].supports_tools);
+        assert!(resolved[0].supports_images);
+    }
+
+    /// Omitted capability fields resolve to safe defaults: tools on (existing
+    /// reasoning/chat models keep tool access), images off (models opt in to
+    /// vision), token budgets unset (consumer derives from context/suffix).
+    #[test]
+    fn resolve_defaults_capability_fields() {
+        let yaml = r#"
+providers:
+- name: test
+  models:
+    m1:
+      wire_apis: [anthropic]
+  endpoints:
+    anthropic:
+      url: https://example.com
+"#;
+        let config: CxConfig = yaml.parse().expect("parse");
+        let resolved = config.resolve_all_models();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].max_output_tokens, None);
+        assert_eq!(resolved[0].max_tokens, None);
+        assert!(resolved[0].supports_tools, "tools default on");
+        assert!(!resolved[0].supports_images, "images default off");
     }
 }

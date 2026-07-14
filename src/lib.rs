@@ -160,6 +160,10 @@ fn resolved_model_from_config(
         copilot_auth: CopilotAuth::from_endpoint(endpoint),
         env: merged_env,
         apikey_source: provider.apikey_source.clone(),
+        max_output_tokens: model.max_output_tokens,
+        max_tokens: model.max_tokens,
+        supports_tools: model.supports_tools.unwrap_or(true),
+        supports_images: model.supports_images.unwrap_or(false),
     }
 }
 
@@ -2811,6 +2815,7 @@ fn collect_model_draft(
             wire_apis: vec![wire_api.display().to_string()],
             agents: model_agents,
             env: BTreeMap::new(),
+            ..Default::default()
         },
     )))
 }
@@ -4001,6 +4006,10 @@ mod tests {
             copilot_auth: CopilotAuth::ApiKey,
             env: BTreeMap::new(),
             apikey_source: None,
+            max_output_tokens: None,
+            max_tokens: None,
+            supports_tools: true,
+            supports_images: false,
         }
     }
 
@@ -4019,6 +4028,7 @@ mod tests {
                         wire_apis: vec![],
                         agents: Vec::new(),
                         env: BTreeMap::new(),
+                        ..Default::default()
                     },
                 )]),
                 endpoints: BTreeMap::from([
@@ -4348,6 +4358,10 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: BTreeMap::new(),
                 apikey_source: None,
+                max_output_tokens: None,
+                max_tokens: None,
+                supports_tools: true,
+                supports_images: false,
             }),
             injected_models: Vec::new(),
         };
@@ -4418,6 +4432,10 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: BTreeMap::new(),
                 apikey_source: None,
+                max_output_tokens: None,
+                max_tokens: None,
+                supports_tools: true,
+                supports_images: false,
             }),
             injected_models: Vec::new(),
         };
@@ -4461,6 +4479,10 @@ mod tests {
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
                 apikey_source: None,
+                max_output_tokens: None,
+                max_tokens: None,
+                supports_tools: true,
+                supports_images: false,
             }),
             injected_models: Vec::new(),
         };
@@ -4513,6 +4535,10 @@ mod tests {
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
                 apikey_source: None,
+                max_output_tokens: None,
+                max_tokens: None,
+                supports_tools: true,
+                supports_images: false,
             }),
             injected_models: Vec::new(),
         };
@@ -4557,6 +4583,10 @@ mod tests {
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
                 apikey_source: None,
+                max_output_tokens: None,
+                max_tokens: None,
+                supports_tools: true,
+                supports_images: false,
             }),
             injected_models: Vec::new(),
         };
@@ -4656,6 +4686,10 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: model_env,
                 apikey_source: None,
+                max_output_tokens: None,
+                max_tokens: None,
+                supports_tools: true,
+                supports_images: false,
             }),
             injected_models: Vec::new(),
         };
@@ -4704,6 +4738,10 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: model_env,
                 apikey_source: None,
+                max_output_tokens: None,
+                max_tokens: None,
+                supports_tools: true,
+                supports_images: false,
             }),
             injected_models: Vec::new(),
         };
@@ -4789,6 +4827,10 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: merged_env,
                 apikey_source: None,
+                max_output_tokens: None,
+                max_tokens: None,
+                supports_tools: true,
+                supports_images: false,
             }),
             injected_models: Vec::new(),
         };
@@ -4823,6 +4865,7 @@ mod tests {
                     wire_apis: vec![],
                     agents: Vec::new(),
                     env: model_only_env,
+                    ..Default::default()
                 },
             )]),
             endpoints: BTreeMap::from([(
@@ -5096,6 +5139,7 @@ mod tests {
                     wire_apis: vec!["responses".into()],
                     agents: vec!["codex".into()],
                     env: BTreeMap::new(),
+                    ..Default::default()
                 },
             },
         )
@@ -5139,6 +5183,7 @@ mod tests {
                         wire_apis: vec!["anthropic".into()],
                         agents: Vec::new(),
                         env: BTreeMap::new(),
+                        ..Default::default()
                     },
                 )]),
                 endpoints: BTreeMap::from([(
