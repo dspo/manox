@@ -673,6 +673,9 @@ pub(crate) fn normalize_model_name(model: &str) -> String {
     // 这类后缀只是同模型的上下文长度变体，统计与展示上应与原模型归并
     let base_model = strip_context_variant_suffix(base_model);
 
+    // 剥离尾部日期后缀，如 qwen3.7-max-2026-06-08 → qwen3.7-max
+    let base_model = strip_date_suffix(base_model);
+
     // 仅对 claude- 前缀的模型做归一化：版本号中的 "." → "-"
     if base_model.starts_with("claude-") {
         let rest = &base_model[7..]; // "opus-4.7" 或 "sonnet-4-20250514" 等
@@ -721,6 +724,21 @@ fn strip_wire_api_suffix(model: &str) -> &str {
         }
     }
     model
+}
+
+/// 剥离尾部日期后缀，如 `qwen3.7-max-2026-06-08` → `qwen3.7-max`。
+/// 匹配 `-YYYY-MM-DD` 格式（年份 1900-2099，月份 01-12，日期 01-31）；
+/// 若整个字符串就是 `-YYYY-MM-DD` 则不剥离（避免返回空名）。
+fn strip_date_suffix(model: &str) -> &str {
+    use regex::Regex;
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"-(?:19|20)\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$").unwrap()
+    });
+    match re.find(model) {
+        Some(m) if m.start() > 0 => &model[..m.start()],
+        _ => model,
+    }
 }
 
 fn dump_records(records: &[UsageRecord], today: &str) -> Result<()> {
@@ -820,6 +838,62 @@ mod tests {
         assert_eq!(normalize_model_name("model"), "model");
         // 空串不应崩溃
         assert_eq!(normalize_model_name(""), "");
+    }
+
+    #[test]
+    fn normalize_model_name_strips_date_suffix() {
+        // 日期后缀 -YYYY-MM-DD 应被剥离
+        assert_eq!(
+            normalize_model_name("qwen3.7-max-2026-06-08"),
+            "qwen3.7-max"
+        );
+        assert_eq!(
+            normalize_model_name("qwen3.7-max-2026-06-08"),
+            normalize_model_name("qwen3.7-max")
+        );
+        assert_eq!(
+            normalize_model_name("gemini-2.5-flash-2025-01-15"),
+            "gemini-2.5-flash"
+        );
+        // 不带日期后缀的模型不受影响
+        assert_eq!(normalize_model_name("qwen3.6-plus"), "qwen3.6-plus");
+        assert_eq!(normalize_model_name("gpt-5.4"), "gpt-5.4");
+    }
+
+    #[test]
+    fn normalize_model_name_date_suffix_with_provider_prefix() {
+        assert_eq!(
+            normalize_model_name("Alibaba/qwen3.7-max-2026-06-08"),
+            "qwen3.7-max"
+        );
+    }
+
+    #[test]
+    fn normalize_model_name_date_suffix_does_not_match_short_digits() {
+        // 非日期格式的数字后缀不应被剥离
+        assert_eq!(
+            normalize_model_name("claude-sonnet-4-20250514"),
+            "claude-sonnet-4-20250514"
+        );
+        assert_eq!(normalize_model_name("model-12-34"), "model-12-34");
+    }
+
+    #[test]
+    fn normalize_model_name_date_suffix_with_context_variant() {
+        // 同时包含日期后缀和上下文变体后缀：先剥离 [1m]，再剥离日期
+        assert_eq!(
+            normalize_model_name("qwen3.7-max-2026-06-08[1m]"),
+            "qwen3.7-max"
+        );
+    }
+
+    #[test]
+    fn normalize_model_name_date_suffix_validates_date_range() {
+        // 非法月份/日期不应被剥离
+        assert_eq!(normalize_model_name("model-1234-56-78"), "model-1234-56-78");
+        assert_eq!(normalize_model_name("model-2026-13-01"), "model-2026-13-01");
+        assert_eq!(normalize_model_name("model-2026-00-01"), "model-2026-00-01");
+        assert_eq!(normalize_model_name("model-2026-01-32"), "model-2026-01-32");
     }
 
     #[test]
