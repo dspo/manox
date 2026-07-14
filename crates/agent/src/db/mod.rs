@@ -20,6 +20,7 @@
 //! and blocking (callers wrap them in `background_spawn`).
 
 mod events;
+mod projects;
 mod terminals;
 mod threads;
 mod token_usage;
@@ -74,6 +75,7 @@ impl ThreadsDatabase {
         token_usage::create_table(conn)?;
         terminals::create_table(conn)?;
         ui_notes::create_table(conn)?;
+        projects::create_table(conn)?;
         Ok(())
     }
 }
@@ -396,5 +398,46 @@ mod tests {
         assert!(!db.list(false).unwrap()[0].has_unread);
         db.upsert(&sample_record("t1"), true).unwrap();
         assert!(!db.list(false).unwrap()[0].has_unread);
+    }
+
+    #[test]
+    fn register_and_list_projects() {
+        let db = open_mem();
+        assert!(db.list_projects().unwrap().is_empty());
+
+        db.register_project("/home/user/project-a").unwrap();
+        db.register_project("/home/user/project-b").unwrap();
+
+        let list = db.list_projects().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], "/home/user/project-a");
+        assert_eq!(list[1], "/home/user/project-b");
+    }
+
+    #[test]
+    fn register_project_is_idempotent() {
+        let db = open_mem();
+        db.register_project("/home/user/project-a").unwrap();
+        db.register_project("/home/user/project-a").unwrap();
+        assert_eq!(db.list_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn register_empty_path_is_noop() {
+        let db = open_mem();
+        db.register_project("").unwrap();
+        assert!(db.list_projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_project() {
+        let db = open_mem();
+        db.register_project("/home/user/project-a").unwrap();
+        db.register_project("/home/user/project-b").unwrap();
+        db.remove_project("/home/user/project-a").unwrap();
+
+        let list = db.list_projects().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0], "/home/user/project-b");
     }
 }
