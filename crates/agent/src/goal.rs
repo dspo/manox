@@ -11,9 +11,9 @@
 //! complete is worse than an extra round. A separate evaluation cap in
 //! `Thread` bounds the loop either way.
 //!
-//! The evaluator prompt lives in `goal/prompt.md` and is `include_str!`-ed
-//! at compile time. It is model-facing text and is therefore English-only —
-//! it is never routed through the `i18n` bundle.
+//! The evaluator prompt lives in the `side_call/goal_system.tera.md` template
+//! and is rendered at the request-build boundary. It is model-facing text and
+//! is therefore English-only — it is never routed through the `i18n` bundle.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,8 +29,6 @@ use crate::language_model::{
 };
 use crate::message::Message;
 use crate::thread::truncate_summary;
-
-const PROMPT: &str = include_str!("goal/prompt.md");
 
 /// Per-call hard timeout. The evaluator judges a whole turn's outcome, so it
 /// is allowed a little longer than a streaming chunk — but it runs on the
@@ -78,18 +76,24 @@ pub async fn evaluate(
     let last_assistant = last_text(messages, Role::Assistant)
         .map(|t| truncate_summary(&t, MESSAGE_SAMPLE_CHARS))
         .unwrap_or_default();
-    let user_prompt = format!(
-        "Condition: {condition}\n\n\
-         Latest user turn:\n{last_user}\n\n\
-         Latest assistant turn:\n{last_assistant}\n\n\
-         Is the condition now satisfied?"
-    );
+    let user_prompt = crate::prompt::render(
+        crate::prompt::PromptTemplate::SideCallGoalUser,
+        &crate::prompt::GoalEvalPromptData {
+            condition: condition.to_string(),
+            last_user,
+            last_assistant,
+        },
+    )
+    .expect("goal user prompt render");
 
     let request = LanguageModelRequest {
         messages: vec![
             LanguageModelRequestMessage {
                 role: Role::System,
-                content: vec![MessageContent::Text(PROMPT.to_string())],
+                content: vec![MessageContent::Text(
+                    crate::prompt::render_static(crate::prompt::PromptTemplate::SideCallGoalSystem)
+                        .expect("goal system prompt render"),
+                )],
                 cache: true,
             },
             LanguageModelRequestMessage {

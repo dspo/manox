@@ -108,6 +108,10 @@ open = "5"
 fluent = "0.17"
 unic-langid = "0.9"
 
+# tera —— prompt 模板引擎。所有模型可见提示词以纯文本 .tera.md 维护，仅在
+# 统一边界（prompt::render）一次性渲染。业务流程只构造强类型 data/draft，不拼字符串。
+tera = "2"
+
 # cx-providers —— provider 配置解析的单一事实来源（与 cx 共享）。锁 cx 仓库已合并的确定 rev。
 cx-providers = { git = "https://github.com/dspo/cx.git", rev = "e2dd5769811ff6c8deda997c33ea0ac4070432bf" }
 

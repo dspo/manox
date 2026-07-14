@@ -73,9 +73,13 @@ pub struct CommandDefinition {
 }
 
 impl CommandDefinition {
-    /// Render the command body with `$ARGUMENTS` substituted by the raw args.
+    /// Render the command body, substituting `arguments` into the
+    /// `{{ arguments }}` placeholder. Legacy `$ARGUMENTS` placeholders are
+    /// rewritten first so old command files keep working. Command bodies are
+    /// untrusted prose, so a Tera-incompatible literal `{{` falls back to plain
+    /// substitution rather than breaking the render.
     pub fn render(&self, args: &str) -> String {
-        self.body.replace("$ARGUMENTS", args)
+        crate::prompt::render_command_body(&self.body, args)
     }
 }
 

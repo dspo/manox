@@ -51,9 +51,6 @@ pub const CLAUDE_CODE_AUTO_COMPACT_THRESHOLD: f64 = 0.8;
 /// results and prior compactions are never retained raw.
 const RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 
-/// The handoff summarization prompt, compiled in at build time.
-pub const COMPACTION_PROMPT: &str = include_str!("compact_prompt.md");
-
 /// Tokens that count toward the context limit for compaction triggering:
 /// input (cache-creation + cache-read + uncached) plus output. Cache-read
 /// tokens still occupy KV cache slots, so they count against the window.
@@ -305,7 +302,10 @@ pub fn build_compaction_request(messages: &[Message], insertion_ix: usize) -> La
     let mut request_messages: Vec<LanguageModelRequestMessage> = Vec::with_capacity(bound + 2);
     request_messages.push(LanguageModelRequestMessage {
         role: Role::System,
-        content: vec![MessageContent::Text(COMPACTION_PROMPT.to_string())],
+        content: vec![MessageContent::Text(
+            crate::prompt::render_static(crate::prompt::PromptTemplate::SideCallCompactSystem)
+                .expect("compact system prompt render"),
+        )],
         cache: false,
     });
     for m in &messages[..bound] {
@@ -318,7 +318,10 @@ pub fn build_compaction_request(messages: &[Message], insertion_ix: usize) -> La
     request_messages.push(LanguageModelRequestMessage {
         role: Role::User,
         content: vec![MessageContent::Text(
-            "Write the handoff summary of the conversation above, following the rules.".to_string(),
+            crate::prompt::render_static(
+                crate::prompt::PromptTemplate::SideCallCompactFinalInstruction,
+            )
+            .expect("compact final instruction render"),
         )],
         cache: false,
     });

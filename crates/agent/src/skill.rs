@@ -110,19 +110,17 @@ impl SkillRegistry {
         self.skills.iter().collect()
     }
 
-    /// One-line summaries (`- name: description`) for the system prompt, so the
+    /// One-line `(name, description)` summaries for the system prompt, so the
     /// model knows which skills exist without their full bodies in context.
-    pub fn summary_block(&self) -> String {
-        if self.skills.is_empty() {
-            return String::new();
-        }
-        let mut out = String::from(
-            "## Available skills (consult their full body via the `skill` tool on demand)\n",
-        );
-        for s in self.skills.values() {
-            out.push_str(&format!("- {}: {}\n", s.name, s.description));
-        }
-        out
+    /// The `system/main` template iterates this list — no markdown is built here.
+    pub fn summaries(&self) -> Vec<crate::prompt::SkillSummaryPromptData> {
+        self.skills
+            .values()
+            .map(|s| crate::prompt::SkillSummaryPromptData {
+                name: s.name.clone(),
+                description: s.description.clone(),
+            })
+            .collect()
     }
 }
 
@@ -283,13 +281,10 @@ pub fn remove_user_skill(name: &str) -> Result<()> {
 }
 
 /// Safe accessor for callers that may run before `init` (e.g. system-prompt
-/// construction in tests): returns an empty summary when the registry is not
-/// yet installed, so the prompt is well-formed throughout boot.
-pub fn summary_block_or_empty() -> String {
-    REGISTRY
-        .get()
-        .map(|r| r.summary_block())
-        .unwrap_or_default()
+/// construction in tests): returns an empty list when the registry is not yet
+/// installed, so the prompt is well-formed throughout boot.
+pub fn summaries_or_empty() -> Vec<crate::prompt::SkillSummaryPromptData> {
+    REGISTRY.get().map(|r| r.summaries()).unwrap_or_default()
 }
 
 fn classify_origin(key: &str, source: &Path, user_root: Option<&Path>) -> SkillOrigin {
@@ -337,8 +332,8 @@ mod tests {
     }
 
     #[test]
-    fn summary_block_empty_when_no_skills() {
+    fn summaries_empty_when_no_skills() {
         let r = SkillRegistry::default();
-        assert!(r.summary_block().is_empty());
+        assert!(r.summaries().is_empty());
     }
 }

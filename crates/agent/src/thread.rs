@@ -1193,7 +1193,17 @@ impl Thread {
             return;
         }
         for msg in &msgs {
-            self.insert_user_message(format!("[from {}]: {}", msg.from, msg.content), cx);
+            self.insert_user_message(
+                crate::prompt::render(
+                    crate::prompt::PromptTemplate::WrapperPeerMessage,
+                    &crate::prompt::PeerMessageData {
+                        from: msg.from.clone(),
+                        content: msg.content.clone(),
+                    },
+                )
+                .expect("peer message template render"),
+                cx,
+            );
             cx.emit(ThreadEvent::PeerMessage {
                 from: msg.from.clone(),
                 content: msg.content.clone(),
@@ -1235,7 +1245,11 @@ impl Thread {
             // 0b80401d: the plan-exit round lost its 34万 cache_read because
             // the switch rewrote the system head). The directive rides in
             // history (append-only); the model sees it each round-trip.
-            self.insert_user_message(crate::system_prompt::PLAN_MODE_ADDENDUM.to_string(), cx);
+            self.insert_user_message(
+                crate::prompt::render_static(crate::prompt::PromptTemplate::ModePlanAddendum)
+                    .expect("plan mode addendum render"),
+                cx,
+            );
         }
         cx.notify();
     }
@@ -1788,16 +1802,15 @@ impl Thread {
         let Some(s) = crate::skill::global().get(key).cloned() else {
             return false;
         };
-        let mut rendered = String::new();
-        if !s.description.is_empty() {
-            rendered.push_str(&s.description);
-            rendered.push_str("\n\n");
-        }
-        rendered.push_str(&s.body);
-        if !args.is_empty() {
-            rendered.push_str("\n\n");
-            rendered.push_str(args);
-        }
+        let rendered = crate::prompt::render(
+            crate::prompt::PromptTemplate::SkillBody,
+            &crate::prompt::SkillBodyData {
+                description: (!s.description.is_empty()).then(|| s.description.clone()),
+                body: s.body.clone(),
+                arguments: (!args.is_empty()).then(|| args.to_string()),
+            },
+        )
+        .expect("skill body render");
         self.insert_user_message(rendered, cx);
         self.run_turn(cx);
         true
@@ -1989,11 +2002,13 @@ impl Thread {
                         if this.goal.is_none() {
                             return;
                         }
-                        let directive = format!(
-                            "[goal continuation] Continue working toward this \
-                             completion condition. Do not ask for confirmation; \
-                             keep going until it is met.\n\nCondition: {condition}"
-                        );
+                        let directive = crate::prompt::render(
+                            crate::prompt::PromptTemplate::WrapperGoalContinuation,
+                            &crate::prompt::GoalContinuationData {
+                                condition: condition.clone(),
+                            },
+                        )
+                        .expect("goal continuation template render");
                         this.insert_user_message(directive, cx);
                         this.run_turn(cx);
                     });
@@ -2590,11 +2605,13 @@ impl Thread {
                         // failures never reach here — they nudge at the call
                         // site, before any assistant message starts.
                         this.insert_user_message(
-                            format!(
-                                "The previous model request failed: {reason}. \
-                                 Retry the last step, or summarize the current progress \
-                                 and deliver the result if the work is done."
-                            ),
+                            crate::prompt::render(
+                                crate::prompt::PromptTemplate::WrapperRecoveryFailure,
+                                &crate::prompt::RecoveryFailureData {
+                                    reason: reason.to_string(),
+                                },
+                            )
+                            .expect("recovery failure template render"),
                             cx,
                         );
                     } else if max_tok {
@@ -2605,10 +2622,10 @@ impl Thread {
                         // Degenerate empty turn: nudge the model toward visible
                         // output so it does not end silently on empty reasoning.
                         this.insert_user_message(
-                            "Your previous turn produced no visible output (only reasoning). \
-                             If you were about to submit a plan, call exit_plan_mode; if \
-                             researching, continue; otherwise state your next step."
-                                .to_string(),
+                            crate::prompt::render_static(
+                                crate::prompt::PromptTemplate::WrapperEmptyTurnNudge,
+                            )
+                            .expect("empty turn nudge render"),
                             cx,
                         );
                     }
@@ -2774,7 +2791,11 @@ impl Thread {
                 if capped && !this.cap_summary_injected {
                     this.cap_summary_injected = true;
                     this.insert_user_message(
-                        crate::system_prompt::max_turns_summary_prompt(max),
+                        crate::prompt::render(
+                            crate::prompt::PromptTemplate::WrapperMaxTurnsSummary,
+                            &crate::prompt::MaxTurnsSummaryData { max },
+                        )
+                        .expect("max turns summary render"),
                         cx,
                     );
                     return false;
@@ -2925,7 +2946,10 @@ impl Thread {
             })?;
             match response {
                 ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {
-                    let msg = "User denied execution".to_string();
+                    let msg = crate::prompt::render_static(
+                        crate::prompt::PromptTemplate::WrapperToolDenied,
+                    )
+                    .expect("tool denied render");
                     Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
                     Self::append_tool_result(&this, tu, msg, true, cx)?;
                     return Ok(());
@@ -2936,18 +2960,24 @@ impl Thread {
                 ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {}
                 ToolAuthorizationResponse::AskUserQuestion { answers, response } => {
                     let output = match response {
-                        Some(text) => format!("User responded: {text}"),
-                        None => {
-                            let mut buf = String::new();
-                            for (q, a) in &answers {
-                                buf.push_str("Question: ");
-                                buf.push_str(q);
-                                buf.push_str("\nAnswer: ");
-                                buf.push_str(a);
-                                buf.push_str("\n\n");
-                            }
-                            buf.trim_end().to_string()
-                        }
+                        Some(text) => crate::prompt::render(
+                            crate::prompt::PromptTemplate::WrapperAskUserResponse,
+                            &crate::prompt::AskUserResponseData { text },
+                        )
+                        .expect("ask user response render"),
+                        None => crate::prompt::render(
+                            crate::prompt::PromptTemplate::WrapperAskUserQuestions,
+                            &crate::prompt::AskUserQuestionsData {
+                                answers: answers
+                                    .into_iter()
+                                    .map(|(q, a)| crate::prompt::AskUserQa {
+                                        question: q,
+                                        answer: a,
+                                    })
+                                    .collect(),
+                            },
+                        )
+                        .expect("ask user questions render"),
                     };
                     Self::emit_tool_result(&this, &id, &name, &title, &output, false, cx)?;
                     Self::append_tool_result(&this, tu, output, false, cx)?;
@@ -3074,7 +3104,8 @@ impl Thread {
         let name = "enter_plan_mode".to_string();
         let title = "Enter plan mode".to_string();
 
-        let msg = "Entered plan mode. Research the codebase with read-only tools and the `agent` tool (delegate to the `plan`/`explore` sub-agents for isolated-context exploration). Do not implement. When the plan is ready, call `exit_plan_mode` with it.".to_string();
+        let msg = crate::prompt::render_static(crate::prompt::PromptTemplate::WrapperEnterPlanMode)
+            .expect("enter plan mode render");
 
         this.update(cx, |_, cx| {
             cx.emit(ThreadEvent::ToolCall {
@@ -3159,9 +3190,11 @@ impl Thread {
 
         match response {
             PlanApprovalResponse::Approve => {
-                let msg = format!(
-                    "User approved the plan. Plan contents:\n\n{plan_text}\n\nYou may now begin execution."
-                );
+                let msg = crate::prompt::render(
+                    crate::prompt::PromptTemplate::WrapperPlanApproved,
+                    &crate::prompt::PlanApprovedData { plan_text },
+                )
+                .expect("plan approved render");
                 this.update(cx, |_, cx| {
                     cx.emit(ThreadEvent::ToolCall {
                         id: id.clone(),
@@ -3193,8 +3226,10 @@ impl Thread {
                 // completion would burn a round with zero new information.
                 // `plan_mode` stays on; the next user message restarts the turn
                 // still in plan mode.
-                let msg = "User chose to continue discussing in plan mode. Do not resubmit a revised plan yet; await the user's next message for new direction."
-                    .to_string();
+                let msg = crate::prompt::render_static(
+                    crate::prompt::PromptTemplate::WrapperPlanContinue,
+                )
+                .expect("plan continue render");
                 this.update(cx, |this, cx| {
                     cx.emit(ThreadEvent::ToolCall {
                         id: id.clone(),
@@ -3218,8 +3253,10 @@ impl Thread {
                 // call (now that the overlay is armed) surfaces real approval.
                 // Mirrors codex `ReviewDecision::Abort`: a non-response is a
                 // distinct terminal from a real decline.
-                let msg = "Plan approval was not acted upon (the approval overlay was not shown or the turn was cancelled). Re-submit the plan with `exit_plan_mode`."
-                    .to_string();
+                let msg = crate::prompt::render_static(
+                    crate::prompt::PromptTemplate::WrapperPlanCancelled,
+                )
+                .expect("plan cancelled render");
                 this.update(cx, |_, cx| {
                     cx.emit(ThreadEvent::ToolCall {
                         id: id.clone(),
@@ -3463,7 +3500,10 @@ impl Thread {
         }
         if let Some(m) = self.messages.last_mut() {
             m.push_content(MessageContent::Text(
-                crate::system_prompt::max_tokens_directive().to_string(),
+                crate::prompt::render_static(
+                    crate::prompt::PromptTemplate::WrapperMaxTokensDirective,
+                )
+                .expect("max tokens directive render"),
             ));
         }
     }
@@ -3605,61 +3645,54 @@ impl Thread {
         // rewrite without that layer would silently break the provider's
         // prefix cache.
         let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
-        let mut system = self.system.clone().unwrap_or_else(|| {
-            let wt = self
-                .worktree
-                .as_ref()
-                .map(|w| (w.branch.as_str(), w.path.as_path()));
-            crate::system_prompt::build_main_system_prompt(
+        // System message: a pre-rendered base plus optional mode addendums,
+        // assembled through the `system/assembly` template so no `push_str` of
+        // model prose lands in flow code. The base is the main-thread prompt
+        // (built from live state) for the main thread, or the sub-agent's own
+        // `agents/*.md` body for a sub-agent. Sub-agents additionally get the
+        // language directive and (if worktree-isolated) a worktree section;
+        // the main thread already bakes both into its identity block via
+        // `build_main_system_prompt`.
+        let wt = self
+            .worktree
+            .as_ref()
+            .map(|w| (w.branch.as_str(), w.path.as_path()));
+        let is_subagent = self.system.is_some();
+        let base = match &self.system {
+            Some(subagent_body) => subagent_body.clone(),
+            None => crate::system_prompt::build_main_system_prompt(
                 &self.cwd,
                 self.project.as_deref(),
                 self.approval_mode,
                 wt,
-            )
-        });
-        // Sub-agents carry their own system prompt from `agents/*.md`; the main
-        // thread already has the language directive baked in via
-        // `build_main_system_prompt`. Append it for sub-agents so their reply
-        // language follows the UI locale too — the prompt prose itself stays
-        // English, only this one directive varies.
-        if self.system.is_some() {
-            system.push_str(crate::system_prompt::language_directive());
-            // A worktree-isolated sub-agent carries its own `system` from
-            // `agents/*.md`, so it never goes through
-            // `build_main_system_prompt` and would otherwise not see the
-            // "Active worktree" identity row. Append the worktree context so
-            // the sub-agent knows its cwd is a temporary worktree on a fresh
-            // branch (not the branch the parent mentioned) and that clean
-            // worktrees are auto-removed on exit.
-            if let Some(wt) = &self.worktree {
-                system.push_str(&format!(
-                    "\n\n## Active worktree\n\
-                     You are running inside a git worktree on branch `{branch}` at `{path}`. \
-                     Your cwd is this worktree, not the parent's project root. Work here; \
-                     git operations (commit/push) run without approval. A clean worktree is \
-                     auto-removed when you finish — commit or keep your work explicitly if it \
-                     must persist.",
-                    branch = wt.branch,
-                    path = wt.path.display()
-                ));
-            }
-        }
+            ),
+        };
         // Goal mode appends its autonomy directive. Unlike plan mode (whose
         // directive is injected as a user message on `set_plan_mode(true)` to
         // keep the system prefix byte-stable across the on/off switch), goal
-        // mode still rewrites the system head — a known prefix-cache hit on
+        // mode still rewrites the system head — a known prefix-cache miss on
         // goal enter/exit, accepted because goal mode is entered far less often
         // than plan mode and rarely mid-thread.
-        if self.goal.is_some() {
-            system.push_str(crate::system_prompt::GOAL_MODE_ADDENDUM);
-        }
-        // Ultracode appends its multi-agent grant (model-facing standing
-        // permission to orchestrate sub-agents). The effort level itself is
-        // resolved to `XHigh` for the wire below; this addendum is the
-        // behavioral half of the Claude Code ultracode semantic.
-        if self.reasoning_effort == ReasoningEffort::Ultracode {
-            system.push_str(crate::system_prompt::ULTRACODE_GRANT);
-        }
+        let system = crate::prompt::render(
+            crate::prompt::PromptTemplate::SystemAssembly,
+            &crate::prompt::SystemPromptAssembly {
+                base,
+                language: is_subagent.then(crate::system_prompt::language_data),
+                worktree_subagent: if is_subagent {
+                    self.worktree
+                        .as_ref()
+                        .map(|w| crate::prompt::WorktreePromptData {
+                            branch: w.branch.clone(),
+                            path: w.path.display().to_string(),
+                        })
+                } else {
+                    None
+                },
+                goal: self.goal.is_some(),
+                ultracode: self.reasoning_effort == ReasoningEffort::Ultracode,
+            },
+        )
+        .expect("system assembly template render");
         // The system prompt is the head of the cached prefix. `cache_control`
         // breakpoints are placed by `provider::anthropic_cache::apply_prompt_caching`
         // (single source of truth); the `cache` flag is advisory metadata, not
@@ -3808,9 +3841,15 @@ pub(crate) fn model_facing_content(c: &MessageContent) -> MessageContent {
                 content: crate::tools::agent::agent_final_text(&tr.content),
             })
         }
-        MessageContent::Compaction(summary) => MessageContent::Text(format!(
-            "The previous conversation was compacted. Use this summary as context:\n\n{summary}"
-        )),
+        MessageContent::Compaction(summary) => MessageContent::Text(
+            crate::prompt::render(
+                crate::prompt::PromptTemplate::WrapperCompactionPreamble,
+                &crate::prompt::CompactionPreambleData {
+                    summary: summary.clone(),
+                },
+            )
+            .expect("compaction preamble render"),
+        ),
         other => other.clone(),
     }
 }

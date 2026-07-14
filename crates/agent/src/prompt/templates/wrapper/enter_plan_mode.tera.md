@@ -1,0 +1,1 @@
+Entered plan mode. Research the codebase with read-only tools and the `agent` tool (delegate to the `plan`/`explore` sub-agents for isolated-context exploration). Do not implement. When the plan is ready, call `exit_plan_mode` with it.
