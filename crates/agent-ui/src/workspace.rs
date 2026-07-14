@@ -3806,13 +3806,20 @@ impl Workspace {
             .relative()
             .child(trigger)
             .child(
-                gpui::div()
-                    .id("titlebar-dropdown")
-                    .absolute()
-                    .top_full()
-                    .left_0()
-                    .occlude()
-                    .child(menu),
+                // `deferred()` + `with_priority(1)` paints the dropdown after
+                // the whole conversation column tree, escaping overflow_hidden
+                // clipping from ancestor containers. `right_0()` keeps the menu
+                // within the viewport when the window sits near the screen edge.
+                deferred(
+                    gpui::div()
+                        .id("titlebar-dropdown")
+                        .absolute()
+                        .top_full()
+                        .right_0()
+                        .occlude()
+                        .child(menu),
+                )
+                .with_priority(1),
             )
             .into_any_element()
     }
