@@ -13,6 +13,7 @@ sidebar-section-external = 外部
 sidebar-new-session-label = 新建会话
 sidebar-new-session-manox = Manox 线程
 sidebar-close-external = 关闭会话
+sidebar-archive = 归档
 external-wizard-no-model = 尚无模型支持该 agent
 external-session-start-failed = 启动外部 agent 失败
 sidebar-empty-summary = (新对话)

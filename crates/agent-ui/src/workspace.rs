@@ -1135,9 +1135,9 @@ impl Workspace {
                     );
                 }
                 SidebarEvent::OpenExternalSession(id) => {
-                    this.attach_external_session(id, cx);
+                    this.attach_external_session(id, window, cx);
                 }
-                SidebarEvent::CloseExternalSession(id) => {
+                SidebarEvent::ArchiveExternalSession(id) => {
                     this.close_external_session(id, cx);
                 }
                 SidebarEvent::ArchiveThread(id, archived) => {
@@ -1321,17 +1321,32 @@ impl Workspace {
             }
         };
         // Tear the session down when the CLI exits on its own (e.g. `/exit`),
-        // without waiting for the user to click ×. The subscription lives on
-        // the session so a later close detaches it before any spurious event.
+        // without waiting for the user to click ×, and mirror the agent's OSC
+        // title into the sidebar row + titlebar as it changes. The subscription
+        // lives on the session so a later close detaches it before any spurious
+        // event.
         let exit_id = id.clone();
         let exit_sub = cx.subscribe(
             &terminal,
-            move |this, _terminal, ev: &terminal::event::TerminalEvent, cx| {
-                if let terminal::event::TerminalEvent::ChildExit(_) = ev {
+            move |this, _terminal, ev: &terminal::event::TerminalEvent, cx| match ev {
+                terminal::event::TerminalEvent::ChildExit(_) => {
                     this.remove_external_session(&exit_id, cx);
                 }
+                terminal::event::TerminalEvent::Title(title) => {
+                    this.set_external_title(&exit_id, title.clone(), cx);
+                }
+                _ => {}
             },
         );
+        // The cx session id (and its socket path) are the traceable identity for
+        // `~/.config/cx/sessions/<id>.sock`, surfaced in the sidebar tag +
+        // clipboard copy. cx does not yet expose `SessionHandle::session_id()`,
+        // so the id is recovered from the `<id>.sock` filename.
+        let socket_path = handle.socket_path().map(std::path::Path::to_path_buf);
+        let cx_session_id = handle
+            .socket_path()
+            .and_then(crate::external_session::cx_session_id_from_socket)
+            .unwrap_or_default();
         let view = TerminalView::new(terminal, cx);
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1342,20 +1357,35 @@ impl Workspace {
             kind,
             created_at,
             project: project_cwd,
+            title: None,
+            cx_session_id,
+            socket_path,
             terminal_view: view,
             handle,
             _exit_sub: exit_sub,
         });
         self.sync_sidebar_external(cx);
-        self.attach_external_session(&id, cx);
+        self.attach_external_session(&id, window, cx);
     }
 
     /// Display an already-running external session in the main area. Does not
     /// touch the foreground `Thread` (the thread entity stays mounted; only the
     /// view mode flips) — the session's terminal keeps running across switches
     /// because the `ExternalSession` owns the live `TerminalView` + handle.
-    pub fn attach_external_session(&mut self, id: &str, cx: &mut Context<Self>) {
-        if !self.external_sessions.iter().any(|s| s.id == id) {
+    /// Focuses the terminal view on the next frame so the user can type
+    /// immediately without clicking into the TUI.
+    pub fn attach_external_session(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self
+            .external_sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.terminal_view.clone());
+        if view.is_none() {
             return;
         }
         self.active_external = Some(id.to_string());
@@ -1363,6 +1393,50 @@ impl Workspace {
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id.to_string()), cx));
         cx.notify();
+        if let Some(view) = view {
+            self.focus_external_view(view, window, cx);
+        }
+    }
+
+    /// Focus an external session's terminal view on the next frame. Deferred so
+    /// the `TerminalView` element is mounted (the view-mode flip schedules a
+    /// re-render) before the focus is set — GPUI can't focus an element that
+    /// hasn't rendered its `track_focus` yet.
+    fn focus_external_view(
+        &self,
+        view: Entity<terminal_ui::TerminalView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.defer(cx, move |window, cx| {
+            let handle = view.read(cx).focus_handle();
+            window.focus(&handle, cx);
+        });
+    }
+
+    /// Mirror an external agent's OSC title (`TerminalEvent::Title`) into its
+    /// `ExternalSession`, push a fresh projection to the sidebar, and refresh
+    /// the titlebar when the active session's title changed. No-op when the
+    /// session was already removed (a spurious title after close).
+    fn set_external_title(&mut self, id: &str, title: Option<String>, cx: &mut Context<Self>) {
+        let active = self.active_external.as_deref() == Some(id);
+        let new = title.as_deref().filter(|t| !t.is_empty());
+        let changed = self.external_sessions.iter_mut().any(|s| {
+            if s.id != id {
+                return false;
+            }
+            if s.title.as_deref() == new {
+                return false;
+            }
+            s.title = new.map(str::to_string);
+            true
+        });
+        if changed {
+            self.sync_sidebar_external(cx);
+            if active {
+                cx.notify();
+            }
+        }
     }
 
     /// Kill an external session and remove it (the sidebar `×` path). The
@@ -5360,11 +5434,12 @@ impl Render for Workspace {
         }
         // External agent CLI session: render the active session's terminal TUI
         // in place of the conversation. Mirrors the Terminal branch — sidebar on
-        // the left, a TitleBar + the terminal filling the main column — but the
-        // bar shows only the agent kind label (e.g. "Claude Code"). The
-        // provider/model picked at spawn is intentionally omitted: the user can
-        // switch models mid-session inside the TUI (`/model`), and manox cannot
-        // observe that change, so showing the spawn-time model would mislead.
+        // the left, a TitleBar + the terminal filling the main column. The bar
+        // title is the agent's OSC title (mirrored from `TerminalEvent::Title`),
+        // falling back to the kind label ("Claude Code" / "Codex" / "GitHub
+        // Copilot") until the TUI sets its own. The provider/model picked at
+        // spawn is intentionally omitted: the user can switch models mid-session
+        // inside the TUI (`/model`), and manox cannot observe that change.
         if matches!(self.view_mode, ViewMode::ExternalSession) {
             let theme = cx.theme().clone();
             let active = self
@@ -5379,9 +5454,10 @@ impl Render for Workspace {
                 return h_flex().size_full().child(self.sidebar.clone());
             };
             let kind = session.kind;
-            let title = session.kind.label();
+            // Titlebar + sidebar share `display_title()` so a TUI rename
+            // (OSC title) updates both at once.
+            let title: SharedString = session.display_title().to_string().into();
             let terminal = session.terminal_view.clone();
-            let close_id = session.id.clone();
             return h_flex()
                 .size_full()
                 .bg(theme.background)
@@ -5416,15 +5492,6 @@ impl Render for Workspace {
                                             .min_w_0()
                                             .truncate()
                                             .child(title),
-                                    )
-                                    .child(
-                                        Button::new("close-external")
-                                            .small()
-                                            .ghost()
-                                            .icon(IconName::Close)
-                                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                                this.close_external_session(&close_id.clone(), cx);
-                                            })),
                                     ),
                             ),
                         )
