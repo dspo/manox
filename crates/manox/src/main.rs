@@ -66,7 +66,7 @@ fn main() {
         .with_thread_names(true)
         .init();
 
-    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    let app = gpui_platform::application().with_assets(agent_ui::assets::ExtrasAssetSource::new());
 
     app.run(move |cx| {
         gpui_component::init(cx);

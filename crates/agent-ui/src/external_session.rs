@@ -7,6 +7,7 @@
 //! can `kill` the agent explicitly. Sessions live only in memory — they are not
 //! persisted and vanish from the sidebar on exit.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{Entity, Subscription};
@@ -49,6 +50,17 @@ impl SessionKind {
             Self::GithubCopilot => "copilot",
         }
     }
+
+    /// Embedded SVG asset path (resolved by `ExtrasAssetSource`) for the
+    /// agent's brand icon. The SVGs use `fill="currentColor"` so the caller
+    /// tints via `.text_color(...)`.
+    pub fn icon_asset(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "icons/claude.svg",
+            Self::Codex => "icons/codex.svg",
+            Self::GithubCopilot => "icons/githubcopilot.svg",
+        }
+    }
 }
 
 /// A live external agent CLI session. The `TerminalView` renders the agent's
@@ -68,16 +80,25 @@ impl SessionKind {
 pub struct ExternalSession {
     pub id: String,
     pub kind: SessionKind,
-    pub provider_name: String,
-    pub model_id: String,
+    /// Epoch seconds at spawn time. The sidebar sort key so an external
+    /// session mixes into the Conversations list by recency alongside manox
+    /// threads (which sort by `interacted_at`). manox cannot observe model
+    /// switches inside the TUI, let alone inter-message timing, so the spawn
+    /// time is the only stable ordering signal it has.
+    pub created_at: i64,
+    /// The project path the session was bound to at spawn (`Some` when launched
+    /// from a project folder's `+` button, `None` from the Conversations
+    /// header). The sidebar uses it to group the row under its project folder
+    /// instead of in the loose Conversations list, matching how manox threads
+    /// bound to a project are grouped.
+    pub project: Option<PathBuf>,
     pub terminal_view: Entity<TerminalView>,
     pub handle: Arc<cx::SessionHandle>,
     pub _exit_sub: Subscription,
 }
 
 impl ExternalSession {
-    /// Display line for the sidebar row: `<kind label>` (the provider/model is
-    /// shown beneath it as a muted subtitle).
+    /// Display line for the sidebar row: `<kind label>`.
     pub fn title(&self) -> &str {
         self.kind.label()
     }
@@ -85,13 +106,15 @@ impl ExternalSession {
     /// The lightweight descriptor the sidebar renders from. The sidebar is a
     /// separate Entity from the Workspace that owns the live `ExternalSession`
     /// (with its `TerminalView` + `Arc<SessionHandle>`); it only needs identity
-    /// + display fields to render a row.
+    /// and display fields to render a row. The spawn-time provider/model are
+    /// intentionally not projected: the user can switch models inside the TUI
+    /// and manox cannot observe that, so showing them would mislead.
     pub fn summary(&self) -> ExternalSessionSummary {
         ExternalSessionSummary {
             id: self.id.clone(),
             kind: self.kind,
-            provider_name: self.provider_name.clone(),
-            model_id: self.model_id.clone(),
+            created_at: self.created_at,
+            project: self.project.clone(),
         }
     }
 }
@@ -105,6 +128,6 @@ impl ExternalSession {
 pub struct ExternalSessionSummary {
     pub id: String,
     pub kind: SessionKind,
-    pub provider_name: String,
-    pub model_id: String,
+    pub created_at: i64,
+    pub project: Option<PathBuf>,
 }

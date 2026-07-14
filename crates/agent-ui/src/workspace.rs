@@ -1276,11 +1276,19 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let agent_id = kind.agent_id();
+        // The agent process runs in the project directory when spawned from a
+        // project folder's `+` button, else the workspace cwd. cx's
+        // AgentBuilder.cwd forwards to both the PTY-relay and direct spawn
+        // paths; without it the agent inherits manox's own cwd (the user's
+        // home dir), so a project-scoped session would operate on the wrong
+        // tree.
+        let cwd = project_cwd.clone().unwrap_or_else(|| self.cwd.clone());
         let handle = match cx::AgentBuilder::new()
             .agent(kind.agent())
             .pty(true)
             .provider(provider_name.clone())
             .model(model_id.clone())
+            .cwd(cwd.clone())
             .spawn()
         {
             Ok(h) => Arc::new(h),
@@ -1298,7 +1306,6 @@ impl Workspace {
         };
         let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
         let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
-        let cwd = project_cwd.unwrap_or_else(|| self.cwd.clone());
         let terminal = match Terminal::new(id.clone(), cwd, 80, 24, Box::new(source), cx) {
             Ok(t) => t,
             Err(e) => {
@@ -1326,11 +1333,15 @@ impl Workspace {
             },
         );
         let view = TerminalView::new(terminal, cx);
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         self.external_sessions.push(ExternalSession {
             id: id.clone(),
             kind,
-            provider_name,
-            model_id,
+            created_at,
+            project: project_cwd,
             terminal_view: view,
             handle,
             _exit_sub: exit_sub,
@@ -1792,6 +1803,11 @@ impl Workspace {
         // The incoming thread's cwd / worktree may differ from the outgoing
         // one; refresh the rail's git stats/branch display for it.
         self.spawn_git_status_refresh(cx);
+        // Returning to a thread leaves the external-session view: without this
+        // the render still takes the ExternalSession branch and the swapped-in
+        // thread is invisible behind the terminal TUI.
+        self.view_mode = ViewMode::Workspace;
+        self.active_external = None;
         cx.notify();
     }
 
@@ -5345,8 +5361,10 @@ impl Render for Workspace {
         // External agent CLI session: render the active session's terminal TUI
         // in place of the conversation. Mirrors the Terminal branch — sidebar on
         // the left, a TitleBar + the terminal filling the main column — but the
-        // bar shows the agent kind + provider/model and a `×` that kills the
-        // session and removes it from the sidebar.
+        // bar shows only the agent kind label (e.g. "Claude Code"). The
+        // provider/model picked at spawn is intentionally omitted: the user can
+        // switch models mid-session inside the TUI (`/model`), and manox cannot
+        // observe that change, so showing the spawn-time model would mislead.
         if matches!(self.view_mode, ViewMode::ExternalSession) {
             let theme = cx.theme().clone();
             let active = self
@@ -5362,7 +5380,6 @@ impl Render for Workspace {
             };
             let kind = session.kind;
             let title = session.kind.label();
-            let subtitle = format!("{} · {}", session.provider_name, session.model_id);
             let terminal = session.terminal_view.clone();
             let close_id = session.id.clone();
             return h_flex()
@@ -5386,18 +5403,10 @@ impl Render for Workspace {
                                     .flex_1()
                                     .min_w_0()
                                     .child(
-                                        Icon::new(match kind {
-                                            crate::external_session::SessionKind::ClaudeCode => {
-                                                IconName::Bot
-                                            }
-                                            crate::external_session::SessionKind::Codex => {
-                                                IconName::Cpu
-                                            }
-                                            crate::external_session::SessionKind::GithubCopilot => {
-                                                IconName::Github
-                                            }
-                                        })
-                                        .small(),
+                                        gpui::svg()
+                                            .path(kind.icon_asset())
+                                            .size(px(16.))
+                                            .text_color(theme.muted_foreground),
                                     )
                                     .child(
                                         gpui::div()
@@ -5406,13 +5415,7 @@ impl Render for Workspace {
                                             .flex_1()
                                             .min_w_0()
                                             .truncate()
-                                            .child(title)
-                                            .child(
-                                                gpui::div()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child(subtitle),
-                                            ),
+                                            .child(title),
                                     )
                                     .child(
                                         Button::new("close-external")

@@ -65,6 +65,35 @@ enum AnimRole {
     None,
 }
 
+/// A row in the Conversations list — either a manox thread or an external
+/// agent CLI session, unified so the two can be merged and ordered by recency
+/// instead of living in separate sections. External rows do not participate
+/// in the selection-slide (they have no `ThreadSummary` and are not part of
+/// the slide's flat-id ordering); their renderer ignores `SlideCtx`.
+enum SidebarRow {
+    Thread(agent::ThreadSummary),
+    External(crate::external_session::ExternalSessionSummary),
+}
+
+impl SidebarRow {
+    /// Recency sort key (newest first). Threads use `interacted_at`; external
+    /// sessions use their spawn `created_at` — manox cannot observe in-TUI
+    /// interaction, so the spawn time is the only signal it has.
+    fn sort_key(&self) -> i64 {
+        match self {
+            Self::Thread(s) => s.interacted_at,
+            Self::External(s) => s.created_at,
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Thread(s) => s.id.as_str(),
+            Self::External(s) => s.id.as_str(),
+        }
+    }
+}
+
 /// Events the sidebar emits to the Workspace.
 #[derive(Debug, Clone)]
 pub enum SidebarEvent {
@@ -106,8 +135,8 @@ pub struct Sidebar {
     /// Project paths whose folder group is collapsed; absent means expanded.
     collapsed: HashSet<String>,
     /// Live external agent sessions, projected from the Workspace's canonical
-    /// list. Rendered in a dedicated "External" section; an `external:` id in
-    /// `selected` highlights the active one.
+    /// list. Merged into the Conversations list by recency (an `external:` id
+    /// in `selected` highlights the active one).
     external_sessions: Vec<crate::external_session::ExternalSessionSummary>,
     /// Whether the new-session `PopupMenu` (Manox Thread / Claude Code / Codex /
     /// GitHub Copilot) is open.
@@ -223,15 +252,15 @@ impl Sidebar {
             ] {
                 let sidebar = sidebar.clone();
                 let theme = theme.clone();
-                let icon = match kind {
-                    crate::external_session::SessionKind::ClaudeCode => IconName::Bot,
-                    crate::external_session::SessionKind::Codex => IconName::Cpu,
-                    crate::external_session::SessionKind::GithubCopilot => IconName::Github,
-                };
                 let label = kind.label();
                 let agent_id = kind.agent_id();
                 menu = menu.submenu_with_icon(
-                    Some(Icon::new(icon).small().text_color(theme.muted_foreground)),
+                    Some(
+                        Icon::default()
+                            .path(kind.icon_asset())
+                            .small()
+                            .text_color(theme.muted_foreground),
+                    ),
                     label,
                     window,
                     cx,
@@ -256,6 +285,26 @@ impl Sidebar {
         self.new_session_menu = None;
         self.new_session_menu_sub = None;
         self.new_session_project = None;
+    }
+
+    /// Build the new-session dropdown anchored below the `+` button that
+    /// opened it. Deferred so it paints above sibling rows; `top_full()` is
+    /// 100% of the wrapping `.relative()` div, so the menu sits just under the
+    /// button rather than at the sidebar's bottom edge.
+    fn render_new_session_dropdown(&self, id: SharedString) -> Option<AnyElement> {
+        self.new_session_menu.clone().map(|menu| {
+            deferred(
+                gpui::div()
+                    .id(id)
+                    .absolute()
+                    .top_full()
+                    .right_0()
+                    .occlude()
+                    .child(menu),
+            )
+            .with_priority(1)
+            .into_any_element()
+        })
     }
 
     /// Mark the currently selected thread id (back-filled by Workspace on switch/new, for highlight).
@@ -290,6 +339,15 @@ impl Sidebar {
             .unwrap_or(path)
             .to_string();
         let key: SharedString = path.to_string().into();
+        // External sessions bound to this project folder — pulled from the
+        // sidebar's projection rather than threaded through as an arg, so the
+        // signature stays under clippy's argument limit.
+        let externals: Vec<crate::external_session::ExternalSessionSummary> = self
+            .external_sessions
+            .iter()
+            .filter(|s| s.project.as_deref() == Some(std::path::Path::new(path)))
+            .cloned()
+            .collect();
 
         let header = h_flex()
             .id(key.clone())
@@ -324,27 +382,46 @@ impl Sidebar {
                     .child(name),
             )
             .child(
-                Button::new(format!("new-thread-in-project-{key}"))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Plus)
-                    .tooltip(i18n::t("sidebar-new-chat"))
-                    .on_click(cx.listener({
-                        let path = path.to_string();
-                        move |this, _ev, window, cx| {
-                            cx.stop_propagation();
-                            if this.new_session_open {
-                                this.close_new_session_menu();
-                            } else {
-                                this.open_new_session_menu(
-                                    Some(PathBuf::from(path.clone())),
-                                    window,
-                                    cx,
-                                );
-                            }
-                            cx.notify();
-                        }
-                    })),
+                gpui::div()
+                    .relative()
+                    .child(
+                        Button::new(format!("new-thread-in-project-{key}"))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Plus)
+                            .tooltip(i18n::t("sidebar-new-chat"))
+                            .on_click(cx.listener({
+                                let path = path.to_string();
+                                move |this, _ev, window, cx| {
+                                    cx.stop_propagation();
+                                    if this.new_session_open {
+                                        this.close_new_session_menu();
+                                    } else {
+                                        this.open_new_session_menu(
+                                            Some(PathBuf::from(path.clone())),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    // Only render the dropdown here when the menu was opened
+                    // from *this* project folder's `+` button, so the menu
+                    // anchors below the clicked button instead of the
+                    // Conversations header's `+`.
+                    .children(
+                        (self.new_session_open
+                            && self.new_session_project.as_deref()
+                                == Some(std::path::Path::new(path)))
+                        .then(|| {
+                            self.render_new_session_dropdown(
+                                format!("new-session-dropdown-{path}").into(),
+                            )
+                        })
+                        .flatten(),
+                    ),
             )
             .on_click(cx.listener({
                 let path = path.to_string();
@@ -357,17 +434,36 @@ impl Sidebar {
             }));
 
         let rows = expanded.then(|| {
-            v_flex().w_full().gap_0p5().children(group.iter().map(|s| {
-                render_thread_item(
-                    s,
-                    selected == Some(s.id.as_str()),
-                    store.read(cx).is_running(&s.id),
-                    px(16.),
-                    slide,
-                    &theme,
-                    cx,
-                )
-            }))
+            // Threads + this project's external sessions, merged by recency so
+            // an external CLI session launched from the folder's `+` sits
+            // among the folder's manox threads instead of in the loose list.
+            let mut rows: Vec<SidebarRow> = group
+                .iter()
+                .cloned()
+                .map(SidebarRow::Thread)
+                .chain(externals.iter().cloned().map(SidebarRow::External))
+                .collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key()));
+            v_flex()
+                .w_full()
+                .gap_0p5()
+                .children(rows.into_iter().map(|row| {
+                    let is_selected = selected == Some(row.id());
+                    match row {
+                        SidebarRow::Thread(s) => render_thread_item(
+                            &s,
+                            is_selected,
+                            store.read(cx).is_running(&s.id),
+                            px(16.),
+                            slide,
+                            &theme,
+                            cx,
+                        ),
+                        SidebarRow::External(s) => {
+                            render_external_session_item(&s, is_selected, &theme, cx)
+                        }
+                    }
+                }))
         });
 
         v_flex()
@@ -397,6 +493,15 @@ impl Render for Sidebar {
                 projects.push((s.project.clone(), vec![s.clone()]));
             }
         }
+        // External sessions not bound to a project stay in the loose
+        // Conversations list; bound ones are pulled into their folder group
+        // inside `render_project_group` (filtered by project path there).
+        let loose_externals: Vec<crate::external_session::ExternalSessionSummary> = self
+            .external_sessions
+            .iter()
+            .filter(|s| s.project.is_none())
+            .cloned()
+            .collect();
 
         let mut flat_ids: Vec<String> = Vec::new();
         for (path, group) in &projects {
@@ -502,53 +607,55 @@ impl Render for Sidebar {
                                             cx.notify();
                                         })),
                                 )
+                                // Dropdown is deferred inside this relative wrapper so it paints
+                                // after sibling rows (z-order) while staying positioned just below
+                                // the button (`top_full()` is 100% of this wrapper's height).
+                                .children(
+                                    (self.new_session_open && self.new_session_project.is_none())
+                                        .then(|| {
+                                            self.render_new_session_dropdown(
+                                                "new-session-dropdown".into(),
+                                            )
+                                        })
+                                        .flatten(),
+                                )
                                 .into_any_element(),
                         ),
                     ))
-                    .child(v_flex().w_full().gap_0p5().children(loose.iter().map(|s| {
-                        render_thread_item(
-                            s,
-                            selected.as_deref() == Some(s.id.as_str()),
-                            store.read(cx).is_running(&s.id),
-                            px(0.),
-                            &slide,
-                            &theme,
-                            cx,
-                        )
-                    })))
-                    .children(
-                        (!self.external_sessions.is_empty()).then(|| {
-                            section_header(i18n::t("sidebar-section-external"), &theme, None)
-                        }),
-                    )
-                    .child(v_flex().w_full().gap_0p5().children(
-                        self.external_sessions.iter().map(|s| {
-                            render_external_session_item(
-                                s,
-                                selected.as_deref() == Some(s.id.as_str()),
-                                &theme,
-                                cx,
-                            )
-                        }),
-                    )),
+                    // Merge loose threads and external sessions into one
+                    // recency-ordered list so an external CLI session sits
+                    // among manox threads instead of a separate section.
+                    // External rows sort by spawn time (manox cannot observe
+                    // in-TUI interaction); threads by last interaction.
+                    .child({
+                        let mut rows: Vec<SidebarRow> = loose
+                            .into_iter()
+                            .map(SidebarRow::Thread)
+                            .chain(loose_externals.into_iter().map(SidebarRow::External))
+                            .collect();
+                        rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key()));
+                        v_flex()
+                            .w_full()
+                            .gap_0p5()
+                            .children(rows.into_iter().map(|row| {
+                                let is_selected = selected.as_deref() == Some(row.id());
+                                match row {
+                                    SidebarRow::Thread(s) => render_thread_item(
+                                        &s,
+                                        is_selected,
+                                        store.read(cx).is_running(&s.id),
+                                        px(0.),
+                                        &slide,
+                                        &theme,
+                                        cx,
+                                    ),
+                                    SidebarRow::External(s) => {
+                                        render_external_session_item(&s, is_selected, &theme, cx)
+                                    }
+                                }
+                            }))
+                    }),
             )
-            // Render the new-session dropdown outside the scrollable body so it
-            // is not clipped by `overflow_y_scroll`. `deferred` + `with_priority(1)`
-            // paints it after the whole sidebar tree, floating above the scroll
-            // container — same pattern as ContextRail's branch dropdown.
-            .children(self.new_session_menu.clone().map(|menu| {
-                deferred(
-                    gpui::div()
-                        .id("new-session-dropdown")
-                        .absolute()
-                        .top_full()
-                        .right_0()
-                        .occlude()
-                        .child(menu),
-                )
-                .with_priority(1)
-                .into_any_element()
-            }))
     }
 }
 
@@ -720,12 +827,6 @@ fn render_external_session_item(
     let id_open = id.clone();
     let id_close = id.clone();
     let kind = summary.kind;
-    let icon = match kind {
-        crate::external_session::SessionKind::ClaudeCode => IconName::Bot,
-        crate::external_session::SessionKind::Codex => IconName::Cpu,
-        crate::external_session::SessionKind::GithubCopilot => IconName::Github,
-    };
-    let subtitle = format!("{} · {}", summary.provider_name, summary.model_id);
     let mut row = h_flex()
         .id(format!("external-row-{id}"))
         .w_full()
@@ -743,24 +844,19 @@ fn render_external_session_item(
         row = row.bg(theme.accent.opacity(0.10));
     }
     row = row
-        .child(Icon::new(icon).small().text_color(theme.muted_foreground))
         .child(
-            v_flex()
+            gpui::svg()
+                .path(kind.icon_asset())
+                .size(px(16.))
+                .text_color(theme.muted_foreground),
+        )
+        .child(
+            gpui::div()
                 .flex_1()
                 .min_w_0()
-                .gap_0p5()
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(kind.label()),
-                )
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(subtitle),
-                ),
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(kind.label()),
         )
         .child(
             Button::new(format!("external-close-{id}"))
