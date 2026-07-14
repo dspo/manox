@@ -2547,6 +2547,12 @@ pub fn build_items(
 
     /// Close the active segment for a turn boundary or a special tool that
     /// stays standalone. Freezes and auto-collapses it; clears the index.
+    ///
+    /// `frozen_secs` is pinned to `Some(0)` so historical containers rebuilt
+    /// from persisted messages do not fall back to a live
+    /// `started_at.elapsed()` — `build_items` creates every container with a
+    /// fresh `Instant::now()`, so an unfrozen timer would tick forever from
+    /// zero on a reloaded thread.
     fn close_segment(items: &mut [ConvItem], seg_ix: Option<usize>) {
         if let Some(ix) = seg_ix
             && let Some(ConvItem::Thinking(t)) = items.get_mut(ix)
@@ -2554,6 +2560,9 @@ pub fn build_items(
             t.accepting_entries = false;
             t.streaming = false;
             t.collapsed = !t.user_toggled;
+            if t.frozen_secs.is_none() {
+                t.frozen_secs = Some(0);
+            }
         }
     }
 
@@ -2820,8 +2829,11 @@ pub fn build_items(
                 // A resumed turn may still be mid-segment: mark the
                 // container live so later-arriving `ToolCall`/`ToolOutput`
                 // deltas fold into it instead of opening a fresh one.
+                // Unfreeze the timer too — `close_segment` just pinned it,
+                // but a live container must tick from `started_at` (now).
                 t.accepting_entries = true;
                 t.streaming = true;
+                t.frozen_secs = None;
             }
             _ => {}
         }
@@ -3109,8 +3121,34 @@ mod tests {
         assert_eq!(tool_ids, vec!["tu_1", "tu_2", "tu_3"]);
     }
 
-    /// A second user prompt starts a new turn and closes the previous segment.
-    /// A tool-result-only user message (no prompt text) is NOT a turn boundary.
+    /// Historical `ThinkingContainer`s rebuilt from persisted messages must
+    /// have `frozen_secs` pinned so `compact_summary` doesn't fall back to a
+    /// live `started_at.elapsed()` — otherwise the timer ticks forever from
+    /// zero on a reloaded thread (regression: the old "计时一直进行" bug).
+    #[test]
+    fn build_items_freezes_historical_segment_elapsed() {
+        let messages = vec![
+            Message::user("do it".to_string()),
+            Message::assistant(vec![tu(
+                "tu_1",
+                "read_file",
+                serde_json::json!({"path": "a.rs"}),
+            )]),
+            Message::user_with_content(vec![tr("tu_1", "read_file", "a contents")]),
+            // Second user prompt closes the first turn's segment.
+            Message::user("next".to_string()),
+        ];
+        let items = build_items(&messages, &HashMap::new(), false);
+        let seg = items.iter().find_map(|i| match i {
+            ConvItem::Thinking(t) => Some(t),
+            _ => None,
+        });
+        let seg = seg.expect("segment present");
+        assert!(
+            seg.frozen_secs.is_some(),
+            "historical segment must pin elapsed to stop the timer"
+        );
+    }
     #[test]
     fn build_items_user_prompt_is_turn_boundary_tool_result_is_not() {
         let messages = vec![
