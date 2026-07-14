@@ -1,0 +1,1 @@
+Generate a concise title (a few words, no trailing punctuation, no surrounding quotes, no prefix such as "Title:") that captures what this conversation is about. Write the title in the same language as the user's first message. Reply with the title only, on a single line.

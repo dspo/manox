@@ -5,30 +5,33 @@
 //! every request build — date changes, project may change — and prepended as a
 //! `System` message by `Thread::build_completion_request`.
 //!
-//! The static body (working discipline + sandbox boundary) lives in
-//! [`system_prompt.md`] next to this file, embedded via `include_str!` so the
-//! prose reads as plain markdown and edits don't touch Rust — matching the
-//! split (static prompt file + dynamic environment block).
-//! No template engine crate — string concatenation is enough.
+//! This module probes the live environment (date, shell, python/node versions,
+//! approval mode, active worktree, advertised skills, reply language) and packs
+//! it into a [`crate::prompt::MainSystemPromptData`]. The layout — section
+//! order, headings, list rows — lives in the `system/main.tera.md` template;
+//! nothing here formats model-visible prose. The static body is embedded via
+//! `include_str!` from [`system_prompt.md`] and carried as a `&'static str`
+//! data field so prose edits never touch Rust.
 //!
-//! **Static-first layering for prefix-cache stability.** The prompt is
-//! assembled most-static → most-volatile so the provider's prefix cache hits
-//! the longest possible byte run turn-over-turn: (1) the compile-time static
-//! prose + sandbox boundary, (2) the skills block (session-stable), (3) the
-//! language directive (locale-stable), (4) the runtime identity block. Within
-//! the identity block, session-stable rows (cwd/project/os/shell) come before
-//! daily-volatile `today` and toggle-volatile `yolo`. Thread id is deliberately
-//! NOT injected — the model fetches it on demand via the `self_info` tool
-//! (session/thread id injection is not needed in the prompt).
+//! **Static-first layering for prefix-cache stability.** The template emits
+//! most-static → most-volatile so the provider's prefix cache hits the longest
+//! possible byte run turn-over-turn: (1) the compile-time static prose, (2) the
+//! skills block (session-stable), (3) the language directive (locale-stable),
+//! (4) the runtime identity block. Within the identity block, session-stable
+//! rows (cwd/project/os/shell) come before daily-volatile `today` and
+//! toggle-volatile approval mode. Thread id is deliberately NOT injected — the
+//! model fetches it on demand via the `self_info` tool.
 //!
 //! The prompt prose is fixed English regardless of the UI locale (the model's
 //! context stays in one language). The user's preferred reply language is
-//! conveyed by a one-line directive appended to the system prompt — see
-//! [`build_main_system_prompt`] and [`language_directive`].
+//! conveyed by a one-line directive baked into the main template via
+//! [`language_data`], and appended to a sub-agent's `system` string by the
+//! `system/assembly` template (sub-agents do not pass through this module).
 
 use std::path::Path;
 use std::sync::OnceLock;
 
+use crate::prompt::{LanguagePromptData, MainSystemPromptData, PromptTemplate, render};
 use crate::thread::ApprovalMode;
 
 const STATIC_PROMPT: &str = include_str!("system_prompt.md");
@@ -41,9 +44,9 @@ const STATIC_PROMPT: &str = include_str!("system_prompt.md");
 ///
 /// Assembly order is static-first (see module docs): the volatile identity
 /// block lands at the very end so toggling `approval_mode` or a day rollover
-/// only invalidates the cached tail, not the static prose. `PLAN_MODE_ADDENDUM`
-/// (appended by `Thread::build_completion_request`) follows the identity block,
-/// so toggling plan mode likewise only busts the tail.
+/// only invalidates the cached tail, not the static prose. The plan-mode
+/// directive is injected as a user message by `set_plan_mode` (not here), so
+/// toggling plan mode likewise only busts the tail.
 pub fn build_main_system_prompt(
     cwd: &Path,
     project: Option<&Path>,
@@ -53,63 +56,40 @@ pub fn build_main_system_prompt(
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
     let os = std::env::consts::OS;
-
-    let mut prompt = String::from(STATIC_PROMPT);
-
-    // Advertise installed skills so the model knows what reference docs it can
-    // pull via the `skill` tool. The full bodies are loaded on demand, not
-    // injected here — only the one-line summaries, to keep the prompt small.
-    // Session-stable, so it sits above the volatile identity block.
-    let skills = crate::skill::summary_block_or_empty();
-    if !skills.is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(&skills);
-    }
-
-    // Locale-stable for the session; above the volatile identity block.
-    prompt.push_str(language_directive());
-
-    // Runtime identity — the only volatile section. Session-stable rows first
-    // (cwd/project/os/shell), then the worktree row (toggle-volatile across
-    // enter/exit), then daily-volatile `today`, then toggle-volatile `yolo`
-    // last, so the cacheable prefix extends as far as possible.
-    prompt.push_str("\n\n## Runtime identity\n");
-    prompt.push_str(&format!(
-        "- Current working directory: `{}`\n",
-        cwd.display()
-    ));
-    if let Some(p) = project {
-        prompt.push_str(&format!("- Project root: `{}`\n", p.display()));
-    }
-    if let Some((branch, path)) = active_worktree {
-        prompt.push_str(&format!(
-            "- Active worktree: `{branch}` at `{}`\n",
-            path.display()
-        ));
-    }
-    prompt.push_str(&format!("- Operating system: {os}\n"));
-    prompt.push_str(&format!("- Default shell: {shell}\n"));
     let (python3, node) = runtime_versions();
-    prompt.push_str(&format!("- python3: {python3}\n"));
-    prompt.push_str(&format!("- node: {node}\n"));
-    prompt.push_str(&format!("- Today: {today}\n"));
-    match approval_mode {
-        // OnRequest is the default; staying silent keeps the identity block
-        // byte-stable for the common case. AutoReview and Yolo are the two
-        // modes the model can act differently on, so only those are advertised
-        // — and without revealing the internal mechanism (the reviewer LLM
-        // exists, but the model doesn't need to know; adversarial framing
-        // risk if it does).
-        ApprovalMode::OnRequest => {}
-        ApprovalMode::AutoReview => {
-            prompt.push_str("- Mode: AutoReview (risky tool calls still ask before running)\n")
-        }
-        ApprovalMode::Yolo => prompt.push_str(
-            "- Mode: YOLO (tool calls need no approval, bash runs outside the sandbox)\n",
-        ),
-    }
 
-    prompt
+    // `None` approval mode stays silent (the default `OnRequest` case), keeping
+    // the identity block byte-stable for the common path. AutoReview and Yolo
+    // are the two modes the model can act differently on, so only those are
+    // advertised — without revealing the internal reviewer mechanism.
+    let approval_mode = match approval_mode {
+        ApprovalMode::OnRequest => None,
+        ApprovalMode::AutoReview => Some("AutoReview"),
+        ApprovalMode::Yolo => Some("Yolo"),
+    };
+
+    let data = MainSystemPromptData {
+        static_body: STATIC_PROMPT,
+        skills: crate::skill::summaries_or_empty(),
+        language: language_data(),
+        runtime: crate::prompt::RuntimeIdentityPromptData {
+            cwd: cwd.display().to_string(),
+            project: project.map(|p| p.display().to_string()),
+            active_worktree: active_worktree.map(|(branch, path)| {
+                crate::prompt::WorktreePromptData {
+                    branch: branch.to_string(),
+                    path: path.display().to_string(),
+                }
+            }),
+            os,
+            shell,
+            python3: python3.to_string(),
+            node: node.to_string(),
+            today,
+            approval_mode,
+        },
+    };
+    render(PromptTemplate::SystemMain, &data).expect("system main template render")
 }
 
 /// Session-stable runtime versions for the identity block: `python3` and
@@ -140,81 +120,20 @@ fn probe_version(bin: &str) -> String {
     }
 }
 
-/// The language directive injected into the system prompt so the model addresses
+/// The language directive baked into the system prompt so the model addresses
 /// the user in the UI's chosen language. The prompt prose itself stays English;
-/// only this one directive varies with [`crate::i18n::current`]. Appendable to
-/// a sub-agent's `system` string as well, to keep sub-agent reply language
-/// consistent with the main thread.
-pub fn language_directive() -> &'static str {
+/// only this one directive varies with [`crate::i18n::current`]. Returned as a
+/// data payload; the `system/main` and `system/assembly` templates own the
+/// surrounding `## Language` layout.
+pub fn language_data() -> LanguagePromptData {
     // The name is always an English endonym ("English", "Simplified Chinese") —
     // the model parses the directive, the user never sees this string.
-    match crate::i18n::current() {
-        crate::i18n::Language::En => {
-            "\n\n## Language\n\nUnless the user specifies otherwise, write your user-facing responses in English.\n"
-        }
-        crate::i18n::Language::ZhCn => {
-            "\n\n## Language\n\nUnless the user specifies otherwise, write your user-facing responses in Simplified Chinese.\n"
-        }
-    }
+    let language = match crate::i18n::current() {
+        crate::i18n::Language::En => "English",
+        crate::i18n::Language::ZhCn => "Simplified Chinese",
+    };
+    LanguagePromptData { language }
 }
-
-/// The user message injected when a sub-agent hits its `max_turns` cap.
-///
-/// Kept here rather than in `system_prompt.md` because it is a one-line
-/// template, not prose — short turn-cap templates are kept in code. The first
-/// in code. The first cap hit asks for a coherent final summary; a second cap
-/// hit (the sub-agent keeps calling tools) is what actually hard-stops the turn
-/// in `Thread::run_turn_loop`.
-pub fn max_turns_summary_prompt(max: u32) -> String {
-    format!(
-        "You've reached the maximum turn count of {max}. Based on the work completed above, produce a concise final summary. Do not call any more tools."
-    )
-}
-
-/// Appended as a user-role directive when a turn ends on `StopReason::MaxTokens`:
-/// the response was cut mid-stream by the output budget (often mid-`tool_use`,
-/// which surfaces as a JSON parse error on the next round). Tells the model to
-/// redo the work compactly so the retry fits, rather than ending the turn dead
-/// on a half-finished assistant message. Model-facing English — never
-/// localized. Kept in code for the same reason as `max_turns_summary_prompt`:
-/// a short, templated instruction, not prose.
-pub fn max_tokens_directive() -> &'static str {
-    "The previous response was cut off by the max_output_tokens budget before it finished. Redo the work more compactly: shorter reasoning, and if you were mid-way through a tool call, re-issue that tool call with shorter arguments. Do not repeat the truncated output verbatim."
-}
-
-/// Appended to the system prompt while the thread is in plan mode. Tells the
-/// Injected as a user message when plan mode is entered (`set_plan_mode(true)`),
-/// so the system prompt stays byte-stable across the plan on/off switch — the
-/// provider prefix cache keeps its system+tools head intact. The directive
-/// rides in history (append-only); the model sees it each round-trip. Kept in
-/// code (not in `system_prompt.md`) for the same reason as
-/// `max_turns_summary_prompt`: a short, templated instruction, not prose.
-pub const PLAN_MODE_ADDENDUM: &str = "## Plan mode\n\
-You are currently in plan mode: research the codebase and produce a plan, but do not implement.\n\
-- You have read-only tools plus the `agent` tool. Delegate codebase research to the `plan` sub-agent (`agent` tool, `subagent_type=plan`) so the exploration stays in an isolated context and does not bloat this conversation. For a focused lookup (\"where is X defined\", \"which files reference Y\"), delegate to the `explore` sub-agent instead.\n\
-- The sub-agent returns only its final conclusion; synthesize that into a complete plan. If research is inconclusive, delegate again with a sharper prompt rather than guessing.\n\
-- Write tools and `bash` are hidden from you. Do not attempt to spawn write-capable sub-agents to bypass this — the bundled `plan`/`explore` are read-only by construction.\n\
-- When the plan is ready, call `exit_plan_mode` with a step-by-step implementation plan: what each step changes, which existing functions to reuse, the tools each step will use, and any risks. End the plan with a `### Critical Files for Implementation` section listing 3–5 paths.\n\
-- After you call `exit_plan_mode` the conversation pauses for user approval or continued discussion: approval exits plan mode and begins execution; continued discussion keeps you in plan mode while you wait for the user's next message — do not resubmit the same plan unchanged.\n";
-
-/// Mid-conversation grant appended when the user selects `Ultracode` effort.
-/// Mirrors Claude Code's ultracode semantic: `xhigh` effort on the wire (sent
-/// via `output_config.effort` / `reasoning.effort`) plus standing permission
-/// to launch multi-agent workflows. In manox the `agent` tool already runs
-/// without per-call approval, so this grant is model-facing — it shapes
-/// behavior, telling the model it may freely orchestrate sub-agents rather
-/// than narrating hesitation. Kept in code (not `system_prompt.md`) for the
-/// same reason as `PLAN_MODE_ADDENDUM`: a short, templated instruction.
-pub const ULTRACODE_GRANT: &str = "\n\n## Ultracode mode\n\
-You are running in ultracode mode at `xhigh` effort. You have standing permission to launch multi-agent workflows: spawn sub-agents freely via the `agent` tool to decompose the task, parallelize independent work, and isolate deep investigations, without asking for confirmation per spawn. Coordinate their results into a single coherent solution; do not narrate hesitation about delegating.\n";
-
-/// Appended to the system prompt while the thread has an active goal. Tells
-/// the model each turn must make concrete, verifiable progress toward the
-/// condition and that it will be auto-continued — there is no need to ask
-/// whether to keep going. Kept in code (not `system_prompt.md`) for the same
-/// reason as `PLAN_MODE_ADDENDUM`: a short, templated instruction, not prose.
-pub const GOAL_MODE_ADDENDUM: &str = "\n\n## Goal mode\n\
-You are working toward a user-defined completion condition. Each turn must make concrete, verifiable progress toward it — do not ask whether to continue, do not pause for confirmation, do not summarize and stop. Use the full tool set and the current approval mode. When you believe the condition is met, state so explicitly with the evidence (e.g. the passing test command output); an external evaluator will verify and either continue you or end the goal loop.\n";
 
 #[cfg(test)]
 mod tests {
@@ -247,9 +166,9 @@ mod tests {
 
     #[test]
     fn runtime_identity_block_appended_at_tail() {
-        // Identity is code-appended (no placeholder substitution), and it lands
-        // at the very end of the prompt — after the static prose, skills, and
-        // language directive — so the cacheable static prefix is maximal.
+        // Identity lands at the very end of the prompt — after the static
+        // prose, skills, and language directive — so the cacheable static
+        // prefix is maximal.
         let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
         assert!(!p.contains("{{"), "no placeholder syntax: {p}");
         assert!(
@@ -390,16 +309,6 @@ mod tests {
         assert!(
             !p.contains("YOLO"),
             "yolo must not appear when disabled: {p}"
-        );
-    }
-
-    #[test]
-    fn max_turns_summary_prompt_contains_cap_and_no_tools() {
-        let s = max_turns_summary_prompt(10);
-        assert!(s.contains("10"), "cap value must appear: {s}");
-        assert!(
-            s.contains("Do not call any more tools"),
-            "no-tools directive: {s}"
         );
     }
 

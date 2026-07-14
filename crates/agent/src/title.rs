@@ -24,14 +24,6 @@ use crate::language_model::{
 use crate::message::Message;
 use crate::thread::truncate_summary;
 
-/// Instruction appended as the final user turn for first-title generation.
-/// Asks for a bare title in the user's own language so Chinese conversations
-/// get Chinese titles.
-const SUMMARIZE_THREAD_PROMPT: &str = "\
-Generate a concise title (a few words, no trailing punctuation, no surrounding quotes, no prefix such as \"Title:\") that captures what this conversation is about. \
-Write the title in the same language as the user's first message. \
-Reply with the title only, on a single line.";
-
 /// Upper bound on raw streamed chars accumulated before stopping. Titles are
 /// short; this caps consumption so a chatty model cannot run on.
 const MAX_RAW_CHARS: usize = 120;
@@ -69,7 +61,10 @@ pub fn build_title_request(messages: &[Message]) -> LanguageModelRequest {
     }
     req_messages.push(LanguageModelRequestMessage {
         role: Role::User,
-        content: vec![MessageContent::Text(SUMMARIZE_THREAD_PROMPT.to_string())],
+        content: vec![MessageContent::Text(
+            crate::prompt::render_static(crate::prompt::PromptTemplate::TitleFirstInstruction)
+                .expect("title first instruction render"),
+        )],
         cache: false,
     });
 
@@ -137,13 +132,14 @@ pub fn build_topic_shift_request(
             cache: false,
         });
     }
-    let instruction = format!(
-        "The current conversation title is: \"{current_title}\". \
-         If the latest user message indicates a NEW conversation topic distinct from the current title, \
-         output a concise new title (a few words, no trailing punctuation, no surrounding quotes, \
-         no prefix such as \"Title:\", in the same language as the user's latest message, on a single line). \
-         Otherwise output exactly the single word {UNCHANGED_SENTINEL}."
-    );
+    let instruction = crate::prompt::render(
+        crate::prompt::PromptTemplate::TitleTopicShiftInstruction,
+        &crate::prompt::TopicShiftData {
+            current_title: current_title.to_string(),
+            unchanged_sentinel: UNCHANGED_SENTINEL,
+        },
+    )
+    .expect("topic shift instruction render");
     req_messages.push(LanguageModelRequestMessage {
         role: Role::User,
         content: vec![MessageContent::Text(instruction)],

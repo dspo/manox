@@ -1,0 +1,1 @@
+The previous response was cut off by the max_output_tokens budget before it finished. Redo the work more compactly: shorter reasoning, and if you were mid-way through a tool call, re-issue that tool call with shorter arguments. Do not repeat the truncated output verbatim.

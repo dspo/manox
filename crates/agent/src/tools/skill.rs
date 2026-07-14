@@ -54,15 +54,15 @@ impl AgentTool for SkillTool {
         cx.background_spawn(async move {
             let reg = crate::skill::global();
             match reg.get(&parsed.name) {
-                Some(s) => {
-                    let mut out = String::new();
-                    if !s.description.is_empty() {
-                        out.push_str(&s.description);
-                        out.push_str("\n\n");
-                    }
-                    out.push_str(&s.body);
-                    Ok(out)
-                }
+                Some(s) => crate::prompt::render(
+                    crate::prompt::PromptTemplate::SkillBody,
+                    &crate::prompt::SkillBodyData {
+                        description: (!s.description.is_empty()).then(|| s.description.clone()),
+                        body: s.body.clone(),
+                        arguments: None,
+                    },
+                )
+                .map_err(|e| e.to_string()),
                 None => Err(format!(
                     "Unknown skill: `{}`. Check the name against the system prompt's \"Available skills\" list (plugin skills require a `plugin:` prefix).",
                     parsed.name

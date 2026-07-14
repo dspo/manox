@@ -24,6 +24,7 @@ pub mod path_env;
 pub mod paths;
 pub mod plugin;
 pub mod prefix_stability;
+pub mod prompt;
 pub mod provider;
 pub mod read_policy;
 pub mod runtime;

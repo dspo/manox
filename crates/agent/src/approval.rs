@@ -14,9 +14,10 @@
 //! to `Ask` with a generic reason — the reviewer is fail-closed so a broken
 //! auto-review path never silently widens access.
 //!
-//! The reviewer prompt lives in `approval/prompt.md` and is `include_str!`-ed
-//! at compile time. It is model-facing text and is therefore English-only —
-//! it is never routed through the `i18n` bundle.
+//! The reviewer prompt lives in the `side_call/approval_system.tera.md`
+//! template and is rendered at the request-build boundary. It is model-facing
+//! text and is therefore English-only — it is never routed through the `i18n`
+//! bundle.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -31,8 +32,6 @@ use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage, MessageContent, Role,
 };
-
-const PROMPT: &str = include_str!("approval/prompt.md");
 
 /// Per-call hard timeout for the reviewer. The reviewer is allowed to take
 /// longer than a streaming chunk — the user is already waiting for the tool
@@ -116,20 +115,28 @@ pub async fn review(
     cancel: CancellationToken,
     cx: &AsyncApp,
 ) -> ReviewVerdict {
-    let user_prompt = format!(
-        "cwd: {}\ntool_name: {}\ntool_title: {}\ntool_input: {}",
-        cwd.display(),
-        tool_name,
-        tool_title,
-        serde_json::to_string_pretty(&truncate_tool_input(tool_input))
-            .unwrap_or_else(|_| "<unprintable input>".to_string()),
-    );
+    let user_prompt = crate::prompt::render(
+        crate::prompt::PromptTemplate::SideCallApprovalUser,
+        &crate::prompt::ApprovalReviewPromptData {
+            cwd: cwd.display().to_string(),
+            tool_name: tool_name.to_string(),
+            tool_title: tool_title.to_string(),
+            tool_input: serde_json::to_string_pretty(&truncate_tool_input(tool_input))
+                .unwrap_or_else(|_| "<unprintable input>".to_string()),
+        },
+    )
+    .expect("approval user prompt render");
 
     let request = LanguageModelRequest {
         messages: vec![
             LanguageModelRequestMessage {
                 role: Role::System,
-                content: vec![MessageContent::Text(PROMPT.to_string())],
+                content: vec![MessageContent::Text(
+                    crate::prompt::render_static(
+                        crate::prompt::PromptTemplate::SideCallApprovalSystem,
+                    )
+                    .expect("approval system prompt render"),
+                )],
                 cache: true,
             },
             LanguageModelRequestMessage {

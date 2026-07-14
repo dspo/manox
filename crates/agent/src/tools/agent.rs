@@ -967,43 +967,20 @@ fn absolutize_path(worktree_dir: &Path, git_common_dir: &str) -> PathBuf {
 /// available sub-agent types with a capability tag and their one-line
 /// descriptions.
 fn build_description() -> Arc<str> {
-    let mut s = String::from(
-        "Spawn a sub-agent to handle a focused subtask. The sub-agent runs in \
-         its own fresh context (no parent history), with a restricted tool set \
-         and a specialized system prompt. Only its final assistant message \
-         returns as the tool result. Useful for: exploring code, research, \
-         parallel subtasks, or any work that would bloat the main context. \
-         Set `isolation: \"worktree\"` to run the sub-agent in its own git \
-         worktree on a fresh branch — full filesystem isolation from the \
-         parent's working tree (the child cannot write the parent's project \
-         root); a clean worktree is auto-removed when the sub-agent finishes.",
-    );
-    let defs = agent_def::global().list();
-    if !defs.is_empty() {
-        s.push_str("\n\nAvailable subagent_type values:");
-        for d in defs {
-            s.push_str(&format!(
-                "\n- {} ({}): {}",
-                d.def.name,
-                capability_tag(&d.def),
-                d.def.description
-            ));
-        }
-        s.push_str(
-            "\n\nThe capability tag in parentheses shows what each sub-agent can \
-             do: `read-only` sub-agents cannot write files or run bash — do not \
-             delegate write/exec work to them (they will refuse and waste a \
-             round). Each sub-agent starts from a blank context with no parent \
-             history, so pin any interface contract the sub-agent must honor \
-             (exact function names, signatures, types) directly in the prompt.",
-        );
-    } else {
-        s.push_str(
-            "\n\nNo sub-agent definitions are loaded. Add Markdown files under \
-             ~/.config/cx/manox/agents/ (frontmatter name/description/tools/model \
-             + body as system prompt) and restart.",
-        );
-    }
+    let subagents: Vec<crate::prompt::SubagentTypeData> = agent_def::global()
+        .list()
+        .into_iter()
+        .map(|d| crate::prompt::SubagentTypeData {
+            name: d.def.name.clone(),
+            capability: capability_tag(&d.def),
+            description: d.def.description.clone(),
+        })
+        .collect();
+    let s = crate::prompt::render(
+        crate::prompt::PromptTemplate::AgentToolDescription,
+        &crate::prompt::AgentToolDescriptionData { subagents },
+    )
+    .expect("agent tool description render");
     Arc::<str>::from(s)
 }
 
