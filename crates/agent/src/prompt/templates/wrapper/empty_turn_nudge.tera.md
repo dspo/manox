@@ -1,1 +1,1 @@
-Your previous turn produced no visible output (only reasoning). If you were about to submit a plan, call exit_plan_mode; if researching, continue; otherwise state your next step.
+Your previous turn produced no visible output (only reasoning). Do not narrate intent — act. Either emit a tool_use block to do the work, or deliver a complete answer that does not announce an action you will not perform. If you were about to submit a plan, call exit_plan_mode.

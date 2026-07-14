@@ -388,6 +388,13 @@ pub trait LanguageModel: Send + Sync {
     fn supports_tools(&self) -> bool {
         true
     }
+    /// Whether the model accepts image attachments in user content. Sourced
+    /// from the provider config's per-model `supports_images` field (ground
+    /// truth, not model self-report). Defaults to `false`; concrete providers
+    /// override when the resolved model declares the capability.
+    fn supports_images(&self) -> bool {
+        false
+    }
     /// Whether the provider supports long-lived prompt cache retention
     /// (`cache_control.ttl:"1h"` on Anthropic, `prompt_cache_retention:"24h"`
     /// on OpenAI). Defaults to `false`; concrete providers override based on

@@ -43,6 +43,10 @@ pub struct AnthropicModel {
     supports_effort: bool,
     /// cx agent ids this model can drive (from the endpoint `agents:` list).
     visible_agents: Vec<String>,
+    /// Operator-declared tool capability (provider config `supports_tools`).
+    supports_tools: bool,
+    /// Operator-declared image capability (provider config `supports_images`).
+    supports_images: bool,
 }
 
 /// Construction inputs for [`AnthropicModel`]. Bundled into a struct so the
@@ -56,6 +60,11 @@ pub struct AnthropicModelConfig {
     pub endpoint_url: String,
     pub api_key: String,
     pub max_token_count: u64,
+    /// Resolved single-response output budget (operator-declared, capped at
+    /// `max_token_count`; falls back to the heuristic clamp in `build_model`).
+    pub max_output_tokens: u64,
+    pub supports_tools: bool,
+    pub supports_images: bool,
     pub auto_compact_window: Option<u64>,
     pub visible_agents: Vec<String>,
 }
@@ -71,6 +80,9 @@ impl AnthropicModel {
             endpoint_url,
             api_key,
             max_token_count,
+            max_output_tokens,
+            supports_tools,
+            supports_images,
             auto_compact_window,
             visible_agents,
         } = cfg;
@@ -89,14 +101,14 @@ impl AnthropicModel {
             api_model_id,
             endpoint_url: endpoint_url.clone(),
             api_key,
-            max_output_tokens: crate::provider::registry::default_max_output_tokens(
-                max_token_count,
-            ),
+            max_output_tokens,
             max_token_count,
             auto_compact_window,
             long_ttl,
             supports_effort,
             visible_agents,
+            supports_tools,
+            supports_images,
         }
     }
 }
@@ -119,6 +131,12 @@ impl LanguageModel for AnthropicModel {
     }
     fn visible_agents(&self) -> &[String] {
         &self.visible_agents
+    }
+    fn supports_tools(&self) -> bool {
+        self.supports_tools
+    }
+    fn supports_images(&self) -> bool {
+        self.supports_images
     }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
@@ -378,11 +396,18 @@ fn content_to_anthropic(c: &MessageContent) -> Option<serde_json::Value> {
         // skipped, so emit the summary as plain text rather than dropping it.
         MessageContent::Compaction(t) => Some(json!({"type": "text", "text": t})),
         MessageContent::Thinking { text, signature } => {
-            let mut v = json!({"type": "thinking", "thinking": text});
-            if let Some(sig) = signature {
-                v["signature"] = serde_json::Value::String(sig.clone());
-            }
-            Some(v)
+            // Anthropic requires a signature on every thinking block it receives
+            // as input; a signature-less block (e.g. sourced from a completions
+            // wire, where `reasoning_content` carries no signature) would 400.
+            // Drop it rather than emit an invalid block. Anthropic-native
+            // thinking always carries a signature (SignatureDelta), so this
+            // only filters thinking imported from a non-Anthropic wire.
+            let sig = signature.as_deref().filter(|s| !s.is_empty())?;
+            Some(json!({
+                "type": "thinking",
+                "thinking": text,
+                "signature": sig,
+            }))
         }
         MessageContent::ToolUse(tu) => Some(json!({
             "type": "tool_use",
@@ -702,12 +727,14 @@ mod tests {
         }
     }
 
-    /// `AnthropicModel::new` derives `max_output_tokens` from the context budget
-    /// via `registry::default_max_output_tokens`: a 1m-context model is capped to
-    /// `MAX_OUTPUT_TOKENS_CAP` (not handed a million-token output budget), and a
-    /// sub-floor context is raised to the minimum so reasoning isn't choked.
+    /// `AnthropicModel::new` stores the resolved `max_output_tokens` from the
+    /// config verbatim — it does not re-derive or re-clamp. Output-budget
+    /// resolution (operator-declared value capped at the context window, else
+    /// the heuristic clamp) happens in `registry::resolve_max_output_tokens`
+    /// before the config is built; `::new` is a plain store so the resolved
+    /// value reaches the request body unchanged.
     #[test]
-    fn new_clamps_max_output_tokens_to_budget() {
+    fn new_stores_max_output_tokens_from_config_verbatim() {
         let big = AnthropicModel::new(AnthropicModelConfig {
             id: "p/m/anthropic".into(),
             name: "m[1m]".into(),
@@ -716,12 +743,15 @@ mod tests {
             endpoint_url: "https://example.invalid".into(),
             api_key: "k".into(),
             max_token_count: 1024 * 1024,
+            max_output_tokens: 65_536,
+            supports_tools: true,
+            supports_images: false,
             auto_compact_window: None,
             visible_agents: Vec::new(),
         });
         assert_eq!(
-            big.max_output_tokens,
-            crate::provider::registry::MAX_OUTPUT_TOKENS_CAP
+            big.max_output_tokens, 65_536,
+            "stored verbatim, not re-clamped"
         );
         let tiny = AnthropicModel::new(AnthropicModelConfig {
             id: "p/m/anthropic".into(),
@@ -731,10 +761,35 @@ mod tests {
             endpoint_url: "https://example.invalid".into(),
             api_key: "k".into(),
             max_token_count: 4_096,
+            max_output_tokens: 1_024,
+            supports_tools: true,
+            supports_images: false,
             auto_compact_window: None,
             visible_agents: Vec::new(),
         });
-        assert_eq!(tiny.max_output_tokens, 8_192);
+        assert_eq!(tiny.max_output_tokens, 1_024);
+    }
+
+    /// `supports_tools` / `supports_images` round-trip from the config struct
+    /// into the stored fields and the `LanguageModel` trait overrides.
+    #[test]
+    fn new_stores_capability_flags_from_config() {
+        let caps = AnthropicModel::new(AnthropicModelConfig {
+            id: "p/m/anthropic".into(),
+            name: "m".into(),
+            provider_name: "p".into(),
+            api_model_id: "m".into(),
+            endpoint_url: "https://example.invalid".into(),
+            api_key: "k".into(),
+            max_token_count: 8_192,
+            max_output_tokens: 8_192,
+            supports_tools: false,
+            supports_images: true,
+            auto_compact_window: None,
+            visible_agents: Vec::new(),
+        });
+        assert!(!caps.supports_tools());
+        assert!(caps.supports_images());
     }
 
     /// `auto_compact_window` round-trips from the config struct into the stored
@@ -752,6 +807,9 @@ mod tests {
             max_token_count: 8_192,
             auto_compact_window: Some(202_745),
             visible_agents: Vec::new(),
+            max_output_tokens: 8_192,
+            supports_tools: true,
+            supports_images: false,
         });
         assert_eq!(with_override.auto_compact_window, Some(202_745));
 
@@ -765,6 +823,9 @@ mod tests {
             max_token_count: 8_192,
             auto_compact_window: None,
             visible_agents: Vec::new(),
+            max_output_tokens: 8_192,
+            supports_tools: true,
+            supports_images: false,
         });
         assert_eq!(without_override.auto_compact_window, None);
     }
@@ -1110,5 +1171,37 @@ mod tests {
         eprintln!(
             "[PROBE3 multi] read1={read1} read2={read2} (read2≈1500 → both honored; read2≈10 → last-only)"
         );
+    }
+
+    /// Anthropic requires a signature on every thinking block received as
+    /// input. A signature-less block (imported from a completions wire, where
+    /// `reasoning_content` carries no signature) must be dropped rather than
+    /// emitted as an invalid `{"type":"thinking", ...}` without a signature —
+    /// otherwise a thread with mixed-wire history 400s when sent to Anthropic.
+    #[test]
+    fn drops_signature_less_thinking_and_keeps_signed() {
+        let dropped = content_to_anthropic(&MessageContent::Thinking {
+            text: "imported from completions".into(),
+            signature: None,
+        });
+        assert!(dropped.is_none(), "signature-less thinking must be dropped");
+
+        let empty_sig = content_to_anthropic(&MessageContent::Thinking {
+            text: "empty signature".into(),
+            signature: Some(String::new()),
+        });
+        assert!(
+            empty_sig.is_none(),
+            "empty-string signature must be dropped"
+        );
+
+        let kept = content_to_anthropic(&MessageContent::Thinking {
+            text: "native anthropic thinking".into(),
+            signature: Some("sig-0".into()),
+        })
+        .expect("signed thinking is emitted");
+        assert_eq!(kept["type"], "thinking");
+        assert_eq!(kept["thinking"], "native anthropic thinking");
+        assert_eq!(kept["signature"], "sig-0");
     }
 }

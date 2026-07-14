@@ -2063,7 +2063,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 [[package]]
 name = "cx"
 version = "0.2.0"
-source = "git+https://github.com/dspo/cx.git?rev=43e268092637c447f4ece15a08dc6454edc3481b#43e268092637c447f4ece15a08dc6454edc3481b"
+source = "git+https://github.com/dspo/cx.git?rev=5c47c1874c3d057e2c2d6af7f65e8b7bc760e64b#5c47c1874c3d057e2c2d6af7f65e8b7bc760e64b"
 dependencies = [
  "anyhow",
  "base64",
@@ -2094,7 +2094,7 @@ dependencies = [
 [[package]]
 name = "cx-providers"
 version = "0.1.0"
-source = "git+https://github.com/dspo/cx.git?rev=43e268092637c447f4ece15a08dc6454edc3481b#43e268092637c447f4ece15a08dc6454edc3481b"
+source = "git+https://github.com/dspo/cx.git?rev=5c47c1874c3d057e2c2d6af7f65e8b7bc760e64b#5c47c1874c3d057e2c2d6af7f65e8b7bc760e64b"
 dependencies = [
  "anyhow",
  "dirs",

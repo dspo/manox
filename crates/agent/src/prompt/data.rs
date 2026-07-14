@@ -81,6 +81,29 @@ pub struct SystemPromptAssembly {
     pub worktree_subagent: Option<WorktreePromptData>,
     pub goal: bool,
     pub ultracode: bool,
+    /// Operator-declared model capability ground truth (provider-config
+    /// `supports_tools` / `supports_images`), so the model does not
+    /// self-report — and hallucinate — its own capabilities (thread 480b2469:
+    /// a non-multimodal model claimed multimodal ability).
+    pub capabilities: ModelCapabilitiesPromptData,
+}
+
+/// Model capability ground truth injected into the system prompt. Defaults to
+/// the common case (tools on, images off) so call sites without a resolved
+/// model — tests, restore paths — get the baseline without spelling it out.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ModelCapabilitiesPromptData {
+    pub supports_tools: bool,
+    pub supports_images: bool,
+}
+
+impl Default for ModelCapabilitiesPromptData {
+    fn default() -> Self {
+        Self {
+            supports_tools: true,
+            supports_images: false,
+        }
+    }
 }
 
 // --- conversation wrappers ---

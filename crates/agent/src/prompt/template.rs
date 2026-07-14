@@ -36,6 +36,7 @@ pub enum PromptTemplate {
     WrapperMaxTokensDirective,
     WrapperRecoveryFailure,
     WrapperEmptyTurnNudge,
+    WrapperUnfulfilledToolIntentNudge,
     WrapperPeerMessage,
     WrapperAskUserResponse,
     WrapperAskUserQuestions,
@@ -80,6 +81,9 @@ impl PromptTemplate {
             Self::WrapperMaxTokensDirective => "wrapper/max_tokens_directive.tera.md",
             Self::WrapperRecoveryFailure => "wrapper/recovery_failure.tera.md",
             Self::WrapperEmptyTurnNudge => "wrapper/empty_turn_nudge.tera.md",
+            Self::WrapperUnfulfilledToolIntentNudge => {
+                "wrapper/unfulfilled_tool_intent_nudge.tera.md"
+            }
             Self::WrapperPeerMessage => "wrapper/peer_message.tera.md",
             Self::WrapperAskUserResponse => "wrapper/ask_user_response.tera.md",
             Self::WrapperAskUserQuestions => "wrapper/ask_user_questions.tera.md",
@@ -108,7 +112,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 29] = [
+pub const ALL: [PromptTemplate; 30] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::ModePlanAddendum,
@@ -118,6 +122,7 @@ pub const ALL: [PromptTemplate; 29] = [
     PromptTemplate::WrapperMaxTokensDirective,
     PromptTemplate::WrapperRecoveryFailure,
     PromptTemplate::WrapperEmptyTurnNudge,
+    PromptTemplate::WrapperUnfulfilledToolIntentNudge,
     PromptTemplate::WrapperPeerMessage,
     PromptTemplate::WrapperAskUserResponse,
     PromptTemplate::WrapperAskUserQuestions,
