@@ -7,6 +7,7 @@
 //! can `kill` the agent explicitly. Sessions live only in memory — they are not
 //! persisted and vanish from the sidebar on exit.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui::{Entity, Subscription};
@@ -76,6 +77,12 @@ pub struct ExternalSession {
     /// switches inside the TUI, let alone inter-message timing, so the spawn
     /// time is the only stable ordering signal it has.
     pub created_at: i64,
+    /// The project path the session was bound to at spawn (`Some` when launched
+    /// from a project folder's `+` button, `None` from the Conversations
+    /// header). The sidebar uses it to group the row under its project folder
+    /// instead of in the loose Conversations list, matching how manox threads
+    /// bound to a project are grouped.
+    pub project: Option<PathBuf>,
     pub terminal_view: Entity<TerminalView>,
     pub handle: Arc<cx::SessionHandle>,
     pub _exit_sub: Subscription,
@@ -99,6 +106,7 @@ impl ExternalSession {
             provider_name: self.provider_name.clone(),
             model_id: self.model_id.clone(),
             created_at: self.created_at,
+            project: self.project.clone(),
         }
     }
 }
@@ -115,4 +123,5 @@ pub struct ExternalSessionSummary {
     pub provider_name: String,
     pub model_id: String,
     pub created_at: i64,
+    pub project: Option<PathBuf>,
 }

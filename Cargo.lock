@@ -885,7 +885,7 @@ dependencies = [
  "bitflags 2.13.0",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1027,7 +1027,7 @@ version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.20.11",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -2061,7 +2061,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 [[package]]
 name = "cx"
 version = "0.2.0"
-source = "git+https://github.com/dspo/cx.git?rev=e2dd5769811ff6c8deda997c33ea0ac4070432bf#e2dd5769811ff6c8deda997c33ea0ac4070432bf"
+source = "git+https://github.com/dspo/cx.git?rev=43e268092637c447f4ece15a08dc6454edc3481b#43e268092637c447f4ece15a08dc6454edc3481b"
 dependencies = [
  "anyhow",
  "base64",
@@ -2092,7 +2092,7 @@ dependencies = [
 [[package]]
 name = "cx-providers"
 version = "0.1.0"
-source = "git+https://github.com/dspo/cx.git?rev=e2dd5769811ff6c8deda997c33ea0ac4070432bf#e2dd5769811ff6c8deda997c33ea0ac4070432bf"
+source = "git+https://github.com/dspo/cx.git?rev=43e268092637c447f4ece15a08dc6454edc3481b#43e268092637c447f4ece15a08dc6454edc3481b"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4252,7 +4252,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.57.0",
 ]
 
 [[package]]

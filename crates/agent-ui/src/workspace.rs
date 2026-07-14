@@ -1276,11 +1276,19 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let agent_id = kind.agent_id();
+        // The agent process runs in the project directory when spawned from a
+        // project folder's `+` button, else the workspace cwd. cx's
+        // AgentBuilder.cwd forwards to both the PTY-relay and direct spawn
+        // paths; without it the agent inherits manox's own cwd (the user's
+        // home dir), so a project-scoped session would operate on the wrong
+        // tree.
+        let cwd = project_cwd.clone().unwrap_or_else(|| self.cwd.clone());
         let handle = match cx::AgentBuilder::new()
             .agent(kind.agent())
             .pty(true)
             .provider(provider_name.clone())
             .model(model_id.clone())
+            .cwd(cwd.clone())
             .spawn()
         {
             Ok(h) => Arc::new(h),
@@ -1298,7 +1306,6 @@ impl Workspace {
         };
         let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
         let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
-        let cwd = project_cwd.unwrap_or_else(|| self.cwd.clone());
         let terminal = match Terminal::new(id.clone(), cwd, 80, 24, Box::new(source), cx) {
             Ok(t) => t,
             Err(e) => {
@@ -1336,6 +1343,7 @@ impl Workspace {
             provider_name,
             model_id,
             created_at,
+            project: project_cwd,
             terminal_view: view,
             handle,
             _exit_sub: exit_sub,

@@ -339,6 +339,15 @@ impl Sidebar {
             .unwrap_or(path)
             .to_string();
         let key: SharedString = path.to_string().into();
+        // External sessions bound to this project folder — pulled from the
+        // sidebar's projection rather than threaded through as an arg, so the
+        // signature stays under clippy's argument limit.
+        let externals: Vec<crate::external_session::ExternalSessionSummary> = self
+            .external_sessions
+            .iter()
+            .filter(|s| s.project.as_deref() == Some(std::path::Path::new(path)))
+            .cloned()
+            .collect();
 
         let header = h_flex()
             .id(key.clone())
@@ -425,17 +434,36 @@ impl Sidebar {
             }));
 
         let rows = expanded.then(|| {
-            v_flex().w_full().gap_0p5().children(group.iter().map(|s| {
-                render_thread_item(
-                    s,
-                    selected == Some(s.id.as_str()),
-                    store.read(cx).is_running(&s.id),
-                    px(16.),
-                    slide,
-                    &theme,
-                    cx,
-                )
-            }))
+            // Threads + this project's external sessions, merged by recency so
+            // an external CLI session launched from the folder's `+` sits
+            // among the folder's manox threads instead of in the loose list.
+            let mut rows: Vec<SidebarRow> = group
+                .iter()
+                .cloned()
+                .map(SidebarRow::Thread)
+                .chain(externals.iter().cloned().map(SidebarRow::External))
+                .collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key()));
+            v_flex()
+                .w_full()
+                .gap_0p5()
+                .children(rows.into_iter().map(|row| {
+                    let is_selected = selected == Some(row.id());
+                    match row {
+                        SidebarRow::Thread(s) => render_thread_item(
+                            &s,
+                            is_selected,
+                            store.read(cx).is_running(&s.id),
+                            px(16.),
+                            slide,
+                            &theme,
+                            cx,
+                        ),
+                        SidebarRow::External(s) => {
+                            render_external_session_item(&s, is_selected, &theme, cx)
+                        }
+                    }
+                }))
         });
 
         v_flex()
@@ -465,6 +493,15 @@ impl Render for Sidebar {
                 projects.push((s.project.clone(), vec![s.clone()]));
             }
         }
+        // External sessions not bound to a project stay in the loose
+        // Conversations list; bound ones are pulled into their folder group
+        // inside `render_project_group` (filtered by project path there).
+        let loose_externals: Vec<crate::external_session::ExternalSessionSummary> = self
+            .external_sessions
+            .iter()
+            .filter(|s| s.project.is_none())
+            .cloned()
+            .collect();
 
         let mut flat_ids: Vec<String> = Vec::new();
         for (path, group) in &projects {
@@ -594,12 +631,7 @@ impl Render for Sidebar {
                         let mut rows: Vec<SidebarRow> = loose
                             .into_iter()
                             .map(SidebarRow::Thread)
-                            .chain(
-                                self.external_sessions
-                                    .iter()
-                                    .cloned()
-                                    .map(SidebarRow::External),
-                            )
+                            .chain(loose_externals.into_iter().map(SidebarRow::External))
                             .collect();
                         rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key()));
                         v_flex()
@@ -800,7 +832,6 @@ fn render_external_session_item(
         crate::external_session::SessionKind::Codex => IconName::Cpu,
         crate::external_session::SessionKind::GithubCopilot => IconName::Github,
     };
-    let subtitle = format!("{} · {}", summary.provider_name, summary.model_id);
     let mut row = h_flex()
         .id(format!("external-row-{id}"))
         .w_full()
@@ -820,22 +851,12 @@ fn render_external_session_item(
     row = row
         .child(Icon::new(icon).small().text_color(theme.muted_foreground))
         .child(
-            v_flex()
+            gpui::div()
                 .flex_1()
                 .min_w_0()
-                .gap_0p5()
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .text_color(theme.foreground)
-                        .child(kind.label()),
-                )
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(subtitle),
-                ),
+                .text_sm()
+                .text_color(theme.foreground)
+                .child(kind.label()),
         )
         .child(
             Button::new(format!("external-close-{id}"))

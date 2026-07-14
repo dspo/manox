@@ -109,12 +109,12 @@ fluent = "0.17"
 unic-langid = "0.9"
 
 # cx-providers —— provider 配置解析的单一事实来源（与 cx 共享）。锁 cx 仓库已合并的确定 rev。
-cx-providers = { git = "https://github.com/dspo/cx.git", rev = "e2dd5769811ff6c8deda997c33ea0ac4070432bf" }
+cx-providers = { git = "https://github.com/dspo/cx.git", rev = "43e268092637c447f4ece15a08dc6454edc3481b" }
 
 # cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library。SessionHandle 暴露
 # PTY 的 read/write_bytes/resize/socket_path/kill/wait，manox 经 CxSessionSource
 # 驱动 CLI TUI 渲染到 Terminal。与 cx-providers 同 rev 锁定（同一仓库）。
-cx = { git = "https://github.com/dspo/cx.git", rev = "e2dd5769811ff6c8deda997c33ea0ac4070432bf" }
+cx = { git = "https://github.com/dspo/cx.git", rev = "43e268092637c447f4ece15a08dc6454edc3481b" }
 
 # GPUI 栈 —— git 仓库地址（规则允许）。gpui-component 锁定 zed rev 1d217ee，三者必须一致。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
