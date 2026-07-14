@@ -48,6 +48,9 @@ pub(crate) fn spawn_pty(spec: &LaunchSpec, extra_env: &[(&str, String)]) -> Resu
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    if let Some(cwd) = spec.cwd.as_deref() {
+        cmd.cwd(cwd);
+    }
 
     let child = pair
         .slave
@@ -99,6 +102,7 @@ mod tests {
             model_id: None,
             pty: true,
             socket: None,
+            cwd: None,
         };
         let pty = spawn_pty(&spec, &[]).expect("spawn_pty");
         let mut writer = pty.writer;

@@ -190,6 +190,7 @@ mod tests {
             model_id: None,
             pty: true,
             socket: None,
+            cwd: None,
         };
         let pty = spawn_pty(&spec, &[]).expect("spawn_pty");
         let (tx, rx) = mpsc::channel();

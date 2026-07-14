@@ -1089,6 +1089,9 @@ struct Cli {
     /// 自定义 IPC socket 路径（仅与 --pty 同时生效；默认 ~/.config/cx/sessions/<id>.sock）。
     #[arg(long, short = 'S', value_name = "SOCK PATH", requires = "pty")]
     socket: Option<String>,
+    /// Agent 进程的工作目录；默认继承 cx 自身 cwd。绑定外部 CLI session 到项目目录时用。
+    #[arg(long, value_name = "DIR")]
+    cwd: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<CxCommand>,
 }
@@ -1170,6 +1173,7 @@ enum DispatchCommand {
         args: Vec<String>,
         pty: bool,
         socket: Option<String>,
+        cwd: Option<PathBuf>,
     },
 }
 
@@ -1238,6 +1242,7 @@ fn dispatch_command(raw_args: &[String]) -> Result<DispatchCommand> {
                 args: agent_args,
                 pty: cli.pty,
                 socket: cli.socket,
+                cwd: cli.cwd,
             }),
         },
         Err(e) => match e.kind() {
@@ -1326,18 +1331,30 @@ pub fn run() -> Result<()> {
             clear_buffer,
             text,
         } => run_send(session, clear_buffer, text),
-        DispatchCommand::Launch { args, pty, socket } => {
+        DispatchCommand::Launch {
+            args,
+            pty,
+            socket,
+            cwd,
+        } => {
             // `--` separated cx flags from agent args; the first arg, if it names a
             // known agent, is consumed as the hint and dropped from passthrough.
             let config = load_config()?;
 
             if let Some(first) = args.first() {
                 if let Some(agent) = find_agent(&config, first) {
-                    return run_launcher(Some(agent.id), &config, args[1..].to_vec(), pty, socket);
+                    return run_launcher(
+                        Some(agent.id),
+                        &config,
+                        args[1..].to_vec(),
+                        pty,
+                        socket,
+                        cwd,
+                    );
                 }
             }
 
-            run_launcher(None, &config, args, pty, socket)
+            run_launcher(None, &config, args, pty, socket, cwd)
         }
     }
 }
@@ -1352,8 +1369,10 @@ fn run_launcher(
     passthrough_args: Vec<String>,
     pty: bool,
     socket: Option<String>,
+    cwd: Option<PathBuf>,
 ) -> Result<()> {
     let rerun_agent_hint = agent_hint.clone();
+    let rerun_cwd = cwd.clone();
     let mut all_models = build_all_models(config);
     apply_probe_cache(&mut all_models);
 
@@ -1366,7 +1385,14 @@ fn run_launcher(
     if selection.provider.name == ADD_PROVIDER_SENTINEL {
         if run_add()? {
             let refreshed = load_config()?;
-            return run_launcher(rerun_agent_hint, &refreshed, passthrough_args, pty, socket);
+            return run_launcher(
+                rerun_agent_hint,
+                &refreshed,
+                passthrough_args,
+                pty,
+                socket,
+                rerun_cwd,
+            );
         }
         return Ok(());
     }
@@ -1384,7 +1410,7 @@ fn run_launcher(
         return codex_app::launch_with_injection(&selection, &passthrough_args);
     }
 
-    let spec = build_launch_spec(&selection, &passthrough_args, pty, socket)?;
+    let spec = build_launch_spec(&selection, &passthrough_args, pty, socket, cwd)?;
 
     apply_selected_model_tab_name(&selection)?;
     launch_agent(spec)
@@ -1823,6 +1849,9 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
         command.env_remove(name);
     }
     command.envs(&spec.env);
+    if let Some(cwd) = spec.cwd.as_deref() {
+        command.current_dir(cwd);
+    }
 
     if spec.detach {
         // GUI app: spawn in background, then exit terminal
@@ -2110,6 +2139,9 @@ struct LaunchSpec {
     pty: bool,
     /// 自定义 IPC socket 路径（仅 pty 时生效；None 则用 ~/.config/cx/sessions/<id>.sock）。
     socket: Option<String>,
+    /// Agent 进程的工作目录。`None` 时继承 cx 自身的 cwd（`std::env::current_dir`），
+    /// 保留直连/库调用的默认行为；`Some` 时 PTY 与直连两条 spawn 路径都以此为子进程 cwd。
+    cwd: Option<PathBuf>,
 }
 
 fn build_launch_spec(
@@ -2117,6 +2149,7 @@ fn build_launch_spec(
     passthrough_args: &[String],
     pty: bool,
     socket: Option<String>,
+    cwd: Option<PathBuf>,
 ) -> Result<LaunchSpec> {
     let program = resolve_binary(&selection.agent_binary)?;
     let mut args = Vec::new();
@@ -2290,6 +2323,7 @@ fn build_launch_spec(
         // PTY 中继 opt-in：仅当传入 --pty 时启用，否则 build_launch_spec 调用方走直连 status()。
         pty,
         socket,
+        cwd,
     })
 }
 
@@ -4031,6 +4065,7 @@ mod tests {
                 args: Vec::new(),
                 pty: false,
                 socket: None,
+                cwd: None,
             }
         );
     }
@@ -4145,6 +4180,7 @@ mod tests {
                 args: vec!["claude".into(), "--foo".into()],
                 pty: true,
                 socket: None,
+                cwd: None,
             }
         );
         // `cx --pty -- --foo` → TUI agent selection, passthrough = ["--foo"]
@@ -4154,6 +4190,7 @@ mod tests {
                 args: vec!["--foo".into()],
                 pty: true,
                 socket: None,
+                cwd: None,
             }
         );
         // `cx -- claude` → pty off (direct), args = ["claude"]
@@ -4163,6 +4200,7 @@ mod tests {
                 args: vec!["claude".into()],
                 pty: false,
                 socket: None,
+                cwd: None,
             }
         );
         // `cx --pty` (no agent args) → pty on, TUI selection
@@ -4172,6 +4210,7 @@ mod tests {
                 args: Vec::new(),
                 pty: true,
                 socket: None,
+                cwd: None,
             }
         );
     }
@@ -4185,6 +4224,7 @@ mod tests {
                 args: vec!["claude".into()],
                 pty: true,
                 socket: Some("/tmp/cx.sock".into()),
+                cwd: None,
             }
         );
         // `--socket` without `--pty` is rejected by clap (requires = "pty").
@@ -4196,6 +4236,7 @@ mod tests {
                 args: vec!["--socket".into(), "/tmp/x".into()],
                 pty: true,
                 socket: None,
+                cwd: None,
             }
         );
     }
@@ -4231,8 +4272,14 @@ mod tests {
             injected_models: Vec::new(),
         };
 
-        let spec =
-            build_launch_spec(&selection, &["mcp".into(), "serve".into()], false, None).unwrap();
+        let spec = build_launch_spec(
+            &selection,
+            &["mcp".into(), "serve".into()],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(spec.args, vec!["mcp".to_string(), "serve".to_string()]);
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
@@ -4255,7 +4302,7 @@ mod tests {
             model: None,
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
         assert!(
             spec.env_remove
@@ -4304,8 +4351,14 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec =
-            build_launch_spec(&selection, &["mcp".into(), "list".into()], false, None).unwrap();
+        let spec = build_launch_spec(
+            &selection,
+            &["mcp".into(), "list".into()],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
         assert!(
             spec.env_remove
@@ -4368,7 +4421,7 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         assert_eq!(spec.env.get("CX_MODEL"), Some(&"glm-5.2".to_string()));
         assert_eq!(
             spec.env.get("ANTHROPIC_MODEL"),
@@ -4412,7 +4465,7 @@ mod tests {
             injected_models: Vec::new(),
         };
 
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         assert_eq!(
             spec.env.get("COPILOT_PROVIDER_BEARER_TOKEN"),
             Some(&"test-key".to_string())
@@ -4464,7 +4517,7 @@ mod tests {
             injected_models: Vec::new(),
         };
 
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         assert_eq!(spec.env.get("COPILOT_MODEL"), Some(&"glm-5.2".to_string()));
         assert_eq!(
             spec.env.get("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"),
@@ -4508,7 +4561,7 @@ mod tests {
             injected_models: Vec::new(),
         };
 
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         assert!(spec.env.get("COPILOT_MODEL").is_some());
         assert!(!spec.env.contains_key("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"));
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
@@ -4566,7 +4619,7 @@ mod tests {
             model: None,
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         assert_eq!(spec.env.get("MY_AGENT_VAR"), Some(&"from-agent".into()));
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
@@ -4606,7 +4659,7 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         assert_eq!(
             spec.env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
             Some(&"1000000".into())
@@ -4654,7 +4707,7 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         // Model env overrides agent env for the shared key
         assert_eq!(spec.env.get("SHARED_VAR"), Some(&"from-model".into()));
         // Both unique keys are present
@@ -4689,7 +4742,7 @@ mod tests {
             model: None,
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         // Provider overrides agent
         assert_eq!(spec.env.get("SHARED"), Some(&"from-provider".into()));
         assert_eq!(spec.env.get("AGENT_ONLY"), Some(&"agent".into()));
@@ -4739,7 +4792,7 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[], false, None).unwrap();
+        let spec = build_launch_spec(&selection, &[], false, None, None).unwrap();
         // Model overrides provider for shared key
         assert_eq!(spec.env.get("SHARED"), Some(&"from-model".into()));
         // Provider-only key is still present (via merged model.env)
@@ -5781,6 +5834,7 @@ trust_level = "trusted"
             model_id: Some("MiniMax-M2.7".into()),
             pty: false,
             socket: None,
+            cwd: None,
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(192), None, None);
         assert_eq!(
@@ -5803,6 +5857,7 @@ trust_level = "trusted"
             model_id: None,
             pty: false,
             socket: None,
+            cwd: None,
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(45), None, None);
         assert_eq!(
@@ -5825,6 +5880,7 @@ trust_level = "trusted"
             model_id: Some("qwen-max".into()),
             pty: false,
             socket: None,
+            cwd: None,
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(10), Some("exit 1"), None);
         assert_eq!(
@@ -5847,6 +5903,7 @@ trust_level = "trusted"
             model_id: Some("opus-4.7".into()),
             pty: false,
             socket: None,
+            cwd: None,
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(5), Some("signal 9"), None);
         assert_eq!(
@@ -5869,6 +5926,7 @@ trust_level = "trusted"
             model_id: Some("MiniMax-M2.7".into()),
             pty: false,
             socket: None,
+            cwd: None,
         };
         let tokens = stats::SessionTokens {
             input: 100_000,

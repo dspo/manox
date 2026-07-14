@@ -62,6 +62,7 @@ pub struct AgentBuilder {
     provider: Option<String>,
     model: Option<String>,
     passthrough: Vec<String>,
+    cwd: Option<PathBuf>,
 }
 
 impl Default for AgentBuilder {
@@ -79,6 +80,7 @@ impl AgentBuilder {
             provider: None,
             model: None,
             passthrough: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -109,6 +111,16 @@ impl AgentBuilder {
 
     pub fn model(mut self, id: impl Into<String>) -> Self {
         self.model = Some(id.into());
+        self
+    }
+
+    /// Working directory the spawned agent process runs in. When unset, the
+    /// agent inherits cx's own cwd (the historical default). The override
+    /// applies on both the PTY-relay and direct `Command::status()` spawn
+    /// paths, so an embedding app can bind an external CLI session to a
+    /// project directory without chdir'ing its own process.
+    pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(path.into());
         self
     }
 
@@ -207,7 +219,7 @@ impl AgentBuilder {
             .socket
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
-        let spec = build_launch_spec(&selection, &self.passthrough, self.pty, socket)?;
+        let spec = build_launch_spec(&selection, &self.passthrough, self.pty, socket, self.cwd)?;
 
         let warp_session =
             crate::warp::maybe_emit_session_start(&spec.agent_id, spec.model_id.as_deref());
@@ -551,6 +563,7 @@ mod tests {
             model_id: None,
             pty: true,
             socket,
+            cwd: None,
         }
     }
 
