@@ -98,6 +98,14 @@ impl TerminalView {
         &self.terminal
     }
 
+    /// The view's focus handle, so a parent can focus the terminal after
+    /// mounting it (e.g. switching to an external agent session). Returns a
+    /// clone so the caller can call `window.focus` without holding the view's
+    /// context borrow.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
     fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
 
@@ -151,6 +159,18 @@ impl TerminalView {
                     self.run_search(cx);
                 }
             }
+            return;
+        }
+
+        // Tab / shift+tab always reach the PTY while the terminal is focused:
+        // Tab writes `\t` (a completion trigger in the agent TUI), shift+tab
+        // writes `\x1b[Z. Handled before anything else (save the search overlay
+        // above) so GPUI's focus traversal never steals Tab away from the TUI —
+        // `stop_propagation` keeps focus on the terminal.
+        if k.key == "tab" && !k.modifiers.control && !k.modifiers.platform {
+            let seq = if k.modifiers.shift { "\x1b[Z" } else { "\t" };
+            let _ = self.terminal.update(cx, |t, _cx| t.input(seq.as_bytes()));
+            cx.stop_propagation();
             return;
         }
 
@@ -246,7 +266,7 @@ impl TerminalView {
     fn on_scroll_wheel(
         &mut self,
         ev: &ScrollWheelEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Negative = scroll up into scrollback history.
@@ -254,6 +274,21 @@ impl TerminalView {
             ScrollDelta::Pixels(p) => -(f32::from(p.y) / 20.) as i32,
             ScrollDelta::Lines(l) => -(l.y as i32),
         };
+        if lines == 0 {
+            return;
+        }
+        let mode = self.terminal.read_with(cx, |t, _| t.mode());
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            // The TUI app captures the mouse (claude code / vim / htop): forward
+            // the wheel as xterm mouse reports so its own viewport scrolls.
+            // Local scrollback scroll is a no-op on the alt screen the TUI
+            // owns, so without this the wheel does nothing.
+            let (row, col) = self.px_to_grid(ev.position, window);
+            self.terminal.update(cx, |t, _| {
+                t.mouse_wheel(row, col, lines, &ev.modifiers);
+            });
+            return;
+        }
         if lines != 0 {
             self.terminal.update(cx, |t, cx| t.scroll(lines, cx));
         }

@@ -14,6 +14,7 @@ sidebar-section-external = External
 sidebar-new-session-label = New session
 sidebar-new-session-manox = Manox Thread
 sidebar-close-external = Close session
+sidebar-archive = Archive
 external-wizard-no-model = No model configured for this agent
 external-session-start-failed = Failed to start external agent
 sidebar-empty-summary = (New chat)

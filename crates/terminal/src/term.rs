@@ -252,6 +252,41 @@ impl Terminal {
         cx.notify();
     }
 
+    /// Forward a mouse-wheel scroll to the PTY as xterm mouse reports, so a TUI
+    /// app that captures the mouse (claude code / vim / htop) scrolls its own
+    /// viewport instead of the (no-op, alt-screen) local scrollback. `delta_lines`
+    /// is signed (negative = wheel up, positive = wheel down); one report per
+    /// line, capped at a small burst so a single fling does not flood the PTY.
+    /// `row`/`col` are the visible grid coords under the cursor. No-op when no
+    /// mouse mode is active — callers should fall back to [`Self::scroll`].
+    pub fn mouse_wheel(
+        &self,
+        row: usize,
+        col: usize,
+        delta_lines: i32,
+        modifiers: &gpui::Modifiers,
+    ) {
+        if delta_lines == 0 {
+            return;
+        }
+        let mode = self.mode();
+        if !mode.intersects(TermMode::MOUSE_MODE) {
+            return;
+        }
+        // xterm mouse modifier bits: shift=4, alt=8, control=16 (added to the
+        // button code). Wheel up is button 64, wheel down 65.
+        let mod_bits = 4 * (modifiers.shift as u8)
+            + 8 * (modifiers.alt as u8)
+            + 16 * (modifiers.control as u8);
+        let base = if delta_lines < 0 { 64 } else { 65 };
+        let count = delta_lines.unsigned_abs().min(6) as usize;
+        let button = base + mod_bits;
+        let report = mouse_report_bytes(mode, button, row, col);
+        for _ in 0..count {
+            let _ = self.pty.write(&report);
+        }
+    }
+
     /// Selected text as a plain string, if a selection is active.
     pub fn selection_to_string(&self) -> Option<String> {
         self.with_term(|t| t.selection_to_string())
@@ -374,6 +409,24 @@ impl Terminal {
     }
 }
 
+/// Encode an xterm mouse report for `button` at visible grid `(row, col)`,
+/// following the mode the TUI enabled:
+/// - SGR (`\x1b[<`): `\x1b[<button;col+1;row+1M` (1-based, no +32 offset).
+/// - Legacy / UTF8 (`\x1b[M`): `\x1b[M` + three payload bytes, each `32 +
+///   value` (button code, 1-based column, 1-based row). Wheel button codes
+///   (64/65 + modifiers) stay below 128, so the encoding is byte-identical
+///   across legacy and UTF8 for the wheel case.
+fn mouse_report_bytes(mode: TermMode, button: u8, row: usize, col: usize) -> Vec<u8> {
+    if mode.contains(TermMode::SGR_MOUSE) {
+        format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
+    } else {
+        let cb = (32u32 + button as u32).min(255) as u8;
+        let cx = (32u32 + col as u32 + 1).min(255) as u8;
+        let cy = (32u32 + row as u32 + 1).min(255) as u8;
+        vec![0x1b, b'[', b'M', cb, cx, cy]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,5 +488,19 @@ mod tests {
         }
         // Drop kills the child and detaches both threads.
         drop(pty);
+    }
+
+    #[test]
+    fn sgr_wheel_report_is_one_based() {
+        // wheel down = button 65 at row 2, col 4 (0-based) → 1-based 3,5.
+        let b = mouse_report_bytes(TermMode::SGR_MOUSE, 65, 2, 4);
+        assert_eq!(b, b"\x1b[<65;5;3M");
+    }
+
+    #[test]
+    fn legacy_wheel_report_adds_32_offset() {
+        // wheel up = button 64 at row 0, col 0 → payload 96 (0x60), 33 ('!'), 33.
+        let b = mouse_report_bytes(TermMode::MOUSE_REPORT_CLICK, 64, 0, 0);
+        assert_eq!(b, b"\x1b[M\x60!!");
     }
 }

@@ -116,9 +116,10 @@ pub enum SidebarEvent {
     ),
     /// Switch the main area to an already-running external session.
     OpenExternalSession(String),
-    /// Close an external session (× on the row): kill the agent and drop it
-    /// from the sidebar.
-    CloseExternalSession(String),
+    /// Archive an external session from the sidebar row's hover action (the
+    /// unified "Inbox" button threads also use): kill the agent and drop it
+    /// from the sidebar — the same path as closing the tab.
+    ArchiveExternalSession(String),
 }
 
 pub struct Sidebar {
@@ -451,17 +452,23 @@ impl Sidebar {
                     let is_selected = selected == Some(row.id());
                     match row {
                         SidebarRow::Thread(s) => render_thread_item(
-                            &s,
-                            is_selected,
-                            store.read(cx).is_running(&s.id),
-                            px(16.),
+                            &SidebarThreadItem::from_thread(
+                                &s,
+                                is_selected,
+                                store.read(cx).is_running(&s.id),
+                                px(16.),
+                                &theme,
+                            ),
                             slide,
                             &theme,
                             cx,
                         ),
-                        SidebarRow::External(s) => {
-                            render_external_session_item(&s, is_selected, &theme, cx)
-                        }
+                        SidebarRow::External(s) => render_thread_item(
+                            &SidebarThreadItem::from_external(&s, is_selected, px(16.), &theme),
+                            slide,
+                            &theme,
+                            cx,
+                        ),
                     }
                 }))
         });
@@ -507,9 +514,19 @@ impl Render for Sidebar {
         for (path, group) in &projects {
             if !self.collapsed.contains(path.as_str()) {
                 flat_ids.extend(group.iter().map(|s| s.id.clone()));
+                // Include external sessions bound to this project folder so
+                // they participate in the selection-slide alongside the
+                // folder's threads (merged + recency-sorted at render time).
+                flat_ids.extend(
+                    self.external_sessions
+                        .iter()
+                        .filter(|s| s.project.as_deref() == Some(std::path::Path::new(path)))
+                        .map(|s| s.id.clone()),
+                );
             }
         }
         flat_ids.extend(loose.iter().map(|s| s.id.clone()));
+        flat_ids.extend(loose_externals.iter().map(|s| s.id.clone()));
         let dir = match (&self.prev_selected, &self.selected) {
             (Some(prev), Some(cur)) => match (
                 flat_ids.iter().position(|id| id == prev),
@@ -641,17 +658,28 @@ impl Render for Sidebar {
                                 let is_selected = selected.as_deref() == Some(row.id());
                                 match row {
                                     SidebarRow::Thread(s) => render_thread_item(
-                                        &s,
-                                        is_selected,
-                                        store.read(cx).is_running(&s.id),
-                                        px(0.),
+                                        &SidebarThreadItem::from_thread(
+                                            &s,
+                                            is_selected,
+                                            store.read(cx).is_running(&s.id),
+                                            px(0.),
+                                            &theme,
+                                        ),
                                         &slide,
                                         &theme,
                                         cx,
                                     ),
-                                    SidebarRow::External(s) => {
-                                        render_external_session_item(&s, is_selected, &theme, cx)
-                                    }
+                                    SidebarRow::External(s) => render_thread_item(
+                                        &SidebarThreadItem::from_external(
+                                            &s,
+                                            is_selected,
+                                            px(0.),
+                                            &theme,
+                                        ),
+                                        &slide,
+                                        &theme,
+                                        cx,
+                                    ),
                                 }
                             }))
                     }),
@@ -816,85 +844,148 @@ fn build_agent_model_cascade(
     menu
 }
 
-/// Render one external-session row in the "External" section.
-fn render_external_session_item(
-    summary: &crate::external_session::ExternalSessionSummary,
-    selected: bool,
-    theme: &Theme,
-    cx: &mut Context<Sidebar>,
-) -> AnyElement {
-    let id = summary.id.clone();
-    let id_open = id.clone();
-    let id_close = id.clone();
-    let kind = summary.kind;
-    let mut row = h_flex()
-        .id(format!("external-row-{id}"))
-        .w_full()
-        .px_2()
-        .py_1p5()
-        .gap_2()
-        .items_center()
-        .rounded(theme.radius)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.accent.opacity(0.06)))
-        .on_click(cx.listener(move |_this, _ev, _window, cx| {
-            cx.emit(SidebarEvent::OpenExternalSession(id_open.clone()));
-        }));
-    if selected {
-        row = row.bg(theme.accent.opacity(0.10));
-    }
-    row = row
-        .child(
-            gpui::svg()
-                .path(kind.icon_asset())
-                .size(px(16.))
-                .text_color(theme.muted_foreground),
-        )
-        .child(
-            gpui::div()
-                .flex_1()
-                .min_w_0()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(kind.label()),
-        )
-        .child(
-            Button::new(format!("external-close-{id}"))
-                .ghost()
-                .xsmall()
-                .compact()
-                .icon(IconName::Close)
-                .tooltip(i18n::t("sidebar-close-external"))
-                .on_click(cx.listener(move |_this, _ev, _window, cx| {
-                    cx.stop_propagation();
-                    cx.emit(SidebarEvent::CloseExternalSession(id_close.clone()));
-                })),
-        );
-    row.into_any_element()
+/// Leading icon for a unified sidebar row. Threads use a generic
+/// message-square glyph; external agent sessions use their brand SVG (resolved
+/// by `ExtrasAssetSource`, tinted via `text_color`).
+#[derive(Clone)]
+enum RowIcon {
+    Thread,
+    External(&'static str),
 }
 
-/// Render one conversation row.
-fn render_thread_item(
-    summary: &agent::ThreadSummary,
-    selected: bool,
+/// What the row's hover "Inbox" archive action emits — a thread toggles its
+/// archived flag, an external session tears itself down (kill + drop).
+#[derive(Clone)]
+enum RowKind {
+    Thread { archived: bool },
+    External,
+}
+
+/// A UI-layer sidebar row projected from either a manox `ThreadSummary` or an
+/// `ExternalSessionSummary`, so the two render through one layout with a shared
+/// selection-slide animation, id tag, and hover archive action. Only display +
+/// identity fields live here — the sidebar never holds PTY handles.
+#[derive(Clone)]
+struct SidebarThreadItem {
+    id: String,
+    /// 8-char tag label. Threads use the thread UUID prefix; external sessions
+    /// use the cx session id prefix (traceable to `~/.config/cx/sessions/<id>.sock`).
+    short_id: String,
+    /// Clipboard payload for the id-tag click. Threads copy the thread id;
+    /// external sessions copy the full cx session id (or socket path).
+    copy_value: String,
+    title: String,
+    updated: String,
+    pinned: bool,
+    has_unread: bool,
     running: bool,
+    selected: bool,
     indent: gpui::Pixels,
+    icon: RowIcon,
+    /// Selection-wash color: threads tint by approval mode, external rows use
+    /// the theme accent.
+    wash: gpui::Hsla,
+    kind: RowKind,
+}
+
+impl SidebarThreadItem {
+    fn from_thread(
+        summary: &agent::ThreadSummary,
+        selected: bool,
+        running: bool,
+        indent: gpui::Pixels,
+        theme: &Theme,
+    ) -> Self {
+        let display = summary.display_title();
+        let title = if display.is_empty() {
+            i18n::t("sidebar-empty-summary").to_string()
+        } else {
+            truncate(display, 24)
+        };
+        Self {
+            short_id: summary.id.chars().take(8).collect(),
+            copy_value: summary.id.clone(),
+            id: summary.id.clone(),
+            title,
+            updated: format_relative(summary.interacted_at),
+            pinned: summary.pinned,
+            has_unread: summary.has_unread,
+            running,
+            selected,
+            indent,
+            icon: RowIcon::Thread,
+            wash: approval_mode_color(summary.approval_mode, theme),
+            kind: RowKind::Thread {
+                archived: summary.archived,
+            },
+        }
+    }
+
+    fn from_external(
+        summary: &crate::external_session::ExternalSessionSummary,
+        selected: bool,
+        indent: gpui::Pixels,
+        theme: &Theme,
+    ) -> Self {
+        let display = summary.display_title();
+        let title = if display.is_empty() {
+            i18n::t("sidebar-empty-summary").to_string()
+        } else {
+            truncate(display, 24)
+        };
+        // Tag the row with the cx session id prefix (tracks the .sock file);
+        // fall back to the manox-internal id prefix when the cx id was not
+        // recoverable (IPC bind failed).
+        let short_id: String = if !summary.cx_session_id.is_empty() {
+            summary.cx_session_id.chars().take(8).collect()
+        } else {
+            summary.id.chars().take(8).collect()
+        };
+        Self {
+            id: summary.id.clone(),
+            short_id,
+            copy_value: summary.copy_identity(),
+            title,
+            updated: format_relative(summary.created_at),
+            pinned: false,
+            has_unread: false,
+            running: false,
+            selected,
+            indent,
+            icon: RowIcon::External(summary.kind.icon_asset()),
+            wash: theme.accent,
+            kind: RowKind::External,
+        }
+    }
+}
+
+/// Render one unified sidebar row — threads and external agent sessions share
+/// the layout (leading icon → title → id tag + updated time + hover archive),
+/// the selection-wash slide animation, and the hover "Inbox" archive action.
+/// Only the emitted event and the leading icon differ by `kind`.
+fn render_thread_item(
+    item: &SidebarThreadItem,
     slide: &SlideCtx,
     theme: &Theme,
     cx: &mut Context<Sidebar>,
 ) -> AnyElement {
-    let id = summary.id.clone();
+    let id = item.id.clone();
     let id_open = id.clone();
     let id_archive = id.clone();
-    let id_copy = id.clone();
-    let archive_to = !summary.archived;
-    let display = summary.display_title();
-    let title = if display.is_empty() {
-        i18n::t("sidebar-empty-summary").to_string()
+    let id_copy = item.copy_value.clone();
+    let short_id = item.short_id.clone();
+    let title = item.title.clone();
+    let updated = item.updated.clone();
+    let title_color = theme.foreground;
+    let wash = item.wash;
+    let icon = item.icon.clone();
+    let open_kind = item.kind.clone();
+    let group = gpui::SharedString::from(format!("thread-row-{id}"));
+    let tag_variant = if item.selected || item.running {
+        TagVariant::Primary
     } else {
-        truncate(display, 24)
+        TagVariant::Secondary
     };
-    let updated = format_relative(summary.interacted_at);
     let role = if slide.selecting_id.as_deref() == Some(id.as_str()) {
         AnimRole::Selecting
     } else if slide.deselecting_id.as_deref() == Some(id.as_str()) {
@@ -907,7 +998,6 @@ fn render_thread_item(
         SlideDir::Up => -1.0,
         SlideDir::None => 0.0,
     };
-    let wash = approval_mode_color(summary.approval_mode, theme);
     let slide_gen = slide.gen_id;
     let wash_overlay: Option<AnyElement> = if role != AnimRole::None {
         let anim_role = role;
@@ -937,14 +1027,6 @@ fn render_thread_item(
     } else {
         None
     };
-    let title_color = theme.foreground;
-    let group = gpui::SharedString::from(format!("thread-row-{id}"));
-    let short_id: String = summary.id.chars().take(8).collect();
-    let tag_variant = if selected || running {
-        TagVariant::Primary
-    } else {
-        TagVariant::Secondary
-    };
 
     let tag_button = Button::new(format!("thread-id-tag-{id}"))
         .ghost()
@@ -965,7 +1047,7 @@ fn render_thread_item(
         });
 
     let tag_wrapper = gpui::div().relative().overflow_hidden().child(tag_button);
-    let tag_element: AnyElement = if running {
+    let tag_element: AnyElement = if item.running {
         let accent = theme.accent;
         tag_wrapper
             .with_animation(
@@ -990,24 +1072,42 @@ fn render_thread_item(
         tag_wrapper.into_any_element()
     };
 
+    let leading_icon = match icon {
+        RowIcon::Thread => Icon::new(IconName::Bot)
+            .small()
+            .text_color(theme.muted_foreground)
+            .into_any_element(),
+        RowIcon::External(path) => gpui::svg()
+            .path(path)
+            .size(px(16.))
+            .text_color(theme.muted_foreground)
+            .into_any_element(),
+    };
+
     h_flex()
         .id(format!("thread-item-{id}"))
         .group(group.clone())
         .w_full()
         .relative()
         .overflow_hidden()
-        .pl(px(8.) + indent)
+        .pl(px(8.) + item.indent)
         .pr_2()
         .py_1()
+        .gap_2()
+        .items_start()
         .rounded(theme.radius)
-        .when(!selected, |this| {
+        .when(!item.selected, |this| {
             this.hover(move |s| s.bg(wash.opacity(0.08)))
                 .active(move |s| s.bg(wash.opacity(0.18)))
         })
-        .on_click(cx.listener(move |_this, _ev, _window, cx| {
-            cx.emit(SidebarEvent::OpenThread(id_open.clone()));
+        // Open click branches on `kind`: a thread opens the conversation, an
+        // external session switches the main area to its running TUI.
+        .on_click(cx.listener(move |_this, _ev, _window, cx| match open_kind {
+            RowKind::Thread { .. } => cx.emit(SidebarEvent::OpenThread(id_open.clone())),
+            RowKind::External => cx.emit(SidebarEvent::OpenExternalSession(id_open.clone())),
         }))
         .when_some(wash_overlay, |this, overlay| this.child(overlay))
+        .child(leading_icon)
         .child(
             v_flex()
                 .w_full()
@@ -1020,7 +1120,7 @@ fn render_thread_item(
                         .gap_1()
                         .items_center()
                         .min_w_0()
-                        .when(summary.has_unread, |this| {
+                        .when(item.has_unread, |this| {
                             this.child(
                                 gpui::div()
                                     .w(px(8.))
@@ -1029,7 +1129,7 @@ fn render_thread_item(
                                     .bg(theme.danger),
                             )
                         })
-                        .when(summary.pinned, |this| {
+                        .when(item.pinned, |this| {
                             this.child(Icon::new(IconName::Star).xsmall().text_color(theme.accent))
                         })
                         .child(
@@ -1063,22 +1163,43 @@ fn render_thread_item(
                                 .gap_0p5()
                                 .invisible()
                                 .group_hover(group.clone(), |s| s.visible())
-                                .child(
-                                    Button::new(format!("archive-thread-{id_archive}"))
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Inbox)
-                                        .on_click(cx.listener(move |_this, _ev, _window, cx| {
-                                            cx.stop_propagation();
-                                            cx.emit(SidebarEvent::ArchiveThread(
-                                                id_archive.clone(),
-                                                archive_to,
-                                            ));
-                                        })),
-                                ),
+                                .child(render_archive_button(
+                                    id_archive.clone(),
+                                    item.kind.clone(),
+                                    cx,
+                                )),
                         ),
                 ),
         )
+        .into_any_element()
+}
+
+/// The hover "Inbox" archive button shared by threads and external sessions.
+/// Threads toggle their archived flag; an external session tears itself down
+/// (kill + drop) — the unified archive semantics. Uses `cx.listener` so the
+/// click emits on the sidebar's own context (where `EventEmitter<SidebarEvent>`
+/// lives) rather than the bare `App` the standalone `on_click` receives.
+fn render_archive_button(id: String, kind: RowKind, cx: &mut Context<Sidebar>) -> AnyElement {
+    let id = id.clone();
+    Button::new(format!("archive-thread-{id}"))
+        .ghost()
+        .xsmall()
+        .icon(IconName::Inbox)
+        .tooltip(match &kind {
+            RowKind::Thread { .. } => i18n::t("sidebar-archive"),
+            RowKind::External => i18n::t("sidebar-close-external"),
+        })
+        .on_click(cx.listener(move |_this, _ev, _window, cx| {
+            cx.stop_propagation();
+            match kind {
+                RowKind::Thread { archived } => {
+                    cx.emit(SidebarEvent::ArchiveThread(id.clone(), !archived));
+                }
+                RowKind::External => {
+                    cx.emit(SidebarEvent::ArchiveExternalSession(id.clone()));
+                }
+            }
+        }))
         .into_any_element()
 }
 

@@ -219,4 +219,20 @@ mod tests {
         let s = to_esc_str(&ks("a", mods), TermMode::NONE);
         assert_eq!(s.as_deref(), Some("\x1ba"));
     }
+
+    #[test]
+    fn tab_writes_horizontal_tab() {
+        let s = to_esc_str(&ks("tab", Modifiers::default()), TermMode::NONE);
+        assert_eq!(s.as_deref(), Some("\t"));
+    }
+
+    #[test]
+    fn shift_tab_writes_csi_z() {
+        let mods = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let s = to_esc_str(&ks("tab", mods), TermMode::NONE);
+        assert_eq!(s.as_deref(), Some("\x1b[Z"));
+    }
 }

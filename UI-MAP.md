@@ -117,7 +117,7 @@ Full-window settings overlay with slide-in animation. Plugin/skill/MCP managemen
 Full-window terminal emulator.
 
 #### ViewMode::ExternalSession
-Full-window external agent CLI session (claude / codex / copilot). Renders the active `ExternalSession`'s `TerminalView` (the agent's TUI) in place of the conversation, with a TitleBar showing the agent kind + provider/model and a `×` that kills the session. Lives in memory only — never persisted; the sidebar row is removed both on `×` (explicit kill) and when the CLI exits on its own (a `ChildExit` subscription on the terminal tears the session down without user action). If the removed session was the active one, the view falls back to the conversation pane.
+Full-window external agent CLI session (claude / codex / copilot). Renders the active `ExternalSession`'s `TerminalView` (the agent's TUI) in place of the conversation, with a TitleBar showing the agent's live OSC title (falling back to the kind label — "Claude Code" / "Codex" / "GitHub Copilot") + provider/model. The session has no dedicated titlebar close button: it is archived the same way a thread row is — via the hover archive control on its [SidebarExternalSessionItem](#sidebarexternalsessionitem) row (or the title menu). Lives in memory only — never persisted; the sidebar row is removed both on archive (kill + drop the `SessionHandle`) and when the CLI exits on its own (a `ChildExit` subscription on the terminal tears the session down without user action). The terminal's OSC title is mirrored into `ExternalSession.title` so the titlebar and sidebar row share one `display_title()`. If the removed session was the active one, the view falls back to the conversation pane.
 
 ---
 
@@ -194,7 +194,7 @@ Bottom section: loose (non-project) threads. The header's `+` button opens the `
 
 #### SidebarThreadItem
 
-Single thread row: unread red dot (8px, `theme.danger`, shown when `summary.has_unread`), pinned star, title, short-id tag (shimmer if running), token count, time, archive btn. Hover/active/selected wash uses the thread's last saved approval-mode color. The red dot marks a thread that finished a turn while the user was viewing another thread; it clears when the user switches into the thread.
+Unified row projection (`SidebarThreadItem` struct: `id`/`display_id`/`title`/`updated_at`/`project`/`selected`/`running`/`icon`/`archive_action`) rendered by one `render_thread_item` for both native threads and external-agent sessions. Native thread row: unread red dot (8px, `theme.danger`, shown when `summary.has_unread`), pinned star, title, short-id tag (shimmer if running), token count, time, hover archive btn. Hover/active/selected wash uses the thread's last saved approval-mode color. The red dot marks a thread that finished a turn while the user was viewing another thread; it clears when the user switches into the thread. External rows reuse the same layout but swap the leading icon for the agent's brand SVG and drop the unread/pin/token/running shimmer affordances. The row kind (`RowKind::Thread { archived }` vs `RowKind::External`) routes the hover archive button to the right `SidebarEvent` (`ArchiveThread` / `ArchiveExternalSession`).
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -206,7 +206,7 @@ Section below "Conversations" listing live external agent sessions (claude / cod
 
 #### SidebarExternalSessionItem
 
-Single external-session row: kind icon (Bot/Cpu/Github) + kind label + muted "provider · model" subtitle + trailing `×` that emits `CloseExternalSession(id)` (kills the agent). Clicking the row emits `OpenExternalSession(id)`. Simpler than a thread row — no slide-wash (external rows live in their own section and don't participate in the conversation selection slide).
+Single external-session row, rendered through the unified `render_thread_item` (see [SidebarThreadItem](#sidebarthreaditem)) with `RowKind::External`. Leading icon is the agent's brand SVG (`claude.svg` / `codex.svg` / `githubcopilot.svg`); title is `display_title()` (the agent's OSC title, falling back to the kind label); the short-id tag shows the cx session id (derived from the `<id>.sock` filename of the session's socket path) with click-to-copy of the full id / socket path. The row has no trailing `×` — it shares the thread row's hover archive button, which emits `ArchiveExternalSession(id)` (kill + drop the `SessionHandle`, the unified archive semantics). Clicking the row emits `OpenExternalSession(id)`. External rows live in their own section and don't participate in the conversation selection slide.
 
 > Source: `agent-ui/src/views/sidebar.rs`
 
@@ -923,7 +923,7 @@ Full-window terminal emulator.
 
 #### TerminalView
 
-Root view, `size_full`.
+Root view, `size_full`. Owns the focus handle; `focus(&self, window, cx)` is called after spawning/attaching/switching an external-agent session so the TUI receives keystrokes immediately. The focused root intercepts `tab` / `shift-tab` (when no search overlay is open) and forwards them to the PTY as `\t` / `\x1b[Z` with `stop_propagation`, so tab never escapes into GPUI focus traversal. Mouse-wheel events are forwarded to the PTY as xterm mouse reports when a TUI app captures the mouse (e.g. claude code / vim / htop), so its own viewport scrolls; otherwise the local scrollback scrolls.
 
 > Source: `terminal-ui/src/terminal_view.rs`
 
