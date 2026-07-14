@@ -252,15 +252,15 @@ impl Sidebar {
             ] {
                 let sidebar = sidebar.clone();
                 let theme = theme.clone();
-                let icon = match kind {
-                    crate::external_session::SessionKind::ClaudeCode => IconName::Bot,
-                    crate::external_session::SessionKind::Codex => IconName::Cpu,
-                    crate::external_session::SessionKind::GithubCopilot => IconName::Github,
-                };
                 let label = kind.label();
                 let agent_id = kind.agent_id();
                 menu = menu.submenu_with_icon(
-                    Some(Icon::new(icon).small().text_color(theme.muted_foreground)),
+                    Some(
+                        Icon::default()
+                            .path(kind.icon_asset())
+                            .small()
+                            .text_color(theme.muted_foreground),
+                    ),
                     label,
                     window,
                     cx,

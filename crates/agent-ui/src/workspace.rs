@@ -1340,8 +1340,6 @@ impl Workspace {
         self.external_sessions.push(ExternalSession {
             id: id.clone(),
             kind,
-            provider_name,
-            model_id,
             created_at,
             project: project_cwd,
             terminal_view: view,
