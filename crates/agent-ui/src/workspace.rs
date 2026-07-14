@@ -5405,18 +5405,10 @@ impl Render for Workspace {
                                     .flex_1()
                                     .min_w_0()
                                     .child(
-                                        Icon::new(match kind {
-                                            crate::external_session::SessionKind::ClaudeCode => {
-                                                IconName::Bot
-                                            }
-                                            crate::external_session::SessionKind::Codex => {
-                                                IconName::Cpu
-                                            }
-                                            crate::external_session::SessionKind::GithubCopilot => {
-                                                IconName::Github
-                                            }
-                                        })
-                                        .small(),
+                                        gpui::svg()
+                                            .path(kind.icon_asset())
+                                            .size(px(16.))
+                                            .text_color(theme.muted_foreground),
                                     )
                                     .child(
                                         gpui::div()

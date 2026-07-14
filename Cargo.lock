@@ -186,6 +186,7 @@ dependencies = [
  "gpui-component-assets",
  "manox-components",
  "manox-webview",
+ "rust-embed",
  "serde",
  "serde_json",
  "terminal",

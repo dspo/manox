@@ -827,11 +827,6 @@ fn render_external_session_item(
     let id_open = id.clone();
     let id_close = id.clone();
     let kind = summary.kind;
-    let icon = match kind {
-        crate::external_session::SessionKind::ClaudeCode => IconName::Bot,
-        crate::external_session::SessionKind::Codex => IconName::Cpu,
-        crate::external_session::SessionKind::GithubCopilot => IconName::Github,
-    };
     let mut row = h_flex()
         .id(format!("external-row-{id}"))
         .w_full()
@@ -849,7 +844,12 @@ fn render_external_session_item(
         row = row.bg(theme.accent.opacity(0.10));
     }
     row = row
-        .child(Icon::new(icon).small().text_color(theme.muted_foreground))
+        .child(
+            gpui::svg()
+                .path(kind.icon_asset())
+                .size(px(16.))
+                .text_color(theme.muted_foreground),
+        )
         .child(
             gpui::div()
                 .flex_1()

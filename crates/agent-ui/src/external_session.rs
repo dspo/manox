@@ -50,6 +50,17 @@ impl SessionKind {
             Self::GithubCopilot => "copilot",
         }
     }
+
+    /// Embedded SVG asset path (resolved by `ExtrasAssetSource`) for the
+    /// agent's brand icon. The SVGs use `fill="currentColor"` so the caller
+    /// tints via `.text_color(...)`.
+    pub fn icon_asset(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "icons/claude.svg",
+            Self::Codex => "icons/codex.svg",
+            Self::GithubCopilot => "icons/githubcopilot.svg",
+        }
+    }
 }
 
 /// A live external agent CLI session. The `TerminalView` renders the agent's

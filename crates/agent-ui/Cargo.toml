@@ -23,6 +23,7 @@ uuid.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
+rust-embed.workspace = true
 
 agent.workspace = true
 terminal.workspace = true

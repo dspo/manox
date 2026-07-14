@@ -76,6 +76,10 @@ base64 = "0.22"
 # image —— clipboard image resize + PNG re-encode before sending to the provider
 # (Anthropic long-edge cap 1568px / 5MB). CPU-bound work runs on the background executor.
 image = "0.25"
+# rust-embed — embed SVG icons into the binary at compile time so manox stays a
+# single-binary deliverable; the ExtrasAssetSource overlays custom agent icons
+# (claude/codex/copilot) on top of gpui-component-assets.
+rust-embed = "8"
 
 rmcp = { version = "1.8", default-features = false }
 # lsp-types —— LSP protocol types (InitializeParams, Location, Hover, ...). The
