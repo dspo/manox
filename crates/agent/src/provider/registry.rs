@@ -60,6 +60,9 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
         )
     })?)?;
     let max_tokens = resolve_context_window(resolved);
+    let max_output_tokens = resolve_max_output_tokens(resolved, max_tokens);
+    let supports_tools = resolved.supports_tools;
+    let supports_images = resolved.supports_images;
     let auto_compact_window =
         resolve_auto_compact_window(resolved.wire_api, &resolved.env, max_tokens);
 
@@ -72,6 +75,9 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             endpoint_url: resolved.endpoint_url.clone(),
             api_key,
             max_token_count: max_tokens,
+            max_output_tokens,
+            supports_tools,
+            supports_images,
             auto_compact_window,
             visible_agents: resolved.visible_agents.clone(),
         })),
@@ -83,6 +89,9 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             endpoint_url: resolved.endpoint_url.clone(),
             api_key,
             max_token_count: max_tokens,
+            max_output_tokens,
+            supports_tools,
+            supports_images,
             visible_agents: resolved.visible_agents.clone(),
         })),
         WireApi::Completions => Arc::new(CompletionsModel::new(CompletionsModelConfig {
@@ -93,6 +102,9 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             endpoint_url: resolved.endpoint_url.clone(),
             api_key,
             max_token_count: max_tokens,
+            max_output_tokens,
+            supports_tools,
+            supports_images,
             visible_agents: resolved.visible_agents.clone(),
         })),
         WireApi::Unavailable => {
@@ -115,14 +127,19 @@ pub(crate) fn default_max_output_tokens(max_token_count: u64) -> u64 {
     max_token_count.clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_CAP)
 }
 
-/// Resolve a model's context-window size in tokens. The `context` yaml field
-/// takes precedence when present and parseable; an unparseable `context` is a
-/// hard error (warn + 8192 fallback) — it does NOT silently fall through to a
+/// Resolve a model's context-window size in tokens. The numeric `max_tokens`
+/// field (operator-declared in the provider config) takes precedence — an
+/// explicit numeric field is unambiguous, unlike the legacy `context` string.
+/// Absent that, the `context` yaml field is parsed; an unparseable `context` is
+/// a hard error (warn + 8192 fallback) — it does NOT silently fall through to a
 /// bracket suffix on the id, because an explicit field means the operator chose
 /// a value and a typo should surface, not masquerade as a different number. When
-/// no `context` is set, a trailing bracket suffix on the id (e.g.
-/// `glm-5.2[1m123k]`) is parsed; absent both, 8192.
+/// neither `max_tokens` nor `context` is set, a trailing bracket suffix on the
+/// id (e.g. `glm-5.2[1m123k]`) is parsed; absent all three, 8192.
 fn resolve_context_window(resolved: &ResolvedModel) -> u64 {
+    if let Some(n) = resolved.max_tokens {
+        return n;
+    }
     let ctx = resolved.context.trim();
     if !ctx.is_empty() {
         match cx_providers::parse_context_window(ctx) {
@@ -138,6 +155,20 @@ fn resolve_context_window(resolved: &ResolvedModel) -> u64 {
         }
     } else {
         cx_providers::context_window_from_suffix(&resolved.id).unwrap_or(8192)
+    }
+}
+
+/// Resolve a model's `max_output_tokens` request field. The operator-declared
+/// `max_output_tokens` config field wins when present (capped at the context
+/// window so a misconfigured budget cannot exceed the model's input capacity);
+/// otherwise the heuristic [`default_max_output_tokens`] clamp applies. The
+/// explicit field is operator intent — a value that floors/ceil the heuristic
+/// bounds is honored as-is (only the context cap is enforced), so a model with
+/// a genuinely large output budget is not silently shrunk to the 32k cap.
+fn resolve_max_output_tokens(resolved: &ResolvedModel, max_tokens: u64) -> u64 {
+    match resolved.max_output_tokens {
+        Some(n) => n.min(max_tokens),
+        None => default_max_output_tokens(max_tokens),
     }
 }
 /// Provider-config env var (`~/.config/cx/cx.providers.config.yaml`, provider-
@@ -254,7 +285,20 @@ mod tests {
             copilot_auth: cx_providers::CopilotAuth::ApiKey,
             env: std::collections::BTreeMap::new(),
             apikey_source: None,
+            max_output_tokens: None,
+            max_tokens: None,
+            supports_tools: true,
+            supports_images: false,
         }
+    }
+
+    /// `model()` with an explicit numeric `max_tokens` capability field, so the
+    /// precedence rule (numeric `max_tokens` beats the `context` string and the
+    /// id bracket suffix) can be exercised.
+    fn model_with_max_tokens(id: &str, context: &str, max_tokens: u64) -> ResolvedModel {
+        let mut m = model(id, context);
+        m.max_tokens = Some(max_tokens);
+        m
     }
 
     #[test]
@@ -279,6 +323,48 @@ mod tests {
         assert_eq!(resolve_context_window(&model("glm-5.2", "")), 8192);
         // context is trimmed before parsing.
         assert_eq!(resolve_context_window(&model("glm-5.2", " 1m ")), 1_000_000);
+    }
+
+    #[test]
+    fn resolve_context_window_prefers_max_tokens_field() {
+        // The numeric `max_tokens` config field is unambiguous and wins over
+        // the `context` string and the id bracket suffix — operator intent, not
+        // a string parse.
+        assert_eq!(
+            resolve_context_window(&model_with_max_tokens("glm-5.2[1m]", "244k", 131_072)),
+            131_072
+        );
+        assert_eq!(
+            resolve_context_window(&model_with_max_tokens("glm-5.2[1m1234k]", "", 200_000)),
+            200_000
+        );
+        // `max_tokens` absent falls back to the `context` string path.
+        assert_eq!(
+            resolve_context_window(&model("glm-5.2[1m]", "244k")),
+            244_000
+        );
+    }
+
+    #[test]
+    fn resolve_max_output_tokens_honors_config_then_heuristic() {
+        // Explicit `max_output_tokens` is used verbatim, capped only at the
+        // context window (a misconfigured output budget cannot exceed input).
+        let mut m = model_with_max_tokens("m", "", 131_072);
+        m.max_output_tokens = Some(131_072);
+        assert_eq!(resolve_max_output_tokens(&m, 131_072), 131_072);
+        // Capped at the context window when the declared output exceeds it.
+        let mut over = model_with_max_tokens("m", "", 8_192);
+        over.max_output_tokens = Some(65_536);
+        assert_eq!(resolve_max_output_tokens(&over, 8_192), 8_192);
+        // Absent `max_output_tokens` falls back to the heuristic clamp.
+        assert_eq!(
+            resolve_max_output_tokens(&model("m", ""), 4_096),
+            MIN_OUTPUT_TOKENS
+        );
+        assert_eq!(
+            resolve_max_output_tokens(&model("m", ""), 1024 * 1024),
+            MAX_OUTPUT_TOKENS_CAP
+        );
     }
 
     #[test]

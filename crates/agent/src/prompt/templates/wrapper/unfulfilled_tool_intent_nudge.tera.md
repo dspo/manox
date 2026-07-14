@@ -1,0 +1,1 @@
+Your previous turn announced a tool action in prose ("let me search", "让我先找到", "I'll call ...") but emitted no tool_use block, so nothing happened. Do not announce intent without acting. Either call the tool now (emit the tool_use block), or give a complete final answer that contains no action announcement.

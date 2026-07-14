@@ -42,6 +42,8 @@ pub struct ResponsesModel {
     long_ttl: bool,
     /// cx agent ids this model can drive (from the endpoint `agents:` list).
     visible_agents: Vec<String>,
+    supports_tools: bool,
+    supports_images: bool,
 }
 
 /// Construction inputs for [`ResponsesModel`]. Bundled into a struct so the
@@ -55,6 +57,9 @@ pub struct ResponsesModelConfig {
     pub endpoint_url: String,
     pub api_key: String,
     pub max_token_count: u64,
+    pub max_output_tokens: u64,
+    pub supports_tools: bool,
+    pub supports_images: bool,
     pub visible_agents: Vec<String>,
 }
 
@@ -68,6 +73,9 @@ impl ResponsesModel {
             endpoint_url,
             api_key,
             max_token_count,
+            max_output_tokens,
+            supports_tools,
+            supports_images,
             visible_agents,
         } = cfg;
         Self {
@@ -77,12 +85,12 @@ impl ResponsesModel {
             api_model_id,
             endpoint_url: endpoint_url.clone(),
             api_key,
-            max_output_tokens: crate::provider::registry::default_max_output_tokens(
-                max_token_count,
-            ),
+            max_output_tokens,
             max_token_count,
             long_ttl: crate::provider::openai_long_ttl(&endpoint_url),
             visible_agents,
+            supports_tools,
+            supports_images,
         }
     }
 }
@@ -105,6 +113,12 @@ impl LanguageModel for ResponsesModel {
     }
     fn visible_agents(&self) -> &[String] {
         &self.visible_agents
+    }
+    fn supports_tools(&self) -> bool {
+        self.supports_tools
+    }
+    fn supports_images(&self) -> bool {
+        self.supports_images
     }
     fn max_token_count(&self) -> u64 {
         self.max_token_count

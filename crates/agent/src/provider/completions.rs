@@ -38,6 +38,8 @@ pub struct CompletionsModel {
     long_ttl: bool,
     /// cx agent ids this model can drive (from the endpoint `agents:` list).
     visible_agents: Vec<String>,
+    supports_tools: bool,
+    supports_images: bool,
 }
 
 /// Construction inputs for [`CompletionsModel`]. Bundled into a struct so the
@@ -51,6 +53,9 @@ pub struct CompletionsModelConfig {
     pub endpoint_url: String,
     pub api_key: String,
     pub max_token_count: u64,
+    pub max_output_tokens: u64,
+    pub supports_tools: bool,
+    pub supports_images: bool,
     pub visible_agents: Vec<String>,
 }
 
@@ -64,6 +69,9 @@ impl CompletionsModel {
             endpoint_url,
             api_key,
             max_token_count,
+            max_output_tokens,
+            supports_tools,
+            supports_images,
             visible_agents,
         } = cfg;
         Self {
@@ -73,12 +81,12 @@ impl CompletionsModel {
             api_model_id,
             endpoint_url: endpoint_url.clone(),
             api_key,
-            max_output_tokens: crate::provider::registry::default_max_output_tokens(
-                max_token_count,
-            ),
+            max_output_tokens,
             max_token_count,
             long_ttl: crate::provider::openai_long_ttl(&endpoint_url),
             visible_agents,
+            supports_tools,
+            supports_images,
         }
     }
 }
@@ -101,6 +109,12 @@ impl LanguageModel for CompletionsModel {
     }
     fn visible_agents(&self) -> &[String] {
         &self.visible_agents
+    }
+    fn supports_tools(&self) -> bool {
+        self.supports_tools
+    }
+    fn supports_images(&self) -> bool {
+        self.supports_images
     }
     fn max_token_count(&self) -> u64 {
         self.max_token_count
@@ -724,12 +738,12 @@ mod tests {
         }
     }
 
-    /// `CompletionsModel::new` derives `max_output_tokens` from the context
-    /// budget via `registry::default_max_output_tokens`: a 1m-context model is
-    /// capped to `MAX_OUTPUT_TOKENS_CAP`, a sub-floor context is raised to the
-    /// minimum. Mirrors the anthropic wire's assertion.
+    /// `CompletionsModel::new` stores the resolved `max_output_tokens` from the
+    /// config verbatim — output-budget resolution (operator-declared value
+    /// capped at the context window, else the heuristic clamp) happens in
+    /// `registry::resolve_max_output_tokens` before the config is built.
     #[test]
-    fn new_clamps_max_output_tokens_to_budget() {
+    fn new_stores_max_output_tokens_from_config_verbatim() {
         let big = CompletionsModel::new(CompletionsModelConfig {
             id: "p/m/completions".into(),
             name: "m[1m]".into(),
@@ -738,11 +752,14 @@ mod tests {
             endpoint_url: "https://example.invalid".into(),
             api_key: "k".into(),
             max_token_count: 1024 * 1024,
+            max_output_tokens: 65_536,
+            supports_tools: true,
+            supports_images: false,
             visible_agents: Vec::new(),
         });
         assert_eq!(
-            big.max_output_tokens,
-            crate::provider::registry::MAX_OUTPUT_TOKENS_CAP
+            big.max_output_tokens, 65_536,
+            "stored verbatim, not re-clamped"
         );
         let tiny = CompletionsModel::new(CompletionsModelConfig {
             id: "p/m/completions".into(),
@@ -752,9 +769,12 @@ mod tests {
             endpoint_url: "https://example.invalid".into(),
             api_key: "k".into(),
             max_token_count: 4_096,
+            max_output_tokens: 1_024,
+            supports_tools: true,
+            supports_images: false,
             visible_agents: Vec::new(),
         });
-        assert_eq!(tiny.max_output_tokens, 8_192);
+        assert_eq!(tiny.max_output_tokens, 1_024);
     }
 
     #[test]

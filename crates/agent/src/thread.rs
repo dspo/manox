@@ -320,6 +320,85 @@ enum GoalAction {
 /// forever.
 const MAX_RECOVERY_ATTEMPTS: u32 = 2;
 
+/// Whether the assistant's visible text announces a tool action the model then
+/// failed to perform (no `tool_use` emitted). Catches the narrate-without-acting
+/// loop seen in thread 480b2469, where the model writes "let me find the
+/// relevant component code" / "让我先找到相关组件代码" each turn but emits no
+/// `tool_use`, so the turn ends as a clean `EndTurn` and the user must manually
+/// prod the model.
+///
+/// Conservative by design: only short visible text (under `MAX_LEN` chars, so a
+/// genuine long answer is never mis-flagged) and a tight bilingual phrase set.
+/// The degenerate-empty check cannot reach this case — it requires *no* visible
+/// text. A false positive costs at most one nudge round-trip and is bounded by
+/// `MAX_RECOVERY_ATTEMPTS`; a true positive breaks a loop that would otherwise
+/// spin until the user intervenes.
+fn announces_tool_intent_without_call(text: &str) -> bool {
+    const MAX_LEN: usize = 400;
+    if text.chars().count() >= MAX_LEN {
+        return false;
+    }
+    // English intent phrases, matched case-insensitively as substrings (no
+    // regex dependency — the agent crate stays regex-free). Curly apostrophes
+    // are not normalized; models overwhelmingly emit straight ASCII quotes.
+    const EN: &[&str] = &[
+        "let me",
+        "i'll",
+        "i will",
+        "let's",
+        "going to",
+        "i'm going",
+        "i'm about",
+    ];
+    // Chinese intent phrases, matched verbatim (CJK has no case).
+    const ZH: &[&str] = &["让我", "我现在", "我来", "接下来我", "我先", "我将"];
+    let lower = text.to_ascii_lowercase();
+    EN.iter().any(|p| lower.contains(p)) || ZH.iter().any(|p| text.contains(p))
+}
+
+/// Normalize an assistant message's content block list at finalization: drop
+/// whitespace-only Text/Thinking blocks, defensively merge accidentally-adjacent
+/// same-type blocks, and never merge Thinking blocks separated by Text (that
+/// would erase the streaming timeline). The streaming append helpers already
+/// coalesce consecutive same-type deltas, so adjacency should not arise during
+/// a live stream — this is a backstop for crash-recovery restores and future
+/// regressions. ToolUse blocks pass through untouched.
+fn normalize_assistant_content(content: &mut Vec<MessageContent>) {
+    let mut out: Vec<MessageContent> = Vec::with_capacity(content.len());
+    for c in content.drain(..) {
+        match c {
+            MessageContent::Text(t) => {
+                if t.trim().is_empty() {
+                    continue;
+                }
+                match out.last_mut() {
+                    Some(MessageContent::Text(existing)) => existing.push_str(&t),
+                    _ => out.push(MessageContent::Text(t)),
+                }
+            }
+            MessageContent::Thinking { text, signature } => {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                match out.last_mut() {
+                    Some(MessageContent::Thinking {
+                        text: existing,
+                        signature: sig,
+                    }) => {
+                        existing.push_str(&text);
+                        if sig.is_none() {
+                            *sig = signature;
+                        }
+                    }
+                    _ => out.push(MessageContent::Thinking { text, signature }),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    *content = out;
+}
+
 /// What `run_turn_loop` does after a round-trip produced no executable tool
 /// call. `Done` ends the turn (a clean `EndTurn` with nothing to retry);
 /// `Continue` loops back to `build_completion_request` with the failure fed
@@ -2544,21 +2623,24 @@ impl Thread {
 
             if tool_uses.is_empty() {
                 // The model stopped without producing any executable tool call.
-                // Four cases: a clean EndTurn (the turn is done),
+                // Five cases: a clean EndTurn (the turn is done),
                 // max_output_tokens truncation (the response was cut mid-stream,
                 // often mid-tool_use), a tool_use JSON parse error (the
                 // placeholder tool_use + error tool_result are already in
-                // history), or a degenerate empty turn (only empty Thinking, no
-                // visible text — thread 1c9c8df1 msg23). The last three feed a
-                // failure/nudge back to the model and continue the loop —
-                // aligning with pi/oh-my-pi/codex/zed — instead of ending the
+                // history), a degenerate empty turn (only empty Thinking, no
+                // visible text — thread 1c9c8df1 msg23), or an unfulfilled
+                // tool intent (visible text *announcing* a tool action but no
+                // tool_use emitted — thread 480b2469 msg3/5/9). The last four
+                // feed a failure/nudge back to the model and continue the loop
+                // — aligning with pi/oh-my-pi/codex/zed — instead of ending the
                 // turn dead on a half-finished or empty assistant message.
                 // Append-only: a directive, an error tool_result, or a user
                 // nudge is added, history is never rewritten, so the provider
-                // prefix cache stays intact. All three recovery paths share a
+                // prefix cache stays intact. All four recovery paths share a
                 // per-turn retry cap so a model stuck re-truncating,
-                // re-emitting bad JSON, or re-producing empty turns cannot
-                // loop forever (the main thread has no `max_turns` guard).
+                // re-emitting bad JSON, or re-producing empty/unfulfilled turns
+                // cannot loop forever (the main thread has no `max_turns`
+                // guard).
                 let recovery = this.update(cx, |this, cx| {
                     let parse_err = this.pending_parse_error;
                     // `take()` so the flag does not outlive this recovery: a
@@ -2570,23 +2652,44 @@ impl Thread {
                     // assistant text (only empty Thinking). Distinct from
                     // parse_err / stream_err / max_tok — the model produced
                     // nothing useful and the turn would otherwise end silently.
+                    let last_assistant_text = match this.messages.last() {
+                        Some(m) if m.role == Role::Assistant => m
+                            .content
+                            .iter()
+                            .filter_map(|c| match c {
+                                MessageContent::Text(t) => Some(t.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(""),
+                        _ => String::new(),
+                    };
                     let degenerate = !parse_err
                         && stream_err.is_none()
                         && !max_tok
-                        && match this.messages.last() {
-                            Some(m) if m.role == Role::Assistant => !m
-                                .content
-                                .iter()
-                                .any(|c| matches!(c, MessageContent::Text(t) if !t.is_empty())),
-                            _ => false,
-                        };
-                    if !parse_err && stream_err.is_none() && !max_tok && !degenerate {
+                        && last_assistant_text.trim().is_empty();
+                    // Unfulfilled tool intent: the turn has visible text (so not
+                    // degenerate) that announces a tool action — "let me search",
+                    // "让我先找到" — yet no tool_use was emitted, so nothing
+                    // happened. The degenerate check cannot reach this case (it
+                    // requires *no* visible text); without it the model loops
+                    // "narrate intent → clean EndTurn" indefinitely.
+                    let unfulfilled_intent = !parse_err
+                        && stream_err.is_none()
+                        && !max_tok
+                        && !degenerate
+                        && announces_tool_intent_without_call(&last_assistant_text);
+                    if !parse_err
+                        && stream_err.is_none()
+                        && !max_tok && !degenerate
+                        && !unfulfilled_intent
+                    {
                         return RecoveryAction::Done;
                     }
                     this.recovery_retries += 1;
                     if this.recovery_retries > MAX_RECOVERY_ATTEMPTS {
                         cx.emit(ThreadEvent::Error(anyhow::anyhow!(
-                            "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (stream error / tool_use JSON parse error / max_output_tokens truncation / degenerate empty turn)"
+                            "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (stream error / tool_use JSON parse error / max_output_tokens truncation / degenerate empty turn / unfulfilled tool intent)"
                         )));
                         this.pending_parse_error = false;
                         this.pending_stream_error = None;
@@ -2618,6 +2721,18 @@ impl Thread {
                         // MaxTokens: append a "redo compactly" directive so the
                         // model shortens the next attempt to fit the budget.
                         this.append_max_tokens_directive(cx);
+                    } else if unfulfilled_intent {
+                        // The model announced a tool action but emitted no
+                        // tool_use. Nudge it to either call the tool now or
+                        // deliver an answer with no action announcement —
+                        // breaking the narrate-without-acting loop.
+                        this.insert_user_message(
+                            crate::prompt::render_static(
+                                crate::prompt::PromptTemplate::WrapperUnfulfilledToolIntentNudge,
+                            )
+                            .expect("unfulfilled tool intent nudge render"),
+                            cx,
+                        );
                     } else {
                         // Degenerate empty turn: nudge the model toward visible
                         // output so it does not end silently on empty reasoning.
@@ -3573,9 +3688,16 @@ impl Thread {
     fn finalize_assistant_message(&mut self, cx: &mut Context<Self>) {
         if let Some(m) = self.messages.last_mut()
             && m.role == Role::Assistant
-            && m.content.is_empty()
         {
-            m.push_text(String::new());
+            normalize_assistant_content(&mut m.content);
+            // A fully empty assistant message (only whitespace text/thinking
+            // was streamed, all dropped above) is invalid on the provider wire
+            // — keep one empty Text block so the message stays serializable.
+            // The degenerate-empty recovery check still fires on it (empty
+            // visible text), so this safety net does not mask the loop.
+            if m.content.is_empty() {
+                m.push_text(String::new());
+            }
         }
         cx.notify();
     }
@@ -3673,6 +3795,14 @@ impl Thread {
         // mode still rewrites the system head — a known prefix-cache miss on
         // goal enter/exit, accepted because goal mode is entered far less often
         // than plan mode and rarely mid-thread.
+        // Capability ground truth (tools / images) comes from the resolved
+        // model's operator-declared config fields, not model self-report — so
+        // a non-multimodal model cannot claim image ability (thread 480b2469).
+        // Model-stable, so the system prefix stays byte-stable across turns.
+        let capabilities = crate::prompt::ModelCapabilitiesPromptData {
+            supports_tools: self.model.as_ref().is_none_or(|m| m.supports_tools()),
+            supports_images: self.model.as_ref().is_some_and(|m| m.supports_images()),
+        };
         let system = crate::prompt::render(
             crate::prompt::PromptTemplate::SystemAssembly,
             &crate::prompt::SystemPromptAssembly {
@@ -3690,6 +3820,7 @@ impl Thread {
                 },
                 goal: self.goal.is_some(),
                 ultracode: self.reasoning_effort == ReasoningEffort::Ultracode,
+                capabilities,
             },
         )
         .expect("system assembly template render");
@@ -3774,7 +3905,16 @@ impl Thread {
             }
             messages.push(m);
         }
-        let tools = if self.plan_mode {
+        // A model that declares `supports_tools: false` (provider-config ground
+        // truth, not model self-report) runs in pure-conversation mode: no tools
+        // array, no synthesized `enter_plan_mode`/`exit_plan_mode` (those are
+        // tool-driven). The wire mappers omit `tools` when the list is empty, so
+        // the request stays a plain chat completion. Plan-mode synthesis is
+        // gated by the same flag — there is nothing to plan without tools.
+        let supports_tools = self.model.as_ref().is_none_or(|m| m.supports_tools());
+        let tools = if !supports_tools {
+            Vec::new()
+        } else if self.plan_mode {
             // In plan mode, advertise read-only tools plus the synthesized
             // `exit_plan_mode` tool (not in the registry). The `agent` tool is
             // read-only (see `SpawnAgentTool::is_read_only`), so it is included
@@ -4696,6 +4836,101 @@ mod tests {
         );
     }
 
+    /// A model declaring `supports_tools: false` runs in pure-conversation mode:
+    /// `build_completion_request` omits the tools array (no registry tools, no
+    /// synthesized `enter_plan_mode`) and the system prompt carries the
+    /// ground-truth "no tools" line — so a toolless model cannot claim tool
+    /// ability. Flipping `supports_tools`/`supports_images` to true restores the
+    /// tool list and advertises image capability (thread 480b2469: a
+    /// non-multimodal model claimed multimodal ability; this is the ground
+    /// truth that stops it).
+    #[test]
+    fn build_completion_request_gates_tools_and_images_on_capability() {
+        use crate::language_model::{MessageContent, Role};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+
+        // Toolless, imageless model.
+        let no_tools: AnyLanguageModel = Arc::new(CapabilityMockModel {
+            id: "test/no-tools".into(),
+            supports_tools: false,
+            supports_images: false,
+        });
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-cap-no-tools", "/tmp", Vec::new()),
+                Some(no_tools),
+                cx,
+            )
+        });
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        assert!(
+            req.tools.is_empty(),
+            "supports_tools=false must omit all tools (incl. plan tools)"
+        );
+        let sys_text = req
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .and_then(|m| {
+                m.content.iter().find_map(|c| match c {
+                    MessageContent::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })
+            })
+            .expect("system message");
+        assert!(
+            sys_text.contains("You have no tools"),
+            "ground-truth no-tools line missing: {sys_text}"
+        );
+        assert!(
+            sys_text.contains("cannot process images"),
+            "ground-truth no-images line missing: {sys_text}"
+        );
+
+        // Capable model: tools advertised (incl. enter_plan_mode on depth 0)
+        // and image capability announced.
+        let capable: AnyLanguageModel = Arc::new(CapabilityMockModel {
+            id: "test/capable".into(),
+            supports_tools: true,
+            supports_images: true,
+        });
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-cap-able", "/tmp", Vec::new()),
+                Some(capable),
+                cx,
+            )
+        });
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        assert!(
+            !req.tools.is_empty(),
+            "supports_tools=true must advertise the tool list"
+        );
+        assert!(
+            req.tools
+                .iter()
+                .any(|t| t.name.as_str() == "enter_plan_mode"),
+            "main thread (depth 0) must advertise the synthesized enter_plan_mode tool"
+        );
+        let sys_text = req
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .and_then(|m| {
+                m.content.iter().find_map(|c| match c {
+                    MessageContent::Text(s) => Some(s.as_str()),
+                    _ => None,
+                })
+            })
+            .expect("system message");
+        assert!(
+            sys_text.contains("can process image"),
+            "ground-truth image-capability line missing: {sys_text}"
+        );
+    }
+
     /// Regression guard for the YOLO + `AskUserQuestion` interaction.
     /// `AskUserQuestion`'s `run` body is unreachable — its result is built
     /// from the `ToolAuthorizationResponse` at the authorization gate. YOLO
@@ -4903,6 +5138,59 @@ mod tests {
                 use futures::StreamExt as _;
                 let events: Vec<_> = events.iter().cloned().map(Ok).collect();
                 Ok(futures::stream::iter(events).boxed())
+            })
+        }
+    }
+
+    /// A mock model whose only configurable surface is the two capability flags,
+    /// so `build_completion_request`'s tool-gating and system-prompt ground-truth
+    /// can be exercised without a wire round-trip. `supports_tools == false`
+    /// must yield an empty tools list and a "no tools" capability line;
+    /// `supports_images` must drive the image-capability line.
+    struct CapabilityMockModel {
+        id: String,
+        supports_tools: bool,
+        supports_images: bool,
+    }
+
+    impl crate::language_model::LanguageModel for CapabilityMockModel {
+        fn id(&self) -> String {
+            self.id.clone()
+        }
+        fn name(&self) -> String {
+            self.id.clone()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn supports_tools(&self) -> bool {
+            self.supports_tools
+        }
+        fn supports_images(&self) -> bool {
+            self.supports_images
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            Box::pin(async move {
+                use futures::StreamExt as _;
+                Ok(futures::stream::empty().boxed())
             })
         }
     }
@@ -6229,5 +6517,121 @@ mod tests {
             Some(true),
             "drained steer must be tagged steered (persisted receipt of injection)"
         );
+    }
+
+    #[test]
+    fn announces_tool_intent_without_call_flags_narrate_no_act() {
+        // thread 480b2469 msg3/5/9: model writes "let me find ..." / "让我先找到"
+        // but emits no tool_use. These must be flagged so the recovery loop
+        // nudges instead of ending the turn as a clean EndTurn.
+        assert!(super::announces_tool_intent_without_call(
+            "让我先找到相关组件代码"
+        ));
+        assert!(super::announces_tool_intent_without_call(
+            "Let me search the codebase now."
+        ));
+        assert!(super::announces_tool_intent_without_call(
+            "I'll call the read_file tool."
+        ));
+        assert!(super::announces_tool_intent_without_call(
+            "接下来我先看一下配置"
+        ));
+    }
+
+    #[test]
+    fn announces_tool_intent_without_call_skips_real_answers() {
+        // A genuine long answer, or short text with no intent phrase, must not
+        // be flagged — only narrate-without-acting trips the check.
+        let long = "x".repeat(500);
+        assert!(!super::announces_tool_intent_without_call(&long));
+        // thread 480b2469 msg7: screenshot recap, no "让我", short-ish — must not trip.
+        assert!(!super::announces_tool_intent_without_call(
+            "我可以看到截图里有一个文本溢出的列表。"
+        ));
+        assert!(!super::announces_tool_intent_without_call("完成。"));
+    }
+
+    #[test]
+    fn normalize_drops_whitespace_blocks_and_merges_adjacent_same_type() {
+        use super::normalize_assistant_content;
+        // thread 480b2469 msg3 shape: Thinking, Text, Thinking("."), Text —
+        // the whitespace Thinking is dropped; the two Texts are NOT adjacent
+        // (Thinking between them was non-empty? here it is whitespace, so after
+        // dropping it the two Texts become adjacent and merge).
+        let mut content = vec![
+            MessageContent::Thinking {
+                text: "real reasoning".into(),
+                signature: Some("sig".into()),
+            },
+            MessageContent::Text("让我先找到相关的".into()),
+            MessageContent::Thinking {
+                text: "   ".into(),
+                signature: None,
+            },
+            MessageContent::Text("组件代码".into()),
+        ];
+        normalize_assistant_content(&mut content);
+        assert_eq!(
+            content.len(),
+            2,
+            "whitespace thinking dropped, two texts merge"
+        );
+        assert!(
+            matches!(&content[0], MessageContent::Thinking { text, signature } if text == "real reasoning" && signature.as_deref() == Some("sig"))
+        );
+        assert!(matches!(&content[1], MessageContent::Text(t) if t == "让我先找到相关的组件代码"));
+    }
+
+    #[test]
+    fn normalize_keeps_thinking_separated_by_text_distinct() {
+        use super::normalize_assistant_content;
+        // Thinking blocks separated by a real Text block must NOT merge —
+        // merging would erase the streaming timeline.
+        let mut content = vec![
+            MessageContent::Thinking {
+                text: "first".into(),
+                signature: Some("s1".into()),
+            },
+            MessageContent::Text("visible answer".into()),
+            MessageContent::Thinking {
+                text: "second".into(),
+                signature: Some("s2".into()),
+            },
+        ];
+        normalize_assistant_content(&mut content);
+        assert_eq!(content.len(), 3, "text between thinking prevents merge");
+        assert!(matches!(&content[0], MessageContent::Thinking { text, .. } if text == "first"));
+        assert!(matches!(&content[1], MessageContent::Text(t) if t == "visible answer"));
+        assert!(matches!(&content[2], MessageContent::Thinking { text, .. } if text == "second"));
+    }
+
+    #[test]
+    fn normalize_merges_adjacent_thinking_retaining_first_signature() {
+        use super::normalize_assistant_content;
+        // Defensive backstop: accidentally-adjacent Thinking blocks merge, and
+        // the first non-empty signature is retained (Anthropic echo requirement).
+        let mut content = vec![
+            MessageContent::Thinking {
+                text: "a".into(),
+                signature: Some("keep".into()),
+            },
+            MessageContent::Thinking {
+                text: "b".into(),
+                signature: Some("drop".into()),
+            },
+        ];
+        normalize_assistant_content(&mut content);
+        assert_eq!(content.len(), 1);
+        match &content[0] {
+            MessageContent::Thinking { text, signature } => {
+                assert_eq!(text, "ab");
+                assert_eq!(
+                    signature.as_deref(),
+                    Some("keep"),
+                    "first signature retained"
+                );
+            }
+            _ => panic!("expected merged Thinking"),
+        }
     }
 }

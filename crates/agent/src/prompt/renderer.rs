@@ -37,6 +37,8 @@ const TPL_WRAPPER_RECOVERY_FAILURE: &str =
     include_str!("templates/wrapper/recovery_failure.tera.md");
 const TPL_WRAPPER_EMPTY_TURN_NUDGE: &str =
     include_str!("templates/wrapper/empty_turn_nudge.tera.md");
+const TPL_WRAPPER_UNFULFILLED_TOOL_INTENT_NUDGE: &str =
+    include_str!("templates/wrapper/unfulfilled_tool_intent_nudge.tera.md");
 const TPL_WRAPPER_PEER_MESSAGE: &str = include_str!("templates/wrapper/peer_message.tera.md");
 const TPL_WRAPPER_ASK_USER_RESPONSE: &str =
     include_str!("templates/wrapper/ask_user_response.tera.md");
@@ -103,6 +105,10 @@ fn tera() -> &'static tera::Tera {
             (
                 PromptTemplate::WrapperEmptyTurnNudge,
                 TPL_WRAPPER_EMPTY_TURN_NUDGE,
+            ),
+            (
+                PromptTemplate::WrapperUnfulfilledToolIntentNudge,
+                TPL_WRAPPER_UNFULFILLED_TOOL_INTENT_NUDGE,
             ),
             (PromptTemplate::WrapperPeerMessage, TPL_WRAPPER_PEER_MESSAGE),
             (
@@ -304,6 +310,7 @@ mod tests {
             PromptTemplate::ModeUltracodeGrant,
             PromptTemplate::WrapperMaxTokensDirective,
             PromptTemplate::WrapperEmptyTurnNudge,
+            PromptTemplate::WrapperUnfulfilledToolIntentNudge,
             PromptTemplate::WrapperToolDenied,
             PromptTemplate::WrapperEnterPlanMode,
             PromptTemplate::WrapperPlanContinue,
@@ -331,7 +338,7 @@ mod tests {
         let _ = render_static(PromptTemplate::ModeGoalAddendum).unwrap();
         // Every variant in `ALL` has a `name` arm (compile-checked by the
         // `match` in `name`), and every name is registered (init-checked).
-        assert_eq!(template::ALL.len(), 29);
+        assert_eq!(template::ALL.len(), 30);
     }
 
     /// Every data-bearing template must fully substitute its variables against
@@ -380,6 +387,7 @@ mod tests {
 
         let assembly = crate::prompt::SystemPromptAssembly {
             base: "BASE".to_string(),
+            capabilities: crate::prompt::ModelCapabilitiesPromptData::default(),
             language: Some(crate::prompt::LanguagePromptData {
                 language: "English",
             }),
