@@ -5959,6 +5959,7 @@ impl Render for Workspace {
                                             .items_center()
                                             .flex_1()
                                             .min_w_0()
+                                            .pr_4()
                                             .child(Icon::new(IconName::Bot).small())
                                             .child(
                                                 gpui::div()
