@@ -70,6 +70,12 @@ pub struct ExternalSession {
     pub kind: SessionKind,
     pub provider_name: String,
     pub model_id: String,
+    /// Epoch seconds at spawn time. The sidebar sort key so an external
+    /// session mixes into the Conversations list by recency alongside manox
+    /// threads (which sort by `interacted_at`). manox cannot observe model
+    /// switches inside the TUI, let alone inter-message timing, so the spawn
+    /// time is the only stable ordering signal it has.
+    pub created_at: i64,
     pub terminal_view: Entity<TerminalView>,
     pub handle: Arc<cx::SessionHandle>,
     pub _exit_sub: Subscription,
@@ -92,6 +98,7 @@ impl ExternalSession {
             kind: self.kind,
             provider_name: self.provider_name.clone(),
             model_id: self.model_id.clone(),
+            created_at: self.created_at,
         }
     }
 }
@@ -107,4 +114,5 @@ pub struct ExternalSessionSummary {
     pub kind: SessionKind,
     pub provider_name: String,
     pub model_id: String,
+    pub created_at: i64,
 }

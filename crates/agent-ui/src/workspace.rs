@@ -1326,11 +1326,16 @@ impl Workspace {
             },
         );
         let view = TerminalView::new(terminal, cx);
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         self.external_sessions.push(ExternalSession {
             id: id.clone(),
             kind,
             provider_name,
             model_id,
+            created_at,
             terminal_view: view,
             handle,
             _exit_sub: exit_sub,
@@ -1792,6 +1797,11 @@ impl Workspace {
         // The incoming thread's cwd / worktree may differ from the outgoing
         // one; refresh the rail's git stats/branch display for it.
         self.spawn_git_status_refresh(cx);
+        // Returning to a thread leaves the external-session view: without this
+        // the render still takes the ExternalSession branch and the swapped-in
+        // thread is invisible behind the terminal TUI.
+        self.view_mode = ViewMode::Workspace;
+        self.active_external = None;
         cx.notify();
     }
 
