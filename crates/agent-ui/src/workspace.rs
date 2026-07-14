@@ -332,11 +332,12 @@ pub struct Workspace {
     /// element only lays out (and only syntax-highlights, via the synchronous
     /// renderer) the items in the viewport plus `MSG_LIST_OVERDRAW` — so a long
     /// thread's first frame pays only for the visible turn, not every block.
-    /// `FollowMode::Tail` replaces the hand-rolled stick-to-bottom: it re-pins
-    /// to the end each layout while following and re-arms when the user scrolls
-    /// back to the bottom. Item heights are deterministic per-frame (sync
-    /// markdown), so the per-item height cache the list maintains never falls
-    /// out of sync with async parsing — the root cause of the old overlap bug.
+    /// `ListAlignment::Bottom` gives the list native chat-log semantics: short
+    /// histories sit at the bottom of the viewport, and tail-follow re-pins to
+    /// the end each layout while following. Item heights are deterministic
+    /// per-frame (sync markdown), so the per-item height cache the list
+    /// maintains never falls out of sync with async parsing — the root cause of
+    /// the old overlap bug.
     list_state: ListState,
     /// Cached `items().len()`; the event handler reconciles the list count via
     /// `splice` whenever the conversation grows or shrinks.
@@ -582,7 +583,7 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
-            list_state: ListState::new(0, ListAlignment::Top, px(MSG_LIST_OVERDRAW)),
+            list_state: ListState::new(0, ListAlignment::Bottom, px(MSG_LIST_OVERDRAW)),
             list_count: 0,
             expanded_tasks: HashSet::new(),
             view_mode: ViewMode::default(),
@@ -970,6 +971,7 @@ impl Workspace {
         // Fallback for the pre-layout frame, before the list has captured item
         // bounds to answer positional queries.
         let fallback_top = self.list_state.logical_scroll_top().item_ix;
+        let fallback_at_tail = fallback_top >= total;
         // Viewport box in window coordinates. `bounds_for_item` already returns
         // window-coordinate (scroll-adjusted) bounds, so a span is off-screen
         // when its last item's bottom is above the viewport top, or its first
@@ -983,7 +985,7 @@ impl Workspace {
             // viewport. `bounds_for_item` returns `None` before layout; then
             // fall back to the logical scroll top intersecting the span.
             let last = span.end.saturating_sub(1);
-            let active = if following {
+            let active = if following || fallback_at_tail {
                 turn.ordinal == last_ordinal
             } else {
                 match (
@@ -5937,16 +5939,15 @@ impl Render for Workspace {
                                 // the synchronous renderer — the items in the viewport
                                 // plus `MSG_LIST_OVERDRAW`, so a long thread's first frame
                                 // pays only for the visible turn, not every code block.
-                                // `FollowMode::Tail` on the ListState replaces the
-                                // hand-rolled stick-to-bottom: it re-pins to the end each
-                                // layout while following, disengages on upward scroll, and
-                                // re-arms at the bottom. Item heights are deterministic
-                                // per-frame (sync markdown), so the per-item height cache
-                                // the list maintains never falls out of sync with async
-                                // parsing — the root cause of the old overlap bug. Count
-                                // and height changes are reconciled from the ThreadEvent
-                                // handler and the `push_*` sites via `splice`/
-                                // `remeasure_items`.
+                                // `ListAlignment::Bottom` gives the list native chat-log
+                                // layout: short conversations sit at the bottom, and
+                                // tail-follow re-pins to the end each layout while
+                                // following. Item heights are deterministic per-frame (sync
+                                // markdown), so the per-item height cache the list maintains
+                                // never falls out of sync with async parsing — the root cause
+                                // of the old overlap bug. Count and height changes are
+                                // reconciled from the ThreadEvent handler and the `push_*`
+                                // sites via `splice`/`remeasure_items`.
                                 let list_state = self.list_state.clone();
                                 let list_el = gpui::list(list_state, move |ix, _window, cx| {
                                     let item = conv.read(cx).items().get(ix).cloned();
@@ -5968,8 +5969,9 @@ impl Render for Workspace {
                                         None => gpui::div().into_any_element(),
                                     }
                                 })
-                                .with_sizing_behavior(ListSizingBehavior::Infer)
+                                .with_sizing_behavior(ListSizingBehavior::Auto)
                                 .w_full()
+                                .h_full()
                                 .min_h_0()
                                 .min_w_0()
                                 // Body typeface: Lilex Light. Every message row (assistant,
@@ -5978,23 +5980,17 @@ impl Render for Workspace {
                                 // italic syntax and tool-card overrides hit the italic cuts.
                                 .font_family(theme.mono_font_family.clone())
                                 .font_weight(gpui::FontWeight::LIGHT);
-                                // Outer column fills the list region and bottom-anchors its
-                                // child. `h_full()` is load-bearing: the region is an
-                                // `h_flex()` row (items_center, not stretch), so without it
-                                // the wrapper shrinks to content height and the list has no
-                                // room to fill. The list uses `Infer` sizing — it takes its
-                                // content height when shorter than the region and caps at the
-                                // region height when longer — so `justify_end` pins short
-                                // conversations just above the composer while long threads
-                                // still fill and scroll (`FollowMode::Tail` re-pins to the
-                                // bottom on new content). Virtualization is preserved: only
-                                // visible + overdraw items render/measure.
+                                // The wrapper fills the list region; the list itself owns
+                                // bottom alignment. Relying on flex `justify_end` outside a
+                                // virtual list is brittle because `Infer` only knows measured
+                                // item heights during early frames and after width resets.
+                                // Virtualization is preserved: only visible + overdraw items
+                                // render/measure.
                                 let list_wrap = v_flex()
                                     .flex_1()
                                     .h_full()
                                     .min_h_0()
                                     .min_w_0()
-                                    .justify_end()
                                     .child(list_el);
                                 // Outline rail (left) + flat message column (right) share
                                 // the list region's height.

@@ -5,9 +5,9 @@
 //! overflowing content still scrolls normally without inverting offset semantics.
 
 use gpui::{
-    AnyWindowHandle, AppContext as _, Context, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Render, ScrollHandle, StatefulInteractiveElement, Styled, TestAppContext, Window, div,
-    px,
+    AnyWindowHandle, AppContext as _, Context, InteractiveElement, IntoElement, ListAlignment,
+    ListSizingBehavior, ListState, ParentElement, Pixels, Render, ScrollHandle,
+    StatefulInteractiveElement, Styled, TestAppContext, Window, div, list, px,
 };
 
 struct Probe {
@@ -226,4 +226,76 @@ fn draw_in_row(cx: &mut TestAppContext, body: Vec<Pixels>, viewport_h: Pixels) -
     })
     .unwrap();
     handle
+}
+
+struct NativeListProbe {
+    state: ListState,
+    body: Vec<Pixels>,
+    viewport_h: Pixels,
+}
+
+impl Render for NativeListProbe {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let body = self.body.clone();
+        let state = self.state.clone();
+        div()
+            .id("row")
+            .w(px(100.))
+            .h(self.viewport_h)
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(
+                div()
+                    .id("wrap")
+                    .flex_1()
+                    .h_full()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        list(state, move |ix, _, _| {
+                            let height = body.get(ix).copied().unwrap_or(px(0.));
+                            div()
+                                .id(("native-c", ix))
+                                .w(px(100.))
+                                .h(height)
+                                .flex_shrink_0()
+                                .into_any_element()
+                        })
+                        .with_sizing_behavior(ListSizingBehavior::Auto)
+                        .w_full()
+                        .h_full()
+                        .min_h_0(),
+                    ),
+            )
+    }
+}
+
+fn draw_native_list(cx: &mut TestAppContext, body: Vec<Pixels>, viewport_h: Pixels) -> ListState {
+    let state = ListState::new(body.len(), ListAlignment::Bottom, px(0.));
+    let build = state.clone();
+    let window = cx.add_window(move |_, _| NativeListProbe {
+        state: build,
+        body: body.clone(),
+        viewport_h,
+    });
+    cx.run_until_parked();
+    let any: AnyWindowHandle = window.into();
+    cx.update_window(any, |_, window, cx| {
+        window.draw(cx).clear();
+    })
+    .unwrap();
+    state
+}
+
+#[gpui::test]
+async fn native_bottom_list_anchors_short_content_in_h_flex_row(cx: &mut TestAppContext) {
+    let state = draw_native_list(cx, vec![px(40.), px(40.)], px(100.));
+    assert_eq!(
+        state.logical_scroll_top().item_ix,
+        state.item_count(),
+        "ListAlignment::Bottom keeps a fitting chat list anchored at the tail"
+    );
+    assert_eq!(state.scroll_px_offset_for_scrollbar().y, px(0.));
 }
