@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
-use gpui::{App, AppContext as _, AsyncApp, Entity, Task, WeakEntity};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
 use tokio::sync::oneshot;
 
 use agent::thread::{Thread, ThreadEvent};
@@ -411,11 +411,22 @@ impl WorkspaceBrowserHost {
         }
     }
 
-    /// Retire every outstanding yield owned by `thread` — called from the
-    /// workspace Stop handler so a stopped turn leaves no parked yield or stale
-    /// banner behind. Dropping each pending sender resolves the parked `Task`
-    /// with a cancellation error; the banner is cleared on the live view.
-    pub(crate) fn clear_yields_for_thread(&self, thread: &Entity<Thread>, cx: &mut App) {
+    /// Retire every outstanding yield owned by the workspace's thread — called
+    /// from the workspace Stop/Error handler so a stopped turn leaves no parked
+    /// yield or stale banner behind. Dropping each pending sender resolves the
+    /// parked `Task` with a cancellation error; the banner is cleared on the
+    /// live view.
+    ///
+    /// Invoked from within the `Workspace` subscribe callback, which already
+    /// holds a lease on the `Workspace` entity. Re-entering it via
+    /// `self.weak_ws.update(cx, ..)` would double-lease the same entity and
+    /// trip GPUI's `double_lease_panic` (the browser-turn crash). The caller
+    /// therefore passes the already-leased `&mut Workspace` in directly; the
+    /// owning thread id is read off `ws.thread`, and only the per-tab
+    /// `BrowserView` entities are leased here — they are distinct from
+    /// `Workspace`.
+    pub(crate) fn clear_yields_for_thread(&self, ws: &mut Workspace, cx: &mut Context<Workspace>) {
+        let owner_id = ws.thread.entity_id();
         let owned: Vec<BrowserTabId> = self
             .routes
             .tabs
@@ -425,7 +436,7 @@ impl WorkspaceBrowserHost {
             .filter(|(_, t)| {
                 t.thread
                     .upgrade()
-                    .is_some_and(|owner| owner.entity_id() == thread.entity_id())
+                    .is_some_and(|owner| owner.entity_id() == owner_id)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -443,12 +454,8 @@ impl WorkspaceBrowserHost {
                     .expect("pending_yield lock poisoned")
                     .take();
             }
-            if let Some(ws) = self.weak_ws.upgrade() {
-                ws.update(cx, |ws, cx| {
-                    if let Some(view) = ws.browser_views.get(&id).cloned() {
-                        view.update(cx, |v, cx| v.set_yielded(false, cx));
-                    }
-                });
+            if let Some(view) = ws.browser_views.get(&id).cloned() {
+                view.update(cx, |v, cx| v.set_yielded(false, cx));
             }
         }
     }
