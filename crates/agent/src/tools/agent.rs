@@ -968,10 +968,10 @@ fn absolutize_path(worktree_dir: &Path, git_common_dir: &str) -> PathBuf {
 /// descriptions.
 fn build_description() -> Arc<str> {
     let subagents: Vec<crate::prompt::SubagentTypeData> = agent_def::global()
-        .list()
+        .entries()
         .into_iter()
-        .map(|d| crate::prompt::SubagentTypeData {
-            name: d.def.name.clone(),
+        .map(|(key, d)| crate::prompt::SubagentTypeData {
+            name: key.clone(),
             capability: capability_tag(&d.def),
             description: d.def.description.clone(),
         })
