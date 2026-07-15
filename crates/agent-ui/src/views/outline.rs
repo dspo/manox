@@ -6,7 +6,7 @@
 //! summarizing each turn for the hover card, and mapping a turn to the span of
 //! list items it owns so the rail can light up whichever turns intersect the
 //! viewport. Rendering and scroll wiring stay in `workspace.rs`, next to the
-//! private `ListState`.
+//! pixel-anchored `ScrollHandle`.
 
 use std::ops::Range;
 
@@ -132,6 +132,7 @@ mod tests {
             streaming: false,
             collapsed: true,
             user_toggled: false,
+            panel: None,
         })
     }
 

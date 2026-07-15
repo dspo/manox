@@ -72,6 +72,8 @@ similar = "2"
 markdown = "1"
 # ropey — SyntaxHighlighter::update 接收 &Rope;版本对齐 gpui-component 在 Cargo.lock 锁定的 2.0.0-beta.1。
 ropey = "2.0.0-beta.1"
+# vte — ANSI escape parser (alacritty/wezterm 的同款,仅解析器)。TerminalPanel 用其 Handler trait 解析工具输出着色。
+vte = { version = "0.13", default-features = false, features = ["ansi"] }
 base64 = "0.22"
 # image —— clipboard image resize + PNG re-encode before sending to the provider
 # (Anthropic long-edge cap 1568px / 5MB). CPU-bound work runs on the background executor.

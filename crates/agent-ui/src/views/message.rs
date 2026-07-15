@@ -28,7 +28,7 @@ use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
-use gpui::{App, ClipboardItem, CursorStyle, Render, SharedString, Task, WeakEntity, px};
+use gpui::{App, ClipboardItem, CursorStyle, Entity, Render, SharedString, WeakEntity, px};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
@@ -38,10 +38,10 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
-use manox_components::markdown::ast::Block;
-use manox_components::markdown::incremental::IncrementalParser;
-use manox_components::markdown::{HeadingMode, Markdown};
+use manox_components::markdown::terminal_panel::GitSummary;
+use manox_components::markdown::{HeadingMode, Markdown, PanelKind, TerminalPanel};
 use manox_components::turn_frame::TurnFrame;
+use std::path::{Path, PathBuf};
 
 use crate::Workspace;
 use crate::conversation::{
@@ -82,18 +82,26 @@ pub struct ToolCallCtx {
 /// `scrollable = false` clips overflow horizontally — the renderer itself is a
 /// `w_full` + `min_w_0` column, so a long unbreakable run cannot push past the
 /// env-card gutter.
+///
+/// Mounts a fresh `Entity<Markdown>` per frame — used for static chrome
+/// (notices, errors, tool output, sub-message bodies) where cross-block
+/// selection is not required (code blocks carry their own hover copy button).
+/// The owned streaming body uses the `MessageItem`'s persistent
+/// `Entity<Markdown>` directly (see `render_assistant` / `render_reasoning`).
 fn markdown_tv(
     id: impl Into<gpui::ElementId>,
     text: impl Into<gpui::SharedString>,
     theme: &Theme,
     scrollable: bool,
+    cx: &mut App,
 ) -> gpui::AnyElement {
-    Markdown::new(id, text)
-        .theme(theme)
-        .selectable(true)
-        .scrollable(scrollable)
-        .heading_mode(HeadingMode::Uniform)
-        .into_any_element()
+    cx.new(|_cx| {
+        Markdown::new(id, text)
+            .theme(theme)
+            .scrollable(scrollable)
+            .heading_mode(HeadingMode::Uniform)
+    })
+    .into_any_element()
 }
 
 /// One renderable conversation item, owned by its own gpui `Entity` so a
@@ -104,12 +112,13 @@ fn markdown_tv(
 /// creation time so a finished bubble keeps its model label after the user
 /// switches models.
 ///
-/// `parser` holds the incremental markdown state for text-bearing items
-/// (Assistant, Reasoning). It is `None` for non-text items (ToolCall, Error,
-/// etc.) — those render static text via `markdown_tv` which parses internally.
-/// `pending_parse` + `dirty` implement backpressure: when a parse is in
-/// flight, further deltas set `dirty` instead of starting a new parse, and the
-/// completion handler re-arms if dirty.
+/// `markdown` holds the owned `Entity<Markdown>` for text-bearing items
+/// (Assistant, Reasoning): a stateful document carrying parse-once incremental
+/// parsing + document-level selection, so a streaming delta re-parses only the
+/// tail and a cross-block drag selects one continuous range with Cmd/Ctrl+C
+/// copy. `None` for non-text items (ToolCall, Error, …) — those render static
+/// chrome via `markdown_tv`, which mounts a fresh `Entity<Markdown>` per frame
+/// (no persistent selection; code blocks carry their own hover copy button).
 pub struct MessageItem {
     kind: ConvItem,
     role: String,
@@ -117,35 +126,17 @@ pub struct MessageItem {
     /// Weak handle to the owning `Workspace`, used to read/toggle the shared
     /// `expanded_tasks` set from `AgentTask` cards.
     weak_workspace: WeakEntity<Workspace>,
-    /// Incremental markdown parser for streaming text bodies (Assistant,
-    /// Reasoning). `None` for non-text items.
-    parser: Option<IncrementalParser>,
-    /// In-flight background parse. While `Some`, new deltas set `dirty` rather
-    /// than spawning a competing parse.
-    pending_parse: Option<Task<()>>,
-    /// Set when a delta arrived while `pending_parse` was `Some`. The
-    /// completion handler re-arms a parse when this is true.
-    dirty: bool,
+    markdown: Option<Entity<Markdown>>,
 }
 
 impl MessageItem {
     pub fn new(kind: ConvItem, role: String, id: usize, weak: WeakEntity<Workspace>) -> Self {
-        let is_text = matches!(
-            kind,
-            ConvItem::Assistant { .. } | ConvItem::Reasoning { .. }
-        );
         Self {
             kind,
             role,
             id,
             weak_workspace: weak,
-            parser: if is_text {
-                Some(IncrementalParser::new())
-            } else {
-                None
-            },
-            pending_parse: None,
-            dirty: false,
+            markdown: None,
         }
     }
 
@@ -157,85 +148,220 @@ impl MessageItem {
         &mut self.kind
     }
 
-    /// The parsed blocks for a text-bearing item. Returns `None` for non-text
-    /// items (they don't carry an `IncrementalParser`).
-    pub fn blocks(&self) -> Option<Arc<Vec<Block>>> {
-        self.parser.as_ref().map(|p| p.blocks())
+    /// Lazily create the owned `Entity<Markdown>` for a text-bearing item,
+    /// seeded with the kind's streaming flag (true mid-stream, false for
+    /// finalized/historical bodies). Returns the entity handle so the caller can
+    /// mount it. `None` for non-text items (they have no owned markdown body).
+    fn ensure_markdown(&mut self, cx: &mut gpui::Context<Self>) -> Option<Entity<Markdown>> {
+        let is_text = matches!(
+            self.kind,
+            ConvItem::Assistant { .. } | ConvItem::Reasoning { .. }
+        );
+        if is_text && self.markdown.is_none() {
+            let streaming = match &self.kind {
+                ConvItem::Assistant { streaming, .. } | ConvItem::Reasoning { streaming, .. } => {
+                    *streaming
+                }
+                _ => false,
+            };
+            let id = self.id;
+            self.markdown = Some(cx.new(|cx| {
+                Markdown::new(("md", id), "")
+                    .theme(cx.theme())
+                    .heading_mode(HeadingMode::Uniform)
+                    .streaming(streaming)
+            }));
+        }
+        self.markdown.clone()
     }
 
-    /// Feed a text delta to the incremental parser (synchronous fast path). For
-    /// the streaming body, this updates the blocks in place on the foreground
-    /// thread; Phase 3 backpressure wraps this in a background spawn when the
-    /// body is long enough to jank the frame.
-    pub fn update_text(&mut self, full_text: &str) {
-        if let Some(parser) = &mut self.parser {
-            parser.update(full_text);
+    /// Feed a full text snapshot to the owned markdown document. `replace` runs
+    /// the incremental parser's append-only fast path (re-parse only the tail),
+    /// so a streaming delta pays proportional to the delta, not the full body.
+    pub fn update_text(&mut self, full_text: &str, cx: &mut gpui::Context<Self>) {
+        if let Some(md) = self.ensure_markdown(cx) {
+            md.update(cx, |m, cx| m.replace(full_text, cx));
         }
     }
 
-    /// Finalize the parser (one full parse for consistency) without touching
-    /// the streaming/collapse flags. Used by `rebuild_from_messages` for non-
-    /// streaming text items that need their blocks populated.
-    pub fn finalize_parser(&mut self) {
-        if let Some(parser) = &mut self.parser {
-            parser.finalize();
+    /// Run the parser's final full parse so the frozen prefix + tail match a
+    /// one-shot parse. Used by `rebuild_from_messages` for non-streaming text
+    /// items loaded from history.
+    pub fn finalize_parser(&mut self, cx: &mut gpui::Context<Self>) {
+        if let Some(md) = &self.markdown {
+            md.update(cx, |m, cx| m.finalize(cx));
         }
     }
 
-    /// Kick off a background parse if no parse is in flight; otherwise mark
-    /// dirty so the completion handler re-arms. The background task parses on a
-    /// worker thread and updates the parser state + notifies on completion.
-    pub fn schedule_parse(&mut self, full_text: String, cx: &mut gpui::Context<Self>) {
-        if self.pending_parse.is_some() {
-            self.dirty = true;
-            return;
-        }
-        self.dirty = false;
-        let Some(parser) = self.parser.as_mut() else {
+    /// Ensure the `eix`-th activity entry's persistent `Entity<Markdown>` exists
+    /// and feed it the entry's current text. Mirrors `update_text` for the
+    /// activity-tree reasoning rounds: a streaming delta drives the incremental
+    /// parser's append-only fast path while document-level selection + focus
+    /// survive across frames (drag + Cmd/Ctrl+C), so a reasoning round selects
+    /// and copies just like the top-level body.
+    pub fn sync_reasoning_entry(&mut self, eix: usize, cx: &mut gpui::Context<Self>) {
+        let ConvItem::Thinking(t) = &mut self.kind else {
             return;
         };
-        // Snapshot the parser state so the background task can update a clone
-        // without holding the entity lock. The result (new blocks + frozen
-        // offset) is applied on the foreground thread.
-        let mut snapshot = parser.clone();
-        let task = cx.background_spawn(async move {
-            snapshot.update(&full_text);
-            snapshot
-        });
-        let weak = cx.weak_entity();
-        self.pending_parse = Some(cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
-            let updated = task.await;
-            this.update(cx, |item, cx| {
-                // The authoritative text is the item's `text` field, which the
-                // append branch mutates *before* re-arming. The background
-                // snapshot may lag it (deltas landed during the parse), so only
-                // adopt the snapshot when it matches the authoritative text —
-                // overwriting with a stale snapshot would regress the rendered
-                // body and, after stream stop, permanently drop the last
-                // delta. When the snapshot lagged, the foreground `update_text`
-                // already holds the authoritative text, so leaving the parser
-                // is correct; the dirty re-arm catches up.
-                let authoritative = match item.kind() {
-                    ConvItem::Assistant { text, .. } | ConvItem::Reasoning { text, .. } => {
-                        text.clone()
-                    }
-                    _ => return,
-                };
-                if let Some(parser) = &mut item.parser
-                    && updated.text() == authoritative
-                {
-                    *parser = updated;
-                }
-                item.pending_parse = None;
-                if item.dirty {
-                    item.dirty = false;
-                    item.schedule_parse(authoritative, cx);
-                }
-                cx.notify();
-            })
-            .ok();
-            let _ = weak;
-        }));
+        let Some(ActivityEntry::Reasoning {
+            text,
+            streaming,
+            markdown,
+            ..
+        }) = t.entries.get_mut(eix)
+        else {
+            return;
+        };
+        if markdown.is_none() {
+            let streaming = *streaming;
+            let id = eix;
+            *markdown = Some(cx.new(|cx| {
+                Markdown::new(("reasoning-md", id), "")
+                    .theme(cx.theme())
+                    .heading_mode(HeadingMode::Uniform)
+                    .streaming(streaming)
+            }));
+        }
+        if let Some(md) = markdown.as_ref().cloned() {
+            let text = text.clone();
+            md.update(cx, |m, cx| m.replace(&text, cx));
+        }
+    }
+
+    /// For a rebuilt (historical) `Thinking` container, mount + finalize the
+    /// persistent markdown for every reasoning round so document-level
+    /// selection works on reloaded history (not just live-streamed turns).
+    /// Mirrors `update_text` + `finalize_parser` for the top-level text bodies.
+    pub fn rebuild_activity_reasoning(&mut self, cx: &mut gpui::Context<Self>) {
+        let eixs: Vec<usize> = {
+            let ConvItem::Thinking(t) = &mut self.kind else {
+                return;
+            };
+            t.entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| matches!(e, ActivityEntry::Reasoning { .. }))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        for eix in eixs {
+            self.sync_reasoning_entry(eix, cx);
+            if let ConvItem::Thinking(t) = &mut self.kind
+                && let Some(ActivityEntry::Reasoning { markdown, .. }) = t.entries.get_mut(eix)
+                && let Some(md) = markdown.as_ref()
+            {
+                md.update(cx, |m, cx| m.finalize(cx));
+            }
+        }
+    }
+
+    /// Ensure the `eix`-th activity entry's persistent `Entity<TerminalPanel>`
+    /// exists and feed it the entry's current display output. Mirrors
+    /// `sync_reasoning_entry` for tool calls: a streaming delta or a finalized
+    /// result drives the panel's `set_output` while document-level selection +
+    /// focus survive across frames (drag + Cmd/Ctrl+C), so tool output selects
+    /// and copies like the assistant body — and renders as a terminal-styled
+    /// shell (cwd / toolchain / `❯` command + ANSI-colored output) rather than
+    /// a fenced code block.
+    pub fn sync_tool_entry_panel(
+        &mut self,
+        eix: usize,
+        cwd: Option<SharedString>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let ConvItem::Thinking(t) = &mut self.kind else {
+            return;
+        };
+        let Some(ActivityEntry::Tool(entry)) = t.entries.get_mut(eix) else {
+            return;
+        };
+        Self::ensure_tool_panel(entry, cwd, cx);
+    }
+
+    /// Top-level `ConvItem::ToolCall` variant of the panel sync, used by the
+    /// `AskUserQuestion` answered-state card and the orphan `ToolResult` card.
+    pub fn sync_tool_call_panel(
+        &mut self,
+        cwd: Option<SharedString>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let ConvItem::ToolCall(entry) = &mut self.kind else {
+            return;
+        };
+        Self::ensure_tool_panel(entry, cwd, cx);
+    }
+
+    /// Mount (lazily) and refresh the tool-call's `TerminalPanel` from its
+    /// current display output. `cwd` is the live thread working directory
+    /// gathered by the caller from the workspace; `command` is read from the
+    /// tool input's `command` field (bash / monitor) so the `❯` prompt line
+    /// echoes what the agent ran.
+    fn ensure_tool_panel(
+        entry: &mut ToolCallItem,
+        cwd: Option<SharedString>,
+        cx: &mut gpui::Context<MessageItem>,
+    ) {
+        let (kind, body) = tool_panel_body(entry);
+        if entry.panel.is_none() {
+            let command = entry
+                .input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(SharedString::from);
+            let cwd_for_panel = cwd.clone();
+            let panel = cx.new(|cx| TerminalPanel::new(kind, command, cwd_for_panel, cx.theme()));
+            // Probe the workdir's git state once per panel — a snapshot at the
+            // moment the command ran, like a real shell prompt. Runs on the
+            // background executor so the two `git` subprocess spawns never block
+            // the UI; `set_git` re-renders the prompt line when it lands.
+            if let Some(cwd_s) = cwd.as_ref() {
+                let cwd_path = PathBuf::from(cwd_s.as_ref());
+                let panel = panel.clone();
+                cx.spawn(async move |_, cx| {
+                    let git = cx
+                        .background_spawn(async move { detect_git(&cwd_path) })
+                        .await;
+                    panel.update(cx, |p, cx| p.set_git(git, cx));
+                })
+                .detach();
+            }
+            entry.panel = Some(panel);
+        }
+        if let Some(panel) = entry.panel.as_ref().cloned() {
+            let streaming = entry.streaming;
+            panel.update(cx, |p, cx| {
+                p.set_kind(kind, cx);
+                p.set_streaming(streaming, cx);
+                p.set_output(body, cx);
+            });
+        }
+    }
+
+    /// On history reload, mount + refresh the persistent panel for every tool
+    /// entry across all activity segments (and each top-level `ToolCall`),
+    /// so selection works on reloaded history and finalized output renders as a
+    /// terminal panel rather than a per-frame fallback.
+    pub fn rebuild_tool_panels(&mut self, cwd: Option<SharedString>, cx: &mut gpui::Context<Self>) {
+        // Gather entry indices through an immutable borrow first, then drive the
+        // mutable `sync_tool_*_panel` calls — otherwise `&mut self.kind` and
+        // `&mut self` (via the sync method) collide.
+        let tool_eixs: Vec<usize> = match &self.kind {
+            ConvItem::Thinking(t) => t
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| matches!(e, ActivityEntry::Tool(_)))
+                .map(|(i, _)| i)
+                .collect(),
+            // `exit_plan_mode` renders via the Markdown plan card, not the
+            // TerminalPanel — skip mounting a panel for it.
+            ConvItem::ToolCall(t) if t.name == "exit_plan_mode" => return,
+            ConvItem::ToolCall(_) => return self.sync_tool_call_panel(cwd, cx),
+            _ => return,
+        };
+        for eix in tool_eixs {
+            self.sync_tool_entry_panel(eix, cwd.clone(), cx);
+        }
     }
 
     /// Flip streaming flags off on a `Stop`. Called once per stop, so the
@@ -244,9 +370,10 @@ impl MessageItem {
     /// `StopReason::ToolUse`: a terminal stop freezes the activity segment
     /// (pins elapsed, auto-collapses) and the tool-call cards; a ToolUse stop
     /// only finalizes the assistant/reasoning text streaming so the next model
-    /// response's tool calls fold into the same segment. The parser always gets
-    /// a final pass so the frozen prefix + tail match a one-shot full parse.
-    pub fn finalize_streaming(&mut self, terminal: bool) {
+    /// response's tool calls fold into the same segment. The markdown document
+    /// always gets a final pass so the frozen prefix + tail match a one-shot
+    /// full parse exactly.
+    pub fn finalize_streaming(&mut self, terminal: bool, cx: &mut gpui::Context<Self>) {
         match &mut self.kind {
             ConvItem::Assistant { streaming, .. } => *streaming = false,
             ConvItem::Reasoning {
@@ -269,10 +396,14 @@ impl MessageItem {
                             streaming,
                             collapsed,
                             user_toggled,
+                            markdown,
                             ..
                         } => {
                             *streaming = false;
                             *collapsed = !*user_toggled;
+                            if let Some(md) = markdown.as_ref() {
+                                md.update(cx, |m, cx| m.finalize_streaming(cx));
+                            }
                         }
                         ActivityEntry::Tool(tool) => {
                             tool.streaming = false;
@@ -309,14 +440,9 @@ impl MessageItem {
             ConvItem::AgentTask(t) => t.streaming = false,
             _ => {}
         }
-        // Final full parse to guarantee the frozen prefix + tail match a
-        // one-shot full parse exactly (the tail may have been held back by
-        // the \n\n boundary guard during streaming).
-        if let Some(parser) = &mut self.parser {
-            parser.finalize();
+        if let Some(md) = &self.markdown {
+            md.update(cx, |m, cx| m.finalize_streaming(cx));
         }
-        self.pending_parse = None;
-        self.dirty = false;
     }
 }
 
@@ -346,8 +472,10 @@ impl Render for MessageItem {
                 pending_plan_id: read.pending_plan_id(),
             }
         });
-        let blocks_arc = self.blocks();
-        let blocks = blocks_arc.as_ref().map(|b| -> &[Block] { &b[..] });
+        // The owned markdown document for text-bearing items (persistent across
+        // frames → selection + streaming state survive). `None` for non-text
+        // items; their chrome mounts a fresh `Entity<Markdown>` per frame.
+        let body = self.ensure_markdown(cx);
         centered(render_item(
             &self.kind,
             self.id,
@@ -355,16 +483,26 @@ impl Render for MessageItem {
             &theme,
             agent_ctx.as_ref(),
             tool_ctx.as_ref(),
-            blocks,
+            body,
+            cx,
         ))
     }
 }
 
-/// Render a `ConvItem` as an element. `ix` is the entry index (stable key for collapsibles and text-block element ids).
-/// `agent_ctx` supplies expansion state for `AgentTask` cards; `tool_ctx` carries
-/// the workspace weak handle for `ToolCall` cards to flip their own collapse flag.
-/// `None` renders them in a static state with no-op clicks (used when the owning
-/// Workspace is gone).
+/// Render a `ConvItem` as an element. `ix` is the entry index (stable key for
+/// collapsibles and text-block element ids). `agent_ctx` supplies expansion
+/// state for `AgentTask` cards; `tool_ctx` carries the workspace weak handle
+/// for `ToolCall` cards to flip their own collapse flag. `None` renders them
+/// in a static state with no-op clicks (used when the owning Workspace is gone).
+///
+/// `body` is the owned `Entity<Markdown>` for a top-level text body
+/// (Assistant / Reasoning); the recursive `render_item` calls for embedded
+/// sub-messages pass `None`, falling back to a per-frame `Entity<Markdown>`.
+//
+// Each arg is a distinct render input; the function is a leaf dispatch, not a
+// public API. Bundling would only forward the same values through an
+// intermediate struct without reducing complexity.
+#[allow(clippy::too_many_arguments)]
 pub fn render_item(
     item: &ConvItem,
     ix: usize,
@@ -372,17 +510,18 @@ pub fn render_item(
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
     tool_ctx: Option<&ToolCallCtx>,
-    blocks: Option<&[Block]>,
+    body: Option<Entity<Markdown>>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     match item {
         ConvItem::User { text, images, meta } => {
-            render_user(text, images, meta.as_ref(), ix, role, theme)
+            render_user(text, images, meta.as_ref(), ix, role, theme, cx)
         }
         ConvItem::Assistant {
             text,
-            streaming,
+            streaming: _,
             token_usage: _,
-        } => render_assistant(text, *streaming, ix, role, theme, blocks),
+        } => render_assistant(text, ix, role, theme, body, cx),
         ConvItem::Reasoning {
             text,
             streaming,
@@ -396,31 +535,34 @@ pub fn render_item(
             *user_toggled,
             theme,
             tool_ctx,
-            blocks,
+            body,
+            cx,
         ),
-        ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx),
+        ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx, cx),
         ConvItem::ToolCall(t) => {
             if t.name == "exit_plan_mode" {
-                render_plan_card(t, ix, theme, tool_ctx)
+                render_plan_card(t, ix, theme, tool_ctx, cx)
             } else if t.name == "AskUserQuestion" {
-                render_ask_user_card(t, ix, theme, tool_ctx)
+                render_ask_user_card(t, ix, theme, tool_ctx, cx)
             } else {
                 // Ordinary tool calls fold into `Thinking`; a top-level
                 // ToolCall here is the answered-state fallback for an
                 // `AskUserQuestion` whose interactive snapshot is gone, or a
                 // defensive orphan — render it as a plain card.
-                render_tool_call(t, ix, theme, tool_ctx)
+                render_tool_call(t, ix, theme, tool_ctx, cx)
             }
         }
-        ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx),
-        ConvItem::Error(msg) => render_error(msg, ix, theme),
-        ConvItem::Notice(msg) => render_notice(msg, ix, theme),
-        ConvItem::TeamMessage { from, content } => render_team_message(from, content, ix, theme),
+        ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx, cx),
+        ConvItem::Error(msg) => render_error(msg, ix, theme, cx),
+        ConvItem::Notice(msg) => render_notice(msg, ix, theme, cx),
+        ConvItem::TeamMessage { from, content } => {
+            render_team_message(from, content, ix, theme, cx)
+        }
         ConvItem::Recap {
             summary,
             collapsed,
             user_toggled: _,
-        } => render_recap(summary, *collapsed, ix, theme, tool_ctx),
+        } => render_recap(summary, *collapsed, ix, theme, tool_ctx, cx),
         ConvItem::Retry {
             attempt,
             max_attempts,
@@ -439,6 +581,7 @@ pub fn render_item(
             ix,
             theme,
             tool_ctx,
+            cx,
         ),
     }
 }
@@ -480,6 +623,7 @@ pub fn render_user(
     ix: usize,
     model: &str,
     theme: &Theme,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     let model_id = meta
         .map(|m| m.model_id.as_str())
@@ -556,6 +700,7 @@ pub fn render_user(
                     text.to_string(),
                     theme,
                     false,
+                    cx,
                 )),
         )
         .into_any_element()
@@ -590,12 +735,18 @@ fn format_user_turn_time(timestamp: i64) -> String {
 /// name (dynamic).
 pub fn render_assistant(
     text: &str,
-    streaming: bool,
     ix: usize,
     role: &str,
     theme: &Theme,
-    blocks: Option<&[Block]>,
+    body: Option<Entity<Markdown>>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
+    // Owned `Entity<Markdown>` (persistent → selection + streaming survive);
+    // fall back to a per-frame mount for embedded sub-message bodies.
+    let body_el = match body {
+        Some(md) => md.into_any_element(),
+        None => markdown_tv(("assistant", ix), text.to_string(), theme, false, cx),
+    };
     v_flex()
         .group(format!("assistant-{ix}"))
         .w_full()
@@ -626,41 +777,25 @@ pub fn render_assistant(
                 .w_full()
                 .min_w_0()
                 .overflow_x_hidden()
-                .child(render_text_body(
-                    text,
-                    streaming,
-                    ("assistant", ix),
-                    theme,
-                    blocks,
-                )),
+                .child(body_el),
         )
         .into_any_element()
 }
 
-/// Render the assistant / reasoning body. When `blocks` is supplied (from the
-/// `IncrementalParser`), the renderer uses them directly — no re-parse per
-/// frame. When `None` (e.g. static mounts without a parser), it falls back to
-/// `Markdown::new` which parses internally. `streaming` only controls the
-/// trailing cursor on the last block; the full markdown layout renders
-/// throughout streaming.
-fn render_text_body(
+/// Resolve a text body element: the owned `Entity<Markdown>` when present
+/// (persistent selection + streaming), otherwise a per-frame `markdown_tv`
+/// mount. Used by `render_reasoning`; `render_assistant` inlines the same logic.
+fn body_element(
     text: &str,
-    streaming: bool,
     id: impl Into<gpui::ElementId>,
     theme: &Theme,
-    blocks: Option<&[Block]>,
+    body: Option<Entity<Markdown>>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
-    let md = match blocks {
-        Some(blocks) if !blocks.is_empty() => {
-            Markdown::blocks(id, text.to_string(), Arc::from(blocks.to_vec()))
-        }
-        _ => Markdown::new(id, text.to_string()),
-    };
-    md.theme(theme)
-        .selectable(true)
-        .streaming(streaming)
-        .heading_mode(HeadingMode::Uniform)
-        .into_any_element()
+    match body {
+        Some(md) => md.into_any_element(),
+        None => markdown_tv(id, text.to_string(), theme, false, cx),
+    }
 }
 
 /// Render a reasoning (thinking) block: expanded while streaming, collapsed when done, with a copy button.
@@ -674,12 +809,13 @@ fn render_text_body(
 pub fn render_reasoning(
     text: &str,
     ix: usize,
-    streaming: bool,
+    _streaming: bool,
     collapsed: bool,
     _user_toggled: bool,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
-    blocks: Option<&[Block]>,
+    body: Option<Entity<Markdown>>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     let chevron = if collapsed {
         IconName::ChevronRight
@@ -739,7 +875,7 @@ pub fn render_reasoning(
                 )),
         );
     if !collapsed {
-        let body = render_text_body(text, streaming, ("reasoning", ix), theme, blocks);
+        let body = body_element(text, ("reasoning", ix), theme, body, cx);
         block = block.child(
             gpui::div()
                 .w_full()
@@ -861,7 +997,7 @@ fn render_banner(
 }
 
 /// Render an error message + copy button.
-pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
+pub fn render_error(msg: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::AnyElement {
     render_banner(
         theme.danger,
         i18n::t("message-error"),
@@ -870,7 +1006,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
         ix,
         "copy-error",
         msg.to_string(),
-        markdown_tv(("error", ix), msg.to_string(), theme, false),
+        markdown_tv(("error", ix), msg.to_string(), theme, false, cx),
         theme,
         None,
     )
@@ -879,7 +1015,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
 /// Render an ephemeral system notice — status toggles, slash-command acks.
 /// Neutral tones so positive state changes (e.g. "YOLO mode is on") do not
 /// read as a runtime error.
-pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
+pub fn render_notice(msg: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::AnyElement {
     render_banner(
         theme.muted_foreground,
         i18n::t("message-notice"),
@@ -888,7 +1024,7 @@ pub fn render_notice(msg: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
         ix,
         "copy-notice",
         msg.to_string(),
-        markdown_tv(("notice", ix), msg.to_string(), theme, false),
+        markdown_tv(("notice", ix), msg.to_string(), theme, false, cx),
         theme,
         None,
     )
@@ -903,6 +1039,7 @@ pub fn render_team_message(
     content: &str,
     ix: usize,
     theme: &Theme,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     // The whole label row is accent-colored, so `from` inherits primary here.
     let label: SharedString = format!("{from} · {}", i18n::t("message-team")).into();
@@ -914,7 +1051,7 @@ pub fn render_team_message(
         ix,
         "copy-team-msg",
         content.to_string(),
-        markdown_tv(("team-msg", ix), content.to_string(), theme, false),
+        markdown_tv(("team-msg", ix), content.to_string(), theme, false, cx),
         theme,
         None,
     )
@@ -930,6 +1067,7 @@ pub fn render_recap(
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
     let on_click = Box::new(move |_cx: &mut App| {
@@ -966,7 +1104,7 @@ pub fn render_recap(
         ix,
         "copy-recap",
         summary.to_string(),
-        markdown_tv(("recap", ix), summary.to_string(), theme, false),
+        markdown_tv(("recap", ix), summary.to_string(), theme, false, cx),
         theme,
         Some(CollapsibleBanner {
             collapsed,
@@ -994,6 +1132,7 @@ pub fn render_retry(
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     let badge: SharedString = i18n::t_str(
         "retry-badge",
@@ -1032,7 +1171,7 @@ pub fn render_retry(
         });
     }) as Box<dyn Fn(&mut App) + 'static>;
     let body = detail
-        .map(|d| markdown_tv(("retry", ix), d.to_string(), theme, false))
+        .map(|d| markdown_tv(("retry", ix), d.to_string(), theme, false, cx))
         .unwrap_or_else(|| gpui::div().into_any_element());
     let collapsible = if detail.is_some() {
         Some(CollapsibleBanner {
@@ -1100,6 +1239,7 @@ pub fn render_thinking(
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     let summary = compact_summary(t);
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
@@ -1193,7 +1333,7 @@ pub fn render_thinking(
         // Wrap visible entries in a rail-and-branch tree structure: a thin
         // left border (the "rail") with each entry drawing a short horizontal
         // branch connector via GPUI layout rather than Unicode `├─`/`└─`.
-        block = block.child(render_activity_tree(&visible, ix, theme, tool_ctx));
+        block = block.child(render_activity_tree(&visible, ix, theme, tool_ctx, cx));
     }
     block.into_any_element()
 }
@@ -1206,6 +1346,7 @@ fn render_activity_tree(
     cix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     let rail_color = theme.border.opacity(0.6);
 
@@ -1219,7 +1360,7 @@ fn render_activity_tree(
         .children(
             visible
                 .iter()
-                .map(|(eix, e)| render_activity_entry(e, *eix, cix, theme, tool_ctx)),
+                .map(|(eix, e)| render_activity_entry(e, *eix, cix, theme, tool_ctx, cx)),
         )
         .border_l_1()
         .border_color(rail_color)
@@ -1236,6 +1377,7 @@ fn render_activity_entry(
     cix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     // Short horizontal branch connector from the rail to the entry content.
     let branch = gpui::div()
@@ -1252,17 +1394,20 @@ fn render_activity_entry(
             streaming,
             collapsed,
             user_toggled,
+            markdown,
         } => render_reasoning_entry(
             text,
             *streaming,
             *collapsed,
             *user_toggled,
+            markdown.clone(),
             eix,
             cix,
             theme,
             tool_ctx,
+            cx,
         ),
-        ActivityEntry::Tool(tool) => render_tool_entry(tool, eix, theme, tool_ctx),
+        ActivityEntry::Tool(tool) => render_tool_entry(tool, eix, theme, tool_ctx, cx),
     };
 
     h_flex()
@@ -1293,16 +1438,18 @@ fn render_reasoning_entry(
     streaming: bool,
     collapsed: bool,
     _user_toggled: bool,
+    markdown: Option<Entity<Markdown>>,
     eix: usize,
     cix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
     let label = format!("{} {}", i18n::t("message-reasoning"), eix + 1);
     let show_body = streaming || !collapsed;
 
-    let mut row = v_flex().w_full().min_w_0().flex_1().child(
+    let mut row = v_flex().w_full().min_w_0().flex_1().italic().child(
         h_flex()
             .id(("reasoning-entry", eix))
             .w_full()
@@ -1359,25 +1506,29 @@ fn render_reasoning_entry(
                     .min_w_0()
                     .overflow_x_hidden()
                     .text_xs()
-                    .italic()
                     .text_color(theme.muted_foreground)
                     .child(truncate(&label, 80)),
             ),
     );
 
     if show_body && !text.is_empty() {
+        // The persistent `Entity<Markdown>` (synced by the streaming/rebuild
+        // path) carries parse-once incremental parsing + document-level
+        // selection; fall back to a per-frame mount only before the first sync.
+        let body = match markdown {
+            Some(md) => md.into_any_element(),
+            None => markdown_tv(("reasoning-entry-body", eix), text, theme, false, cx),
+        };
         row = row.child(
             gpui::div()
+                .id(("reasoning-body", eix))
                 .w_full()
                 .min_w_0()
                 .pl_6()
                 .py_1()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .font_family(theme.mono_font_family.clone())
-                .max_h(px(200.))
-                .overflow_hidden()
-                .child(text.to_string()),
+                .child(body),
         );
     }
     row.into_any_element()
@@ -1391,6 +1542,7 @@ fn render_tool_entry(
     eix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
     let (status_icon, status_color) = match e.status {
@@ -1414,73 +1566,75 @@ fn render_tool_entry(
     let id_for_toggle = e.id.clone();
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
 
-    let mut row = v_flex().w_full().min_w_0().flex_1().italic().child(
-        h_flex()
-            .id(("act-header", eix))
-            .w_full()
-            .min_w_0()
-            .px_2()
-            .py_0p5()
-            .gap_1p5()
-            .items_center()
-            .rounded(theme.radius)
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.secondary.opacity(0.3)))
-            .on_click(move |_, _window, cx: &mut App| {
-                let Some(weak) = weak_workspace.clone() else {
-                    return;
-                };
-                let _ = weak.update(cx, |w, cx| {
-                    let id = id_for_toggle.clone();
-                    let conv = w.conversation.clone();
-                    conv.update(cx, |c, cx| {
-                        if let Some((cix, eix)) = c.find_thinking_entry(&id, &*cx)
-                            && let Some(item) = c.items().get(cix)
-                        {
-                            item.update(cx, |item, cx| {
-                                if let ConvItem::Thinking(t) = item.kind_mut()
-                                    && let Some(ActivityEntry::Tool(entry)) = t.entries.get_mut(eix)
-                                {
-                                    entry.collapsed = !entry.collapsed;
-                                    entry.user_toggled = true;
-                                }
-                                cx.notify();
-                            });
-                        }
+    // The terminal frame: a titlebar (command summary + status + disclosure)
+    // that toggles the body, and the body itself. One bordered rounded box so
+    // the pair reads as a single terminal window rather than a floating header
+    // above a detached panel.
+    let mut frame = v_flex()
+        .w_full()
+        .min_w_0()
+        .flex_1()
+        .italic()
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.radius)
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .id(("act-header", eix))
+                .w_full()
+                .min_w_0()
+                .px_2()
+                .py_0p5()
+                .gap_1p5()
+                .items_center()
+                .when(show_output, |h| h.border_b_1().border_color(theme.border))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.secondary.opacity(0.3)))
+                .on_click(move |_, _window, cx: &mut App| {
+                    let Some(weak) = weak_workspace.clone() else {
+                        return;
+                    };
+                    let _ = weak.update(cx, |w, cx| {
+                        let id = id_for_toggle.clone();
+                        let conv = w.conversation.clone();
+                        conv.update(cx, |c, cx| {
+                            if let Some((cix, eix)) = c.find_thinking_entry(&id, &*cx)
+                                && let Some(item) = c.items().get(cix)
+                            {
+                                item.update(cx, |item, cx| {
+                                    if let ConvItem::Thinking(t) = item.kind_mut()
+                                        && let Some(ActivityEntry::Tool(entry)) =
+                                            t.entries.get_mut(eix)
+                                    {
+                                        entry.collapsed = !entry.collapsed;
+                                        entry.user_toggled = true;
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        cx.notify();
                     });
-                    cx.notify();
-                });
-            })
-            .child(disclosure_icon(e.collapsed, theme))
-            .child(Icon::new(status_icon).xsmall().text_color(status_color))
-            .child(
-                gpui::div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_x_hidden()
-                    .text_xs()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_color(theme.muted_foreground)
-                    .child(truncate(&title, 80)),
-            ),
-    );
+                })
+                .child(disclosure_icon(e.collapsed, theme))
+                .child(Icon::new(status_icon).xsmall().text_color(status_color))
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_x_hidden()
+                        .text_xs()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(truncate(&title, 80)),
+                ),
+        );
 
-    let display_output = if e.streaming {
-        live_tail(&e.output)
-    } else {
-        e.output.clone()
-    };
-
-    if show_output && !display_output.is_empty() {
-        row = row.child(render_tool_output(
-            &display_output,
-            &e.name,
-            e.streaming,
-            eix,
-            theme,
-        ));
+    if show_output && !e.output.is_empty() {
+        frame = frame.child(render_tool_output(e, eix, theme, cx));
     }
-    row.into_any_element()
+    frame.into_any_element()
 }
 
 /// Compact summary for the activity segment header: rounds · files · tools ·
@@ -1672,15 +1826,16 @@ fn render_ask_user_card(
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     let Some(ctx) = tool_ctx else {
-        return render_tool_call(item, ix, theme, tool_ctx);
+        return render_tool_call(item, ix, theme, tool_ctx, cx);
     };
     let Some(snapshot) = ctx.ask.clone() else {
-        return render_tool_call(item, ix, theme, tool_ctx);
+        return render_tool_call(item, ix, theme, tool_ctx, cx);
     };
     if item.status != ToolCallStatus::PendingApproval {
-        return render_tool_call(item, ix, theme, tool_ctx);
+        return render_tool_call(item, ix, theme, tool_ctx, cx);
     }
 
     let weak = ctx.weak.clone();
@@ -1931,6 +2086,7 @@ pub fn render_tool_call(
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
     let (status_color, status_label): (gpui::Hsla, SharedString) = match item.status {
@@ -1962,12 +2118,18 @@ pub fn render_tool_call(
     // Tool-call chrome and output render as Lilex italic to set them apart
     // from upright body text (#140). This card is now only the AskUserQuestion
     // answered-state fallback + the defensive orphan; ordinary tools fold into
-    // `render_activity_entry`, which carries the same italic.
+    // `render_activity_entry`, which carries the same italic. The header is the
+    // terminal titlebar (command summary + status + copy + chevron), clicking it
+    // toggles the body; the pair shares one bordered frame.
     let mut card = v_flex()
         .group(format!("tool-{ix}"))
         .w_full()
         .min_w_0()
         .italic()
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.radius)
+        .overflow_hidden()
         .child(
             h_flex()
                 .id(("tool-header", ix))
@@ -1977,7 +2139,7 @@ pub fn render_tool_call(
                 .py_1()
                 .gap_1p5()
                 .items_center()
-                .rounded(theme.radius)
+                .when(show_body, |h| h.border_b_1().border_color(theme.border))
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.secondary.opacity(0.5)))
                 .on_click(move |_, _window, cx: &mut App| {
@@ -2032,20 +2194,8 @@ pub fn render_tool_call(
                 ),
         );
 
-    let display_output = if item.streaming {
-        live_tail(&item.output)
-    } else {
-        item.output.clone()
-    };
-
-    if show_body && !display_output.is_empty() {
-        card = card.child(render_tool_output(
-            &display_output,
-            &item.name,
-            item.streaming,
-            ix,
-            theme,
-        ));
+    if show_body && !item.output.is_empty() {
+        card = card.child(render_tool_output(item, ix, theme, cx));
     }
     card.into_any_element()
 }
@@ -2059,6 +2209,7 @@ fn render_plan_card(
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
     let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) =
@@ -2207,6 +2358,7 @@ fn render_plan_card(
                     item.output.clone(),
                     theme,
                     false,
+                    cx,
                 )),
         );
     }
@@ -2319,77 +2471,68 @@ fn strip_leading_line_number(line: &str) -> &str {
 }
 
 fn render_tool_output(
-    output: &str,
-    tool_name: &str,
-    streaming: bool,
+    item: &ToolCallItem,
     ix: usize,
     theme: &Theme,
+    cx: &mut App,
 ) -> gpui::AnyElement {
-    let container = gpui::div()
-        .id(("tool-output", ix))
-        .w_full()
-        .min_w_0()
-        .debug_selector(|| format!("message-overflow-tool-output-{ix}"))
-        .h(px(220.))
-        .overflow_hidden()
-        .px_3()
-        .py_2()
-        .border_t_1()
-        .border_color(theme.border)
-        .text_xs()
-        .text_color(theme.muted_foreground);
+    // Persistent terminal panel: the conversation handler mounts it at every
+    // live output chunk, finalized result, and reloaded-history entry, so the
+    // common path renders the `Entity<TerminalPanel>` directly — giving tool
+    // output the same document-level selection + Cmd/Ctrl+C copy as message
+    // bodies (drag/copy survive across frames) and rendering the body as a
+    // terminal-styled shell (cwd / toolchain / `❯` command + ANSI-colored
+    // output) rather than a per-frame fenced code block.
+    if let Some(panel) = item.panel.clone() {
+        return panel.into_any_element();
+    }
+    // Defensive fallback (panel not yet mounted): render the display output as
+    // a fenced code block so the body still appears while selection degrades to
+    // per-frame. The persistent panel is the supported path; this only fires
+    // for paths the conversation handler doesn't sync (e.g. a freshly built
+    // entry before the first `ToolOutput`).
+    let display_output = if item.streaming {
+        live_tail(&item.output)
+    } else {
+        item.output.clone()
+    };
     // Display-only transform for `read_file`: hide the hashline `[path#TAG]`
     // header and `N:` line numbers so the user sees raw file content. The raw
     // `output` (LLM-facing, persisted, edit_file-anchored) is untouched, so
     // copy-selection yields the display text while the LLM still sees numbered
     // output on the next turn. Non-`read_file` tools borrow the raw output
     // without allocating.
-    let display: std::borrow::Cow<'_, str> = if tool_name == "read_file" {
-        std::borrow::Cow::Owned(strip_hashline_numbering(output))
+    let display: std::borrow::Cow<'_, str> = if item.name == "read_file" {
+        std::borrow::Cow::Owned(strip_hashline_numbering(&display_output))
     } else {
-        std::borrow::Cow::Borrowed(output)
+        std::borrow::Cow::Borrowed(&display_output)
     };
-    if streaming {
-        // Bidirectional scroll for streaming output, mirroring the final
-        // branch's `markdown_tv(scrollable)` + `code_block` pattern: an outer
-        // vertical-scroll viewport over the fixed 220px panel, with an inner
-        // horizontal-scroll run so long lines scroll instead of wrapping. Both
-        // need an `id` — `overflow_*_scroll` are `InteractiveElement` methods.
-        container
-            .font_family(theme.mono_font_family.clone())
-            .child(
-                gpui::div()
-                    .id(("tool-output-vscroll", ix))
-                    .w_full()
-                    .h_full()
-                    .min_h_0()
-                    .min_w_0()
-                    .debug_selector(|| format!("message-overflow-tool-output-vscroll-{ix}"))
-                    .overflow_y_scroll()
-                    .child(
-                        gpui::div()
-                            .id(("tool-output-hscroll", ix))
-                            .w_full()
-                            .min_w_0()
-                            .debug_selector(|| format!("message-overflow-tool-output-hscroll-{ix}"))
-                            .overflow_x_scroll()
-                            .children(display.split('\n').map(|line| {
-                                gpui::div().whitespace_nowrap().child(line.to_string())
-                            })),
-                    ),
-            )
-            .into_any_element()
+    let lang = lang_hint_for_tool(&item.name);
+    let code = if let Some(l) = lang {
+        format!("```{l}\n{display}\n```")
     } else {
-        let lang = lang_hint_for_tool(tool_name);
-        let code = if let Some(l) = lang {
-            format!("```{l}\n{display}\n```")
-        } else {
-            format!("```\n{display}\n```")
-        };
-        container
-            .child(markdown_tv(("tool-output-text", ix), code, theme, true))
-            .into_any_element()
-    }
+        format!("```\n{display}\n```")
+    };
+    let container = gpui::div()
+        .id(("tool-output", ix))
+        .w_full()
+        .min_w_0()
+        .debug_selector(|| format!("message-overflow-tool-output-{ix}"))
+        .px_3()
+        .py_2()
+        .border_t_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.muted_foreground);
+    container
+        .child(markdown_tv(
+            ("tool-output-text", ix),
+            code,
+            theme,
+            false,
+            cx,
+        ))
+        .into_any_element()
 }
 
 /// Render a sub-agent task card: title + status icon + chevron to expand the
@@ -2442,6 +2585,7 @@ pub fn render_agent_task(
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
     tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
     let (status_color, status_label): (gpui::Hsla, SharedString) = match item.status {
@@ -2545,7 +2689,7 @@ pub fn render_agent_task(
         let sub_items = build_items(&item.sub_messages, &HashMap::new(), false);
         if sub_items.is_empty() {
             if !collapsed_body.is_empty() {
-                card = card.child(render_agent_body(&collapsed_body, ix, theme));
+                card = card.child(render_agent_body(&collapsed_body, ix, theme, cx));
             }
         } else {
             card = card.child(
@@ -2558,19 +2702,19 @@ pub fn render_agent_task(
                     .py_2()
                     .gap_1()
                     .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                        render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx, None)
+                        render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx, None, cx)
                     })),
             );
         }
     } else if !collapsed_body.is_empty() {
-        card = card.child(render_agent_body(&collapsed_body, ix, theme));
+        card = card.child(render_agent_body(&collapsed_body, ix, theme, cx));
     }
     card.into_any_element()
 }
 
 /// Monospace, scrollable body for a sub-agent card (collapsed tail or fallback
 /// when the snapshot is empty).
-fn render_agent_body(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
+fn render_agent_body(text: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::AnyElement {
     if text.is_empty() {
         return gpui::div().into_any_element();
     }
@@ -2579,16 +2723,110 @@ fn render_agent_body(text: &str, ix: usize, theme: &Theme) -> gpui::AnyElement {
         .id(("agent-body", ix))
         .w_full()
         .min_w_0()
-        .max_h(px(220.))
-        .overflow_y_scroll()
         .px_3()
         .py_2()
         .border_t_1()
         .border_color(theme.border)
         .text_xs()
         .text_color(theme.muted_foreground)
-        .child(markdown_tv(("agent-body-text", ix), code, theme, false))
+        .child(markdown_tv(("agent-body-text", ix), code, theme, false, cx))
         .into_any_element()
+}
+
+/// Map a tool call to its panel rendering kind and the body text the panel
+/// renders. `read_file`/`write_file` → `File` (the agent-ui layer strips the
+/// hashline `[path#TAG]` header + `N:` prefixes for read_file so the panel shows
+/// plain content; write_file feeds the written content from the tool input).
+/// `edit_file` → `Diff` (the panel classifies the `+`/`-`/`@@` lines). Anything
+/// else → `Plain` (ANSI-parsed command output). Streaming bodies take the live
+/// tail so the most recent lines are in view as they stream in.
+fn tool_panel_body(entry: &ToolCallItem) -> (PanelKind, String) {
+    let raw = if entry.streaming {
+        live_tail(&entry.output)
+    } else {
+        entry.output.clone()
+    };
+    match entry.name.as_ref() {
+        "read_file" => (PanelKind::File, strip_hashline_numbering(&raw)),
+        "write_file" => {
+            let content = entry
+                .input
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            (PanelKind::File, content)
+        }
+        "edit_file" => (PanelKind::Diff, raw),
+        _ => (PanelKind::Plain, raw),
+    }
+}
+
+/// Snapshot the workdir's git state for the `TerminalPanel` prompt line:
+/// branch name (`HEAD` when detached) + counts of modified / deleted / conflict
+/// / untracked paths. Shells out to `git` (two short subprocess spawns) on the
+/// background executor; returns `None` outside a git repo so the panel omits
+/// the `git:…` segment entirely.
+fn detect_git(cwd: &Path) -> Option<GitSummary> {
+    use std::process::Command;
+    // `rev-parse --abbrev-ref HEAD` succeeds inside any repo (yields the branch
+    // name, or `HEAD` when detached) and fails outside one — so a missing branch
+    // is a reliable not-a-repo signal.
+    let branch = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let branch = branch?;
+    let mut modified = 0usize;
+    let mut deleted = 0usize;
+    let mut conflict = 0usize;
+    let mut untracked = 0usize;
+    let porcelain = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    for line in porcelain.lines() {
+        let b = line.as_bytes();
+        if b.len() < 2 {
+            continue;
+        }
+        let x = b[0] as char;
+        let y = b[1] as char;
+        if x == '?' && y == '?' {
+            untracked += 1;
+        } else if [x, y] == ['U', 'U']
+            || [x, y] == ['A', 'A']
+            || [x, y] == ['D', 'D']
+            || [x, y] == ['A', 'U']
+            || [x, y] == ['U', 'A']
+            || [x, y] == ['D', 'U']
+            || [x, y] == ['U', 'D']
+        {
+            conflict += 1;
+        } else if x == 'D' || y == 'D' {
+            deleted += 1;
+        } else {
+            // M (modified/staged), A (added), R (renamed), C (copied) — surface
+            // as modified so the marker stays meaningful without a per-code table.
+            modified += 1;
+        }
+    }
+    Some(GitSummary {
+        branch: Some(branch),
+        modified,
+        deleted,
+        conflict,
+        untracked,
+    })
 }
 
 /// Trailing slice of live output: keep the last ~12 KiB so the most recent
@@ -2766,6 +3004,7 @@ pub fn build_items(
                                 streaming: false,
                                 collapsed: true,
                                 user_toggled: false,
+                                markdown: None,
                             };
                             match active_segment_ix {
                                 Some(ix) => {
@@ -2825,6 +3064,7 @@ pub fn build_items(
                                     streaming: false,
                                     collapsed: false,
                                     user_toggled: false,
+                                    panel: None,
                                 }));
                             } else if tu.name.as_ref() == "exit_plan_mode" {
                                 // The plan body is the card's whole point; pull it
@@ -2852,6 +3092,7 @@ pub fn build_items(
                                     streaming: false,
                                     collapsed: false,
                                     user_toggled: false,
+                                    panel: None,
                                 }));
                             } else {
                                 // Ordinary tool call: fold into the active
@@ -2871,6 +3112,7 @@ pub fn build_items(
                                     streaming: false,
                                     collapsed: true,
                                     user_toggled: false,
+                                    panel: None,
                                 });
                                 match active_segment_ix {
                                     Some(ix) => {
@@ -2986,6 +3228,7 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
                     ToolCallStatus::Running | ToolCallStatus::PendingApproval
                 ),
                 user_toggled: false,
+                panel: None,
             })],
             accepting_entries: false,
             streaming: false,
@@ -3093,6 +3336,7 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
+            panel: None,
         })];
         pair_tool_result(
             &mut items,
@@ -3161,6 +3405,7 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: true,
+                markdown: None,
             });
             thinking.entries.push(ActivityEntry::Tool(ToolCallItem {
                 id: "tool-long-final-output".into(),
@@ -3173,6 +3418,7 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: true,
+                panel: None,
             }));
             thinking.entries.push(ActivityEntry::Tool(ToolCallItem {
                 id: "tool-long-streaming-output".into(),
@@ -3185,6 +3431,7 @@ mod tests {
                 streaming: true,
                 collapsed: false,
                 user_toggled: true,
+                panel: None,
             }));
 
             let thinking_item = ConvItem::Thinking(thinking);
@@ -3203,6 +3450,7 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: true,
+                panel: None,
             });
             let theme = cx.theme().clone();
             gpui::div()
@@ -3225,6 +3473,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            cx,
                         ))
                         .child(render_item(
                             &plan_item,
@@ -3234,6 +3483,7 @@ mod tests {
                             None,
                             None,
                             None,
+                            cx,
                         )),
                 )
         }
@@ -3270,8 +3520,6 @@ mod tests {
             "message-overflow-activity-entry-0-2",
             "message-overflow-activity-entry-body-0-2",
             "message-overflow-tool-output-2",
-            "message-overflow-tool-output-vscroll-2",
-            "message-overflow-tool-output-hscroll-2",
             "message-overflow-plan-card-1",
             "message-overflow-plan-header-1",
             "message-overflow-plan-title-1",
@@ -3514,6 +3762,7 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: false,
+                panel: None,
             }),
             ActivityEntry::Tool(ToolCallItem {
                 id: "2".into(),
@@ -3527,6 +3776,7 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: false,
+                panel: None,
             }),
             ActivityEntry::Tool(ToolCallItem {
                 id: "3".into(),
@@ -3540,6 +3790,7 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: false,
+                panel: None,
             }),
             ActivityEntry::Tool(ToolCallItem {
                 id: "4".into(),
@@ -3552,6 +3803,7 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: false,
+                panel: None,
             }),
             ActivityEntry::Tool(ToolCallItem {
                 id: "5".into(),
@@ -3565,6 +3817,7 @@ mod tests {
                 streaming: false,
                 collapsed: false,
                 user_toggled: false,
+                panel: None,
             }),
         ];
         let summary = thinking_summary(&entries);
@@ -3601,6 +3854,7 @@ mod tests {
             streaming: false,
             collapsed: true,
             user_toggled: false,
+            panel: None,
         }));
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "2".into(),
@@ -3613,6 +3867,7 @@ mod tests {
             streaming: false,
             collapsed: true,
             user_toggled: false,
+            panel: None,
         }));
 
         /// Replicate the visibility logic from `render_thinking` for testing.
@@ -3823,6 +4078,7 @@ mod tests {
             streaming: false,
             collapsed: true,
             user_toggled: false,
+            markdown: None,
         });
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "t1".into(),
@@ -3835,6 +4091,7 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
+            panel: None,
         }));
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "t2".into(),
@@ -3847,6 +4104,7 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
+            panel: None,
         }));
         let summary = compact_summary(&t);
         assert!(!summary.is_empty());

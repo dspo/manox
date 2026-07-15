@@ -53,7 +53,11 @@ impl MdStyles {
             diff_del_bg: hsla(danger.h, danger.s, danger.l, 0.15),
             inline_code_bg: theme.secondary,
             inline_code_radius: theme.radius,
-            selection_bg: theme.accent.opacity(0.25),
+            // The universal light-blue text-selection tint. `theme.accent` varies
+            // per palette and at low alpha can vanish against the message
+            // background; a fixed blue keeps the drag highlight legible across
+            // light/dark themes.
+            selection_bg: hsla(211.0 / 360.0, 0.85, 0.6, 0.4),
         }
     }
 }

@@ -56,6 +56,14 @@ impl MemberPanel {
         let messages = member.read(cx).messages().to_vec();
         let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
         let weak_ws = weak_workspace.clone();
+        let cwd = {
+            let p = member.read(cx).cwd();
+            if p.as_os_str().is_empty() {
+                None
+            } else {
+                Some(SharedString::from(p.to_string_lossy().to_string()))
+            }
+        };
         let conversation = cx.new(|cx| {
             ConversationState::rebuild_from_messages(
                 &messages,
@@ -63,7 +71,7 @@ impl MemberPanel {
                 &role,
                 false,
                 &[],
-                weak_ws,
+                crate::conversation::ApplyCtx { weak: weak_ws, cwd },
                 cx,
             )
         });
@@ -87,8 +95,23 @@ impl MemberPanel {
             let member_sub = cx.subscribe(&member, move |this, _m, ev: &ThreadEvent, cx| {
                 let role = this.role.clone();
                 let weak = this.weak_workspace.clone();
-                this.conversation
-                    .update(cx, |c, cx| c.apply(ev, &role, None, weak, cx));
+                let cwd = this.member.upgrade().and_then(|m| {
+                    let p = m.read(cx).cwd();
+                    if p.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(SharedString::from(p.to_string_lossy().to_string()))
+                    }
+                });
+                this.conversation.update(cx, |c, cx| {
+                    c.apply(
+                        ev,
+                        &role,
+                        None,
+                        crate::conversation::ApplyCtx { weak, cwd },
+                        cx,
+                    )
+                });
                 // New content arrives: resume tail-follow unless the user has
                 // scrolled up to inspect history.
                 this.stick_to_bottom = true;

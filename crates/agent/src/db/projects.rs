@@ -41,9 +41,7 @@ impl ThreadsDatabase {
     /// to produce the full project section.
     pub fn list_projects(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT path FROM projects ORDER BY created_at ASC",
-        )?;
+        let mut stmt = conn.prepare("SELECT path FROM projects ORDER BY created_at ASC")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for r in rows {
@@ -57,11 +55,8 @@ impl ThreadsDatabase {
     #[allow(dead_code)]
     pub fn remove_project(&self, path: &str) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
-        conn.execute(
-            "DELETE FROM projects WHERE path = ?1",
-            params![path],
-        )
-        .context("remove project")?;
+        conn.execute("DELETE FROM projects WHERE path = ?1", params![path])
+            .context("remove project")?;
         Ok(())
     }
 }
