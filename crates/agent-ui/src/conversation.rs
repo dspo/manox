@@ -293,6 +293,25 @@ impl ThinkingContainer {
         }
         self.streaming = false;
     }
+    /// Stop accepting entries because assistant text has arrived mid-turn —
+    /// the model moved on to the answer, so this segment's reasoning/tool
+    /// activity is done. Mirrors `build_items`'s `close_segment` on
+    /// `MessageContent::Text`: sets `accepting_entries = false` so subsequent
+    /// `AgentThinking` opens a fresh segment instead of folding into this one
+    /// (temporal inversion, issue #216). Also finalizes still-streaming
+    /// reasoning rounds — a `Stop(ToolUse)` left them live — and re-derives
+    /// `streaming` so the spinner stops and the elapsed timer pins. Unlike
+    /// `finalize_segment` (terminal stop), does NOT auto-collapse entries or
+    /// the container: the user may be inspecting the activity tree.
+    pub fn close_for_text(&mut self) {
+        self.accepting_entries = false;
+        for entry in &mut self.entries {
+            if let ActivityEntry::Reasoning { streaming, .. } = entry {
+                *streaming = false;
+            }
+        }
+        self.recompute_streaming();
+    }
 
     /// True when at least one entry has produced output worth showing (the
     /// `⎿` list is non-vacuous even while collapsed — the running/latest
@@ -599,6 +618,17 @@ impl ConversationState {
                     None => true,
                 };
                 if needs_new {
+                    // Close the active activity segment so subsequent
+                    // `AgentThinking` opens a fresh one — mirrors
+                    // `build_items`'s `close_segment` on `MessageContent::Text`.
+                    // Without this, thinking arriving after the answer text
+                    // folds into the pre-answer segment (issue #216).
+                    if let Some(cix) = self.find_active_activity_segment(cx) {
+                        self.items[cix].update(cx, |item, cx| {
+                            item.close_segment_for_text(cx);
+                            cx.notify();
+                        });
+                    }
                     let id = self.items.len();
                     self.items.push(cx.new(|cx| {
                         let mut item = MessageItem::new(
@@ -1814,6 +1844,49 @@ mod tests {
         assert!(!t.accepting_entries, "segment closed on terminal stop");
         assert!(!t.streaming, "segment frozen on terminal stop");
         assert!(t.frozen_secs.is_some(), "elapsed pinned on terminal stop");
+    }
+    /// `close_for_text` stops accepting entries (so subsequent
+    /// `AgentThinking` opens a fresh segment), finalizes streaming reasoning
+    /// rounds left live by a `Stop(ToolUse)`, and pins the elapsed timer —
+    /// but does NOT auto-collapse (mid-turn, the user may be inspecting the
+    /// tree). This is the live-path mirror of `build_items`'s `close_segment`
+    /// on `MessageContent::Text` (issue #216).
+    #[test]
+    fn close_for_text_stops_accepting_entries() {
+        let mut t = ThinkingContainer::new();
+        t.entries.push(ActivityEntry::Reasoning {
+            text: "round 1".into(),
+            streaming: true, // Stop(ToolUse) left it live
+            collapsed: false,
+            user_toggled: false,
+            markdown: None,
+        });
+        t.entries.push(ActivityEntry::Tool(ToolCallItem {
+            id: "1".into(),
+            name: "read_file".into(),
+            title: String::new(),
+            status: ToolCallStatus::Success,
+            output: String::new(),
+            is_error: false,
+            input: serde_json::Value::Null,
+            streaming: false,
+            collapsed: false,
+            user_toggled: false,
+            panel: None,
+        }));
+        t.recompute_streaming();
+        assert!(t.accepting_entries);
+        assert!(t.streaming, "segment live while reasoning streaming");
+
+        t.close_for_text();
+        assert!(!t.accepting_entries, "segment closed for text");
+        assert!(!t.streaming, "segment not streaming after close");
+        assert!(t.frozen_secs.is_some(), "elapsed pinned");
+        // Reasoning entry finalized → last_streaming_reasoning_index returns None.
+        assert!(
+            t.last_streaming_reasoning_index().is_none(),
+            "reasoning finalized, new round would start"
+        );
     }
 
     /// `last_streaming_reasoning_index` returns the index of the last streaming
