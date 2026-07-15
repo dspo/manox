@@ -205,22 +205,26 @@ impl TerminalPanel {
     /// gutter for `File`, +/- colored diff for `Diff`. Returns the total line
     /// count and the rendered count alongside the text so the caller drives the
     /// "load more" affordance from one parse.
+    ///
+    /// Each branch derives `total` from the same line set it slices, so the
+    /// pagination cursor ([`Self::visible_count`] → `v`) can never exceed the
+    /// slice length. The `Plain` branch strips ANSI + up to two trailing
+    /// newlines (one before parsing, one after), so its line count can be
+    /// lower than [`body_parts`] for output ending in a blank line — computing
+    /// `total` from `body_parts` here would make `parts[..v]` index out of
+    /// bounds and abort the process (crash report 3F94B265).
     fn body(&self) -> (String, Vec<(Range<usize>, HighlightStyle)>, usize, usize) {
         if self.output.is_empty() {
             return (String::new(), Vec::new(), 0, 0);
         }
-        let total = body_parts(&self.output).len();
-        let v = if self.streaming {
-            total
-        } else {
-            self.visible.min(total)
-        };
         match self.kind {
             PanelKind::Plain => {
                 let trimmed = self.output.strip_suffix('\n').unwrap_or(&self.output);
                 let (plain_owned, runs) = parse_ansi(trimmed);
                 let plain = plain_owned.strip_suffix('\n').unwrap_or(&plain_owned);
                 let parts: Vec<&str> = plain.split('\n').collect();
+                let total = parts.len();
+                let v = self.visible_count(total);
                 // The visible window is a byte prefix of the stripped plain, so
                 // the parsed highlight ranges clip by end-offset without re-parse.
                 let visible: String = parts[..v].join("\n");
@@ -239,6 +243,8 @@ impl TerminalPanel {
             }
             PanelKind::File => {
                 let parts = body_parts(&self.output);
+                let total = parts.len();
+                let v = self.visible_count(total);
                 let width = digits(total);
                 let muted = style_color(self.styles.muted);
                 let mut s = String::new();
@@ -257,6 +263,8 @@ impl TerminalPanel {
             }
             PanelKind::Diff => {
                 let parts = body_parts(&self.output);
+                let total = parts.len();
+                let v = self.visible_count(total);
                 let muted = self.styles.muted;
                 let mut s = String::new();
                 let mut runs = Vec::new();
@@ -278,6 +286,17 @@ impl TerminalPanel {
                 trim_trailing_newline(&mut s);
                 (s, runs, total, v)
             }
+        }
+    }
+
+    /// Pagination cursor for `total` body lines: the full count while streaming,
+    /// otherwise clamped to the user-expanded `visible` window. Always `<= total`,
+    /// so callers slicing `parts[..v]` stay in bounds.
+    fn visible_count(&self, total: usize) -> usize {
+        if self.streaming {
+            total
+        } else {
+            self.visible.min(total)
         }
     }
 }
@@ -909,6 +928,29 @@ mod tests {
         // Streaming overrides the cursor: all 5 lines visible.
         assert_eq!(total, 5);
         assert_eq!(v, 5);
+    }
+
+    #[test]
+    fn plain_trailing_blank_line_does_not_panic_streaming() {
+        // Regression for crash report 3F94B265: output ending in a blank line
+        // ("\n\n") made `parts[..v]` index out of bounds because `total` (from
+        // `body_parts`, which strips one trailing newline) exceeded `parts.len()`
+        // (the Plain branch strips up to two). `total` is now derived from the
+        // same `parts` that get sliced, so streaming shows the single real line.
+        let (text, total, v) = panel_body(PanelKind::Plain, "a\n\n", 0, true);
+        assert_eq!(total, 1);
+        assert_eq!(v, 1);
+        assert_eq!(text, "a");
+    }
+
+    #[test]
+    fn plain_trailing_blank_line_clamps_pagination_cursor() {
+        // Non-streaming with `visible` past the real line count must clamp, not
+        // panic. The trailing blank line is not a renderable line, so total is 2.
+        let (text, total, v) = panel_body(PanelKind::Plain, "a\nb\n\n", 10, false);
+        assert_eq!(total, 2);
+        assert_eq!(v, 2);
+        assert_eq!(text, "a\nb");
     }
 
     #[test]
