@@ -317,7 +317,10 @@ impl Render for TerminalPanel {
             .px_3()
             .py_2()
             .text_sm()
-            .text_color(self.styles.foreground)
+            // The body (tool output) is the secondary text; the prompt block — the
+            // input echo (cwd / git / `❯ command`) — overrides to foreground via its
+            // own highlight runs, so input reads as primary and output as muted.
+            .text_color(self.styles.muted)
             .font_family(self.mono_family.clone())
             .cursor_text()
             .track_focus(&focus)
