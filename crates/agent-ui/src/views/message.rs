@@ -293,9 +293,10 @@ impl MessageItem {
 
     /// Mount (lazily) and refresh the tool-call's `TerminalPanel` from its
     /// current display output. `cwd` is the live thread working directory
-    /// gathered by the caller from the workspace; `command` is read from the
-    /// tool input's `command` field (bash / monitor) so the `❯` prompt line
-    /// echoes what the agent ran.
+    /// gathered by the caller from the workspace. Only `bash` earns a prompt
+    /// block (cwd + git + `❯ command`); see the gate below — internal tools
+    /// and MCP tools render the body only, so `command`/`cwd` stay `None`
+    /// for them even though some carry a `command` input field.
     fn ensure_tool_panel(
         entry: &mut ToolCallItem,
         cwd: Option<SharedString>,
