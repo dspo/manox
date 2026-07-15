@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use agent::i18n;
 use agent::{agent_def, skill};
-use gpui::{AnyElement, App, ListAlignment, ListState, SharedString, Window, prelude::*, px};
+use gpui::{AnyElement, App, ScrollHandle, SharedString, Window, prelude::*, px};
 use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 
 use crate::slash_command::SlashCommandRegistry;
@@ -28,7 +28,7 @@ impl CompletionKind {
     fn icon(self) -> IconName {
         match self {
             Self::Command => IconName::SquareTerminal,
-            Self::Skill => IconName::Frame,
+            Self::Skill => IconName::BookOpen,
             Self::Agent => IconName::Bot,
         }
     }
@@ -167,7 +167,7 @@ pub struct CompletionState {
     pub token_start: usize,
     pub items: Vec<CompletionItem>,
     pub selected: usize,
-    pub list_state: ListState,
+    pub scroll_handle: ScrollHandle,
 }
 
 impl CompletionState {
@@ -182,20 +182,16 @@ impl CompletionState {
         } else {
             selected.min(items.len() - 1)
         };
-        let list_state = ListState::new(items.len(), ListAlignment::Top, px(0.));
-        if !items.is_empty() {
-            list_state.scroll_to_reveal_item(selected);
-        }
         Self {
             trigger,
             token_start,
             items,
             selected,
-            list_state,
+            scroll_handle: ScrollHandle::new(),
         }
     }
 
-    /// Move the selection by `delta` (wrapping); scroll the new row into view.
+    /// Move the selection by `delta` (wrapping).
     pub fn move_selection(&mut self, delta: i32) {
         if self.items.is_empty() {
             return;
@@ -204,7 +200,6 @@ impl CompletionState {
         let mut next = self.selected as i32 + delta;
         next = ((next % n) + n) % n;
         self.selected = next as usize;
-        self.list_state.scroll_to_reveal_item(self.selected);
     }
 }
 
@@ -236,6 +231,11 @@ pub fn build_replacement(
 pub type SelectHandler = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 /// Render the popover list. `on_select(ix)` fires on click or keyboard confirm.
+/// Uses plain `.children()` (not `gpui::list`) because the virtualized list
+/// needs a bounded height from its container, which the `deferred` + `anchored`
+/// popover cannot reliably provide — `gpui::list` would render zero rows and
+/// the popover would be invisible (even though keyboard nav still works).
+/// A handful of completion rows is trivially cheap to render eagerly.
 pub fn render_completion(
     state: &CompletionState,
     theme: &Theme,
@@ -251,63 +251,81 @@ pub fn render_completion(
     let radius = theme.radius;
     let mono = theme.mono_font_family.clone();
     let on_select = on_select.clone();
+    let scroll_handle = state.scroll_handle.clone();
+    let hover_bg = theme.muted_foreground.opacity(0.08);
 
-    let list = gpui::list(state.list_state.clone(), move |ix, _window, _cx| {
-        let Some(item) = items.get(ix) else {
-            return gpui::div().into_any_element();
-        };
-        let is_selected = ix == selected;
-        let label = format!("{trigger}{}", item.name);
-        let desc = if item.description.is_empty() {
-            None
-        } else {
-            Some(item.description.clone())
-        };
-        let tag = i18n::t(item.kind.tag_key());
-        let on_select = on_select.clone();
-        let mono = mono.clone();
-        let mut row = h_flex()
-            .id(("completion-row", ix))
-            .w_full()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .cursor_pointer()
-            .child(Icon::new(item.kind.icon()).small().text_color(muted))
-            .child(
-                gpui::div()
-                    .text_sm()
-                    .text_color(fg)
-                    .child(gpui::StyledText::new(label)),
-            );
-        if let Some(desc) = desc {
-            row = row.child(
-                gpui::div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(desc),
-            );
-        }
-        row = row.child(gpui::div().text_xs().text_color(muted).child(tag.clone()));
-        // Apply the mono family + selected highlight at the row root so the
-        // whole line reads as code and the highlight spans full width.
-        let mut row = row.font_family(mono);
-        if is_selected {
-            row = row.bg(secondary);
-        }
-        row.on_click(move |_, window, cx| on_select(ix, window, cx))
-            .into_any_element()
-    })
-    .w_full()
-    .max_h(px(300.))
-    .min_w_0();
+    let list = v_flex()
+        .id("completion-list")
+        .w_full()
+        .max_h(px(300.))
+        .overflow_y_scroll()
+        .track_scroll(&scroll_handle)
+        .min_w_0()
+        .children(items.iter().enumerate().map(move |(ix, item)| {
+            let is_selected = ix == selected;
+            let label = format!("{trigger}{}", item.name);
+            let desc = if item.description.is_empty() {
+                None
+            } else {
+                Some(item.description.clone())
+            };
+            let tag = i18n::t(item.kind.tag_key());
+            let on_select = on_select.clone();
+            let mono = mono.clone();
+
+            // Command name weight: Light by default, Medium when selected so the
+            // highlight reads as active. The body family stays Lilex throughout;
+            // Medium is the project's conventional emphasis weight, never bold.
+            let name_weight = if is_selected {
+                gpui::FontWeight::MEDIUM
+            } else {
+                gpui::FontWeight::LIGHT
+            };
+
+            let mut row = h_flex()
+                .id(("completion-row", ix))
+                .w_full()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .cursor_pointer()
+                .font_family(mono)
+                .font_weight(gpui::FontWeight::LIGHT)
+                // Hover tint for affordance — selected already has its own bg.
+                .hover(move |s| s.bg(hover_bg));
+
+            if is_selected {
+                row = row.bg(secondary);
+            }
+
+            row = row
+                .child(Icon::new(item.kind.icon()).small().text_color(muted))
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .text_color(fg)
+                        .font_weight(name_weight)
+                        .child(gpui::StyledText::new(label)),
+                );
+            if let Some(desc) = desc {
+                row = row.child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(muted)
+                        .truncate()
+                        .child(desc),
+                );
+            }
+            row = row.child(gpui::div().text_xs().text_color(muted).child(tag.clone()));
+            row.on_click(move |_, window, cx| on_select(ix, window, cx))
+                .into_any_element()
+        }));
 
     v_flex()
-        .w_full()
-        .max_w(px(520.))
+        .w(px(520.))
         .child(
             v_flex()
                 .w_full()
