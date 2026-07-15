@@ -2748,7 +2748,12 @@ fn tool_panel_body(entry: &ToolCallItem) -> (PanelKind, String) {
     };
     match entry.name.as_ref() {
         "read_file" => (PanelKind::File, strip_hashline_numbering(&raw)),
-        "write_file" => {
+        // write_file's `output` is a one-line confirmation ("Wrote N bytes"), not
+        // the file content; the content lives in the tool input. Show the written
+        // content with a line-number gutter on success. On failure (`is_error`)
+        // `output` carries the error — surface that as plain text via the default
+        // arm so the user sees what went wrong, not just what was attempted.
+        "write_file" if !entry.is_error => {
             let content = entry
                 .input
                 .get("content")
