@@ -16,7 +16,7 @@ use agent::language_model::{MessageContent, Role, StopReason};
 use agent::thread::ApprovalMode;
 use agent::tools::agent::SubagentMetrics;
 use agent::{Message, ThreadEvent, TokenUsage, ToolCallStatus};
-use gpui::{App, AppContext as _, Entity, WeakEntity};
+use gpui::{App, AppContext as _, Entity, SharedString, WeakEntity};
 
 use crate::Workspace;
 use crate::views::message::{MessageItem, build_items};
@@ -167,6 +167,12 @@ pub struct ToolCallItem {
     /// manual choice survives subsequent status transitions within the same
     /// tool call.
     pub user_toggled: bool,
+    /// Persistent `Entity<TerminalPanel>` carrying the terminal-styled output
+    /// body + document-level selection. `None` until first sync
+    /// (`MessageItem::sync_tool_*_panel`), so a freshly constructed entry
+    /// renders the per-frame fallback until the streaming/rebuild path mounts
+    /// the persistent panel — mirroring the reasoning `markdown` field.
+    pub panel: Option<Entity<manox_components::markdown::TerminalPanel>>,
 }
 
 /// An entry within a `ThinkingContainer`'s activity segment. A segment mixes
@@ -183,6 +189,12 @@ pub enum ActivityEntry {
         streaming: bool,
         collapsed: bool,
         user_toggled: bool,
+        /// Persistent `Entity<Markdown>` carrying parse-once incremental parsing
+        /// and document-level selection, mirroring the top-level reasoning body.
+        /// `None` until first sync (`MessageItem::sync_reasoning_entry`), so a
+        /// freshly constructed entry renders a per-frame fallback until the
+        /// streaming/rebuild path mounts the persistent document.
+        markdown: Option<Entity<manox_components::markdown::Markdown>>,
     },
     /// One tool invocation (reuses `ToolCallItem` for status/output/collapse).
     Tool(ToolCallItem),
@@ -349,20 +361,6 @@ pub struct AgentTaskItem {
     pub metrics: Option<SubagentMetrics>,
 }
 
-/// What `apply` did to the item list, so the caller can keep the `ListState`
-/// in sync (splice on append, remeasure on in-place mutation).
-pub enum ApplyOutcome {
-    /// No item touched (e.g. `ToolCallAuthorization`).
-    None,
-    /// An existing item's content changed at `index`; remeasure that item.
-    Remeasure(usize),
-    /// A new item was appended at the end; splice the list count up.
-    Appended,
-    /// A trailing transient item (a `Retry` badge) was popped without a
-    /// replacement pushed. Splice the list count down by one at the tail.
-    RemovedTail,
-}
-
 #[derive(Debug)]
 pub struct ConversationState {
     items: Vec<Entity<MessageItem>>,
@@ -382,6 +380,17 @@ impl Default for ConversationState {
             turn_started_at: Instant::now(),
         }
     }
+}
+
+/// Workspace context threaded through `apply` / `rebuild_from_messages`: the
+/// weak handle (for item toggle callbacks) plus the thread cwd snapshot (for
+/// the `TerminalPanel` prompt line). Bundled so the signatures stay under
+/// clippy's argument-count limit. The cwd is a per-call snapshot taken by the
+/// caller from the `Thread` entity — reading the `Workspace` itself would
+/// double-lease inside a `Workspace::update`.
+pub struct ApplyCtx {
+    pub weak: WeakEntity<Workspace>,
+    pub cwd: Option<SharedString>,
 }
 
 impl ConversationState {
@@ -477,22 +486,18 @@ impl ConversationState {
     }
 
     /// Feed the child `Thread`'s full message list into the matching agent task,
-    /// populating the expandable sub-conversation panel. Returns the item index
-    /// so the caller can remeasure it; `None` if no matching task was found.
-    pub fn set_agent_sub_messages(
-        &mut self,
-        id: &str,
-        messages: Vec<Message>,
-        cx: &mut App,
-    ) -> Option<usize> {
-        let ix = self.find_agent_task(id, cx)?;
+    /// populating the expandable sub-conversation panel. No-op when no matching
+    /// task is found.
+    pub fn set_agent_sub_messages(&mut self, id: &str, messages: Vec<Message>, cx: &mut App) {
+        let Some(ix) = self.find_agent_task(id, cx) else {
+            return;
+        };
         self.items[ix].update(cx, |item, cx| {
             if let ConvItem::AgentTask(t) = item.kind_mut() {
                 t.sub_messages = messages;
             }
             cx.notify();
         });
-        Some(ix)
     }
 
     /// Apply a `ThreadEvent` delta (excludes `ToolCallAuthorization`, which `Workspace` handles).
@@ -503,27 +508,28 @@ impl ConversationState {
         event: &ThreadEvent,
         role: &str,
         last_request_usage: Option<TokenUsage>,
-        weak: WeakEntity<Workspace>,
+        ctx: ApplyCtx,
         cx: &mut App,
-    ) -> ApplyOutcome {
+    ) {
+        let ApplyCtx { weak, cwd } = ctx;
         // A trailing `Retry` badge is stale the moment a real content or
         // terminal-error event lands — that event means the retry either
         // succeeded (assistant text / tool call) or exhausted the budget
-        // (Error). Pop the badge first; the arm below then pushes its own
-        // item, keeping the list length stable so `Appended` is rewritten to
-        // `Remeasure(tail)` at the bottom. Non-item events (usage, mode
-        // change, …) and the `Retry` event itself skip this.
-        let replaces_retry = matches!(
+        // (Error). Pop the badge first so the arm below pushes its own item
+        // into the freed slot. Non-item events (usage, mode change, …) and
+        // the `Retry` event itself skip this.
+        if matches!(
             event,
             ThreadEvent::AgentText(_)
                 | ThreadEvent::AgentThinking(_)
                 | ThreadEvent::ToolCall { .. }
                 | ThreadEvent::Error(_)
                 | ThreadEvent::Compaction { .. }
-        ) && self.pop_trailing_retry(cx);
-        let len_after_pop = self.items.len();
+        ) {
+            self.pop_trailing_retry(cx);
+        }
 
-        let outcome = match event {
+        match event {
             // A compaction landed — render the handoff summary as a Recap card.
             // The card is appended (never updated in place): a compaction is a
             // one-time boundary marker, and the summary text is final.
@@ -541,7 +547,6 @@ impl ConversationState {
                         weak,
                     )
                 }));
-                ApplyOutcome::Appended
             }
             // Backfill plan text into the matching exit_plan_mode ToolCall
             // item so it renders as markdown in the chat view. The ToolCall
@@ -554,9 +559,6 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
-                } else {
-                    ApplyOutcome::None
                 }
             }
             // Token usage + model/effort changes are surfaced elsewhere (sidebar /
@@ -567,12 +569,12 @@ impl ConversationState {
             // `CompactionStarted` is a cockpit-only phase signal (the side-LLM
             // summarization is in flight); the conversation list renders nothing
             // for it. The workspace flips the cockpit phase on this event.
-            | ThreadEvent::CompactionStarted { .. } => ApplyOutcome::None,
+            | ThreadEvent::CompactionStarted { .. } => {},
             // `SteerInjected` is fired by the turn loop at drain time. The
             // workspace owns the queue→list transition (it pairs the event with
             // the matching `SteerPending` queue card and pushes the bubble here
             // via `push_user`); the conversation list takes no direct action.
-            | ThreadEvent::SteerInjected { .. } => ApplyOutcome::None,
+            | ThreadEvent::SteerInjected { .. } => {},
             // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
             // workspace to light the sidebar running indicator; it carries no
             // conversation content. We capture the turn's start instant here so
@@ -581,13 +583,10 @@ impl ConversationState {
             // `ToolCall`.
             ThreadEvent::TurnStarted => {
                 self.turn_started_at = Instant::now();
-                ApplyOutcome::None
             }
             // Goal lifecycle is surfaced by the composer chip + status popover,
             // not as a conversation item.
-            ThreadEvent::GoalChanged { .. } | ThreadEvent::GoalEvaluated { .. } => {
-                ApplyOutcome::None
-            }
+            ThreadEvent::GoalChanged { .. } | ThreadEvent::GoalEvaluated { .. } => {}
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
@@ -612,11 +611,9 @@ impl ConversationState {
                             id,
                             weak,
                         );
-                        item.update_text(delta);
-                        item.schedule_parse(delta.to_string(), cx);
+                        item.update_text(delta, cx);
                         item
                     }));
-                    ApplyOutcome::Appended
                 } else {
                     let ix = self.items.len() - 1;
                     self.items[ix].update(cx, |item, cx| {
@@ -633,11 +630,9 @@ impl ConversationState {
                             }
                             _ => return,
                         };
-                        item.update_text(&full_text);
-                        item.schedule_parse(full_text, cx);
+                        item.update_text(&full_text, cx);
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
                 }
             }
             ThreadEvent::AgentThinking(delta) => {
@@ -665,28 +660,40 @@ impl ConversationState {
                 };
                 let delta = delta.clone();
                 self.items[cix].update(cx, |item, cx| {
-                    if let ConvItem::Thinking(t) = item.kind_mut() {
-                        if let Some(eix) = t.last_streaming_reasoning_index() {
+                    let eix = if let ConvItem::Thinking(t) = item.kind_mut() {
+                        let eix = if let Some(eix) = t.last_streaming_reasoning_index() {
                             // Append to the existing streaming reasoning round.
                             if let ActivityEntry::Reasoning { text, .. } =
                                 &mut t.entries[eix]
                             {
                                 text.push_str(&delta);
                             }
+                            eix
                         } else {
                             // Start a new reasoning round.
+                            let eix = t.entries.len();
                             t.entries.push(ActivityEntry::Reasoning {
                                 text: delta,
                                 streaming: true,
                                 collapsed: false,
                                 user_toggled: false,
+                                markdown: None,
                             });
-                        }
+                            eix
+                        };
                         t.recompute_streaming();
+                        Some(eix)
+                    } else {
+                        None
+                    };
+                    // Mount/sync the persistent `Entity<Markdown>` so streaming
+                    // deltas drive incremental parsing + document-level
+                    // selection (drag + Cmd/Ctrl+C), mirroring the top-level body.
+                    if let Some(eix) = eix {
+                        item.sync_reasoning_entry(eix, cx);
                     }
                     cx.notify();
                 });
-                ApplyOutcome::Remeasure(cix)
             }
             ThreadEvent::ToolCall {
                 id,
@@ -704,7 +711,6 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        ApplyOutcome::Remeasure(ix)
                     } else {
                         let ix = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -725,7 +731,6 @@ impl ConversationState {
                                 weak,
                             )
                         }));
-                        ApplyOutcome::Appended
                     }
                 } else if name == "exit_plan_mode" || name == "AskUserQuestion" {
                     // Top-level card, never folded into an activity segment. The
@@ -743,7 +748,6 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        ApplyOutcome::Remeasure(ix)
                     } else {
                         let ix = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -759,13 +763,13 @@ impl ConversationState {
                                     streaming: matches!(*status, ToolCallStatus::Running),
                                     collapsed: false,
                                     user_toggled: false,
+                                    panel: None,
                                 }),
                                 role.to_string(),
                                 ix,
                                 weak,
                             )
                         }));
-                        ApplyOutcome::Appended
                     }
                 } else {
                     // Ordinary tool call: fold into the active activity
@@ -826,13 +830,13 @@ impl ConversationState {
                                     streaming: matches!(status, ToolCallStatus::Running),
                                     collapsed: false,
                                     user_toggled: false,
+                                    panel: None,
                                 }));
                             }
                             t.recompute_streaming();
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(cix)
                 }
             }
             ThreadEvent::ToolOutput { id, chunk } => {
@@ -844,7 +848,6 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
                 } else if let Some((cix, eix)) = self.find_thinking_entry(id, cx) {
                     self.items[cix].update(cx, |item, cx| {
                         if let ConvItem::Thinking(t) = item.kind_mut() {
@@ -854,11 +857,9 @@ impl ConversationState {
                             }
                             t.streaming = true;
                         }
+                        item.sync_tool_entry_panel(eix, cwd, cx);
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(cix)
-                } else {
-                    ApplyOutcome::None
                 }
             }
             ThreadEvent::ToolResult {
@@ -893,7 +894,6 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
                 } else if let Some((cix, eix)) = self.find_thinking_entry(id, cx) {
                     let entry_output = output.clone();
                     let entry_is_error = *is_error;
@@ -913,18 +913,21 @@ impl ConversationState {
                             // collapses only when the whole turn goes terminal.
                             t.recompute_streaming();
                         }
+                        item.sync_tool_entry_panel(eix, cwd, cx);
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(cix)
                 } else if let Some(ix) = self.find_tool(id, cx) {
                     self.items[ix].update(cx, |item, cx| {
+                        let is_plan = matches!(
+                            item.kind(),
+                            ConvItem::ToolCall(t) if t.name == "exit_plan_mode"
+                        );
                         if let ConvItem::ToolCall(t) = item.kind_mut() {
                             // `exit_plan_mode`'s body is the plan (backfilled
                             // from `PlanProposed`); the approval verdict lives
                             // in `status`, so keep the plan body and keep it
                             // expanded — collapsing would hide the very plan
                             // the user just read.
-                            let is_plan = t.name == "exit_plan_mode";
                             if !is_plan {
                                 t.output = output.clone();
                             }
@@ -939,9 +942,14 @@ impl ConversationState {
                                 !t.user_toggled
                             };
                         }
+                        // The plan card renders its body via Markdown (see
+                        // `render_plan_card`), not the TerminalPanel, so skip
+                        // mounting a panel for `exit_plan_mode`.
+                        if !is_plan {
+                            item.sync_tool_call_panel(cwd, cx);
+                        }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
                 } else {
                     // No matching entry; insert as a finalized single-entry
                     // activity segment so the orphan result still renders as a
@@ -961,6 +969,7 @@ impl ConversationState {
                             ToolCallStatus::Running | ToolCallStatus::PendingApproval
                         ),
                         user_toggled: false,
+                        panel: None,
                     };
                     let mut container = ThinkingContainer::new();
                     container.accepting_entries = false;
@@ -968,14 +977,19 @@ impl ConversationState {
                     container.collapsed = false;
                     container.entries.push(ActivityEntry::Tool(entry));
                     self.items.push(cx.new(|_| {
-                        MessageItem::new(ConvItem::Thinking(container), role.to_string(), ix, weak)
+                        MessageItem::new(ConvItem::Thinking(container), role.to_string(), ix, weak.clone())
                     }));
-                    ApplyOutcome::Appended
+                    // Mount the orphan entry's persistent panel after push — the
+                    // panel needs an `&mut Context<MessageItem>` to create the
+                    // Entity, which the `cx.new(|_| …)` closure above lacks.
+                    self.items[ix].update(cx, |item, cx| {
+                        item.sync_tool_entry_panel(0, cwd, cx);
+                        cx.notify();
+                    });
                 }
             }
             ThreadEvent::ToolCallAuthorization { .. } => {
                 // Handled by `Workspace` as a prompt overlay; not part of the conversation flow.
-                ApplyOutcome::None
             }
             ThreadEvent::Stop(reason) => {
                 // `StopReason::ToolUse` is mid-turn: the model paused to
@@ -987,7 +1001,7 @@ impl ConversationState {
                 let terminal = !matches!(reason, StopReason::ToolUse);
                 for e in &self.items {
                     e.update(cx, |item, cx| {
-                        item.finalize_streaming(terminal);
+                        item.finalize_streaming(terminal, cx);
                         cx.notify();
                     });
                 }
@@ -1011,22 +1025,12 @@ impl ConversationState {
                         }
                     }
                 }
-                // No full reflow: the incremental parser kept blocks in sync
-                // throughout streaming, and `finalize_streaming` only does a
-                // consistency pass. Remeasure just the last item (the one whose
-                // streaming flag flipped, which is the only one whose layout
-                // changes — the cursor disappears).
-                match self.items.len() {
-                    0 => ApplyOutcome::None,
-                    n => ApplyOutcome::Remeasure(n - 1),
-                }
             }
             ThreadEvent::Error(e) => {
                 let ix = self.items.len();
                 self.items.push(cx.new(|_| {
                     MessageItem::new(ConvItem::Error(e.to_string()), role.to_string(), ix, weak)
                 }));
-                ApplyOutcome::Appended
             }
             ThreadEvent::PeerMessage { from, content } => {
                 let ix = self.items.len();
@@ -1041,16 +1045,13 @@ impl ConversationState {
                         weak,
                     )
                 }));
-                ApplyOutcome::Appended
             }
             ThreadEvent::ApprovalModeChanged { .. } => {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
-                ApplyOutcome::None
             }
             ThreadEvent::PrefixStability { .. } => {
                 // Cache discipline signal: no conversation item, the drift
                 // flags are only consumed by debug telemetry views (if at all).
-                ApplyOutcome::None
             }
             ThreadEvent::Retry {
                 attempt,
@@ -1089,7 +1090,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        return ApplyOutcome::Remeasure(self.items.len() - 1);
+                        return;
                     }
                 }
                 let id = self.items.len();
@@ -1109,7 +1110,6 @@ impl ConversationState {
                         weak.clone(),
                     )
                 }));
-                ApplyOutcome::Appended
             }
             ThreadEvent::SubagentProgress {
                 id,
@@ -1136,50 +1136,25 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
-                    ApplyOutcome::Remeasure(ix)
-                } else {
-                    ApplyOutcome::None
                 }
             }
             ThreadEvent::BrowserNotification { .. } | ThreadEvent::InboundAuthorization { .. } => {
                 // Browser-axis signals are routed for the UI chrome (overlay,
                 // hint, tab state), not rendered as conversation items. The
                 // owning Workspace subscriber handles the surface.
-                ApplyOutcome::None
             }
-        };
-
-        // Reconcile the list state with the stale `Retry` badge we popped at
-        // the top. The arm either pushed a new item into the freed slot (net
-        // zero — remeasure the tail) or updated an earlier item in place
-        // (net -1 — splice the dangling slot out). Detecting via length, not
-        // the arm's returned outcome, keeps this correct for arms like
-        // `ToolCall` whose Remeasure-vs-Appended branch depends on whether the
-        // tool id already existed.
-        if replaces_retry {
-            let len_after_arm = self.items.len();
-            if len_after_arm > len_after_pop {
-                return ApplyOutcome::Remeasure(len_after_arm.saturating_sub(1));
-            }
-            return ApplyOutcome::RemovedTail;
         }
-        outcome
     }
 
-    /// Drop the trailing item if it is a `Retry` badge. Returns whether it
-    /// popped. The list state is not notified here — the caller rewrites the
-    /// arm's `Appended` outcome to `Remeasure(tail)` to keep the logical
-    /// length stable.
-    fn pop_trailing_retry(&mut self, cx: &App) -> bool {
+    /// Drop the trailing item if it is a stale `Retry` badge, so the real
+    /// content event that follows pushes its own item into the freed slot.
+    fn pop_trailing_retry(&mut self, cx: &App) {
         if self
             .items
             .last()
             .is_some_and(|e| matches!(e.read(cx).kind(), ConvItem::Retry { .. }))
         {
             self.items.pop();
-            true
-        } else {
-            false
         }
     }
 
@@ -1200,9 +1175,10 @@ impl ConversationState {
         role: &str,
         running: bool,
         notes: &[UiNoteRecord],
-        weak: WeakEntity<Workspace>,
+        ctx: ApplyCtx,
         cx: &mut App,
     ) -> Self {
+        let ApplyCtx { weak, cwd } = ctx;
         let plain = build_items(messages, usage, running);
         let merged = merge_ui_notes(messages, plain, notes);
         let items = merged
@@ -1221,10 +1197,18 @@ impl ConversationState {
                     // + finalize so blocks are populated and the frozen prefix
                     // is the entire document (no further updates expected).
                     if let Some(text) = text {
-                        item.update_text(&text);
-                        item.finalize_parser();
+                        item.update_text(&text, cx);
+                        item.finalize_parser(cx);
                     }
-                    let _ = cx;
+                    // Mount + finalize persistent markdown for every historical
+                    // reasoning round inside a `Thinking` segment, so selection
+                    // works on reloaded history (not just live-streamed turns).
+                    item.rebuild_activity_reasoning(cx);
+                    // Mount the persistent `TerminalPanel` for every historical
+                    // tool call (activity-segment entries + top-level ToolCall)
+                    // so reloaded history renders the terminal-styled body with
+                    // working selection, not a per-frame fallback.
+                    item.rebuild_tool_panels(cwd.clone(), cx);
                     item
                 })
             })
@@ -1807,6 +1791,7 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
+            panel: None,
         }));
         // All entries terminal, but segment is still accepting (turn in progress).
         t.recompute_streaming();
@@ -1844,6 +1829,7 @@ mod tests {
             streaming: false,
             collapsed: true,
             user_toggled: false,
+            markdown: None,
         });
         assert!(t.last_streaming_reasoning_index().is_none());
 
@@ -1853,6 +1839,7 @@ mod tests {
             streaming: true,
             collapsed: false,
             user_toggled: false,
+            markdown: None,
         });
         assert_eq!(t.last_streaming_reasoning_index(), Some(1));
 
@@ -1868,6 +1855,7 @@ mod tests {
             streaming: true,
             collapsed: false,
             user_toggled: false,
+            panel: None,
         }));
         // Still finds the streaming reasoning at index 1.
         assert_eq!(t.last_streaming_reasoning_index(), Some(1));
@@ -1882,6 +1870,7 @@ mod tests {
             streaming: false,
             collapsed: true,
             user_toggled: false,
+            markdown: None,
         });
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "tu_1".into(),
@@ -1894,6 +1883,7 @@ mod tests {
             streaming: false,
             collapsed: false,
             user_toggled: false,
+            panel: None,
         }));
         assert!(t.get_tool_entry_mut("tu_1").is_some());
         assert!(t.get_tool_entry_mut("nonexistent").is_none());

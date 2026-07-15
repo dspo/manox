@@ -13,3 +13,8 @@ gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
 markdown.workspace = true
 # ropey::Rope is what SyntaxHighlighter::update consumes for syntax highlighting.
 ropey.workspace = true
+# vte::ansi::Processor + Handler — parse SGR/color escapes in tool output for the TerminalPanel.
+vte.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
