@@ -115,9 +115,9 @@ impl SkillRegistry {
     /// The `system/main` template iterates this list — no markdown is built here.
     pub fn summaries(&self) -> Vec<crate::prompt::SkillSummaryPromptData> {
         self.skills
-            .values()
-            .map(|s| crate::prompt::SkillSummaryPromptData {
-                name: s.name.clone(),
+            .iter()
+            .map(|(key, s)| crate::prompt::SkillSummaryPromptData {
+                name: key.clone(),
                 description: s.description.clone(),
             })
             .collect()
@@ -336,4 +336,52 @@ mod tests {
         let r = SkillRegistry::default();
         assert!(r.summaries().is_empty());
     }
+
+    /// `summaries()` must advertise the full registry key (e.g.
+ /// `plugin:skill-name`), not the bare frontmatter `name`, so the model
+ /// can pass it back to `get()` and resolve the skill. A bare name for a
+ /// plugin skill would miss the lookup — the same bug class as plugin
+ /// subagent types.
+ #[test]
+ fn summaries_use_registry_key_not_bare_name() {
+ let mut skills = BTreeMap::new();
+ // User skill: key == bare name.
+ skills.insert(
+ "exam".to_string(),
+ Arc::new(SkillDefinition {
+ name: "exam".to_string(),
+ description: "生成试卷".to_string(),
+ body: String::new(),
+ source: PathBuf::new(),
+ }),
+ );
+ // Plugin skill: key has namespace prefix.
+ skills.insert(
+ "remora:task".to_string(),
+ Arc::new(SkillDefinition {
+ name: "task".to_string(),
+ description: "delegate task".to_string(),
+ body: String::new(),
+ source: PathBuf::new(),
+ }),
+ );
+ let reg = SkillRegistry { skills };
+ let sums = reg.summaries();
+
+ // User skill: advertised name == key == bare name.
+ let exam = sums.iter().find(|s| s.name == "exam").expect("exam summary");
+ assert_eq!(exam.description, "生成试卷");
+
+ // Plugin skill: advertised name == full key, NOT the bare frontmatter name.
+ let remora = sums
+ .iter()
+ .find(|s| s.name == "remora:task")
+ .expect("remora:task summary must use the full key");
+ assert_eq!(remora.description, "delegate task");
+ // The bare name "task" must NOT appear — it would be an unresolvable lookup.
+ assert!(
+ !sums.iter().any(|s| s.name == "task"),
+ "bare plugin skill name must not be advertised — it is not a resolvable lookup key"
+ );
+ }
 }
