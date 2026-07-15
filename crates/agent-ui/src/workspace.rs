@@ -24,9 +24,10 @@ use agent::{
     save_thread,
 };
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle, DismissEvent,
-    DragMoveEvent, Entity, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle, SharedString,
-    Subscription, WeakEntity, Window, deferred, ease_in_out, ease_out_quint, prelude::*, px,
+    Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle,
+    DismissEvent, DragMoveEvent, Entity, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle,
+    SharedString, Subscription, WeakEntity, Window, anchored, deferred, ease_in_out,
+    ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
@@ -1642,6 +1643,12 @@ impl Workspace {
         if self.completion.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// Test-only: whether the completion popover is currently open.
+    #[cfg(all(test, feature = "debug"))]
+    pub(crate) fn completion_is_open(&self) -> bool {
+        self.completion.is_some()
     }
 
     /// Confirm the selected (or clicked) completion item: replace the trigger
@@ -4781,9 +4788,11 @@ impl Workspace {
     }
 
     /// The completion popover overlaid above the composer while a trigger token
-    /// (`/` or `@`) is active at the caret. Mounted once on the composer's own
-    /// relative v_flex in `render_composer`, so it stays glued to the input bar
-    /// in both hero and footer layouts without perturbing the composer's centering.
+    /// (`/` or `@`) is active at the caret. Uses [`gpui::anchored`] (the same
+    /// mechanism gpui-component's `Popover` and zed's completion menu use) so the
+    /// popover escapes ancestor `overflow_hidden` clipping and avoids window-edge
+    /// overflow — `div().absolute().bottom_full()` inside `deferred` does not
+    /// position correctly and gets clipped by the body wrapper's `overflow_hidden`.
     /// A click on a row confirms it.
     fn render_completion_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = self.completion.as_ref()?;
@@ -4795,13 +4804,15 @@ impl Workspace {
             std::rc::Rc::new(move |ix, window, cx| on_select(&ix, window, cx));
         Some(
             deferred(
-                gpui::div()
-                    .id("completion-dropdown")
-                    .absolute()
-                    .bottom_full()
-                    .left_0()
-                    .occlude()
-                    .child(render_completion(state, &theme, on_select)),
+                anchored()
+                    .anchor(Anchor::BottomLeft)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        gpui::div()
+                            .id("completion-dropdown")
+                            .occlude()
+                            .child(render_completion(state, &theme, on_select)),
+                    ),
             )
             .with_priority(1)
             .into_any_element(),

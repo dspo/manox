@@ -349,3 +349,51 @@ fn build_workspace_with_window(
     );
     build_workspace(cx, dummy)
 }
+
+/// Typing `/` in the composer must open the slash-command typeahead popover.
+/// Drives the real text-input path (`simulate_input`) so the `InputEvent::Change`
+/// subscription fires `sync_completion`; the popover should list the built-in
+/// commands. Regression guard for issue #226.
+#[gpui::test]
+#[ignore = "reads ~/.config/cx provider config; run with --ignored"]
+async fn slash_typeahead_opens_on_slash(cx: &mut gpui::TestAppContext) {
+    use agent::language_model::{AnyLanguageModel, LanguageModelCompletionEvent};
+    use gpui::AppContext as _;
+    let _guard = setup(cx);
+    cx.update(crate::slash_command::init);
+    let dummy: AnyLanguageModel = ReplayModel::build(
+        "test/slash-typeahead",
+        Vec::<LanguageModelCompletionEvent>::new(),
+    );
+    // Capture the workspace entity + window handle so we can dispatch input.
+    let mut ws_handle: Option<gpui::Entity<crate::workspace::Workspace>> = None;
+    let mut window_handle: Option<gpui::AnyWindowHandle> = None;
+    let (_root, _vctx) = cx.add_window_view(|window, cx| {
+        let ws = cx.new(|cx| crate::workspace::Workspace::new(window, cx));
+        ws_handle = Some(ws.clone());
+        window_handle = Some(window.window_handle());
+        gpui_component::Root::new(ws, window, cx)
+    });
+    let ws = ws_handle.expect("workspace captured");
+    let window = window_handle.expect("window handle captured");
+    // Pin the dummy model so Workspace::new's provider assumptions hold.
+    cx.update(|cx| {
+        ws.update(cx, |ws, cx| {
+            ws.thread.update(cx, |t, cx| t.set_model(dummy, cx));
+        });
+    });
+    cx.run_until_parked();
+    // Focus the composer input then type `/`.
+    cx.update_window(window, |_, window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.input_state.update(cx, |s, cx| s.focus(window, cx));
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.simulate_input(window, "/");
+    cx.run_until_parked();
+    let open = cx.read(|cx| ws.read(cx).completion_is_open());
+    assert!(open, "typing `/` should open the completion popover");
+    drop(_guard);
+}
