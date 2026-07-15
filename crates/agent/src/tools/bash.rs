@@ -57,6 +57,21 @@ const CANCELLATION_GRACE_MS: u64 = 50;
 /// grandchildren that inherited the pipes can otherwise keep them open.
 const IO_DRAIN_TIMEOUT_MS: u64 = 2_000;
 
+/// Build a brush shell variable marked exported, so it reaches child-process
+/// environments. brush assembles a child's env from exported vars only
+/// (`ShellEnvironment::iter_exported`, exercised in `brush-core` `commands.rs`);
+/// `ShellVariable::new` defaults to non-exported, so `set_env_global` on a
+/// plain new var sets a shell-only variable that spawned commands never see.
+/// That was the `ed3391e6` failure: `echo $PATH` showed the login PATH and
+/// `brew` ran fine (brush's own lookup reads the shell var), but `/usr/bin/which
+/// brew` saw the launchd PATH and reported "not found" — the var never reached
+/// children. Marking it exported makes `set_env_global` cover external children.
+fn exported_shell_var(value: String) -> brush_core::ShellVariable {
+    let mut v = brush_core::ShellVariable::new(value);
+    v.export();
+    v
+}
+
 pub struct BashTool {
     /// Base cwd used to seed the shell on first use; per-call overrides persist.
     cwd: PathBuf,
@@ -369,21 +384,22 @@ async fn run_bash(
             s.set_working_dir(base_cwd).map_err(brush_err)?;
             // Inject the login shell's PATH so brush-spawned children find
             // Homebrew / toolchain binaries the GUI process env lacks (thread
-            // `e5047fd2`: `gh` not found). brush propagates shell env vars to
-            // external children, so a single set on init covers every call.
+            // `e5047fd2`: `gh` not found). The var must be exported: brush only
+            // passes exported shell vars to child-process env, so an unexported
+            // `set_env_global` would leave children on the launchd PATH.
             s.set_env_global(
                 "PATH",
-                brush_core::ShellVariable::new(crate::path_env::resolved_login_path().to_string()),
+                exported_shell_var(crate::path_env::resolved_login_path().to_string()),
             )
             .map_err(brush_err)?;
             // Inject non-interactive editor/pager defaults (only when the
             // process env hasn't set them) so `git rebase --continue` / `git
             // log` do not open an interactive `$EDITOR` / pager and hang the
-            // turn (thread 56ed5d5f msg308). brush propagates shell env to
-            // external children, so one set on init covers every call.
+            // turn (thread 56ed5d5f msg308). Same export requirement as PATH:
+            // `git` is an external child reading these from its env.
             for (k, v) in crate::sandbox::NONINTERACTIVE_ENV {
                 if std::env::var_os(k).is_none() {
-                    s.set_env_global(k, brush_core::ShellVariable::new((*v).to_string()))
+                    s.set_env_global(k, exported_shell_var((*v).to_string()))
                         .map_err(brush_err)?;
                 }
             }
@@ -937,6 +953,38 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("exit code 7"), "got: {msg}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bash_exports_login_path_to_child_env() {
+        // Regression for thread `ed3391e6`: brush clears child-process env and
+        // rebuilds it from exported shell vars only (`brush-core` `commands.rs`:
+        // `env_clear()` + `iter_exported()`). `set_env_global` on a plain
+        // `ShellVariable::new` set a non-exported PATH, so the shell var was
+        // correct (`echo $PATH` showed the login PATH, `brew` ran via brush's own
+        // lookup) but external children got NO path var — `/usr/bin/which brew` /
+        // `printenv PATH` saw nothing and reported "not found". Marking the var
+        // exported makes an external child reading its env see the login PATH.
+        let out = run_bash(
+            fresh_shell(),
+            "printenv PATH",
+            &PathBuf::from("."),
+            None,
+            &policy(),
+            Duration::from_secs(10),
+            CancellationToken::new(),
+            null_sink(),
+            None,
+            None,
+        )
+        .await
+        .expect("printenv must succeed when PATH is exported");
+        assert_eq!(
+            out.trim(),
+            crate::path_env::resolved_login_path(),
+            "child must see the login PATH, not an unset/launchd PATH"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
