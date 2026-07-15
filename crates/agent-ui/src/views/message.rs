@@ -2728,13 +2728,14 @@ pub fn render_agent_task(
     card.into_any_element()
 }
 
-/// Monospace, scrollable body for a sub-agent card (collapsed tail or fallback
-/// when the snapshot is empty).
+/// Prose markdown body for a sub-agent card (collapsed tail or fallback when
+/// the snapshot is empty). The sub-agent's natural-language output renders the
+/// same way an assistant message does — flowing prose, not a fenced code dump —
+/// while keeping the shared tool-call-kin card chrome (inherited italic, text_xs).
 fn render_agent_body(text: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::AnyElement {
     if text.is_empty() {
         return gpui::div().into_any_element();
     }
-    let code = format!("```\n{text}\n```");
     gpui::div()
         .id(("agent-body", ix))
         .w_full()
@@ -2744,8 +2745,14 @@ fn render_agent_body(text: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui
         .border_t_1()
         .border_color(theme.border)
         .text_xs()
-        .text_color(theme.muted_foreground)
-        .child(markdown_tv(("agent-body-text", ix), code, theme, false, cx))
+        .text_color(theme.foreground)
+        .child(markdown_tv(
+            ("agent-body-text", ix),
+            text.to_string(),
+            theme,
+            false,
+            cx,
+        ))
         .into_any_element()
 }
 
