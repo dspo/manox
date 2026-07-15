@@ -299,50 +299,54 @@ mod tests {
     }
 
     /// `entries()` returns the full registry key for each definition, which
- /// for plugin-provided agents includes the `plugin:name` namespace prefix.
- /// This is the key the model must pass as `subagent_type` — the bare
- /// frontmatter `name` alone would miss. Built-in agents use their bare
- /// name as the key, so they appear unchanged.
- #[test]
- fn entries_keys_match_lookup_names() {
- let mut defs = BTreeMap::new();
- defs.insert(
- "explore".to_string(),
- Arc::new(parse_definition(
- "---\nname: explore\ndescription: d\n---\nbody",
- "builtin:explore",
- )
- .expect("parse")),
- );
- defs.insert(
- "remora:remora-task".to_string(),
- Arc::new(parse_definition(
- "---\nname: remora-task\ndescription: d\n---\nbody",
- "plugin:remora",
- )
- .expect("parse")),
- );
- let reg = AgentDefinitionRegistry { defs };
- let entries = reg.entries();
+    /// for plugin-provided agents includes the `plugin:name` namespace prefix.
+    /// This is the key the model must pass as `subagent_type` — the bare
+    /// frontmatter `name` alone would miss. Built-in agents use their bare
+    /// name as the key, so they appear unchanged.
+    #[test]
+    fn entries_keys_match_lookup_names() {
+        let mut defs = BTreeMap::new();
+        defs.insert(
+            "explore".to_string(),
+            Arc::new(
+                parse_definition(
+                    "---\nname: explore\ndescription: d\n---\nbody",
+                    "builtin:explore",
+                )
+                .expect("parse"),
+            ),
+        );
+        defs.insert(
+            "remora:remora-task".to_string(),
+            Arc::new(
+                parse_definition(
+                    "---\nname: remora-task\ndescription: d\n---\nbody",
+                    "plugin:remora",
+                )
+                .expect("parse"),
+            ),
+        );
+        let reg = AgentDefinitionRegistry { defs };
+        let entries = reg.entries();
 
- // Built-in: key == bare name.
- let explore = entries
- .iter()
- .find(|(k, _)| *k == "explore")
- .expect("explore entry");
- assert_eq!(explore.1.def.name, "explore");
- // The key is what the model would pass back; it must match `get`.
- assert!(reg.get("explore").is_some());
+        // Built-in: key == bare name.
+        let explore = entries
+            .iter()
+            .find(|(k, _)| *k == "explore")
+            .expect("explore entry");
+        assert_eq!(explore.1.def.name, "explore");
+        // The key is what the model would pass back; it must match `get`.
+        assert!(reg.get("explore").is_some());
 
- // Plugin: key has namespace prefix, bare name does not.
- let remora = entries
- .iter()
- .find(|(k, _)| *k == "remora:remora-task")
- .expect("remora entry");
- assert_eq!(remora.1.def.name, "remora-task");
- assert_ne!(*remora.0, remora.1.def.name);
- // The namespaced key is the one `get` resolves; the bare name is not.
- assert!(reg.get("remora:remora-task").is_some());
- assert!(reg.get("remora-task").is_none());
- }
+        // Plugin: key has namespace prefix, bare name does not.
+        let remora = entries
+            .iter()
+            .find(|(k, _)| *k == "remora:remora-task")
+            .expect("remora entry");
+        assert_eq!(remora.1.def.name, "remora-task");
+        assert_ne!(*remora.0, remora.1.def.name);
+        // The namespaced key is the one `get` resolves; the bare name is not.
+        assert!(reg.get("remora:remora-task").is_some());
+        assert!(reg.get("remora-task").is_none());
+    }
 }

@@ -286,7 +286,6 @@ mod tests {
             PromptTemplate::ModeGoalAddendum,
             PromptTemplate::ModeUltracodeGrant,
             PromptTemplate::WrapperMaxTokensDirective,
-            PromptTemplate::WrapperEmptyTurnNudge,
             PromptTemplate::WrapperUnfulfilledToolIntentNudge,
             PromptTemplate::WrapperToolDenied,
             PromptTemplate::SideCallApprovalSystem,
@@ -395,6 +394,22 @@ mod tests {
             )
             .unwrap(),
             PromptTemplate::WrapperRecoveryFailure,
+        );
+        assert_clean(
+            &render(
+                PromptTemplate::WrapperEmptyTurnNudge,
+                &crate::prompt::EmptyTurnNudgeData { in_plan: true },
+            )
+            .unwrap(),
+            PromptTemplate::WrapperEmptyTurnNudge,
+        );
+        assert_clean(
+            &render(
+                PromptTemplate::WrapperEmptyTurnNudge,
+                &crate::prompt::EmptyTurnNudgeData { in_plan: false },
+            )
+            .unwrap(),
+            PromptTemplate::WrapperEmptyTurnNudge,
         );
         assert_clean(
             &render(
