@@ -460,6 +460,26 @@ impl MessageItem {
             md.update(cx, |m, cx| m.finalize_streaming(cx));
         }
     }
+    /// Close the activity segment when assistant text arrives mid-turn —
+    /// mirrors `build_items`'s `close_segment` on `MessageContent::Text` so
+    /// the live streaming path matches the historical rebuild path. Without
+    /// this, `AgentThinking` arriving after the answer text folds into the
+    /// pre-answer segment (temporal inversion, issue #216).
+    pub fn close_segment_for_text(&mut self, cx: &mut gpui::Context<Self>) {
+        let ConvItem::Thinking(t) = &mut self.kind else {
+            return;
+        };
+        t.close_for_text();
+        // Finalize reasoning markdown so the streaming cursor stops and the
+        // final parse matches a one-shot parse.
+        for entry in &mut t.entries {
+            if let ActivityEntry::Reasoning { markdown, .. } = entry
+                && let Some(md) = markdown.as_ref()
+            {
+                md.update(cx, |m, cx| m.finalize_streaming(cx));
+            }
+        }
+    }
 }
 
 impl Render for MessageItem {
@@ -4145,6 +4165,59 @@ mod tests {
         assert!(
             summary.contains("42"),
             "summary should include duration: {summary}"
+        );
+    }
+
+    /// Historical rebuild of the issue #216 scenario: text THEN thinking within
+    /// one assistant message must produce two activity segments, not fold the
+    /// post-text thinking into the pre-text segment. The `Text` arm calls
+    /// `close_segment` so the subsequent `Thinking` opens a fresh container.
+    /// This test confirms the rebuild path is correct (the live `apply` path
+    /// is fixed by `close_for_text` to match this behavior).
+    #[test]
+    fn build_items_text_before_thinking_opens_new_segment() {
+        // Round 1: thinking + tool → tool result
+        // Round 2: Text THEN Thinking (the issue's temporal-inversion scenario)
+        let messages = vec![
+            Message::user("go".to_string()),
+            Message::assistant(vec![
+                MessageContent::Thinking {
+                    text: "round 1".to_string(),
+                    signature: None,
+                },
+                tu("tu_1", "read_file", serde_json::json!({"path": "a.rs"})),
+            ]),
+            Message::user_with_content(vec![tr("tu_1", "read_file", "a")]),
+            Message::assistant(vec![
+                MessageContent::Text("the answer".to_string()),
+                MessageContent::Thinking {
+                    text: "round 2".to_string(),
+                    signature: None,
+                },
+            ]),
+        ];
+        let items = build_items(&messages, &HashMap::new(), false);
+        let containers: Vec<&ThinkingContainer> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConvItem::Thinking(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            containers.len(),
+            2,
+            "text closes old segment, thinking opens new"
+        );
+        assert_eq!(containers[0].entries.len(), 2, "round 1: thinking + tool");
+        assert_eq!(containers[1].entries.len(), 1, "round 2: thinking only");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i, ConvItem::Assistant { .. }))
+                .count(),
+            1,
+            "one assistant text between the two segments"
         );
     }
 }
