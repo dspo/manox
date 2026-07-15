@@ -121,7 +121,7 @@ pub fn create_table(conn: &Connection) -> Result<()> {
             provider_id TEXT,
             cwd TEXT,
             project TEXT,
-            approval_mode INTEGER NOT NULL DEFAULT 0,
+            approval_mode INTEGER NOT NULL DEFAULT 1,
             reasoning_effort INTEGER NOT NULL DEFAULT 1,
             depth INTEGER NOT NULL DEFAULT 0,
             parent_id TEXT,

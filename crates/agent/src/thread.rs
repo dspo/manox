@@ -71,13 +71,13 @@ pub enum ToolCallStatus {
 pub enum ApprovalMode {
     /// Every approval-required tool call shows the authorization overlay.
     #[serde(rename = "on-request")]
-    #[default]
     OnRequest,
     /// A built-in security-reviewer LLM agent vet each approval-required tool
     /// call. Safe calls run without prompting; risky ones still raise the
     /// overlay (with a one-line reason from the agent). Failures (timeout,
     /// parse error, unsupported verdict) fall back to the overlay.
     #[serde(rename = "auto-review")]
+    #[default]
     AutoReview,
     /// All approvals are bypassed and `bash` runs unsandboxed
     /// (DangerFullAccess equivalent). Inherited by sub-agents.
