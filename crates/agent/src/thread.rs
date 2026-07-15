@@ -3760,6 +3760,14 @@ impl Thread {
                 _ => self.tools.to_request_tools(),
             }
         };
+        // Coalesce the fully assembled list so the fixed-position
+        // `<collaboration_mode>` User message merges with a leading User turn
+        // instead of producing adjacent same-role messages Anthropic rejects.
+        // The mapped history was already coalesced above; this pass only
+        // touches the instruction↔first-turn boundary (and is idempotent on
+        // the rest). Cache flags survive — coalesce keeps the trailing
+        // segment's flag, so the prefix and trailing cache anchors persist.
+        let messages = crate::compact::coalesce_same_role(messages);
         LanguageModelRequest {
             messages,
             tools,
@@ -4408,6 +4416,89 @@ mod tests {
         assert!(
             sys_text.contains("can process image"),
             "ground-truth image-capability line missing: {sys_text}"
+        );
+    }
+
+    /// Regression guard: a fresh Default-mode main thread carries the mode's
+    /// `developer_instructions` as a fixed-position `<collaboration_mode>` User
+    /// message injected at request-build time (system-after, history-before).
+    /// When the first persisted message is itself a User turn — the normal case —
+    /// the instruction message is adjacent to it. Anthropic's wire rejects
+    /// adjacent same-role messages, so the assembled list must be coalesced
+    /// before it reaches a provider: the instruction folds into the leading User
+    /// turn instead of standing as a second, adjacent User message. This asserts
+    /// the wire-facing message list (System extracted to the top-level system
+    /// field, as `provider::anthropic` does) alternates strictly User↔Assistant.
+    #[test]
+    fn build_completion_request_no_adjacent_same_role_after_mode_injection() {
+        use crate::language_model::{MessageContent, Role};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let capable: AnyLanguageModel = Arc::new(CapabilityMockModel {
+            id: "test/capable".into(),
+            supports_tools: true,
+            supports_images: false,
+        });
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-no-adjacent-role", "/tmp", Vec::new()),
+                Some(capable),
+                cx,
+            )
+        });
+        // First turn: a lone User message — exactly the adjacency the
+        // injection creates if left uncoalesced.
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.insert_user_message("hello".into(), cx));
+        });
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+
+        // The wire-facing list drops System-role messages (Anthropic hoists
+        // them to the top-level `system` field). Assert what remains
+        // alternates strictly — no two consecutive messages share a role.
+        let wire: Vec<Role> = req
+            .messages
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .map(|m| m.role)
+            .collect();
+        assert!(
+            !wire.is_empty(),
+            "expected at least the first user turn on the wire"
+        );
+        for pair in wire.windows(2) {
+            assert_ne!(
+                pair[0], pair[1],
+                "adjacent same-role messages on the wire: {wire:?}"
+            );
+        }
+        // The mode instruction must ride inside the first User message (coalesced),
+        // not as a separate adjacent User — so the first wire User carries both the
+        // `<collaboration_mode>` block and "hello" (coalesce appends content as
+        // separate blocks, so read every text block, not just the first).
+        let first_user_text: String = req
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User)
+            .map(|m| {
+                m.content
+                    .iter()
+                    .filter_map(|c| match c {
+                        MessageContent::Text(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .expect("at least one user message");
+        assert!(
+            first_user_text.contains("<collaboration_mode>"),
+            "mode instruction missing from the first user message: {first_user_text}"
+        );
+        assert!(
+            first_user_text.contains("hello"),
+            "first user turn missing from the coalesced message: {first_user_text}"
         );
     }
 
