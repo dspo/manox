@@ -293,9 +293,10 @@ impl MessageItem {
 
     /// Mount (lazily) and refresh the tool-call's `TerminalPanel` from its
     /// current display output. `cwd` is the live thread working directory
-    /// gathered by the caller from the workspace; `command` is read from the
-    /// tool input's `command` field (bash / monitor) so the `❯` prompt line
-    /// echoes what the agent ran.
+    /// gathered by the caller from the workspace. Only `bash` earns a prompt
+    /// block (cwd + git + `❯ command`); see the gate below — internal tools
+    /// and MCP tools render the body only, so `command`/`cwd` stay `None`
+    /// for them even though some carry a `command` input field.
     fn ensure_tool_panel(
         entry: &mut ToolCallItem,
         cwd: Option<SharedString>,
@@ -303,18 +304,33 @@ impl MessageItem {
     ) {
         let (kind, body) = tool_panel_body(entry);
         if entry.panel.is_none() {
-            let command = entry
-                .input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .map(SharedString::from);
-            let cwd_for_panel = cwd.clone();
+            // Only the `bash` tool runs a real shell command a human would type in
+            // a terminal, so only it earns the prompt block (cwd + git + `❯
+            // command`). Internal tools (grep / read_file / edit_file / glob /
+            // list_directory / …) and MCP tools are manox abstractions, not
+            // terminal commands — they render the body only, without the cwd
+            // preamble that would imply "run this in a shell".
+            let is_terminal_command = entry.name.as_str() == "bash";
+            let command = if is_terminal_command {
+                entry
+                    .input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(SharedString::from)
+            } else {
+                None
+            };
+            let cwd_for_panel = if is_terminal_command {
+                cwd.clone()
+            } else {
+                None
+            };
             let panel = cx.new(|cx| TerminalPanel::new(kind, command, cwd_for_panel, cx.theme()));
             // Probe the workdir's git state once per panel — a snapshot at the
             // moment the command ran, like a real shell prompt. Runs on the
             // background executor so the two `git` subprocess spawns never block
             // the UI; `set_git` re-renders the prompt line when it lands.
-            if let Some(cwd_s) = cwd.as_ref() {
+            if is_terminal_command && let Some(cwd_s) = cwd.as_ref() {
                 let cwd_path = PathBuf::from(cwd_s.as_ref());
                 let panel = panel.clone();
                 cx.spawn(async move |_, cx| {

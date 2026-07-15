@@ -159,19 +159,22 @@ impl TerminalPanel {
             s: String::new(),
             runs: Vec::new(),
         };
-        let muted = style_color(self.styles.muted);
-        let fg = style_color(self.styles.foreground);
-
-        // Line 1: cwd + git status markers.
+        let fg = self.styles.foreground;
+        // Guidance text (cwd / `git:` / branch / markers / `❯`) reads upright at
+        // foreground; the echoed command reads italic at foreground. The upright/
+        // italic split, plus the body's muted-italic base, separates prompt
+        // chrome / input / output — the runs pin the slant explicitly so the
+        // body's inherited italic does not leak into the prompt.
+        // Line 1: cwd + git status markers (guidance — upright, foreground).
         if let Some(cwd) = &self.cwd {
-            c.push_styled(&tilde(cwd), muted);
+            c.push_styled(&tilde(cwd), styled(fg, false));
         }
         if let Some(git) = &self.git {
             if !c.s.is_empty() {
-                c.push_styled(" git:", muted);
+                c.push_styled(" git:", styled(fg, false));
             }
             if let Some(branch) = &git.branch {
-                c.push_styled(branch, fg);
+                c.push_styled(branch, styled(fg, false));
             }
             for (count, sym, color) in [
                 (git.modified, "*", MARKER_MODIFIED),
@@ -180,18 +183,18 @@ impl TerminalPanel {
                 (git.untracked, "?", MARKER_UNTRACKED),
             ] {
                 if count > 0 {
-                    c.push_styled(&format!("{sym}{count}"), style_color(color));
+                    c.push_styled(&format!("{sym}{count}"), styled(color, false));
                 }
             }
         }
 
-        // Line 2: command echo with the `❯` prompt symbol.
+        // Line 2: `❯` prompt symbol (guidance) + command echo (italic).
         if let Some(cmd) = &self.command {
             if !c.s.is_empty() {
                 c.push("\n");
             }
-            c.push_styled("❯ ", style_color(PROMPT_GREEN));
-            c.push_styled(cmd, fg);
+            c.push_styled("❯ ", styled(PROMPT_GREEN, false));
+            c.push_styled(cmd, styled(fg, true));
         }
 
         (c.s, c.runs)
@@ -304,7 +307,11 @@ impl Render for TerminalPanel {
             }
         }
 
-        let doc = div().w_full().min_w_0().overflow_hidden().child(
+        // The body is the secondary, italic text: `.italic()` sets the base the
+        // RichText unstyled ranges inherit (so command output / file content /
+        // diff context all read muted + italic). The prompt-block guidance and
+        // command runs pin their own slant via `styled`, overriding back.
+        let doc = div().w_full().min_w_0().overflow_hidden().italic().child(
             RichText::new(SharedString::from(s), 0, self.selection.clone())
                 .highlights(runs)
                 .selection_bg(selection_bg),
@@ -433,6 +440,21 @@ impl Compose {
 fn style_color(c: Hsla) -> HighlightStyle {
     HighlightStyle {
         color: Some(c),
+        ..Default::default()
+    }
+}
+
+/// A color highlight that also pins the slant, so prompt guidance can override
+/// the body's inherited italic base back to upright (and the command echo can
+/// stay italic). `style_color` leaves `font_style` inherited.
+fn styled(color: Hsla, italic: bool) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(color),
+        font_style: Some(if italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        }),
         ..Default::default()
     }
 }
