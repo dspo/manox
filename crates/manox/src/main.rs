@@ -227,6 +227,10 @@ fn main() {
                 agent_ui::CompletionDismiss,
                 Some("completion == open > Input"),
             ),
+            // Cycle the collaboration mode (Default ↔ Plan). Mirrors `/plan`,
+            // the `+` menu row, and the composer mode chip. The handler lives
+            // on the active Workspace (see `Workspace::Render`).
+            gpui::KeyBinding::new("shift-tab", agent_ui::CycleCollaborationMode, None),
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &ToggleFullscreen, cx: &mut App| {

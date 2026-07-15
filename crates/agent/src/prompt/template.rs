@@ -27,7 +27,6 @@ pub enum PromptTemplate {
     SystemAssembly,
 
     // --- mode addendums (static prose, no variables) ---
-    ModePlanAddendum,
     ModeGoalAddendum,
     ModeUltracodeGrant,
 
@@ -41,10 +40,6 @@ pub enum PromptTemplate {
     WrapperAskUserResponse,
     WrapperAskUserQuestions,
     WrapperToolDenied,
-    WrapperEnterPlanMode,
-    WrapperPlanApproved,
-    WrapperPlanContinue,
-    WrapperPlanCancelled,
     WrapperGoalContinuation,
     WrapperCompactionPreamble,
 
@@ -74,7 +69,6 @@ impl PromptTemplate {
         match self {
             Self::SystemMain => "system/main.tera.md",
             Self::SystemAssembly => "system/assembly.tera.md",
-            Self::ModePlanAddendum => "mode/plan.tera.md",
             Self::ModeGoalAddendum => "mode/goal.tera.md",
             Self::ModeUltracodeGrant => "mode/ultracode.tera.md",
             Self::WrapperMaxTurnsSummary => "wrapper/max_turns_summary.tera.md",
@@ -88,10 +82,6 @@ impl PromptTemplate {
             Self::WrapperAskUserResponse => "wrapper/ask_user_response.tera.md",
             Self::WrapperAskUserQuestions => "wrapper/ask_user_questions.tera.md",
             Self::WrapperToolDenied => "wrapper/tool_denied.tera.md",
-            Self::WrapperEnterPlanMode => "wrapper/enter_plan_mode.tera.md",
-            Self::WrapperPlanApproved => "wrapper/plan_approved.tera.md",
-            Self::WrapperPlanContinue => "wrapper/plan_continue.tera.md",
-            Self::WrapperPlanCancelled => "wrapper/plan_cancelled.tera.md",
             Self::WrapperGoalContinuation => "wrapper/goal_continuation.tera.md",
             Self::WrapperCompactionPreamble => "wrapper/compaction_preamble.tera.md",
             Self::SideCallApprovalSystem => "side_call/approval_system.tera.md",
@@ -112,10 +102,9 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 30] = [
+pub const ALL: [PromptTemplate; 25] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
-    PromptTemplate::ModePlanAddendum,
     PromptTemplate::ModeGoalAddendum,
     PromptTemplate::ModeUltracodeGrant,
     PromptTemplate::WrapperMaxTurnsSummary,
@@ -127,10 +116,6 @@ pub const ALL: [PromptTemplate; 30] = [
     PromptTemplate::WrapperAskUserResponse,
     PromptTemplate::WrapperAskUserQuestions,
     PromptTemplate::WrapperToolDenied,
-    PromptTemplate::WrapperEnterPlanMode,
-    PromptTemplate::WrapperPlanApproved,
-    PromptTemplate::WrapperPlanContinue,
-    PromptTemplate::WrapperPlanCancelled,
     PromptTemplate::WrapperGoalContinuation,
     PromptTemplate::WrapperCompactionPreamble,
     PromptTemplate::SideCallApprovalSystem,

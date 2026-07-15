@@ -6,6 +6,7 @@
 
 pub mod agent_def;
 pub mod approval;
+pub mod collaboration_mode;
 pub mod command;
 pub mod compact;
 pub mod db;
@@ -25,6 +26,7 @@ pub mod paths;
 pub mod plugin;
 pub mod prefix_stability;
 pub mod prompt;
+pub mod proposed_plan;
 pub mod provider;
 pub mod read_policy;
 pub mod runtime;
@@ -44,6 +46,7 @@ pub mod webview_host;
 
 use gpui::App;
 
+pub use collaboration_mode::{ModeKind, ModeSettings, ModeSettingsMap, PlanReviewChoice};
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
 pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};
@@ -51,10 +54,7 @@ pub use message::{Message, MessageUiMetadata};
 pub use thread::{PendingAuthMeta, Thread, ThreadEvent, ThreadId, ToolCallStatus};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
 pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
-pub use tool::{
-    AgentTool, AnyAgentTool, PlanApprovalResponse, ToolOutputSink, ToolRegistry,
-    enter_plan_mode_request_tool, exit_plan_mode_request_tool,
-};
+pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};
 
 /// Register the tokio runtime, `ProviderRegistry`, `McpRegistry`,
 /// `ThreadStore`, the hashline snapshot store, the i18n bundle, and the
@@ -64,6 +64,7 @@ pub fn init(cx: &mut App) {
     // i18n before anything that renders UI or builds a system prompt, so the
     // user's locale is settled before the first frame / first turn.
     i18n::init();
+    settings::init_modes();
     provider::registry::init(cx);
     mcp::registry::init(cx);
     // LSP PATH detection (no spawn — servers start lazily on first code-intel

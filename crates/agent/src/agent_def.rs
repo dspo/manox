@@ -1,5 +1,5 @@
 //! Subagent definitions: a set of built-in definitions compiled into the
-//! binary (`plan`, `explore`) plus user-authored files under
+//! binary (`explore`) plus user-authored files under
 //! `~/.config/cx/manox/agents/*.md` and the `agents/` subdirectory of every
 //! installed plugin.
 //!
@@ -11,7 +11,7 @@
 //!
 //! Built-in definitions are loaded first; a user-authored or plugin file with
 //! the same `name` overrides the built-in (same-key-wins on insert order), so
-//! users can customize or replace the bundled `plan`/`explore` agents.
+//! users can customize or replace the bundled `explore` agent.
 //!
 //! Plugin-provided definitions are registered under a `plugin:name` namespace
 //! so they never collide with built-in or user-authored agents — the parent
@@ -73,7 +73,7 @@ pub struct AgentDefinitionRegistry {
 impl AgentDefinitionRegistry {
     /// Load the registry: built-in definitions first, then user-authored and
     /// plugin files. Same-`name` later loads override earlier ones, so users can
-    /// customize the bundled `plan`/`explore` agents by dropping a same-named
+    /// customize the bundled `explore` agent by dropping a same-named
     /// file in `~/.config/cx/manox/agents/`. Missing dirs or parse errors do not
     /// abort the load; the registry ends up partial. Plugin definitions are
     /// registered under `plugin:name` so they cannot shadow user-authored ones.
@@ -172,12 +172,8 @@ fn parse_definition(raw: &str, source: &str) -> Result<AgentDefinitionFile> {
 /// authoring error, so failures are surfaced as panics at load time rather than
 /// silently skipped.
 fn builtin_definitions() -> Vec<AgentDefinitionFile> {
-    const PLAN: &str = include_str!("agents/plan.md");
     const EXPLORE: &str = include_str!("agents/explore.md");
-    vec![
-        parse_definition(PLAN, "builtin:plan").expect("builtin plan agent must parse"),
-        parse_definition(EXPLORE, "builtin:explore").expect("builtin explore agent must parse"),
-    ]
+    vec![parse_definition(EXPLORE, "builtin:explore").expect("builtin explore agent must parse")]
 }
 
 static REGISTRY: OnceLock<AgentDefinitionRegistry> = OnceLock::new();
@@ -267,10 +263,6 @@ mod tests {
     fn builtin_definitions_parse_and_are_read_only() {
         let builtins = builtin_definitions();
         let names: Vec<&str> = builtins.iter().map(|f| f.def.name.as_str()).collect();
-        assert!(
-            names.contains(&"plan"),
-            "builtin plan must exist: {names:?}"
-        );
         assert!(
             names.contains(&"explore"),
             "builtin explore must exist: {names:?}"

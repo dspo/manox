@@ -45,6 +45,7 @@ gpui::actions!(
         CompletionDismiss,
         UndoLastQueued,
         ToggleCockpitTasks,
-        BackgroundCurrentThread
+        BackgroundCurrentThread,
+        CycleCollaborationMode
     ]
 );

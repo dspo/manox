@@ -147,13 +147,6 @@ pub struct GoalContinuationData {
     pub condition: String,
 }
 
-/// Plan-approval wrapper: echoes the approved plan text back to the model so it
-/// can begin execution from the agreed scope.
-#[derive(Debug, Clone, Serialize)]
-pub struct PlanApprovedData {
-    pub plan_text: String,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactionPreambleData {
     pub summary: String,

@@ -9,7 +9,6 @@
 //! `serde_json::from_value`. The registry stores `Arc<dyn AgentTool>`.
 
 pub mod permission;
-pub mod plan_mode;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -21,10 +20,6 @@ use tokio_util::sync::CancellationToken;
 use crate::language_model::{AnyLanguageModel, LanguageModelRequestTool};
 
 pub use permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
-pub use plan_mode::{
-    EnterPlanModeTool, ExitPlanModeTool, PlanApprovalResponse, enter_plan_mode_request_tool,
-    exit_plan_mode_request_tool,
-};
 
 /// Read-only runtime identity a tool reads from its owning `Thread`, passed
 /// into [`AgentTool::run`] / [`AgentTool::run_streaming`] per invocation.
@@ -264,10 +259,11 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Plan-mode filter: only tools whose `is_read_only()` returns true. Write
-    /// tools (`write_file`, `edit_file`, `bash`, `agent`) are excluded, leaving
-    /// the read-only allowlist. The `exit_plan_mode` tool is appended separately
-    /// by the caller — it is not in the registry.
+    /// Plan-mode tool set: only tools whose `is_read_only()` returns true.
+    /// Write/exec tools (`write_file`, `edit_file`, `bash`) are excluded; the
+    /// `agent` tool is read-only (`SpawnAgentTool::is_read_only`), so it
+    /// survives — letting the main thread delegate research to the `explore`
+    /// sub-agent with isolated context.
     pub fn to_request_tools_read_only(&self) -> Vec<LanguageModelRequestTool> {
         self.tools
             .values()
@@ -404,8 +400,7 @@ mod tests {
                 "{allowed} missing from plan-mode set"
             );
         }
-        // exit_plan_mode is NOT in the registry — it is appended by the caller.
-        assert!(!ro_names.contains(&"exit_plan_mode"));
+        // The read-only set is strictly smaller than the full set.
         assert!(ro.len() < full.len());
     }
 }

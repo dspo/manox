@@ -20,8 +20,8 @@ use agent::settings;
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
 use agent::{
-    PermissionDecision, PlanApprovalResponse, ReasoningEffort, Thread, ThreadEvent, ThreadId, i18n,
-    save_thread,
+    ModeKind, PermissionDecision, PlanReviewChoice, ReasoningEffort, Thread, ThreadEvent, ThreadId,
+    i18n, save_thread,
 };
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle,
@@ -89,12 +89,10 @@ struct PendingAuth {
     reason: Option<String>,
 }
 
-/// A pending plan approval prompted by `ThreadEvent::PlanProposed`. The plan
-/// text is carried here for the approval overlay body, backfilled into the
-/// matching ToolCall item for the chat view, and parsed into cockpit
-/// milestones when the user approves.
-struct PendingPlan {
-    id: String,
+/// A completed `<proposed_plan>` block awaiting the user's three-way review
+/// verdict. Carries the plan text for the overlay body and (on an implement
+/// verdict) for re-injection as the implement turn's seed.
+struct PendingPlanReview {
     plan_text: String,
 }
 
@@ -299,15 +297,12 @@ pub struct Workspace {
     title_menu_open: bool,
     title_menu: Option<Entity<PopupMenu>>,
     title_menu_sub: Option<Subscription>,
-    /// A pending plan approval (model called `exit_plan_mode`) rendered as
-    /// inline actions on the matching plan card.
-    pending_plan: Option<PendingPlan>,
-    /// Follow-ups submitted while a turn is running (or while a plan card is
-    /// awaiting inline approval). Steer items are injected into the running
-    /// turn at the next safe join point; queue items flush as the next user
-    /// turn on terminal Stop. The first item also covers the plan-continue
-    /// deferred-turn path: it is pushed here and `respond_plan(false)` auto
-    /// continues, so the flush lands after the plan-continue tool result.
+    /// A completed plan awaiting the user's implement / clear-context / stay
+    /// verdict, rendered as the plan-review overlay.
+    pending_plan_review: Option<PendingPlanReview>,
+    /// Follow-ups submitted while a turn is running. Steer items are injected
+    /// into the running turn at the next safe join point; queue items flush as
+    /// the next user turn on terminal Stop.
     queued_follow_ups: std::collections::VecDeque<QueuedFollowUp>,
     /// Tracks whether the composer placeholder currently reads the follow-up
     /// hint, so the placeholder only flips on the running↔idle transition
@@ -567,7 +562,7 @@ impl Workspace {
             title_menu_open: false,
             title_menu: None,
             title_menu_sub: None,
-            pending_plan: None,
+            pending_plan_review: None,
             queued_follow_ups: std::collections::VecDeque::new(),
             composer_followup_placeholder: false,
             pending_attachments: Vec::new(),
@@ -650,24 +645,15 @@ impl Workspace {
                     });
                     cx.notify();
                 }
-                ThreadEvent::PlanProposed { id, plan_text } => {
-                    this.pending_plan = Some(PendingPlan {
-                        id: id.clone(),
+                ThreadEvent::PlanDelta { .. } => {
+                    // Live plan text streaming in; the finalized plan surfaces
+                    // as a PlanReady review prompt at turn end. Deltas only
+                    // refresh so a future real-time preview can hook here.
+                    cx.notify();
+                }
+                ThreadEvent::PlanReady { plan_text } => {
+                    this.pending_plan_review = Some(PendingPlanReview {
                         plan_text: plan_text.clone(),
-                    });
-                    // Delegate to ConversationState to backfill the plan text
-                    // into the matching ToolCall item for markdown rendering.
-                    let weak = cx.weak_entity();
-                    let role = this.model_label(cx);
-                    let cwd = thread_cwd(&this.thread, cx);
-                    this.conversation.update(cx, |c, cx| {
-                        c.apply(
-                            ev,
-                            &role,
-                            None,
-                            crate::conversation::ApplyCtx { weak, cwd },
-                            cx,
-                        )
                     });
                     cx.notify();
                 }
@@ -731,15 +717,13 @@ impl Workspace {
                     // to the end via the per-frame arbitration in `render`.
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
-                        // A terminal state ends any pending plan approval — the
-                        // oneshot was resolved or cancelled on the thread side.
-                        // Mid-turn `Stop(ToolUse)` must NOT clear it: that fires
-                        // between tool rounds and would race a `PlanProposed`
-                        // arriving in the same turn (thread 1c9c8df1: the first
-                        // `exit_plan_mode` call dropped the overlay because this
-                        // cleared `pending_plan` before the approval arm ran).
-                        this.pending_plan = None;
-                        // A terminal stop abandons any parked browser yield
+                        // A terminal stop is exactly when a finalized plan
+                        // surfaces — `PlanReady` is emitted just before `Stop`
+                        // in the same thread update, so it has already armed
+                        // the review overlay. Do NOT clear it here (the old
+                        // oneshot-approval clear raced the PlanReady arm).
+                        // Mid-turn `Stop(ToolUse)` carries no plan review.
+                        // A terminal state abandons any parked browser yield
                         // (the parked Task is cancelled on the thread side)
                         // and dismisses stranded inbound-write overlays whose
                         // decision oneshot the thread just dropped.
@@ -844,9 +828,9 @@ impl Workspace {
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
                         // An error is a terminal state symmetric to a terminal
-                        // `Stop`: the turn aborted, so any pending plan overlay
+                        // `Stop`: the turn aborted, so any pending plan review
                         // is now stale and must not linger over an idle thread.
-                        this.pending_plan = None;
+                        this.pending_plan_review = None;
                         // Symmetric to the terminal `Stop` arm: retire parked
                         // browser yields + stranded inbound overlays so an
                         // aborted turn leaves no stale banner behind.
@@ -1807,7 +1791,7 @@ impl Workspace {
         self.outline_hover = None;
         self.pending_auths.clear();
         self.pending_ask = None;
-        self.pending_plan = None;
+        self.pending_plan_review = None;
         self.queued_follow_ups.clear();
         self.thread_sub = Some(self.subscribe_thread(cx));
         // The thinking ticker belongs to the outgoing thread: bump its
@@ -1820,9 +1804,9 @@ impl Workspace {
         }
         // Cockpit state is per-thread: the outgoing thread's milestones,
         // running-tool title, and per-model counter state do not apply to the
-        // incoming one. Milestones are not persisted (PlanProposed isn't in
-        // the store's event stream), so a reloaded thread starts with an empty
-        // panel; a still-running parked thread resumes mid-stream. Refresh
+        // incoming one. Milestones are not persisted (a plan review never
+        // enters the store's event stream), so a reloaded thread starts with
+        // an empty panel; a still-running parked thread resumes mid-stream. Refresh
         // cached auto-compact knobs in case the user edited settings while
         // viewing another thread — cheap, and keeps the budget accurate.
         let auto_compact = settings::load().auto_compact;
@@ -1842,13 +1826,6 @@ impl Workspace {
         // while waiting for tool approval), re-surface them so the overlay
         // appears immediately upon switching back.
         self.resurface_pending_auths(cx);
-        // Symmetric to the auth resurface: if the incoming thread is parked on
-        // an `exit_plan_mode` approval, restore `pending_plan` so the plan card
-        // re-arms its Approve/Continue buttons and the parked oneshot can be
-        // resolved. Without this, `attach_thread`'s `pending_plan = None`
-        // above leaves a parked plan with no UI to approve it — the turn hangs
-        // until the user cancels.
-        self.resurface_pending_plan(cx);
         self.sidebar
             .update(cx, |s, cx| s.set_selected(Some(id.clone()), cx));
         // The user is now viewing this thread: clear any unread red dot it
@@ -1968,28 +1945,6 @@ impl Workspace {
         }
     }
 
-    /// Restore `pending_plan` if the incoming thread is parked on an
-    /// `exit_plan_mode` approval. Mirrors `resurface_pending_auths`: the thread
-    /// kept its parked oneshot alive in the background, and stored the plan text
-    /// alongside it; `attach_thread` cleared the workspace's `pending_plan`, so
-    /// without this the plan card re-renders without Approve/Continue buttons
-    /// and the parked turn hangs until cancelled.
-    fn resurface_pending_plan(&mut self, cx: &mut Context<Self>) {
-        if self.pending_plan.is_some() {
-            return;
-        }
-        if let Some((id, plan_text)) = self
-            .thread
-            .read(cx)
-            .pending_plan_entries()
-            .into_iter()
-            .last()
-        {
-            self.pending_plan = Some(PendingPlan { id, plan_text });
-            cx.notify();
-        }
-    }
-
     fn start_new_thread(
         &mut self,
         project: Option<PathBuf>,
@@ -2084,7 +2039,7 @@ impl Workspace {
         // rather than interrupting the run (e.g. `/clear` mid-turn would race
         // the streaming conversation). The queued text flushes at turn end.
         if !self.thread.read(cx).is_running()
-            && self.pending_plan.is_none()
+            && self.pending_plan_review.is_none()
             && attachments.is_empty()
             && let Some(parsed) = crate::slash_command::parse(&text)
         {
@@ -2238,15 +2193,10 @@ impl Workspace {
             ui,
             user_images,
         };
-        // Plan approval in flight: park the turn and let the plan response
-        // drive it. Reuses the queue; the state is moot here since the
-        // turn runs as soon as the plan-continue result lands.
-        if self.pending_plan.is_some() {
-            self.queued_follow_ups.push_back(QueuedFollowUp {
-                turn,
-                state: FollowUpState::Queued,
-            });
-            self.respond_plan(false, cx);
+        // A plan review is awaiting the user's verdict — block new turns until
+        // they pick implement / clear-context / stay (the review overlay is the
+        // only live affordance, mirroring the pending-ask gate).
+        if self.pending_plan_review.is_some() {
             return;
         }
         // A turn is running — park the message as a visible follow-up instead
@@ -2756,7 +2706,7 @@ impl Workspace {
         let text = self.editor_state.read(cx).value().to_string();
         if text.trim().is_empty()
             || self.pending_ask.is_some()
-            || self.pending_plan.is_some()
+            || self.pending_plan_review.is_some()
             || self.thread.read(cx).is_running()
         {
             return;
@@ -3049,10 +2999,6 @@ impl Workspace {
         })
     }
 
-    pub(crate) fn pending_plan_id(&self) -> Option<String> {
-        self.pending_plan.as_ref().map(|p| p.id.clone())
-    }
-
     pub(crate) fn toggle_ask_option(&mut self, qi: usize, oi: usize, cx: &mut Context<Self>) {
         if let Some(ask) = self.pending_ask.as_mut()
             && let Some(sel) = ask.selections.get_mut(qi)
@@ -3168,42 +3114,27 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Resolve the pending plan approval (approve/reject from the overlay).
-    pub(crate) fn respond_plan(&mut self, approve: bool, cx: &mut Context<Self>) {
-        let Some(plan) = self.pending_plan.take() else {
+    /// Resolve the pending plan review with the user's three-way verdict.
+    /// Implement (with or without a context clear) seeds the cockpit
+    /// milestone panel and delegates to the thread, which exits Plan mode and
+    /// re-injects the plan as the implement turn's seed. Stay keeps the thread
+    /// in Plan mode for another research round.
+    pub(crate) fn respond_plan_review(&mut self, choice: PlanReviewChoice, cx: &mut Context<Self>) {
+        let Some(review) = self.pending_plan_review.take() else {
             return;
         };
-        // An approved plan seeds the cockpit milestone panel. Continue-in-plan
-        // does not — the user asked for another planning round, so the prior
-        // steps no longer describe committed work.
-        if approve {
-            self.context_rail
-                .update(cx, |r, cx| r.set_milestones_from_plan(&plan.plan_text, cx));
+        if matches!(
+            choice,
+            PlanReviewChoice::Implement | PlanReviewChoice::ImplementClearContext
+        ) {
+            self.context_rail.update(cx, |r, cx| {
+                r.set_milestones_from_plan(&review.plan_text, cx)
+            });
         }
         self.thread.update(cx, |thread, cx| {
-            thread.respond_plan_approval(
-                &plan.id,
-                if approve {
-                    PlanApprovalResponse::Approve
-                } else {
-                    PlanApprovalResponse::ContinueInPlanMode
-                },
-                cx,
-            );
+            thread.respond_plan_review(choice, review.plan_text, cx);
         });
         cx.notify();
-    }
-
-    pub(crate) fn respond_plan_for_card(
-        &mut self,
-        id: &str,
-        approve: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if self.pending_plan.as_ref().is_none_or(|p| p.id != id) {
-            return;
-        }
-        self.respond_plan(approve, cx);
     }
 
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3439,6 +3370,126 @@ impl Workspace {
                                         .on_click(cx.listener({
                                             move |this, _, _, cx| {
                                                 this.resolve_inbound(true, cx);
+                                            }
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Plan-review overlay: surfaced by `ThreadEvent::PlanReady` at a terminal
+    /// stop in Plan mode. The model's finalized `<proposed_plan>` block renders
+    /// as markdown, and the user picks one of three verdicts — implement
+    /// (optionally after clearing context), or stay in Plan for another round.
+    /// Faithful adaptation of codex's turn-end review popup: no mid-turn
+    /// oneshot, the block content never enters the conversation.
+    fn render_plan_review_overlay(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let review = self.pending_plan_review.as_ref()?;
+        let plan_text = review.plan_text.clone();
+        let accent = theme.accent;
+        Some(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.foreground.opacity(0.6))
+                .child(
+                    v_flex()
+                        .w(px(560.))
+                        .max_h(px(640.))
+                        .p_4()
+                        .gap_3()
+                        .rounded(theme.radius)
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::LayoutDashboard)
+                                        .small()
+                                        .text_color(accent),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(i18n::t("plan-review-title")),
+                                ),
+                        )
+                        .child(
+                            gpui::div()
+                                .w_full()
+                                .max_h(px(420.))
+                                .overflow_hidden()
+                                .rounded(theme.radius)
+                                .bg(theme.secondary)
+                                .p_3()
+                                .child(
+                                    cx.new(|_| {
+                                        Markdown::new("plan-review-body", plan_text)
+                                            .theme(theme)
+                                            .scrollable(true)
+                                            .heading_mode(HeadingMode::Uniform)
+                                    })
+                                    .into_any_element(),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("plan-review-stay")
+                                        .ghost()
+                                        .small()
+                                        .label(i18n::t("plan-review-stay"))
+                                        .on_click(cx.listener({
+                                            move |this, _, _, cx| {
+                                                this.respond_plan_review(
+                                                    PlanReviewChoice::StayInPlan,
+                                                    cx,
+                                                );
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new("plan-review-clear")
+                                        .ghost()
+                                        .small()
+                                        .label(i18n::t("plan-review-implement-clear"))
+                                        .on_click(cx.listener({
+                                            move |this, _, _, cx| {
+                                                this.respond_plan_review(
+                                                    PlanReviewChoice::ImplementClearContext,
+                                                    cx,
+                                                );
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    Button::new("plan-review-implement")
+                                        .primary()
+                                        .small()
+                                        .label(i18n::t("plan-review-implement"))
+                                        .on_click(cx.listener({
+                                            move |this, _, _, cx| {
+                                                this.respond_plan_review(
+                                                    PlanReviewChoice::Implement,
+                                                    cx,
+                                                );
                                             }
                                         })),
                                 ),
@@ -3898,7 +3949,8 @@ impl Workspace {
         // running (and no plan/ask is awaiting input), restoring it on idle.
         // The cached flag limits the InputState mutation to the transition so
         // render doesn't churn the placeholder every frame.
-        let followup_mode = running && self.pending_plan.is_none() && self.pending_ask.is_none();
+        let followup_mode =
+            running && self.pending_plan_review.is_none() && self.pending_ask.is_none();
         if followup_mode != self.composer_followup_placeholder {
             self.composer_followup_placeholder = followup_mode;
             let key = if followup_mode {
@@ -3913,14 +3965,14 @@ impl Workspace {
         let queue = self.render_queued_follow_ups(theme, cx);
         let plus = self.render_plus_button(cx);
         let project_chip = self.render_project_chip(theme, cx);
-        let plan_chip = self.render_plan_chip(theme, cx);
+        let mode_chip = self.render_mode_chip(theme, cx);
         let goal_chip = self.render_goal_chip(theme, cx);
         let team_chip = self.render_team_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
         let effort = self.render_reasoning_effort_selector(theme, cx);
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(
-            running && self.pending_plan.is_none() && self.pending_ask.is_none(),
+            running && self.pending_plan_review.is_none() && self.pending_ask.is_none(),
             cx,
         );
         // The completion popover overlays the composer; anchoring it on the
@@ -4000,7 +4052,7 @@ impl Workspace {
                             .min_w_0()
                             .child(plus)
                             .child(project_chip)
-                            .when_some(plan_chip, |el, chip| el.child(chip))
+                            .when_some(mode_chip, |el, chip| el.child(chip))
                             .when_some(goal_chip, |el, chip| el.child(chip))
                             .when_some(team_chip, |el, chip| el.child(chip))
                             .child(access),
@@ -4180,19 +4232,22 @@ impl Workspace {
         rows
     }
 
-    /// Plan-mode chip — shown only while the thread is in plan mode. A
-    /// highlighted accent pill next to the access chip so the read-only
-    /// research posture is legible at a glance. Clicking exits plan mode
-    /// (mirrors the `+` menu toggle).
-    fn render_plan_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.thread.read(cx).plan_mode() {
-            return None;
-        }
+    /// Collaboration-mode chip — always visible, shows the active mode's
+    /// display name so the read-only Plan posture (vs execution Default) is
+    /// legible at a glance. Clicking cycles to the next mode, mirroring
+    /// `/plan`, the `+` menu row, and `shift-tab`.
+    fn render_mode_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let mode = self.thread.read(cx).collaboration_mode();
+        let in_plan = mode == ModeKind::Plan;
         let accent = theme.accent;
-        let label: SharedString = i18n::t("workspace-chip-plan-mode");
+        let label: SharedString = i18n::t(if in_plan {
+            "mode-chip-plan"
+        } else {
+            "mode-chip-default"
+        });
         Some(
             h_flex()
-                .id("plan-chip")
+                .id("mode-chip")
                 .items_center()
                 .gap_1()
                 .px_2()
@@ -4200,16 +4255,31 @@ impl Workspace {
                 .rounded(theme.radius)
                 .bg(theme.secondary)
                 .border_1()
-                .border_color(accent)
+                .border_color(if in_plan { accent } else { theme.border })
                 .cursor_pointer()
                 .child(
                     Icon::new(IconName::LayoutDashboard)
                         .xsmall()
-                        .text_color(accent),
+                        .text_color(if in_plan {
+                            accent
+                        } else {
+                            theme.muted_foreground
+                        }),
                 )
-                .child(gpui::div().text_xs().text_color(accent).child(label))
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(if in_plan {
+                            accent
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .child(label),
+                )
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.thread.update(cx, |t, cx| t.set_plan_mode(false, cx));
+                    this.thread.update(cx, |t, cx| {
+                        t.set_collaboration_mode(t.collaboration_mode().next(), cx);
+                    });
                     cx.notify();
                 }))
                 .into_any_element(),
@@ -4662,8 +4732,9 @@ impl Workspace {
                 move |_window, cx| {
                     let _ = ws_plan.update(cx, |this, cx| {
                         this.close_plus_menu();
-                        let on = this.thread.read(cx).plan_mode();
-                        this.thread.update(cx, |t, cx| t.set_plan_mode(!on, cx));
+                        this.thread.update(cx, |t, cx| {
+                            t.set_collaboration_mode(t.collaboration_mode().next(), cx);
+                        });
                         cx.notify();
                     });
                 },
@@ -4776,7 +4847,7 @@ impl Workspace {
             .disabled(disabled)
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.thread.read(cx).is_running()
-                    && this.pending_plan.is_none()
+                    && this.pending_plan_review.is_none()
                     && this.pending_ask.is_none()
                 {
                     this.cancel_turn(cx);
@@ -5202,7 +5273,7 @@ impl Workspace {
     ) -> Option<AnyElement> {
         if self.pending_ask.is_some()
             || !self.pending_auths.is_empty()
-            || self.pending_plan.is_some()
+            || self.pending_plan_review.is_some()
         {
             return None;
         }
@@ -5478,7 +5549,8 @@ impl Render for Workspace {
         self.ensure_blank_project_input(window, cx);
 
         let overlay = self
-            .render_auth_overlay(&theme, cx)
+            .render_plan_review_overlay(&theme, cx)
+            .or_else(|| self.render_auth_overlay(&theme, cx))
             .or_else(|| self.render_inbound_overlay(&theme, cx))
             .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
 
@@ -5832,6 +5904,14 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &crate::UndoLastQueued, _window, cx| {
                 this.undo_last_queued(cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::CycleCollaborationMode, _window, cx| {
+                    this.thread.update(cx, |t, cx| {
+                        t.set_collaboration_mode(t.collaboration_mode().next(), cx);
+                    });
+                    cx.notify();
+                }),
+            )
             // Completion actions only match via the `completion == open > Input`
             // keybindings, so any fire means the popover was open and these
             // keystrokes belong to it. Stop propagation so the Input's own
@@ -6406,7 +6486,7 @@ impl Workspace {
             self.resolve_ask_with_response(Some(text), cx);
             return Ok(());
         }
-        if self.thread.read(cx).is_running() && self.pending_plan.is_none() {
+        if self.thread.read(cx).is_running() && self.pending_plan_review.is_none() {
             return Err("thread is already running a turn".into());
         }
         self.send_user_turn(text, Vec::new(), cx);
@@ -6423,14 +6503,18 @@ impl Workspace {
         has
     }
 
-    pub(crate) fn harness_plan_respond(&mut self, approve: bool, cx: &mut Context<Self>) -> bool {
-        let has = self.pending_plan.is_some();
-        self.respond_plan(approve, cx);
+    pub(crate) fn harness_plan_review_respond(
+        &mut self,
+        choice: PlanReviewChoice,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let has = self.pending_plan_review.is_some();
+        self.respond_plan_review(choice, cx);
         has
     }
 
-    pub(crate) fn harness_pending_plan_id(&self) -> Option<String> {
-        self.pending_plan_id()
+    pub(crate) fn harness_has_pending_plan_review(&self) -> bool {
+        self.pending_plan_review.is_some()
     }
 
     pub(crate) fn harness_has_pending_ask(&self) -> bool {

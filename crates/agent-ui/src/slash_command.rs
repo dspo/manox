@@ -333,12 +333,13 @@ impl SlashCommand for SkillSlashCommand {
     }
 }
 ///
-/// - No args: toggle plan mode and consume the input (nothing sent to the
-///   model). The state change is reflected in the access chip.
-/// - With args: ensure plan mode is on, then send `args` as a normal user
-///   message so the agent plans against that prompt. `set_plan_mode(true)`
+/// - No args: cycle the collaboration mode (Default ↔ Plan) and consume the
+///   input (nothing sent to the model). The state change is reflected in the
+///   mode chip.
+/// - With args: switch to Plan mode, then send `args` as a normal user message
+///   so the agent plans against that prompt. `set_collaboration_mode(Plan)`
 ///   runs before `InjectUserTurn` returns, so the turn `submit_input` then
-///   launches builds its request with the read-only tool filter already active.
+///   launches builds its request with the read-only tool set already active.
 struct PlanCommand;
 
 impl SlashCommand for PlanCommand {
@@ -356,14 +357,16 @@ impl SlashCommand for PlanCommand {
         cx: &mut Context<Workspace>,
     ) -> SlashResult {
         let thread = workspace.thread.clone();
-        let in_plan = thread.read(cx).plan_mode();
+        let mode = thread.read(cx).collaboration_mode();
         if args.is_empty() {
-            thread.update(cx, |t, cx| t.set_plan_mode(!in_plan, cx));
+            thread.update(cx, |t, cx| t.set_collaboration_mode(mode.next(), cx));
             cx.notify();
             SlashResult::Handled
         } else {
-            if !in_plan {
-                thread.update(cx, |t, cx| t.set_plan_mode(true, cx));
+            if mode != agent::ModeKind::Plan {
+                thread.update(cx, |t, cx| {
+                    t.set_collaboration_mode(agent::ModeKind::Plan, cx)
+                });
             }
             cx.notify();
             SlashResult::InjectUserTurn(args.to_string())
