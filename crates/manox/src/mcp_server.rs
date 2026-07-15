@@ -120,8 +120,17 @@ async fn dispatch_call(
             McpRequest::Approve { decision, reply }
         }
         "manox_plan_respond" => {
-            let approve = get_bool(args, "approve")?;
-            McpRequest::PlanRespond { approve, reply }
+            let choice = match get_str(args, "choice")?.as_str() {
+                "implement" => agent::PlanReviewChoice::Implement,
+                "implement_clear" => agent::PlanReviewChoice::ImplementClearContext,
+                "stay" => agent::PlanReviewChoice::StayInPlan,
+                other => {
+                    return Err(format!(
+                        "unknown plan review choice: {other} (implement | implement_clear | stay)"
+                    ));
+                }
+            };
+            McpRequest::PlanReviewRespond { choice, reply }
         }
         "manox_cancel" => McpRequest::Cancel { reply },
         "manox_read_conversation" => McpRequest::ReadConversation { reply },
@@ -147,14 +156,6 @@ fn get_str(args: &JsonObject, key: &str) -> Result<String, String> {
     match args.get(key) {
         Some(Value::String(s)) => Ok(s.clone()),
         Some(other) => Err(format!("argument `{key}` must be a string, got {other}")),
-        None => Err(format!("missing required argument `{key}`")),
-    }
-}
-
-fn get_bool(args: &JsonObject, key: &str) -> Result<bool, String> {
-    match args.get(key) {
-        Some(Value::Bool(b)) => Ok(*b),
-        Some(other) => Err(format!("argument `{key}` must be a boolean, got {other}")),
         None => Err(format!("missing required argument `{key}`")),
     }
 }
@@ -260,13 +261,16 @@ fn tool_list() -> Vec<rmcp::model::Tool> {
         ),
         tool(
             "manox_plan_respond",
-            "Approve or reject the pending exit_plan_mode plan.",
+            "Resolve the pending plan review with the user's verdict.",
             json!({
                 "type": "object",
                 "properties": {
-                    "approve": { "type": "boolean" }
+                    "choice": {
+                        "type": "string",
+                        "enum": ["implement", "implement_clear", "stay"]
+                    }
                 },
-                "required": ["approve"],
+                "required": ["choice"],
                 "additionalProperties": false
             }),
         ),

@@ -25,6 +25,7 @@ use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::collaboration_mode::{ModeKind, ModeSettings};
 use crate::db::ThreadRecord;
 use crate::goal::{self, GoalVerdict};
 use crate::language_model::{
@@ -34,12 +35,10 @@ use crate::language_model::{
 };
 use crate::message::Message;
 use crate::prefix_stability::StablePrefix;
+use crate::proposed_plan::{ProposedPlanParser, ProposedPlanSegment};
 use crate::title_state::TitleState;
 use crate::token_meter::TokenMeter;
-use crate::tool::{
-    PermissionCache, PermissionDecision, PlanApprovalResponse, ToolAuthorizationResponse,
-    ToolRegistry, enter_plan_mode_request_tool, exit_plan_mode_request_tool,
-};
+use crate::tool::{PermissionCache, PermissionDecision, ToolAuthorizationResponse, ToolRegistry};
 use crate::tools;
 
 /// Stable `Thread` id used for persistence.
@@ -177,9 +176,15 @@ pub enum ThreadEvent {
     },
     /// An error during streaming.
     Error(anyhow::Error),
-    /// The model called `exit_plan_mode` and submitted a plan. The UI shows an
-    /// approval overlay; resolution arrives via `respond_plan_approval`.
-    PlanProposed { id: String, plan_text: String },
+    /// Live `<proposed_plan>` block delta streamed from the model in Plan mode.
+    /// UI-only: never enters the model's message history. The block content is
+    /// stripped from the assistant message so the model never re-reads its own
+    /// plan next turn.
+    PlanDelta { delta: String },
+    /// A turn ended with a complete `<proposed_plan>` block. The UI shows the
+    /// Plan Implementation overlay; the user's choice arrives via the
+    /// workspace's plan-review handler. UI-only: never enters history.
+    PlanReady { plan_text: String },
     /// The prefix-stability fingerprint for this turn vs. the previous one.
     /// Emitted every turn with the current stability ratio plus the drift
     /// flags so subscribers (e.g. future telemetry or debug views) can
@@ -273,15 +278,6 @@ pub struct PendingAuthMeta {
     pub tool_name: String,
     pub summary: String,
     pub input: serde_json::Value,
-}
-
-/// UI metadata for a pending plan approval. The plan text lives here, not on
-/// the oneshot sender, so a thread backgrounded while parked on
-/// `exit_plan_mode` can hand the plan back to the workspace when the user
-/// switches back — the workspace's `pending_plan` would otherwise be lost on
-/// `attach_thread`, leaving the parked oneshot unresolvable.
-pub struct PendingPlanMeta {
-    pub plan_text: String,
 }
 
 /// Session-scoped goal-mode state. Not persisted — a goal is an ephemeral
@@ -508,12 +504,6 @@ pub struct Thread {
     /// of each round-trip and after a recovery turn so a prior stop reason
     /// never bleeds forward.
     last_stop_reason: Option<StopReason>,
-    /// Set by `run_plan_approval`'s continue branch to signal `run_turn_loop`
-    /// to stop after the tool batch rather than auto-continuing into another
-    /// completion. Continuing carries no new information, so a follow-up round
-    /// would be a pointless burn; the user's next message becomes the
-    /// revision direction. `plan_mode` stays on.
-    stop_after_plan_reject: bool,
     /// The running turn task; dropping it aborts the turn.
     running_turn: Option<Task<()>>,
     /// Cancellation token for the running turn. Cancelled by `cancel()` so the
@@ -534,23 +524,30 @@ pub struct Thread {
     /// Whether the SessionStart hook has fired for this thread. Main threads
     /// (depth 0) fire once on their first turn; sub-agents never fire it.
     session_started: bool,
-    /// Whether this thread is in plan mode. When true, `build_completion_request`
-    /// filters the tool list to read-only tools plus `exit_plan_mode` and
-    /// appends the plan-mode system-prompt addendum; `run_tool_inner` intercepts
-    /// `exit_plan_mode` to run the approval handshake. Main-thread only —
-    /// sub-agents always have `plan_mode == false`.
-    plan_mode: bool,
+    /// The active collaboration mode. `Plan` filters the tool set to
+    /// read-only tools and the model submits a plan by emitting a single
+    /// `<proposed_plan>` block (parsed by `proposed_plan_parser`); `Default`
+    /// is the execution mode. Session-scoped — never persisted: a reloaded
+    /// thread always starts in `Default`. Main-thread only in spirit; the
+    /// per-mode `developer_instructions` are injected as a fixed-position
+    /// `<collaboration_mode>` message at request-build time, not woven into
+    /// the system prompt, so toggling mode keeps the provider prefix cache
+    /// warm. Sub-agents always run in `Default`.
+    collaboration_mode: ModeKind,
+    /// Streaming `<proposed_plan>` parser for the current turn. Reset at the
+    /// top of each turn iteration. Splits assistant text deltas into visible
+    /// text (persisted into the assistant message) and plan deltas (emitted as
+    /// `ThreadEvent::PlanDelta`); a completed block at turn end yields
+    /// `ThreadEvent::PlanReady`.
+    proposed_plan_parser: ProposedPlanParser,
+    /// Accumulated text of the current turn's `<proposed_plan>` block (the
+    /// concatenated `Delta` segments the parser emits). Drains into
+    /// `ThreadEvent::PlanReady` at turn end, then clears. Empty when the turn
+    /// produced no plan.
+    pending_plan_text: String,
     /// User-selected reasoning effort for providers that expose an effort knob.
     /// This is request metadata, not model-visible prompt text.
     reasoning_effort: ReasoningEffort,
-    /// Pending plan-approval oneshots, keyed by the `exit_plan_mode` tool_use
-    /// id. Mirrors `pending_authorizations` exactly.
-    pending_plan_approval: HashMap<String, tokio::sync::oneshot::Sender<PlanApprovalResponse>>,
-    /// Plan text for each pending plan approval, keyed by the same tool_use id.
-    /// Mirrors `pending_auth_meta`: `run_plan_approval` stores the plan here when
-    /// it parks, so `attach_thread` can restore the workspace's `pending_plan`
-    /// after a background→foreground round-trip.
-    pending_plan_meta: HashMap<String, PendingPlanMeta>,
     /// Pending inbound-write authorization oneshots for the browser axis,
     /// keyed by the inbound request id allocated by the host. Resolved by
     /// `respond_inbound` with an allow/deny decision; orthogonal to
@@ -765,16 +762,15 @@ impl Thread {
                 pending_stream_error: None,
                 recovery_retries: 0,
                 last_stop_reason: None,
-                stop_after_plan_reject: false,
                 running_turn: None,
                 turn_started_at: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
-                plan_mode: false,
+                collaboration_mode: ModeKind::Default,
+                proposed_plan_parser: ProposedPlanParser::new(),
+                pending_plan_text: String::new(),
                 reasoning_effort: ReasoningEffort::default(),
-                pending_plan_approval: HashMap::new(),
-                pending_plan_meta: HashMap::new(),
                 goal: None,
                 goal_cancel: None,
                 title_state: TitleState::default(),
@@ -852,16 +848,15 @@ impl Thread {
                 pending_stream_error: None,
                 recovery_retries: 0,
                 last_stop_reason: None,
-                stop_after_plan_reject: false,
                 running_turn: None,
                 turn_started_at: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
-                plan_mode: false,
+                collaboration_mode: ModeKind::Default,
+                proposed_plan_parser: ProposedPlanParser::new(),
+                pending_plan_text: String::new(),
                 reasoning_effort: ReasoningEffort::from_i64(rec.reasoning_effort),
-                pending_plan_approval: HashMap::new(),
-                pending_plan_meta: HashMap::new(),
                 goal: None,
                 goal_cancel: None,
                 title_state: TitleState::restore(
@@ -943,16 +938,15 @@ impl Thread {
                 pending_stream_error: None,
                 recovery_retries: 0,
                 last_stop_reason: None,
-                stop_after_plan_reject: false,
                 running_turn: None,
                 turn_started_at: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
-                plan_mode: false,
+                collaboration_mode: ModeKind::Default,
+                proposed_plan_parser: ProposedPlanParser::new(),
+                pending_plan_text: String::new(),
                 reasoning_effort,
-                pending_plan_approval: HashMap::new(),
-                pending_plan_meta: HashMap::new(),
                 goal: None,
                 goal_cancel: None,
                 title_state: TitleState::default(),
@@ -1299,38 +1293,81 @@ impl Thread {
         self.running_turn = t;
     }
 
-    /// Whether this thread is currently in plan mode.
-    pub fn plan_mode(&self) -> bool {
-        self.plan_mode
+    /// The thread's active collaboration mode.
+    pub fn collaboration_mode(&self) -> ModeKind {
+        self.collaboration_mode
     }
 
-    /// Toggle plan mode. Called by the UI (slash `/plan` or the `+` menu row).
-    /// Only sets the flag; the next `build_completion_request` filters tools and
-    /// appends the plan-mode addendum. Does not start a turn. Goal mode and
-    /// plan mode are mutually exclusive — entering plan mode clears an active
-    /// goal so the next turn advertises write tools rather than the read-only
-    /// plan-mode set.
-    pub fn set_plan_mode(&mut self, on: bool, cx: &mut Context<Self>) {
-        if on && self.goal.is_some() {
+    /// Switch collaboration mode. Called by the UI (slash `/plan`, the `+` menu
+    /// row, or shift-tab cycling). Only sets the mode; the next
+    /// `build_completion_request` resolves the per-mode tool set, model,
+    /// reasoning effort, and `developer_instructions` injection. Does not start
+    /// a turn. Goal mode and Plan mode are mutually exclusive — entering Plan
+    /// clears an active goal so the next turn advertises write tools rather
+    /// than the read-only plan set.
+    pub fn set_collaboration_mode(&mut self, mode: ModeKind, cx: &mut Context<Self>) {
+        if mode == ModeKind::Plan && self.goal.is_some() {
             self.clear_goal(cx);
         }
-        let entering = on && !self.plan_mode;
-        self.plan_mode = on;
-        if entering {
-            // Inject the plan-mode directive as a user message so the system
-            // prompt stays byte-stable across the mode switch — `system` no
-            // longer gains/loses `PLAN_MODE_ADDENDUM` on plan on/off, so the
-            // provider prefix cache keeps its system+tools head intact (thread
-            // 0b80401d: the plan-exit round lost its 34万 cache_read because
-            // the switch rewrote the system head). The directive rides in
-            // history (append-only); the model sees it each round-trip.
-            self.insert_user_message(
-                crate::prompt::render_static(crate::prompt::PromptTemplate::ModePlanAddendum)
-                    .expect("plan mode addendum render"),
-                cx,
-            );
-        }
+        self.collaboration_mode = mode;
         cx.notify();
+    }
+
+    /// Act on the user's verdict for a turn-end proposed plan. `Implement`
+    /// exits Plan mode and launches a Default-mode turn seeded with the
+    /// approved plan; `ImplementClearContext` does the same after dropping
+    /// prior history; `StayInPlan` is a no-op. The plan text is re-injected as
+    /// a user message because the `<proposed_plan>` block was never persisted
+    /// into the assistant message — the model needs it to execute.
+    pub fn respond_plan_review(
+        &mut self,
+        choice: crate::collaboration_mode::PlanReviewChoice,
+        plan_text: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::collaboration_mode::PlanReviewChoice;
+        match choice {
+            PlanReviewChoice::Implement | PlanReviewChoice::ImplementClearContext => {
+                if matches!(choice, PlanReviewChoice::ImplementClearContext) {
+                    self.messages.clear();
+                }
+                self.set_collaboration_mode(ModeKind::Default, cx);
+                self.insert_user_message(
+                    format!("Implement the approved plan:\n\n{plan_text}"),
+                    cx,
+                );
+                self.run_turn(cx);
+            }
+            PlanReviewChoice::StayInPlan => {}
+        }
+    }
+
+    /// Resolve the active mode's effective settings: built-in preset overlaid
+    /// with the user's `[modes.*]` override from `settings.toml`. Request-build
+    /// reads this for the tool set, `reasoning_effort`, `model`, and the
+    /// `developer_instructions` injection.
+    fn active_mode_settings(&self) -> ModeSettings {
+        crate::collaboration_mode::resolve(self.collaboration_mode, &crate::settings::modes())
+    }
+
+    /// The model that serves this request: the mode's `model` override
+    /// (resolved through the alias registry) when set, else the thread's
+    /// selected model. Resolved fresh each call — the registry is a HashMap
+    /// and the result is mode-stable across a session, so the prefix cache is
+    /// unaffected.
+    fn active_model(&self) -> Option<crate::language_model::AnyLanguageModel> {
+        let mode = self.active_mode_settings();
+        mode.model
+            .as_deref()
+            .and_then(crate::model_alias::resolve_model_ref)
+            .or_else(|| self.model.clone())
+    }
+
+    /// The reasoning effort that serves this request: the mode's override
+    /// when set, else the thread's user-selected effort.
+    fn active_reasoning_effort(&self) -> ReasoningEffort {
+        let mode = self.active_mode_settings();
+        mode.reasoning_effort.unwrap_or(self.reasoning_effort)
     }
 
     /// Active goal state, if any. Drives the composer's `◎ /goal active` chip.
@@ -1339,15 +1376,16 @@ impl Thread {
     }
 
     /// Set a completion condition and enter goal mode. Main-thread only — a
-    /// sub-agent (depth > 0) no-ops. Exits plan mode (the two are mutually
+    /// sub-agent (depth > 0) no-ops. Exits Plan mode (the two are mutually
     /// exclusive) so the next turn advertises write tools. Does NOT start a
-    /// turn — the caller owns turn initiation, exactly like `set_plan_mode`.
+    /// turn — the caller owns turn initiation, exactly like
+    /// `set_collaboration_mode`.
     pub fn set_goal(&mut self, condition: String, cx: &mut Context<Self>) {
         if self.depth != 0 {
             return;
         }
-        if self.plan_mode {
-            self.plan_mode = false;
+        if self.collaboration_mode == ModeKind::Plan {
+            self.collaboration_mode = ModeKind::Default;
         }
         self.goal = Some(GoalState {
             condition,
@@ -1360,9 +1398,9 @@ impl Thread {
     }
 
     /// Clear the active goal and abort any in-flight evaluator. Called by
-    /// `/goal clear`, on satisfaction, from `set_plan_mode` (mutual exclusion),
-    /// and as a backstop from `cancel()`. Emits `GoalChanged { active: false }`
-    /// when a goal was actually active so the chip disappears.
+    /// `/goal clear`, on satisfaction, from `set_collaboration_mode` (mutual
+    /// exclusion), and as a backstop from `cancel()`. Emits `GoalChanged {
+    /// active: false }` when a goal was actually active so the chip disappears.
     pub fn clear_goal(&mut self, cx: &mut Context<Self>) {
         let was_active = self.goal.is_some();
         if let Some(c) = self.goal_cancel.take() {
@@ -1386,25 +1424,6 @@ impl Thread {
         self.reasoning_effort = effort;
         cx.emit(ThreadEvent::ReasoningEffortChanged { effort });
         cx.notify();
-    }
-
-    /// Resolve a pending plan approval (user clicked approve/reject in the UI
-    /// overlay). Mirrors `respond_authorization` for the plan-approval oneshot.
-    pub fn respond_plan_approval(
-        &mut self,
-        id: &str,
-        response: PlanApprovalResponse,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tx) = self.pending_plan_approval.remove(id) {
-            // Drop the plan metadata alongside the sender, mirroring
-            // `respond_authorization`: the post-select resolve block in
-            // `run_plan_approval` also removes it, but clearing here keeps the
-            // two maps in lockstep at the moment the response is sent.
-            self.pending_plan_meta.remove(id);
-            let _ = tx.send(response);
-        }
-        let _ = cx;
     }
 
     /// Snapshot of this Thread's always-allow set, for seeding a sub-agent's
@@ -1732,22 +1751,6 @@ impl Thread {
             .collect()
     }
 
-    /// Return the id and plan text for each pending plan approval. Used by the
-    /// workspace to restore its `pending_plan` when switching back to a thread
-    /// that was parked on `exit_plan_mode` — the workspace's copy is cleared by
-    /// `attach_thread`, so without this the parked oneshot has no UI to resolve
-    /// it and the turn hangs until cancelled.
-    pub fn pending_plan_entries(&self) -> Vec<(String, String)> {
-        self.pending_plan_approval
-            .keys()
-            .filter_map(|id| {
-                self.pending_plan_meta
-                    .get(id)
-                    .map(|meta| (id.clone(), meta.plan_text.clone()))
-            })
-            .collect()
-    }
-
     /// Append a user message.
     pub fn insert_user_message(&mut self, text: String, cx: &mut Context<Self>) {
         self.insert_user_message_with_ui_metadata(text, None, cx);
@@ -1898,7 +1901,7 @@ impl Thread {
         if self.running_turn.is_some() {
             return;
         }
-        let Some(model) = self.model.clone() else {
+        let Some(model) = self.active_model() else {
             cx.emit(ThreadEvent::Error(anyhow::anyhow!("No model configured")));
             return;
         };
@@ -2001,6 +2004,13 @@ impl Thread {
         // is no goal, this is a sub-agent, or an evaluator is already running.
         let claimed = this.update(cx, |this, cx| {
             if this.depth != 0 {
+                return None;
+            }
+            // Plan turns do not advance a goal: codex gates `account_tokens` on
+            // `!Plan`, and a Plan turn is read-only research with no execution
+            // to evaluate progress against. Goal and Plan are also mutually
+            // exclusive at entry, so this is a backstop for any stale path.
+            if this.collaboration_mode == ModeKind::Plan {
                 return None;
             }
             let g = this.goal.as_mut()?;
@@ -2267,12 +2277,6 @@ impl Thread {
             cancel.cancel();
             // A cancelled slash-command turn must also clear its tool filter.
             self.turn_tool_filter = None;
-            // Drop pending plan-approval oneshots immediately so the senders
-            // are closed. Without this, the async `run_plan_approval` task
-            // stays parked until the entity is dropped, and a late
-            // `respond_plan_approval` from the UI silently no-ops.
-            self.pending_plan_approval.clear();
-            self.pending_plan_meta.clear();
             // Symmetric cleanup of pending tool-authorization oneshots. A
             // cancelled turn resolves in-flight approvals via the cancellation
             // token's `select!` arms, but the senders must also be dropped so a
@@ -2359,7 +2363,10 @@ impl Thread {
         this.update(cx, |this, _| {
             this.turn_count = 0;
             this.cap_summary_injected = false;
-            this.stop_after_plan_reject = false;
+            // Reset the `<proposed_plan>` parser for the turn: a prior turn's
+            // partial block state must not bleed into this one.
+            this.proposed_plan_parser = ProposedPlanParser::new();
+            this.pending_plan_text.clear();
             // Reset the turn's recovery state: a prior turn's parse error or
             // max-tokens truncation must not bleed into this one. The retry
             // counter is turn-scoped — it accumulates across this turn's
@@ -2562,14 +2569,6 @@ impl Thread {
                 let mut appr = Vec::new();
                 let mut review = Vec::new();
                 for tu in &tool_uses {
-                    // `exit_plan_mode` and `enter_plan_mode` are synthesized
-                    // (not in `this.tools`), so the registry lookup below
-                    // would default them to the free (parallel) path.
-                    // `exit_plan_mode` has its own plan-overlay routing below;
-                    // `enter_plan_mode` is a free, no-approval mode transition
-                    // (intercepted in `run_tool_inner`), so the free path is
-                    // correct for it.
-                    let is_plan_exit = tu.name.as_ref() == "exit_plan_mode";
                     // YOLO/AutoReview bypass the permission gate, but not tools
                     // whose authorization flow IS their execution
                     // (AskUserQuestion): bypassing those would drop the user's
@@ -2587,9 +2586,7 @@ impl Thread {
                         ApprovalMode::Yolo | ApprovalMode::AutoReview
                     ) && !requires_user_input;
 
-                    if is_plan_exit {
-                        appr.push(tu.clone());
-                    } else if !requires_approval || always_allowed {
+                    if !requires_approval || always_allowed {
                         free.push(tu.clone());
                     } else if bypassed && this.approval_mode == ApprovalMode::Yolo {
                         // Yolo short-circuits; AutoReview must consult the
@@ -2923,26 +2920,6 @@ impl Thread {
             if hit_cap {
                 break;
             }
-
-            // Plan-mode continue: the user kept discussing the submitted plan and the
-            // `exit_plan_mode` result has been appended (wire stays paired).
-            // Stop the turn here — continuing carries no new information, so a
-            // follow-up completion would be a pointless burn. `plan_mode` is
-            // left on; the user's next message restarts the turn still in
-            // plan mode with the new direction. Mirrors the `max_turns` cap
-            // pattern: emit a terminal `Stop` so the workspace marks the
-            // thread idle and persists, then break.
-            let stop_after_reject = this.update(cx, |this, cx| {
-                if this.stop_after_plan_reject {
-                    this.stop_after_plan_reject = false;
-                    cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
-                    return true;
-                }
-                false
-            })?;
-            if stop_after_reject {
-                break;
-            }
         }
         Ok(())
     }
@@ -2959,26 +2936,6 @@ impl Thread {
         let name = tu.name.to_string();
         let title = tool_title(&name, &tu.input);
 
-        // Plan-mode entry: the model asked to transition into plan mode.
-        // Intercept before the registry lookup (`enter_plan_mode` is
-        // synthesized in `build_completion_request`, not registered) and flip
-        // `plan_mode` on. Only the main thread (depth 0) and only when not
-        // already in plan mode — sub-agents and an already-planning thread
-        // never see the tool, so this guards against a stray/hallucinated
-        // call. No approval: it is a mode transition, not a write.
-        if name == "enter_plan_mode"
-            && this.read_with(cx, |this, _| !this.plan_mode && this.depth == 0)?
-        {
-            return Self::run_enter_plan_mode(this, tu, cx).await;
-        }
-
-        // Plan-mode exit handshake: the model submitted a plan. Intercept before
-        // the registry lookup (`exit_plan_mode` is synthesized in
-        // `build_completion_request`, not registered) and run the approval flow.
-        if name == "exit_plan_mode" && this.read_with(cx, |this, _| this.plan_mode)? {
-            return Self::run_plan_approval(this, tu, cancel, cx).await;
-        }
-
         let tool = this.read_with(cx, |this, _| this.tools.get(&name).cloned())?;
 
         let Some(tool) = tool else {
@@ -2992,7 +2949,7 @@ impl Thread {
         // plan mode (the request-tool list is filtered), but if one slips
         // through (stale registry, model hallucination) synthesize an error
         // rather than execute it.
-        let in_plan = this.read_with(cx, |this, _| this.plan_mode)?;
+        let in_plan = this.read_with(cx, |this, _| this.collaboration_mode == ModeKind::Plan)?;
         if in_plan && !tool.is_read_only() {
             let msg = format!("Plan mode does not permit calling {name}.");
             Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
@@ -3203,191 +3160,6 @@ impl Thread {
         Ok(())
     }
 
-    /// Handle an `enter_plan_mode` tool call: flip `plan_mode` on (clearing any
-    /// active goal — the two are mutually exclusive) and append a tool result
-    /// steering the model toward read-only research. No approval handshake: it
-    /// is a mode transition the model initiates, not a write. The turn loop
-    /// then continues naturally; the next `build_completion_request` sees
-    /// `plan_mode == true` and advertises the read-only tool set plus
-    /// `exit_plan_mode`, so the model researches and eventually submits a plan.
-    async fn run_enter_plan_mode(
-        this: gpui::WeakEntity<Self>,
-        tu: LanguageModelToolUse,
-        cx: &mut AsyncApp,
-    ) -> Result<()> {
-        let id = tu.id.clone();
-        let name = "enter_plan_mode".to_string();
-        let title = "Enter plan mode".to_string();
-
-        let msg = crate::prompt::render_static(crate::prompt::PromptTemplate::WrapperEnterPlanMode)
-            .expect("enter plan mode render");
-
-        this.update(cx, |_, cx| {
-            cx.emit(ThreadEvent::ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                title: title.clone(),
-                status: ToolCallStatus::Success,
-                input: Some(tu.input.clone()),
-            });
-        })?;
-        Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
-        Self::append_tool_result(&this, tu, msg, false, cx)?;
-        // Flip plan mode after the tool result lands, so the adjacent user
-        // messages coalesce as [tool_result, directive] — the model sees the
-        // enter confirmation first, then the detailed plan-mode contract, in
-        // natural reading order. Ordering the flip after `append_tool_result`
-        // also keeps the flag unset if that append fails, so a failed enter
-        // never leaves the thread half-switched into plan mode.
-        this.update(cx, |this, cx| {
-            this.set_plan_mode(true, cx);
-        })?;
-        Ok(())
-    }
-
-    /// Handle an `exit_plan_mode` tool call: extract the plan text, emit
-    /// `ThreadEvent::PlanProposed`, park on a oneshot until the user responds
-    /// via `respond_plan_approval`. Mirrors the authorization handshake in
-    /// `run_tool_inner`. Approve exits plan mode and continues execution;
-    /// continue stays in plan mode and waits for the user's next direction.
-    async fn run_plan_approval(
-        this: gpui::WeakEntity<Self>,
-        tu: LanguageModelToolUse,
-        cancel: CancellationToken,
-        cx: &mut AsyncApp,
-    ) -> Result<()> {
-        let id = tu.id.clone();
-        let name = "exit_plan_mode".to_string();
-        let title = "Submit plan".to_string();
-
-        let plan_text = tu
-            .input
-            .get("plan")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(no plan text provided)")
-            .to_string();
-
-        this.update(cx, |_, cx| {
-            cx.emit(ThreadEvent::ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                title: title.clone(),
-                status: ToolCallStatus::PendingApproval,
-                input: Some(tu.input.clone()),
-            });
-        })?;
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        this.update(cx, |this, _cx| {
-            this.pending_plan_approval.insert(id.clone(), tx);
-            this.pending_plan_meta.insert(
-                id.clone(),
-                PendingPlanMeta {
-                    plan_text: plan_text.clone(),
-                },
-            );
-        })?;
-        this.update(cx, |_, cx| {
-            cx.emit(ThreadEvent::PlanProposed {
-                id: id.clone(),
-                plan_text: plan_text.clone(),
-            });
-        })?;
-
-        let response = tokio::select! {
-            r = rx => r.unwrap_or(PlanApprovalResponse::Cancelled),
-            _ = cancel.cancelled() => PlanApprovalResponse::Cancelled,
-        };
-        this.update(cx, |this, _cx| {
-            this.pending_plan_approval.remove(&id);
-            this.pending_plan_meta.remove(&id);
-        })?;
-
-        match response {
-            PlanApprovalResponse::Approve => {
-                let msg = crate::prompt::render(
-                    crate::prompt::PromptTemplate::WrapperPlanApproved,
-                    &crate::prompt::PlanApprovedData { plan_text },
-                )
-                .expect("plan approved render");
-                this.update(cx, |_, cx| {
-                    cx.emit(ThreadEvent::ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        title: title.clone(),
-                        status: ToolCallStatus::Success,
-                        input: Some(tu.input.clone()),
-                    });
-                })?;
-                Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
-                Self::append_tool_result(&this, tu, msg, false, cx)?;
-                // Exit plan mode AFTER the tool result is safely appended to
-                // the message list. Clearing `plan_mode` before `append` would
-                // leave the messages inconsistent (plan mode off but no
-                // approval result recorded) if `append_tool_result` failed.
-                // The turn loop continues naturally: the next
-                // `build_completion_request` sees `plan_mode == false` so the
-                // write tools become visible, and the approval ToolResult
-                // ("You may now begin execution.") prompts the model to act.
-                this.update(cx, |this, cx| {
-                    this.plan_mode = false;
-                    cx.notify();
-                })?;
-            }
-            PlanApprovalResponse::ContinueInPlanMode => {
-                // Continuing carries no revision text — the user's next message
-                // IS the new direction. Append a paired ToolResult so the wire
-                // stays well-formed, then flag the turn loop to stop: a follow-up
-                // completion would burn a round with zero new information.
-                // `plan_mode` stays on; the next user message restarts the turn
-                // still in plan mode.
-                let msg = crate::prompt::render_static(
-                    crate::prompt::PromptTemplate::WrapperPlanContinue,
-                )
-                .expect("plan continue render");
-                this.update(cx, |this, cx| {
-                    cx.emit(ThreadEvent::ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        title: title.clone(),
-                        status: ToolCallStatus::Continued,
-                        input: Some(tu.input.clone()),
-                    });
-                    this.stop_after_plan_reject = true;
-                })?;
-                Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
-                Self::append_tool_result(&this, tu, msg, false, cx)?;
-            }
-            PlanApprovalResponse::Cancelled => {
-                // The overlay was not shown or the turn was cancelled before the
-                // user responded. Append an honest ToolResult (the wire stays
-                // paired) but do NOT set `stop_after_plan_reject`: this is not a
-                // user "keep discussing" verdict, so the turn must not stop on
-                // the pretense that the user gave direction. The model re-reads
-                // the result, re-submits the plan, and the second `exit_plan_mode`
-                // call (now that the overlay is armed) surfaces real approval.
-                // Mirrors codex `ReviewDecision::Abort`: a non-response is a
-                // distinct terminal from a real decline.
-                let msg = crate::prompt::render_static(
-                    crate::prompt::PromptTemplate::WrapperPlanCancelled,
-                )
-                .expect("plan cancelled render");
-                this.update(cx, |_, cx| {
-                    cx.emit(ThreadEvent::ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        title: title.clone(),
-                        status: ToolCallStatus::Cancelled,
-                        input: Some(tu.input.clone()),
-                    });
-                })?;
-                Self::emit_tool_result(&this, &id, &name, &title, &msg, false, cx)?;
-                Self::append_tool_result(&this, tu, msg, false, cx)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Append an error `ToolResult` for a tool_use that never ran (the turn was
     /// cancelled or a sibling tool errored before it started). Anthropic rejects
     /// a request whose tool_uses lack matching tool_results, so this keeps the
@@ -3442,8 +3214,22 @@ impl Thread {
     ) {
         match event {
             Ok(LanguageModelCompletionEvent::Text(text)) => {
-                self.append_assistant_text(text.clone(), cx);
-                cx.emit(ThreadEvent::AgentText(text));
+                // Route the delta through the `<proposed_plan>` parser: only
+                // visible text enters the assistant message (and thus the next
+                // request's context); block content becomes a live plan delta.
+                for segment in self.proposed_plan_parser.feed(&text) {
+                    match segment {
+                        ProposedPlanSegment::Normal(t) => {
+                            self.append_assistant_text(t.clone(), cx);
+                            cx.emit(ThreadEvent::AgentText(t));
+                        }
+                        ProposedPlanSegment::Delta(t) => {
+                            self.pending_plan_text.push_str(&t);
+                            cx.emit(ThreadEvent::PlanDelta { delta: t });
+                        }
+                        ProposedPlanSegment::Start | ProposedPlanSegment::End => {}
+                    }
+                }
             }
             Ok(LanguageModelCompletionEvent::Thinking { text, signature }) => {
                 self.append_assistant_thinking(text.clone(), signature, cx);
@@ -3457,6 +3243,30 @@ impl Thread {
             }
             Ok(LanguageModelCompletionEvent::Stop(reason)) => {
                 self.finalize_assistant_message(cx);
+                // Flush the parser's tail and close any block left open at
+                // end-of-turn. Trailing visible text enters the assistant
+                // message; remaining block content joins the plan accumulator.
+                for segment in self.proposed_plan_parser.finish() {
+                    match segment {
+                        ProposedPlanSegment::Normal(t) => {
+                            self.append_assistant_text(t.clone(), cx);
+                            cx.emit(ThreadEvent::AgentText(t));
+                        }
+                        ProposedPlanSegment::Delta(t) => {
+                            self.pending_plan_text.push_str(&t);
+                            cx.emit(ThreadEvent::PlanDelta { delta: t });
+                        }
+                        ProposedPlanSegment::Start | ProposedPlanSegment::End => {}
+                    }
+                }
+                // A completed plan surfaces to the UI as a turn-end review
+                // prompt — only on a terminal stop, never mid-turn (a
+                // `StopReason::ToolUse` between research rounds must not pop the
+                // review). Drain the accumulator so a next turn starts clean.
+                if !matches!(reason, StopReason::ToolUse) && !self.pending_plan_text.is_empty() {
+                    let plan_text = std::mem::take(&mut self.pending_plan_text);
+                    cx.emit(ThreadEvent::PlanReady { plan_text });
+                }
                 // Attribute the just-finished request's usage to its triggering
                 // user message, then reset the per-request counter so the next
                 // round (a tool-use loop iteration or a new user turn) starts
@@ -3789,19 +3599,15 @@ impl Thread {
                 wt,
             ),
         };
-        // Goal mode appends its autonomy directive. Unlike plan mode (whose
-        // directive is injected as a user message on `set_plan_mode(true)` to
-        // keep the system prefix byte-stable across the on/off switch), goal
-        // mode still rewrites the system head — a known prefix-cache miss on
-        // goal enter/exit, accepted because goal mode is entered far less often
-        // than plan mode and rarely mid-thread.
         // Capability ground truth (tools / images) comes from the resolved
         // model's operator-declared config fields, not model self-report — so
         // a non-multimodal model cannot claim image ability (thread 480b2469).
         // Model-stable, so the system prefix stays byte-stable across turns.
+        let active_model = self.active_model();
+        let active_effort = self.active_reasoning_effort();
         let capabilities = crate::prompt::ModelCapabilitiesPromptData {
-            supports_tools: self.model.as_ref().is_none_or(|m| m.supports_tools()),
-            supports_images: self.model.as_ref().is_some_and(|m| m.supports_images()),
+            supports_tools: active_model.as_ref().is_none_or(|m| m.supports_tools()),
+            supports_images: active_model.as_ref().is_some_and(|m| m.supports_images()),
         };
         let system = crate::prompt::render(
             crate::prompt::PromptTemplate::SystemAssembly,
@@ -3819,7 +3625,7 @@ impl Thread {
                     None
                 },
                 goal: self.goal.is_some(),
-                ultracode: self.reasoning_effort == ReasoningEffort::Ultracode,
+                ultracode: active_effort == ReasoningEffort::Ultracode,
                 capabilities,
             },
         )
@@ -3833,6 +3639,26 @@ impl Thread {
             content: vec![MessageContent::Text(system)],
             cache: true,
         });
+        // Inject the active mode's `developer_instructions` as a fixed-position
+        // user-role message wrapped in a `<collaboration_mode>` tag — the
+        // codex port's equivalent of the developer-role message. manox has no
+        // Developer role, so it rides as User. Main-thread only: sub-agents
+        // carry their own `agents/*.md` system body and run in `Default`.
+        // Never written into `self.messages` (it is per-request, mode-stable),
+        // so toggling mode does not rewrite history — the system head before it
+        // stays byte-stable, and the block sits at a fixed slot so the prefix
+        // cache stays warm across mode-stable turns.
+        if self.depth == 0
+            && let Some(instructions) = self.active_mode_settings().developer_instructions
+        {
+            messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text(format!(
+                    "<collaboration_mode>\n{instructions}\n</collaboration_mode>"
+                ))],
+                cache: true,
+            });
+        }
         // Map canonical messages to the request, stripping the `agent` tool's
         // JSON envelope to just its `final` text. The full sub-conversation
         // stays in `self.messages` for persistence and UI rebuild, but the
@@ -3907,55 +3733,37 @@ impl Thread {
         }
         // A model that declares `supports_tools: false` (provider-config ground
         // truth, not model self-report) runs in pure-conversation mode: no tools
-        // array, no synthesized `enter_plan_mode`/`exit_plan_mode` (those are
-        // tool-driven). The wire mappers omit `tools` when the list is empty, so
-        // the request stays a plain chat completion. Plan-mode synthesis is
-        // gated by the same flag — there is nothing to plan without tools.
-        let supports_tools = self.model.as_ref().is_none_or(|m| m.supports_tools());
+        // array. The wire mappers omit `tools` when the list is empty, so the
+        // request stays a plain chat completion. Plan mode is gated by the same
+        // flag — there is nothing to plan without tools.
+        let supports_tools = active_model.as_ref().is_none_or(|m| m.supports_tools());
         let tools = if !supports_tools {
             Vec::new()
-        } else if self.plan_mode {
-            // In plan mode, advertise read-only tools plus the synthesized
-            // `exit_plan_mode` tool (not in the registry). The `agent` tool is
-            // read-only (see `SpawnAgentTool::is_read_only`), so it is included
-            // automatically — letting the main thread delegate research to the
-            // bundled `plan`/`explore` sub-agents with isolated context. Write
-            // tools and `bash` stay hidden; `run_tool_inner` backstops any
-            // stray write call. Plan mode takes precedence over
-            // `turn_tool_filter` — it is the stricter, user-visible safety
-            // contract.
-            let mut list = self.tools.to_request_tools_read_only();
-            list.push(exit_plan_mode_request_tool());
-            list
+        } else if self.collaboration_mode == ModeKind::Plan {
+            // In Plan mode, advertise the read-only tool set only — the model
+            // submits a plan by emitting a `<proposed_plan>` block, not by
+            // calling a submit tool. The `agent` tool is read-only
+            // (`SpawnAgentTool::is_read_only`), so it is included, letting the
+            // main thread delegate research to the `explore` sub-agent with
+            // isolated context. Write tools and `bash` stay hidden;
+            // `run_tool_inner` backstops any stray write call. Plan mode takes
+            // precedence over `turn_tool_filter` — it is the stricter,
+            // user-visible safety contract.
+            self.tools.to_request_tools_read_only()
         } else {
             // A slash command's `allowed-tools` whitelist is an intentional
-            // narrowing of this turn's tool set. Respect it: do not append
-            // `enter_plan_mode` to a filtered turn, since entering plan mode
-            // would (once `plan_mode` is on) let the plan-state branch take
-            // precedence over the whitelist and expand the model back to the
-            // full read-only set. The model can still plan on an unrestricted
-            // turn, and the user can always `/plan` manually.
+            // narrowing of this turn's tool set. Respect it; the model enters
+            // Plan mode only via an explicit user action (`/plan`, the `+` menu,
+            // shift-tab), never by a synthesized tool.
             match self.turn_tool_filter.as_deref() {
                 Some(f) if !f.is_empty() => self.tools.to_request_tools_filtered(f),
-                _ => {
-                    let mut list = self.tools.to_request_tools();
-                    // Advertise `enter_plan_mode` only on the main thread, so
-                    // the model can proactively transition to plan mode when it
-                    // judges the task non-trivial. Sub-agents (`depth > 0`)
-                    // never see it — plan mode is a main-thread concept
-                    // (`run_enter_plan_mode` no-ops them too). Synthesized, not
-                    // registered, mirroring `exit_plan_mode`.
-                    if self.depth == 0 {
-                        list.push(enter_plan_mode_request_tool());
-                    }
-                    list
-                }
+                _ => self.tools.to_request_tools(),
             }
         };
         LanguageModelRequest {
             messages,
             tools,
-            reasoning_effort: Some(self.reasoning_effort.resolve_for_wire(self.depth)),
+            reasoning_effort: Some(active_effort.resolve_for_wire(self.depth)),
             ..Default::default()
         }
     }
@@ -4341,52 +4149,6 @@ mod tests {
     /// `pending_plan` overlay (via the `Stop` event) but the thread's oneshot
     /// lingers — a late `respond_plan_approval` silently no-ops and the async
     /// `run_plan_approval` task stays parked until the entity is dropped.
-    #[test]
-    fn cancel_clears_pending_plan_approval() {
-        use crate::tool::PlanApprovalResponse;
-
-        crate::agent_def::init();
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            super::Thread::restore(
-                crate::db::ThreadRecord::for_test("reg-cancel-plan", "/tmp", Vec::new()),
-                None,
-                cx,
-            )
-        });
-
-        // Simulate a running turn with a pending plan approval.
-        cx.update(|cx| {
-            thread.update(cx, |t, _cx| {
-                t.plan_mode = true;
-                let cancel = tokio_util::sync::CancellationToken::new();
-                t.turn_cancel = Some(cancel);
-                let (tx, _rx) = tokio::sync::oneshot::channel::<PlanApprovalResponse>();
-                t.pending_plan_approval.insert("plan-1".to_string(), tx);
-            });
-        });
-
-        // Cancel the turn.
-        cx.update(|cx| {
-            thread.update(cx, |t, cx| t.cancel(cx));
-        });
-
-        // Both turn_cancel and pending_plan_approval must be cleared.
-        cx.update(|cx| {
-            thread.read_with(cx, |t, _| {
-                assert!(t.turn_cancel.is_none(), "cancel should take turn_cancel");
-                assert!(
-                    t.pending_plan_approval.is_empty(),
-                    "cancel should clear pending_plan_approval (oneshot sender \
-                     still lingering — UI cleared but thread didn't)"
-                );
-                // plan_mode is NOT cleared by cancel — it stays true so the
-                // next turn still builds a plan-mode request.
-                assert!(t.plan_mode, "cancel should not clear plan_mode");
-            });
-        });
-    }
-
     /// Regression: `cancel()` must clear `pending_authorizations` symmetrically
     /// with `pending_plan_approval`. The cancellation token resolves in-flight
     /// `select!` arms, but the oneshot senders must also be dropped so a late
@@ -4504,285 +4266,11 @@ mod tests {
     /// failed (entity gone, infra error), the thread would exit plan mode
     /// without recording the approval — inconsistent state for the next
     /// `build_completion_request`.
-    #[test]
-    fn plan_approval_approve_appends_result_before_clearing_plan_mode() {
-        use crate::language_model::LanguageModelToolUse;
-        use std::sync::{Arc, Mutex};
-        use tokio_util::sync::CancellationToken;
-
-        crate::agent_def::init();
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            super::Thread::restore(
-                crate::db::ThreadRecord::for_test("reg-plan-approve-order", "/tmp", Vec::new()),
-                None,
-                cx,
-            )
-        });
-
-        let tu = LanguageModelToolUse {
-            id: "tu_plan_1".to_string(),
-            name: Arc::from("exit_plan_mode"),
-            raw_input: r#"{"plan":"do stuff"}"#.to_string(),
-            input: serde_json::json!({"plan": "do stuff"}),
-            is_input_complete: true,
-            thought_signature: None,
-        };
-
-        // Enable plan mode; `run_plan_approval` creates its own oneshot
-        // and stores the sender in `pending_plan_approval`.
-        cx.update(|cx| {
-            thread.update(cx, |t, _cx| {
-                t.plan_mode = true;
-            });
-        });
-
-        let weak = thread.downgrade();
-        let cancel = CancellationToken::new();
-        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
-        let r = result.clone();
-
-        // Spawn run_plan_approval.
-        cx.spawn(|cx| {
-            let mut cx = cx.clone();
-            async move {
-                *r.lock().unwrap() =
-                    Some(super::Thread::run_plan_approval(weak, tu, cancel, &mut cx).await);
-            }
-        })
-        .detach();
-
-        // Let the task reach the tokio::select! and park on the oneshot.
-        cx.run_until_parked();
-
-        // Send the approval via `respond_plan_approval`, which extracts the
-        // sender from `pending_plan_approval` and resolves the oneshot.
-        cx.update(|cx| {
-            thread.update(cx, |t, cx| {
-                t.respond_plan_approval(
-                    "tu_plan_1",
-                    crate::tool::PlanApprovalResponse::Approve,
-                    cx,
-                );
-            });
-        });
-
-        // Let the task process the approval and complete.
-        cx.run_until_parked();
-
-        let res = result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("run_plan_approval did not complete");
-        assert!(res.is_ok(), "run_plan_approval failed: {:?}", res.err());
-
-        // Verify: plan_mode is now false AND the last message is the
-        // approval ToolResult. The ordering guarantee is that the
-        // ToolResult was appended before plan_mode was cleared.
-        cx.update(|cx| {
-            thread.read_with(cx, |t, _| {
-                assert!(!t.plan_mode, "plan_mode should be false after approval");
-                let last = t.messages.last().expect("no message after approval");
-                let tr = last
-                    .content
-                    .iter()
-                    .find_map(|c| match c {
-                        MessageContent::ToolResult(tr) => Some(tr),
-                        _ => None,
-                    })
-                    .expect("no ToolResult in last message");
-                assert_eq!(tr.tool_use_id.as_str(), "tu_plan_1");
-                assert!(
-                    tr.content.contains("approved"),
-                    "expected approval message in ToolResult, got: {}",
-                    tr.content
-                );
-            });
-        });
-    }
-
     /// While `run_plan_approval` is parked, the plan text must be queryable via
     /// `pending_plan_entries` so the workspace can restore its `pending_plan`
     /// after a background→foreground round-trip, and the entry must be gone
     /// once the approval resolves. Regression for the hang where a backgrounded
     /// plan approval lost its UI on reclaim.
-    #[test]
-    fn pending_plan_entries_present_while_parked_and_cleared_after_resolve() {
-        use crate::language_model::LanguageModelToolUse;
-        use std::sync::{Arc, Mutex};
-        use tokio_util::sync::CancellationToken;
-
-        crate::agent_def::init();
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            super::Thread::restore(
-                crate::db::ThreadRecord::for_test("reg-plan-resurface", "/tmp", Vec::new()),
-                None,
-                cx,
-            )
-        });
-
-        let tu = LanguageModelToolUse {
-            id: "tu_plan_resurface".to_string(),
-            name: Arc::from("exit_plan_mode"),
-            raw_input: r#"{"plan":"the plan body"}"#.to_string(),
-            input: serde_json::json!({"plan": "the plan body"}),
-            is_input_complete: true,
-            thought_signature: None,
-        };
-
-        cx.update(|cx| {
-            thread.update(cx, |t, _cx| {
-                t.plan_mode = true;
-            });
-        });
-
-        let weak = thread.downgrade();
-        let cancel = CancellationToken::new();
-        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
-        let r = result.clone();
-
-        cx.spawn(|cx| {
-            let mut cx = cx.clone();
-            async move {
-                *r.lock().unwrap() =
-                    Some(super::Thread::run_plan_approval(weak, tu, cancel, &mut cx).await);
-            }
-        })
-        .detach();
-
-        cx.run_until_parked();
-
-        // While parked: the plan is queryable for the workspace to restore.
-        cx.update(|cx| {
-            let entries = thread.read(cx).pending_plan_entries();
-            assert_eq!(entries.len(), 1, "exactly one pending plan while parked");
-            assert_eq!(entries[0].0, "tu_plan_resurface");
-            assert_eq!(entries[0].1, "the plan body");
-        });
-
-        cx.update(|cx| {
-            thread.update(cx, |t, cx| {
-                t.respond_plan_approval(
-                    "tu_plan_resurface",
-                    crate::tool::PlanApprovalResponse::Approve,
-                    cx,
-                );
-            });
-        });
-
-        cx.run_until_parked();
-
-        let res = result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("run_plan_approval did not complete");
-        assert!(res.is_ok(), "run_plan_approval failed: {:?}", res.err());
-
-        // After resolve: no dangling plan metadata for the workspace to pick up.
-        cx.update(|cx| {
-            assert!(
-                thread.read(cx).pending_plan_entries().is_empty(),
-                "pending plan entries must be cleared after resolve"
-            );
-        });
-    }
-
-    #[test]
-    fn plan_approval_continue_keeps_plan_mode_and_appends_result() {
-        use crate::language_model::LanguageModelToolUse;
-        use std::sync::{Arc, Mutex};
-        use tokio_util::sync::CancellationToken;
-
-        crate::agent_def::init();
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            super::Thread::restore(
-                crate::db::ThreadRecord::for_test("reg-plan-continue", "/tmp", Vec::new()),
-                None,
-                cx,
-            )
-        });
-
-        let tu = LanguageModelToolUse {
-            id: "tu_plan_continue".to_string(),
-            name: Arc::from("exit_plan_mode"),
-            raw_input: r#"{"plan":"do stuff"}"#.to_string(),
-            input: serde_json::json!({"plan": "do stuff"}),
-            is_input_complete: true,
-            thought_signature: None,
-        };
-
-        cx.update(|cx| {
-            thread.update(cx, |t, _cx| {
-                t.plan_mode = true;
-            });
-        });
-
-        let weak = thread.downgrade();
-        let cancel = CancellationToken::new();
-        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
-        let r = result.clone();
-
-        cx.spawn(|cx| {
-            let mut cx = cx.clone();
-            async move {
-                *r.lock().unwrap() =
-                    Some(super::Thread::run_plan_approval(weak, tu, cancel, &mut cx).await);
-            }
-        })
-        .detach();
-
-        cx.run_until_parked();
-
-        cx.update(|cx| {
-            thread.update(cx, |t, cx| {
-                t.respond_plan_approval(
-                    "tu_plan_continue",
-                    crate::tool::PlanApprovalResponse::ContinueInPlanMode,
-                    cx,
-                );
-            });
-        });
-
-        cx.run_until_parked();
-
-        let res = result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("run_plan_approval did not complete");
-        assert!(res.is_ok(), "run_plan_approval failed: {:?}", res.err());
-
-        cx.update(|cx| {
-            thread.read_with(cx, |t, _| {
-                assert!(t.plan_mode, "plan_mode should stay true after continue");
-                assert!(
-                    t.stop_after_plan_reject,
-                    "continue should ask run_turn_loop to stop before another completion"
-                );
-                let last = t.messages.last().expect("no message after continue");
-                let tr = last
-                    .content
-                    .iter()
-                    .find_map(|c| match c {
-                        MessageContent::ToolResult(tr) => Some(tr),
-                        _ => None,
-                    })
-                    .expect("no ToolResult in last message");
-                assert_eq!(tr.tool_use_id.as_str(), "tu_plan_continue");
-                assert!(!tr.is_error);
-                assert!(
-                    tr.content.contains("continue discussing in plan mode"),
-                    "expected neutral continue message in ToolResult, got: {}",
-                    tr.content
-                );
-            });
-        });
-    }
-
     /// `build_completion_request` must fold `Auto` / `Ultracode` into concrete
     /// wire levels before the request reaches a provider, and append the
     /// Ultracode multi-agent grant to the system prompt. The raw enum never
@@ -4837,13 +4325,12 @@ mod tests {
     }
 
     /// A model declaring `supports_tools: false` runs in pure-conversation mode:
-    /// `build_completion_request` omits the tools array (no registry tools, no
-    /// synthesized `enter_plan_mode`) and the system prompt carries the
-    /// ground-truth "no tools" line — so a toolless model cannot claim tool
-    /// ability. Flipping `supports_tools`/`supports_images` to true restores the
-    /// tool list and advertises image capability (thread 480b2469: a
-    /// non-multimodal model claimed multimodal ability; this is the ground
-    /// truth that stops it).
+    /// `build_completion_request` omits the tools array (no registry tools) and
+    /// the system prompt carries the ground-truth "no tools" line — so a
+    /// toolless model cannot claim tool ability. Flipping `supports_tools`/
+    /// `supports_images` to true restores the tool list and advertises image
+    /// capability (thread 480b2469: a non-multimodal model claimed multimodal
+    /// ability; this is the ground truth that stops it).
     #[test]
     fn build_completion_request_gates_tools_and_images_on_capability() {
         use crate::language_model::{MessageContent, Role};
@@ -4889,8 +4376,7 @@ mod tests {
             "ground-truth no-images line missing: {sys_text}"
         );
 
-        // Capable model: tools advertised (incl. enter_plan_mode on depth 0)
-        // and image capability announced.
+        // Capable model: tools advertised and image capability announced.
         let capable: AnyLanguageModel = Arc::new(CapabilityMockModel {
             id: "test/capable".into(),
             supports_tools: true,
@@ -4907,12 +4393,6 @@ mod tests {
         assert!(
             !req.tools.is_empty(),
             "supports_tools=true must advertise the tool list"
-        );
-        assert!(
-            req.tools
-                .iter()
-                .any(|t| t.name.as_str() == "enter_plan_mode"),
-            "main thread (depth 0) must advertise the synthesized enter_plan_mode tool"
         );
         let sys_text = req
             .messages
@@ -6034,226 +5514,16 @@ mod tests {
     /// and appends a non-error ToolResult steering the model toward read-only
     /// research. No approval handshake — the turn loop continues and the next
     /// `build_completion_request` advertises the plan-mode tool set.
-    #[test]
-    fn enter_plan_mode_sets_flag_and_appends_result() {
-        use crate::language_model::{LanguageModelToolUse, MessageContent};
-        use std::sync::{Arc, Mutex};
-
-        crate::agent_def::init();
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            super::Thread::restore(
-                crate::db::ThreadRecord::for_test("reg-enter-plan", "/tmp", Vec::new()),
-                None,
-                cx,
-            )
-        });
-
-        let tu = LanguageModelToolUse {
-            id: "tu_enter_1".to_string(),
-            name: Arc::from("enter_plan_mode"),
-            raw_input: "{}".to_string(),
-            input: serde_json::json!({}),
-            is_input_complete: true,
-            thought_signature: None,
-        };
-
-        assert!(
-            !cx.update(|cx| thread.read_with(cx, |t, _| t.plan_mode)),
-            "plan_mode must start off"
-        );
-
-        let weak = thread.downgrade();
-        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
-        let r = result.clone();
-        cx.spawn(|cx| {
-            let mut cx = cx.clone();
-            async move {
-                *r.lock().unwrap() =
-                    Some(super::Thread::run_enter_plan_mode(weak, tu, &mut cx).await);
-            }
-        })
-        .detach();
-        cx.run_until_parked();
-
-        let res = result
-            .lock()
-            .unwrap()
-            .take()
-            .expect("run_enter_plan_mode did not complete");
-        assert!(res.is_ok(), "run_enter_plan_mode failed: {:?}", res.err());
-
-        cx.update(|cx| {
-            thread.read_with(cx, |t, _| {
-                assert!(
-                    t.plan_mode,
-                    "plan_mode should be true after enter_plan_mode"
-                );
-                // The tool result is no longer the final message: enter flips
-                // plan mode (injecting the directive) *after* appending the
-                // tool result, so the plan-mode directive lands last. Scan back
-                // from the tail for the ToolResult instead of assuming `last()`.
-                let tr = t
-                    .messages
-                    .iter()
-                    .rev()
-                    .find_map(|m| {
-                        m.content.iter().find_map(|c| match c {
-                            MessageContent::ToolResult(tr) => Some(tr),
-                            _ => None,
-                        })
-                    })
-                    .expect("no ToolResult after enter_plan_mode");
-                assert_eq!(tr.tool_use_id.as_str(), "tu_enter_1");
-                assert!(
-                    !tr.is_error,
-                    "enter_plan_mode ToolResult must not be an error"
-                );
-                assert!(
-                    tr.content.contains("Entered plan mode"),
-                    "expected plan-mode steering message, got: {}",
-                    tr.content
-                );
-            });
-        });
-    }
-
     /// `build_completion_request` advertises `enter_plan_mode` only on the main
     /// thread (depth 0) while not in plan mode, and `exit_plan_mode` only while
     /// in plan mode. The two are mutually exclusive by state, mirroring the
     /// synthesized-tool contract.
-    #[test]
-    fn build_completion_request_advertises_plan_tools_by_state() {
-        crate::agent_def::init();
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            super::Thread::restore(
-                crate::db::ThreadRecord::for_test("reg-plan-tools", "/tmp", Vec::new()),
-                None,
-                cx,
-            )
-        });
-
-        // Main thread, not in plan mode: enter_plan_mode advertised,
-        // exit_plan_mode not.
-        let req = cx.update(|cx| thread.read(cx).build_completion_request());
-        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            names.contains(&"enter_plan_mode"),
-            "main thread should see enter_plan_mode, got: {names:?}"
-        );
-        assert!(
-            !names.contains(&"exit_plan_mode"),
-            "non-plan request should not advertise exit_plan_mode, got: {names:?}"
-        );
-
-        // Enter plan mode: exit_plan_mode advertised, enter_plan_mode not.
-        cx.update(|cx| {
-            thread.update(cx, |t, cx| t.set_plan_mode(true, cx));
-        });
-        let req = cx.update(|cx| thread.read(cx).build_completion_request());
-        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            names.contains(&"exit_plan_mode"),
-            "plan-mode request should advertise exit_plan_mode, got: {names:?}"
-        );
-        assert!(
-            !names.contains(&"enter_plan_mode"),
-            "plan-mode request should not advertise enter_plan_mode, got: {names:?}"
-        );
-
-        // Sub-agent (depth > 0), not in plan mode: enter_plan_mode NOT
-        // advertised — plan mode is a main-thread concept.
-        cx.update(|cx| {
-            thread.update(cx, |t, cx| {
-                t.set_plan_mode(false, cx);
-                t.depth = 1;
-            });
-        });
-        let req = cx.update(|cx| thread.read(cx).build_completion_request());
-        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            !names.contains(&"enter_plan_mode"),
-            "sub-agent should not see enter_plan_mode, got: {names:?}"
-        );
-        assert!(
-            !names.contains(&"exit_plan_mode"),
-            "sub-agent non-plan request should not advertise exit_plan_mode, got: {names:?}"
-        );
-
-        // Back to main thread, but with a slash-command `allowed-tools`
-        // whitelist active: enter_plan_mode must NOT be appended — entering
-        // plan mode would override the whitelist via the plan-state precedence,
-        // expanding the model back to the full read-only set.
-        cx.update(|cx| {
-            thread.update(cx, |t, _cx| {
-                t.depth = 0;
-                t.turn_tool_filter = Some(vec!["read_file".to_string()]);
-            });
-        });
-        let req = cx.update(|cx| thread.read(cx).build_completion_request());
-        let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(
-            !names.contains(&"enter_plan_mode"),
-            "a whitelisted turn must not advertise enter_plan_mode, got: {names:?}"
-        );
-    }
-
     /// Plan on/off must not rewrite the system head — the plan directive is a
     /// user message, so the provider prefix cache keeps its system+tools head
     /// intact across the switch. Before this fix, `set_plan_mode(true)`
     /// appended `PLAN_MODE_ADDENDUM` to `system` and `set_plan_mode(false)`
     /// removed it, so every plan enter/exit round-trip broke the cached system
     /// prefix (thread 0b80401d: the plan-exit round lost its 34万 cache_read).
-    #[test]
-    fn build_completion_request_system_stable_across_plan_switch() {
-        use crate::language_model::{MessageContent, Role};
-
-        crate::agent_def::init();
-        let mut cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            super::Thread::restore(
-                crate::db::ThreadRecord::for_test("reg-plan-system-stable", "/tmp", Vec::new()),
-                None,
-                cx,
-            )
-        });
-
-        let system_text = |cx: &mut gpui::TestAppContext| -> String {
-            cx.update(|cx| {
-                let req = thread.read(cx).build_completion_request();
-                req.messages
-                    .iter()
-                    .find(|m| m.role == Role::System)
-                    .and_then(|m| {
-                        m.content.iter().find_map(|c| match c {
-                            MessageContent::Text(t) => Some(t.clone()),
-                            _ => None,
-                        })
-                    })
-            })
-            .expect("system message present")
-        };
-
-        let baseline = system_text(&mut cx);
-        cx.update(|cx| {
-            thread.update(cx, |t, cx| t.set_plan_mode(true, cx));
-        });
-        let after_enter = system_text(&mut cx);
-        assert_eq!(
-            baseline, after_enter,
-            "system head must be byte-stable across plan enter (directive is a user message, not a system addendum)"
-        );
-        cx.update(|cx| {
-            thread.update(cx, |t, cx| t.set_plan_mode(false, cx));
-        });
-        let after_exit = system_text(&mut cx);
-        assert_eq!(
-            baseline, after_exit,
-            "system head must be byte-stable across plan exit"
-        );
-    }
-
     /// Regression guard: plan-mode continue ends the turn on a user-role
     /// ToolResult; the user's next message is also user-role. The two adjacent
     /// user messages must be coalesced before the request leaves
@@ -6261,72 +5531,6 @@ mod tests {
     /// 400. `coalesce_same_role` wraps the whole mapping — not just the
     /// compaction branch — so this adjacent-user run is normalized even when no
     /// compaction is in play.
-    #[test]
-    fn build_completion_request_coalesces_plan_continue_then_user_message() {
-        use crate::language_model::{LanguageModelToolUse, Role};
-
-        crate::agent_def::init();
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            super::Thread::restore(
-                crate::db::ThreadRecord::for_test("reg-plan-reject-coalesce", "/tmp", Vec::new()),
-                None,
-                cx,
-            )
-        });
-
-        cx.update(|cx| {
-            thread.update(cx, |t, cx| {
-                // Assistant submits a plan via exit_plan_mode.
-                t.messages
-                    .push(Message::assistant(vec![MessageContent::ToolUse(
-                        LanguageModelToolUse {
-                            id: "tu_plan".to_string(),
-                            name: Arc::from("exit_plan_mode"),
-                            raw_input: "{}".to_string(),
-                            input: json!({ "plan": "# plan body" }),
-                            is_input_complete: true,
-                            thought_signature: None,
-                        },
-                    )]));
-                // Continue: a user-role ToolResult, as `append_tool_result` emits
-                // on the continue branch.
-                t.messages.push(Message::user_with_content(vec![
-                    MessageContent::ToolResult(LanguageModelToolResult {
-                        tool_use_id: "tu_plan".to_string(),
-                        tool_name: Arc::from("exit_plan_mode"),
-                        is_error: false,
-                        content: "User chose to continue discussing in plan mode.".to_string(),
-                    }),
-                ]));
-                // User's next message carrying new direction — also user role.
-                t.insert_user_message("Focus on the i18n layer instead.".to_string(), cx);
-            });
-        });
-
-        let req = cx.update(|cx| thread.read(cx).build_completion_request());
-        // Drop the leading system message; the wire contract concerns the
-        // user/assistant alternation in the conversation proper.
-        let convo: Vec<_> = req
-            .messages
-            .into_iter()
-            .filter(|m| m.role != Role::System)
-            .collect();
-        for pair in convo.windows(2) {
-            assert_ne!(
-                pair[0].role, pair[1].role,
-                "adjacent same-role messages would be rejected by the wire: {convo:?}"
-            );
-        }
-        // The reject ToolResult and the new-direction text must land in one
-        // coalesced user message, not two.
-        let user_count = convo.iter().filter(|m| m.role == Role::User).count();
-        assert_eq!(
-            user_count, 1,
-            "adjacent user messages were not coalesced into one"
-        );
-    }
-
     /// `auto_compaction_target` honors a model's `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
     /// override: at 80% of the window it fires; below, it does not. The default
     /// (`None`) path falls back to `max_token_count` + the settings threshold.

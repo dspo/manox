@@ -9,8 +9,30 @@
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
+use crate::collaboration_mode::ModeSettingsMap;
 use crate::paths;
+
+/// Process-global snapshot of `[modes.*]` overrides, settled once at `init`
+/// from `settings.toml`. Constant across a session, so request-build can read
+/// it without re-parsing the file (which would also risk a mid-session flip
+/// breaking the provider prefix cache).
+static MODES: OnceLock<ModeSettingsMap> = OnceLock::new();
+
+/// Read `settings.toml` once at startup and cache its `[modes.*]` table.
+/// Called from `agent::init` after i18n (which reads the same file for the
+/// locale). A missing or malformed file yields the empty map — no per-mode
+/// overrides, presets alone apply.
+pub fn init_modes() {
+    let _ = MODES.set(load().modes);
+}
+
+/// The cached per-mode override table. Empty before `init_modes` or when the
+/// user configured nothing — presets alone then apply.
+pub fn modes() -> ModeSettingsMap {
+    MODES.get().cloned().unwrap_or_default()
+}
 
 /// Parsed view of `settings.toml`. Every field is optional so a missing or
 /// partial file still yields a usable (defaulted) result.
@@ -38,6 +60,13 @@ pub struct Settings {
     /// injection at the next safe join point so the running turn can absorb it.
     #[serde(default)]
     pub follow_up_behavior: FollowUpBehavior,
+
+    /// Per-collaboration-mode overrides (`[modes.plan]` / `[modes.default]`)
+    /// layered over the built-in presets: `model`, `reasoning_effort`, and
+    /// `developer_instructions`. Resolved at request-build time in
+    /// `thread::build_completion_request`.
+    #[serde(default, skip_serializing_if = "ModeSettingsMap::is_empty")]
+    pub modes: ModeSettingsMap,
 }
 
 /// Follow-up disposition for a message submitted while a turn is running. The

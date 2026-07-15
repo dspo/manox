@@ -39,7 +39,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Footer / Composer
 
-- [Footer](#footer) · [Composer](#composer) · [QueuedFollowUps](#queuedfollowups) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [EffortChip](#effortchip) · [ProjectChip](#projectchip) · [PlusBtn](#plusbtn) · [TeamChip](#teamchip)
+- [Footer](#footer) · [Composer](#composer) · [QueuedFollowUps](#queuedfollowups) · [ComposerDivider](#composerdivider) · [AttachmentChips](#attachmentchips) · [AttachmentChip](#attachmentchip) · [ComposerInputRow](#composerinputrow) · [InputField](#inputfield) · [SendBtn](#sendbtn) · [ModelChip](#modelchip) · [AccessChip](#accesschip) · [EffortChip](#effortchip) · [ProjectChip](#projectchip) · [ModeChip](#modechip) · [PlusBtn](#plusbtn) · [TeamChip](#teamchip)
 
 ### AskDrawer
 
@@ -51,7 +51,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Overlays
 
-- [ApprovalOverlay](#approvaloverlay) · [PlanApprovalOverlay](#planapprovaloverlay) · [InboundWriteOverlay](#inboundwriteoverlay) · [BlankProjectOverlay](#blankprojectoverlay)
+- [ApprovalOverlay](#approvaloverlay) · [PlanReviewOverlay](#planreviewoverlay) · [InboundWriteOverlay](#inboundwriteoverlay) · [BlankProjectOverlay](#blankprojectoverlay)
 
 ### EditorPane
 
@@ -334,7 +334,7 @@ Folded batch of tool calls from one model response, rendered as one Claude Code�
 
 #### ToolCallCard
 
-Plan card only: `exit_plan_mode`'s plan body + verdict badge + full-height markdown body (no local scroll). Ordinary tool calls no longer produce this variant (they fold into [ThinkingStatusRow](#thinkingstatusrow)); their output renders via [TerminalPanel](#terminalpanel), not this card.
+A standalone tool-call card (`render_tool_call`) for the special-case tools that don't fold into a [ThinkingStatusRow](#thinkingstatusrow) batch — today `agent` sub-agent calls and `AskUserQuestion`. A model response's other tool calls batch into the `Thinking` container; their output renders via [TerminalPanel](#terminalpanel). The former plan-display variant is gone: a proposed plan no longer renders as a conversation card but as the [PlanReviewOverlay](#planreviewoverlay) at turn end.
 
 Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see [ToolCallStatus](#tool-call-statuses).
 
@@ -454,6 +454,12 @@ Dropdown chip showing current project → [ProjectMenu](#projectmenu) popup.
 
 > Source: `agent-ui/src/workspace.rs`
 
+#### ModeChip
+
+Always-visible chip showing the thread's [CollaborationMode](#collaboration-modes) (`mode-chip-default` / `mode-chip-plan`). Click, `/plan`, or `shift-tab` (the `CycleCollaborationMode` action) cycles Plan↔Default. In Plan mode the tool set is read-only and the model submits a plan via a `<proposed_plan>` block surfaced as the [PlanReviewOverlay](#planreviewoverlay); in Default the full tool set is restored.
+
+> Source: `agent-ui/src/workspace.rs` — `render_mode_chip`, `mode_chip_visual`.
+
 #### PlusBtn
 
 "+" button → [PlusMenu](#plusmenu) popup.
@@ -512,7 +518,7 @@ Prev / Next / Cancel / Submit buttons.
 
 #### PlusMenu
 
-Trigger: [PlusBtn](#plusbtn). "Add" menu: files, goal, plan mode, plugins.
+Trigger: [PlusBtn](#plusbtn). "Add" menu: files, goal, cycle Plan↔Default, plugins.
 
 > Source: `agent-ui/src/views/composer_menu.rs`
 
@@ -568,9 +574,9 @@ Trigger: tool requires approval. Centered modal + scrim (`bg:foreground/0.6`): t
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### PlanApprovalOverlay
+#### PlanReviewOverlay
 
-Trigger: `exit_plan_mode` called. Similar modal: plan text + Approve / Reject buttons.
+Trigger: a turn ending in Plan mode whose model output carried a `<proposed_plan>…</proposed_plan>` block (`ThreadEvent::PlanReady`, gated on terminal stop so mid-turn research tool calls don't pop it prematurely). The block content never enters the persisted message history — it is surfaced only here. Centered modal (scrim + 560px card): the plan body as scrollable [Markdown](#markdown) (max 420px) + three buttons — Implement (primary, exit Plan → Default, seed milestones on [ContextRail](#contextrail), inject "Implement the approved plan." user turn) / Implement-clear-context (ghost, same but clear prior context first, plan re-injected as the fresh-context seed) / Stay-in-Plan (ghost, no-op, keep refining). Mirrors codex's three-way plan review; the former mid-turn `exit_plan_mode` oneshot is gone.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -604,7 +610,7 @@ Contents, top to bottom:
 - **Status block** (`cockpit_status_block`): a two-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2. Elapsed refreshes per-second via the thinking ticker.
 - **Active agents row** (rendered only when `active_agents` is non-empty): a `Bot` icon + i18n `agent-metrics-running-agents` plural ("Running N Explore agents…"). Driven by in-flight subagent tool_use ids — `record_subagent_progress` inserts on non-terminal status, removes on terminal (Success/Error/Denied/Cancelled); cleared on thread switch. Vanishes the moment the last child reports a terminal status.
 - **Context budget row**: `context_budget_pct` reads `Thread::cumulative_token_usage` (cross-turn cumulative, always available — never `None`) against `MIN_COMPACTION_CONTEXT_WINDOW` and the `cockpit_auto_compact_threshold` cached on the rail. Always renders a percentage bar + explicit `current / cap` token counts (e.g. `396k / 900k`); warning-colored within 10% of the trigger. No "waiting for usage" state — the row is hidden entirely only when no model is configured.
-- **Milestone section** (collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): plan steps parsed from the approved `exit_plan_mode` plan. All `Pending` outside a turn; the first is promoted to `InProgress` while the thread runs, demoted back to `Pending` on terminal stop.
+- **Milestone section** (collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): plan steps parsed from the approved `<proposed_plan>` block (seeded when the user picks Implement / Implement-clear-context on the [PlanReviewOverlay](#planreviewoverlay)). All `Pending` outside a turn; the first is promoted to `InProgress` while the thread runs, demoted back to `Pending` on terminal stop.
 - **Changes row**: [ContextRailChangesRow](#contextrailchangesrow).
 - **Branch row**: [ContextRailBranchRow](#contextrailbranchrow).
 - **Usage section** (`render_usage_section`): `MemoryStick` icon + "Usage" header, then per-model blocks (sorted by total tokens desc; empty for unused models). Each block is:
@@ -1027,7 +1033,21 @@ Red — approve everything without asking.
 
 ---
 
-## 9. Tool Call Statuses
+## 9. Collaboration Modes
+
+The thread's [`ModeKind`](#modechip) (`collaboration_mode` on `Thread`). Two modes, cycled by [ModeChip](#modechip) click / `/plan` / `shift-tab` (the `CycleCollaborationMode` action).
+
+#### Default
+
+Execution mode. Full tool set. No mode-specific developer instructions injected beyond the default instructions.
+
+#### Plan
+
+Read-only research-and-plan mode. Tool set filtered to read-only (no write/bash/submit tools). Per-mode overrides apply (`reasoning_effort = Medium`, plan-mode developer instructions injected as a fixed-position `<collaboration_mode>` User message at request-build time — never persisted into history, never woven into the system prompt, so the provider prefix cache stays warm across mode-stable turns). The model submits a plan by emitting a single `<proposed_plan>…</proposed_plan>` block; block content surfaces only via the [PlanReviewOverlay](#planreviewoverlay). Goal accounting is suspended in Plan mode.
+
+---
+
+## 10. Tool Call Statuses
 
 States of a [ToolCallCard](#toolcallcard).
 
@@ -1053,7 +1073,7 @@ Greyed out, "denied" label.
 
 ---
 
-## 10. Reasoning Effort Levels
+## 11. Reasoning Effort Levels
 
 Values selectable in [EffortMenu](#effortmenu).
 

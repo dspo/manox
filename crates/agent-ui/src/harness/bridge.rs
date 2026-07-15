@@ -53,8 +53,8 @@ pub enum McpRequest {
         decision: PermissionDecision,
         reply: Reply,
     },
-    PlanRespond {
-        approve: bool,
+    PlanReviewRespond {
+        choice: agent::PlanReviewChoice,
         reply: Reply,
     },
     Cancel {
@@ -140,9 +140,10 @@ async fn handle_request(req: McpRequest, workspace: &Entity<Workspace>, cx: &mut
                 cx.update(|cx| workspace.update(cx, |ws, cx| ws.harness_approve(decision, cx)));
             let _ = reply.send(Ok(json!({ "had_pending": had })));
         }
-        McpRequest::PlanRespond { approve, reply } => {
-            let had =
-                cx.update(|cx| workspace.update(cx, |ws, cx| ws.harness_plan_respond(approve, cx)));
+        McpRequest::PlanReviewRespond { choice, reply } => {
+            let had = cx.update(|cx| {
+                workspace.update(cx, |ws, cx| ws.harness_plan_review_respond(choice, cx))
+            });
             let _ = reply.send(Ok(json!({ "had_pending": had })));
         }
         McpRequest::Cancel { reply } => {

@@ -26,7 +26,6 @@ use crate::prompt::template::{self, PromptTemplate};
 // rather than surfacing as a runtime render error.
 const TPL_SYSTEM_MAIN: &str = include_str!("templates/system/main.tera.md");
 const TPL_SYSTEM_ASSEMBLY: &str = include_str!("templates/system/assembly.tera.md");
-const TPL_MODE_PLAN: &str = include_str!("templates/mode/plan.tera.md");
 const TPL_MODE_GOAL: &str = include_str!("templates/mode/goal.tera.md");
 const TPL_MODE_ULTRACODE: &str = include_str!("templates/mode/ultracode.tera.md");
 const TPL_WRAPPER_MAX_TURNS_SUMMARY: &str =
@@ -45,10 +44,6 @@ const TPL_WRAPPER_ASK_USER_RESPONSE: &str =
 const TPL_WRAPPER_ASK_USER_QUESTIONS: &str =
     include_str!("templates/wrapper/ask_user_questions.tera.md");
 const TPL_WRAPPER_TOOL_DENIED: &str = include_str!("templates/wrapper/tool_denied.tera.md");
-const TPL_WRAPPER_ENTER_PLAN_MODE: &str = include_str!("templates/wrapper/enter_plan_mode.tera.md");
-const TPL_WRAPPER_PLAN_APPROVED: &str = include_str!("templates/wrapper/plan_approved.tera.md");
-const TPL_WRAPPER_PLAN_CONTINUE: &str = include_str!("templates/wrapper/plan_continue.tera.md");
-const TPL_WRAPPER_PLAN_CANCELLED: &str = include_str!("templates/wrapper/plan_cancelled.tera.md");
 const TPL_WRAPPER_GOAL_CONTINUATION: &str =
     include_str!("templates/wrapper/goal_continuation.tera.md");
 const TPL_WRAPPER_COMPACTION_PREAMBLE: &str =
@@ -86,7 +81,6 @@ fn tera() -> &'static tera::Tera {
         // not matter.
         let registrations: &[(PromptTemplate, &str)] = &[
             (PromptTemplate::SystemMain, TPL_SYSTEM_MAIN),
-            (PromptTemplate::ModePlanAddendum, TPL_MODE_PLAN),
             (PromptTemplate::ModeGoalAddendum, TPL_MODE_GOAL),
             (PromptTemplate::ModeUltracodeGrant, TPL_MODE_ULTRACODE),
             (PromptTemplate::SystemAssembly, TPL_SYSTEM_ASSEMBLY),
@@ -120,22 +114,6 @@ fn tera() -> &'static tera::Tera {
                 TPL_WRAPPER_ASK_USER_QUESTIONS,
             ),
             (PromptTemplate::WrapperToolDenied, TPL_WRAPPER_TOOL_DENIED),
-            (
-                PromptTemplate::WrapperEnterPlanMode,
-                TPL_WRAPPER_ENTER_PLAN_MODE,
-            ),
-            (
-                PromptTemplate::WrapperPlanApproved,
-                TPL_WRAPPER_PLAN_APPROVED,
-            ),
-            (
-                PromptTemplate::WrapperPlanContinue,
-                TPL_WRAPPER_PLAN_CONTINUE,
-            ),
-            (
-                PromptTemplate::WrapperPlanCancelled,
-                TPL_WRAPPER_PLAN_CANCELLED,
-            ),
             (
                 PromptTemplate::WrapperGoalContinuation,
                 TPL_WRAPPER_GOAL_CONTINUATION,
@@ -305,16 +283,12 @@ mod tests {
         // variable. Templates that DO require a variable are exercised by
         // their own module tests; this loop only guards the static ones.
         let static_templates = [
-            PromptTemplate::ModePlanAddendum,
             PromptTemplate::ModeGoalAddendum,
             PromptTemplate::ModeUltracodeGrant,
             PromptTemplate::WrapperMaxTokensDirective,
             PromptTemplate::WrapperEmptyTurnNudge,
             PromptTemplate::WrapperUnfulfilledToolIntentNudge,
             PromptTemplate::WrapperToolDenied,
-            PromptTemplate::WrapperEnterPlanMode,
-            PromptTemplate::WrapperPlanContinue,
-            PromptTemplate::WrapperPlanCancelled,
             PromptTemplate::SideCallApprovalSystem,
             PromptTemplate::SideCallGoalSystem,
             PromptTemplate::SideCallCompactSystem,
@@ -338,7 +312,7 @@ mod tests {
         let _ = render_static(PromptTemplate::ModeGoalAddendum).unwrap();
         // Every variant in `ALL` has a `name` arm (compile-checked by the
         // `match` in `name`), and every name is registered (init-checked).
-        assert_eq!(template::ALL.len(), 30);
+        assert_eq!(template::ALL.len(), 25);
     }
 
     /// Every data-bearing template must fully substitute its variables against
@@ -475,16 +449,6 @@ mod tests {
             )
             .unwrap(),
             PromptTemplate::WrapperCompactionPreamble,
-        );
-        assert_clean(
-            &render(
-                PromptTemplate::WrapperPlanApproved,
-                &crate::prompt::PlanApprovedData {
-                    plan_text: "do X".to_string(),
-                },
-            )
-            .unwrap(),
-            PromptTemplate::WrapperPlanApproved,
         );
 
         // Side-call user prompts.

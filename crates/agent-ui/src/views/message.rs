@@ -70,7 +70,6 @@ pub struct AgentTaskCtx {
 pub struct ToolCallCtx {
     pub weak: WeakEntity<Workspace>,
     pub(crate) ask: Option<AskCardSnapshot>,
-    pub(crate) pending_plan_id: Option<String>,
 }
 
 /// Markdown renderer with theme-aware syntax highlighting.
@@ -369,9 +368,6 @@ impl MessageItem {
                 .filter(|(_, e)| matches!(e, ActivityEntry::Tool(_)))
                 .map(|(i, _)| i)
                 .collect(),
-            // `exit_plan_mode` renders via the Markdown plan card, not the
-            // TerminalPanel — skip mounting a panel for it.
-            ConvItem::ToolCall(t) if t.name == "exit_plan_mode" => return,
             ConvItem::ToolCall(_) => return self.sync_tool_call_panel(cwd, cx),
             _ => return,
         };
@@ -505,7 +501,6 @@ impl Render for MessageItem {
             ToolCallCtx {
                 weak: ws.downgrade(),
                 ask: tool_id.and_then(|id| read.ask_card_snapshot(id, cx)),
-                pending_plan_id: read.pending_plan_id(),
             }
         });
         // The owned markdown document for text-bearing items (persistent across
@@ -576,9 +571,7 @@ pub fn render_item(
         ),
         ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx, cx),
         ConvItem::ToolCall(t) => {
-            if t.name == "exit_plan_mode" {
-                render_plan_card(t, ix, theme, tool_ctx, cx)
-            } else if t.name == "AskUserQuestion" {
+            if t.name == "AskUserQuestion" {
                 render_ask_user_card(t, ix, theme, tool_ctx, cx)
             } else {
                 // Ordinary tool calls fold into `Thinking`; a top-level
@@ -2236,220 +2229,6 @@ pub fn render_tool_call(
     card.into_any_element()
 }
 
-/// Render an `exit_plan_mode` tool-call as a plan card. The body uses
-/// `Markdown` (assistant-style, no code-block wrapping, no height cap) instead
-/// of the monospace scrollable container. PendingApproval forces the body open;
-/// terminal status auto-collapses like a regular ToolCall.
-fn render_plan_card(
-    item: &ToolCallItem,
-    ix: usize,
-    theme: &Theme,
-    tool_ctx: Option<&ToolCallCtx>,
-    cx: &mut App,
-) -> gpui::AnyElement {
-    use agent::ToolCallStatus;
-    let (status_icon, status_color, status_label): (IconName, gpui::Hsla, SharedString) =
-        match item.status {
-            ToolCallStatus::PendingApproval => (
-                IconName::LoaderCircle,
-                theme.muted_foreground,
-                i18n::t("status-pending"),
-            ),
-            ToolCallStatus::Running => (
-                IconName::LoaderCircle,
-                theme.muted_foreground,
-                i18n::t("status-running"),
-            ),
-            ToolCallStatus::Success => (
-                IconName::CircleCheck,
-                theme.success,
-                i18n::t("status-success"),
-            ),
-            ToolCallStatus::Continued => (
-                IconName::Info,
-                theme.muted_foreground,
-                i18n::t("status-continued"),
-            ),
-            ToolCallStatus::Error => (IconName::CircleX, theme.danger, i18n::t("status-error")),
-            ToolCallStatus::Denied => (IconName::CircleX, theme.danger, i18n::t("status-denied")),
-            ToolCallStatus::Cancelled => (
-                IconName::Minus,
-                theme.muted_foreground,
-                i18n::t("status-cancelled"),
-            ),
-        };
-
-    let title = if item.title.is_empty() {
-        item.name.clone()
-    } else {
-        item.title.clone()
-    };
-
-    // PendingApproval always shows the body; terminal status auto-collapses.
-    let show_body =
-        item.status == ToolCallStatus::PendingApproval || item.streaming || !item.collapsed;
-    let chevron = if item.collapsed {
-        IconName::ChevronRight
-    } else {
-        IconName::ChevronDown
-    };
-
-    let id_for_toggle = item.id.clone();
-    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
-    let pending_plan_id = tool_ctx.and_then(|c| c.pending_plan_id.clone());
-    let show_actions = item.status == ToolCallStatus::PendingApproval
-        && pending_plan_id.as_deref() == Some(&item.id);
-
-    let mut card = v_flex()
-        .w_full()
-        .min_w_0()
-        .debug_selector(|| format!("message-overflow-plan-card-{ix}"))
-        .rounded(theme.radius)
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.secondary)
-        .overflow_hidden()
-        .child(
-            h_flex()
-                .id(("plan-header", ix))
-                .w_full()
-                .min_w_0()
-                .debug_selector(|| format!("message-overflow-plan-header-{ix}"))
-                .px_3()
-                .py_1p5()
-                .gap_2()
-                .items_center()
-                .cursor_pointer()
-                .on_click(move |_, _window, cx: &mut App| {
-                    let Some(weak) = weak_workspace.clone() else {
-                        return;
-                    };
-                    let _ = weak.update(cx, |w, cx| {
-                        let id = id_for_toggle.clone();
-                        let conv = w.conversation.clone();
-                        conv.update(cx, |c, cx| {
-                            if let Some(ix) = c.find_tool(&id, &*cx)
-                                && let Some(item) = c.items().get(ix)
-                            {
-                                item.update(cx, |item, cx| {
-                                    if let ConvItem::ToolCall(t) = item.kind_mut() {
-                                        t.collapsed = !t.collapsed;
-                                        t.user_toggled = true;
-                                    }
-                                    cx.notify();
-                                });
-                            }
-                        });
-                        cx.notify();
-                    });
-                })
-                .child(
-                    Icon::new(chevron)
-                        .xsmall()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    Icon::new(IconName::LayoutDashboard)
-                        .small()
-                        .text_color(theme.accent),
-                )
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_x_hidden()
-                        .debug_selector(|| format!("message-overflow-plan-title-{ix}"))
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child(title),
-                )
-                .child(copy_button(ix, "copy-plan", item.output.clone()))
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .text_xs()
-                        .text_color(status_color)
-                        .child(Icon::new(status_icon).xsmall())
-                        .child(status_label),
-                ),
-        );
-
-    if show_body && !item.output.is_empty() {
-        card = card.child(
-            gpui::div()
-                .w_full()
-                .min_w_0()
-                .overflow_x_hidden()
-                .debug_selector(|| format!("message-overflow-plan-body-{ix}"))
-                .px_3()
-                .py_2()
-                .border_t_1()
-                .border_color(theme.border)
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(markdown_tv(
-                    ("plan-text", ix),
-                    item.output.clone(),
-                    theme,
-                    false,
-                    cx,
-                )),
-        );
-    }
-
-    if show_actions {
-        let id_for_continue = item.id.clone();
-        let id_for_approve = item.id.clone();
-        let weak_continue = tool_ctx.map(|c| c.weak.clone());
-        let weak_approve = tool_ctx.map(|c| c.weak.clone());
-        card = card.child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .gap_2()
-                .justify_end()
-                .px_3()
-                .py_2()
-                .border_t_1()
-                .border_color(theme.border)
-                .child(
-                    Button::new(("plan-card-continue", ix))
-                        .ghost()
-                        .small()
-                        .label(i18n::t("workspace-plan-continue"))
-                        .on_click(move |_, _, cx: &mut App| {
-                            let Some(weak) = weak_continue.clone() else {
-                                return;
-                            };
-                            let id = id_for_continue.clone();
-                            let _ = weak.update(cx, |w, cx| {
-                                w.respond_plan_for_card(&id, false, cx);
-                            });
-                        }),
-                )
-                .child(
-                    Button::new(("plan-card-approve", ix))
-                        .primary()
-                        .small()
-                        .label(i18n::t("workspace-plan-approve"))
-                        .on_click(move |_, _, cx: &mut App| {
-                            let Some(weak) = weak_approve.clone() else {
-                                return;
-                            };
-                            let id = id_for_approve.clone();
-                            let _ = weak.update(cx, |w, cx| {
-                                w.respond_plan_for_card(&id, true, cx);
-                            });
-                        }),
-                ),
-        );
-    }
-
-    card.into_any_element()
-}
-
 /// Fixed-height container with the tool's output. While streaming we paint a
 /// plain monospace run (no markdown re-parse per chunk); once the final
 /// `ToolResult` lands we mount the syntax-highlighted, scrollable `Markdown`.
@@ -3114,34 +2893,6 @@ pub fn build_items(
                                     user_toggled: false,
                                     panel: None,
                                 }));
-                            } else if tu.name.as_ref() == "exit_plan_mode" {
-                                // The plan body is the card's whole point; pull it
-                                // from the tool input so a reloaded thread shows the
-                                // plan even before (or without) a paired approval
-                                // result. Expanded by default; a paired result only
-                                // stamps the verdict status, never overwrites the
-                                // plan body (see `pair_tool_result`).
-                                close_segment(&mut items, active_segment_ix);
-                                active_segment_ix = None;
-                                let plan_text = tu
-                                    .input
-                                    .get("plan")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                items.push(ConvItem::ToolCall(ToolCallItem {
-                                    id: tu.id.clone(),
-                                    name: tu.name.to_string(),
-                                    title: agent::thread::tool_title(tu.name.as_ref(), &tu.input),
-                                    status: ToolCallStatus::Success,
-                                    output: plan_text,
-                                    is_error: false,
-                                    input: tu.input.clone(),
-                                    streaming: false,
-                                    collapsed: false,
-                                    user_toggled: false,
-                                    panel: None,
-                                }));
                             } else {
                                 // Ordinary tool call: fold into the active
                                 // activity segment. The segment is created at
@@ -3234,19 +2985,19 @@ pub fn build_items(
 }
 
 /// Attach a tool_result to its matching item by id. Sub-agent results land in
-/// `AgentTaskItem::final_text`; `exit_plan_mode` results stamp only the verdict
-/// on the plan card; ordinary tool results stamp the entry inside the owning
-/// `ThinkingContainer`. A result with no matching ToolUse becomes a standalone
-/// single-entry `ThinkingContainer` so an orphan result still renders as a `⎿`.
+/// `AgentTaskItem::final_text`; ordinary tool results stamp the entry inside the
+/// owning `ThinkingContainer`. A result with no matching ToolUse becomes a
+/// standalone single-entry `ThinkingContainer` so an orphan result still renders
+/// as a `⎿`.
 fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
     let status = if tr.is_error {
         ToolCallStatus::Error
     } else {
         ToolCallStatus::Success
     };
-    // Locate the owning item: an AgentTask, the exit_plan_mode plan card, or a
-    // Thinking-container entry. Remember the entry index for the Thinking path
-    // so we can stamp the right `⎿` inside its batch.
+    // Locate the owning item: an AgentTask or a Thinking-container entry.
+    // Remember the entry index for the Thinking path so we can stamp the
+    // right `⎿` inside its batch.
     let mut thinking_eix: Option<usize> = None;
     let ix = items.iter().position(|i| match i {
         ConvItem::AgentTask(t) => t.id == tr.tool_use_id,
@@ -3298,13 +3049,7 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
             t.status = status;
         }
         ConvItem::ToolCall(t) => {
-            // `exit_plan_mode`'s body is the plan (extracted from the tool
-            // input at build time); the approval verdict lives in `status`,
-            // so never clobber the plan with the canned approval/rejection
-            // result text.
-            if t.name != "exit_plan_mode" {
-                t.output = tr.content.clone();
-            }
+            t.output = tr.content.clone();
             t.is_error = tr.is_error;
             t.status = status;
             if t.name.is_empty() {
@@ -3337,72 +3082,6 @@ mod tests {
     use gpui::{
         AnyWindowHandle, Bounds, Pixels, Render, TestAppContext, VisualTestContext, Window, size,
     };
-
-    /// A reloaded `exit_plan_mode` ToolUse with no paired ToolResult (plan was
-    /// pending approval at save time) still renders the plan body, expanded —
-    /// the plan is extracted from the tool input, not left empty.
-    #[test]
-    fn build_items_extracts_exit_plan_mode_plan_from_input() {
-        let plan = "## Goal\n\nUnify the banner UI.\n\n### Critical Files\n\n- message.rs\n";
-        let messages = vec![Message::assistant(vec![MessageContent::ToolUse(
-            LanguageModelToolUse {
-                id: "tu_plan".to_string(),
-                name: Arc::from("exit_plan_mode"),
-                raw_input: String::new(),
-                input: serde_json::json!({ "plan": plan }),
-                is_input_complete: true,
-                thought_signature: None,
-            },
-        )])];
-        let items = build_items(&messages, &HashMap::new(), false);
-        let tool = items
-            .iter()
-            .find_map(|i| match i {
-                ConvItem::ToolCall(t) if t.name == "exit_plan_mode" => Some(t),
-                _ => None,
-            })
-            .expect("exit_plan_mode card present");
-        assert_eq!(tool.output, plan);
-        assert!(!tool.collapsed);
-    }
-
-    /// Pairing an approval/rejection ToolResult onto an `exit_plan_mode` card
-    /// stamps the verdict status but must not clobber the plan body with the
-    /// canned verdict text — the plan is the card's content, the verdict is the
-    /// icon.
-    #[test]
-    fn pair_tool_result_preserves_exit_plan_mode_plan_body() {
-        let plan = "## Goal\n\nKeep this plan body.\n";
-        let mut items: Vec<ConvItem> = vec![ConvItem::ToolCall(ToolCallItem {
-            id: "tu_plan".to_string(),
-            name: "exit_plan_mode".to_string(),
-            title: "Submit plan".to_string(),
-            status: ToolCallStatus::PendingApproval,
-            output: plan.to_string(),
-            is_error: false,
-            input: serde_json::Value::Null,
-            streaming: false,
-            collapsed: false,
-            user_toggled: false,
-            panel: None,
-        })];
-        pair_tool_result(
-            &mut items,
-            &LanguageModelToolResult {
-                tool_use_id: "tu_plan".to_string(),
-                tool_name: Arc::from("exit_plan_mode"),
-                is_error: false,
-                content: "User approved the plan. You may now begin execution.".to_string(),
-            },
-        );
-        match &items[0] {
-            ConvItem::ToolCall(t) => {
-                assert_eq!(t.output, plan, "plan body must survive pairing");
-                assert_eq!(t.status, ToolCallStatus::Success);
-            }
-            _ => panic!("item is still a ToolCall"),
-        }
-    }
 
     #[test]
     fn live_tail_short_output_unchanged() {
@@ -3483,23 +3162,6 @@ mod tests {
             }));
 
             let thinking_item = ConvItem::Thinking(thinking);
-            let plan_item = ConvItem::ToolCall(ToolCallItem {
-                id: "tool-long-plan".into(),
-                name: "exit_plan_mode".into(),
-                title: "Submit a very long plan title that should stay inside the message list width even when pending approval".into(),
-                status: ToolCallStatus::PendingApproval,
-                output: format!(
-                    "## Plan\n\n{}\n\n```text\n{}\n```",
-                    "ordinary plan prose ".repeat(200),
-                    "p".repeat(2048)
-                ),
-                is_error: false,
-                input: serde_json::json!({"plan": "test"}),
-                streaming: false,
-                collapsed: false,
-                user_toggled: true,
-                panel: None,
-            });
             let theme = cx.theme().clone();
             gpui::div()
                 .id("message-overflow-probe")
@@ -3516,16 +3178,6 @@ mod tests {
                         .child(render_item(
                             &thinking_item,
                             0,
-                            "test-model",
-                            &theme,
-                            None,
-                            None,
-                            None,
-                            cx,
-                        ))
-                        .child(render_item(
-                            &plan_item,
-                            1,
                             "test-model",
                             &theme,
                             None,
@@ -3568,10 +3220,6 @@ mod tests {
             "message-overflow-activity-entry-0-2",
             "message-overflow-activity-entry-body-0-2",
             "message-overflow-tool-output-2",
-            "message-overflow-plan-card-1",
-            "message-overflow-plan-header-1",
-            "message-overflow-plan-title-1",
-            "message-overflow-plan-body-1",
         ] {
             let bounds = cx
                 .debug_bounds(selector)
@@ -3728,9 +3376,9 @@ mod tests {
         assert_eq!(segments[1].entries.len(), 1, "turn two has 1 tool");
     }
 
-    /// `agent`, `exit_plan_mode`, and `AskUserQuestion` must stay standalone
-    /// top-level cards — they must not be swallowed into the activity segment,
-    /// even when they appear in the same assistant message as ordinary tools.
+    /// `agent` and `AskUserQuestion` must stay standalone top-level cards — they
+    /// must not be swallowed into the activity segment, even when they appear in
+    /// the same assistant message as ordinary tools.
     #[test]
     fn build_items_keeps_special_tools_standalone() {
         let messages = vec![
@@ -3743,11 +3391,6 @@ mod tests {
                     serde_json::json!({"subagent_type": "r", "prompt": "p"}),
                 ),
                 tu(
-                    "tu_plan",
-                    "exit_plan_mode",
-                    serde_json::json!({"plan": "do it"}),
-                ),
-                tu(
                     "tu_ask",
                     "AskUserQuestion",
                     serde_json::json!({"questions": [{"question": "q", "header": "h", "options": [{"text": "a", "value": "a"}], "multi_select": false}]}),
@@ -3756,19 +3399,14 @@ mod tests {
             Message::user_with_content(vec![
                 tr("tu_1", "read_file", "a"),
                 tr("tu_agent", "agent", "{\"final\":\"done\"}"),
-                tr("tu_plan", "exit_plan_mode", "approved"),
                 tr("tu_ask", "AskUserQuestion", "answered"),
             ]),
         ];
         let items = build_items(&messages, &HashMap::new(), false);
-        // The ordinary tool folds into a segment; the three special tools are
+        // The ordinary tool folds into a segment; the two special tools are
         // standalone top-level cards.
         let agent = items.iter().find_map(|i| match i {
             ConvItem::AgentTask(t) if t.id == "tu_agent" => Some(t),
-            _ => None,
-        });
-        let plan = items.iter().find_map(|i| match i {
-            ConvItem::ToolCall(t) if t.name == "exit_plan_mode" => Some(t),
             _ => None,
         });
         let ask = items.iter().find_map(|i| match i {
@@ -3780,7 +3418,6 @@ mod tests {
             _ => None,
         });
         assert!(agent.is_some(), "agent task is standalone");
-        assert!(plan.is_some(), "exit_plan_mode is standalone");
         assert!(ask.is_some(), "AskUserQuestion is standalone");
         let seg = seg.expect("ordinary tool folded into a segment");
         assert_eq!(

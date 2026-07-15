@@ -93,9 +93,8 @@ pub enum ConvItem {
     /// shows the running/latest entry; expanded lists every entry, each itself
     /// expandable to its full tool output.
     Thinking(ThinkingContainer),
-    /// A plan card for `exit_plan_mode` — the plan body is the card's whole
-    /// point, so it stays a top-level item rather than folding into a
-    /// `Thinking` batch. Ordinary tool calls never produce this variant.
+    /// A top-level tool-call card — the `AskUserQuestion` clarify card while
+    /// pending and its answered-state fallback, plus any defensive orphan.
     ToolCall(ToolCallItem),
     AgentTask(AgentTaskItem),
     /// A runtime error from the agent (red danger styling).
@@ -567,19 +566,11 @@ impl ConversationState {
                     )
                 }));
             }
-            // Backfill plan text into the matching exit_plan_mode ToolCall
-            // item so it renders as markdown in the chat view. The ToolCall
-            // event (PendingApproval) always arrives before PlanProposed.
-            ThreadEvent::PlanProposed { id, plan_text } => {
-                if let Some(ix) = self.find_tool(id, cx) {
-                    self.items[ix].update(cx, |item, cx| {
-                        if let ConvItem::ToolCall(t) = item.kind_mut() {
-                            t.output = plan_text.clone();
-                        }
-                        cx.notify();
-                    });
-                }
-            }
+            // `<proposed_plan>` streaming + completion are owned by the
+            // workspace's review overlay, not the conversation list — there is
+            // no ToolCall card to backfill (the plan arrives as a text block,
+            // not a tool call).
+            ThreadEvent::PlanDelta { .. } | ThreadEvent::PlanReady { .. } => {}
             // Token usage + model/effort changes are surfaced elsewhere (sidebar /
             // model-history overlay). No conversation item.
             ThreadEvent::TokenUsageUpdated(_)
@@ -762,13 +753,11 @@ impl ConversationState {
                             )
                         }));
                     }
-                } else if name == "exit_plan_mode" || name == "AskUserQuestion" {
-                    // Top-level card, never folded into an activity segment. The
-                    // plan card (`exit_plan_mode`) keeps its body expanded —
-                    // the verdict rides on the status icon; `PlanProposed`
-                    // backfills the body. `AskUserQuestion` drives an inline
-                    // clarify card via `render_ask_user_card` while pending and
-                    // a plain answered card once its result lands.
+                } else if name == "AskUserQuestion" {
+                    // Top-level card, never folded into an activity segment.
+                    // `AskUserQuestion` drives an inline clarify card via
+                    // `render_ask_user_card` while pending and a plain answered
+                    // card once its result lands.
                     if let Some(ix) = self.find_tool(id, cx) {
                         self.items[ix].update(cx, |item, cx| {
                             if let ConvItem::ToolCall(t) = item.kind_mut() {
@@ -948,36 +937,16 @@ impl ConversationState {
                     });
                 } else if let Some(ix) = self.find_tool(id, cx) {
                     self.items[ix].update(cx, |item, cx| {
-                        let is_plan = matches!(
-                            item.kind(),
-                            ConvItem::ToolCall(t) if t.name == "exit_plan_mode"
-                        );
                         if let ConvItem::ToolCall(t) = item.kind_mut() {
-                            // `exit_plan_mode`'s body is the plan (backfilled
-                            // from `PlanProposed`); the approval verdict lives
-                            // in `status`, so keep the plan body and keep it
-                            // expanded — collapsing would hide the very plan
-                            // the user just read.
-                            if !is_plan {
-                                t.output = output.clone();
-                            }
+                            t.output = output.clone();
                             t.is_error = *is_error;
                             t.streaming = false;
                             t.status = status;
                             // Auto-collapse once the tool call reaches a terminal
                             // status. Preserves the user's manual choice if any.
-                            t.collapsed = if is_plan {
-                                t.user_toggled
-                            } else {
-                                !t.user_toggled
-                            };
+                            t.collapsed = !t.user_toggled;
                         }
-                        // The plan card renders its body via Markdown (see
-                        // `render_plan_card`), not the TerminalPanel, so skip
-                        // mounting a panel for `exit_plan_mode`.
-                        if !is_plan {
-                            item.sync_tool_call_panel(cwd, cx);
-                        }
+                        item.sync_tool_call_panel(cwd, cx);
                         cx.notify();
                     });
                 } else {

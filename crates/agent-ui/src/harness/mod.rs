@@ -83,16 +83,20 @@ impl Harness {
             .update(cx, |ws, cx| ws.harness_approve(decision, cx)))
     }
 
-    /// Approve or reject the pending `exit_plan_mode` plan. Returns whether
-    /// a plan was pending.
-    pub fn plan_respond(&self, approve: bool, cx: &mut App) -> Result<bool, String> {
+    /// Resolve the pending plan review with the user's three-way verdict.
+    /// Returns whether a plan review was pending.
+    pub fn plan_review_respond(
+        &self,
+        choice: agent::PlanReviewChoice,
+        cx: &mut App,
+    ) -> Result<bool, String> {
         Ok(self
             .workspace
-            .update(cx, |ws, cx| ws.harness_plan_respond(approve, cx)))
+            .update(cx, |ws, cx| ws.harness_plan_review_respond(choice, cx)))
     }
 
-    pub fn pending_plan_id(&self, cx: &App) -> Option<String> {
-        self.workspace.read(cx).harness_pending_plan_id()
+    pub fn has_pending_plan_review(&self, cx: &App) -> bool {
+        self.workspace.read(cx).harness_has_pending_plan_review()
     }
 
     pub fn has_pending_ask(&self, cx: &App) -> bool {
