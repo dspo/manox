@@ -589,8 +589,8 @@ pub fn render_item(
         ConvItem::TeamMessage { from, content } => {
             render_team_message(from, content, ix, theme, cx)
         }
-        ConvItem::PlanReview { plan_text } => {
-            render_plan_review_card(plan_text, ix, theme, tool_ctx, cx)
+        ConvItem::PlanReview { plan_text, active } => {
+            render_plan_review_card(plan_text, *active, ix, theme, tool_ctx, cx)
         }
         ConvItem::Recap {
             summary,
@@ -1864,6 +1864,7 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
 /// can discuss or refine the plan instead of picking a verdict.
 fn render_plan_review_card(
     plan_text: &str,
+    active: bool,
     ix: usize,
     theme: &Theme,
     tool_ctx: Option<&ToolCallCtx>,
@@ -1949,6 +1950,33 @@ fn render_plan_review_card(
         .child(copy_btn)
         .child(sidebar_btn);
 
+    let body = gpui::div().w_full().min_w_0().p_1().child(markdown_tv(
+        ("plan-review", ix),
+        plan_text.to_string(),
+        theme,
+        false,
+        cx,
+    ));
+    if !active {
+        // Consumed: a verdict was clicked or a free-form message superseded
+        // this plan. Render a plain read-only record — no drawer shadow, no
+        // slide-in, no verdict footer — so the plan stays readable as history
+        // but cannot be re-judged.
+        return v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_2p5()
+            .px_3()
+            .py_3()
+            .rounded(px(18.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(header)
+            .child(body)
+            .into_any_element();
+    }
+
     let weak_stay = weak.clone();
     let stay_btn = Button::new(("plan-verdict-stay", ix))
         .ghost()
@@ -2014,13 +2042,7 @@ fn render_plan_review_card(
         .bg(theme.background)
         .shadow_lg()
         .child(header)
-        .child(gpui::div().w_full().min_w_0().p_1().child(markdown_tv(
-            ("plan-review", ix),
-            plan_text.to_string(),
-            theme,
-            false,
-            cx,
-        )))
+        .child(body)
         .child(footer)
         .with_animation(
             format!("plan-card-slide-{ix}"),

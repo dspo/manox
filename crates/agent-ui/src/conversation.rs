@@ -138,9 +138,13 @@ pub enum ConvItem {
     },
     /// A plan review item rendered as a bordered card in the message list.
     /// Carries the finalized `<proposed_plan>` text so the user can read it
-    /// inline; the action buttons live in the composer drawer.
+    /// inline. `active` distinguishes the one plan currently awaiting a
+    /// verdict (drawer + footer buttons) from prior plans already consumed by
+    /// a verdict or a free-form message (plain read-only record, no buttons) —
+    /// a consumed plan must not be re-judgeable.
     PlanReview {
         plan_text: String,
+        active: bool,
     },
 }
 
@@ -473,6 +477,9 @@ impl ConversationState {
 
     /// Append a plan-review item to the message list. The plan text renders
     /// inline as a read-only bordered card with a height-limited markdown body.
+    /// Pushed `active` — a fresh `PlanReady` always awaits a verdict; the card
+    /// is demoted to an inactive record by `consume_plan_review` once the user
+    /// acts on it (verdict or free-form message).
     pub fn push_plan_review(
         &mut self,
         plan_text: String,
@@ -481,8 +488,39 @@ impl ConversationState {
         cx: &mut App,
     ) {
         let id = self.items.len();
-        self.items
-            .push(cx.new(|_| MessageItem::new(ConvItem::PlanReview { plan_text }, role, id, weak)));
+        self.items.push(cx.new(|_| {
+            MessageItem::new(
+                ConvItem::PlanReview {
+                    plan_text,
+                    active: true,
+                },
+                role,
+                id,
+                weak,
+            )
+        }));
+    }
+
+    /// Mark the most recent plan-review card as no longer actionable: a verdict
+    /// was clicked or a free-form message superseded it. Only the tail plan can
+    /// be active (every prior one was already consumed when its turn ended), so
+    /// the first `PlanReview` found scanning from the tail is the one to demote.
+    pub fn consume_plan_review(&mut self, cx: &mut App) {
+        for item in self.items.iter().rev() {
+            let is_active_plan = matches!(
+                item.read(cx).kind(),
+                ConvItem::PlanReview { active: true, .. }
+            );
+            if is_active_plan {
+                item.update(cx, |it, cx| {
+                    if let ConvItem::PlanReview { active, .. } = it.kind_mut() {
+                        *active = false;
+                    }
+                    cx.notify();
+                });
+                break;
+            }
+        }
     }
 
     pub fn find_tool(&self, id: &str, cx: &App) -> Option<usize> {

@@ -836,7 +836,10 @@ impl Workspace {
                         // An error is a terminal state symmetric to a terminal
                         // `Stop`: the turn aborted, so any pending plan review
                         // is now stale and must not linger over an idle thread.
-                        this.pending_plan_review = None;
+                        if this.pending_plan_review.take().is_some() {
+                            this.conversation
+                                .update(cx, |c, cx| c.consume_plan_review(cx));
+                        }
                         // Symmetric to the terminal `Stop` arm: retire parked
                         // browser yields + stranded inbound overlays so an
                         // aborted turn leaves no stale banner behind.
@@ -2075,7 +2078,12 @@ impl Workspace {
         // rather than accepting — drop the stale verdict so the drawer hides
         // until the agent re-proposes via a fresh `PlanReady`. Without this the
         // lingering Implement button would act on the now-outdated plan text.
+        let had_plan = self.pending_plan_review.is_some();
         self.pending_plan_review = None;
+        if had_plan {
+            self.conversation
+                .update(cx, |c, cx| c.consume_plan_review(cx));
+        }
         self.append_and_run_user_turn(turn, weak, cx);
     }
 
@@ -2973,6 +2981,12 @@ impl Workspace {
         let Some(review) = self.pending_plan_review.take() else {
             return;
         };
+        // The verdict consumes the plan: demote the card to an inactive record
+        // so its buttons collapse and it cannot be re-judged. Applies to every
+        // choice, including StayInPlan — staying is itself a verdict, and the
+        // next proposal lands as a fresh active card.
+        self.conversation
+            .update(cx, |c, cx| c.consume_plan_review(cx));
         if matches!(
             choice,
             PlanReviewChoice::Implement | PlanReviewChoice::ImplementClearContext
