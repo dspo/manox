@@ -570,6 +570,9 @@ pub fn render_item(
             cx,
         ),
         ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx, cx),
+        ConvItem::PlanReview { plan_text } => {
+            render_plan_review_card(plan_text, ix, theme, cx)
+        }
         ConvItem::ToolCall(t) => {
             if t.name == "AskUserQuestion" {
                 render_ask_user_card(t, ix, theme, tool_ctx, cx)
@@ -1848,6 +1851,63 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
     } else {
         format!("{}…", parts.join(", "))
     }
+}
+
+/// Render a plan-review item inline in the message list — a markdown body with
+/// a distinct accent-tinted header so it reads apart from the regular assistant
+/// bubble. The action buttons live in the composer drawer, not here; this card
+/// only renders the plan text for the user to read and discuss.
+fn render_plan_review_card(
+    plan_text: &str,
+    ix: usize,
+    theme: &Theme,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let accent = theme.accent;
+    v_flex()
+        .group(format!("plan-review-{ix}"))
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1()
+                .items_center()
+                .child(
+                    Icon::new(IconName::LayoutDashboard)
+                        .xsmall()
+                        .text_color(accent),
+                )
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(i18n::t("plan-review-title")),
+                )
+                .child(gpui::div().flex_1())
+                .child(copy_button_hoverable(
+                    ix,
+                    "copy-plan-review",
+                    format!("plan-review-{ix}"),
+                    plan_text.to_string(),
+                )),
+        )
+        .child(
+            gpui::div()
+                .w_full()
+                .min_w_0()
+                .overflow_x_hidden()
+                .child(markdown_tv(
+                    ("plan-review", ix),
+                    plan_text.to_string(),
+                    theme,
+                    false,
+                    cx,
+                )),
+        )
+        .into_any_element()
 }
 
 fn render_ask_user_card(

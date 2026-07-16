@@ -93,6 +93,11 @@ pub enum ConvItem {
     /// shows the running/latest entry; expanded lists every entry, each itself
     /// expandable to its full tool output.
     Thinking(ThinkingContainer),
+    /// A plan review item rendered in the message list. Carries the finalized
+    /// `<proposed_plan>` text so the user can read it inline and continue the
+    /// discussion in the composer while the action drawer presents the three-way
+    /// verdict affordance.
+    PlanReview { plan_text: String },
     /// A top-level tool-call card — the `AskUserQuestion` clarify card while
     /// pending and its answered-state fallback, plus any defensive orphan.
     ToolCall(ToolCallItem),
@@ -463,6 +468,22 @@ impl ConversationState {
         let id = self.items.len();
         self.items
             .push(cx.new(|_| MessageItem::new(ConvItem::Notice(text), String::new(), id, weak)));
+    }
+
+    /// Append a plan-review item to the message list. The plan text renders
+    /// inline as a read-only markdown card; the action buttons live in the
+    /// composer drawer.
+    pub fn push_plan_review(
+        &mut self,
+        plan_text: String,
+        role: String,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) {
+        let id = self.items.len();
+        self.items.push(cx.new(|_| {
+            MessageItem::new(ConvItem::PlanReview { plan_text }, role, id, weak)
+        }));
     }
 
     pub fn find_tool(&self, id: &str, cx: &App) -> Option<usize> {

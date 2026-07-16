@@ -253,11 +253,34 @@ impl ContextRail {
         cx.notify();
     }
 
-    /// Demote any `InProgress` milestone back to `Pending` on a terminal stop.
+    /// Finalize milestones on a terminal stop: mark the `InProgress`
+    /// milestone as `Completed` (the step the model was working on has
+    /// finished), then promote the next `Pending` to `InProgress` for the
+    /// next turn. If no `InProgress` milestone exists, do nothing.
     pub(crate) fn demote_milestones_to_pending(&mut self, cx: &mut Context<Self>) {
+        let mut found_in_progress = false;
         for m in &mut self.cockpit_milestones {
             if m.status == MilestoneStatus::InProgress {
-                m.status = MilestoneStatus::Pending;
+                m.status = MilestoneStatus::Completed;
+                found_in_progress = true;
+                break;
+            }
+        }
+        // Promote the first Pending to InProgress so the next turn signals
+        // which step is being worked on.
+        if found_in_progress {
+            for m in &mut self.cockpit_milestones {
+                if m.status == MilestoneStatus::Pending {
+                    m.status = MilestoneStatus::InProgress;
+                    break;
+                }
+            }
+        } else {
+            // No InProgress found — demote any stray ones back to Pending.
+            for m in &mut self.cockpit_milestones {
+                if m.status == MilestoneStatus::InProgress {
+                    m.status = MilestoneStatus::Pending;
+                }
             }
         }
         cx.notify();

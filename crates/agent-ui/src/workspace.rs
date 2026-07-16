@@ -89,11 +89,19 @@ struct PendingAuth {
     reason: Option<String>,
 }
 
-/// A completed `<proposed_plan>` block awaiting the user's three-way review
-/// verdict. Carries the plan text for the overlay body and (on an implement
-/// verdict) for re-injection as the implement turn's seed.
-struct PendingPlanReview {
-    plan_text: String,
+/// A unified drawer that slides up from the composer to present interactive
+/// affordances. AskUserQuestion and plan-review share this shape so the user
+/// experience is consistent regardless of what the agent needs from them.
+#[derive(Clone)]
+enum PendingDrawer {
+    /// An approved `<proposed_plan>` block awaiting the three-way verdict. The
+    /// plan text has already been appended to the conversation as a
+    /// `ConvItem::PlanReview` item; the drawer only carries it for the action
+    /// buttons.
+    Plan { plan_text: String },
+    /// An `AskUserQuestion` tool call awaiting the user's selections. The
+    /// interactive state lives in `pending_ask` / `ask_step` on Workspace.
+    Ask,
 }
 
 /// A pending inbound-write request from a built-in browser tab, surfaced by
@@ -297,9 +305,9 @@ pub struct Workspace {
     title_menu_open: bool,
     title_menu: Option<Entity<PopupMenu>>,
     title_menu_sub: Option<Subscription>,
-    /// A completed plan awaiting the user's implement / clear-context / stay
-    /// verdict, rendered as the plan-review overlay.
-    pending_plan_review: Option<PendingPlanReview>,
+    /// A pending drawer (AskUserQuestion or plan-review) that slides up from
+    /// the composer. Ask takes priority over Plan when both are present.
+    pending_drawer: Option<PendingDrawer>,
     /// Follow-ups submitted while a turn is running. Steer items are injected
     /// into the running turn at the next safe join point; queue items flush as
     /// the next user turn on terminal Stop.
@@ -562,7 +570,7 @@ impl Workspace {
             title_menu_open: false,
             title_menu: None,
             title_menu_sub: None,
-            pending_plan_review: None,
+            pending_drawer: None,
             queued_follow_ups: std::collections::VecDeque::new(),
             composer_followup_placeholder: false,
             pending_attachments: Vec::new(),
@@ -620,9 +628,12 @@ impl Workspace {
                     input,
                 } => {
                     if tool_name == "AskUserQuestion" {
-                        this.pending_ask = parse_pending_ask(id.clone(), input.clone());
-                        this.ask_step = 0;
-                        this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
+                        if let Some(ask) = parse_pending_ask(id.clone(), input.clone()) {
+                            this.pending_ask = Some(ask);
+                            this.pending_drawer = Some(PendingDrawer::Ask);
+                            this.ask_step = 0;
+                            this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
+                        }
                     }
                     // The `AutoReview` approval agent attaches a one-line reason
                     // to every tool it escalates back to the overlay; pull it
@@ -652,9 +663,17 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::PlanReady { plan_text } => {
-                    this.pending_plan_review = Some(PendingPlanReview {
-                        plan_text: plan_text.clone(),
+                    // Append the plan text as a message in the conversation
+                    // list so the user can read it inline, then arm the drawer
+                    // with the three-way verdict affordance.
+                    let weak = cx.weak_entity();
+                    let role = this.model_label(cx);
+                    this.conversation.update(cx, |c, cx| {
+                        c.push_plan_review(plan_text.clone(), role, weak, cx);
                     });
+                    this.pending_drawer = Some(PendingDrawer::Plan { plan_text: plan_text.clone() });
+                    this.auto_follow = true;
+                    this.message_scroll.scroll_to_bottom();
                     cx.notify();
                 }
                 ThreadEvent::ApprovalModeChanged { .. } => {
@@ -830,7 +849,7 @@ impl Workspace {
                         // An error is a terminal state symmetric to a terminal
                         // `Stop`: the turn aborted, so any pending plan review
                         // is now stale and must not linger over an idle thread.
-                        this.pending_plan_review = None;
+                        this.pending_drawer = None;
                         // Symmetric to the terminal `Stop` arm: retire parked
                         // browser yields + stranded inbound overlays so an
                         // aborted turn leaves no stale banner behind.
@@ -1791,7 +1810,7 @@ impl Workspace {
         self.outline_hover = None;
         self.pending_auths.clear();
         self.pending_ask = None;
-        self.pending_plan_review = None;
+        self.pending_drawer = None;
         self.queued_follow_ups.clear();
         self.thread_sub = Some(self.subscribe_thread(cx));
         // The thinking ticker belongs to the outgoing thread: bump its
@@ -2039,7 +2058,7 @@ impl Workspace {
         // rather than interrupting the run (e.g. `/clear` mid-turn would race
         // the streaming conversation). The queued text flushes at turn end.
         if !self.thread.read(cx).is_running()
-            && self.pending_plan_review.is_none()
+            && self.pending_drawer.is_none()
             && attachments.is_empty()
             && let Some(parsed) = crate::slash_command::parse(&text)
         {
@@ -2196,7 +2215,7 @@ impl Workspace {
         // A plan review is awaiting the user's verdict — block new turns until
         // they pick implement / clear-context / stay (the review overlay is the
         // only live affordance, mirroring the pending-ask gate).
-        if self.pending_plan_review.is_some() {
+        if matches!(self.pending_drawer, Some(PendingDrawer::Plan { .. })) {
             return;
         }
         // A turn is running — park the message as a visible follow-up instead
@@ -2706,7 +2725,7 @@ impl Workspace {
         let text = self.editor_state.read(cx).value().to_string();
         if text.trim().is_empty()
             || self.pending_ask.is_some()
-            || self.pending_plan_review.is_some()
+            || self.pending_drawer.is_some()
             || self.thread.read(cx).is_running()
         {
             return;
@@ -2911,6 +2930,7 @@ impl Workspace {
         self.pending_auths.retain(|a| a.id != id);
         if self.pending_ask.as_ref().is_some_and(|a| a.id == id) {
             self.pending_ask = None;
+            self.pending_drawer = None;
             self.ask_step = 0;
             self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
         }
@@ -3094,6 +3114,7 @@ impl Workspace {
         // alongside the ask card) so it doesn't resurface after the ask resolves.
         self.pending_auths.retain(|a| a.id != id);
         self.pending_ask = None;
+        self.pending_drawer = None;
         self.ask_step = 0;
         self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
         self.thread.update(cx, |thread, cx| {
@@ -3120,19 +3141,20 @@ impl Workspace {
     /// re-injects the plan as the implement turn's seed. Stay keeps the thread
     /// in Plan mode for another research round.
     pub(crate) fn respond_plan_review(&mut self, choice: PlanReviewChoice, cx: &mut Context<Self>) {
-        let Some(review) = self.pending_plan_review.take() else {
-            return;
+        let plan_text = match self.pending_drawer.take() {
+            Some(PendingDrawer::Plan { plan_text }) => plan_text,
+            _ => return,
         };
         if matches!(
             choice,
             PlanReviewChoice::Implement | PlanReviewChoice::ImplementClearContext
         ) {
             self.context_rail.update(cx, |r, cx| {
-                r.set_milestones_from_plan(&review.plan_text, cx)
+                r.set_milestones_from_plan(&plan_text, cx)
             });
         }
         self.thread.update(cx, |thread, cx| {
-            thread.respond_plan_review(choice, review.plan_text, cx);
+            thread.respond_plan_review(choice, plan_text, cx);
         });
         cx.notify();
     }
@@ -3379,124 +3401,134 @@ impl Workspace {
         )
     }
 
-    /// Plan-review overlay: surfaced by `ThreadEvent::PlanReady` at a terminal
-    /// stop in Plan mode. The model's finalized `<proposed_plan>` block renders
-    /// as markdown, and the user picks one of three verdicts — implement
-    /// (optionally after clearing context), or stay in Plan for another round.
-    /// Faithful adaptation of codex's turn-end review popup: no mid-turn
-    /// oneshot, the block content never enters the conversation.
-    fn render_plan_review_overlay(
-        &self,
+    /// Action drawer: a panel that slides up from the composer presenting
+    /// interactive affordances. When `pending_drawer` is `Plan`, renders the
+    /// three-way verdict buttons (stay / implement-clear / implement). When
+    /// `Ask`, renders the AskUserQuestion option selection + navigation. The
+    /// drawer replaces the old modal overlays — the plan text is already in the
+    /// message list, only the buttons live here.
+    fn render_action_drawer(
+        &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let review = self.pending_plan_review.as_ref()?;
-        let plan_text = review.plan_text.clone();
+        let drawer = self.pending_drawer.clone()?;
         let accent = theme.accent;
-        Some(
-            gpui::div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.foreground.opacity(0.6))
-                .child(
-                    v_flex()
-                        .w(px(560.))
-                        .max_h(px(640.))
-                        .p_4()
-                        .gap_3()
-                        .rounded(theme.radius)
-                        .bg(theme.background)
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_lg()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    Icon::new(IconName::LayoutDashboard)
-                                        .small()
-                                        .text_color(accent),
-                                )
-                                .child(
-                                    gpui::div()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(i18n::t("plan-review-title")),
+        let drawer_gen = self.ask_transition_gen;
+        match drawer {
+            PendingDrawer::Plan { plan_text: _ } => {
+                Some(
+                    deferred(
+                        gpui::div()
+                            .id(format!("action-drawer-plan-{drawer_gen}"))
+                            .absolute()
+                            .bottom_full()
+                            .left_0()
+                            .right_0()
+                            .occlude()
+                            .child(
+                                centered(
+                                    v_flex()
+                                        .w_full()
+                                        .max_w(px(560.))
+                                        .gap_2()
+                                        .p_3()
+                                        .rounded(theme.radius)
+                                        .bg(theme.background)
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .shadow_lg()
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
+                                                .child(
+                                                    Icon::new(IconName::LayoutDashboard)
+                                                        .xsmall()
+                                                        .text_color(accent),
+                                                )
+                                                .child(
+                                                    gpui::div()
+                                                        .text_xs()
+                                                        .text_color(theme.muted_foreground)
+                                                        .child(i18n::t("plan-review-title")),
+                                                )
+                                                .child(gpui::div().flex_1())
+                                                .child(
+                                                    Button::new("plan-drawer-close")
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .icon(IconName::Close)
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.pending_drawer = None;
+                                                            cx.notify();
+                                                        })),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .gap_2()
+                                                .justify_end()
+                                                .child(
+                                                    Button::new("plan-drawer-stay")
+                                                        .ghost()
+                                                        .small()
+                                                        .label(i18n::t("plan-review-stay"))
+                                                        .on_click(cx.listener({
+                                                            move |this, _, _, cx| {
+                                                                this.respond_plan_review(
+                                                                    PlanReviewChoice::StayInPlan,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        })),
+                                                )
+                                                .child(
+                                                    Button::new("plan-drawer-clear")
+                                                        .ghost()
+                                                        .small()
+                                                        .label(i18n::t("plan-review-implement-clear"))
+                                                        .on_click(cx.listener({
+                                                            move |this, _, _, cx| {
+                                                                this.respond_plan_review(
+                                                                    PlanReviewChoice::ImplementClearContext,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        })),
+                                                )
+                                                .child(
+                                                    Button::new("plan-drawer-implement")
+                                                        .primary()
+                                                        .small()
+                                                        .label(i18n::t("plan-review-implement"))
+                                                        .on_click(cx.listener({
+                                                            move |this, _, _, cx| {
+                                                                this.respond_plan_review(
+                                                                    PlanReviewChoice::Implement,
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        })),
+                                                ),
+                                        ),
                                 ),
-                        )
-                        .child(
-                            gpui::div()
-                                .w_full()
-                                .max_h(px(420.))
-                                .overflow_hidden()
-                                .rounded(theme.radius)
-                                .bg(theme.secondary)
-                                .p_3()
-                                .child(
-                                    cx.new(|_| {
-                                        Markdown::new("plan-review-body", plan_text)
-                                            .theme(theme)
-                                            .scrollable(true)
-                                            .heading_mode(HeadingMode::Uniform)
-                                    })
-                                    .into_any_element(),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    Button::new("plan-review-stay")
-                                        .ghost()
-                                        .small()
-                                        .label(i18n::t("plan-review-stay"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.respond_plan_review(
-                                                    PlanReviewChoice::StayInPlan,
-                                                    cx,
-                                                );
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new("plan-review-clear")
-                                        .ghost()
-                                        .small()
-                                        .label(i18n::t("plan-review-implement-clear"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.respond_plan_review(
-                                                    PlanReviewChoice::ImplementClearContext,
-                                                    cx,
-                                                );
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new("plan-review-implement")
-                                        .primary()
-                                        .small()
-                                        .label(i18n::t("plan-review-implement"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.respond_plan_review(
-                                                    PlanReviewChoice::Implement,
-                                                    cx,
-                                                );
-                                            }
-                                        })),
-                                ),
-                        ),
+                            ),
+                    )
+                    .with_priority(1)
+                    .into_any_element(),
                 )
-                .into_any_element(),
-        )
+            }
+            PendingDrawer::Ask => {
+                // The ask drawer reuses the existing inline card rendering.
+                // The snapshot is read from the workspace by the ToolCall card
+                // in the message list; the drawer only needs to exist as a
+                // signal that the composer should keep accepting text input.
+                // The actual interactive UI is rendered inline in the message
+                // list via render_ask_user_card.
+                None
+            }
+        }
     }
 
     fn render_reasoning_effort_selector(
@@ -3950,7 +3982,7 @@ impl Workspace {
         // The cached flag limits the InputState mutation to the transition so
         // render doesn't churn the placeholder every frame.
         let followup_mode =
-            running && self.pending_plan_review.is_none() && self.pending_ask.is_none();
+            running && self.pending_drawer.is_none() && self.pending_ask.is_none();
         if followup_mode != self.composer_followup_placeholder {
             self.composer_followup_placeholder = followup_mode;
             let key = if followup_mode {
@@ -3972,7 +4004,7 @@ impl Workspace {
         let effort = self.render_reasoning_effort_selector(theme, cx);
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(
-            running && self.pending_plan_review.is_none() && self.pending_ask.is_none(),
+            running && self.pending_drawer.is_none() && self.pending_ask.is_none(),
             cx,
         );
         // The completion popover overlays the composer; anchoring it on the
@@ -4847,7 +4879,7 @@ impl Workspace {
             .disabled(disabled)
             .on_click(cx.listener(|this, _, window, cx| {
                 if this.thread.read(cx).is_running()
-                    && this.pending_plan_review.is_none()
+                    && this.pending_drawer.is_none()
                     && this.pending_ask.is_none()
                 {
                     this.cancel_turn(cx);
@@ -5273,7 +5305,7 @@ impl Workspace {
     ) -> Option<AnyElement> {
         if self.pending_ask.is_some()
             || !self.pending_auths.is_empty()
-            || self.pending_plan_review.is_some()
+            || self.pending_drawer.is_some()
         {
             return None;
         }
@@ -5549,8 +5581,7 @@ impl Render for Workspace {
         self.ensure_blank_project_input(window, cx);
 
         let overlay = self
-            .render_plan_review_overlay(&theme, cx)
-            .or_else(|| self.render_auth_overlay(&theme, cx))
+            .render_auth_overlay(&theme, cx)
             .or_else(|| self.render_inbound_overlay(&theme, cx))
             .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
 
@@ -6074,6 +6105,8 @@ impl Render for Workspace {
                                     .child(list_wrap)
                             }))
                             .children(footer)
+                            // Action drawer (plan review / ask) above composer
+                            .children(self.render_action_drawer(&theme, cx))
                             // Approval overlay (if any)
                             .children(overlay)
                     })
@@ -6486,7 +6519,7 @@ impl Workspace {
             self.resolve_ask_with_response(Some(text), cx);
             return Ok(());
         }
-        if self.thread.read(cx).is_running() && self.pending_plan_review.is_none() {
+        if self.thread.read(cx).is_running() && self.pending_drawer.is_none() {
             return Err("thread is already running a turn".into());
         }
         self.send_user_turn(text, Vec::new(), cx);
@@ -6508,13 +6541,13 @@ impl Workspace {
         choice: PlanReviewChoice,
         cx: &mut Context<Self>,
     ) -> bool {
-        let has = self.pending_plan_review.is_some();
+        let has = self.pending_drawer.is_some();
         self.respond_plan_review(choice, cx);
         has
     }
 
     pub(crate) fn harness_has_pending_plan_review(&self) -> bool {
-        self.pending_plan_review.is_some()
+        self.pending_drawer.is_some()
     }
 
     pub(crate) fn harness_has_pending_ask(&self) -> bool {
