@@ -135,6 +135,7 @@ pub struct AskUserQa {
 #[derive(Debug, Clone, Serialize)]
 pub struct AskUserQuestionsData {
     pub answers: Vec<AskUserQa>,
+    pub response: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

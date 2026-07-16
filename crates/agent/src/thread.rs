@@ -3048,26 +3048,20 @@ impl Thread {
                 }
                 ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {}
                 ToolAuthorizationResponse::AskUserQuestion { answers, response } => {
-                    let output = match response {
-                        Some(text) => crate::prompt::render(
-                            crate::prompt::PromptTemplate::WrapperAskUserResponse,
-                            &crate::prompt::AskUserResponseData { text },
-                        )
-                        .expect("ask user response render"),
-                        None => crate::prompt::render(
-                            crate::prompt::PromptTemplate::WrapperAskUserQuestions,
-                            &crate::prompt::AskUserQuestionsData {
-                                answers: answers
-                                    .into_iter()
-                                    .map(|(q, a)| crate::prompt::AskUserQa {
-                                        question: q,
-                                        answer: a,
-                                    })
-                                    .collect(),
-                            },
-                        )
-                        .expect("ask user questions render"),
-                    };
+                    let output = crate::prompt::render(
+                        crate::prompt::PromptTemplate::WrapperAskUserQuestions,
+                        &crate::prompt::AskUserQuestionsData {
+                            answers: answers
+                                .into_iter()
+                                .map(|(q, a)| crate::prompt::AskUserQa {
+                                    question: q,
+                                    answer: a,
+                                })
+                                .collect(),
+                            response,
+                        },
+                    )
+                    .expect("ask user questions render");
                     Self::emit_tool_result(&this, &id, &name, &title, &output, false, cx)?;
                     Self::append_tool_result(&this, tu, output, false, cx)?;
                     return Ok(());

@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::thread::ApprovalMode;
@@ -28,12 +28,14 @@ use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
-use gpui::{App, ClipboardItem, CursorStyle, Entity, Render, SharedString, WeakEntity, px};
+use gpui::{
+    Animation, AnimationExt as _, App, ClipboardItem, CursorStyle, Entity, Render, SharedString,
+    WeakEntity, ease_out_quint, px,
+};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::Input,
     spinner::Spinner,
     tag::{Tag, TagVariant},
     v_flex,
@@ -1873,44 +1875,20 @@ fn render_ask_user_card(
     let can_prev = step > 0;
     let can_next = step + 1 < total;
 
+    let title = if snapshot.question.header.trim().is_empty() {
+        i18n::t("workspace-clarify-title")
+    } else {
+        snapshot.question.header.clone().into()
+    };
+
+    let weak_prev = weak.clone();
+    let weak_next = weak.clone();
+    let weak_cancel = weak.clone();
     let header = h_flex()
         .w_full()
         .min_w_0()
-        .gap_2()
         .items_center()
         .justify_between()
-        .child(
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .overflow_x_hidden()
-                .gap_2()
-                .items_center()
-                .child(Icon::new(IconName::Info).small().text_color(theme.primary))
-                .child(
-                    gpui::div()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(i18n::t("workspace-clarify-title")),
-                ),
-        )
-        .child(
-            gpui::div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(format!("{}/{total}", step + 1)),
-        );
-
-    let question_row = h_flex()
-        .w_full()
-        .min_w_0()
-        .gap_2()
-        .items_center()
-        .child(
-            Tag::new()
-                .with_variant(TagVariant::Secondary)
-                .small()
-                .child(snapshot.question.header.clone()),
-        )
         .child(
             gpui::div()
                 .flex_1()
@@ -1918,21 +1896,72 @@ fn render_ask_user_card(
                 .overflow_x_hidden()
                 .text_sm()
                 .text_color(theme.foreground)
-                .child(snapshot.question.question.clone()),
+                .child(title),
+        )
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    Button::new(("ask-card-prev", ix))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ChevronLeft)
+                        .when(!can_prev, |b| b.disabled(true))
+                        .on_click(move |_, _, cx: &mut App| {
+                            let _ = weak_prev.update(cx, |w, cx| w.ask_prev(cx));
+                        }),
+                )
+                .child(
+                    gpui::div()
+                        .min_w(px(44.))
+                        .text_center()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{} of {total}", step + 1)),
+                )
+                .child(
+                    Button::new(("ask-card-next", ix))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ChevronRight)
+                        .when(!can_next, |b| b.disabled(true))
+                        .on_click(move |_, _, cx: &mut App| {
+                            let _ = weak_next.update(cx, |w, cx| w.ask_next(cx));
+                        }),
+                )
+                .child(
+                    Button::new(("ask-card-cancel", ix))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .on_click(move |_, _, cx: &mut App| {
+                            let _ = weak_cancel.update(cx, |w, cx| {
+                                w.resolve_auth(agent::PermissionDecision::Deny, cx);
+                            });
+                        }),
+                ),
         );
+
+    let question_row = gpui::div()
+        .w_full()
+        .min_w_0()
+        .text_sm()
+        .text_color(theme.foreground)
+        .child(snapshot.question.question.clone());
 
     let mut options_block = v_flex().w_full().min_w_0().gap_1p5();
     for (oi, opt) in snapshot.question.options.iter().enumerate() {
         let selected = snapshot.selections.get(oi).copied().unwrap_or(false);
-        let indicator_size = px(16.);
+        let indicator_size = px(15.);
         let indicator = if snapshot.question.multi_select {
             if selected {
                 h_flex()
                     .size(indicator_size)
-                    .rounded(px(2.))
+                    .rounded(px(3.))
                     .border_1()
                     .border_color(theme.primary)
-                    .bg(theme.primary.opacity(0.1))
+                    .bg(theme.primary.opacity(0.08))
                     .items_center()
                     .justify_center()
                     .child(
@@ -1943,7 +1972,7 @@ fn render_ask_user_card(
             } else {
                 h_flex()
                     .size(indicator_size)
-                    .rounded(px(2.))
+                    .rounded(px(3.))
                     .border_1()
                     .border_color(theme.border)
             }
@@ -1967,8 +1996,13 @@ fn render_ask_user_card(
         let option_row = h_flex()
             .w_full()
             .min_w_0()
-            .gap_2()
+            .gap_2p5()
             .items_start()
+            .px_2()
+            .py_1p5()
+            .rounded(px(10.))
+            .when(selected, |row| row.bg(theme.accent.opacity(0.08)))
+            .hover(|row| row.bg(theme.accent.opacity(0.06)))
             .id(gpui::SharedString::from(format!(
                 "ask-card-opt-{ix}-{step}-{oi}"
             )))
@@ -1980,107 +2014,51 @@ fn render_ask_user_card(
             })
             .child(indicator)
             .child(
-                h_flex()
+                gpui::div()
                     .flex_1()
                     .min_w_0()
                     .overflow_x_hidden()
-                    .gap_1()
-                    .items_center()
                     .child(
-                        gpui::div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child(opt.label.clone()),
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                gpui::div()
+                                    .flex_shrink_0()
+                                    .text_sm()
+                                    .text_color(theme.foreground)
+                                    .child(format!("{}.", oi + 1)),
+                            )
+                            .child(
+                                gpui::div()
+                                    .min_w_0()
+                                    .overflow_x_hidden()
+                                    .text_sm()
+                                    .text_color(theme.foreground)
+                                    .child(opt.label.clone()),
+                            )
+                            .when(opt.recommended, |row| {
+                                row.child(
+                                    Tag::new()
+                                        .with_variant(TagVariant::Secondary)
+                                        .small()
+                                        .child(i18n::t("workspace-ask-recommended")),
+                                )
+                            }),
                     )
-                    .child(
-                        gpui::div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(opt.description.clone()),
-                    ),
+                    .when(!opt.description.trim().is_empty(), |col| {
+                        col.child(
+                            gpui::div()
+                                .mt_0p5()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(opt.description.clone()),
+                        )
+                    }),
             );
         options_block = options_block.child(option_row);
     }
-
-    let mut other_block = v_flex().gap_1();
-    if let Some(state) = snapshot.other {
-        other_block = other_block
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(i18n::t("workspace-clarify-other")),
-            )
-            .child(Input::new(&state));
-    }
-
-    let response_block = if let Some(state) = snapshot.response_input {
-        v_flex()
-            .gap_1()
-            .child(gpui::div().h(px(1.)).w_full().bg(theme.border).mt_1())
-            .child(Input::new(&state))
-    } else {
-        v_flex()
-    };
-
-    let weak_prev = weak.clone();
-    let weak_next = weak.clone();
-    let weak_cancel = weak.clone();
-    let weak_submit = weak.clone();
-    let nav = h_flex()
-        .gap_2()
-        .items_center()
-        .justify_between()
-        .child(
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new(("ask-card-prev", ix))
-                        .ghost()
-                        .small()
-                        .icon(IconName::ChevronLeft)
-                        .label(i18n::t("workspace-ask-prev"))
-                        .when(!can_prev, |b| b.disabled(true))
-                        .on_click(move |_, _, cx: &mut App| {
-                            let _ = weak_prev.update(cx, |w, cx| w.ask_prev(cx));
-                        }),
-                )
-                .child(
-                    Button::new(("ask-card-next", ix))
-                        .ghost()
-                        .small()
-                        .icon(IconName::ChevronRight)
-                        .label(i18n::t("workspace-ask-next"))
-                        .when(!can_next, |b| b.disabled(true))
-                        .on_click(move |_, _, cx: &mut App| {
-                            let _ = weak_next.update(cx, |w, cx| w.ask_next(cx));
-                        }),
-                ),
-        )
-        .child(
-            h_flex()
-                .gap_1()
-                .child(
-                    Button::new(("ask-card-cancel", ix))
-                        .ghost()
-                        .small()
-                        .label(i18n::t("workspace-cancel"))
-                        .on_click(move |_, _, cx: &mut App| {
-                            let _ = weak_cancel.update(cx, |w, cx| {
-                                w.resolve_auth(agent::PermissionDecision::Deny, cx);
-                            });
-                        }),
-                )
-                .child(
-                    Button::new(("ask-card-submit", ix))
-                        .primary()
-                        .small()
-                        .label(i18n::t("workspace-submit"))
-                        .on_click(move |_, _, cx: &mut App| {
-                            let _ = weak_submit.update(cx, |w, cx| w.resolve_ask(cx));
-                        }),
-                ),
-        );
 
     v_flex()
         .id(format!(
@@ -2090,18 +2068,24 @@ fn render_ask_user_card(
         .key_context("AskDrawer")
         .w_full()
         .min_w_0()
-        .gap_3()
-        .p_3()
-        .rounded(theme.radius)
+        .gap_2p5()
+        .px_3()
+        .pt_3()
+        .pb_5()
+        .mb(px(-10.))
+        .rounded(px(18.))
         .border_1()
         .border_color(theme.border)
         .bg(theme.background)
+        .shadow_lg()
         .child(header)
         .child(question_row)
         .child(options_block)
-        .child(other_block)
-        .child(response_block)
-        .child(nav)
+        .with_animation(
+            format!("ask-card-slide-{}", snapshot.transition_gen),
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            |el, delta| el.mt(px(8. * (1. - delta))).opacity(delta),
+        )
         .into_any_element()
 }
 

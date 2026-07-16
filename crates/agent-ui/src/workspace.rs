@@ -113,13 +113,6 @@ struct PendingAsk {
     questions: Vec<AskQuestion>,
     /// Per-question toggled option flags, aligned with `questions[i].options`.
     selections: Vec<Vec<bool>>,
-    /// Per-question free-form "Other" input; non-empty text overrides the
-    /// option selection for that question.
-    others: Vec<Entity<InputState>>,
-    /// Free-form dismiss input; non-empty text is sent as the `response`
-    /// field of `ToolAuthorizationResponse::AskUserQuestion`, overriding
-    /// all per-question answers.
-    response_input: Option<Entity<InputState>>,
 }
 
 #[derive(Clone)]
@@ -130,8 +123,6 @@ pub(crate) struct AskCardSnapshot {
     pub transition_gen: u64,
     pub question: AskCardQuestion,
     pub selections: Vec<bool>,
-    pub other: Option<Entity<InputState>>,
-    pub response_input: Option<Entity<InputState>>,
 }
 
 #[derive(Clone)]
@@ -146,6 +137,7 @@ pub(crate) struct AskCardQuestion {
 pub(crate) struct AskCardOption {
     pub label: String,
     pub description: String,
+    pub recommended: bool,
 }
 
 struct AskQuestion {
@@ -158,6 +150,14 @@ struct AskQuestion {
 struct AskOption {
     label: String,
     description: String,
+    recommended: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComposerPlaceholderMode {
+    Normal,
+    FollowUp,
+    Ask,
 }
 
 struct DeferredUserTurn {
@@ -304,11 +304,9 @@ pub struct Workspace {
     /// into the running turn at the next safe join point; queue items flush as
     /// the next user turn on terminal Stop.
     queued_follow_ups: std::collections::VecDeque<QueuedFollowUp>,
-    /// Tracks whether the composer placeholder currently reads the follow-up
-    /// hint, so the placeholder only flips on the running↔idle transition
-    /// (avoids re-setting it every render and the notify churn that would
-    /// cause).
-    composer_followup_placeholder: bool,
+    /// Tracks which composer placeholder is installed, so render only mutates
+    /// the input state on mode transitions.
+    composer_placeholder_mode: ComposerPlaceholderMode,
     /// Files picked via the `+` menu, not yet sent. Cleared on submit.
     pending_attachments: Vec<PendingAttachment>,
     /// True while a native directory picker is open from the "Choose project" row.
@@ -564,7 +562,7 @@ impl Workspace {
             title_menu_sub: None,
             pending_plan_review: None,
             queued_follow_ups: std::collections::VecDeque::new(),
-            composer_followup_placeholder: false,
+            composer_placeholder_mode: ComposerPlaceholderMode::Normal,
             pending_attachments: Vec::new(),
             project_picker_pending: false,
             blank_project_parent: None,
@@ -1997,13 +1995,12 @@ impl Workspace {
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
         if self.pending_ask.is_some() {
-            if !text.trim().is_empty() && attachments.is_empty() {
+            self.pending_attachments = attachments;
+            if !text.trim().is_empty() || self.pending_ask_has_selection() {
                 self.input_state
                     .update(cx, |state, cx| state.set_value("", window, cx));
                 self.close_completion(cx);
                 self.resolve_ask_with_response(Some(text), cx);
-            } else {
-                self.pending_attachments = attachments;
             }
             return;
         }
@@ -2938,34 +2935,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Allocate the per-question `InputState` entities for the ask drawer on
-    /// first render. `InputState::new` needs a `Window`, which the event
-    /// handler lacks, so creation is deferred to here.
-    fn ensure_ask_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ask) = self.pending_ask.as_mut() else {
-            return;
-        };
-        if ask.others.len() == ask.questions.len() && ask.response_input.is_some() {
-            return;
-        }
-        ask.others = (0..ask.questions.len())
-            .map(|_| {
-                cx.new(|cx| {
-                    InputState::new(window, cx)
-                        .multi_line(true)
-                        .auto_grow(2, 6)
-                        .placeholder(i18n::t("workspace-clarify-other"))
-                })
-            })
-            .collect();
-        ask.response_input = Some(cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .auto_grow(2, 6)
-                .placeholder(i18n::t("workspace-ask-response"))
-        }));
-    }
-
     /// Toggle an option in the pending ask card. Single-select questions reset
     /// siblings; multi-select toggles in place.
     pub(crate) fn ask_card_snapshot(&self, id: &str, _cx: &App) -> Option<AskCardSnapshot> {
@@ -2990,13 +2959,18 @@ impl Workspace {
                     .map(|o| AskCardOption {
                         label: o.label.clone(),
                         description: o.description.clone(),
+                        recommended: o.recommended,
                     })
                     .collect(),
             },
             selections: ask.selections.get(step).cloned().unwrap_or_default(),
-            other: ask.others.get(step).cloned(),
-            response_input: ask.response_input.clone(),
         })
+    }
+
+    fn pending_ask_has_selection(&self) -> bool {
+        self.pending_ask
+            .as_ref()
+            .is_some_and(|ask| ask.selections.iter().flatten().any(|selected| *selected))
     }
 
     pub(crate) fn toggle_ask_option(&mut self, qi: usize, oi: usize, cx: &mut Context<Self>) {
@@ -3041,13 +3015,8 @@ impl Workspace {
         }
     }
 
-    /// Submit the ask drawer: gather answers (per-question "Other" text
-    /// overrides option selections). If the free-form response field has
-    /// content, it overrides all per-question answers.
-    pub(crate) fn resolve_ask(&mut self, cx: &mut Context<Self>) {
-        self.resolve_ask_with_response(None, cx);
-    }
-
+    /// Submit the ask drawer: gather selected options plus an optional global
+    /// supplemental note from the composer.
     pub(crate) fn resolve_ask_with_response(
         &mut self,
         response_override: Option<String>,
@@ -3057,12 +3026,7 @@ impl Workspace {
             Some(a) => a,
             None => return,
         };
-        let response_text = ask
-            .response_input
-            .as_ref()
-            .map(|s| s.read(cx).value().trim().to_string())
-            .unwrap_or_default();
-        let response_text = response_override.unwrap_or(response_text);
+        let response_text = response_override.unwrap_or_default();
         let response = if response_text.trim().is_empty() {
             None
         } else {
@@ -3070,23 +3034,14 @@ impl Workspace {
         };
         let mut answers: Vec<(String, String)> = Vec::with_capacity(ask.questions.len());
         for (i, q) in ask.questions.iter().enumerate() {
-            let other = ask
-                .others
-                .get(i)
-                .map(|s| s.read(cx).value().trim().to_string())
-                .unwrap_or_default();
-            let answer = if !other.is_empty() {
-                other
-            } else {
-                let sel = ask.selections.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
-                let selected: Vec<&str> = q
-                    .options
-                    .iter()
-                    .zip(sel.iter())
-                    .filter_map(|(o, &s)| s.then_some(o.label.as_str()))
-                    .collect();
-                selected.join(", ")
-            };
+            let sel = ask.selections.get(i).map(|s| s.as_slice()).unwrap_or(&[]);
+            let selected: Vec<&str> = q
+                .options
+                .iter()
+                .zip(sel.iter())
+                .filter_map(|(o, &s)| s.then_some(o.label.as_str()))
+                .collect();
+            let answer = selected.join(", ");
             answers.push((q.question.clone(), answer));
         }
         let id = ask.id.clone();
@@ -3945,18 +3900,23 @@ impl Workspace {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Flip the composer placeholder to a follow-up hint while a turn is
-        // running (and no plan/ask is awaiting input), restoring it on idle.
-        // The cached flag limits the InputState mutation to the transition so
-        // render doesn't churn the placeholder every frame.
+        // Flip the composer placeholder only on mode transitions, so render
+        // doesn't churn the InputState every frame.
         let followup_mode =
             running && self.pending_plan_review.is_none() && self.pending_ask.is_none();
-        if followup_mode != self.composer_followup_placeholder {
-            self.composer_followup_placeholder = followup_mode;
-            let key = if followup_mode {
-                "composer-placeholder-followup"
-            } else {
-                "workspace-input-placeholder"
+        let placeholder_mode = if self.pending_ask.is_some() {
+            ComposerPlaceholderMode::Ask
+        } else if followup_mode {
+            ComposerPlaceholderMode::FollowUp
+        } else {
+            ComposerPlaceholderMode::Normal
+        };
+        if placeholder_mode != self.composer_placeholder_mode {
+            self.composer_placeholder_mode = placeholder_mode;
+            let key = match placeholder_mode {
+                ComposerPlaceholderMode::Normal => "workspace-input-placeholder",
+                ComposerPlaceholderMode::FollowUp => "composer-placeholder-followup",
+                ComposerPlaceholderMode::Ask => "workspace-ask-supplement-placeholder",
             };
             self.input_state.update(cx, |state, cx| {
                 state.set_placeholder(i18n::t(key), window, cx);
@@ -4016,6 +3976,14 @@ impl Workspace {
                     }
                 }
             }))
+            .when(self.pending_ask.is_some(), |this| {
+                this.child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(i18n::t("workspace-ask-supplement-label")),
+                )
+            })
             .child(
                 // Composer input is message content in the mono family (Lilex).
                 // Weight is pinned to Light to match body type; the Input component
@@ -4804,11 +4772,16 @@ impl Workspace {
     /// driven by Enter, not by this button, so running never disables stop.
     fn render_send_button(&self, running: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        // Idle + (no text and no attachments) => inert. Running is a stop
-        // control and stays clickable regardless of composer content.
-        let input_empty = self.input_state.read(cx).value().trim().is_empty()
-            && self.pending_attachments.is_empty();
-        let disabled = !running && input_empty;
+        // Idle + no pending content => inert. An ask drawer can be submitted
+        // with selected options even when the supplemental note is empty.
+        let input_empty = self.input_state.read(cx).value().trim().is_empty();
+        let disabled = if running {
+            false
+        } else if self.pending_ask.is_some() {
+            input_empty && !self.pending_ask_has_selection()
+        } else {
+            input_empty && self.pending_attachments.is_empty()
+        };
 
         // Matches the composer chip row height (px_2/py_1 + text_xs ≈ 20px),
         // so the send control shares the effort/model chips' rhythm instead of
@@ -5545,7 +5518,6 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         let running = self.thread.read(cx).is_running();
 
-        self.ensure_ask_inputs(window, cx);
         self.ensure_blank_project_input(window, cx);
 
         let overlay = self
@@ -6219,7 +6191,7 @@ fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk>
         let mut opts: Vec<AskOption> = Vec::new();
         if let Some(arr) = q.get("options").and_then(|v| v.as_array()) {
             for o in arr {
-                let label = o
+                let raw_label = o
                     .get("label")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
@@ -6229,7 +6201,16 @@ fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk>
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                opts.push(AskOption { label, description });
+                let explicit_recommended = o
+                    .get("recommended")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let (label, suffix_recommended) = strip_recommended_suffix(raw_label);
+                opts.push(AskOption {
+                    label,
+                    description,
+                    recommended: explicit_recommended || suffix_recommended,
+                });
             }
         }
         selections.push(vec![false; opts.len()]);
@@ -6244,9 +6225,16 @@ fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk>
         id,
         questions: parsed,
         selections,
-        others: Vec::new(),
-        response_input: None,
     })
+}
+
+fn strip_recommended_suffix(label: String) -> (String, bool) {
+    for suffix in [" (Recommended)", "（推荐）", " (推荐)", "（Recommended）"] {
+        if let Some(stripped) = label.strip_suffix(suffix) {
+            return (stripped.trim().to_string(), true);
+        }
+    }
+    (label, false)
 }
 
 /// Map an `ApprovalMode` to the chip's (label, accent color, icon) triple.

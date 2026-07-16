@@ -440,6 +440,7 @@ mod tests {
                         question: "q".to_string(),
                         answer: "a".to_string(),
                     }],
+                    response: Some("extra context".to_string()),
                 },
             )
             .unwrap(),
