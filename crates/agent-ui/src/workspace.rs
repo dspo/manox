@@ -311,8 +311,15 @@ pub struct Workspace {
     title_menu: Option<Entity<PopupMenu>>,
     title_menu_sub: Option<Subscription>,
     /// A completed plan awaiting the user's implement / clear-context / stay
-    /// verdict, rendered as the plan-review overlay.
+    /// verdict, rendered as the inline plan-review drawer card.
     pending_plan_review: Option<PendingPlanReview>,
+    /// Per-thread stash of `pending_plan_review`, keyed by thread id. A
+    /// pending plan never enters persisted messages (the `<proposed_plan>`
+    /// block is stripped before the assistant text is saved), and a reloaded
+    /// thread always starts in `Default` mode, so without this stash the
+    /// verdict card + buttons vanish on a switch-away/switch-back round-trip.
+    /// Mirrors `drafts`: populated on switch-away, drained on switch-back.
+    pending_plans: HashMap<String, PendingPlanReview>,
     /// Follow-ups submitted while a turn is running. Steer items are injected
     /// into the running turn at the next safe join point; queue items flush as
     /// the next user turn on terminal Stop.
@@ -556,6 +563,7 @@ impl Workspace {
             title_menu: None,
             title_menu_sub: None,
             pending_plan_review: None,
+            pending_plans: HashMap::new(),
             queued_follow_ups: std::collections::VecDeque::new(),
             composer_placeholder_mode: ComposerPlaceholderMode::Normal,
             pending_attachments: Vec::new(),
@@ -1544,6 +1552,14 @@ impl Workspace {
             self.input_state.read(cx).value().to_string(),
         );
 
+        // Stash the outgoing thread's pending plan verdict so it survives a
+        // round-trip through another thread. The plan text lives only in
+        // `pending_plan_review` (never in persisted messages), so switching
+        // away would otherwise drop it — and the verdict card with it.
+        if let Some(review) = self.pending_plan_review.take() {
+            self.pending_plans.insert(old_id.clone(), review);
+        }
+
         // If the old thread is still running a turn, park it in the background
         // so its `run_turn_loop` task stays alive (the entity is otherwise only
         // held by `self.thread`; overwriting that field would drop it and
@@ -1604,7 +1620,26 @@ impl Workspace {
         self.message_scroll.scroll_to_bottom();
         self.pending_auths.clear();
         self.pending_ask = None;
-        self.pending_plan_review = None;
+        // Restore the incoming thread's stashed pending plan, if any. A reloaded
+        // thread always starts in `Default` mode (collaboration_mode is
+        // session-scoped and never persisted), so a restored verdict also
+        // re-enters `Plan` mode — the buttons are only meaningful while the
+        // model is paused in plan review, and a free-form message must keep
+        // routing through Plan mode (re-propose) rather than Default (execute).
+        self.pending_plan_review = self.pending_plans.remove(&new_id);
+        if let Some(review) = self.pending_plan_review.as_ref() {
+            self.thread
+                .update(cx, |t, cx| t.set_collaboration_mode(ModeKind::Plan, cx));
+            let plan_text = review.plan_text.clone();
+            let weak = cx.weak_entity();
+            self.conversation.update(cx, |c, cx| {
+                c.push_plan_review(plan_text, role.clone(), weak, cx);
+            });
+            // The card is appended after the earlier `scroll_to_bottom`, so
+            // re-pin so the restored drawer is in view.
+            self.auto_follow = true;
+            self.message_scroll.scroll_to_bottom();
+        }
         self.queued_follow_ups.clear();
         self.thread_sub = Some(self.subscribe_thread(cx));
         // The thinking ticker belongs to the outgoing thread: bump its
