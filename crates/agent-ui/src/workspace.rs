@@ -159,7 +159,6 @@ enum ComposerPlaceholderMode {
     Normal,
     FollowUp,
     Ask,
-    Plan,
 }
 
 struct DeferredUserTurn {
@@ -3647,8 +3646,6 @@ impl Workspace {
             running && self.pending_plan_review.is_none() && self.pending_ask.is_none();
         let placeholder_mode = if self.pending_ask.is_some() {
             ComposerPlaceholderMode::Ask
-        } else if self.pending_plan_review.is_some() {
-            ComposerPlaceholderMode::Plan
         } else if followup_mode {
             ComposerPlaceholderMode::FollowUp
         } else {
@@ -3660,7 +3657,6 @@ impl Workspace {
                 ComposerPlaceholderMode::Normal => "workspace-input-placeholder",
                 ComposerPlaceholderMode::FollowUp => "composer-placeholder-followup",
                 ComposerPlaceholderMode::Ask => "workspace-ask-supplement-placeholder",
-                ComposerPlaceholderMode::Plan => "workspace-plan-supplement-placeholder",
             };
             self.input_state.update(cx, |state, cx| {
                 state.set_placeholder(i18n::t(key), window, cx);
@@ -3726,14 +3722,6 @@ impl Workspace {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(i18n::t("workspace-ask-supplement-label")),
-                )
-            })
-            .when(self.pending_plan_review.is_some(), |this| {
-                this.child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(i18n::t("workspace-plan-supplement-label")),
                 )
             })
             .child(

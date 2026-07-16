@@ -1973,7 +1973,7 @@ fn render_plan_review_card(
 
     let weak_impl = weak.clone();
     let impl_btn = Button::new(("plan-verdict-implement", ix))
-        .primary()
+        .ghost()
         .small()
         .label(i18n::t("plan-drawer-implement"))
         .on_click(move |_, _, cx: &mut App| {
