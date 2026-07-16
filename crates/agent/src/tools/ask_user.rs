@@ -93,17 +93,43 @@ impl AgentTool for AskUserQuestionTool {
 
     fn run(
         &self,
-        _input: serde_json::Value,
+        input: serde_json::Value,
         _cancel: CancellationToken,
         _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
+        let validation = serde_json::from_value::<AskUserQuestionInput>(input)
+            .map_err(|e| format!("Invalid AskUserQuestion input: {e}"))
+            .and_then(|input| validate_input(&input));
+
         // Unreachable in normal flow: the thread intercepts AskUserQuestion at
         // the authorization gate and builds the result from the UI response.
-        cx.background_spawn(async {
+        cx.background_spawn(async move {
+            if let Err(e) = validation {
+                return Err(e);
+            }
             Err("AskUserQuestion is resolved by the UI, not executed".to_string())
         })
     }
+}
+
+fn validate_input(input: &AskUserQuestionInput) -> Result<(), String> {
+    if !(1..=3).contains(&input.questions.len()) {
+        return Err(format!(
+            "AskUserQuestion requires 1-3 questions, got {}",
+            input.questions.len()
+        ));
+    }
+    for (idx, question) in input.questions.iter().enumerate() {
+        if !(2..=3).contains(&question.options.len()) {
+            return Err(format!(
+                "AskUserQuestion question {} requires 2-3 options, got {}",
+                idx + 1,
+                question.options.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -126,6 +152,39 @@ mod tests {
 
         let recommended = find_property(&schema, "recommended").expect("recommended property");
         assert_eq!(recommended.get("type"), Some(&json!("boolean")));
+    }
+
+    #[test]
+    fn validate_input_rejects_out_of_range_counts() {
+        let valid = AskUserQuestionInput {
+            questions: vec![question(2)],
+        };
+        assert!(validate_input(&valid).is_ok());
+
+        let too_many_questions = AskUserQuestionInput {
+            questions: vec![question(2), question(2), question(2), question(2)],
+        };
+        assert!(validate_input(&too_many_questions).is_err());
+
+        let too_many_options = AskUserQuestionInput {
+            questions: vec![question(4)],
+        };
+        assert!(validate_input(&too_many_options).is_err());
+    }
+
+    fn question(option_count: usize) -> Question {
+        Question {
+            question: "Pick one?".to_string(),
+            header: "Pick".to_string(),
+            options: (0..option_count)
+                .map(|idx| QuestionOption {
+                    label: format!("Option {}", idx + 1),
+                    description: String::new(),
+                    recommended: false,
+                })
+                .collect(),
+            multi_select: false,
+        }
     }
 
     fn find_property<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {

@@ -2079,6 +2079,8 @@ fn render_ask_user_card(
         .gap_2p5()
         .px_3()
         .pt_3()
+        // The extra bottom padding plus negative margin lets the composer cover
+        // the drawer tail, so the card reads as emerging from beneath it.
         .pb_5()
         .mb(px(-10.))
         .rounded(px(18.))

@@ -2973,6 +2973,18 @@ impl Workspace {
             .is_some_and(|ask| ask.selections.iter().flatten().any(|selected| *selected))
     }
 
+    fn composer_can_submit(&self, running: bool, cx: &App) -> bool {
+        if running {
+            return true;
+        }
+        let input_empty = self.input_state.read(cx).value().trim().is_empty();
+        if self.pending_ask.is_some() {
+            !input_empty || self.pending_ask_has_selection()
+        } else {
+            !input_empty || !self.pending_attachments.is_empty()
+        }
+    }
+
     pub(crate) fn toggle_ask_option(&mut self, qi: usize, oi: usize, cx: &mut Context<Self>) {
         if let Some(ask) = self.pending_ask.as_mut()
             && let Some(sel) = ask.selections.get_mut(qi)
@@ -4772,16 +4784,7 @@ impl Workspace {
     /// driven by Enter, not by this button, so running never disables stop.
     fn render_send_button(&self, running: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
-        // Idle + no pending content => inert. An ask drawer can be submitted
-        // with selected options even when the supplemental note is empty.
-        let input_empty = self.input_state.read(cx).value().trim().is_empty();
-        let disabled = if running {
-            false
-        } else if self.pending_ask.is_some() {
-            input_empty && !self.pending_ask_has_selection()
-        } else {
-            input_empty && self.pending_attachments.is_empty()
-        };
+        let disabled = !self.composer_can_submit(running, cx);
 
         // Matches the composer chip row height (px_2/py_1 + text_xs ≈ 20px),
         // so the send control shares the effort/model chips' rhythm instead of
@@ -6170,9 +6173,9 @@ fn thread_cwd(thread: &Entity<Thread>, cx: &App) -> Option<SharedString> {
 
 fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk> {
     let questions = input.get("questions")?.as_array()?;
-    // An empty questions array renders a button-only card with no way to
-    // answer; fall back to the generic approval overlay instead.
-    if questions.is_empty() {
+    // Out-of-range counts violate the tool contract; fall back to the generic
+    // approval path so the defensive tool runner can report a model-visible error.
+    if !(1..=3).contains(&questions.len()) {
         return None;
     }
     let mut parsed: Vec<AskQuestion> = Vec::with_capacity(questions.len());
@@ -6213,6 +6216,9 @@ fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk>
                 });
             }
         }
+        if !(2..=3).contains(&opts.len()) {
+            return None;
+        }
         selections.push(vec![false; opts.len()]);
         parsed.push(AskQuestion {
             question,
@@ -6229,8 +6235,11 @@ fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk>
 }
 
 fn strip_recommended_suffix(label: String) -> (String, bool) {
+    let lower = label.to_lowercase();
     for suffix in [" (Recommended)", "（推荐）", " (推荐)", "（Recommended）"] {
-        if let Some(stripped) = label.strip_suffix(suffix) {
+        let suffix_lower = suffix.to_lowercase();
+        if lower.ends_with(&suffix_lower) {
+            let stripped = &label[..label.len() - suffix.len()];
             return (stripped.trim().to_string(), true);
         }
     }
