@@ -663,18 +663,20 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::PlanReady { plan_text } => {
-                    // Insert the plan text as a canonical assistant message so it
-                    // persists in thread.messages and survives thread switch /
-                    // reload. The <proposed_plan> block was stripped from the
-                    // streaming assistant message by the parser, so without this
-                    // the plan text would be lost on reload. Inserting it here
-                    // means rebuild_from_messages picks it up as a normal
-                    // ConvItem::Assistant and renders the markdown inline.
-                    this.thread.update(cx, |thread, cx| {
-                        thread.insert_plan_message(plan_text.clone(), cx);
+                    // Push the plan text into ConversationState as a live
+                    // assistant item so it renders immediately in the message
+                    // list. Also persist it into thread.messages so a thread
+                    // switch / reload rebuilds it via build_items.
+                    let weak = cx.weak_entity();
+                    let role = this.model_label(cx);
+                    let pt = plan_text.clone();
+                    this.conversation.update(cx, |c, cx| {
+                        c.push_plan_review(pt.clone(), role, weak, cx);
                     });
-                    // Also arm the drawer with the verdict buttons.
-                    this.pending_drawer = Some(PendingDrawer::Plan { plan_text: plan_text.clone() });
+                    this.thread.update(cx, |thread, cx| {
+                        thread.insert_plan_message(pt.clone(), cx);
+                    });
+                    this.pending_drawer = Some(PendingDrawer::Plan { plan_text: pt });
                     this.auto_follow = true;
                     this.message_scroll.scroll_to_bottom();
                     cx.notify();
