@@ -2204,11 +2204,12 @@ impl Workspace {
             ui,
             user_images,
         };
-        // A plan review is awaiting the user's verdict — block new turns until
-        // they pick implement / clear-context / stay (the review overlay is the
-        // only live affordance, mirroring the pending-ask gate).
+        // A plan drawer is active — the user can either click a verdict button
+        // OR continue typing to discuss the plan. If they type, clear the
+        // drawer and send the message as a normal user turn (the agent will
+        // re-evaluate and may submit a new plan).
         if matches!(self.pending_drawer, Some(PendingDrawer::Plan { .. })) {
-            return;
+            self.pending_drawer = None;
         }
         // A turn is running — park the message as a visible follow-up instead
         // of interrupting the in-flight tool calls. The default disposition
