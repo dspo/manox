@@ -156,6 +156,15 @@ pub enum PlanReviewChoice {
     StayInPlan,
 }
 
+/// The user turn that seeds an implement turn after the user approves a proposed
+/// plan. The `<proposed_plan>` block is never persisted into the assistant
+/// message (prefix-cache preservation), so the approved plan text is re-injected
+/// as this user turn — identical text live and on rebuild, so a reloaded thread
+/// renders the same verdict bubble the live view showed.
+pub fn implement_plan_user_message(plan_text: &str) -> String {
+    format!("Implement the approved plan:\n\n{plan_text}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

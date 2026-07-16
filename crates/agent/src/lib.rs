@@ -46,7 +46,9 @@ pub mod webview_host;
 
 use gpui::App;
 
-pub use collaboration_mode::{ModeKind, ModeSettings, ModeSettingsMap, PlanReviewChoice};
+pub use collaboration_mode::{
+    ModeKind, ModeSettings, ModeSettingsMap, PlanReviewChoice, implement_plan_user_message,
+};
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
 pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};

@@ -1327,11 +1327,14 @@ impl Thread {
     /// approved plan; `ImplementClearContext` does the same after dropping
     /// prior history; `StayInPlan` is a no-op. The plan text is re-injected as
     /// a user message because the `<proposed_plan>` block was never persisted
-    /// into the assistant message — the model needs it to execute.
+    /// into the assistant message — the model needs it to execute. `ui` is the
+    /// same UI metadata the live view stamps onto the verdict bubble, so a
+    /// reloaded thread rebuilds the identical bubble (model/approval badges).
     pub fn respond_plan_review(
         &mut self,
         choice: crate::collaboration_mode::PlanReviewChoice,
         plan_text: String,
+        ui: Option<crate::MessageUiMetadata>,
         cx: &mut Context<Self>,
     ) {
         use crate::collaboration_mode::PlanReviewChoice;
@@ -1341,10 +1344,8 @@ impl Thread {
                     self.messages.clear();
                 }
                 self.set_collaboration_mode(ModeKind::Default, cx);
-                self.insert_user_message(
-                    format!("Implement the approved plan:\n\n{plan_text}"),
-                    cx,
-                );
+                let text = crate::collaboration_mode::implement_plan_user_message(&plan_text);
+                self.insert_user_message_with_ui_metadata(text, ui, cx);
                 self.run_turn(cx);
             }
             PlanReviewChoice::StayInPlan => {}

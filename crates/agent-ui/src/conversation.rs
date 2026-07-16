@@ -523,6 +523,24 @@ impl ConversationState {
         }
     }
 
+    /// Drop the most recent plan-review card outright. Called only on an
+    /// implement verdict, where the pending plan card is by construction the
+    /// live tail (a fresh `PlanReady` always lands at the tail and nothing is
+    /// pushed between the card and the verdict) — so a tail pop is the safe
+    /// removal. The verdict's own user bubble is pushed in its place, carrying
+    /// the same plan text the thread injects, so live and rebuilt views match.
+    pub fn pop_plan_review_tail(&mut self, cx: &mut App) -> bool {
+        let is_plan = self
+            .items
+            .last()
+            .map(|last| matches!(last.read(cx).kind(), ConvItem::PlanReview { .. }))
+            .unwrap_or(false);
+        if is_plan {
+            self.items.pop();
+        }
+        is_plan
+    }
+
     pub fn find_tool(&self, id: &str, cx: &App) -> Option<usize> {
         self.items
             .iter()

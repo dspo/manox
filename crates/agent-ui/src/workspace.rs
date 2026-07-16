@@ -2978,26 +2978,47 @@ impl Workspace {
     /// re-injects the plan as the implement turn's seed. Stay keeps the thread
     /// in Plan mode for another research round.
     pub(crate) fn respond_plan_review(&mut self, choice: PlanReviewChoice, cx: &mut Context<Self>) {
-        let Some(review) = self.pending_plan_review.take() else {
-            return;
-        };
-        // The verdict consumes the plan: demote the card to an inactive record
-        // so its buttons collapse and it cannot be re-judged. Applies to every
-        // choice, including StayInPlan — staying is itself a verdict, and the
-        // next proposal lands as a fresh active card.
-        self.conversation
-            .update(cx, |c, cx| c.consume_plan_review(cx));
-        if matches!(
-            choice,
-            PlanReviewChoice::Implement | PlanReviewChoice::ImplementClearContext
-        ) {
-            self.context_rail.update(cx, |r, cx| {
-                r.set_milestones_from_plan(&review.plan_text, cx)
-            });
+        use PlanReviewChoice::*;
+        match choice {
+            Implement | ImplementClearContext => {
+                let Some(review) = self.pending_plan_review.take() else {
+                    return;
+                };
+                // The verdict becomes a user bubble carrying the approved plan
+                // text — the same text+ui the thread injects below — so the live
+                // view and a reloaded thread both show this one bubble. The
+                // ephemeral plan card (never persisted) is retired in its place:
+                // cleared wholesale on a clear-context verdict, or popped from the
+                // tail otherwise (the pending card is the live tail at verdict
+                // time, so a tail pop is the safe removal).
+                let meta = self.user_turn_meta(cx);
+                let ui = Self::message_ui_metadata(&meta);
+                let text = agent::implement_plan_user_message(&review.plan_text);
+                let weak = cx.weak_entity();
+                if matches!(choice, ImplementClearContext) {
+                    self.conversation.update(cx, |c, _| c.clear());
+                } else {
+                    self.conversation.update(cx, |c, cx| {
+                        c.pop_plan_review_tail(cx);
+                    });
+                }
+                self.conversation.update(cx, |c, cx| {
+                    c.push_user(text, Vec::new(), meta, weak, cx);
+                });
+                self.auto_follow = true;
+                self.message_scroll.scroll_to_bottom();
+                self.context_rail.update(cx, |r, cx| {
+                    r.set_milestones_from_plan(&review.plan_text, cx)
+                });
+                self.thread.update(cx, |thread, cx| {
+                    thread.respond_plan_review(choice, review.plan_text, Some(ui), cx);
+                });
+            }
+            // Defer, not a verdict: keep the plan pending and the card active so
+            // the user can Implement this plan later without a fresh proposal, or
+            // type a free-form message to dismiss it and let the model re-propose.
+            StayInPlan => {}
         }
-        self.thread.update(cx, |thread, cx| {
-            thread.respond_plan_review(choice, review.plan_text, cx);
-        });
         cx.notify();
     }
 
