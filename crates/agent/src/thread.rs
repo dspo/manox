@@ -1798,6 +1798,19 @@ impl Thread {
         cx.notify();
     }
 
+    /// Insert the finalized plan text as a canonical assistant message. The
+    ///  block was stripped from the streaming assistant
+    /// message by the parser (so the model never re-reads its own plan next
+    /// turn), but the user needs to see the plan text in the conversation
+    /// list — and it must persist so a thread switch / reload shows it too.
+    /// This inserts a fresh assistant message carrying just the plan text,
+    /// after the stripped streaming message.
+    pub fn insert_plan_message(&mut self, plan_text: String, cx: &mut Context<Self>) {
+        let msg = Message::assistant(vec![MessageContent::Text(plan_text)]);
+        self.messages.push(msg);
+        cx.notify();
+    }
+
     /// Queue a steer follow-up — a user message that the running turn absorbs
     /// at the next safe join point rather than starting a new turn. Drained by
     /// `run_turn_loop` before each `build_completion_request` and at the EndTurn
