@@ -1883,6 +1883,7 @@ fn render_ask_user_card(
 
     let weak_prev = weak.clone();
     let weak_next = weak.clone();
+    let weak_submit = weak.clone();
     let weak_cancel = weak.clone();
     let header = h_flex()
         .w_full()
@@ -1924,10 +1925,17 @@ fn render_ask_user_card(
                     Button::new(("ask-card-next", ix))
                         .ghost()
                         .xsmall()
-                        .icon(IconName::ChevronRight)
-                        .when(!can_next, |b| b.disabled(true))
-                        .on_click(move |_, _, cx: &mut App| {
-                            let _ = weak_next.update(cx, |w, cx| w.ask_next(cx));
+                        .icon(if can_next {
+                            IconName::ChevronRight
+                        } else {
+                            IconName::Check
+                        })
+                        .on_click(move |_, window, cx: &mut App| {
+                            if can_next {
+                                let _ = weak_next.update(cx, |w, cx| w.ask_next(cx));
+                            } else {
+                                let _ = weak_submit.update(cx, |w, cx| w.submit_input(window, cx));
+                            }
                         }),
                 )
                 .child(
