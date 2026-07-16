@@ -120,11 +120,6 @@ pub struct PeerMessageData {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AskUserResponseData {
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct AskUserQa {
     pub question: String,
     pub answer: String,
@@ -135,6 +130,7 @@ pub struct AskUserQa {
 #[derive(Debug, Clone, Serialize)]
 pub struct AskUserQuestionsData {
     pub answers: Vec<AskUserQa>,
+    pub response: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

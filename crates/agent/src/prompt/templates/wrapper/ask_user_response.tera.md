@@ -1,1 +1,0 @@
-User responded: {{ text }}

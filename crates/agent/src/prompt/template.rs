@@ -37,7 +37,6 @@ pub enum PromptTemplate {
     WrapperEmptyTurnNudge,
     WrapperUnfulfilledToolIntentNudge,
     WrapperPeerMessage,
-    WrapperAskUserResponse,
     WrapperAskUserQuestions,
     WrapperToolDenied,
     WrapperGoalContinuation,
@@ -79,7 +78,6 @@ impl PromptTemplate {
                 "wrapper/unfulfilled_tool_intent_nudge.tera.md"
             }
             Self::WrapperPeerMessage => "wrapper/peer_message.tera.md",
-            Self::WrapperAskUserResponse => "wrapper/ask_user_response.tera.md",
             Self::WrapperAskUserQuestions => "wrapper/ask_user_questions.tera.md",
             Self::WrapperToolDenied => "wrapper/tool_denied.tera.md",
             Self::WrapperGoalContinuation => "wrapper/goal_continuation.tera.md",
@@ -102,7 +100,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 25] = [
+pub const ALL: [PromptTemplate; 24] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::ModeGoalAddendum,
@@ -113,7 +111,6 @@ pub const ALL: [PromptTemplate; 25] = [
     PromptTemplate::WrapperEmptyTurnNudge,
     PromptTemplate::WrapperUnfulfilledToolIntentNudge,
     PromptTemplate::WrapperPeerMessage,
-    PromptTemplate::WrapperAskUserResponse,
     PromptTemplate::WrapperAskUserQuestions,
     PromptTemplate::WrapperToolDenied,
     PromptTemplate::WrapperGoalContinuation,

@@ -39,8 +39,6 @@ const TPL_WRAPPER_EMPTY_TURN_NUDGE: &str =
 const TPL_WRAPPER_UNFULFILLED_TOOL_INTENT_NUDGE: &str =
     include_str!("templates/wrapper/unfulfilled_tool_intent_nudge.tera.md");
 const TPL_WRAPPER_PEER_MESSAGE: &str = include_str!("templates/wrapper/peer_message.tera.md");
-const TPL_WRAPPER_ASK_USER_RESPONSE: &str =
-    include_str!("templates/wrapper/ask_user_response.tera.md");
 const TPL_WRAPPER_ASK_USER_QUESTIONS: &str =
     include_str!("templates/wrapper/ask_user_questions.tera.md");
 const TPL_WRAPPER_TOOL_DENIED: &str = include_str!("templates/wrapper/tool_denied.tera.md");
@@ -105,10 +103,6 @@ fn tera() -> &'static tera::Tera {
                 TPL_WRAPPER_UNFULFILLED_TOOL_INTENT_NUDGE,
             ),
             (PromptTemplate::WrapperPeerMessage, TPL_WRAPPER_PEER_MESSAGE),
-            (
-                PromptTemplate::WrapperAskUserResponse,
-                TPL_WRAPPER_ASK_USER_RESPONSE,
-            ),
             (
                 PromptTemplate::WrapperAskUserQuestions,
                 TPL_WRAPPER_ASK_USER_QUESTIONS,
@@ -424,22 +418,13 @@ mod tests {
         );
         assert_clean(
             &render(
-                PromptTemplate::WrapperAskUserResponse,
-                &crate::prompt::AskUserResponseData {
-                    text: "yes".to_string(),
-                },
-            )
-            .unwrap(),
-            PromptTemplate::WrapperAskUserResponse,
-        );
-        assert_clean(
-            &render(
                 PromptTemplate::WrapperAskUserQuestions,
                 &crate::prompt::AskUserQuestionsData {
                     answers: vec![crate::prompt::AskUserQa {
                         question: "q".to_string(),
                         answer: "a".to_string(),
                     }],
+                    response: Some("extra context".to_string()),
                 },
             )
             .unwrap(),
