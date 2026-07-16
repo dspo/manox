@@ -410,6 +410,8 @@ workspace-inbound-deny = Deny
 workspace-clarify-title = Clarifying question
 workspace-ask-supplement-label = Supplemental note
 workspace-ask-supplement-placeholder = Add optional context
+workspace-plan-supplement-label = Discuss or refine the plan, or pick a verdict above
+workspace-plan-supplement-placeholder = Discuss the plan, or choose a verdict
 workspace-ask-recommended = Recommended
 workspace-cancel = Cancel
 workspace-submit = Submit
@@ -586,9 +588,7 @@ plan-card-download = Download plan
 plan-card-copy = Copy plan
 plan-card-sidebar = Open in side panel
 
-# Plan review drawer
-plan-drawer-title = Review Plan
+# Plan review card verdict buttons
 plan-drawer-implement = Implement
 plan-drawer-clear = Clear & Implement
 plan-drawer-stay = Stay in Plan
-plan-drawer-hint = Discuss below, or choose an action

@@ -159,6 +159,7 @@ enum ComposerPlaceholderMode {
     Normal,
     FollowUp,
     Ask,
+    Plan,
 }
 
 struct DeferredUserTurn {
@@ -2952,83 +2953,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Plan-review drawer anchored above the composer. `ThreadEvent::PlanReady`
-    /// pushes the plan body into the message list as a card; this drawer then
-    /// surfaces the three verdicts (stay / clear-and-implement / implement) so
-    /// the user can act without a modal blocking the conversation. The composer
-    /// below stays live — the user may type to discuss or refine the plan, in
-    /// which case the agent re-evaluates and may submit a fresh `PlanReady`.
-    fn render_plan_review_drawer(
-        &self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        // The plan body is already rendered as a card in the message list;
-        // this drawer only carries the verdict buttons, so the pending review
-        // is referenced solely to gate visibility.
-        let _ = self.pending_plan_review.as_ref()?;
-        let accent = theme.accent;
-        Some(
-            h_flex()
-                .w_full()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .rounded(theme.radius)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.secondary)
-                .child(
-                    Icon::new(IconName::LayoutDashboard)
-                        .xsmall()
-                        .text_color(accent),
-                )
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(i18n::t("plan-drawer-title")),
-                )
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(i18n::t("plan-drawer-hint")),
-                )
-                .child(
-                    Button::new("plan-drawer-stay")
-                        .ghost()
-                        .small()
-                        .label(i18n::t("plan-drawer-stay"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.respond_plan_review(PlanReviewChoice::StayInPlan, cx);
-                        })),
-                )
-                .child(
-                    Button::new("plan-drawer-clear")
-                        .ghost()
-                        .small()
-                        .label(i18n::t("plan-drawer-clear"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.respond_plan_review(PlanReviewChoice::ImplementClearContext, cx);
-                        })),
-                )
-                .child(
-                    Button::new("plan-drawer-implement")
-                        .primary()
-                        .small()
-                        .label(i18n::t("plan-drawer-implement"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.respond_plan_review(PlanReviewChoice::Implement, cx);
-                        })),
-                )
-                .into_any_element(),
-        )
-    }
-
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         // AskUserQuestion renders its own card; suppress the generic approval
         // modal while a question card is open (both share the same id).
@@ -3723,6 +3647,8 @@ impl Workspace {
             running && self.pending_plan_review.is_none() && self.pending_ask.is_none();
         let placeholder_mode = if self.pending_ask.is_some() {
             ComposerPlaceholderMode::Ask
+        } else if self.pending_plan_review.is_some() {
+            ComposerPlaceholderMode::Plan
         } else if followup_mode {
             ComposerPlaceholderMode::FollowUp
         } else {
@@ -3734,6 +3660,7 @@ impl Workspace {
                 ComposerPlaceholderMode::Normal => "workspace-input-placeholder",
                 ComposerPlaceholderMode::FollowUp => "composer-placeholder-followup",
                 ComposerPlaceholderMode::Ask => "workspace-ask-supplement-placeholder",
+                ComposerPlaceholderMode::Plan => "workspace-plan-supplement-placeholder",
             };
             self.input_state.update(cx, |state, cx| {
                 state.set_placeholder(i18n::t(key), window, cx);
@@ -3799,6 +3726,14 @@ impl Workspace {
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(i18n::t("workspace-ask-supplement-label")),
+                )
+            })
+            .when(self.pending_plan_review.is_some(), |this| {
+                this.child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(i18n::t("workspace-plan-supplement-label")),
                 )
             })
             .child(
@@ -5363,7 +5298,6 @@ impl Render for Workspace {
                     .gap_2()
                     .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
                     .children(self.render_attachments(&theme, cx))
-                    .children(self.render_plan_review_drawer(&theme, cx))
                     .child(centered(self.render_composer(running, window, &theme, cx))),
             )
         };

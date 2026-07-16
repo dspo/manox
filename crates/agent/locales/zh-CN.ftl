@@ -358,6 +358,8 @@ workspace-inbound-deny = 拒绝
 workspace-clarify-title = 澄清问题
 workspace-ask-supplement-label = 补充说明
 workspace-ask-supplement-placeholder = 添加可选补充说明
+workspace-plan-supplement-label = 继续讨论或修改计划，或在上方选择裁决
+workspace-plan-supplement-placeholder = 讨论计划，或选择裁决
 workspace-ask-recommended = 推荐
 workspace-cancel = 取消
 workspace-submit = 提交
@@ -528,9 +530,7 @@ plan-card-download = 下载计划
 plan-card-copy = 复制计划
 plan-card-sidebar = 在侧边栏打开
 
-# Plan review drawer
-plan-drawer-title = 审阅计划
+# Plan review card verdict buttons
 plan-drawer-implement = 执行
 plan-drawer-clear = 清空并执行
 plan-drawer-stay = 保持在计划模式
-plan-drawer-hint = 在下方继续讨论，或选择操作

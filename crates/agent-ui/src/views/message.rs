@@ -1855,10 +1855,13 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
     }
 }
 
-/// Render a plan-review item as a bordered card with a header bar and a
-/// height-limited markdown body. The header carries the plan title on the
-/// left and three action icons on the right: download (clipboard fallback),
-/// copy (clipboard), and sidebar (opens plan in a right-pane PlanPreview tab).
+/// Render a plan-review item as a drawer card that emerges from beneath the
+/// composer, mirroring `render_ask_user_card`'s shell (negative bottom margin +
+/// shadow + slide-in animation + `PlanDrawer` key context). The header carries
+/// the plan title and three affordances — download / copy / open in a right-pane
+/// [PlanPreviewTab] — and the footer carries the three verdicts that delegate to
+/// `Workspace::respond_plan_review`. The composer below stays live so the user
+/// can discuss or refine the plan instead of picking a verdict.
 fn render_plan_review_card(
     plan_text: &str,
     ix: usize,
@@ -1866,9 +1869,25 @@ fn render_plan_review_card(
     tool_ctx: Option<&ToolCallCtx>,
     cx: &mut App,
 ) -> gpui::AnyElement {
+    let Some(weak) = tool_ctx.map(|c| c.weak.clone()) else {
+        return v_flex()
+            .w_full()
+            .min_w_0()
+            .p_3()
+            .rounded(px(18.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(markdown_tv(
+                ("plan-review", ix),
+                plan_text.to_string(),
+                theme,
+                false,
+                cx,
+            ))
+            .into_any_element();
+    };
     let accent = theme.accent;
-    let group = format!("plan-review-{ix}");
-    let weak = tool_ctx.map(|c| c.weak.clone());
 
     let download_btn = Button::new(("plan-download", ix))
         .ghost()
@@ -1894,70 +1913,119 @@ fn render_plan_review_card(
             }
         });
 
-    let plan_text_owned = plan_text.to_string();
+    let plan_owned = plan_text.to_string();
+    let weak_sb = weak.clone();
     let sidebar_btn = Button::new(("plan-sidebar", ix))
         .ghost()
         .xsmall()
         .icon(IconName::PanelRightClose)
         .tooltip(i18n::t("plan-card-sidebar"))
         .on_click(move |_, _, cx: &mut App| {
-            if let Some(weak) = weak.clone() {
-                let _ = weak.update(cx, |ws, cx| {
-                    ws.open_plan_in_editor(plan_text_owned.clone(), cx);
-                });
-            }
+            let _ = weak_sb.update(cx, |ws, cx| {
+                ws.open_plan_in_editor(plan_owned.clone(), cx);
+            });
         });
 
-    v_flex()
-        .group(group)
+    let header = h_flex()
         .w_full()
         .min_w_0()
-        .border_1()
-        .border_color(theme.border)
-        .rounded(theme.radius)
-        .overflow_hidden()
+        .items_center()
+        .gap_2()
         .child(
-            h_flex()
-                .w_full()
-                .min_w_0()
-                .px_3()
-                .py_2()
-                .gap_2()
-                .items_center()
-                .border_b_1()
-                .border_color(theme.border)
-                .bg(accent.opacity(0.06))
-                .child(
-                    Icon::new(IconName::LayoutDashboard)
-                        .xsmall()
-                        .text_color(accent),
-                )
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(accent)
-                        .child(i18n::t("plan-card-title")),
-                )
-                .child(gpui::div().flex_1())
-                .child(download_btn)
-                .child(copy_btn)
-                .child(sidebar_btn),
+            Icon::new(IconName::LayoutDashboard)
+                .xsmall()
+                .text_color(accent),
         )
         .child(
             gpui::div()
-                .w_full()
+                .flex_1()
                 .min_w_0()
-                .max_h(px(300.))
-                .overflow_hidden()
-                .p_3()
-                .child(markdown_tv(
-                    ("plan-review", ix),
-                    plan_text.to_string(),
-                    theme,
-                    false,
-                    cx,
-                )),
+                .text_sm()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(accent)
+                .child(i18n::t("plan-card-title")),
+        )
+        .child(download_btn)
+        .child(copy_btn)
+        .child(sidebar_btn);
+
+    let weak_stay = weak.clone();
+    let stay_btn = Button::new(("plan-verdict-stay", ix))
+        .ghost()
+        .small()
+        .label(i18n::t("plan-drawer-stay"))
+        .on_click(move |_, _, cx: &mut App| {
+            let _ = weak_stay.update(cx, |w, cx| {
+                w.respond_plan_review(agent::PlanReviewChoice::StayInPlan, cx);
+            });
+        });
+
+    let weak_clear = weak.clone();
+    let clear_btn = Button::new(("plan-verdict-clear", ix))
+        .ghost()
+        .small()
+        .label(i18n::t("plan-drawer-clear"))
+        .on_click(move |_, _, cx: &mut App| {
+            let _ = weak_clear.update(cx, |w, cx| {
+                w.respond_plan_review(agent::PlanReviewChoice::ImplementClearContext, cx);
+            });
+        });
+
+    let weak_impl = weak.clone();
+    let impl_btn = Button::new(("plan-verdict-implement", ix))
+        .primary()
+        .small()
+        .label(i18n::t("plan-drawer-implement"))
+        .on_click(move |_, _, cx: &mut App| {
+            let _ = weak_impl.update(cx, |w, cx| {
+                w.respond_plan_review(agent::PlanReviewChoice::Implement, cx);
+            });
+        });
+
+    let footer = h_flex()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .border_t_1()
+        .border_color(theme.border)
+        .pt_2p5()
+        .child(stay_btn)
+        .child(clear_btn)
+        .child(impl_btn);
+
+    v_flex()
+        .id(format!("plan-card-{ix}"))
+        .key_context("PlanDrawer")
+        .w_full()
+        .min_w_0()
+        .gap_2p5()
+        .px_3()
+        .pt_3()
+        // Extra bottom padding + negative margin let the composer cover the
+        // drawer tail, so the card reads as emerging from beneath it — the same
+        // trick render_ask_user_card uses.
+        .pb_5()
+        .mb(px(-10.))
+        .rounded(px(18.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background)
+        .shadow_lg()
+        .child(header)
+        .child(gpui::div().w_full().min_w_0().p_1().child(markdown_tv(
+            ("plan-review", ix),
+            plan_text.to_string(),
+            theme,
+            false,
+            cx,
+        )))
+        .child(footer)
+        .with_animation(
+            format!("plan-card-slide-{ix}"),
+            Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+            |el, delta| el.mt(px(8. * (1. - delta))).opacity(delta),
         )
         .into_any_element()
 }
