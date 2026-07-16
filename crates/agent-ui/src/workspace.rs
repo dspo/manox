@@ -663,14 +663,6 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::PlanReady { plan_text } => {
-                    // Append the plan text as a message in the conversation
-                    // list so the user can read it inline, then arm the drawer
-                    // with the three-way verdict affordance.
-                    let weak = cx.weak_entity();
-                    let role = this.model_label(cx);
-                    this.conversation.update(cx, |c, cx| {
-                        c.push_plan_review(plan_text.clone(), role, weak, cx);
-                    });
                     this.pending_drawer = Some(PendingDrawer::Plan { plan_text: plan_text.clone() });
                     this.auto_follow = true;
                     this.message_scroll.scroll_to_bottom();
@@ -3416,7 +3408,7 @@ impl Workspace {
         let accent = theme.accent;
         let drawer_gen = self.ask_transition_gen;
         match drawer {
-            PendingDrawer::Plan { plan_text: _ } => {
+            PendingDrawer::Plan { plan_text } => {
                 Some(
                     deferred(
                         gpui::div()
@@ -3463,6 +3455,24 @@ impl Workspace {
                                                             this.pending_drawer = None;
                                                             cx.notify();
                                                         })),
+                                                ),
+                                        )
+                                        .child(
+                                            gpui::div()
+                                                .w_full()
+                                                .max_h(px(360.))
+                                                .overflow_hidden()
+                                                .rounded(theme.radius)
+                                                .bg(theme.secondary)
+                                                .p_3()
+                                                .child(
+                                                    cx.new(|_| {
+                                                        Markdown::new("plan-drawer-body", plan_text.clone())
+                                                            .theme(theme)
+                                                            .scrollable(true)
+                                                            .heading_mode(HeadingMode::Uniform)
+                                                    })
+                                                    .into_any_element(),
                                                 ),
                                         )
                                         .child(
