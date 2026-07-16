@@ -28,6 +28,7 @@ const MAX_ALLOWED_BYTES: usize = 4 * 1024 * 1024;
 pub struct WebFetchTool;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WebFetchInput {
     /// Absolute `http://` or `https://` URL to fetch.
     url: String,
@@ -66,8 +67,11 @@ impl AgentTool for WebFetchTool {
         _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<WebFetchInput>(input) else {
-            return cx.background_spawn(async { Err("input parse failed".to_string()) });
+        let parsed = match serde_json::from_value::<WebFetchInput>(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return cx.background_spawn(async move { Err(format!("input parse failed: {e}")) });
+            }
         };
         let max_bytes = parsed
             .max_bytes

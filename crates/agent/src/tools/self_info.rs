@@ -39,6 +39,7 @@ impl SelfInfoTool {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SelfInfoInput {}
 
 impl AgentToolTrait for SelfInfoTool {

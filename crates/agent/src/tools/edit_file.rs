@@ -20,6 +20,7 @@ pub struct EditFileTool {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EditFileInput {
     /// Hashline patch text. Each file section starts with a header
     /// `[<abs-path>#<tag>]` — paste the exact absolute path and 4-hex tag
@@ -73,8 +74,11 @@ impl AgentTool for EditFileTool {
         ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<EditFileInput>(input) else {
-            return cx.background_spawn(async { Err("input parse failed".to_string()) });
+        let parsed = match serde_json::from_value::<EditFileInput>(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return cx.background_spawn(async move { Err(format!("input parse failed: {e}")) });
+            }
         };
         let cwd = self.cwd.clone();
         let sandbox = self.sandbox.clone();

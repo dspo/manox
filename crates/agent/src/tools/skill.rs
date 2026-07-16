@@ -18,6 +18,7 @@ use crate::tools::schema;
 pub struct SkillTool;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SkillInput {
     /// Skill name exactly as it appears in the system prompt's available-skills list.
     /// Plugin skills use the `plugin:skill` form (e.g. `gitwork:review`).
@@ -48,8 +49,11 @@ impl AgentTool for SkillTool {
         _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<SkillInput>(input) else {
-            return cx.background_spawn(async { Err("input parse failed".to_string()) });
+        let parsed = match serde_json::from_value::<SkillInput>(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return cx.background_spawn(async move { Err(format!("input parse failed: {e}")) });
+            }
         };
         cx.background_spawn(async move {
             let reg = crate::skill::global();

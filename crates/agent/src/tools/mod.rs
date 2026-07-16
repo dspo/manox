@@ -18,6 +18,7 @@ pub mod glob;
 pub mod grep;
 pub mod list_directory;
 pub mod monitor;
+pub mod path_selector;
 pub mod read_file;
 pub mod self_info;
 pub mod skill;

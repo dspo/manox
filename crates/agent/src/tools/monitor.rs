@@ -35,6 +35,7 @@ const MAX_TIMEOUT_MS: u64 = 3_600_000;
 const MONITOR_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MonitorInput {
     /// Shell command to run (`sh -c`). stdout and stderr are streamed line by
     /// line; each line becomes a live update. Filter the command to emit only

@@ -57,6 +57,7 @@ impl ExitWorktreeTool {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct EnterWorktreeInput {
     /// Name for a NEW worktree (and its branch). Auto-generated as
     /// `wt-<short>` when absent. Mutually exclusive with `path`.
@@ -69,6 +70,7 @@ struct EnterWorktreeInput {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ExitWorktreeInput {
     /// `keep` (default) leaves the worktree and branch on disk; `remove`
     /// deletes both.

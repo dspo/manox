@@ -12,6 +12,7 @@ use super::schema;
 pub struct WebExploreOpenTool;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct OpenInput {
     /// Absolute URL to navigate the new tab to (`https://` recommended).
     url: String,
@@ -40,8 +41,9 @@ impl AgentTool for WebExploreOpenTool {
         _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<OpenInput>(input) else {
-            return Task::ready(Err("input parse failed".to_string()));
+        let parsed = match serde_json::from_value::<OpenInput>(input) {
+            Ok(p) => p,
+            Err(e) => return Task::ready(Err(format!("input parse failed: {e}"))),
         };
         let Some(host) = crate::webview_host::host() else {
             return Task::ready(Err("browser host not available".to_string()));
