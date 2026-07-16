@@ -50,8 +50,9 @@ pub struct Settings {
 
     /// Auto-compaction: summarize older history into a handoff message when the
     /// live context window fills, so long sessions keep going. The trigger
-    /// threshold is a fraction of the model's `max_token_count`; 0.9 leaves a
-    /// 10% headroom for the output turn that follows. See `compact`.
+    /// threshold is a fraction of the model's `max_token_count`; 0.8 leaves a
+    /// 20% headroom for the output turn that follows. Compaction also fires
+    /// when the estimated request body exceeds 6 MiB. See `compact`.
     #[serde(default)]
     pub auto_compact: AutoCompactSettings,
 
@@ -95,7 +96,7 @@ impl Default for AutoCompactSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            threshold: 0.9,
+            threshold: 0.8,
         }
     }
 }
