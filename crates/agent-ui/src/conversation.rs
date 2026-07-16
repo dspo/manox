@@ -136,6 +136,12 @@ pub enum ConvItem {
         from: String,
         content: String,
     },
+    /// A plan review item rendered as a bordered card in the message list.
+    /// Carries the finalized `<proposed_plan>` text so the user can read it
+    /// inline; the action buttons live in the composer drawer.
+    PlanReview {
+        plan_text: String,
+    },
 }
 
 /// A tool-call item, tracking status/output by id.
@@ -463,6 +469,20 @@ impl ConversationState {
         let id = self.items.len();
         self.items
             .push(cx.new(|_| MessageItem::new(ConvItem::Notice(text), String::new(), id, weak)));
+    }
+
+    /// Append a plan-review item to the message list. The plan text renders
+    /// inline as a read-only bordered card with a height-limited markdown body.
+    pub fn push_plan_review(
+        &mut self,
+        plan_text: String,
+        role: String,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) {
+        let id = self.items.len();
+        self.items
+            .push(cx.new(|_| MessageItem::new(ConvItem::PlanReview { plan_text }, role, id, weak)));
     }
 
     pub fn find_tool(&self, id: &str, cx: &App) -> Option<usize> {

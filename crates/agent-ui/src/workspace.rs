@@ -74,6 +74,7 @@ enum RightTab {
     Editor,
     Member(String),
     Browser(BrowserTabId),
+    PlanPreview,
 }
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
@@ -243,6 +244,9 @@ pub struct Workspace {
     /// `h_full`-percentage) scroll container reliably engages `overflow_y_scroll`
     /// instead of letting content overflow and clip.
     editor_preview_scroll: ScrollHandle,
+    /// Plan text for the `RightTab::PlanPreview` tab. `None` when no plan
+    /// preview tab is open.
+    plan_preview_text: Option<String>,
     /// Right-pane tabs: the markdown Editor plus one Member tab per observed
     /// worker. The pane renders while non-empty; `editor_open` tracks whether
     /// the Editor tab specifically is active.
@@ -522,6 +526,7 @@ impl Workspace {
             editor_preview: false,
             editor_preview_md: None,
             editor_preview_scroll: ScrollHandle::new(),
+            plan_preview_text: None,
             right_tabs: Vec::new(),
             active_right_tab: 0,
             member_panels: BTreeMap::new(),
@@ -639,9 +644,15 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::PlanReady { plan_text } => {
-                    this.pending_plan_review = Some(PendingPlanReview {
-                        plan_text: plan_text.clone(),
+                    let weak = cx.weak_entity();
+                    let role = this.model_label(cx);
+                    let pt = plan_text.clone();
+                    this.conversation.update(cx, |c, cx| {
+                        c.push_plan_review(pt.clone(), role, weak, cx);
                     });
+                    this.pending_plan_review = Some(PendingPlanReview { plan_text: pt });
+                    this.auto_follow = true;
+                    this.message_scroll.scroll_to_bottom();
                     cx.notify();
                 }
                 ThreadEvent::ApprovalModeChanged { .. } => {
@@ -1840,7 +1851,6 @@ impl Workspace {
         // rather than interrupting the run (e.g. `/clear` mid-turn would race
         // the streaming conversation). The queued text flushes at turn end.
         if !self.thread.read(cx).is_running()
-            && self.pending_plan_review.is_none()
             && attachments.is_empty()
             && let Some(parsed) = crate::slash_command::parse(&text)
         {
@@ -1994,12 +2004,10 @@ impl Workspace {
             ui,
             user_images,
         };
-        // A plan review is awaiting the user's verdict — block new turns until
-        // they pick implement / clear-context / stay (the review overlay is the
-        // only live affordance, mirroring the pending-ask gate).
-        if self.pending_plan_review.is_some() {
-            return;
-        }
+        // A plan review is awaiting the user's verdict. Allow the user to send
+        // messages to discuss or revise the plan. The drawer buttons (implement /
+        // clear-context / stay) provide the explicit verdict, while free-form
+        // input lets the user refine the plan through conversation.
         // A turn is running — park the message as a visible follow-up instead
         // of interrupting the in-flight tool calls. The default disposition
         // (Queue vs Steer) comes from the setting: `Steer` hands the message
@@ -2027,6 +2035,12 @@ impl Workspace {
             cx.notify();
             return;
         }
+        // The thread is idle (not running). If a plan review was awaiting a
+        // verdict, a free-form message means the user is discussing or revising
+        // rather than accepting — drop the stale verdict so the drawer hides
+        // until the agent re-proposes via a fresh `PlanReady`. Without this the
+        // lingering Implement button would act on the now-outdated plan text.
+        self.pending_plan_review = None;
         self.append_and_run_user_turn(turn, weak, cx);
     }
 
@@ -2469,11 +2483,21 @@ impl Workspace {
                 .is_some_and(|t| matches!(t, RightTab::Editor));
             cx.notify();
         }
+        if let Some(RightTab::PlanPreview) = self.right_tabs.get(ix).cloned() {
+            self.right_tabs.remove(ix);
+            self.plan_preview_text = None;
+            self.reseat_active_after_close(ix);
+            self.editor_open = self
+                .right_tabs
+                .get(self.active_right_tab)
+                .is_some_and(|t| matches!(t, RightTab::Editor));
+            cx.notify();
+            return;
+        }
         if let Some(RightTab::Browser(id)) = self.right_tabs.get(ix).cloned() {
             self.close_browser_tab(id, cx);
         }
     }
-
     /// Close the active right-pane tab if it is a browser tab. No-op
     /// otherwise (the keybinding is global; it should not close Editor or
     /// Member tabs that happen to be active).
@@ -2505,12 +2529,11 @@ impl Workspace {
 
     /// Submit the editor text to the thread, then close the panel and return
     /// focus to the inline input.
+    /// Submit the editor text to the thread, then close the panel and return
+    /// focus to the inline input.
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
-        if text.trim().is_empty()
-            || self.pending_ask.is_some()
-            || self.pending_plan_review.is_some()
-            || self.thread.read(cx).is_running()
+        if text.trim().is_empty() || self.pending_ask.is_some() || self.thread.read(cx).is_running()
         {
             return;
         }
@@ -2546,6 +2569,24 @@ impl Workspace {
         self.editor_preview_md = None;
         self.input_state.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
+    }
+
+    /// Open the plan text in a right-pane PlanPreview tab (peer of Editor).
+    /// If a PlanPreview tab already exists, update its text and focus it.
+    pub(crate) fn open_plan_in_editor(&mut self, plan_text: String, cx: &mut Context<Self>) {
+        if let Some(ix) = self
+            .right_tabs
+            .iter()
+            .position(|t| matches!(t, RightTab::PlanPreview))
+        {
+            self.plan_preview_text = Some(plan_text);
+            self.set_active_right_tab(ix, cx);
+            return;
+        }
+        self.right_tabs.push(RightTab::PlanPreview);
+        let ix = self.right_tabs.len() - 1;
+        self.plan_preview_text = Some(plan_text);
+        self.set_active_right_tab(ix, cx);
     }
 
     fn user_turn_meta(&self, cx: &mut Context<Self>) -> UserTurnMeta {
@@ -2911,6 +2952,83 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Plan-review drawer anchored above the composer. `ThreadEvent::PlanReady`
+    /// pushes the plan body into the message list as a card; this drawer then
+    /// surfaces the three verdicts (stay / clear-and-implement / implement) so
+    /// the user can act without a modal blocking the conversation. The composer
+    /// below stays live — the user may type to discuss or refine the plan, in
+    /// which case the agent re-evaluates and may submit a fresh `PlanReady`.
+    fn render_plan_review_drawer(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        // The plan body is already rendered as a card in the message list;
+        // this drawer only carries the verdict buttons, so the pending review
+        // is referenced solely to gate visibility.
+        let _ = self.pending_plan_review.as_ref()?;
+        let accent = theme.accent;
+        Some(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded(theme.radius)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                .child(
+                    Icon::new(IconName::LayoutDashboard)
+                        .xsmall()
+                        .text_color(accent),
+                )
+                .child(
+                    gpui::div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(i18n::t("plan-drawer-title")),
+                )
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(i18n::t("plan-drawer-hint")),
+                )
+                .child(
+                    Button::new("plan-drawer-stay")
+                        .ghost()
+                        .small()
+                        .label(i18n::t("plan-drawer-stay"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.respond_plan_review(PlanReviewChoice::StayInPlan, cx);
+                        })),
+                )
+                .child(
+                    Button::new("plan-drawer-clear")
+                        .ghost()
+                        .small()
+                        .label(i18n::t("plan-drawer-clear"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.respond_plan_review(PlanReviewChoice::ImplementClearContext, cx);
+                        })),
+                )
+                .child(
+                    Button::new("plan-drawer-implement")
+                        .primary()
+                        .small()
+                        .label(i18n::t("plan-drawer-implement"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.respond_plan_review(PlanReviewChoice::Implement, cx);
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         // AskUserQuestion renders its own card; suppress the generic approval
         // modal while a question card is open (both share the same id).
@@ -3144,126 +3262,6 @@ impl Workspace {
                                         .on_click(cx.listener({
                                             move |this, _, _, cx| {
                                                 this.resolve_inbound(true, cx);
-                                            }
-                                        })),
-                                ),
-                        ),
-                )
-                .into_any_element(),
-        )
-    }
-
-    /// Plan-review overlay: surfaced by `ThreadEvent::PlanReady` at a terminal
-    /// stop in Plan mode. The model's finalized `<proposed_plan>` block renders
-    /// as markdown, and the user picks one of three verdicts — implement
-    /// (optionally after clearing context), or stay in Plan for another round.
-    /// Faithful adaptation of codex's turn-end review popup: no mid-turn
-    /// oneshot, the block content never enters the conversation.
-    fn render_plan_review_overlay(
-        &self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let review = self.pending_plan_review.as_ref()?;
-        let plan_text = review.plan_text.clone();
-        let accent = theme.accent;
-        Some(
-            gpui::div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.foreground.opacity(0.6))
-                .child(
-                    v_flex()
-                        .w(px(560.))
-                        .max_h(px(640.))
-                        .p_4()
-                        .gap_3()
-                        .rounded(theme.radius)
-                        .bg(theme.background)
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_lg()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    Icon::new(IconName::LayoutDashboard)
-                                        .small()
-                                        .text_color(accent),
-                                )
-                                .child(
-                                    gpui::div()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(i18n::t("plan-review-title")),
-                                ),
-                        )
-                        .child(
-                            gpui::div()
-                                .w_full()
-                                .max_h(px(420.))
-                                .overflow_hidden()
-                                .rounded(theme.radius)
-                                .bg(theme.secondary)
-                                .p_3()
-                                .child(
-                                    cx.new(|_| {
-                                        Markdown::new("plan-review-body", plan_text)
-                                            .theme(theme)
-                                            .scrollable(true)
-                                            .heading_mode(HeadingMode::Uniform)
-                                    })
-                                    .into_any_element(),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .justify_end()
-                                .child(
-                                    Button::new("plan-review-stay")
-                                        .ghost()
-                                        .small()
-                                        .label(i18n::t("plan-review-stay"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.respond_plan_review(
-                                                    PlanReviewChoice::StayInPlan,
-                                                    cx,
-                                                );
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new("plan-review-clear")
-                                        .ghost()
-                                        .small()
-                                        .label(i18n::t("plan-review-implement-clear"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.respond_plan_review(
-                                                    PlanReviewChoice::ImplementClearContext,
-                                                    cx,
-                                                );
-                                            }
-                                        })),
-                                )
-                                .child(
-                                    Button::new("plan-review-implement")
-                                        .primary()
-                                        .small()
-                                        .label(i18n::t("plan-review-implement"))
-                                        .on_click(cx.listener({
-                                            move |this, _, _, cx| {
-                                                this.respond_plan_review(
-                                                    PlanReviewChoice::Implement,
-                                                    cx,
-                                                );
                                             }
                                         })),
                                 ),
@@ -5331,11 +5329,9 @@ impl Render for Workspace {
         self.ensure_blank_project_input(window, cx);
 
         let overlay = self
-            .render_plan_review_overlay(&theme, cx)
-            .or_else(|| self.render_auth_overlay(&theme, cx))
+            .render_auth_overlay(&theme, cx)
             .or_else(|| self.render_inbound_overlay(&theme, cx))
             .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
-
         let editor_open = self.editor_open;
         let right_pane_open = !self.right_tabs.is_empty();
         let editor_preview = self.editor_preview;
@@ -5367,6 +5363,7 @@ impl Render for Workspace {
                     .gap_2()
                     .child(centered(gpui::div().w_full().h(px(1.)).bg(theme.border)))
                     .children(self.render_attachments(&theme, cx))
+                    .children(self.render_plan_review_drawer(&theme, cx))
                     .child(centered(self.render_composer(running, window, &theme, cx))),
             )
         };
@@ -5521,29 +5518,31 @@ impl Render for Workspace {
                             .unwrap_or_default();
                         Tab::new().label(i18n::t_str("browser-tab", &[("url", &url)]))
                     }
+                    RightTab::PlanPreview => Tab::new().label(i18n::t("plan-card-title")),
                 };
                 // Member and Browser tabs carry a close affordance; the
                 // Editor tab keeps its keyboard toggle (`ToggleEditor` /
                 // `CloseEditor`).
                 match tab {
-                    RightTab::Member(_) | RightTab::Browser(_) => base.suffix(
-                        gpui::div()
-                            .id(("right-tab-close", ix))
-                            .cursor_pointer()
-                            .child(
-                                Icon::new(IconName::Close)
-                                    .xsmall()
-                                    .text_color(theme.muted_foreground),
-                            )
-                            // Stop the click from also selecting the tab
-                            // underneath the ×.
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation();
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close_right_tab(ix, window, cx);
-                            })),
-                    ),
+                    RightTab::Member(_) | RightTab::Browser(_) | RightTab::PlanPreview => base
+                        .suffix(
+                            gpui::div()
+                                .id(("right-tab-close", ix))
+                                .cursor_pointer()
+                                .child(
+                                    Icon::new(IconName::Close)
+                                        .xsmall()
+                                        .text_color(theme.muted_foreground),
+                                )
+                                // Stop the click from also selecting the tab
+                                // underneath the ×.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.close_right_tab(ix, window, cx);
+                                })),
+                        ),
                     RightTab::Editor => base,
                 }
             })
@@ -5657,6 +5656,43 @@ impl Render for Workspace {
                             .get(&id)
                             .map(|v| v.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
+                        Some(RightTab::PlanPreview) => {
+                            let text = self.plan_preview_text.clone().unwrap_or_default();
+                            let theme = cx.theme().clone();
+                            let scroll = self.editor_preview_scroll.clone();
+                            v_flex()
+                                .h_full()
+                                .child(
+                                    h_flex().w_full().px_2().child(
+                                        TabBar::new("plan-preview-tabs")
+                                            .underline()
+                                            .small()
+                                            .selected_index(1)
+                                            .child("Write")
+                                            .child("Preview"),
+                                    ),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .id("plan-preview-scroll")
+                                        .w_full()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&scroll)
+                                        .child(
+                                            gpui::div().w_full().p_4().text_sm().child(
+                                                cx.new(|_cx| {
+                                                    Markdown::new("plan-preview", text)
+                                                        .theme(&theme)
+                                                        .heading_mode(HeadingMode::Uniform)
+                                                })
+                                                .into_any_element(),
+                                            ),
+                                        ),
+                                )
+                                .into_any_element()
+                        }
                         None => gpui::div().into_any_element(),
                     }),
             );

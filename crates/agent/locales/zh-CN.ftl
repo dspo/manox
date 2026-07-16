@@ -355,10 +355,6 @@ workspace-inbound-intent = 请求：{$intent}
 workspace-inbound-note = 该请求恒为确认，不受审批模式影响 —— 网页不得在未确认时驱动 agent。
 workspace-inbound-allow = 允许
 workspace-inbound-deny = 拒绝
-plan-review-title = 实施此计划？
-plan-review-implement = 是，开始实施
-plan-review-implement-clear = 是，清除上下文后实施
-plan-review-stay = 否，留在计划模式
 workspace-clarify-title = 澄清问题
 workspace-ask-supplement-label = 补充说明
 workspace-ask-supplement-placeholder = 添加可选补充说明
@@ -527,3 +523,14 @@ queued-steer-retry-action = 重试引导
 queued-delete-action = 移除
 queued-more-action = 更多
 message-steered-badge = 已引导
+plan-card-title = 计划
+plan-card-download = 下载计划
+plan-card-copy = 复制计划
+plan-card-sidebar = 在侧边栏打开
+
+# Plan review drawer
+plan-drawer-title = 审阅计划
+plan-drawer-implement = 执行
+plan-drawer-clear = 清空并执行
+plan-drawer-stay = 保持在计划模式
+plan-drawer-hint = 在下方继续讨论，或选择操作

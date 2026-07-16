@@ -589,6 +589,9 @@ pub fn render_item(
         ConvItem::TeamMessage { from, content } => {
             render_team_message(from, content, ix, theme, cx)
         }
+        ConvItem::PlanReview { plan_text } => {
+            render_plan_review_card(plan_text, ix, theme, tool_ctx, cx)
+        }
         ConvItem::Recap {
             summary,
             collapsed,
@@ -1850,6 +1853,113 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
     } else {
         format!("{}…", parts.join(", "))
     }
+}
+
+/// Render a plan-review item as a bordered card with a header bar and a
+/// height-limited markdown body. The header carries the plan title on the
+/// left and three action icons on the right: download (clipboard fallback),
+/// copy (clipboard), and sidebar (opens plan in a right-pane PlanPreview tab).
+fn render_plan_review_card(
+    plan_text: &str,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let accent = theme.accent;
+    let group = format!("plan-review-{ix}");
+    let weak = tool_ctx.map(|c| c.weak.clone());
+
+    let download_btn = Button::new(("plan-download", ix))
+        .ghost()
+        .xsmall()
+        .icon(IconName::ExternalLink)
+        .tooltip(i18n::t("plan-card-download"))
+        .on_click({
+            let text = plan_text.to_string();
+            move |_, _, cx: &mut App| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            }
+        });
+
+    let copy_btn = Button::new(("plan-copy", ix))
+        .ghost()
+        .xsmall()
+        .icon(IconName::Copy)
+        .tooltip(i18n::t("plan-card-copy"))
+        .on_click({
+            let text = plan_text.to_string();
+            move |_, _, cx: &mut App| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            }
+        });
+
+    let plan_text_owned = plan_text.to_string();
+    let sidebar_btn = Button::new(("plan-sidebar", ix))
+        .ghost()
+        .xsmall()
+        .icon(IconName::PanelRightClose)
+        .tooltip(i18n::t("plan-card-sidebar"))
+        .on_click(move |_, _, cx: &mut App| {
+            if let Some(weak) = weak.clone() {
+                let _ = weak.update(cx, |ws, cx| {
+                    ws.open_plan_in_editor(plan_text_owned.clone(), cx);
+                });
+            }
+        });
+
+    v_flex()
+        .group(group)
+        .w_full()
+        .min_w_0()
+        .border_1()
+        .border_color(theme.border)
+        .rounded(theme.radius)
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .px_3()
+                .py_2()
+                .gap_2()
+                .items_center()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(accent.opacity(0.06))
+                .child(
+                    Icon::new(IconName::LayoutDashboard)
+                        .xsmall()
+                        .text_color(accent),
+                )
+                .child(
+                    gpui::div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(accent)
+                        .child(i18n::t("plan-card-title")),
+                )
+                .child(gpui::div().flex_1())
+                .child(download_btn)
+                .child(copy_btn)
+                .child(sidebar_btn),
+        )
+        .child(
+            gpui::div()
+                .w_full()
+                .min_w_0()
+                .max_h(px(300.))
+                .overflow_hidden()
+                .p_3()
+                .child(markdown_tv(
+                    ("plan-review", ix),
+                    plan_text.to_string(),
+                    theme,
+                    false,
+                    cx,
+                )),
+        )
+        .into_any_element()
 }
 
 fn render_ask_user_card(
