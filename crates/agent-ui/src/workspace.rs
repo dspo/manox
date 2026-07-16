@@ -234,6 +234,15 @@ pub struct Workspace {
     /// composer stays usable for talking to the leader.
     editor_open: bool,
     editor_preview: bool,
+    /// Stable markdown preview entity kept across renders so the source is
+    /// only re-parsed when the draft changes (not every frame).
+    editor_preview_md: Option<Entity<Markdown>>,
+    /// Explicit pixel-anchored scroll state for the preview column. Mirrors the
+    /// message-list pattern: an explicit handle (not entity-state scroll) keeps
+    /// the offset stable and defaulting to the top, and a `flex_1`-sized (not
+    /// `h_full`-percentage) scroll container reliably engages `overflow_y_scroll`
+    /// instead of letting content overflow and clip.
+    editor_preview_scroll: ScrollHandle,
     /// Right-pane tabs: the markdown Editor plus one Member tab per observed
     /// worker. The pane renders while non-empty; `editor_open` tracks whether
     /// the Editor tab specifically is active.
@@ -532,6 +541,8 @@ impl Workspace {
             editor_state,
             editor_open: false,
             editor_preview: false,
+            editor_preview_md: None,
+            editor_preview_scroll: ScrollHandle::new(),
             right_tabs: Vec::new(),
             active_right_tab: 0,
             member_panels: BTreeMap::new(),
@@ -2574,6 +2585,7 @@ impl Workspace {
         self.right_tabs.push(RightTab::Editor);
         let ix = self.right_tabs.len() - 1;
         self.editor_preview = false;
+        self.editor_preview_md = None;
         self.editor_state.update(cx, |s, cx| {
             s.set_value(draft, window, cx);
             s.focus(window, cx);
@@ -2592,6 +2604,7 @@ impl Workspace {
         let draft = self.editor_state.read(cx).value().to_string();
         self.right_tabs.remove(ix);
         self.editor_preview = false;
+        self.editor_preview_md = None;
         self.input_state.update(cx, |s, cx| {
             s.set_value(draft, window, cx);
             s.focus(window, cx);
@@ -2737,6 +2750,7 @@ impl Workspace {
             .get(self.active_right_tab)
             .is_some_and(|t| matches!(t, RightTab::Editor));
         self.editor_preview = false;
+        self.editor_preview_md = None;
         self.input_state.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
     }
@@ -5786,40 +5800,64 @@ impl Render for Workspace {
                                         .child("Preview"),
                                 ),
                             )
-                            .child(
+                            .child(if editor_preview {
+                                // The preview entity is lazily created and kept stable
+                                // across renders so the source is only re-parsed when
+                                // the draft changes. The scroll lives on an explicit
+                                // `ScrollHandle` + an outer `flex_1`-sized container
+                                // — the message-list pattern — rather than the
+                                // markdown entity's own `overflow_y_scroll`: an explicit
+                                // handle keeps the offset pinned and defaulting to the
+                                // top, and a flex-resolved (not `h_full`-percentage)
+                                // scroll box reliably clips long content instead of
+                                // letting it overflow and lose the first lines off the
+                                // top.
+                                let value = self.editor_state.read(cx).value().to_string();
+                                let theme = cx.theme().clone();
+                                if self.editor_preview_md.is_none() {
+                                    self.editor_preview_md = Some(cx.new(|_cx| {
+                                        Markdown::new("editor-preview", value.clone())
+                                            .theme(&theme)
+                                            .heading_mode(HeadingMode::Uniform)
+                                    }));
+                                }
+                                let md = self
+                                    .editor_preview_md
+                                    .clone()
+                                    .expect("preview md initialized above");
+                                if md.read(cx).source() != value.as_str() {
+                                    md.update(cx, |m, cx| m.replace(value, cx));
+                                }
+                                let scroll = self.editor_preview_scroll.clone();
+                                gpui::div()
+                                    .id("editor-preview-scroll")
+                                    .w_full()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&scroll)
+                                    .child(
+                                        gpui::div()
+                                            .w_full()
+                                            .p_4()
+                                            .text_sm()
+                                            .child(md.into_any_element()),
+                                    )
+                                    .into_any_element()
+                            } else {
                                 gpui::div()
                                     .w_full()
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_hidden()
-                                    .child(if editor_preview {
-                                        // Markdown re-parses mdast and re-lays-out every
-                                        // frame, so a pane resize re-wraps at the new width
-                                        // with no cached tree to go stale; a stable id keeps
-                                        // the scroll position across the resize.
-                                        let value = self.editor_state.read(cx).value().to_string();
-                                        let theme = cx.theme().clone();
-                                        gpui::div()
-                                            .h_full()
-                                            .p_4()
-                                            .text_sm()
-                                            .child(
-                                                cx.new(|_cx| {
-                                                    Markdown::new("editor-preview", value)
-                                                        .theme(&theme)
-                                                        .scrollable(true)
-                                                        .heading_mode(HeadingMode::Uniform)
-                                                })
-                                                .into_any_element(),
-                                            )
-                                            .into_any_element()
-                                    } else {
+                                    .child(
                                         Input::new(&self.editor_state)
                                             .size_full()
                                             .appearance(false)
-                                            .into_any_element()
-                                    }),
-                            )
+                                            .into_any_element(),
+                                    )
+                                    .into_any_element()
+                            })
                             .into_any_element(),
                         Some(RightTab::Member(name)) => self
                             .member_panels
