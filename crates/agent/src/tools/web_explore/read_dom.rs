@@ -13,6 +13,7 @@ use super::schema;
 pub struct WebExploreReadDomTool;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReadDomInput {
     /// The browser tab id returned by `web_explore_open`.
     tab_id: BrowserTabId,
@@ -44,8 +45,9 @@ impl AgentTool for WebExploreReadDomTool {
         _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<ReadDomInput>(input) else {
-            return Task::ready(Err("input parse failed".to_string()));
+        let parsed = match serde_json::from_value::<ReadDomInput>(input) {
+            Ok(p) => p,
+            Err(e) => return Task::ready(Err(format!("input parse failed: {e}"))),
         };
         let Some(host) = crate::webview_host::host() else {
             return Task::ready(Err("browser host not available".to_string()));

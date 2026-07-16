@@ -22,6 +22,7 @@ pub struct GlobTool {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GlobInput {
     /// Glob pattern (e.g. `**/*.rs`), relative to `path`/cwd.
     /// Supports `{a,b}` alternation, `[ab]` classes, `**` recursion.
@@ -66,8 +67,11 @@ impl AgentTool for GlobTool {
         _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<GlobInput>(input) else {
-            return cx.background_spawn(async { Err("input parse failed".to_string()) });
+        let parsed = match serde_json::from_value::<GlobInput>(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return cx.background_spawn(async move { Err(format!("input parse failed: {e}")) });
+            }
         };
         let cwd = self.cwd.as_ref().clone();
         let read_policy = self.read_policy.clone();

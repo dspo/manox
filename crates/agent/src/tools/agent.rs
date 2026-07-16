@@ -61,6 +61,7 @@ impl SpawnAgentTool {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentToolInput {
     /// Name of the sub-agent definition to spawn (from `~/.config/cx/manox/agents/*.md`).
     subagent_type: String,

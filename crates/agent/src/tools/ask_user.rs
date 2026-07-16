@@ -23,6 +23,7 @@ pub struct AskUserQuestionTool;
 // deserializes them (the UI parses the raw `serde_json::Value` directly). Their
 // fields are read indirectly via the generated schema, hence `allow(dead_code)`.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct AskUserQuestionInput {
     /// 1–3 questions to ask the user. Each becomes one step in the question drawer.
@@ -31,6 +32,7 @@ struct AskUserQuestionInput {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct Question {
     /// The full question text to display.
@@ -46,6 +48,7 @@ struct Question {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct QuestionOption {
     /// Concise label for the choice (1–5 words).

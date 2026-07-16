@@ -19,6 +19,7 @@ pub struct ListDirectoryTool {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListDirectoryInput {
     /// Directory path to list (defaults to cwd).
     #[serde(default)]
@@ -45,8 +46,11 @@ impl AgentTool for ListDirectoryTool {
         _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<ListDirectoryInput>(input) else {
-            return cx.background_spawn(async { Err("input parse failed".to_string()) });
+        let parsed = match serde_json::from_value::<ListDirectoryInput>(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return cx.background_spawn(async move { Err(format!("input parse failed: {e}")) });
+            }
         };
         let base = parsed
             .path

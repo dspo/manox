@@ -67,6 +67,7 @@ pub fn all_tools() -> Vec<AnyAgentTool> {
 /// Input shape shared by the tools that address a tab by id alone
 /// (`read_text` / `screenshot` / `yield` / `close`).
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TabIdInput {
     /// The browser tab id returned by `web_explore_open`.
     tab_id: BrowserTabId,

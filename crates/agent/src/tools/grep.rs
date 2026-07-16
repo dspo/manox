@@ -23,6 +23,7 @@ pub struct GrepTool {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GrepInput {
     /// Regex pattern.
     pattern: String,
@@ -54,8 +55,11 @@ impl AgentTool for GrepTool {
         _ctx: &dyn crate::tool::ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<GrepInput>(input) else {
-            return cx.background_spawn(async { Err("input parse failed".to_string()) });
+        let parsed = match serde_json::from_value::<GrepInput>(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return cx.background_spawn(async move { Err(format!("input parse failed: {e}")) });
+            }
         };
         let base = parsed
             .path
@@ -166,6 +170,28 @@ fn run_grep(
             continue;
         }
         all_results.append(&mut sink.results);
+    }
+
+    // Record hashline snapshots for matched files so the model can directly
+    // edit_file without re-reading. Limited to 20 files to avoid excessive I/O.
+    if !all_results.is_empty() {
+        let mut seen_files = std::collections::HashSet::new();
+        for result_line in &all_results {
+            if let Some((file_path, _)) = result_line.split_once(':')
+                && seen_files.len() < 20
+            {
+                seen_files.insert(file_path.to_string());
+            }
+        }
+        let store = crate::hashline::global();
+        let mut store_guard = store.lock().expect("hashline store poisoned");
+        for file_path in seen_files {
+            let path = PathBuf::from(&file_path);
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                let normalized = crate::hashline::normalize_to_lf(&raw);
+                let _ = store_guard.record(&path, &normalized);
+            }
+        }
     }
 
     if all_results.is_empty() {

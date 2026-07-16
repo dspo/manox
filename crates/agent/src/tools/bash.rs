@@ -131,6 +131,7 @@ where
 }
 
 #[derive(Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 struct BashInput {
     /// Bash command to run in the persistent session (`cd` / `export` persist).
     command: String,
@@ -223,8 +224,11 @@ impl AgentTool for BashTool {
         ctx: &dyn ToolContext,
         cx: &mut App,
     ) -> Task<Result<String, String>> {
-        let Ok(parsed) = serde_json::from_value::<BashInput>(input) else {
-            return cx.background_spawn(async { Err("input parse failed".to_string()) });
+        let parsed = match serde_json::from_value::<BashInput>(input) {
+            Ok(p) => p,
+            Err(e) => {
+                return cx.background_spawn(async move { Err(format!("input parse failed: {e}")) });
+            }
         };
         let shell = self.shell.clone();
         let base_cwd = self.cwd.clone();
