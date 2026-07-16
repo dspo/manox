@@ -545,6 +545,12 @@ pub struct Thread {
     /// `ThreadEvent::PlanReady` at turn end, then clears. Empty when the turn
     /// produced no plan.
     pending_plan_text: String,
+    /// Whether the current turn emitted any `<proposed_plan>` block content.
+    /// Set on `PlanDelta` and reset at turn top, it exempts the turn from the
+    /// degenerate-empty-turn check: a turn that produced a plan block has
+    /// produced its intended output even though the block content never enters
+    /// the assistant message (and thus the visible-text check sees nothing).
+    produced_plan_this_turn: bool,
     /// User-selected reasoning effort for providers that expose an effort knob.
     /// This is request metadata, not model-visible prompt text.
     reasoning_effort: ReasoningEffort,
@@ -770,6 +776,7 @@ impl Thread {
                 collaboration_mode: ModeKind::Default,
                 proposed_plan_parser: ProposedPlanParser::new(),
                 pending_plan_text: String::new(),
+                produced_plan_this_turn: false,
                 reasoning_effort: ReasoningEffort::default(),
                 goal: None,
                 goal_cancel: None,
@@ -856,6 +863,7 @@ impl Thread {
                 collaboration_mode: ModeKind::Default,
                 proposed_plan_parser: ProposedPlanParser::new(),
                 pending_plan_text: String::new(),
+                produced_plan_this_turn: false,
                 reasoning_effort: ReasoningEffort::from_i64(rec.reasoning_effort),
                 goal: None,
                 goal_cancel: None,
@@ -946,6 +954,7 @@ impl Thread {
                 collaboration_mode: ModeKind::Default,
                 proposed_plan_parser: ProposedPlanParser::new(),
                 pending_plan_text: String::new(),
+                produced_plan_this_turn: false,
                 reasoning_effort,
                 goal: None,
                 goal_cancel: None,
@@ -2367,6 +2376,7 @@ impl Thread {
             // partial block state must not bleed into this one.
             this.proposed_plan_parser = ProposedPlanParser::new();
             this.pending_plan_text.clear();
+            this.produced_plan_this_turn = false;
             // Reset the turn's recovery state: a prior turn's parse error or
             // max-tokens truncation must not bleed into this one. The retry
             // counter is turn-scoped — it accumulates across this turn's
@@ -2664,6 +2674,7 @@ impl Thread {
                     let degenerate = !parse_err
                         && stream_err.is_none()
                         && !max_tok
+                        && !this.produced_plan_this_turn
                         && last_assistant_text.trim().is_empty();
                     // Unfulfilled tool intent: the turn has visible text (so not
                     // degenerate) that announces a tool action — "let me search",
@@ -2675,11 +2686,14 @@ impl Thread {
                         && stream_err.is_none()
                         && !max_tok
                         && !degenerate
+                        && this.collaboration_mode != ModeKind::Plan
                         && announces_tool_intent_without_call(&last_assistant_text);
-                    if !parse_err
-                        && stream_err.is_none()
-                        && !max_tok && !degenerate
-                        && !unfulfilled_intent
+                    if this.produced_plan_this_turn
+                        || (!parse_err
+                            && stream_err.is_none()
+                            && !max_tok
+                            && !degenerate
+                            && !unfulfilled_intent)
                     {
                         return RecoveryAction::Done;
                     }
@@ -2734,8 +2748,11 @@ impl Thread {
                         // Degenerate empty turn: nudge the model toward visible
                         // output so it does not end silently on empty reasoning.
                         this.insert_user_message(
-                            crate::prompt::render_static(
+                            crate::prompt::render(
                                 crate::prompt::PromptTemplate::WrapperEmptyTurnNudge,
+                                &crate::prompt::EmptyTurnNudgeData {
+                                    in_plan: this.collaboration_mode == ModeKind::Plan,
+                                },
                             )
                             .expect("empty turn nudge render"),
                             cx,
@@ -3225,6 +3242,7 @@ impl Thread {
                         }
                         ProposedPlanSegment::Delta(t) => {
                             self.pending_plan_text.push_str(&t);
+                            self.produced_plan_this_turn = true;
                             cx.emit(ThreadEvent::PlanDelta { delta: t });
                         }
                         ProposedPlanSegment::Start | ProposedPlanSegment::End => {}
@@ -3254,6 +3272,7 @@ impl Thread {
                         }
                         ProposedPlanSegment::Delta(t) => {
                             self.pending_plan_text.push_str(&t);
+                            self.produced_plan_this_turn = true;
                             cx.emit(ThreadEvent::PlanDelta { delta: t });
                         }
                         ProposedPlanSegment::Start | ProposedPlanSegment::End => {}
@@ -5928,5 +5947,241 @@ mod tests {
             }
             _ => panic!("expected merged Thinking"),
         }
+    }
+
+    // === plan-mode recovery regressions (thread cb80f55b) ===
+    //
+    // Drives `events` through a fresh depth-1 thread (sub-agent, so title
+    // generation is skipped and the call counter stays clean) in either Plan
+    // or Default mode, runs a single turn to quiescence, and returns the
+    // stream-call count plus every User-role Text block appended during the
+    // turn — so a test can assert which recovery path fired (Done vs. nudge)
+    // and what the nudge actually said.
+    fn run_recovery_case(
+        thread_id: &str,
+        model_id: &str,
+        events: Vec<LanguageModelCompletionEvent>,
+        plan_mode: bool,
+    ) -> (u64, Vec<String>) {
+        use crate::collaboration_mode::ModeKind;
+        use crate::language_model::Role;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open mem db"),
+        );
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db, cx);
+        });
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(CountingReplayMockModel {
+            id: model_id.into(),
+            events: Arc::new(events),
+            calls: calls.clone(),
+        });
+
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("go".into())],
+            );
+            rec.title = Some("regression".into());
+            let thread = super::Thread::restore(rec, Some(model), cx);
+            thread.update(cx, |t, _| t.depth = 1);
+            if plan_mode {
+                thread.update(cx, |t, cx| t.set_collaboration_mode(ModeKind::Plan, cx));
+            }
+            thread
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+
+        let user_texts = cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                t.messages
+                    .iter()
+                    .filter(|m| m.role == Role::User)
+                    .flat_map(|m| {
+                        m.content.iter().filter_map(|c| match c {
+                            MessageContent::Text(t) => Some(t.clone()),
+                            _ => None,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+        });
+        (calls.load(Ordering::SeqCst), user_texts)
+    }
+
+    #[test]
+    fn produced_plan_this_turn_short_circuits_degenerate() {
+        use crate::language_model::StopReason;
+        // Plan mode, a full `<proposed_plan>` block (block content never
+        // enters the assistant message), no tool_use, EndTurn. The block IS
+        // the turn's intended output — recovery must end the turn (Done) and
+        // emit PlanReady, not flag an empty visible-text turn as degenerate.
+        let (calls, user_texts) = run_recovery_case(
+            "reg-plan-block-done",
+            "test/plan-block",
+            vec![
+                LanguageModelCompletionEvent::Text(
+                    "<proposed_plan>step 1\nstep 2</proposed_plan>".into(),
+                ),
+                LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+            ],
+            true,
+        );
+        assert_eq!(
+            calls, 1,
+            "a produced plan block must end the turn (Done), not retry"
+        );
+        assert!(
+            !user_texts
+                .iter()
+                .any(|t| t.contains("produced no visible output")),
+            "must not inject the empty-turn nudge when a plan block was produced"
+        );
+    }
+
+    #[test]
+    fn empty_turn_nudge_plan_mode_guides_to_proposed_plan() {
+        use crate::language_model::StopReason;
+        // Plan mode, empty stream (no visible text, no tool_use) → degenerate.
+        // The nudge must steer toward `<proposed_plan>` and must NOT mention the
+        // removed `exit_plan_mode` tool (thread cb80f55b's failure mode).
+        let (calls, user_texts) = run_recovery_case(
+            "reg-plan-empty-nudge",
+            "test/plan-empty",
+            vec![LanguageModelCompletionEvent::Stop(StopReason::EndTurn)],
+            true,
+        );
+        assert!(
+            calls > 1,
+            "a degenerate empty turn must be retried, not silently end"
+        );
+        let nudge = user_texts
+            .iter()
+            .find(|t| t.contains("produced no visible output"))
+            .expect("the empty-turn nudge must be injected");
+        assert!(
+            nudge.contains("<proposed_plan>"),
+            "plan-mode nudge must guide to <proposed_plan>: {nudge}"
+        );
+        assert!(
+            !nudge.contains("exit_plan_mode"),
+            "plan-mode nudge must not reference the removed exit_plan_mode tool: {nudge}"
+        );
+    }
+
+    #[test]
+    fn empty_turn_nudge_default_mode_keeps_act_or_answer() {
+        use crate::language_model::StopReason;
+        // Default mode, empty stream → degenerate. The nudge keeps the
+        // act-or-answer guidance and must not mention plan blocks.
+        let (calls, user_texts) = run_recovery_case(
+            "reg-default-empty-nudge",
+            "test/default-empty",
+            vec![LanguageModelCompletionEvent::Stop(StopReason::EndTurn)],
+            false,
+        );
+        assert!(calls > 1, "degenerate empty turn must be retried");
+        let nudge = user_texts
+            .iter()
+            .find(|t| t.contains("produced no visible output"))
+            .expect("the empty-turn nudge must be injected");
+        assert!(
+            nudge.contains("tool_use"),
+            "default-mode nudge must steer to acting: {nudge}"
+        );
+        assert!(
+            !nudge.contains("exit_plan_mode"),
+            "default nudge must not reference the removed tool: {nudge}"
+        );
+        assert!(
+            !nudge.contains("<proposed_plan>"),
+            "default-mode nudge must not mention plan blocks: {nudge}"
+        );
+    }
+
+    #[test]
+    fn plan_mode_skips_unfulfilled_tool_intent_nudge() {
+        use crate::language_model::StopReason;
+        // Plan mode, "让我制定修复计划" announces intent but emits no
+        // tool_use and no plan block. Plan mode must NOT fire the
+        // unfulfilled-tool-intent nudge (plan declarations are legitimate) —
+        // the turn ends Done with the declaration visible to the user.
+        let (calls, user_texts) = run_recovery_case(
+            "reg-plan-unfulfilled-skip",
+            "test/plan-unfulfilled",
+            vec![
+                LanguageModelCompletionEvent::Text("让我制定修复计划".into()),
+                LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+            ],
+            true,
+        );
+        assert_eq!(calls, 1, "plan mode must not retry on a plan declaration");
+        assert!(
+            !user_texts
+                .iter()
+                .any(|t| t.contains("announced a tool action in prose")),
+            "plan mode must skip the unfulfilled-tool-intent nudge"
+        );
+    }
+
+    #[test]
+    fn default_mode_still_nudges_unfulfilled_intent() {
+        use crate::language_model::StopReason;
+        // Default mode, same declaration → the unfulfilled-tool-intent nudge
+        // still fires (regression guard for the plan-mode exemption).
+        let (calls, user_texts) = run_recovery_case(
+            "reg-default-unfulfilled",
+            "test/default-unfulfilled",
+            vec![
+                LanguageModelCompletionEvent::Text("让我制定修复计划".into()),
+                LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+            ],
+            false,
+        );
+        assert!(calls > 1, "default mode must retry on unfulfilled intent");
+        assert!(
+            user_texts
+                .iter()
+                .any(|t| t.contains("announced a tool action in prose")),
+            "default mode must inject the unfulfilled-tool-intent nudge"
+        );
     }
 }

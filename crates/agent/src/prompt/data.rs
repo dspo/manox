@@ -142,6 +142,14 @@ pub struct RecoveryFailureData {
     pub reason: String,
 }
 
+/// Payload for the empty-turn nudge. `in_plan` selects the plan-mode branch,
+/// which steers the model toward emitting a `<proposed_plan>` block instead of
+/// referencing the removed `exit_plan_mode` tool.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmptyTurnNudgeData {
+    pub in_plan: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GoalContinuationData {
     pub condition: String,
