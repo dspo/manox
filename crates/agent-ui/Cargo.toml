@@ -35,12 +35,6 @@ manox-webview.workspace = true
 # (claude/codex/copilot) and hold the PTY handle for an `ExternalSession`.
 cx.workspace = true
 
-[features]
-# In-process debug Harness + the `manox --mcp` server build on it. Off by
-# default so a release build pulls in neither the Harness code nor the rmcp
-# server; enable with `--features debug` (the `manox` crate forwards it).
-debug = []
-
 [dev-dependencies]
 agent = { workspace = true, features = ["test-support"] }
 terminal = { workspace = true, features = ["test-support"] }

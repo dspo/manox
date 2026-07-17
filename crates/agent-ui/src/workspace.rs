@@ -1638,12 +1638,6 @@ impl Workspace {
         }
     }
 
-    /// Test-only: whether the completion popover is currently open.
-    #[cfg(all(test, feature = "debug"))]
-    pub(crate) fn completion_is_open(&self) -> bool {
-        self.completion.is_some()
-    }
-
     /// Confirm the selected (or clicked) completion item: replace the trigger
     /// token with `trigger + name + " "` and place the caret after the space.
     fn completion_confirm(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -6498,102 +6492,6 @@ impl Workspace {
         );
         self.close_access_menu();
         cx.notify();
-    }
-}
-
-// Harness shims: pub(crate) wrappers over the private turn-driving methods so
-// the in-crate `harness` module (and the MCP dispatcher built on it) can drive
-// a Workspace programmatically — without a real `&mut Window` or physical
-// input. Each forwards to the existing private method; behavior is unchanged.
-// Gated on `debug` so the shims (and their Harness consumers) are absent from
-// a default build.
-#[cfg(feature = "debug")]
-impl Workspace {
-    pub(crate) fn harness_send_message(
-        &mut self,
-        text: String,
-        cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        if self.pending_ask.is_some() {
-            if text.trim().is_empty() {
-                return Err("pending ask requires a non-empty response".into());
-            }
-            self.resolve_ask_with_response(Some(text), cx);
-            return Ok(());
-        }
-        if self.thread.read(cx).is_running() && self.pending_plan_review.is_none() {
-            return Err("thread is already running a turn".into());
-        }
-        self.send_user_turn(text, Vec::new(), cx);
-        Ok(())
-    }
-
-    pub(crate) fn harness_approve(
-        &mut self,
-        decision: PermissionDecision,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let has = self.pending_ask.is_some() || !self.pending_auths.is_empty();
-        self.resolve_auth(decision, cx);
-        has
-    }
-
-    pub(crate) fn harness_plan_review_respond(
-        &mut self,
-        choice: PlanReviewChoice,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let has = self.pending_plan_review.is_some();
-        self.respond_plan_review(choice, cx);
-        has
-    }
-
-    pub(crate) fn harness_has_pending_plan_review(&self) -> bool {
-        self.pending_plan_review.is_some()
-    }
-
-    pub(crate) fn harness_has_pending_ask(&self) -> bool {
-        self.pending_ask.is_some()
-    }
-
-    pub(crate) fn harness_pending_auth_count(&self) -> usize {
-        self.pending_auths.len()
-    }
-
-    pub(crate) fn harness_has_queued_follow_up(&self) -> bool {
-        !self.queued_follow_ups.is_empty()
-    }
-
-    pub(crate) fn harness_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_new_thread(None, window, cx);
-    }
-
-    pub(crate) fn harness_open_thread(
-        &mut self,
-        id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        // Reclaim a thread still running in the background instead of loading a
-        // stale DB snapshot — mirrors `open_thread`. Without this, an MCP
-        // `OpenThread` on a parked running thread swaps in a dead snapshot,
-        // leaving the live `run_turn_loop` entity orphaned in
-        // `background_threads` and its streaming deltas lost.
-        if let Some(pos) = self
-            .background_threads
-            .iter()
-            .position(|b| b.entity.read(cx).id.0 == id)
-        {
-            let thread = self.background_threads.remove(pos).entity;
-            self.attach_thread(thread, window, cx);
-            return true;
-        }
-        let store = self.sidebar.read(cx).store();
-        let Some(loaded) = store.update(cx, |s, cx| s.load_thread(&id, cx)) else {
-            return false;
-        };
-        self.attach_thread(loaded, window, cx);
-        true
     }
 }
 

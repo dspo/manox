@@ -33,7 +33,7 @@ GPUI/UI 开发时使用 `.claude/skills/` 下的 skill：
 crates/
 ├── agent/        # 核心逻辑：Thread + LanguageModel + tools + MCP + SQLite + i18n + plugin/agent/skill/command/hook
 ├── agent-ui/     # UI 层：Workspace + ConversationState + Sidebar + 消息渲染 + slash command + dispatch
-├── manox/        # 薄 bin：窗口 + 主题 + tracing + 系统菜单 + --mcp server 模式（debug feature）
+├── manox/        # 薄 bin：窗口 + 主题 + tracing + 系统菜单
 ├── terminal/     # 终端模拟器（alacritty_terminal + portable-pty）
 └── terminal-ui/  # 终端 UI 渲染
 ```
@@ -55,13 +55,13 @@ crates/
 - `workspace.rs` — 顶层视图，持 `Entity<Thread>` + `Entity<Sidebar>` + `ConversationState`，订阅 `ThreadEvent`。
 - `conversation.rs` — `ConversationState`，从 `ThreadEvent` 增量构建扁平 `ConvItem` 列表。`rebuild_from_messages` 从规范消息列表重建。
 - `views/` — `sidebar.rs`（历史 Threads）、`message.rs`（Markdown 渲染 + Reasoning 折叠 + ToolCall/AgentTask 卡片）、`composer_menu.rs`（`+`/`⁄` 弹出菜单）、`settings/`、`plugin_manager.rs`、`title_menu.rs`、`outline.rs`。
-- `dispatch.rs` / `slash_command.rs` — action 桥接 + `/name [args]` 解析注册。`harness/` — 进程内 debug harness（debug feature）。
+- `dispatch.rs` / `slash_command.rs` — action 桥接 + `/name [args]` 解析注册。
 
 ### terminal / terminal-ui / manox
 
 - `terminal` — 完整终端模拟器（alacritty_terminal + portable-pty），含 PTY 管理、事件流、终端状态存储。
 - `terminal-ui` — 终端 UI 渲染（grid renderer + terminal view + theme）。
-- `manox` — 薄 bin：tracing → `gpui_component::init` → `agent::init` → `agent_ui::slash_command::init` → 绑键 → 系统菜单 → 创建窗口 → `Workspace` + `Root`。`--mcp` 启动 MCP stdio server（debug feature）。
+- `manox` — 薄 bin：tracing → `gpui_component::init` → `agent::init` → `agent_ui::slash_command::init` → 绑键 → 系统菜单 → 创建窗口 → `Workspace` + `Root`。
 
 ### 关键设计模式
 
