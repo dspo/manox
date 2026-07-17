@@ -77,17 +77,25 @@ pub struct ContextBudget {
     pub cap_tokens: u64,
 }
 
-/// Parse a plan's markdown body into milestones. Best-effort: each line that
-/// opens with an ordered (`1.` / `1)`) or unordered (`-` / `*` / `+`) list
-/// marker yields one milestone (marker stripped, remainder is the title).
-/// Non-list prose lines are dropped rather than folded in (folding mangles
-/// titles). When no list item is found, the whole plan is kept as a single
-/// milestone so the panel never regresses to empty. All milestones start
+/// Parse a plan's markdown body into milestones. Best-effort: each **top-level**
+/// list item (ordered `1.` / `1)` or unordered `-` / `*` / `+` at the shallowest
+/// indent) yields one milestone. Nested sub-items are ignored — the cockpit
+/// tracks high-level steps, not granular implementation details. Non-list prose
+/// lines are dropped. When no list item is found, the whole plan is kept as a
+/// single milestone so the panel never regresses to empty. All milestones start
 /// `Pending`; the workspace promotes the first to `InProgress` while running.
-/// Pseudo-dependency text (e.g. "needs #2") is not parsed into edges.
 pub fn parse_milestones(plan_text: &str) -> Vec<Milestone> {
     let mut out: Vec<Milestone> = Vec::new();
+    // First pass: detect the indent width of the first list item. Subsequent
+    // items at a deeper indent are nested sub-steps and skipped.
+    let base_indent = detect_base_indent(plan_text);
     for line in plan_text.lines() {
+        let indent = leading_indent(line);
+        // Only accept items at the base indent (or unindented). Deeper items
+        // are sub-steps folded into the parent milestone.
+        if indent > base_indent {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -115,6 +123,28 @@ pub fn parse_milestones(plan_text: &str) -> Vec<Milestone> {
         });
     }
     out
+}
+
+/// Detect the indent (in spaces) of the first list item in the plan text.
+/// Falls back to 0 when no list item is found. Reuses [`strip_list_marker`]
+/// semantics — a digit-start line like "2026 plan" is **not** a list item
+/// because it lacks the required `.` / `)` after the digits.
+fn detect_base_indent(text: &str) -> usize {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if strip_list_marker(trimmed).is_some() {
+            return leading_indent(line);
+        }
+    }
+    0
+}
+
+/// Count leading space characters in a line.
+fn leading_indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
 }
 
 /// Strip a leading ordered or unordered list marker, returning the remainder.
@@ -288,6 +318,17 @@ mod tests {
         assert_eq!(strip_list_marker("+ quux"), Some(" quux"));
         assert_eq!(strip_list_marker("plain text"), None);
         assert_eq!(strip_list_marker("2026 plan"), None); // digits, no marker
+    }
+
+    #[test]
+    fn parse_milestones_digit_prefix_non_list_does_not_set_base_indent() {
+        // A line starting with digits but lacking '.'/' )' (e.g. "2026 plan")
+        // must not be treated as a list item. The indented real list item
+        // below it should still be captured as a top-level milestone.
+        let plan = "2026 plan\n  - Real step\n  - Another step";
+        let ms = parse_milestones(plan);
+        let titles: Vec<&str> = ms.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(titles, vec!["Real step", "Another step"]);
     }
 
     #[test]
