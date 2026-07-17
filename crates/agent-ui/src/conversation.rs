@@ -136,6 +136,16 @@ pub enum ConvItem {
         from: String,
         content: String,
     },
+    /// A plan review item rendered as a bordered card in the message list.
+    /// Carries the finalized `<proposed_plan>` text so the user can read it
+    /// inline. `active` distinguishes the one plan currently awaiting a
+    /// verdict (drawer + footer buttons) from prior plans already consumed by
+    /// a verdict or a free-form message (plain read-only record, no buttons) —
+    /// a consumed plan must not be re-judgeable.
+    PlanReview {
+        plan_text: String,
+        active: bool,
+    },
 }
 
 /// A tool-call item, tracking status/output by id.
@@ -463,6 +473,72 @@ impl ConversationState {
         let id = self.items.len();
         self.items
             .push(cx.new(|_| MessageItem::new(ConvItem::Notice(text), String::new(), id, weak)));
+    }
+
+    /// Append a plan-review item to the message list. The plan text renders
+    /// inline as a read-only bordered card with a height-limited markdown body.
+    /// Pushed `active` — a fresh `PlanReady` always awaits a verdict; the card
+    /// is demoted to an inactive record by `consume_plan_review` once the user
+    /// acts on it (verdict or free-form message).
+    pub fn push_plan_review(
+        &mut self,
+        plan_text: String,
+        role: String,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) {
+        let id = self.items.len();
+        self.items.push(cx.new(|_| {
+            MessageItem::new(
+                ConvItem::PlanReview {
+                    plan_text,
+                    active: true,
+                },
+                role,
+                id,
+                weak,
+            )
+        }));
+    }
+
+    /// Mark the most recent plan-review card as no longer actionable: a verdict
+    /// was clicked or a free-form message superseded it. Only the tail plan can
+    /// be active (every prior one was already consumed when its turn ended), so
+    /// the first `PlanReview` found scanning from the tail is the one to demote.
+    pub fn consume_plan_review(&mut self, cx: &mut App) {
+        for item in self.items.iter().rev() {
+            let is_active_plan = matches!(
+                item.read(cx).kind(),
+                ConvItem::PlanReview { active: true, .. }
+            );
+            if is_active_plan {
+                item.update(cx, |it, cx| {
+                    if let ConvItem::PlanReview { active, .. } = it.kind_mut() {
+                        *active = false;
+                    }
+                    cx.notify();
+                });
+                break;
+            }
+        }
+    }
+
+    /// Drop the most recent plan-review card outright. Called only on an
+    /// implement verdict, where the pending plan card is by construction the
+    /// live tail (a fresh `PlanReady` always lands at the tail and nothing is
+    /// pushed between the card and the verdict) — so a tail pop is the safe
+    /// removal. The verdict's own user bubble is pushed in its place, carrying
+    /// the same plan text the thread injects, so live and rebuilt views match.
+    pub fn pop_plan_review_tail(&mut self, cx: &mut App) -> bool {
+        let is_plan = self
+            .items
+            .last()
+            .map(|last| matches!(last.read(cx).kind(), ConvItem::PlanReview { .. }))
+            .unwrap_or(false);
+        if is_plan {
+            self.items.pop();
+        }
+        is_plan
     }
 
     pub fn find_tool(&self, id: &str, cx: &App) -> Option<usize> {
@@ -1373,6 +1449,10 @@ fn note_to_item(n: &UiNoteRecord) -> ConvItem {
     match n.kind {
         UiNoteKind::Error => ConvItem::Error(text),
         UiNoteKind::Notice => ConvItem::Notice(text),
+        UiNoteKind::PlanReview => ConvItem::PlanReview {
+            plan_text: text,
+            active: false,
+        },
     }
 }
 
@@ -1419,6 +1499,7 @@ mod tests {
                 ConvItem::Assistant { text, .. } => format!("A:{text}"),
                 ConvItem::Notice(t) => format!("N:{t}"),
                 ConvItem::Error(t) => format!("E:{t}"),
+                ConvItem::PlanReview { plan_text, .. } => format!("P:{plan_text}"),
                 _ => "?".to_string(),
             })
             .collect()
@@ -1493,6 +1574,43 @@ mod tests {
             Some(&"N:mid".to_string()),
             "no-bubble anchor folds to the nearest preceding segment's tail"
         );
+    }
+
+    /// A dismissed plan persists as a `PlanReview` note anchored to the user
+    /// message that triggered the plan's turn. The rebuild must splice the
+    /// collapsed plan card back at the end of that turn — ahead of the
+    /// dismissing user message — so a switched-away-and-back thread reproduces
+    /// the live order rather than silently dropping the plan.
+    #[test]
+    fn merge_ui_notes_places_dismissed_plan_before_dismissing_message() {
+        // u1 triggers the plan turn (a1 proposes a plan); u2 is the free-form
+        // message that dismissed it; a2 is the re-proposal turn.
+        let messages = vec![
+            msg_with_id("u1", Role::User, "plan it"),
+            msg_with_id("a1", Role::Assistant, "here is the plan"),
+            msg_with_id("u2", Role::User, "revise step 2"),
+            msg_with_id("a2", Role::Assistant, "revised"),
+        ];
+        let items = build_items(&messages, &HashMap::new(), false);
+        // Anchored to u1 — the plan turn's triggering message — so the card
+        // lands at the end of turn 0, before the u2 bubble that dismissed it.
+        let notes = vec![note(1, UiNoteKind::PlanReview, Some("u1"), "PLAN BODY")];
+        let merged = merge_ui_notes(&messages, items, &notes);
+        assert_eq!(
+            signature(&merged),
+            vec![
+                "U:plan it", // turn 0
+                "A:here is the plan",
+                "P:PLAN BODY",     // dismissed plan → end of turn 0
+                "U:revise step 2", // the dismissing message
+                "A:revised",
+            ]
+        );
+        // The rebuilt card is the inactive record form (no verdict buttons).
+        assert!(matches!(
+            merged[2],
+            ConvItem::PlanReview { active: false, .. }
+        ));
     }
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the

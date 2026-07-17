@@ -26,6 +26,12 @@ pub enum UiNoteKind {
     Error,
     /// A neutral system notice — slash-command acks, mode-change chips, etc.
     Notice,
+    /// A plan the user dismissed without implementing — a free-form message
+    /// superseded it. Renders as a collapsed read-only `PlanReview` record so
+    /// the dismissed plan survives a thread switch / reload: the live card is
+    /// UI-only and never enters `Thread::messages`, so without this note it
+    /// would vanish the moment the conversation entity is rebuilt.
+    PlanReview,
 }
 
 impl UiNoteKind {
@@ -33,6 +39,7 @@ impl UiNoteKind {
         match self {
             UiNoteKind::Error => "error",
             UiNoteKind::Notice => "notice",
+            UiNoteKind::PlanReview => "plan_review",
         }
     }
 }
@@ -46,6 +53,7 @@ impl FromStr for UiNoteKind {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Ok(match s {
             "error" => UiNoteKind::Error,
+            "plan_review" => UiNoteKind::PlanReview,
             _ => UiNoteKind::Notice,
         })
     }

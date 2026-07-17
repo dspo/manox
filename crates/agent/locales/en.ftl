@@ -407,10 +407,6 @@ workspace-inbound-intent = Request: {$intent}
 workspace-inbound-note = This request is always confirmed, regardless of approval mode — a web page must never drive the agent unprompted.
 workspace-inbound-allow = Allow
 workspace-inbound-deny = Deny
-plan-review-title = Implement this plan?
-plan-review-implement = Yes, implement
-plan-review-implement-clear = Yes, clear context and implement
-plan-review-stay = No, stay in Plan mode
 workspace-clarify-title = Clarifying question
 workspace-ask-supplement-label = Supplemental note
 workspace-ask-supplement-placeholder = Add optional context
@@ -585,3 +581,11 @@ queued-steer-retry-action = Retry steer
 queued-delete-action = Remove
 queued-more-action = More
 message-steered-badge = Steered
+plan-card-title = Plan
+plan-card-download = Download plan
+plan-card-copy = Copy plan
+plan-card-sidebar = Open in side panel
+
+# Plan review card verdict buttons
+plan-drawer-implement = Implement
+plan-drawer-clear = Clear & Implement

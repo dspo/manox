@@ -1322,33 +1322,39 @@ impl Thread {
         cx.notify();
     }
 
-    /// Act on the user's verdict for a turn-end proposed plan. `Implement`
-    /// exits Plan mode and launches a Default-mode turn seeded with the
-    /// approved plan; `ImplementClearContext` does the same after dropping
-    /// prior history; `StayInPlan` is a no-op. The plan text is re-injected as
-    /// a user message because the `<proposed_plan>` block was never persisted
-    /// into the assistant message — the model needs it to execute.
-    pub fn respond_plan_review(
+    /// Seed the approved plan as a user message (exiting Plan mode) without
+    /// starting a turn. The `<proposed_plan>` block was never persisted into
+    /// the assistant message, so the model needs the plan text re-injected to
+    /// execute it. `ui` is the same UI metadata the live view stamps onto the
+    /// verdict bubble, so a reloaded thread rebuilds the identical bubble
+    /// (model/approval badges). Split from [`implement_approved_plan`] so a
+    /// clear-context verdict can attach the thread before running.
+    pub fn seed_approved_plan(
         &mut self,
-        choice: crate::collaboration_mode::PlanReviewChoice,
         plan_text: String,
+        ui: Option<crate::MessageUiMetadata>,
         cx: &mut Context<Self>,
     ) {
-        use crate::collaboration_mode::PlanReviewChoice;
-        match choice {
-            PlanReviewChoice::Implement | PlanReviewChoice::ImplementClearContext => {
-                if matches!(choice, PlanReviewChoice::ImplementClearContext) {
-                    self.messages.clear();
-                }
-                self.set_collaboration_mode(ModeKind::Default, cx);
-                self.insert_user_message(
-                    format!("Implement the approved plan:\n\n{plan_text}"),
-                    cx,
-                );
-                self.run_turn(cx);
-            }
-            PlanReviewChoice::StayInPlan => {}
-        }
+        self.set_collaboration_mode(ModeKind::Default, cx);
+        let text = crate::collaboration_mode::implement_plan_user_message(&plan_text);
+        self.insert_user_message_with_ui_metadata(text, ui, cx);
+    }
+
+    /// Seed the approved plan and launch a Default-mode turn for it. Used by
+    /// the non-clear `Implement` verdict, where the thread is already the
+    /// foreground view and turn events stream straight into the live
+    /// conversation. The clear-context verdict does not call this — it swaps
+    /// to a fresh thread at the workspace layer (archive old + spawn new),
+    /// seeding the new thread with [`seed_approved_plan`] before attaching and
+    /// running.
+    pub fn implement_approved_plan(
+        &mut self,
+        plan_text: String,
+        ui: Option<crate::MessageUiMetadata>,
+        cx: &mut Context<Self>,
+    ) {
+        self.seed_approved_plan(plan_text, ui, cx);
+        self.run_turn(cx);
     }
 
     /// Resolve the active mode's effective settings: built-in preset overlaid
