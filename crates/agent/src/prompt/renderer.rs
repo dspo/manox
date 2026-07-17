@@ -157,6 +157,18 @@ fn tera() -> &'static tera::Tera {
 /// registered source. Catches "added a variant, forgot the `TPL_*` const or
 /// the registration row" at first use rather than at the deferred render site.
 fn assert_all_registered(tera: &tera::Tera, registrations: &[(PromptTemplate, &str)]) {
+    // `ALL` and the registration table are both hand-maintained, so a variant
+    // added to one but not the other would slip past the per-variant checks
+    // below (which only iterate `ALL`). Tie their lengths here so that drift
+    // panics at first use instead of silently leaving a variant unrenderable.
+    assert_eq!(
+        template::ALL.len(),
+        registrations.len(),
+        "template::ALL ({} entries) and the registration table ({} rows) drifted \
+         out of sync — a variant was added to one but not the other",
+        template::ALL.len(),
+        registrations.len(),
+    );
     let registered: std::collections::HashSet<&str> =
         registrations.iter().map(|(v, _)| v.name()).collect();
     let parsed: std::collections::HashSet<&str> = tera.get_template_names().collect();
@@ -303,9 +315,13 @@ mod tests {
         // Touch the global so `assert_all_registered` runs at init. A variant
         // lacking a template file panics there rather than at render time.
         let _ = render_static(PromptTemplate::ModeGoalAddendum).unwrap();
-        // Every variant in `ALL` has a `name` arm (compile-checked by the
-        // `match` in `name`), and every name is registered (init-checked).
-        assert_eq!(template::ALL.len(), 25);
+        // `assert_all_registered` ties `ALL` to the registration table (length +
+        // per-variant registration) and `name()` is a compile-exhaustive match,
+        // so the only thing left to guard is `ALL` itself staying exhaustive
+        // over the enum. The count is hand-maintained and must be bumped when a
+        // variant is added — this tripwire makes a forgotten bump fail loudly
+        // here rather than letting a new variant ship unregistered.
+        assert_eq!(template::ALL.len(), 24);
     }
 
     /// Every data-bearing template must fully substitute its variables against
