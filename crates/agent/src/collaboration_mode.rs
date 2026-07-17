@@ -143,15 +143,17 @@ pub fn resolve(mode: ModeKind, user: &ModeSettingsMap) -> ModeSettings {
 }
 
 /// The user's verdict on a turn-end proposed plan: implement the approved plan,
-/// optionally after clearing the context. Staying in Plan mode to refine is not
-/// a verdict — the user simply keeps typing, which dismisses the pending plan
-/// and lets the model re-propose.
+/// optionally on a fresh thread. Staying in Plan mode to refine is not a verdict
+/// — the user simply keeps typing, which dismisses the pending plan and lets the
+/// model re-propose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanReviewChoice {
-    /// Exit Plan mode and execute the approved plan.
+    /// Exit Plan mode and execute the approved plan on the current thread.
     Implement,
-    /// Exit Plan mode, clear prior context, then execute — the plan text is
-    /// re-injected as the seed of a fresh context.
+    /// Exit Plan mode and execute the approved plan on a fresh thread — the
+    /// workspace archives the current thread and spawns a new one seeded with
+    /// the plan, so the model starts a clean context. The plan text is
+    /// re-injected as that new thread's first user message.
     ImplementClearContext,
 }
 

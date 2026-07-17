@@ -1982,9 +1982,9 @@ fn render_plan_review_card(
         .ghost()
         .small()
         .label(i18n::t("plan-drawer-clear"))
-        .on_click(move |_, _, cx: &mut App| {
+        .on_click(move |_, window, cx: &mut App| {
             let _ = weak_clear.update(cx, |w, cx| {
-                w.respond_plan_review(agent::PlanReviewChoice::ImplementClearContext, cx);
+                w.respond_plan_review(agent::PlanReviewChoice::ImplementClearContext, window, cx);
             });
         });
 
@@ -1993,9 +1993,9 @@ fn render_plan_review_card(
         .ghost()
         .small()
         .label(i18n::t("plan-drawer-implement"))
-        .on_click(move |_, _, cx: &mut App| {
+        .on_click(move |_, window, cx: &mut App| {
             let _ = weak_impl.update(cx, |w, cx| {
-                w.respond_plan_review(agent::PlanReviewChoice::Implement, cx);
+                w.respond_plan_review(agent::PlanReviewChoice::Implement, window, cx);
             });
         });
 

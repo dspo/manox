@@ -2988,39 +2988,81 @@ impl Workspace {
     /// milestone panel and delegates to the thread, which exits Plan mode and
     /// re-injects the plan as the implement turn's seed. Staying in Plan mode is
     /// not a verdict — the user simply keeps typing.
-    pub(crate) fn respond_plan_review(&mut self, choice: PlanReviewChoice, cx: &mut Context<Self>) {
+    pub(crate) fn respond_plan_review(
+        &mut self,
+        choice: PlanReviewChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(review) = self.pending_plan_review.take() else {
             return;
         };
         // The verdict becomes a user bubble carrying the approved plan text —
         // the same text+ui the thread injects below — so the live view and a
         // reloaded thread both show this one bubble. The ephemeral plan card
-        // (never persisted) is retired in its place: cleared wholesale on a
-        // clear-context verdict, or popped from the tail otherwise (the
-        // pending card is the live tail at verdict time, so a tail pop is the
-        // safe removal).
+        // (never persisted) is retired in its place.
         let meta = self.user_turn_meta(cx);
         let ui = Self::message_ui_metadata(&meta);
         let text = agent::implement_plan_user_message(&review.plan_text);
-        let weak = cx.weak_entity();
+        let plan_text = review.plan_text.clone();
         if matches!(choice, PlanReviewChoice::ImplementClearContext) {
-            self.conversation.update(cx, |c, _| c.clear());
+            // Clear context = archive this thread and continue on a fresh one
+            // seeded with the approved plan. The user perceives only that the
+            // underlying thread id changed and prior messages vanished — the
+            // new thread starts empty save the seed bubble, then runs.
+            let old_id = self.thread.read(cx).id.0.clone();
+            let cwd = self.thread.read(cx).cwd().to_path_buf();
+            let project = self.thread.read(cx).project().cloned();
+            let model = self.thread.read(cx).model().cloned();
+            let effort = self.thread.read(cx).reasoning_effort();
+            let approval = self.thread.read(cx).approval_mode();
+            let new = Thread::new(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx);
+            new.update(cx, |t, cx| {
+                if let Some(dir) = project {
+                    t.set_project(dir, cx);
+                }
+                if let Some(model) = model {
+                    t.set_model(model, cx);
+                }
+                t.set_reasoning_effort(effort, cx);
+                t.set_approval_mode(approval, cx);
+                t.seed_approved_plan(plan_text.clone(), Some(ui), cx);
+            });
+            // Switch the foreground: attach saves the old thread, rebuilds the
+            // conversation from the new thread (just the seed bubble), wires
+            // the event subscription, and clears the input draft. The seed is
+            // inserted but not run yet so turn events stream into the live view.
+            self.attach_thread(new, window, cx);
+            // Surface the new thread in the sidebar immediately, then run —
+            // run_turn marks it running so the sidebar row shows the spinner.
+            save_thread(self.thread.clone(), true, cx);
+            self.thread.update(cx, |t, cx| t.run_turn(cx));
+            self.context_rail.update(cx, |r, cx| {
+                r.set_milestones_from_plan(&review.plan_text, cx)
+            });
+            // Retire the old thread from the active list (consistent with any
+            // archived thread — no "show archived" UI today).
+            agent::thread_store_global().update(cx, |s, cx| s.archive_thread(&old_id, true, cx));
         } else {
+            // Implement: retire the ephemeral plan card (the pending card is
+            // the live tail at verdict time, so a tail pop is the safe removal)
+            // and push the verdict bubble, then seed + run on the current thread.
+            let weak = cx.weak_entity();
             self.conversation.update(cx, |c, cx| {
                 c.pop_plan_review_tail(cx);
             });
+            self.conversation.update(cx, |c, cx| {
+                c.push_user(text, Vec::new(), meta, weak, cx);
+            });
+            self.auto_follow = true;
+            self.message_scroll.scroll_to_bottom();
+            self.context_rail.update(cx, |r, cx| {
+                r.set_milestones_from_plan(&review.plan_text, cx)
+            });
+            self.thread.update(cx, |thread, cx| {
+                thread.implement_approved_plan(plan_text, Some(ui), cx);
+            });
         }
-        self.conversation.update(cx, |c, cx| {
-            c.push_user(text, Vec::new(), meta, weak, cx);
-        });
-        self.auto_follow = true;
-        self.message_scroll.scroll_to_bottom();
-        self.context_rail.update(cx, |r, cx| {
-            r.set_milestones_from_plan(&review.plan_text, cx)
-        });
-        self.thread.update(cx, |thread, cx| {
-            thread.respond_plan_review(choice, review.plan_text, Some(ui), cx);
-        });
         cx.notify();
     }
 
