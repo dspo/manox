@@ -1325,11 +1325,11 @@ impl Thread {
     /// Act on the user's verdict for a turn-end proposed plan. `Implement`
     /// exits Plan mode and launches a Default-mode turn seeded with the
     /// approved plan; `ImplementClearContext` does the same after dropping
-    /// prior history; `StayInPlan` is a no-op. The plan text is re-injected as
-    /// a user message because the `<proposed_plan>` block was never persisted
-    /// into the assistant message — the model needs it to execute. `ui` is the
-    /// same UI metadata the live view stamps onto the verdict bubble, so a
-    /// reloaded thread rebuilds the identical bubble (model/approval badges).
+    /// prior history. The plan text is re-injected as a user message because
+    /// the `<proposed_plan>` block was never persisted into the assistant
+    /// message — the model needs it to execute. `ui` is the same UI metadata
+    /// the live view stamps onto the verdict bubble, so a reloaded thread
+    /// rebuilds the identical bubble (model/approval badges).
     pub fn respond_plan_review(
         &mut self,
         choice: crate::collaboration_mode::PlanReviewChoice,
@@ -1338,18 +1338,20 @@ impl Thread {
         cx: &mut Context<Self>,
     ) {
         use crate::collaboration_mode::PlanReviewChoice;
-        match choice {
-            PlanReviewChoice::Implement | PlanReviewChoice::ImplementClearContext => {
-                if matches!(choice, PlanReviewChoice::ImplementClearContext) {
-                    self.messages.clear();
-                }
-                self.set_collaboration_mode(ModeKind::Default, cx);
-                let text = crate::collaboration_mode::implement_plan_user_message(&plan_text);
-                self.insert_user_message_with_ui_metadata(text, ui, cx);
-                self.run_turn(cx);
-            }
-            PlanReviewChoice::StayInPlan => {}
+        debug_assert!(
+            matches!(
+                choice,
+                PlanReviewChoice::Implement | PlanReviewChoice::ImplementClearContext
+            ),
+            "respond_plan_review is only called with an implement verdict"
+        );
+        if matches!(choice, PlanReviewChoice::ImplementClearContext) {
+            self.messages.clear();
         }
+        self.set_collaboration_mode(ModeKind::Default, cx);
+        let text = crate::collaboration_mode::implement_plan_user_message(&plan_text);
+        self.insert_user_message_with_ui_metadata(text, ui, cx);
+        self.run_turn(cx);
     }
 
     /// Resolve the active mode's effective settings: built-in preset overlaid

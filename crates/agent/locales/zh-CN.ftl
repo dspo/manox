@@ -531,4 +531,3 @@ plan-card-sidebar = 在侧边栏打开
 # Plan review card verdict buttons
 plan-drawer-implement = 执行
 plan-drawer-clear = 清空并执行
-plan-drawer-stay = 保持在计划模式

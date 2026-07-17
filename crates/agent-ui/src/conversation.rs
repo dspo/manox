@@ -1449,6 +1449,10 @@ fn note_to_item(n: &UiNoteRecord) -> ConvItem {
     match n.kind {
         UiNoteKind::Error => ConvItem::Error(text),
         UiNoteKind::Notice => ConvItem::Notice(text),
+        UiNoteKind::PlanReview => ConvItem::PlanReview {
+            plan_text: text,
+            active: false,
+        },
     }
 }
 
@@ -1495,6 +1499,7 @@ mod tests {
                 ConvItem::Assistant { text, .. } => format!("A:{text}"),
                 ConvItem::Notice(t) => format!("N:{t}"),
                 ConvItem::Error(t) => format!("E:{t}"),
+                ConvItem::PlanReview { plan_text, .. } => format!("P:{plan_text}"),
                 _ => "?".to_string(),
             })
             .collect()
@@ -1569,6 +1574,43 @@ mod tests {
             Some(&"N:mid".to_string()),
             "no-bubble anchor folds to the nearest preceding segment's tail"
         );
+    }
+
+    /// A dismissed plan persists as a `PlanReview` note anchored to the user
+    /// message that triggered the plan's turn. The rebuild must splice the
+    /// collapsed plan card back at the end of that turn — ahead of the
+    /// dismissing user message — so a switched-away-and-back thread reproduces
+    /// the live order rather than silently dropping the plan.
+    #[test]
+    fn merge_ui_notes_places_dismissed_plan_before_dismissing_message() {
+        // u1 triggers the plan turn (a1 proposes a plan); u2 is the free-form
+        // message that dismissed it; a2 is the re-proposal turn.
+        let messages = vec![
+            msg_with_id("u1", Role::User, "plan it"),
+            msg_with_id("a1", Role::Assistant, "here is the plan"),
+            msg_with_id("u2", Role::User, "revise step 2"),
+            msg_with_id("a2", Role::Assistant, "revised"),
+        ];
+        let items = build_items(&messages, &HashMap::new(), false);
+        // Anchored to u1 — the plan turn's triggering message — so the card
+        // lands at the end of turn 0, before the u2 bubble that dismissed it.
+        let notes = vec![note(1, UiNoteKind::PlanReview, Some("u1"), "PLAN BODY")];
+        let merged = merge_ui_notes(&messages, items, &notes);
+        assert_eq!(
+            signature(&merged),
+            vec![
+                "U:plan it", // turn 0
+                "A:here is the plan",
+                "P:PLAN BODY",     // dismissed plan → end of turn 0
+                "U:revise step 2", // the dismissing message
+                "A:revised",
+            ]
+        );
+        // The rebuilt card is the inactive record form (no verdict buttons).
+        assert!(matches!(
+            merged[2],
+            ConvItem::PlanReview { active: false, .. }
+        ));
     }
 
     /// A tool_result in a user message must pair back to the ToolUse emitted in the

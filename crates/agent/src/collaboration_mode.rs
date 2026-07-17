@@ -142,9 +142,10 @@ pub fn resolve(mode: ModeKind, user: &ModeSettingsMap) -> ModeSettings {
     preset_for(mode).resolved(user.get(mode).unwrap_or(&ModeSettings::default()))
 }
 
-/// The user's verdict on a turn-end proposed plan. Mirrors codex's three-way
-/// review decision: implement the approved plan (optionally after clearing the
-/// context), or stay in Plan mode for another research round.
+/// The user's verdict on a turn-end proposed plan: implement the approved plan,
+/// optionally after clearing the context. Staying in Plan mode to refine is not
+/// a verdict — the user simply keeps typing, which dismisses the pending plan
+/// and lets the model re-propose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanReviewChoice {
     /// Exit Plan mode and execute the approved plan.
@@ -152,8 +153,6 @@ pub enum PlanReviewChoice {
     /// Exit Plan mode, clear prior context, then execute — the plan text is
     /// re-injected as the seed of a fresh context.
     ImplementClearContext,
-    /// Keep Plan mode; the user will keep refining the plan.
-    StayInPlan,
 }
 
 /// The user turn that seeds an implement turn after the user approves a proposed

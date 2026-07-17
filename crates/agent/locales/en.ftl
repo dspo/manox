@@ -589,4 +589,3 @@ plan-card-sidebar = Open in side panel
 # Plan review card verdict buttons
 plan-drawer-implement = Implement
 plan-drawer-clear = Clear & Implement
-plan-drawer-stay = Stay in Plan

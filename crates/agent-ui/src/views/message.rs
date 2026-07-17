@@ -1977,17 +1977,6 @@ fn render_plan_review_card(
             .into_any_element();
     }
 
-    let weak_stay = weak.clone();
-    let stay_btn = Button::new(("plan-verdict-stay", ix))
-        .ghost()
-        .small()
-        .label(i18n::t("plan-drawer-stay"))
-        .on_click(move |_, _, cx: &mut App| {
-            let _ = weak_stay.update(cx, |w, cx| {
-                w.respond_plan_review(agent::PlanReviewChoice::StayInPlan, cx);
-            });
-        });
-
     let weak_clear = weak.clone();
     let clear_btn = Button::new(("plan-verdict-clear", ix))
         .ghost()
@@ -1999,7 +1988,7 @@ fn render_plan_review_card(
             });
         });
 
-    let weak_impl = weak.clone();
+    let weak_impl = weak;
     let impl_btn = Button::new(("plan-verdict-implement", ix))
         .ghost()
         .small()
@@ -2019,7 +2008,6 @@ fn render_plan_review_card(
         .border_t_1()
         .border_color(theme.border)
         .pt_2p5()
-        .child(stay_btn)
         .child(clear_btn)
         .child(impl_btn);
 
