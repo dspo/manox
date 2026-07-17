@@ -31,7 +31,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### MessageArea
 
-- [MessageArea](#messagearea) · [OutlineRail](#outlinerail) · [OutlineTick](#outlinetick) · [OutlineHoverCard](#outlinehovercard) · [MessageList](#messagelist) · [MessageItem](#messageitem)
+- [MessageArea](#messagearea) · [MessageList](#messagelist) · [MessageItem](#messageitem)
 
 ### MessageItem 变体
 
@@ -272,31 +272,13 @@ Shown when the thread has messages. Replaces [Hero](#hero).
 
 #### MessageArea
 
-Horizontal flex: [OutlineRail](#outlinerail) + [MessageList](#messagelist).
+Wraps [MessageList](#messagelist).
 
 > Source: `agent-ui/src/workspace.rs`
 
-#### OutlineRail
-
-40px gutter, vertical flex, centered ticks (one per user turn).
-
-> Source: `agent-ui/src/workspace.rs` + `views/outline.rs`
-
-#### OutlineTick
-
-16×2px rounded bar per user turn, color varies by state.
-
-> Source: `agent-ui/src/views/outline.rs`
-
-#### OutlineHoverCard
-
-260px popover card on tick hover, shows message preview.
-
-> Source: `agent-ui/src/views/outline.rs`
-
 #### MessageList
 
-Pixel-anchored `ScrollHandle` ordinary scroll container (`div().overflow_y_scroll().track_scroll(&message_scroll)`); the scroll position is an absolute pixel offset, not an item-index + intra-item delta, so streaming growth, width-driven reflow, and streaming→finalized body switches cannot "fly to the top" — the viewport holds its pixel position. Tail-follow is arbitrated each frame from `max_offset()`/`offset()`: when the user sits at the bottom, `auto_follow` latches true and `scroll_to_bottom()` runs on each append; when scrolled up, the pixel offset is left untouched so a resize or a still-streaming tail never yanks the reader back. Click-to-reveal from the outline uses `scroll_to_top_of_item(ix)` (the `ScrollHandle` indexes its direct children). No `gpui::list` / `ListState` / `FollowMode` / `splice` / `remeasure_items` machinery — that index-anchor compensation layer is gone.
+Pixel-anchored `ScrollHandle` ordinary scroll container (`div().overflow_y_scroll().track_scroll(&message_scroll)`); the scroll position is an absolute pixel offset, not an item-index + intra-item delta, so streaming growth, width-driven reflow, and streaming→finalized body switches cannot "fly to the top" — the viewport holds its pixel position. Tail-follow is arbitrated each frame from `max_offset()`/`offset()`: when the user sits at the bottom, `auto_follow` latches true and `scroll_to_bottom()` runs on each append; when scrolled up, the pixel offset is left untouched so a resize or a still-streaming tail never yanks the reader back. No `gpui::list` / `ListState` / `FollowMode` / `splice` / `remeasure_items` machinery — that index-anchor compensation layer is gone.
 
 > Source: `agent-ui/src/workspace.rs`
 
