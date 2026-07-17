@@ -1,24 +1,27 @@
 //! Searchable navigation over the current thread's user turns.
+//!
+//! Renders a centered popup panel with a search input and a scrollable list of
+//! filtered user turns. The visual style (hover/selected backgrounds, container
+//! chrome) is shared with the slash-command completion popover via
+//! `views::popup_menu`.
 
 use agent::i18n;
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement, Render,
-    SharedString, Subscription, Task, Window, prelude::*, px,
+    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement,
+    Render, ScrollHandle, SharedString, Subscription, Window, prelude::*,
 };
 use gpui_component::{
-    ActiveTheme as _, IndexPath, Sizable as _, Size, WindowExt as _,
-    list::{List, ListDelegate, ListEvent, ListItem, ListState},
+    ActiveTheme as _, WindowExt as _,
+    input::{Input, InputEvent, InputState},
     notification::Notification,
     v_flex,
 };
 
 use crate::CopySelectedTurn;
 use crate::conversation::ConvItem;
-
-const SEARCH_HEIGHT: f32 = 36.0;
-const ROW_HEIGHT: f32 = 28.0;
-const EMPTY_HEIGHT: f32 = 72.0;
-const MAX_PANEL_HEIGHT: f32 = 360.0;
+use crate::views::popup_menu::{
+    self, EMPTY_HEIGHT, MAX_LIST_HEIGHT, ROW_HEIGHT, SEARCH_HEIGHT,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TurnEntry {
@@ -78,110 +81,6 @@ fn filter_turns(turns: &[TurnEntry], query: &str) -> Vec<usize> {
         .collect()
 }
 
-struct TurnListDelegate {
-    all: Vec<TurnEntry>,
-    filtered: Vec<usize>,
-    selected: Option<IndexPath>,
-}
-
-impl TurnListDelegate {
-    fn new(turns: Vec<TurnEntry>) -> Self {
-        let filtered = (0..turns.len()).collect();
-        Self {
-            filtered,
-            all: turns,
-            selected: None,
-        }
-    }
-
-    fn selected_entry(&self) -> Option<&TurnEntry> {
-        let ix = self.selected?;
-        self.entry_at(ix.row)
-    }
-
-    fn entry_at(&self, row: usize) -> Option<&TurnEntry> {
-        self.filtered
-            .get(row)
-            .and_then(|entry_ix| self.all.get(*entry_ix))
-    }
-}
-
-impl ListDelegate for TurnListDelegate {
-    type Item = ListItem;
-
-    fn perform_search(
-        &mut self,
-        query: &str,
-        window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Task<()> {
-        self.filtered = filter_turns(&self.all, query);
-        let selected = (!self.filtered.is_empty()).then(IndexPath::default);
-        cx.defer_in(window, move |state, window, cx| {
-            state.set_selected_index(selected, window, cx);
-            cx.notify();
-        });
-        Task::ready(())
-    }
-
-    fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        self.filtered.len()
-    }
-
-    fn render_item(
-        &mut self,
-        ix: IndexPath,
-        _window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Option<Self::Item> {
-        let turn = self.entry_at(ix.row)?;
-        Some(
-            ListItem::new(("turn-navigator-row", turn.item_ix))
-                .h(px(ROW_HEIGHT))
-                .mx_1()
-                .px_2()
-                .rounded(cx.theme().radius)
-                .child(
-                    gpui::div()
-                        .w_full()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .debug_selector(|| format!("TURN_NAVIGATOR_ROW_{}", turn.item_ix))
-                        .child(SharedString::from(turn.display.clone())),
-                ),
-        )
-    }
-
-    fn render_empty(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> impl IntoElement {
-        let key = if self.all.is_empty() {
-            "turn-navigator-empty"
-        } else {
-            "turn-navigator-no-results"
-        };
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(i18n::t(key))
-    }
-
-    fn set_selected_index(
-        &mut self,
-        ix: Option<IndexPath>,
-        _window: &mut Window,
-        _cx: &mut Context<ListState<Self>>,
-    ) {
-        self.selected = ix;
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TurnNavigatorEvent {
     Navigate { item_ix: usize },
@@ -189,83 +88,135 @@ pub(crate) enum TurnNavigatorEvent {
 }
 
 pub(crate) struct TurnNavigator {
-    list: Entity<ListState<TurnListDelegate>>,
-    _list_sub: Subscription,
+    all: Vec<TurnEntry>,
+    filtered: Vec<usize>,
+    selected: usize,
+    search: Entity<InputState>,
+    scroll_handle: ScrollHandle,
+    _search_sub: Subscription,
     #[cfg(test)]
     last_event: Option<TurnNavigatorEvent>,
 }
 
 impl TurnNavigator {
     pub fn new(turns: Vec<TurnEntry>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let has_turns = !turns.is_empty();
-        let list =
-            cx.new(|cx| ListState::new(TurnListDelegate::new(turns), window, cx).searchable(true));
-        if has_turns {
-            list.update(cx, |state, cx| {
-                state.set_selected_index(Some(IndexPath::default()), window, cx);
-            });
-        }
-        let _list_sub = cx.subscribe_in(&list, window, Self::on_list_event);
+        let search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(i18n::t("turn-navigator-search-placeholder"))
+        });
+        let filtered = (0..turns.len()).collect();
+        let _search_sub = cx.subscribe_in(&search, window, Self::on_search_event);
         Self {
-            list,
-            _list_sub,
+            all: turns,
+            filtered,
+            selected: 0,
+            search,
+            scroll_handle: ScrollHandle::new(),
+            _search_sub,
             #[cfg(test)]
             last_event: None,
         }
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
-        self.list.update(cx, |list, cx| list.focus(window, cx));
+        self.search.update(cx, |s, cx| s.focus(window, cx));
     }
 
-    pub fn panel_height(&self, cx: &App) -> gpui::Pixels {
-        let rows = self.list.read(cx).delegate().filtered.len();
+    pub fn panel_height(&self, _cx: &App) -> gpui::Pixels {
+        let rows = self.filtered.len();
         let body = if rows == 0 {
             EMPTY_HEIGHT
         } else {
-            rows as f32 * ROW_HEIGHT
+            let height_px = ROW_HEIGHT * rows as f32;
+            if height_px > MAX_LIST_HEIGHT {
+                MAX_LIST_HEIGHT
+            } else {
+                height_px
+            }
         };
-        px((SEARCH_HEIGHT + body).min(MAX_PANEL_HEIGHT))
+        SEARCH_HEIGHT + body
     }
 
-    fn on_list_event(
+    fn on_search_event(
         &mut self,
-        list: &Entity<ListState<TurnListDelegate>>,
-        event: &ListEvent,
+        search: &Entity<InputState>,
+        event: &InputEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(test)]
-        {
-            self.last_event = match event {
-                ListEvent::Confirm(ix) => {
-                    let delegate = list.read(cx).delegate();
-                    delegate
-                        .entry_at(ix.row)
-                        .map(|turn| TurnNavigatorEvent::Navigate {
-                            item_ix: turn.item_ix,
-                        })
-                }
-                ListEvent::Cancel => Some(TurnNavigatorEvent::Dismiss),
-                ListEvent::Select(_) => self.last_event.clone(),
-            };
-        }
         match event {
-            ListEvent::Confirm(ix) => {
-                let delegate = list.read(cx).delegate();
-                if let Some(turn) = delegate.entry_at(ix.row) {
-                    cx.emit(TurnNavigatorEvent::Navigate {
-                        item_ix: turn.item_ix,
-                    });
-                }
+            InputEvent::Change => {
+                let query = search.read(cx).value().to_string();
+                self.filtered = filter_turns(&self.all, &query);
+                // Keep selection within bounds; reset to first match.
+                self.selected = if self.filtered.is_empty() { 0 } else { 0 };
+                cx.notify();
             }
-            ListEvent::Cancel => cx.emit(TurnNavigatorEvent::Dismiss),
-            ListEvent::Select(_) => {}
+            InputEvent::PressEnter { shift: false, .. } => {
+                self.confirm(cx);
+            }
+            _ => {}
         }
     }
 
+    fn move_selection(&mut self, delta: i32) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let n = self.filtered.len() as i32;
+        let mut next = self.selected as i32 + delta;
+        next = ((next % n) + n) % n;
+        self.selected = next as usize;
+        // Scroll the selected item into view.
+        self.scroll_handle.scroll_to_item(self.selected);
+    }
+
+    fn confirm(&mut self, cx: &mut Context<Self>) {
+        let Some(&entry_ix) = self.filtered.get(self.selected) else {
+            return;
+        };
+        let Some(turn) = self.all.get(entry_ix) else {
+            return;
+        };
+        #[cfg(test)]
+        {
+            self.last_event = Some(TurnNavigatorEvent::Navigate {
+                item_ix: turn.item_ix,
+            });
+        }
+        cx.emit(TurnNavigatorEvent::Navigate {
+            item_ix: turn.item_ix,
+        });
+    }
+
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.last_event = Some(TurnNavigatorEvent::Dismiss);
+        }
+        cx.emit(TurnNavigatorEvent::Dismiss);
+    }
+
+    fn navigate_up(&mut self, _: &crate::CompletionUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(-1);
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn navigate_down(&mut self, _: &crate::CompletionDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(1);
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn on_dismiss(&mut self, _: &crate::CompletionDismiss, _window: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss(cx);
+        cx.stop_propagation();
+    }
     fn copy_selected(&mut self, _: &CopySelectedTurn, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(turn) = self.list.read(cx).delegate().selected_entry() else {
+        let Some(&entry_ix) = self.filtered.get(self.selected) else {
+            return;
+        };
+        let Some(turn) = self.all.get(entry_ix) else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(turn.text.clone()));
@@ -278,27 +229,117 @@ impl EventEmitter<TurnNavigatorEvent> for TurnNavigator {}
 
 impl Render for TurnNavigator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let filtered = self.filtered.clone();
+        let all_for_closure = self.all.clone();
+        let all_empty = self.all.is_empty();
+        let selected = self.selected;
+        let scroll_handle = self.scroll_handle.clone();
+        let hover = popup_menu::hover_bg(&theme);
+        let selected_bg = popup_menu::selected_bg(&theme);
+        let radius = theme.radius;
+        let is_empty = filtered.is_empty();
+        let entity = cx.entity();
+
+        let list = v_flex()
+            .id("turn-navigator-list")
+            .w_full()
+            .max_h(MAX_LIST_HEIGHT)
+            .overflow_y_scroll()
+            .track_scroll(&scroll_handle)
+            .min_w_0()
+            .children(filtered.iter().enumerate().map(move |(row_ix, &entry_ix)| {
+                let entity = entity.clone();
+                let is_selected = row_ix == selected;
+                let Some(turn) = all_for_closure.get(entry_ix) else {
+                    return gpui::div().into_any_element();
+                };
+                let display = turn.display.clone();
+                let item_ix = turn.item_ix;
+                let navigate_item_ix = turn.item_ix;
+
+                let mut row = gpui::div()
+                    .id(("turn-navigator-row", row_ix))
+                    .w_full()
+                    .h(ROW_HEIGHT)
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover));
+
+                if is_selected {
+                    row = row.bg(selected_bg);
+                }
+
+                row.child(
+                    gpui::div()
+                        .w_full()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .debug_selector(|| format!("TURN_NAVIGATOR_ROW_{}", item_ix))
+                        .child(SharedString::from(display)),
+                )
+                .on_click(move |_, _, cx| {
+                    entity.update(cx, |this, cx| {
+                        this.selected = row_ix;
+                        cx.emit(TurnNavigatorEvent::Navigate { item_ix: navigate_item_ix });
+                    });
+                })
+                .into_any_element()
+            }));
+
+        let body = if is_empty {
+            popup_menu::render_empty_state(
+                &theme,
+                if all_empty {
+                    i18n::t("turn-navigator-empty")
+                } else {
+                    i18n::t("turn-navigator-no-results")
+                },
+            )
+            .into_any_element()
+        } else {
+            list.into_any_element()
+        };
+
         v_flex()
             .id("turn-navigator")
             .key_context("TurnNavigator")
-            .size_full()
+            .w_full()
             .overflow_hidden()
-            .bg(cx.theme().popover)
-            .text_color(cx.theme().popover_foreground)
+            .bg(theme.popover)
+            .text_color(theme.popover_foreground)
+            .on_action(cx.listener(Self::navigate_up))
+            .on_action(cx.listener(Self::navigate_down))
+            .on_action(cx.listener(Self::on_dismiss))
             .on_action(cx.listener(Self::copy_selected))
             .child(
-                List::new(&self.list)
-                    .with_size(Size::Small)
-                    .scrollbar_visible(false)
-                    .search_placeholder(i18n::t("turn-navigator-search-placeholder")),
+                gpui::div()
+                    .h(SEARCH_HEIGHT)
+                    .w_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        gpui::div()
+                            .w_full()
+                            .h_full()
+                            .child(Input::new(&self.search).appearance(false))
+                    ),
             )
+            .child(body)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, size};
+    use gpui::{Modifiers, TestAppContext, px, size};
     use gpui_component::Root;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -388,10 +429,11 @@ mod tests {
         });
 
         cx.simulate_input("needle");
-        navigator.read_with(cx, |navigator, cx| {
-            let delegate = navigator.list.read(cx).delegate();
-            assert_eq!(delegate.filtered.len(), 2);
-            assert_eq!(delegate.selected_entry().map(|turn| turn.item_ix), Some(8));
+        navigator.read_with(cx, |navigator, _cx| {
+            assert_eq!(navigator.filtered.len(), 2);
+            assert_eq!(navigator.selected, 0);
+            let entry_ix = navigator.filtered[0];
+            assert_eq!(navigator.all[entry_ix].item_ix, 8);
         });
 
         cx.simulate_keystrokes("down enter");
@@ -404,7 +446,7 @@ mod tests {
 
         navigator.update(cx, |navigator, _| navigator.last_event = None);
         let older_row = cx
-            .debug_bounds("TURN_NAVIGATOR_ROW_3")
+            .debug_bounds("TURN_NAVIGATOR_ROW_0")
             .expect("filtered row rendered");
         cx.simulate_click(older_row.center(), Modifiers::default());
         navigator.read_with(cx, |navigator, _| {

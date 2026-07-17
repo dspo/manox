@@ -15,6 +15,7 @@ use gpui::{AnyElement, App, ScrollHandle, SharedString, Window, prelude::*, px};
 use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 
 use crate::slash_command::SlashCommandRegistry;
+use crate::views::popup_menu::{self, MAX_LIST_HEIGHT, ROW_HEIGHT};
 
 /// What a completion row represents — drives its icon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,20 +245,19 @@ pub fn render_completion(
     let trigger = state.trigger;
     let items = state.items.clone();
     let selected = state.selected;
-    let fg = theme.foreground;
+    let fg = theme.popover_foreground;
     let muted = theme.muted_foreground;
-    let secondary = theme.secondary;
-    let border = theme.border;
+    let hover_bg = popup_menu::hover_bg(theme);
+    let selected_bg = popup_menu::selected_bg(theme);
     let radius = theme.radius;
     let mono = theme.mono_font_family.clone();
     let on_select = on_select.clone();
     let scroll_handle = state.scroll_handle.clone();
-    let hover_bg = theme.muted_foreground.opacity(0.08);
 
     let list = v_flex()
         .id("completion-list")
         .w_full()
-        .max_h(px(300.))
+        .max_h(MAX_LIST_HEIGHT)
         .overflow_y_scroll()
         .track_scroll(&scroll_handle)
         .min_w_0()
@@ -285,18 +285,18 @@ pub fn render_completion(
             let mut row = h_flex()
                 .id(("completion-row", ix))
                 .w_full()
+                .h(ROW_HEIGHT)
                 .items_center()
                 .gap_2()
                 .px_2()
-                .py_1()
                 .cursor_pointer()
                 .font_family(mono)
                 .font_weight(gpui::FontWeight::LIGHT)
-                // Hover tint for affordance — selected already has its own bg.
+                .rounded(radius)
                 .hover(move |s| s.bg(hover_bg));
 
             if is_selected {
-                row = row.bg(secondary);
+                row = row.bg(selected_bg);
             }
 
             row = row
@@ -324,18 +324,8 @@ pub fn render_completion(
                 .into_any_element()
         }));
 
-    v_flex()
+    popup_menu::popup_container(theme, list)
         .w(px(520.))
-        .child(
-            v_flex()
-                .w_full()
-                .bg(theme.background)
-                .border_1()
-                .border_color(border)
-                .rounded(radius)
-                .shadow_md()
-                .child(list),
-        )
         .into_any_element()
 }
 

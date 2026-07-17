@@ -144,19 +144,19 @@ fn main() {
             gpui::KeyBinding::new("cmd-m", agent_ui::ToggleTurnNavigator, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-m", agent_ui::ToggleTurnNavigator, None),
-            // While the navigator's search input owns focus, copy the selected
-            // turn rather than the input selection.
+            // While the navigator is open, copy the selected
+            // turn's full text rather than the input selection.
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new(
                 "cmd-c",
                 agent_ui::CopySelectedTurn,
-                Some("TurnNavigator > Input"),
+                Some("TurnNavigator"),
             ),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new(
                 "ctrl-c",
                 agent_ui::CopySelectedTurn,
-                Some("TurnNavigator > Input"),
+                Some("TurnNavigator"),
             ),
             // Ask drawer: left/right arrows navigate questions, escape closes.
             gpui::KeyBinding::new("left", agent_ui::AskPrev, Some("AskDrawer")),

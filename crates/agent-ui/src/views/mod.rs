@@ -11,6 +11,7 @@ pub mod plugin_manager;
 pub mod settings;
 pub mod sidebar;
 pub mod title_menu;
+pub mod popup_menu;
 pub mod turn_navigator;
 
 use gpui::prelude::*;
