@@ -319,23 +319,39 @@ impl ThinkingContainer {
         }
         self.streaming = false;
     }
-    /// Stop accepting entries because assistant text has arrived mid-turn —
-    /// the model moved on to the answer, so this segment's reasoning/tool
-    /// activity is done. Mirrors `build_items`'s `close_segment` on
-    /// `MessageContent::Text`: sets `accepting_entries = false` so subsequent
-    /// `AgentThinking` opens a fresh segment instead of folding into this one
-    /// (temporal inversion, issue #216). Also finalizes still-streaming
-    /// reasoning rounds — a `Stop(ToolUse)` left them live — and re-derives
-    /// `streaming` so the spinner stops and the elapsed timer pins. Unlike
-    /// `finalize_segment` (terminal stop), does NOT auto-collapse entries or
-    /// the container: the user may be inspecting the activity tree.
-    pub fn close_for_text(&mut self) {
-        self.accepting_entries = false;
+    /// Flip every streaming reasoning round's `streaming` flag off and re-derive
+    /// `streaming`, WITHOUT closing the segment — `accepting_entries` stays true
+    /// so subsequent tool calls still fold in. Called on a mid-turn
+    /// `Stop(ToolUse)`: the current reasoning round is done (the model emitted a
+    /// tool call), so the next `AgentThinking` must open a fresh round instead
+    /// of appending to this one (which would show the prior round's body still
+    /// growing while the answer text is already rendering). Mirrors the
+    /// reasoning-finalization half of `close_for_text` without the
+    /// `accepting_entries = false` / elapsed-pin that only a text boundary or
+    /// terminal stop warrants. Idempotent.
+    pub fn finalize_reasoning_rounds(&mut self) {
         for entry in &mut self.entries {
             if let ActivityEntry::Reasoning { streaming, .. } = entry {
                 *streaming = false;
             }
         }
+        self.recompute_streaming();
+    }
+
+    /// Stop accepting entries because assistant text has arrived mid-turn —
+    /// the model moved on to the answer, so this segment's reasoning/tool
+    /// activity is done. Mirrors `build_items`'s `close_segment` on
+    /// `MessageContent::Text`: sets `accepting_entries = false` so subsequent
+    /// `AgentThinking` opens a fresh segment instead of folding into this one
+    /// (temporal inversion, issue #216). Also finalizes any still-streaming
+    /// reasoning rounds (idempotent with `finalize_reasoning_rounds`, which a
+    /// mid-turn `Stop(ToolUse)` already ran) and re-derives `streaming` so the
+    /// spinner stops and the elapsed timer pins. Unlike `finalize_segment`
+    /// (terminal stop), does NOT auto-collapse entries or the container: the
+    /// user may be inspecting the activity tree.
+    pub fn close_for_text(&mut self) {
+        self.finalize_reasoning_rounds();
+        self.accepting_entries = false;
         self.recompute_streaming();
     }
 
@@ -1949,6 +1965,15 @@ mod tests {
     #[test]
     fn tool_use_stop_does_not_freeze_segment() {
         let mut t = ThinkingContainer::new();
+        // A streaming reasoning round (the model thought before emitting the
+        // tool call) plus the terminal tool entry.
+        t.entries.push(ActivityEntry::Reasoning {
+            text: "round 1".into(),
+            streaming: true,
+            collapsed: false,
+            user_toggled: false,
+            markdown: None,
+        });
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "1".into(),
             name: "read_file".into(),
@@ -1968,14 +1993,23 @@ mod tests {
         assert!(t.streaming, "segment stays live while accepting entries");
         assert!(t.frozen_secs.is_none(), "elapsed not pinned mid-turn");
 
-        // Simulate the Stop(ToolUse) path: finalize_streaming(false) only
-        // finalizes text streaming, leaves the segment live.
-        // (The full `MessageItem::finalize_streaming` needs an entity; we
-        // exercise the segment-level invariant directly.)
-        t.recompute_streaming();
-        assert!(t.accepting_entries);
-        assert!(t.streaming);
-        assert!(t.frozen_secs.is_none());
+        // Simulate the Stop(ToolUse) path: `finalize_streaming(false)` runs
+        // `finalize_reasoning_rounds` — the round's `streaming` flips off so
+        // the next `AgentThinking` opens a fresh round instead of appending to
+        // this one — but the segment stays open for the next response's tool
+        // calls. (The full `MessageItem::finalize_streaming` needs an entity;
+        // we exercise the segment-level invariant directly.)
+        t.finalize_reasoning_rounds();
+        assert!(
+            t.last_streaming_reasoning_index().is_none(),
+            "reasoning round closed; next AgentThinking starts a fresh round"
+        );
+        assert!(
+            t.accepting_entries,
+            "segment still accepting after ToolUse stop"
+        );
+        assert!(t.streaming, "segment stays live while accepting entries");
+        assert!(t.frozen_secs.is_none(), "elapsed not pinned mid-turn");
 
         // Now the terminal stop path: finalize_segment freezes.
         t.finalize_segment();
@@ -1985,17 +2019,18 @@ mod tests {
         assert!(t.frozen_secs.is_some(), "elapsed pinned on terminal stop");
     }
     /// `close_for_text` stops accepting entries (so subsequent
-    /// `AgentThinking` opens a fresh segment), finalizes streaming reasoning
-    /// rounds left live by a `Stop(ToolUse)`, and pins the elapsed timer —
-    /// but does NOT auto-collapse (mid-turn, the user may be inspecting the
-    /// tree). This is the live-path mirror of `build_items`'s `close_segment`
-    /// on `MessageContent::Text` (issue #216).
+    /// `AgentThinking` opens a fresh segment), finalizes any still-streaming
+    /// reasoning rounds (idempotent with `finalize_reasoning_rounds`, which a
+    /// mid-turn `Stop(ToolUse)` already ran), and pins the elapsed timer — but
+    /// does NOT auto-collapse (mid-turn, the user may be inspecting the tree).
+    /// This is the live-path mirror of `build_items`'s `close_segment` on
+    /// `MessageContent::Text` (issue #216).
     #[test]
     fn close_for_text_stops_accepting_entries() {
         let mut t = ThinkingContainer::new();
         t.entries.push(ActivityEntry::Reasoning {
             text: "round 1".into(),
-            streaming: true, // Stop(ToolUse) left it live
+            streaming: true, // still-live if finalize_reasoning_rounds was skipped
             collapsed: false,
             user_toggled: false,
             markdown: None,
@@ -2026,6 +2061,64 @@ mod tests {
             t.last_streaming_reasoning_index().is_none(),
             "reasoning finalized, new round would start"
         );
+    }
+
+    /// `finalize_reasoning_rounds` (the segment-level half of a mid-turn
+    /// `Stop(ToolUse)`) flips every streaming reasoning round's `streaming`
+    /// flag off so the next `AgentThinking` opens a fresh round, WITHOUT
+    /// closing the segment — `accepting_entries` stays true, `streaming` stays
+    /// true, and the elapsed timer stays unpinned.
+    #[test]
+    fn finalize_reasoning_rounds_closes_round_keeps_segment_open() {
+        let mut t = ThinkingContainer::new();
+        t.entries.push(ActivityEntry::Reasoning {
+            text: "round 1".into(),
+            streaming: true,
+            collapsed: false,
+            user_toggled: false,
+            markdown: None,
+        });
+        t.entries.push(ActivityEntry::Tool(ToolCallItem {
+            id: "1".into(),
+            name: "read_file".into(),
+            title: String::new(),
+            status: ToolCallStatus::Success,
+            output: String::new(),
+            is_error: false,
+            input: serde_json::Value::Null,
+            streaming: false,
+            collapsed: false,
+            user_toggled: false,
+            panel: None,
+        }));
+        t.recompute_streaming();
+        assert!(t.streaming, "segment live while reasoning streaming");
+
+        t.finalize_reasoning_rounds();
+
+        // The reasoning round is closed: no streaming round remains, so the
+        // next AgentThinking starts a fresh round instead of appending here.
+        assert!(
+            t.last_streaming_reasoning_index().is_none(),
+            "streaming round finalized"
+        );
+        match &t.entries[0] {
+            ActivityEntry::Reasoning { streaming, .. } => {
+                assert!(!*streaming, "round's streaming flag flipped off");
+            }
+            _ => panic!("first entry is not reasoning"),
+        }
+        // The segment itself stays open for the next model response's tool
+        // calls: accepting_entries/streaming stay true, elapsed not pinned.
+        assert!(t.accepting_entries, "segment still accepting entries");
+        assert!(t.streaming, "segment stays live while accepting entries");
+        assert!(t.frozen_secs.is_none(), "elapsed not pinned mid-turn");
+
+        // Idempotent: a second call is a no-op.
+        t.finalize_reasoning_rounds();
+        assert!(t.accepting_entries);
+        assert!(t.streaming);
+        assert!(t.frozen_secs.is_none());
     }
 
     /// `last_streaming_reasoning_index` returns the index of the last streaming

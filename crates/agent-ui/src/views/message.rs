@@ -419,9 +419,21 @@ impl MessageItem {
                 }
                 t.collapsed = !t.user_toggled;
             }
-            // ToolUse stop (`!terminal`): leave the segment live so the next
-            // model response's tool calls fold into it.
-            ConvItem::Thinking(_) => {}
+            // ToolUse stop (`!terminal`): the segment stays open so the next
+            // model response's tool calls still fold into it, but this
+            // reasoning round is done — flip its `streaming` flag off (and
+            // finalize its markdown) so the next `AgentThinking` opens a
+            // fresh round instead of appending to the previous one.
+            ConvItem::Thinking(t) => {
+                t.finalize_reasoning_rounds();
+                for entry in &mut t.entries {
+                    if let ActivityEntry::Reasoning { markdown, .. } = entry
+                        && let Some(md) = markdown.as_ref()
+                    {
+                        md.update(cx, |m, cx| m.finalize_streaming(cx));
+                    }
+                }
+            }
             ConvItem::ToolCall(t) => {
                 t.streaming = false;
                 if terminal
