@@ -126,16 +126,16 @@ pub fn parse_milestones(plan_text: &str) -> Vec<Milestone> {
 }
 
 /// Detect the indent (in spaces) of the first list item in the plan text.
-/// Falls back to 0 when no list item is found.
+/// Falls back to 0 when no list item is found. Reuses [`strip_list_marker`]
+/// semantics — a digit-start line like "2026 plan" is **not** a list item
+/// because it lacks the required `.` / `)` after the digits.
 fn detect_base_indent(text: &str) -> usize {
     for line in text.lines() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
             continue;
         }
-        let first = trimmed.as_bytes()[0];
-        // Unordered marker or digit-start (potential ordered marker).
-        if matches!(first, b'-' | b'*' | b'+') || first.is_ascii_digit() {
+        if strip_list_marker(trimmed).is_some() {
             return leading_indent(line);
         }
     }
@@ -318,6 +318,17 @@ mod tests {
         assert_eq!(strip_list_marker("+ quux"), Some(" quux"));
         assert_eq!(strip_list_marker("plain text"), None);
         assert_eq!(strip_list_marker("2026 plan"), None); // digits, no marker
+    }
+
+    #[test]
+    fn parse_milestones_digit_prefix_non_list_does_not_set_base_indent() {
+        // A line starting with digits but lacking '.'/' )' (e.g. "2026 plan")
+        // must not be treated as a list item. The indented real list item
+        // below it should still be captured as a top-level milestone.
+        let plan = "2026 plan\n  - Real step\n  - Another step";
+        let ms = parse_milestones(plan);
+        let titles: Vec<&str> = ms.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(titles, vec!["Real step", "Another step"]);
     }
 
     #[test]
