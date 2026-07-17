@@ -44,6 +44,8 @@ gpui::actions!(
         UndoLastQueued,
         ToggleCockpitTasks,
         BackgroundCurrentThread,
-        CycleCollaborationMode
+        CycleCollaborationMode,
+        ToggleTurnNavigator,
+        CopySelectedTurn
     ]
 );
