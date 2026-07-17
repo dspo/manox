@@ -262,15 +262,6 @@ impl ContextRail {
         cx.notify();
     }
 
-    /// Demote any `InProgress` milestone back to `Pending` on a terminal stop.
-    pub(crate) fn demote_milestones_to_pending(&mut self, cx: &mut Context<Self>) {
-        for m in &mut self.cockpit_milestones {
-            if m.status == MilestoneStatus::InProgress {
-                m.status = MilestoneStatus::Pending;
-            }
-        }
-        cx.notify();
-    }
 
     /// Seed milestones from an approved plan. Continue-in-plan does not — the
     /// user asked for another planning round, so the prior steps no longer

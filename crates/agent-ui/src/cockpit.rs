@@ -77,17 +77,25 @@ pub struct ContextBudget {
     pub cap_tokens: u64,
 }
 
-/// Parse a plan's markdown body into milestones. Best-effort: each line that
-/// opens with an ordered (`1.` / `1)`) or unordered (`-` / `*` / `+`) list
-/// marker yields one milestone (marker stripped, remainder is the title).
-/// Non-list prose lines are dropped rather than folded in (folding mangles
-/// titles). When no list item is found, the whole plan is kept as a single
-/// milestone so the panel never regresses to empty. All milestones start
+/// Parse a plan's markdown body into milestones. Best-effort: each **top-level**
+/// list item (ordered `1.` / `1)` or unordered `-` / `*` / `+` at the shallowest
+/// indent) yields one milestone. Nested sub-items are ignored — the cockpit
+/// tracks high-level steps, not granular implementation details. Non-list prose
+/// lines are dropped. When no list item is found, the whole plan is kept as a
+/// single milestone so the panel never regresses to empty. All milestones start
 /// `Pending`; the workspace promotes the first to `InProgress` while running.
-/// Pseudo-dependency text (e.g. "needs #2") is not parsed into edges.
 pub fn parse_milestones(plan_text: &str) -> Vec<Milestone> {
     let mut out: Vec<Milestone> = Vec::new();
+    // First pass: detect the indent width of the first list item. Subsequent
+    // items at a deeper indent are nested sub-steps and skipped.
+    let base_indent = detect_base_indent(plan_text);
     for line in plan_text.lines() {
+        let indent = leading_indent(line);
+        // Only accept items at the base indent (or unindented). Deeper items
+        // are sub-steps folded into the parent milestone.
+        if indent > base_indent {
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -115,6 +123,28 @@ pub fn parse_milestones(plan_text: &str) -> Vec<Milestone> {
         });
     }
     out
+}
+
+/// Detect the indent (in spaces) of the first list item in the plan text.
+/// Falls back to 0 when no list item is found.
+fn detect_base_indent(text: &str) -> usize {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let first = trimmed.as_bytes()[0];
+        // Unordered marker or digit-start (potential ordered marker).
+        if matches!(first, b'-' | b'*' | b'+') || first.is_ascii_digit() {
+            return leading_indent(line);
+        }
+    }
+    0
+}
+
+/// Count leading space characters in a line.
+fn leading_indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
 }
 
 /// Strip a leading ordered or unordered list marker, returning the remainder.

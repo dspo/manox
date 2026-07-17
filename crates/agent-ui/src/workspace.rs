@@ -743,9 +743,8 @@ impl Workspace {
                         let store = agent::thread_store_global();
                         store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
                         this.turn_active = false;
-                        this.context_rail.update(cx, |r, cx| {
+                        this.context_rail.update(cx, |r, _cx| {
                             r.cockpit_phase = CockpitPhase::Stopped;
-                            r.demote_milestones_to_pending(cx);
                         });
                         // Clean up background reference if this thread was parked.
                         this.background_threads
@@ -847,9 +846,8 @@ impl Workspace {
                             host.clear_yields_for_thread(this, cx);
                         }
                         this.pending_inbounds.clear();
-                        this.context_rail.update(cx, |r, cx| {
+                        this.context_rail.update(cx, |r, _cx| {
                             r.cockpit_phase = CockpitPhase::Failed;
-                            r.demote_milestones_to_pending(cx);
                         });
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
