@@ -471,43 +471,35 @@ workspace-env-no-project = 暂无项目
 workspace-env-usage = 消费
 workspace-env-throughput = 穿透
 workspace-env-cache = 缓存
+workspace-env-output = 输出
 workspace-env-cache-hit-rate = 缓存 {$pct}%
 workspace-env-sources = 来源
 workspace-env-no-sources = 暂无来源
 workspace-env-git-unavailable = git 不可用
 workspace-env-git-not-a-repo = 非 git 仓库
 workspace-env-git-detached = 分离头指针
-workspace-env-git-worktree-suffix = (工作区)
 workspace-env-git-copy-branch = 复制分支名
 workspace-env-git-copy-path = 复制工作区路径
 workspace-env-git-exit-worktree = 退出工作区
 
 # ── 上下文栏（右侧边栏）────────────────────────────────────────────────
 context-rail-title = 对话信息
-context-rail-collapse = 折叠上下文栏
 
 # ── Cockpit（运行状态 / 里程碑 / 上下文预算）──────────────────────────
-# 多行运行状态块。{$elapsed} 为预格式化的时长，{$tokens} 为预格式化的 token 计数（如 "22.7k"）。阶段标签单独渲染为加粗行，位于本行之上。
-cockpit-run-status-meta = {$elapsed} · {$tokens}
-# 运行状态行的阶段标签。
-cockpit-status-idle = 空闲
+# 运行状态行的阶段标签（三状态 tag：生成中 / 思考中 / 待输入）。
 cockpit-status-thinking = 思考中
 cockpit-status-streaming = 生成中
-cockpit-status-running-tool = 执行工具
-cockpit-status-awaiting-approval = 等待审批
-cockpit-status-summarizing = 压缩上下文
-cockpit-status-stopped = 已停止
-cockpit-status-failed = 失败
+# "待输入"标签归并 idle / stopped / failed / awaiting approval。
+cockpit-status-awaiting-input = 待输入
 # 里程碑区段标题。
 cockpit-milestones-header = 计划
 # 被阻塞里程碑的尾注。{$deps} 为逗号分隔的列表。
 cockpit-blocked-by = 被 {$deps} 阻塞
 # 折叠的已完成里程碑汇总。{$count} 为数字。
 cockpit-completed-summary = +{$count} 已完成
-# 上下文预算行。{$pct} 为 0–100 的数字。
-cockpit-context-until-auto-summary = {$pct}% 距自动压缩
-cockpit-context-of-window = {$pct}% 上下文
-cockpit-context-estimate = 估算
+# 上下文预算两行。{$pct} 为剩余百分比（0–100），{$used}/{$cap} 为已用/上限的预格式化计数。
+cockpit-context-remaining-ctx = 剩余上下文大小 {$pct}% {$used} / {$cap}
+cockpit-context-remaining-body = 剩余请求体大小 {$pct}% {$used} / {$cap}
 # 里程碑区段标题末尾的隐藏/显示提示。通用——标题也可点击切换。
 cockpit-hide-tasks-hint = 点击折叠
 cockpit-show-tasks-hint = 点击展开

@@ -42,6 +42,22 @@ pub enum CockpitPhase {
     Failed,
 }
 
+/// Collapse a [`CockpitPhase`] into one of three status tags the status-row
+/// slider snaps to: `0` 生成中 (Streaming / RunningTool / Summarizing),
+/// `1` 思考中 (Thinking), `2` 待输入 (Idle / Stopped / Failed /
+/// AwaitingApproval). The slider animates the highlight between these three
+/// positions; the eight raw phases never reach the UI directly.
+pub fn cockpit_phase_tag(phase: CockpitPhase) -> u8 {
+    match phase {
+        CockpitPhase::Streaming | CockpitPhase::RunningTool | CockpitPhase::Summarizing => 0,
+        CockpitPhase::Thinking => 1,
+        CockpitPhase::Idle
+        | CockpitPhase::Stopped
+        | CockpitPhase::Failed
+        | CockpitPhase::AwaitingApproval => 2,
+    }
+}
+
 /// Estimated headroom before the context budget is exhausted. `is_estimate` is
 /// always true — provider usage is reported per-request and the trigger is a
 /// configured threshold, not a hard limit.
@@ -172,6 +188,19 @@ pub fn format_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+/// Compact MiB rendering for the request-body budget: `6m` / `1.2m`. Integer
+/// magnitudes drop the decimal so the 6 MiB cap reads as `6m` not `6.0m`.
+/// Inputs are raw bytes under the 1024² convention used by
+/// [`agent::compact::MAX_REQUEST_BODY_BYTES`].
+pub fn format_mib(bytes: usize) -> String {
+    let m = bytes as f64 / (1024.0 * 1024.0);
+    if m.fract() == 0.0 {
+        format!("{}m", m as i64)
+    } else {
+        format!("{:.1}m", m)
     }
 }
 
@@ -320,6 +349,28 @@ mod tests {
         assert_eq!(format_tokens(8_100), "8.1k");
         assert_eq!(format_tokens(22_700), "22.7k");
         assert_eq!(format_tokens(1_100_000), "1.1m");
+    }
+
+    #[test]
+    fn format_mib_cases() {
+        // 6 MiB cap (MAX_REQUEST_BODY_BYTES) renders as "6m", not "6.0m".
+        assert_eq!(format_mib(6 * 1024 * 1024), "6m");
+        // 1.2 MiB keeps one decimal.
+        assert_eq!(format_mib(1_258_291), "1.2m");
+        // Zero body → "0m".
+        assert_eq!(format_mib(0), "0m");
+    }
+
+    #[test]
+    fn cockpit_phase_tag_collapses_eight_phases_into_three() {
+        assert_eq!(cockpit_phase_tag(CockpitPhase::Streaming), 0);
+        assert_eq!(cockpit_phase_tag(CockpitPhase::RunningTool), 0);
+        assert_eq!(cockpit_phase_tag(CockpitPhase::Summarizing), 0);
+        assert_eq!(cockpit_phase_tag(CockpitPhase::Thinking), 1);
+        assert_eq!(cockpit_phase_tag(CockpitPhase::Idle), 2);
+        assert_eq!(cockpit_phase_tag(CockpitPhase::Stopped), 2);
+        assert_eq!(cockpit_phase_tag(CockpitPhase::Failed), 2);
+        assert_eq!(cockpit_phase_tag(CockpitPhase::AwaitingApproval), 2);
     }
 
     #[test]

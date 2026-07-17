@@ -2132,6 +2132,7 @@ impl Thread {
     /// Two independent trigger paths:
     /// 1. **Token threshold**: `active_tokens >= max_input * threshold_pct`
     /// 2. **Body size**: estimated request body `>= MAX_REQUEST_BODY_BYTES` (6 MiB)
+    ///
     /// Either one fires compaction.
     fn auto_compaction_target(&self) -> Option<usize> {
         if self.depth != 0 {

@@ -526,45 +526,38 @@ workspace-env-no-project = No project
 workspace-env-usage = Usage
 workspace-env-throughput = Throughput
 workspace-env-cache = Cache
+workspace-env-output = Output
 workspace-env-cache-hit-rate = cache {$pct}%
 workspace-env-sources = Sources
 workspace-env-no-sources = No sources yet
 workspace-env-git-unavailable = git unavailable
 workspace-env-git-not-a-repo = Not a git repo
 workspace-env-git-detached = detached
-workspace-env-git-worktree-suffix = (worktree)
 workspace-env-git-copy-branch = Copy branch name
 workspace-env-git-copy-path = Copy worktree path
 workspace-env-git-exit-worktree = Exit worktree
 
 # ── Context rail (right sidecar) ────────────────────────────────────────
 context-rail-title = Conversation info
-context-rail-collapse = Collapse context rail
 
 # ── Cockpit (run status / milestones / context budget) ──────────────────
-# The multi-line run-status block. {$elapsed} is a pre-formatted duration,
-# {$tokens} a pre-formatted token count (e.g. "22.7k"). The phase label is
-# rendered on its own semibold line above this meta line.
-cockpit-run-status-meta = {$elapsed} · {$tokens}
-# Phase labels for the run-status row.
-cockpit-status-idle = Idle
+# Phase labels for the run-status row (three-tag pill: streaming / thinking /
+# awaiting input).
 cockpit-status-thinking = Thinking
 cockpit-status-streaming = Streaming
-cockpit-status-running-tool = Running tool
-cockpit-status-awaiting-approval = Awaiting approval
-cockpit-status-summarizing = Summarizing context
-cockpit-status-stopped = Stopped
-cockpit-status-failed = Failed
+# The "awaiting input" tag label (collapsed state of idle/stopped/failed/
+# awaiting-approval).
+cockpit-status-awaiting-input = Awaiting input
 # Milestone section header.
 cockpit-milestones-header = Plan
 # Trailing note for a blocked milestone. {$deps} is a comma-separated list.
 cockpit-blocked-by = blocked by {$deps}
 # Collapsed summary of completed milestones. {$count} is a number.
 cockpit-completed-summary = +{$count} completed
-# Context-budget row. {$pct} is a number 0–100.
-cockpit-context-until-auto-summary = {$pct}% until auto-summary
-cockpit-context-of-window = {$pct}% of context
-cockpit-context-estimate = estimate
+# Context-budget two rows. {$pct} is the remaining percent (0–100),
+# {$used}/{$cap} are pre-formatted used/cap counts.
+cockpit-context-remaining-ctx = {$pct}% context left {$used} / {$cap}
+cockpit-context-remaining-body = {$pct}% request body left {$used} / {$cap}
 # Hide/show tasks hint appended to the milestone section header. Generic —
 # the header is also clickable to toggle.
 cockpit-hide-tasks-hint = click to collapse

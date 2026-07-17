@@ -22,20 +22,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent::compact::MIN_COMPACTION_CONTEXT_WINDOW;
 use agent::{Thread, ThreadEvent, i18n};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, Entity, Render,
     SharedString, Window, deferred, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme,
-    button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, h_flex, v_flex,
 };
 
 use crate::cockpit::{
-    CockpitPhase, Milestone, MilestoneStatus, cache_read_ratio, context_budget_pct,
+    CockpitPhase, Milestone, MilestoneStatus, cache_read_ratio, cockpit_phase_tag,
+    context_budget_pct,
 };
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
 
@@ -71,6 +69,13 @@ pub(crate) struct ContextRail {
     /// routed here by `Workspace`; the per-second thinking ticker's
     /// `cx.notify()` also refreshes the elapsed display.
     pub(crate) cockpit_phase: CockpitPhase,
+    /// Last tag index the status-row slider committed. The slider animates from
+    /// this to the freshly computed [`cockpit_phase_tag`] index whenever the
+    /// phase drifts to a different tag; `cockpit_tag_gen` bumps to force a fresh
+    /// 0→1 tween. Computed in render (not on every phase write) so the
+    /// workspace's direct `cockpit_phase = …` assignments need no hook.
+    pub(crate) cockpit_tag_prev: u8,
+    pub(crate) cockpit_tag_gen: u64,
     /// Plan steps parsed from the approved `exit_plan_mode` plan. All
     /// `Pending` outside a turn; the first is promoted to `InProgress` while
     /// the thread runs, demoted back to `Pending` on terminal stop.
@@ -119,6 +124,8 @@ impl ContextRail {
         Self {
             thread,
             cockpit_phase: CockpitPhase::Idle,
+            cockpit_tag_prev: cockpit_phase_tag(CockpitPhase::Idle),
+            cockpit_tag_gen: 0,
             cockpit_milestones: Vec::new(),
             cockpit_hide_tasks: false,
             cockpit_auto_compact_enabled: auto_compact_enabled,
@@ -151,11 +158,13 @@ impl ContextRail {
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.env_counter_state.clear();
         self.active_agents.clear();
-        self.cockpit_phase = if running {
+        let new_phase = if running {
             CockpitPhase::Streaming
         } else {
             CockpitPhase::Idle
         };
+        self.cockpit_phase = new_phase;
+        self.cockpit_tag_prev = cockpit_phase_tag(new_phase);
         self.cockpit_milestones = Vec::new();
         self.git_change_stats = None;
         self.git_branch_display = None;
@@ -303,23 +312,11 @@ impl ContextRail {
                     .blur_radius(px(10.)),
             ])
             .child(
-                h_flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        gpui::div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child(i18n::t("context-rail-title")),
-                    )
-                    .child(
-                        Button::new("context-rail-collapse")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::PanelRightClose)
-                            .tooltip(i18n::t("context-rail-collapse")),
-                    ),
+                gpui::div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+                    .child(i18n::t("context-rail-title")),
             )
             .child(self.render_cockpit_status_row(theme, cx))
             .children(self.render_active_agents_row(theme))
@@ -329,8 +326,7 @@ impl ContextRail {
                 None,
                 theme,
             ))
-            .child(self.render_changes_row(&project, theme))
-            .child(self.render_branch_row(&project, theme, cx))
+            .child(self.render_branch_block(&project, theme, cx))
             .child(self.render_usage_section(theme, cx, per_model))
             .child(self.render_cockpit_context_budget(theme, cx))
             .child(self.render_cockpit_milestones(theme, cx))
@@ -355,20 +351,24 @@ impl ContextRail {
             .into_any_element()
     }
 
-    /// Per-model token usage as a two-row tree: `├── 穿透` (input / output) and
-    /// `└── 缓存` (cache create / cache read), each with `↑↓` animated counters.
-    /// The throughput / cache split keeps the cache-read share legible as a
-    /// branch rather than burying it among four flat rows. A cache-hit ratio
-    /// rides beside the model name when the model has any cache-readable input.
-    /// Counter animation state is diffed and rebuilt here so the per-cell `gen`
-    /// bumps on every value delta (see `env_counter_state`).
+    /// Per-model token usage as a two-row tree: `├── 穿透 ↑{in} 缓存 ↑{ccr}`
+    /// (input + cache-read) and `└── 输出 ↓{out}`. Cache creation is no longer
+    /// surfaced — cache-read is the only "reused input" metric. A cache-hit
+    /// ratio rides beside the model name when the model has any cache-readable
+    /// input. The header row carries the conversation's cumulative token total
+    /// (moved here from the run-status row) right-aligned. Counter animation
+    /// state is diffed and rebuilt here so the per-cell `gen` bumps on every
+    /// value delta (see `env_counter_state`).
     fn render_usage_section(
         &mut self,
         theme: &Theme,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
         per_model: HashMap<String, agent::language_model::TokenUsage>,
     ) -> AnyElement {
         let muted = theme.muted_foreground;
+        let total = crate::cockpit::format_tokens(
+            self.thread.read(cx).cumulative_token_usage().total_tokens(),
+        );
         let mut model_rows: Vec<_> = per_model
             .into_iter()
             .filter(|(_, u)| u.total_tokens() > 0)
@@ -377,10 +377,11 @@ impl ContextRail {
 
         let throughput_label = i18n::t("workspace-env-throughput");
         let cache_label = i18n::t("workspace-env-cache");
+        let output_label = i18n::t("workspace-env-output");
 
         let mut new_state: HashMap<String, (u64, u64)> = HashMap::new();
         // Each model block carries: model id text + the two tree rows
-        // (throughput, cache). The capture-based build keeps the closure
+        // (throughput, output). The capture-based build keeps the closure
         // machinery out of the outer builder.
         let mut model_blocks: Vec<(String, Option<SharedString>, gpui::Div, gpui::Div)> =
             Vec::with_capacity(model_rows.len());
@@ -393,13 +394,15 @@ impl ContextRail {
                 let pct = (r * 100.0).round() as i64;
                 i18n::t_str("workspace-env-cache-hit-rate", &[("pct", &pct.to_string())])
             });
-            let cells: [(&str, u64); 4] = [
+            // Three cells: input (穿透 ↑), output (输出 ↓), cache_read (缓存 ↑).
+            // Cache creation is dropped — cache-read is the only cache metric
+            // that reads as "reused input" to the user.
+            let cells: [(&str, u64); 3] = [
                 ("in", usage.input_tokens),
                 ("out", usage.output_tokens),
-                ("cache_create", usage.cache_creation_input_tokens),
                 ("cache_read", usage.cache_read_input_tokens),
             ];
-            let mut from_to_gen: [(u64, u64, u64); 4] = [(0, 0, 0); 4];
+            let mut from_to_gen: [(u64, u64, u64); 3] = [(0, 0, 0); 3];
             for (i, (field, value)) in cells.iter().enumerate() {
                 let cell_key = format!("{model_name}|{field}");
                 let (old_value, new_gen) = match self.env_counter_state.get(&cell_key) {
@@ -412,8 +415,7 @@ impl ContextRail {
             }
             let (in_f, in_t, in_g) = from_to_gen[0];
             let (out_f, out_t, out_g) = from_to_gen[1];
-            let (cce_f, cce_t, cce_g) = from_to_gen[2];
-            let (ccr_f, ccr_t, ccr_g) = from_to_gen[3];
+            let (ccr_f, ccr_t, ccr_g) = from_to_gen[2];
 
             // Tree prefix glyph (`├── ` / `└── `) painted slightly muted so it
             // reads as chrome rather than data.
@@ -432,18 +434,18 @@ impl ContextRail {
                 .child(branch_prefix("├── "))
                 .child(throughput_label.clone())
                 .child(counter_animated("↑", in_f, in_t, "in", in_g))
-                .child(counter_animated("↓", out_f, out_t, "out", out_g));
-            let cache_row = h_flex()
+                .child(cache_label.clone())
+                .child(counter_animated("↑", ccr_f, ccr_t, "cache_read", ccr_g));
+            let output_row = h_flex()
                 .pl(px(12.))
                 .gap_1()
                 .items_center()
                 .text_xs()
                 .text_color(muted)
                 .child(branch_prefix("└── "))
-                .child(cache_label.clone())
-                .child(counter_animated("+", cce_f, cce_t, "cache_create", cce_g))
-                .child(counter_animated("=", ccr_f, ccr_t, "cache_read", ccr_g));
-            model_blocks.push((model_display, hit_rate, throughput_row, cache_row));
+                .child(output_label.clone())
+                .child(counter_animated("↓", out_f, out_t, "out", out_g));
+            model_blocks.push((model_display, hit_rate, throughput_row, output_row));
         }
         self.env_counter_state = new_state;
 
@@ -462,10 +464,16 @@ impl ContextRail {
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(i18n::t("workspace-env-usage")),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(total)),
                     ),
             )
             .children(model_blocks.into_iter().map(
-                |(model_display, hit_rate, throughput_row, cache_row)| {
+                |(model_display, hit_rate, throughput_row, output_row)| {
                     v_flex()
                         .w_full()
                         .gap_0p5()
@@ -491,46 +499,33 @@ impl ContextRail {
                                 })),
                         )
                         .child(throughput_row)
-                        .child(cache_row)
+                        .child(output_row)
                         .into_any_element()
                 },
             ))
             .into_any_element()
     }
 
-    /// Run-status block: a multi-line card so a long phase / tool title is
-    /// not cramped into one truncated line. Line 1 carries the phase label
-    /// (semibold) + elapsed + cumulative tokens; line 2 is the elapsed/tokens
-    /// meta in xs muted; line 3 (when a tool is running) shows the tool title
-    /// in xs muted truncate. The elapsed still refreshes per-second via the
-    /// thinking ticker's `cx.notify()`.
-    /// Changes row: `+added` (green) / `-deleted` (red) plus an untracked
-    /// count badge when there are untracked files. Before the first git
-    /// refresh lands (or when no project is bound) the trailing slot shows
-    /// `--` so the row keeps its height instead of flickering.
-    fn render_changes_row(&self, project: &Option<PathBuf>, theme: &Theme) -> AnyElement {
+    /// Change counts `+added` / `-deleted` plus an untracked badge, themed
+    /// directly with no label or icon. Rides as the branch row's trailing
+    /// element (right-aligned). `--` / no-project is the placeholder before
+    /// the first git refresh lands.
+    fn render_changes_trailing(&self, project: &Option<PathBuf>, theme: &Theme) -> AnyElement {
         let Some(stats) = self.git_change_stats.as_ref() else {
             let trailing = if project.is_some() {
                 SharedString::from("--")
             } else {
                 i18n::t("workspace-env-no-project")
             };
-            return env_row(
-                IconName::Frame,
-                i18n::t("workspace-env-changes"),
-                Some(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(trailing)
-                        .into_any_element(),
-                ),
-                theme,
-            );
+            return gpui::div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(trailing)
+                .into_any_element();
         };
         let added = format!("+{}", stats.added);
         let deleted = format!("-{}", stats.deleted);
-        let trailing = h_flex()
+        h_flex()
             .gap_1()
             .text_xs()
             .child(gpui::div().text_color(theme.success).child(added))
@@ -543,30 +538,29 @@ impl ContextRail {
                 )
             } else {
                 None
-            });
-        env_row(
-            IconName::Frame,
-            i18n::t("workspace-env-changes"),
-            Some(trailing.into_any_element()),
-            theme,
-        )
+            })
+            .into_any_element()
     }
 
-    /// Branch row. Renders the resolved branch (or detached short sha, or a
-    /// not-a-repo label) with a `(worktree)` suffix when the thread is inside a
-    /// git worktree. Clicking opens a context menu to copy the branch name /
-    /// worktree path or to exit the worktree — it never exits directly, so a
-    /// stray click cannot destroy the isolation context.
-    fn render_branch_row(
+    /// Branch block: (1) the worktree directory basename in foreground, shown
+    /// only while the thread is inside a worktree; (2) the branch row —
+    /// resolved branch or detached sha (+ "(detached)") as the label with the
+    /// changes counts as its right-aligned trailing. The branch line is the
+    /// clickable affordance for the copy / exit-worktree context menu — it
+    /// never exits directly, so a stray click cannot destroy the isolation
+    /// context.
+    fn render_branch_block(
         &mut self,
         project: &Option<PathBuf>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let display = self.git_branch_display.clone();
-        let is_worktree = self.thread.read(cx).worktree().is_some();
+        let worktree_path = self.thread.read(cx).worktree().map(|w| w.path.clone());
 
-        let label: SharedString = match &display {
+        // Branch label (line 2): branch / detached sha + (detached). No
+        // worktree suffix — that lives on its own line above when present.
+        let branch_label: SharedString = match &display {
             Some(d) if d.is_no_repo() => i18n::t("workspace-env-git-not-a-repo"),
             Some(d) => {
                 let mut s = d
@@ -575,21 +569,11 @@ impl ContextRail {
                     .or_else(|| d.detached_sha.clone())
                     .map(SharedString::from)
                     .unwrap_or_else(|| i18n::t("workspace-env-git-unavailable"));
-                // A detached HEAD shows the short sha plus a muted "(detached)"
-                // hint so the row reads honestly rather than looking like a
-                // branch name.
                 if d.branch.is_none() && d.detached_sha.is_some() {
                     s = SharedString::from(format!(
                         "{} {}",
                         s,
                         i18n::t("workspace-env-git-detached")
-                    ));
-                }
-                if d.is_worktree || is_worktree {
-                    s = SharedString::from(format!(
-                        "{} {}",
-                        s,
-                        i18n::t("workspace-env-git-worktree-suffix")
                     ));
                 }
                 s
@@ -603,11 +587,13 @@ impl ContextRail {
             }
         };
 
+        let changes_line = self.render_changes_trailing(project, theme);
+
         let menu_open = self.branch_menu.is_some();
         let trigger = env_row_clickable(
             IconName::Github,
-            label,
-            None,
+            branch_label,
+            Some(changes_line),
             theme,
             menu_open,
             cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -695,8 +681,25 @@ impl ContextRail {
             }),
         );
 
+        let mut block = v_flex().w_full().gap_0p5();
+        if let Some(path) = worktree_path {
+            let basename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            block = block.child(
+                gpui::div()
+                    .w_full()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme.foreground)
+                    .child(SharedString::from(basename)),
+            );
+        }
+        block = block.child(trigger);
+
         if !menu_open {
-            return trigger;
+            return block.into_any_element();
         }
         let menu = self
             .branch_menu
@@ -704,10 +707,10 @@ impl ContextRail {
             .expect("branch_menu exists when open");
         // `deferred` + `with_priority(1)` paints the dropdown after the whole
         // rail panel tree, so it floats above the usage/budget/milestone rows
-        // that follow the branch row instead of being overpainted by them.
+        // that follow the branch block instead of being overpainted by them.
         gpui::div()
             .relative()
-            .child(trigger)
+            .child(block)
             .child(
                 deferred(
                     gpui::div()
@@ -752,31 +755,11 @@ impl ContextRail {
         )
     }
 
-    /// Run-status row: phase label + elapsed (per-second refresh via the
-    /// thinking ticker) + cumulative token count. Sits directly under the rail
-    /// title so the current phase is the first thing the eye lands on.
-    fn render_cockpit_status_row(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let phase_key = match self.cockpit_phase {
-            CockpitPhase::Idle => "cockpit-status-idle",
-            CockpitPhase::Thinking => "cockpit-status-thinking",
-            CockpitPhase::Streaming => "cockpit-status-streaming",
-            CockpitPhase::RunningTool => "cockpit-status-running-tool",
-            CockpitPhase::AwaitingApproval => "cockpit-status-awaiting-approval",
-            CockpitPhase::Summarizing => "cockpit-status-summarizing",
-            CockpitPhase::Stopped => "cockpit-status-stopped",
-            CockpitPhase::Failed => "cockpit-status-failed",
-        };
-        let phase_label = i18n::t(phase_key).to_string();
-        let thread = self.thread.read(cx);
-        let elapsed = thread
-            .turn_started_at()
-            .map(|t| crate::cockpit::format_elapsed(t.elapsed()))
-            .unwrap_or_else(|| "0s".to_string());
-        let tokens = crate::cockpit::format_tokens(thread.cumulative_token_usage().total_tokens());
-        let meta = i18n::t_str(
-            "cockpit-run-status-meta",
-            &[("elapsed", elapsed.as_str()), ("tokens", tokens.as_str())],
-        );
+    /// Run-status row: a sliding three-tag pill (生成中 / 思考中 / 待输入) +
+    /// elapsed meta (per-second refresh via the thinking ticker). The
+    /// cumulative token total moved to the usage row's trailing slot. Sits
+    /// directly under the rail title.
+    fn render_cockpit_status_row(&mut self, theme: &Theme, _cx: &mut Context<Self>) -> AnyElement {
         let icon = match self.cockpit_phase {
             CockpitPhase::Thinking | CockpitPhase::Streaming | CockpitPhase::Summarizing => {
                 IconName::LoaderCircle
@@ -787,15 +770,90 @@ impl ContextRail {
             CockpitPhase::Failed => IconName::CircleX,
             CockpitPhase::Idle => IconName::Dash,
         };
-        cockpit_status_block(icon, phase_label.into(), meta, theme)
+        cockpit_status_block(icon, self.render_cockpit_phase_tag(theme), theme)
     }
 
-    /// Context-budget row. Reads the thread's cumulative usage so the display
-    /// reflects the conversation's token spend and stays stable across turn
-    /// warm-up — never a "waiting" placeholder. Hidden (no row) only when the
-    /// thread has no model with a known window. The trailing element renders
-    /// the explicit `current / cap` token counts so the user can read the
-    /// absolute numbers behind the percentage.
+    /// Sliding three-tag pill: 生成中 / 思考中 / 待输入. The highlight block
+    /// animates from the previously committed tag index to the freshly
+    /// computed [`cockpit_phase_tag`] index over 240ms with `ease_out_quint`;
+    /// `cockpit_tag_gen` bumps on every tag change so gpui fires a fresh tween,
+    /// while a stable tag reuses the cached end-state and renders statically.
+    fn render_cockpit_phase_tag(&mut self, theme: &Theme) -> AnyElement {
+        let cur = cockpit_phase_tag(self.cockpit_phase);
+        let prev = self.cockpit_tag_prev;
+        if cur != prev {
+            self.cockpit_tag_gen = self.cockpit_tag_gen.wrapping_add(1);
+        }
+        let tag_gen = self.cockpit_tag_gen;
+        self.cockpit_tag_prev = cur;
+
+        const SLOT_W: f32 = 52.;
+        const PILL_H: f32 = 22.;
+        let pill_w = SLOT_W * 3.0;
+        let from_x = prev as f64 * SLOT_W as f64;
+        let to_x = cur as f64 * SLOT_W as f64;
+        let anim_id = format!("cockpit-tag-{tag_gen}");
+
+        let labels = [
+            i18n::t("cockpit-status-streaming"),
+            i18n::t("cockpit-status-thinking"),
+            i18n::t("cockpit-status-awaiting-input"),
+        ];
+
+        let muted = theme.muted_foreground;
+        let fg = theme.foreground;
+        let accent = theme.accent;
+        let border = theme.border;
+
+        let mut slots = h_flex().w(px(pill_w)).h(px(PILL_H)).relative();
+        for (i, label) in labels.iter().enumerate() {
+            let color = if i as u8 == cur { fg } else { muted };
+            slots = slots.child(
+                gpui::div()
+                    .w(px(SLOT_W))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(color)
+                    .child(label.clone()),
+            );
+        }
+
+        let highlight = gpui::div()
+            .absolute()
+            .top_0()
+            .h_full()
+            .w(px(SLOT_W))
+            .rounded(px(6.))
+            .bg(accent.opacity(0.15))
+            .border_1()
+            .border_color(border)
+            .with_animation(
+                anim_id,
+                Animation::new(Duration::from_millis(240)).with_easing(ease_out_quint()),
+                move |el, t| {
+                    let x = from_x + (to_x - from_x) * t as f64;
+                    el.left(px(x as f32))
+                },
+            );
+
+        gpui::div()
+            .relative()
+            .w(px(pill_w))
+            .h(px(PILL_H))
+            .child(highlight)
+            .child(slots)
+            .into_any_element()
+    }
+
+    /// Context-budget block — two lines: (1) remaining context-window budget
+    /// (tokens, against the auto-compact trigger or raw window), omitted when
+    /// the thread has no model / zero window; (2) remaining request-body budget
+    /// (bytes, against `MAX_REQUEST_BODY_BYTES`), independent of the model so
+    /// it shows whenever there are messages. The cumulative token total moved
+    /// to the usage row; this block is the two remaining percentages.
     fn render_cockpit_context_budget(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let thread = self.thread.read(cx);
         let max_input = thread.model().map(|m| m.max_token_count()).unwrap_or(0);
@@ -805,46 +863,89 @@ impl ContextRail {
             self.cockpit_auto_compact_enabled,
             self.cockpit_auto_compact_threshold,
         );
-        let Some(budget) = budget else {
-            // No model / zero window: nothing honest to show, so omit the row
-            // rather than invent a placeholder.
-            return gpui::div().into_any_element();
-        };
-        let pct = (budget.remaining_pct.round() as i64).clamp(0, 100);
-        let key = if self.cockpit_auto_compact_enabled && max_input >= MIN_COMPACTION_CONTEXT_WINDOW
-        {
-            "cockpit-context-until-auto-summary"
-        } else {
-            "cockpit-context-of-window"
-        };
-        let label = i18n::t_str(key, &[("pct", &pct.to_string())]);
-        let near = budget.remaining_pct <= 10.0;
-        let color = if near {
-            theme.warning
-        } else {
-            theme.muted_foreground
-        };
-        let current = crate::cockpit::format_tokens(budget.active_tokens);
-        let cap = crate::cockpit::format_tokens(budget.cap_tokens);
-        let ratio = format!("{current} / {cap}");
-        env_row(
-            IconName::BatteryFull,
-            label,
-            Some(
+        let muted = theme.muted_foreground;
+        let warn = theme.warning;
+
+        // Both budget lines share a fixed-width leading slot so the label
+        // text starts at the same x regardless of whether the slot holds an
+        // icon (context line) or is empty (request-body line).
+        const LEAD_W: f32 = 14.;
+
+        let mut rows = v_flex().w_full().gap_0p5();
+
+        // Line 1: context-window budget (tokens). Omitted when the thread has
+        // no model / zero window — no honest percentage to show.
+        if let Some(budget) = budget {
+            let pct = (budget.remaining_pct.round() as i64).clamp(0, 100);
+            let used = crate::cockpit::format_tokens(budget.active_tokens);
+            let cap = crate::cockpit::format_tokens(budget.cap_tokens);
+            let near = budget.remaining_pct <= 10.0;
+            let color = if near { warn } else { muted };
+            rows = rows.child(
                 h_flex()
-                    .gap_1()
-                    .text_xs()
-                    .text_color(color)
-                    .child(gpui::div().child(ratio))
+                    .items_center()
+                    .gap_2()
                     .child(
                         gpui::div()
-                            .text_color(theme.muted_foreground.opacity(0.7))
-                            .child(i18n::t("cockpit-context-estimate")),
+                            .w(px(LEAD_W))
+                            .h(px(LEAD_W))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Icon::new(IconName::BatteryFull).xsmall().text_color(muted)),
                     )
-                    .into_any_element(),
-            ),
-            theme,
-        )
+                    .child(
+                        gpui::div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(color)
+                            .child(i18n::t_str(
+                                "cockpit-context-remaining-ctx",
+                                &[("pct", &pct.to_string()), ("used", &used), ("cap", &cap)],
+                            )),
+                    ),
+            );
+        }
+
+        // Line 2: request-body budget (bytes). Fires compaction before the
+        // serialized body exceeds the provider limit; independent of the model
+        // window so it renders whenever the thread has any messages.
+        let body = agent::compact::estimate_request_body_bytes(thread.messages());
+        let body_cap = agent::compact::MAX_REQUEST_BODY_BYTES;
+        let body_pct = if body_cap > 0 {
+            (body_cap.saturating_sub(body) as f64 / body_cap as f64 * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let body_pct_i = (body_pct.round() as i64).clamp(0, 100);
+        let body_used = crate::cockpit::format_mib(body);
+        let body_cap_str = crate::cockpit::format_mib(body_cap);
+        let body_near = body_pct <= 10.0;
+        let body_color = if body_near { warn } else { muted };
+        rows = rows.child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(gpui::div().w(px(LEAD_W)).h(px(LEAD_W)))
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(body_color)
+                        .child(i18n::t_str(
+                            "cockpit-context-remaining-body",
+                            &[
+                                ("pct", &body_pct_i.to_string()),
+                                ("used", &body_used),
+                                ("cap", &body_cap_str),
+                            ],
+                        )),
+                ),
+        );
+
+        rows.into_any_element()
     }
 
     /// Milestone section: the parsed plan steps with status glyphs. Collapsible
@@ -1024,41 +1125,18 @@ fn env_row(
         .into_any_element()
 }
 
-/// Multi-line run-status block. Replaces the single-line `env_row` the status
-/// row used to occupy: phase on a semibold line, an xs muted meta line
-/// (elapsed + tokens). The tool title is intentionally omitted — a long title
-/// never fits one line, so the row stays a phase + meta summary only. The icon
-/// anchors the left column.
-fn cockpit_status_block(
-    icon: IconName,
-    phase: SharedString,
-    meta: SharedString,
-    theme: &Theme,
-) -> AnyElement {
+/// Multi-line run-status block. The phase slot is now an arbitrary element
+/// (the sliding three-tag pill) rather than a plain label, so the caller owns
+/// Status block: a leading xs icon plus the phase element (the sliding
+/// three-tag pill), vertically centered on a single baseline like the other
+/// rail rows.
+fn cockpit_status_block(icon: IconName, phase: AnyElement, theme: &Theme) -> AnyElement {
     h_flex()
         .w_full()
-        .items_start()
+        .items_center()
         .gap_2()
         .child(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
-        .child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_0p5()
-                .child(
-                    gpui::div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(phase),
-                )
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(meta),
-                ),
-        )
+        .child(v_flex().flex_1().min_w_0().child(phase))
         .into_any_element()
 }
 
