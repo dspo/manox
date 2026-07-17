@@ -2128,17 +2128,33 @@ impl Thread {
     /// region, or the threshold has not been crossed. Sub-agents never
     /// auto-compact — a delegated sub-thread should not silently rewrite its
     /// own context under the parent's nose.
+    ///
+    /// Two independent trigger paths:
+    /// 1. **Token threshold**: `active_tokens >= max_input * threshold_pct`
+    /// 2. **Body size**: estimated request body `>= MAX_REQUEST_BODY_BYTES` (6 MiB)
+    /// Either one fires compaction.
     fn auto_compaction_target(&self) -> Option<usize> {
         if self.depth != 0 {
             return None;
         }
-        let model = self.model.as_ref()?;
         let settings = crate::settings::load();
+        if !settings.auto_compact.enabled {
+            return None;
+        }
+        // Body size trigger: fires regardless of the token threshold or
+        // model window size. Providers reject oversized request bodies, so
+        // compaction is mandatory even on models with a small context window
+        // (where the token-based path would bail on MIN_COMPACTION_CONTEXT_WINDOW).
+        let body_bytes = crate::compact::estimate_request_body_bytes(&self.messages);
+        if body_bytes >= crate::compact::MAX_REQUEST_BODY_BYTES {
+            return crate::compact::forced_compaction_target_ix(&self.messages);
+        }
+        let model = self.model.as_ref()?;
         // Claude Code parity: an explicit auto-compact window from the
         // provider config's `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var drives
         // both the window and an 80% trigger threshold. Without it, fall back
         // to the model's full `max_token_count` at the user's settings
-        // threshold (default 0.9). `settings.auto_compact.enabled` still gates
+        // threshold (default 0.8). `settings.auto_compact.enabled` still gates
         // the whole mechanism.
         let (max_input, threshold) = match model.auto_compact_window() {
             Some(window) => (window, crate::compact::CLAUDE_CODE_AUTO_COMPACT_THRESHOLD),

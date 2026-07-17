@@ -42,7 +42,7 @@ pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
 /// Trigger fraction of the auto-compact window when a model carries an explicit
 /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env override (Claude Code parity). The
 /// override's window replaces `max_token_count`; absent the override, the
-/// user's `settings.auto_compact.threshold` (default 0.9) still applies.
+/// user's `settings.auto_compact.threshold` (default 0.8) still applies.
 pub const CLAUDE_CODE_AUTO_COMPACT_THRESHOLD: f64 = 0.8;
 
 /// Byte budget for the recent user-message tail retained verbatim alongside a
@@ -50,6 +50,15 @@ pub const CLAUDE_CODE_AUTO_COMPACT_THRESHOLD: f64 = 0.8;
 /// survive the cut. Only `Text` user messages count toward the budget; tool
 /// results and prior compactions are never retained raw.
 const RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
+
+/// Hard cap on the estimated request body size (in bytes) before
+/// auto-compaction fires regardless of the token threshold. Providers reject
+/// requests whose serialized body exceeds their limit; this triggers a
+/// compaction pass before that happens. 6 MiB is a conservative estimate —
+/// the actual wire size is larger than raw text (JSON framing, tool specs,
+/// system prompt) so firing at 6 MiB of text keeps the real body well under
+/// a typical 10 MiB provider limit.
+pub const MAX_REQUEST_BODY_BYTES: usize = 6 * 1024 * 1024;
 
 /// Tokens that count toward the context limit for compaction triggering:
 /// input (cache-creation + cache-read + uncached) plus output. Cache-read
@@ -241,6 +250,23 @@ fn user_message_byte_len(msg: &LanguageModelRequestMessage) -> usize {
         .iter()
         .filter_map(|c| c.to_str())
         .map(|s| s.len())
+        .sum()
+}
+
+/// Estimate the request body size in bytes by summing all messages' text content.
+/// This is a rough approximation — the actual wire size includes JSON framing,
+/// tool specs, and system prompt overhead, so the real body is larger than
+/// this estimate. Used to trigger compaction before hitting provider limits.
+pub fn estimate_request_body_bytes(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .map(|c| {
+            model_facing_content(c)
+                .to_str()
+                .map(|s| s.len())
+                .unwrap_or(0)
+        })
         .sum()
 }
 
