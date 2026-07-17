@@ -54,7 +54,7 @@ crates/
 
 - `workspace.rs` — 顶层视图，持 `Entity<Thread>` + `Entity<Sidebar>` + `ConversationState`，订阅 `ThreadEvent`。
 - `conversation.rs` — `ConversationState`，从 `ThreadEvent` 增量构建扁平 `ConvItem` 列表。`rebuild_from_messages` 从规范消息列表重建。
-- `views/` — `sidebar.rs`（历史 Threads）、`message.rs`（Markdown 渲染 + Reasoning 折叠 + ToolCall/AgentTask 卡片）、`composer_menu.rs`（`+`/`⁄` 弹出菜单）、`settings/`、`plugin_manager.rs`、`title_menu.rs`、`outline.rs`。
+- `views/` — `sidebar.rs`（历史 Threads）、`message.rs`（Markdown 渲染 + Reasoning 折叠 + ToolCall/AgentTask 卡片）、`composer_menu.rs`（`+`/`⁄` 弹出菜单）、`settings/`、`plugin_manager.rs`、`title_menu.rs`。
 - `dispatch.rs` / `slash_command.rs` — action 桥接 + `/name [args]` 解析注册。
 
 ### terminal / terminal-ui / manox

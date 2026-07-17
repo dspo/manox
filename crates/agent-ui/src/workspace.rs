@@ -337,7 +337,7 @@ pub struct Workspace {
     /// shifts the viewport — the "messages fly off the top" failure mode is
     /// structurally gone, not patched over. `child_bounds` (populated from the
     /// div's direct children) still drives `bounds_for_item` / `scroll_to_item`
-    /// for the outline visibility + click-to-reveal.
+    /// for click-to-reveal.
     message_scroll: ScrollHandle,
     /// Tail-follow pin. Driven each render from the live scroll offset: pinned
     /// to the bottom means following (re-pin to bottom while content streams
@@ -404,11 +404,6 @@ pub struct Workspace {
     /// time" model; switching away parks the session (its terminal keeps
     /// running) rather than killing it.
     active_external: Option<String>,
-    /// Ordinal of the outline tick currently under the cursor, if any. Drives
-    /// the "wave" hover effect: the hovered tick and its neighbors lengthen and
-    /// spread apart, tapering off with distance. `None` when the cursor is off
-    /// the rail.
-    outline_hover: Option<usize>,
     /// Generation counter for the debounced git-status refresh. Bumped on every
     /// refresh trigger (thread attach, terminal stop, enter/exit worktree) so
     /// a prior in-flight refresh self-cancels instead of overwriting newer
@@ -447,22 +442,6 @@ const SIDEBAR_MAX_WIDTH: f32 = 480.;
 const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the main column width when the editor pane is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
-
-/// User-turn outline rail geometry. The rail is a fixed-width gutter between
-/// the sidebar divider and the message list; every tick is the same length so
-/// it reads as a pure navigation anchor, not a length-encoded minimap.
-const OUTLINE_RAIL_WIDTH: f32 = 40.;
-const OUTLINE_TICK_WIDTH: f32 = 16.;
-const OUTLINE_TICK_HEIGHT: f32 = 2.;
-/// Vertical gap between ticks.
-const OUTLINE_TICK_GAP: f32 = 8.;
-/// Hover card max width; the summary wraps within it.
-const OUTLINE_CARD_WIDTH: f32 = 260.;
-/// Wave hover displacement: at the crest a tick grows this much wider and its
-/// row this much taller, tapering to zero at the wave's edge. Neighbors bulge
-/// out around the cursor like the outline rail.
-const OUTLINE_WAVE_EXTRA_WIDTH: f32 = 12.;
-const OUTLINE_WAVE_EXTRA_GAP: f32 = 6.;
 
 /// Settings overlay slide duration. The enter animation glides the panel in
 /// from the left edge, the exit animation glides it out to the right.
@@ -599,7 +578,6 @@ impl Workspace {
             context_rail,
             external_sessions: Vec::new(),
             active_external: None,
-            outline_hover: None,
             git_status_gen: 0,
         };
         ws.thread_sub = Some(ws.subscribe_thread(cx));
@@ -935,181 +913,6 @@ impl Workspace {
                 s.set_unread(&id, true, cx);
             });
         })
-    }
-
-    /// The outline rail: one equal-length tick per user turn,
-    /// mounted between the sidebar divider and the message list. Ticks for the
-    /// turns currently on screen are highlighted; hovering a tick reveals a
-    /// summary card and clicking it scrolls that turn into view.
-    ///
-    /// Returns `None` when there are no user turns yet, so the first screen
-    /// stays clean.
-    fn render_outline(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use crate::views::outline;
-
-        let turns = outline::user_turns_from(
-            self.conversation
-                .read(cx)
-                .items()
-                .iter()
-                .map(|e| e.read(cx).kind()),
-        );
-        if turns.is_empty() {
-            return None;
-        }
-        let total = self.conversation.read(cx).items().len();
-        // Which turn is on screen is queried live from the scroll handle each
-        // frame, so programmatic scrolls (click-to-reveal) highlight correctly,
-        // not just user wheel scrolls.
-        //
-        // Tail-follow is a special case: while pinned to the bottom the offset
-        // sits at the max, which makes the positional queries below meaningless.
-        // The viewport then shows the end of the conversation, so the last turn
-        // is the visible one.
-        let following = self.auto_follow;
-        let last_ordinal = turns.len() - 1;
-        // Fallback for the pre-layout frame, before the scroll handle has
-        // captured item bounds to answer positional queries.
-        let fallback_top = self.message_scroll.logical_scroll_top().0;
-        let fallback_at_tail = fallback_top >= total;
-        // Viewport box in window coordinates. `bounds_for_item` already returns
-        // window-coordinate (scroll-adjusted) bounds, so a span is off-screen
-        // when its last item's bottom is above the viewport top, or its first
-        // item's top is below the viewport bottom — no manual offset needed.
-        let vp = self.message_scroll.bounds();
-
-        let hovered = self.outline_hover;
-        let ticks = turns.iter().map(|turn| {
-            let span = outline::turn_span(&turns, turn.ordinal, total);
-            // A turn is visible unless its whole span sits above or below the
-            // viewport. `bounds_for_item` returns `None` before layout; then
-            // fall back to the logical scroll top intersecting the span.
-            let last = span.end.saturating_sub(1);
-            let active = if following || fallback_at_tail {
-                turn.ordinal == last_ordinal
-            } else {
-                match (
-                    self.message_scroll.bounds_for_item(last),
-                    self.message_scroll.bounds_for_item(span.start),
-                ) {
-                    // `last`'s bottom above the viewport top ⇒ the whole span
-                    // sits above; `span.start`'s top at/below the viewport
-                    // bottom ⇒ the whole span sits below. Visible otherwise.
-                    (Some(lb), Some(sb)) => {
-                        let above = lb.bottom() <= vp.top();
-                        let below = sb.top() >= vp.bottom();
-                        !above && !below
-                    }
-                    // Pre-layout (bounds not captured yet): fall back to the
-                    // top visible item intersecting the span.
-                    _ => span.contains(&fallback_top),
-                }
-            };
-            let target = turn.item_ix;
-            let ordinal = turn.ordinal;
-            let has_summary = !turn.summary.is_empty();
-
-            // Wave displacement: the hovered tick and its neighbors grow wider
-            // and their rows taller, so the rail bulges around the cursor.
-            let weight = outline::wave_weight(ordinal, hovered);
-            let tick_width = OUTLINE_TICK_WIDTH + weight * OUTLINE_WAVE_EXTRA_WIDTH;
-            let row_height =
-                OUTLINE_TICK_HEIGHT + OUTLINE_TICK_GAP + weight * OUTLINE_WAVE_EXTRA_GAP;
-
-            // On-screen turns read at full strength; the wave lifts the rest
-            // toward the foreground as the cursor nears them.
-            let tick_color = if active {
-                theme.foreground.opacity(0.8)
-            } else {
-                theme.muted_foreground.opacity(0.35 + weight * 0.45)
-            };
-            let tick = gpui::div()
-                .w(px(tick_width))
-                .h(px(OUTLINE_TICK_HEIGHT))
-                .rounded_full()
-                .bg(tick_color);
-
-            // The card is driven by `outline_hover`, not `group_hover`: every
-            // hover fires `on_hover` → re-render, which rebuilds the tree and
-            // resets any `group_hover` state, so a group-driven card would flash
-            // and vanish. Keying off the persisted hover ordinal keeps it up.
-            let card = (has_summary && hovered == Some(ordinal)).then(|| {
-                // `deferred` paints the card after the whole workspace tree, so
-                // it floats above the message list instead of being occluded by
-                // the chat bubbles it overlaps.
-                //
-                // A fixed width is required: an absolutely-positioned box with
-                // only `max_w` collapses to its min-content width, which for CJK
-                // text is one glyph per line. `w` + `flex_shrink_0` pins it so
-                // the summary wraps at the card edge, not at every character.
-                deferred(
-                    gpui::div()
-                        .absolute()
-                        .left_full()
-                        .ml_2()
-                        .w(px(OUTLINE_CARD_WIDTH))
-                        .flex_shrink_0()
-                        .px_3()
-                        .py_2()
-                        .rounded(theme.radius)
-                        .bg(theme.popover)
-                        .border_1()
-                        .border_color(theme.border)
-                        .text_color(theme.popover_foreground)
-                        .text_sm()
-                        .shadow_md()
-                        .child(turn.summary.clone()),
-                )
-                .with_priority(1)
-            });
-
-            h_flex()
-                .id(target)
-                .relative()
-                .h(px(row_height))
-                .w_full()
-                .justify_center()
-                .items_center()
-                .cursor_pointer()
-                .child(tick)
-                .children(card)
-                .on_hover(cx.listener(move |this, entered: &bool, _window, cx| {
-                    let next = if *entered { Some(ordinal) } else { None };
-                    // Clear only if the cursor left *this* tick; a newer tick's
-                    // enter has already overwritten `outline_hover`.
-                    if *entered || this.outline_hover == Some(ordinal) {
-                        this.outline_hover = next;
-                        cx.notify();
-                    }
-                }))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                    // Pin the turn to the top of the viewport. Disengage
-                    // tail-follow first, otherwise the next layout would re-pin
-                    // to the bottom and the reveal would be overwritten (the
-                    // click would appear to do nothing).
-                    this.auto_follow = false;
-                    this.message_scroll.scroll_to_top_of_item(target);
-                    cx.notify();
-                }))
-        });
-
-        // `overflow_hidden` + `min_h_0` clip the tick column when a long
-        // conversation's ticks exceed the rail height, instead of overflowing
-        // the layout. Widened wave ticks stay within the fixed width (28px max
-        // < 40px rail), and the hover card is `deferred` — painted outside this
-        // subtree — so neither is affected by the clip.
-        Some(
-            v_flex()
-                .flex_shrink_0()
-                .w(px(OUTLINE_RAIL_WIDTH))
-                .h_full()
-                .min_h_0()
-                .overflow_hidden()
-                .justify_center()
-                .items_center()
-                .children(ticks)
-                .into_any_element(),
-        )
     }
 
     fn subscribe_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
@@ -1788,10 +1591,6 @@ impl Workspace {
         // because the per-frame arbitration disengages follow on upward scroll.
         self.auto_follow = true;
         self.message_scroll.scroll_to_bottom();
-        // Hover is tied to the old thread's tick ordinals; drop it. The
-        // visible-turn highlight needs no reset — it is queried live from the
-        // scroll handle each frame.
-        self.outline_hover = None;
         self.pending_auths.clear();
         self.pending_ask = None;
         self.pending_plan_review = None;
@@ -5632,11 +5431,6 @@ impl Render for Workspace {
                     )),
             )
         };
-        // Outline rail sits left of the message list (right of the sidebar
-        // divider), so it only shows alongside a live conversation.
-        let outline = (!first_screen && !editor_open)
-            .then(|| self.render_outline(&theme, cx))
-            .flatten();
         // No chrome on the panel: Ctrl-G closes, Cmd-Enter sends, Cmd-Shift-P
         // toggles preview — all keyboard-driven per the no-button constraint.
         // The divider is the visual separator and the drag handle for resizing.
@@ -6023,8 +5817,8 @@ impl Render for Workspace {
                                 // no borrow spans the element tree. The scroll div's
                                 // direct children are one row per item, so
                                 // `child_bounds` (and thus `bounds_for_item` /
-                                // `scroll_to_item`) key off the item index for the
-                                // outline + click-to-reveal.
+                                // `scroll_to_item`) key off the item index for
+                                // click-to-reveal.
                                 let items: Vec<_> = self.conversation.read(cx).items().to_vec();
                                 let scroll = self.message_scroll.clone();
                                 // Plain pixel-anchored scroll: no `min_h_full` /
@@ -6077,7 +5871,6 @@ impl Render for Workspace {
                                     .min_h_0()
                                     .min_w_0()
                                     .overflow_hidden()
-                                    .children(outline)
                                     .child(list_wrap)
                             }))
                             .children(footer)

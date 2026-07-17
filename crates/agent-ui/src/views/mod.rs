@@ -7,7 +7,6 @@ pub mod context_rail;
 pub mod management_shell;
 pub mod member_panel;
 pub mod message;
-pub mod outline;
 pub mod plugin_manager;
 pub mod settings;
 pub mod sidebar;
