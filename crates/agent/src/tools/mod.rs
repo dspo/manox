@@ -29,6 +29,7 @@ pub mod write_file;
 
 use gpui::{App, AppContext as _, Task, WeakEntity};
 use schemars::JsonSchema;
+use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -37,9 +38,71 @@ use crate::tool::{AnyAgentTool, ToolRegistry};
 
 // ─── shared helpers ───────────────────────────────────────────────────────
 
-/// Convert a schemars schema to a `serde_json::Value`.
-pub(crate) fn schema<T: JsonSchema>() -> serde_json::Value {
-    serde_json::to_value(schemars::schema_for!(T)).expect("schema serialization")
+/// Convert a schemars schema to a bare `{type, properties, required}` `Value`.
+///
+/// Strips JSON Schema document metadata (`$schema`, `title`) and inlines
+/// `$defs`/`definitions` so the schema is self-contained. LLM tool-calling
+/// APIs expect bare schemas — `$schema`/`title` cause 400 on strict
+/// OpenAI-compatible endpoints (e.g. 百炼/DashScope, see issue #211).
+pub(crate) fn schema<T: JsonSchema>() -> Value {
+    let mut value = serde_json::to_value(schemars::schema_for!(T)).expect("schema serialization");
+    strip_schema_metadata(&mut value);
+    value
+}
+
+/// Remove `$schema`/`title` metadata and inline `$defs`/`definitions`.
+///
+/// `schemars::schema_for!` emits document-level fields that LLM tool-calling
+/// APIs reject. Nested types produce `$defs` with `$ref` references — those
+/// must be inlined before stripping `$defs`, otherwise the schema is broken.
+fn strip_schema_metadata(value: &mut Value) {
+    let defs = value
+        .as_object()
+        .and_then(|obj| {
+            obj.get("$defs")
+                .or(obj.get("definitions"))
+                .and_then(Value::as_object)
+                .cloned()
+        })
+        .unwrap_or_default();
+
+    if !defs.is_empty() {
+        inline_refs(value, &defs);
+    }
+
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("$schema");
+        obj.remove("title");
+        obj.remove("$defs");
+        obj.remove("definitions");
+    }
+}
+
+/// Recursively replace `{"$ref": "#/$defs/Foo"}` nodes with the inlined
+/// definition from `defs`, with its own refs resolved in turn.
+fn inline_refs(value: &mut Value, defs: &Map<String, Value>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(ref_path)) = map.get("$ref") {
+                let name = ref_path.rsplit('/').next().unwrap_or(ref_path);
+                if let Some(def) = defs.get(name) {
+                    let mut inlined = def.clone();
+                    inline_refs(&mut inlined, defs);
+                    *value = inlined;
+                    return;
+                }
+            }
+            for v in map.values_mut() {
+                inline_refs(v, defs);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                inline_refs(v, defs);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Bridge a tokio task back to a gpui background `Task` via `async_channel`.
@@ -381,6 +444,43 @@ mod tests {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
         for t in &tools {
             assert_eq!(t.input_schema()["type"], "object", "{} schema", t.name());
+        }
+    }
+
+    #[test]
+    fn schema_strips_metadata_and_inlines_defs() {
+        use crate::tool::AgentTool;
+        use crate::tools::ask_user::AskUserQuestionTool;
+
+        let schema = AskUserQuestionTool.input_schema();
+
+        // No JSON Schema document metadata.
+        assert!(!schema.as_object().unwrap().contains_key("$schema"));
+        assert!(!schema.as_object().unwrap().contains_key("title"));
+        // No definition containers — refs are inlined.
+        assert!(!schema.as_object().unwrap().contains_key("$defs"));
+        assert!(!schema.as_object().unwrap().contains_key("definitions"));
+        // Inlined nested types have concrete properties, not $ref.
+        assert!(!contains_ref(&schema));
+    }
+
+    #[test]
+    fn schema_preserves_type_and_properties() {
+        use crate::tool::AgentTool;
+        use crate::tools::self_info::SelfInfoTool;
+
+        let schema = SelfInfoTool::new().input_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(!schema.as_object().unwrap().contains_key("$schema"));
+        assert!(!schema.as_object().unwrap().contains_key("title"));
+    }
+
+    /// Recursively check that no `$ref` key exists anywhere in the value tree.
+    fn contains_ref(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => map.contains_key("$ref") || map.values().any(contains_ref),
+            Value::Array(arr) => arr.iter().any(contains_ref),
+            _ => false,
         }
     }
 
