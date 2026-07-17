@@ -64,7 +64,6 @@ status-denied = 已拒绝
 status-cancelled = 已取消
 
 ### views/message.rs — Thinking 状态行
-thinking-live = 思考 { $count } 秒
 agent-metrics-tools = { $count ->
     [one] {$count} 个工具
    *[other] {$count} 个工具
@@ -74,8 +73,6 @@ agent-metrics-running-agents = { $count ->
     [one] 运行 {$count} 个 Explore agent…
    *[other] 运行 {$count} 个 Explore agent…
 }
-thinking-done = 思考了 { $count } 秒
-thinking-done-label = 已思考
 thinking-tool-result = 工具结果
 thinking-reading = 读取 { $count } 个文件
 thinking-writing = 写入 { $count } 个文件

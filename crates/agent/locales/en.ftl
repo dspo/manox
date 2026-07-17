@@ -77,7 +77,6 @@ status-denied = Denied
 status-cancelled = Cancelled
 
 ### views/message.rs — Thinking status row
-thinking-live = Thinking for { $count }s
 agent-metrics-tools = { $count ->
     [one] {$count} tool
    *[other] {$count} tools
@@ -87,8 +86,6 @@ agent-metrics-running-agents = { $count ->
     [one] Running {$count} Explore agent…
    *[other] Running {$count} Explore agents…
 }
-thinking-done = Thought for { $count }s
-thinking-done-label = Thought
 thinking-tool-result = tool result
 thinking-reading = { $count ->
     [one] reading {$count} file

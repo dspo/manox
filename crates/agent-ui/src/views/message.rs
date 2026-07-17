@@ -87,7 +87,7 @@ pub struct ToolCallCtx {
 /// (notices, errors, tool output, sub-message bodies) where cross-block
 /// selection is not required (code blocks carry their own hover copy button).
 /// The owned streaming body uses the `MessageItem`'s persistent
-/// `Entity<Markdown>` directly (see `render_assistant` / `render_reasoning`).
+/// `Entity<Markdown>` directly (see `render_assistant`).
 fn markdown_tv(
     id: impl Into<gpui::ElementId>,
     text: impl Into<gpui::SharedString>,
@@ -153,15 +153,10 @@ impl MessageItem {
     /// finalized/historical bodies). Returns the entity handle so the caller can
     /// mount it. `None` for non-text items (they have no owned markdown body).
     fn ensure_markdown(&mut self, cx: &mut gpui::Context<Self>) -> Option<Entity<Markdown>> {
-        let is_text = matches!(
-            self.kind,
-            ConvItem::Assistant { .. } | ConvItem::Reasoning { .. }
-        );
+        let is_text = matches!(self.kind, ConvItem::Assistant { .. });
         if is_text && self.markdown.is_none() {
             let streaming = match &self.kind {
-                ConvItem::Assistant { streaming, .. } | ConvItem::Reasoning { streaming, .. } => {
-                    *streaming
-                }
+                ConvItem::Assistant { streaming, .. } => *streaming,
                 _ => false,
             };
             let id = self.id;
@@ -389,15 +384,6 @@ impl MessageItem {
     pub fn finalize_streaming(&mut self, terminal: bool, cx: &mut gpui::Context<Self>) {
         match &mut self.kind {
             ConvItem::Assistant { streaming, .. } => *streaming = false,
-            ConvItem::Reasoning {
-                streaming,
-                collapsed,
-                user_toggled,
-                ..
-            } => {
-                *streaming = false;
-                *collapsed = !*user_toggled;
-            }
             ConvItem::Thinking(t) if terminal => {
                 // Turn ended: freeze the segment, pin elapsed, auto-collapse
                 // entries the user didn't pin. `finalize_segment` is
@@ -555,22 +541,6 @@ pub fn render_item(
             token_usage: _,
             activity_summary,
         } => render_assistant(text, ix, role, activity_summary.as_ref(), theme, body, cx),
-        ConvItem::Reasoning {
-            text,
-            streaming,
-            collapsed,
-            user_toggled,
-        } => render_reasoning(
-            text,
-            ix,
-            *streaming,
-            *collapsed,
-            *user_toggled,
-            theme,
-            tool_ctx,
-            body,
-            cx,
-        ),
         ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx, cx),
         ConvItem::ToolCall(t) => {
             if t.name == "AskUserQuestion" {
@@ -826,119 +796,6 @@ pub fn render_assistant(
                 .child(body_el),
         )
         .into_any_element()
-}
-
-/// Resolve a text body element: the owned `Entity<Markdown>` when present
-/// (persistent selection + streaming), otherwise a per-frame `markdown_tv`
-/// mount. Used by `render_reasoning`; `render_assistant` inlines the same logic.
-fn body_element(
-    text: &str,
-    id: impl Into<gpui::ElementId>,
-    theme: &Theme,
-    body: Option<Entity<Markdown>>,
-    cx: &mut App,
-) -> gpui::AnyElement {
-    match body {
-        Some(md) => md.into_any_element(),
-        None => markdown_tv(id, text.to_string(), theme, false, cx),
-    }
-}
-
-/// Render a reasoning (thinking) block: expanded while streaming, collapsed when done, with a copy button.
-/// Clicking the header toggles collapsed state (like tool-call cards), tracked by `user_toggled` so the user's
-/// manual choice survives subsequent status transitions.
-//
-// Each arg is a distinct render input; the function is a leaf render helper,
-// not a public API. Splitting would only forward the same values through an
-// intermediate struct without reducing complexity.
-#[allow(clippy::too_many_arguments)]
-pub fn render_reasoning(
-    text: &str,
-    ix: usize,
-    _streaming: bool,
-    collapsed: bool,
-    _user_toggled: bool,
-    theme: &Theme,
-    tool_ctx: Option<&ToolCallCtx>,
-    body: Option<Entity<Markdown>>,
-    cx: &mut App,
-) -> gpui::AnyElement {
-    let chevron = if collapsed {
-        IconName::ChevronRight
-    } else {
-        IconName::ChevronDown
-    };
-    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
-    let mut block = v_flex()
-        .group(format!("reasoning-{ix}"))
-        .w_full()
-        .min_w_0()
-        .gap_1()
-        .child(
-            h_flex()
-                .id(("reasoning-header", ix))
-                .w_full()
-                .min_w_0()
-                .gap_1p5()
-                .items_center()
-                .cursor_pointer()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .on_click(move |_, _window, cx: &mut App| {
-                    let Some(weak) = weak_workspace.clone() else {
-                        return;
-                    };
-                    let ix_click = ix;
-                    let _ = weak.update(cx, |w, cx| {
-                        let conv = w.conversation.clone();
-                        conv.update(cx, |c, cx| {
-                            if let Some(item) = c.items().get(ix_click) {
-                                item.update(cx, |item, cx| {
-                                    if let ConvItem::Reasoning {
-                                        collapsed,
-                                        user_toggled,
-                                        ..
-                                    } = item.kind_mut()
-                                    {
-                                        *collapsed = !*collapsed;
-                                        *user_toggled = true;
-                                    }
-                                    cx.notify();
-                                });
-                            }
-                        });
-                        cx.notify();
-                    });
-                })
-                .child(Icon::new(chevron).xsmall())
-                .child(i18n::t("message-reasoning"))
-                .child(gpui::div().flex_1())
-                .child(copy_button_hoverable(
-                    ix,
-                    "copy-reasoning",
-                    format!("reasoning-{ix}"),
-                    text.to_string(),
-                )),
-        );
-    if !collapsed {
-        let body = body_element(text, ("reasoning", ix), theme, body, cx);
-        block = block.child(
-            gpui::div()
-                .w_full()
-                .min_w_0()
-                .overflow_x_hidden()
-                .pl_3()
-                .border_l_1()
-                .border_color(theme.border)
-                .text_sm()
-                .text_color(theme.muted_foreground)
-                // Thinking renders as Lilex italic; weight inherits Light from the
-                // list, so this hits Lilex-LightItalic (MediumItalic under bold).
-                .italic()
-                .child(body),
-        );
-    }
-    block.into_any_element()
 }
 
 /// Optional collapsible slot for `render_banner`: turns the label row into a
@@ -3031,7 +2888,7 @@ pub fn build_items(
     // append to it instead of spawning a second bubble.
     if trailing_streaming && let Some(last) = items.last_mut() {
         match last {
-            ConvItem::Assistant { streaming, .. } | ConvItem::Reasoning { streaming, .. } => {
+            ConvItem::Assistant { streaming, .. } => {
                 *streaming = true;
             }
             ConvItem::Thinking(t) => {
@@ -3745,13 +3602,6 @@ mod tests {
         assert!(
             matches!(&t.entries[1], ActivityEntry::Tool(tool) if tool.id == "tu_1"),
             "second entry is tool"
-        );
-        // No top-level Reasoning item should exist.
-        assert!(
-            !items
-                .iter()
-                .any(|i| matches!(i, ConvItem::Reasoning { .. })),
-            "no standalone Reasoning items"
         );
     }
 

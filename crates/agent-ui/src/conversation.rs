@@ -85,12 +85,6 @@ pub enum ConvItem {
         /// evolving after the snapshot but this stays frozen for the row.
         activity_summary: Option<ActivitySummary>,
     },
-    Reasoning {
-        text: String,
-        streaming: bool,
-        collapsed: bool,
-        user_toggled: bool,
-    },
     /// One contiguous activity segment within a user turn: a Claude Code–style
     /// status line ("Thought for 28s, read 1 file, edited 2 files, ran 3
     /// commands") over an expandable `⎿` list of the segment's tool calls. A
@@ -1322,9 +1316,7 @@ impl ConversationState {
             .map(|(id, kind)| {
                 cx.new(|cx| {
                     let text = match &kind {
-                        ConvItem::Assistant { text, .. } | ConvItem::Reasoning { text, .. } => {
-                            Some(text.clone())
-                        }
+                        ConvItem::Assistant { text, .. } => Some(text.clone()),
                         _ => None,
                     };
                     let mut item = MessageItem::new(kind, role.to_string(), id, weak.clone());
