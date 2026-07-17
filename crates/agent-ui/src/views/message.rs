@@ -36,7 +36,6 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex,
-    spinner::Spinner,
     tag::{Tag, TagVariant},
     v_flex,
 };
@@ -554,7 +553,8 @@ pub fn render_item(
             text,
             streaming: _,
             token_usage: _,
-        } => render_assistant(text, ix, role, theme, body, cx),
+            activity_summary,
+        } => render_assistant(text, ix, role, activity_summary.as_ref(), theme, body, cx),
         ConvItem::Reasoning {
             text,
             streaming,
@@ -771,6 +771,7 @@ pub fn render_assistant(
     text: &str,
     ix: usize,
     role: &str,
+    activity_summary: Option<&crate::conversation::ActivitySummary>,
     theme: &Theme,
     body: Option<Entity<Markdown>>,
     cx: &mut App,
@@ -781,6 +782,16 @@ pub fn render_assistant(
         Some(md) => md.into_any_element(),
         None => markdown_tv(("assistant", ix), text.to_string(), theme, false, cx),
     };
+    // Suffix for the model row summarizing the activity segment that preceded
+    // this reply: " · 思考了 N 轮次 · 调用了 M 次工具 · Ss". `None` (no
+    // preceding thinking/tool activity, or all counts zero) renders a bare
+    // row with just the model name.
+    let summary_child = activity_summary.and_then(activity_summary_text).map(|t| {
+        gpui::div()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(t)
+    });
     v_flex()
         .group(format!("assistant-{ix}"))
         .w_full()
@@ -798,6 +809,7 @@ pub fn render_assistant(
                         .text_color(theme.muted_foreground)
                         .child(role.to_string()),
                 )
+                .children(summary_child)
                 .child(gpui::div().flex_1())
                 .child(copy_button_hoverable(
                     ix,
@@ -1256,18 +1268,13 @@ fn disclosure_icon(collapsed: bool, theme: &Theme) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// Render one activity segment as a compact summary header over an expandable
-/// visual tree of reasoning rounds and tool calls. The header shows aggregated
-/// counts ("思考了 2 轮次 · 读取了 3 个文件 · 执行了 5 次工具调用 · 28 秒")
-/// and toggles between summary-only and full tree view. The tree itself uses a
-/// thin left rail with short branch connectors drawn via GPUI layout, replacing
-/// the older Unicode `├─`/`└─` characters.
-///
-/// Collapsed visibility rules:
-/// - frozen + collapsed: only the summary header.
-/// - streaming + collapsed: the summary plus the active entry (streaming
-///   reasoning or running tool).
-/// - expanded: every entry in arrival order, tree-style.
+/// Render an activity segment as a flat stack of its entries — each a
+/// self-collapsible reasoning round or tool node, sitting at the same level
+/// as the surrounding assistant text (no segment-level header, no left rail,
+/// no branch connectors). Entries default to collapsed so the live stream
+/// does not auto-play their content; a manual expand reveals the body. The
+/// segment's aggregated totals ("思考了 N 轮次 · 调用了 M 次工具 · Ss") are
+/// rendered on the following reply's model row via `activity_summary`.
 pub fn render_thinking(
     t: &ThinkingContainer,
     ix: usize,
@@ -1275,136 +1282,32 @@ pub fn render_thinking(
     tool_ctx: Option<&ToolCallCtx>,
     cx: &mut App,
 ) -> gpui::AnyElement {
-    let summary = compact_summary(t);
-    let weak_workspace = tool_ctx.map(|c| c.weak.clone());
-    let ix_click = ix;
-
-    let mut header = h_flex()
-        .id(("thinking-header", ix))
-        .w_full()
-        .min_w_0()
-        .gap_1p5()
-        .items_center()
-        .cursor_pointer()
-        .text_xs()
-        .text_color(theme.muted_foreground)
-        .on_click(move |_, _window, cx: &mut App| {
-            let Some(weak) = weak_workspace.clone() else {
-                return;
-            };
-            let _ = weak.update(cx, |w, cx| {
-                let conv = w.conversation.clone();
-                conv.update(cx, |c, cx| {
-                    if let Some(item) = c.items().get(ix_click) {
-                        item.update(cx, |item, cx| {
-                            if let ConvItem::Thinking(t) = item.kind_mut() {
-                                t.collapsed = !t.collapsed;
-                                t.user_toggled = true;
-                            }
-                            cx.notify();
-                        });
-                    }
-                });
-                cx.notify();
-            });
-        });
-    // Left disclosure chevron.
-    header = header.child(disclosure_icon(t.collapsed, theme));
-    // Spinner while live; static dot once frozen.
-    if t.streaming {
-        header = header.child(Spinner::new().xsmall().color(theme.muted_foreground));
-    } else {
-        header = header.child(
-            gpui::div()
-                .w(px(6.))
-                .h(px(6.))
-                .rounded_full()
-                .bg(theme.muted_foreground.opacity(0.5)),
-        );
+    if t.entries.is_empty() {
+        // A freshly-created container before any entry has arrived renders
+        // nothing — the first reasoning delta or tool call lands next frame.
+        return gpui::div().into_any_element();
     }
-    header = header.child(
-        gpui::div()
-            .flex_1()
-            .min_w_0()
-            .overflow_x_hidden()
-            .child(summary),
-    );
-
-    let mut block = v_flex()
-        .group(format!("thinking-{ix}"))
-        .w_full()
-        .min_w_0()
-        .gap_1()
-        .child(header);
-
-    // Determine visible entries based on collapse state.
-    let visible: Vec<(usize, &ActivityEntry)> = if !t.collapsed {
-        t.entries.iter().enumerate().collect()
-    } else if t.streaming {
-        // Prefer a streaming reasoning entry, then a running tool, then latest.
-        t.entries
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, e)| match e {
-                ActivityEntry::Reasoning { streaming, .. } => *streaming,
-                ActivityEntry::Tool(t) => {
-                    t.streaming
-                        || matches!(
-                            t.status,
-                            ToolCallStatus::Running | ToolCallStatus::PendingApproval
-                        )
-                }
-            })
-            .or(t.entries.iter().enumerate().next_back())
-            .into_iter()
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    if !visible.is_empty() {
-        // Wrap visible entries in a rail-and-branch tree structure: a thin
-        // left border (the "rail") with each entry drawing a short horizontal
-        // branch connector via GPUI layout rather than Unicode `├─`/`└─`.
-        block = block.child(render_activity_tree(&visible, ix, theme, tool_ctx, cx));
-    }
-    block.into_any_element()
-}
-
-/// Render the activity entries inside a visual tree: a thin left rail with
-/// short horizontal branch connectors for each entry. Replaces the old
-/// Unicode `├─`/`└─` prefix with proper GPUI layout elements.
-fn render_activity_tree(
-    visible: &[(usize, &ActivityEntry)],
-    cix: usize,
-    theme: &Theme,
-    tool_ctx: Option<&ToolCallCtx>,
-    cx: &mut App,
-) -> gpui::AnyElement {
-    let rail_color = theme.border.opacity(0.6);
-
+    // No segment-level header or rail-and-branch tree: each entry is a self-
+    // collapsible row at the same level as the surrounding assistant text,
+    // defaulting to collapsed so the live stream does not auto-play. The
+    // segment's totals are summarized on the following reply's model row.
     v_flex()
         .w_full()
         .min_w_0()
-        .overflow_x_hidden()
-        .debug_selector(|| format!("message-overflow-activity-tree-{cix}"))
-        .pl_3()
-        .gap_0()
+        .gap_0p5()
+        .debug_selector(|| format!("message-overflow-activity-tree-{ix}"))
         .children(
-            visible
+            t.entries
                 .iter()
-                .map(|(eix, e)| render_activity_entry(e, *eix, cix, theme, tool_ctx, cx)),
+                .enumerate()
+                .map(|(eix, e)| render_activity_entry(e, eix, ix, theme, tool_ctx, cx)),
         )
-        .border_l_1()
-        .border_color(rail_color)
-        .ml_1()
         .into_any_element()
 }
 
-/// Dispatch rendering for one activity entry (reasoning or tool). Each entry
-/// gets a short horizontal branch connector drawn with GPUI layout, replacing
-/// the old Unicode `├─`/`└─` prefix.
+/// Render one activity entry (a reasoning round or a tool node) as a flat,
+/// self-collapsible row. No branch connector or left rail — entries sit at
+/// the same indentation level as the surrounding assistant text.
 fn render_activity_entry(
     e: &ActivityEntry,
     eix: usize,
@@ -1413,15 +1316,6 @@ fn render_activity_entry(
     tool_ctx: Option<&ToolCallCtx>,
     cx: &mut App,
 ) -> gpui::AnyElement {
-    // Short horizontal branch connector from the rail to the entry content.
-    let branch = gpui::div()
-        .w(px(8.))
-        .h(px(1.))
-        .bg(theme.border.opacity(0.6))
-        .flex_shrink_0()
-        .mt_2()
-        .ml_neg_1();
-
     let entry = match e {
         ActivityEntry::Reasoning {
             text,
@@ -1443,18 +1337,16 @@ fn render_activity_entry(
         ),
         ActivityEntry::Tool(tool) => render_tool_entry(tool, eix, theme, tool_ctx, cx),
     };
-
-    h_flex()
+    // No branch/rail wrapper — a plain full-width overflow guard so the entry
+    // body stays within the message column on narrow widths. The debug
+    // selectors back the overflow test (which now covers the flat layout).
+    gpui::div()
         .w_full()
         .min_w_0()
         .overflow_x_hidden()
         .debug_selector(|| format!("message-overflow-activity-entry-{cix}-{eix}"))
-        .items_start()
-        .gap_1()
-        .child(branch)
         .child(
             gpui::div()
-                .flex_1()
                 .min_w_0()
                 .overflow_x_hidden()
                 .debug_selector(|| format!("message-overflow-activity-entry-body-{cix}-{eix}"))
@@ -1481,7 +1373,11 @@ fn render_reasoning_entry(
 ) -> gpui::AnyElement {
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
     let label = format!("{} {}", i18n::t("message-reasoning"), eix + 1);
-    let show_body = streaming || !collapsed;
+    // Default-collapsed: the live stream does not auto-play the reasoning
+    // text — only a manual expand (user_toggled → collapsed=false) reveals
+    // the body. The streaming spinner on the header still shows work in
+    // progress while collapsed.
+    let show_body = !collapsed;
 
     let mut row = v_flex().w_full().min_w_0().flex_1().italic().child(
         h_flex()
@@ -1589,7 +1485,9 @@ fn render_tool_entry(
         ToolCallStatus::Error | ToolCallStatus::Denied => (IconName::CircleX, theme.danger),
         ToolCallStatus::Cancelled => (IconName::Minus, theme.muted_foreground),
     };
-    let show_output = e.streaming || !e.collapsed;
+    // Default-collapsed: a streaming tool does not auto-reveal its output —
+    // only a manual expand does. The status icon still spins while running.
+    let show_output = !e.collapsed;
     let title = if !e.title.is_empty() {
         e.title.clone()
     } else if !e.name.is_empty() {
@@ -1671,50 +1569,28 @@ fn render_tool_entry(
     frame.into_any_element()
 }
 
-/// Compact summary for the activity segment header: rounds · files · tools ·
-/// duration. Returns an empty string when the segment has no entries and no
-/// known duration (an empty freshly-created container).
-fn compact_summary(t: &ThinkingContainer) -> String {
-    use std::collections::BTreeSet;
-    let thinking_rounds = t
-        .entries
-        .iter()
-        .filter(|e| matches!(e, ActivityEntry::Reasoning { .. }))
-        .count();
-    let mut files_read = BTreeSet::new();
-    let mut total_tools = 0usize;
-    for e in &t.entries {
-        if let ActivityEntry::Tool(tool) = e {
-            total_tools += 1;
-            if tool.name == "read_file" {
-                let path = tool
-                    .input
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                files_read.insert(path);
-            }
-        }
-    }
-    let secs = t
-        .frozen_secs
-        .unwrap_or_else(|| t.started_at.elapsed().as_secs());
-
+/// Format the activity segment summary for the model row of the reply that
+/// follows it: " · 思考了 N 轮次 · 调用了 M 次工具 · Ss". Returns `None`
+/// when every count is zero (or the duration is absent/zero) so the model
+/// row stays bare. The leading " · " separates it from the model name.
+fn activity_summary_text(s: &crate::conversation::ActivitySummary) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
-    if thinking_rounds > 0 {
-        parts.push(i18n::t_count("thinking-rounds", thinking_rounds as i64).to_string());
+    if s.thinking_rounds > 0 {
+        parts.push(i18n::t_count("thinking-rounds", s.thinking_rounds as i64).to_string());
     }
-    if !files_read.is_empty() {
-        parts.push(i18n::t_count("thinking-files-read", files_read.len() as i64).to_string());
+    if s.tool_calls > 0 {
+        parts.push(i18n::t_count("thinking-tool-calls", s.tool_calls as i64).to_string());
     }
-    if total_tools > 0 {
-        parts.push(i18n::t_count("thinking-tool-calls", total_tools as i64).to_string());
-    }
-    if secs > 0 || t.streaming {
+    if let Some(secs) = s.duration_secs
+        && secs > 0
+    {
         parts.push(i18n::t_count("thinking-duration", secs as i64).to_string());
     }
-    parts.join(" · ")
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!(" · {}", parts.join(" · ")))
+    }
 }
 
 /// Aggregate a segment's tool calls into a comma-joined summary like
@@ -2997,11 +2873,19 @@ pub fn build_items(
                             // Assistant prose interrupts the activity segment:
                             // reasoning after it starts a fresh round.
                             close_segment(&mut items, active_segment_ix);
+                            // Snapshot the segment's totals (after close pins
+                            // `frozen_secs`) for this reply's model row.
+                            let activity_summary =
+                                active_segment_ix.and_then(|ix| match &items[ix] {
+                                    ConvItem::Thinking(seg) => seg.activity_summary(),
+                                    _ => None,
+                                });
                             active_segment_ix = None;
                             items.push(ConvItem::Assistant {
                                 text: t.clone(),
                                 streaming: false,
                                 token_usage: last_user_id.and_then(|id| usage.get(id).copied()),
+                                activity_summary,
                             });
                         }
                         MessageContent::Thinking { text, .. } => {
@@ -3492,9 +3376,9 @@ mod tests {
     }
 
     /// Historical `ThinkingContainer`s rebuilt from persisted messages must
-    /// have `frozen_secs` pinned so `compact_summary` doesn't fall back to a
-    /// live `started_at.elapsed()` — otherwise the timer ticks forever from
-    /// zero on a reloaded thread (regression: the old "计时一直进行" bug).
+    /// have `frozen_secs` pinned so `activity_summary` reports a fixed duration
+    /// (not a live `started_at.elapsed()`) — otherwise the timer ticks forever
+    /// from zero on a reloaded thread (regression: the old "计时一直进行" bug).
     #[test]
     fn build_items_freezes_historical_segment_elapsed() {
         let messages = vec![
@@ -3934,11 +3818,13 @@ mod tests {
         ));
     }
 
-    /// `compact_summary` produces a non-empty summary for a container with
-    /// reasoning rounds, file reads, and tool calls.
+    /// `activity_summary` snapshots the segment's round/tool counts and the
+    /// pinned elapsed for the following reply's model row.
     #[test]
-    fn compact_summary_counts_rounds_files_tools() {
+    fn activity_summary_counts_rounds_tools_duration() {
         let mut t = ThinkingContainer::new();
+        // Empty segment → no row suffix.
+        assert!(t.activity_summary().is_none());
         t.frozen_secs = Some(42);
         t.entries.push(ActivityEntry::Reasoning {
             text: "thinking...".into(),
@@ -3956,7 +3842,7 @@ mod tests {
             is_error: false,
             input: serde_json::json!({"path": "a.rs"}),
             streaming: false,
-            collapsed: false,
+            collapsed: true,
             user_toggled: false,
             panel: None,
         }));
@@ -3969,22 +3855,19 @@ mod tests {
             is_error: false,
             input: serde_json::json!({"command": "cargo build"}),
             streaming: false,
-            collapsed: false,
+            collapsed: true,
             user_toggled: false,
             panel: None,
         }));
-        let summary = compact_summary(&t);
-        assert!(!summary.is_empty());
-        // The summary contains counts for rounds, files, tools, and duration.
-        // Since it's localized, check for the numbers rather than exact text.
-        assert!(
-            summary.contains("1"),
-            "summary should count 1 round: {summary}"
-        );
-        assert!(
-            summary.contains("42"),
-            "summary should include duration: {summary}"
-        );
+        let s = t.activity_summary().expect("non-empty segment");
+        assert_eq!(s.thinking_rounds, 1);
+        assert_eq!(s.tool_calls, 2);
+        assert_eq!(s.duration_secs, Some(42));
+
+        // A segment whose only counts are zero still reports `None`.
+        let mut empty = ThinkingContainer::new();
+        empty.frozen_secs = Some(0);
+        assert!(empty.activity_summary().is_none());
     }
 
     /// Historical rebuild of the issue #216 scenario: text THEN thinking within

@@ -89,7 +89,7 @@ thinking-listing = 列出 { $count } 个目录
 thinking-other = { $count } 个其他工具
 thinking-rounds = 思考了 { $count } 轮次
 thinking-files-read = 读取了 { $count } 个文件
-thinking-tool-calls = 执行了 { $count } 次工具调用
+thinking-tool-calls = 调用了 { $count } 次工具
 thinking-duration = { $count } 秒
 
 ### views/settings.rs

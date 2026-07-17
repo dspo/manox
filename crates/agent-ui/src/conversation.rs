@@ -76,6 +76,14 @@ pub enum ConvItem {
         /// preceded this assistant reply. Populated on turn `Stop`; `None`
         /// while streaming or when the provider didn't report usage.
         token_usage: Option<TokenUsage>,
+        /// Summary of the activity segment (thinking rounds + tool calls +
+        /// elapsed) that immediately preceded this reply within the same user
+        /// turn — rendered inline on the model row. `None` when the reply had
+        /// no preceding thinking/tool activity (a pure-text answer), so the
+        /// model row stays bare. Snapshot at `close_segment_for_text` (live)
+        /// / `build_items`'s `close_segment` (reload); the container keeps
+        /// evolving after the snapshot but this stays frozen for the row.
+        activity_summary: Option<ActivitySummary>,
     },
     Reasoning {
         text: String,
@@ -207,6 +215,21 @@ pub enum ActivityEntry {
     },
     /// One tool invocation (reuses `ToolCallItem` for status/output/collapse).
     Tool(ToolCallItem),
+}
+
+/// Frozen snapshot of an activity segment's totals, rendered on the model row
+/// of the assistant reply that immediately follows the segment: thinking
+/// round count, tool-call count, and the segment's elapsed seconds. Built by
+/// `ThinkingContainer::activity_summary` at the moment the segment closes
+/// (`close_segment_for_text` live / `close_segment` on reload), so the row
+/// reflects the segment as it was when the reply began — later segment
+/// mutations don't move the row. `duration_secs` is `None` for segments
+/// rebuilt from persisted history where the elapsed is unknown.
+#[derive(Debug, Clone)]
+pub struct ActivitySummary {
+    pub thinking_rounds: usize,
+    pub tool_calls: usize,
+    pub duration_secs: Option<u64>,
 }
 
 /// One contiguous activity segment within a user turn, rendered as a Claude
@@ -357,6 +380,31 @@ impl ThinkingContainer {
                     ..
                 }
             )
+        })
+    }
+
+    /// Build a frozen snapshot of the segment's totals for the model row of
+    /// the assistant reply that immediately follows it. Returns `None` when
+    /// the segment had no reasoning rounds and no tool calls — the reply
+    /// renders a bare model row with no activity suffix.
+    pub fn activity_summary(&self) -> Option<ActivitySummary> {
+        let thinking_rounds = self
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ActivityEntry::Reasoning { .. }))
+            .count();
+        let tool_calls = self
+            .entries
+            .iter()
+            .filter(|e| matches!(e, ActivityEntry::Tool(_)))
+            .count();
+        if thinking_rounds == 0 && tool_calls == 0 {
+            return None;
+        }
+        Some(ActivitySummary {
+            thinking_rounds,
+            tool_calls,
+            duration_secs: self.frozen_secs,
         })
     }
 }
@@ -690,12 +738,23 @@ impl ConversationState {
                     // `build_items`'s `close_segment` on `MessageContent::Text`.
                     // Without this, thinking arriving after the answer text
                     // folds into the pre-answer segment (issue #216).
-                    if let Some(cix) = self.find_active_activity_segment(cx) {
+                    // Snapshot the just-closed segment's totals for the model
+                    // row. Read *after* `close_segment_for_text` so
+                    // `frozen_secs` is pinned — the row shows the segment's
+                    // elapsed instead of a live timer that would keep growing
+                    // on every re-render of the reply.
+                    let activity_summary = if let Some(cix) = self.find_active_activity_segment(cx) {
                         self.items[cix].update(cx, |item, cx| {
                             item.close_segment_for_text(cx);
                             cx.notify();
                         });
-                    }
+                        match self.items[cix].read(cx).kind() {
+                            ConvItem::Thinking(t) => t.activity_summary(),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     let id = self.items.len();
                     self.items.push(cx.new(|cx| {
                         let mut item = MessageItem::new(
@@ -703,6 +762,7 @@ impl ConversationState {
                                 text: delta.clone(),
                                 streaming: true,
                                 token_usage: None,
+                                activity_summary,
                             },
                             role.to_string(),
                             id,
@@ -772,7 +832,7 @@ impl ConversationState {
                             t.entries.push(ActivityEntry::Reasoning {
                                 text: delta,
                                 streaming: true,
-                                collapsed: false,
+                                collapsed: true,
                                 user_toggled: false,
                                 markdown: None,
                             });
@@ -923,7 +983,7 @@ impl ConversationState {
                                     is_error: false,
                                     input: entry_input,
                                     streaming: matches!(status, ToolCallStatus::Running),
-                                    collapsed: false,
+                                    collapsed: true,
                                     user_toggled: false,
                                     panel: None,
                                 }));
