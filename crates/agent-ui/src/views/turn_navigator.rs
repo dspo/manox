@@ -25,6 +25,7 @@ pub(crate) struct TurnEntry {
     pub item_ix: usize,
     pub text: String,
     pub display: String,
+    search_text: String,
 }
 
 impl TurnEntry {
@@ -41,6 +42,7 @@ impl TurnEntry {
             item_ix,
             text: text.to_string(),
             display,
+            search_text: text.to_lowercase(),
         }
     }
 }
@@ -64,28 +66,29 @@ fn collapse_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn filter_turns(turns: &[TurnEntry], query: &str) -> Vec<TurnEntry> {
+fn filter_turns(turns: &[TurnEntry], query: &str) -> Vec<usize> {
     let query = query.to_lowercase();
     if query.is_empty() {
-        return turns.to_vec();
+        return (0..turns.len()).collect();
     }
     turns
         .iter()
-        .filter(|turn| turn.text.to_lowercase().contains(&query))
-        .cloned()
+        .enumerate()
+        .filter_map(|(ix, turn)| turn.search_text.contains(&query).then_some(ix))
         .collect()
 }
 
 struct TurnListDelegate {
     all: Vec<TurnEntry>,
-    filtered: Vec<TurnEntry>,
+    filtered: Vec<usize>,
     selected: Option<IndexPath>,
 }
 
 impl TurnListDelegate {
     fn new(turns: Vec<TurnEntry>) -> Self {
+        let filtered = (0..turns.len()).collect();
         Self {
-            filtered: turns.clone(),
+            filtered,
             all: turns,
             selected: None,
         }
@@ -93,7 +96,13 @@ impl TurnListDelegate {
 
     fn selected_entry(&self) -> Option<&TurnEntry> {
         let ix = self.selected?;
-        self.filtered.get(ix.row)
+        self.entry_at(ix.row)
+    }
+
+    fn entry_at(&self, row: usize) -> Option<&TurnEntry> {
+        self.filtered
+            .get(row)
+            .and_then(|entry_ix| self.all.get(*entry_ix))
     }
 }
 
@@ -125,7 +134,7 @@ impl ListDelegate for TurnListDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
-        let turn = self.filtered.get(ix.row)?;
+        let turn = self.entry_at(ix.row)?;
         Some(
             ListItem::new(("turn-navigator-row", turn.item_ix))
                 .h(px(ROW_HEIGHT))
@@ -230,11 +239,12 @@ impl TurnNavigator {
         {
             self.last_event = match event {
                 ListEvent::Confirm(ix) => {
-                    list.read(cx).delegate().filtered.get(ix.row).map(|turn| {
-                        TurnNavigatorEvent::Navigate {
+                    let delegate = list.read(cx).delegate();
+                    delegate
+                        .entry_at(ix.row)
+                        .map(|turn| TurnNavigatorEvent::Navigate {
                             item_ix: turn.item_ix,
-                        }
-                    })
+                        })
                 }
                 ListEvent::Cancel => Some(TurnNavigatorEvent::Dismiss),
                 ListEvent::Select(_) => self.last_event.clone(),
@@ -242,7 +252,8 @@ impl TurnNavigator {
         }
         match event {
             ListEvent::Confirm(ix) => {
-                if let Some(turn) = list.read(cx).delegate().filtered.get(ix.row) {
+                let delegate = list.read(cx).delegate();
+                if let Some(turn) = delegate.entry_at(ix.row) {
                     cx.emit(TurnNavigatorEvent::Navigate {
                         item_ix: turn.item_ix,
                     });
@@ -342,7 +353,10 @@ mod tests {
         ];
         let filtered = filter_turns(&turns, "needle");
         assert_eq!(
-            filtered.iter().map(|t| t.item_ix).collect::<Vec<_>>(),
+            filtered
+                .iter()
+                .map(|ix| turns[*ix].item_ix)
+                .collect::<Vec<_>>(),
             [8, 3]
         );
     }
