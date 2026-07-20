@@ -262,7 +262,6 @@ impl ContextRail {
         cx.notify();
     }
 
-
     /// Seed milestones from an approved plan. Continue-in-plan does not — the
     /// user asked for another planning round, so the prior steps no longer
     /// describe committed work.
