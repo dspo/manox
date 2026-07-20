@@ -438,6 +438,7 @@ workspace-yolo-on-notice = Full access on: tool calls need no approval, bash run
 workspace-yolo-off-notice = Switched to request-approval mode: approvals and sandbox restored.
 workspace-empty-prompt = What should we do?
 workspace-effort-section = Reasoning effort
+workspace-provider-reload-failed = Failed to reload provider config; keeping previous providers: {$error}
 
 ### views/composer_menu.rs
 composer-add-label = Add

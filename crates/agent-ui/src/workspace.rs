@@ -2023,18 +2023,41 @@ impl Workspace {
         }
     }
 
+    /// Open a fresh thread. The provider registry is reloaded from the cx
+    /// config file first (on a background thread — api key resolution may hit
+    /// the OS keychain), so every new thread starts from the latest providers
+    /// and the swapped-in snapshot is visible to all existing threads' model
+    /// menus. A failed reload keeps the previous registry and surfaces a
+    /// notice; the new thread is still created either way.
     fn start_new_thread(
         &mut self,
         project: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = ThreadId(uuid::Uuid::new_v4().to_string());
-        let new = Thread::new(id, self.cwd.clone(), cx);
-        if let Some(dir) = project {
-            new.update(cx, |t, cx| t.set_project(dir, cx));
-        }
-        self.attach_thread(new, window, cx);
+        let cwd = self.cwd.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let reload_result = cx.background_spawn(async move { registry::reload() }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let id = ThreadId(uuid::Uuid::new_v4().to_string());
+                let new = Thread::new(id, cwd, cx);
+                if let Some(dir) = project {
+                    new.update(cx, |t, cx| t.set_project(dir, cx));
+                }
+                this.attach_thread(new, window, cx);
+                // The notice must land after the attach: `add_info_message`
+                // targets the active conversation, which is the outgoing
+                // thread until `attach_thread` swaps it.
+                if let Err(e) = reload_result {
+                    let msg = i18n::t_str(
+                        "workspace-provider-reload-failed",
+                        &[("error", &e.to_string())],
+                    );
+                    this.add_info_message(msg.to_string(), cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Park the active thread into the background (preserving its run + event
