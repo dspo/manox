@@ -3289,13 +3289,13 @@ impl Thread {
         };
         // Every tool result enters the conversation bounded: the UI event, the
         // persisted messages, and the PostToolUse hook all share this one
-        // capped text. The `agent` envelope is exempt — it is bounded at
+        // capped text. The `Agent` envelope is exempt — it is bounded at
         // construction and the UI parses it as JSON, which truncation would
         // corrupt.
-        let output_str = if tu.name.as_ref() == "agent" {
-            output_str
-        } else {
+        let output_str = if crate::tools::truncate::should_cap_tool_result(tu.name.as_ref()) {
             crate::tools::truncate::truncate_result(&output_str).into_owned()
+        } else {
+            output_str
         };
 
         this.update(cx, |_, cx| {

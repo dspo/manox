@@ -4,9 +4,9 @@
 //! `Thread::run_tool_inner` before it is appended to the conversation, so no
 //! tool — built-in or MCP — can flood the model context: a single match on a
 //! megabyte-long minified line, or a multi-megabyte command dump, stays
-//! bounded. The `agent` tool is exempt: its JSON envelope is bounded at
-//! construction (see `tools::agent`) and byte-truncation would corrupt the
-//! envelope the UI parses.
+//! bounded. The `Agent` tool is exempt (see [`should_cap_tool_result`]): its
+//! JSON envelope is bounded at construction and byte-truncation would corrupt
+//! the envelope the UI parses.
 //!
 //! Two independent caps, mirroring the pi/oh-my-pi truncation layer:
 //! - a per-line cap, so one long line cannot eat the whole budget;
@@ -97,9 +97,29 @@ pub fn truncate_result(text: &str) -> Cow<'_, str> {
     ))
 }
 
+/// Whether a tool result passes through the output cap in
+/// `Thread::run_tool_inner`. The `Agent` tool's JSON envelope is exempt: it
+/// is bounded at construction (see `tools::agent::ENVELOPE_MESSAGES_BUDGET`)
+/// and the UI parses it as JSON, which byte-truncation would corrupt. The
+/// comparison matches `SpawnAgentTool::name()` — PascalCase `"Agent"`.
+pub fn should_cap_tool_result(tool_name: &str) -> bool {
+    tool_name != "Agent"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_envelope_is_exempt_from_the_cap() {
+        // Regression for the PascalCase rename: the tool's `name()` returns
+        // "Agent", so an exemption keyed on lowercase "agent" never fired and
+        // envelopes were byte-truncated into unparseable JSON.
+        assert!(!should_cap_tool_result("Agent"));
+        assert!(should_cap_tool_result("Grep"));
+        assert!(should_cap_tool_result("Bash"));
+        assert!(should_cap_tool_result("mcp_server_tool"));
+    }
 
     #[test]
     fn short_text_passes_through_borrowed() {
