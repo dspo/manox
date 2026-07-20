@@ -62,7 +62,7 @@ struct QuestionOption {
 
 impl AgentTool for AskUserQuestionTool {
     fn name(&self) -> &str {
-        "AskUserQuestion"
+        super::ASK_USER_QUESTION
     }
 
     fn description(&self) -> &str {

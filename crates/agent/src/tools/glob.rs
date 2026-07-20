@@ -49,7 +49,7 @@ struct GlobInput {
 
 impl AgentTool for GlobTool {
     fn name(&self) -> &str {
-        "Glob"
+        super::GLOB
     }
     fn description(&self) -> &str {
         "Find file paths matching a glob pattern (relative to cwd). Honors .gitignore and skips hidden files by default; returns relative paths, capped at 100. Pass no_ignore/include_hidden/include_dirs/limit to relax. Note: limit is hard-capped at 1000 — prefer narrowing the pattern over raising limit."

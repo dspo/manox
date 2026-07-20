@@ -3307,7 +3307,7 @@ impl Thread {
         // capped text. The `agent` envelope is exempt — it is bounded at
         // construction and the UI parses it as JSON, which truncation would
         // corrupt.
-        let output_str = if tu.name.as_ref() == "agent" {
+        let output_str = if tu.name.as_ref() == crate::tools::AGENT {
             output_str
         } else {
             crate::tools::truncate::truncate_result(&output_str).into_owned()
@@ -4050,7 +4050,7 @@ impl Thread {
 /// mapper.
 pub(crate) fn model_facing_content(c: &MessageContent) -> MessageContent {
     match c {
-        MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == "Agent" => {
+        MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == crate::tools::AGENT => {
             MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: tr.tool_use_id.clone(),
                 tool_name: tr.tool_name.clone(),
@@ -4091,15 +4091,16 @@ pub(crate) fn message_has_text(m: &Message) -> bool {
 
 /// Build a human-readable title for a tool call.
 pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
+    use crate::tools;
     match name {
-        "Read" | "Write" | "List" => {
+        x if x == tools::READ || x == tools::WRITE || x == tools::LIST => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
             format!("{name} {path}")
         }
         // edit_file's input is a single `patch` string whose first `[PATH#TAG]`
         // header names the target file. The path is everything before the last
         // `#`, so paths containing `#` survive.
-        "Edit" => {
+        x if x == tools::EDIT => {
             let patch = input.get("patch").and_then(|v| v.as_str()).unwrap_or("");
             let path = patch
                 .lines()
@@ -4111,7 +4112,7 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
                 .unwrap_or_default();
             format!("Edit {path}")
         }
-        "Bash" => {
+        x if x == tools::BASH => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let single = cmd.lines().next().unwrap_or("").trim().to_string();
             if single.chars().count() > 80 {
@@ -4121,15 +4122,15 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
                 single
             }
         }
-        "Grep" => {
+        x if x == tools::GREP => {
             let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             format!("Grep {p}")
         }
-        "Glob" => {
+        x if x == tools::GLOB => {
             let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             format!("Glob {p}")
         }
-        "Agent" => {
+        x if x == tools::AGENT => {
             let st = input
                 .get("subagent_type")
                 .and_then(|v| v.as_str())
@@ -4143,7 +4144,7 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
             };
             format!("Agent: {st} — {trimmed}")
         }
-        "AskUserQuestion" => {
+        x if x == tools::ASK_USER_QUESTION => {
             let q = input
                 .get("questions")
                 .and_then(|v| v.as_array())
@@ -4166,7 +4167,7 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
         }
         // `web_fetch` and the read-side browser tools surface the target URL so
         // the activity line reads like a Claude Code Fetch/Read action.
-        "WebFetch" => {
+        x if x == tools::WEB_FETCH => {
             let u = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
             format!("Fetch {u}")
         }
@@ -4281,7 +4282,7 @@ mod tests {
         let envelope = json!({ "final": "found 3 files", "messages": sub }).to_string();
         let tr = MessageContent::ToolResult(LanguageModelToolResult {
             tool_use_id: "tu_1".to_string(),
-            tool_name: Arc::from("Agent"),
+            tool_name: Arc::from(crate::tools::AGENT),
             is_error: false,
             content: envelope,
         });
@@ -4290,7 +4291,7 @@ mod tests {
             panic!("expected ToolResult");
         };
         assert_eq!(out.content, "found 3 files");
-        assert_eq!(out.tool_name.as_ref(), "Agent");
+        assert_eq!(out.tool_name.as_ref(), crate::tools::AGENT);
         // Original canonical content is untouched (still the envelope).
         let MessageContent::ToolResult(orig) = tr else {
             unreachable!()
@@ -4304,7 +4305,7 @@ mod tests {
     fn model_facing_content_passes_non_agent_through() {
         let tr = MessageContent::ToolResult(LanguageModelToolResult {
             tool_use_id: "tu_2".to_string(),
-            tool_name: Arc::from("Bash"),
+            tool_name: Arc::from(crate::tools::BASH),
             is_error: false,
             content: "command output".to_string(),
         });
@@ -4312,7 +4313,7 @@ mod tests {
             panic!("expected ToolResult");
         };
         assert_eq!(out.content, "command output");
-        assert_eq!(out.tool_name.as_ref(), "Bash");
+        assert_eq!(out.tool_name.as_ref(), crate::tools::BASH);
     }
 
     /// A legacy `agent` result (plain text, no envelope) falls back to the raw
@@ -4321,7 +4322,7 @@ mod tests {
     fn model_facing_content_agent_legacy_falls_back() {
         let tr = MessageContent::ToolResult(LanguageModelToolResult {
             tool_use_id: "tu_3".to_string(),
-            tool_name: Arc::from("Agent"),
+            tool_name: Arc::from(crate::tools::AGENT),
             is_error: false,
             content: "plain summary".to_string(),
         });
@@ -4374,7 +4375,7 @@ mod tests {
         });
         let tu = LanguageModelToolUse {
             id: "tu_1".to_string(),
-            name: Arc::from("SelfInfo"),
+            name: Arc::from(crate::tools::SELF_INFO),
             raw_input: "{}".to_string(),
             input: serde_json::json!({}),
             is_input_complete: true,
@@ -5014,7 +5015,7 @@ mod tests {
         });
         let tu = LanguageModelToolUse {
             id: "tu_aq".to_string(),
-            name: Arc::from("AskUserQuestion"),
+            name: Arc::from(crate::tools::ASK_USER_QUESTION),
             raw_input: "{}".to_string(),
             input: serde_json::json!({}),
             is_input_complete: true,
@@ -5349,7 +5350,7 @@ mod tests {
                 LanguageModelCompletionEvent::Text("let me read the file".into()),
                 LanguageModelCompletionEvent::ToolUseJsonParseError {
                     id: "tu_parse_1".into(),
-                    tool_name: Arc::from("Read"),
+                    tool_name: Arc::from(crate::tools::READ),
                     raw_input: "{bad".into(),
                     json_parse_error: "expected `}`".into(),
                 },

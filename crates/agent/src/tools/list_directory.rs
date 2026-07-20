@@ -28,7 +28,7 @@ struct ListDirectoryInput {
 
 impl AgentTool for ListTool {
     fn name(&self) -> &str {
-        "List"
+        super::LIST
     }
     fn description(&self) -> &str {
         "List the direct children (files and directories) of a directory."

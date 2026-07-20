@@ -32,7 +32,7 @@ struct WriteFileInput {
 
 impl AgentTool for WriteTool {
     fn name(&self) -> &str {
-        "Write"
+        super::WRITE
     }
     fn description(&self) -> &str {
         "Write content to the specified file (overwrite). Use to create or rewrite a file."

@@ -82,7 +82,7 @@ struct AgentToolInput {
 
 impl AgentToolTrait for SpawnAgentTool {
     fn name(&self) -> &str {
-        "Agent"
+        super::AGENT
     }
 
     fn description(&self) -> &str {

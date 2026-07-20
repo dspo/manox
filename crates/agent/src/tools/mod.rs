@@ -39,6 +39,31 @@ use std::sync::Arc;
 use crate::thread::Thread;
 use crate::tool::{AnyAgentTool, ToolRegistry};
 
+// ─── tool name constants ────────────────────────────────────────────────────
+//
+// Single source of truth for every built-in tool's wire name. Each tool's
+// `name()` returns its constant here, and every comparison site
+// (`model_facing_content`, `tool_title`, truncation exemptions, etc.)
+// references the same constant — a rename that misses a call site becomes a
+// compile error instead of a silent runtime bug (see #273, #279).
+
+pub const AGENT: &str = "Agent";
+pub const ASK_USER_QUESTION: &str = "AskUserQuestion";
+pub const BASH: &str = "Bash";
+pub const BASH_OUTPUT: &str = "BashOutput";
+pub const EDIT: &str = "Edit";
+pub const GLOB: &str = "Glob";
+pub const GREP: &str = "Grep";
+pub const LIST: &str = "List";
+pub const MONITOR: &str = "Monitor";
+pub const READ: &str = "Read";
+pub const SELF_INFO: &str = "SelfInfo";
+pub const SKILL: &str = "Skill";
+pub const WEB_FETCH: &str = "WebFetch";
+pub const ENTER_WORKTREE: &str = "EnterWorktree";
+pub const EXIT_WORKTREE: &str = "ExitWorktree";
+pub const WRITE: &str = "Write";
+
 // ─── shared helpers ───────────────────────────────────────────────────────
 
 /// Convert a schemars schema to a bare `{type, properties, required}` `Value`.

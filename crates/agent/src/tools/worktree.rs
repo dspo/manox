@@ -102,7 +102,7 @@ const EXIT_DESCRIPTION: &str = "Leave the active git worktree. `action=keep` (de
 
 impl AgentTool for EnterWorktreeTool {
     fn name(&self) -> &str {
-        "EnterWorktree"
+        super::ENTER_WORKTREE
     }
     fn description(&self) -> &str {
         ENTER_DESCRIPTION
@@ -256,7 +256,7 @@ impl AgentTool for EnterWorktreeTool {
 
 impl AgentTool for ExitWorktreeTool {
     fn name(&self) -> &str {
-        "ExitWorktree"
+        super::EXIT_WORKTREE
     }
     fn description(&self) -> &str {
         EXIT_DESCRIPTION

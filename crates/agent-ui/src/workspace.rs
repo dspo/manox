@@ -681,7 +681,7 @@ impl Workspace {
                     summary,
                     input,
                 } => {
-                    if tool_name == "AskUserQuestion" {
+                    if tool_name == agent::tools::ASK_USER_QUESTION {
                         this.pending_ask = parse_pending_ask(id.clone(), input.clone());
                         this.ask_step = 0;
                         this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);

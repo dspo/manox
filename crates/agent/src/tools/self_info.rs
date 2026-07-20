@@ -44,7 +44,7 @@ struct SelfInfoInput {}
 
 impl AgentToolTrait for SelfInfoTool {
     fn name(&self) -> &str {
-        "SelfInfo"
+        super::SELF_INFO
     }
 
     fn description(&self) -> &str {

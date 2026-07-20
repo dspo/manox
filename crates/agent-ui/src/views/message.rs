@@ -305,7 +305,7 @@ impl MessageItem {
             // list_directory / …) and MCP tools are manox abstractions, not
             // terminal commands — they render the body only, without the cwd
             // preamble that would imply "run this in a shell".
-            let is_terminal_command = entry.name.as_str() == "Bash";
+            let is_terminal_command = entry.name.as_str() == agent::tools::BASH;
             let command = if is_terminal_command {
                 entry
                     .input
@@ -577,7 +577,7 @@ pub fn render_item(
         } => render_assistant(text, ix, role, activity_summary.as_ref(), theme, body, cx),
         ConvItem::Thinking(t) => render_thinking(t, ix, theme, tool_ctx, cx),
         ConvItem::ToolCall(t) => {
-            if t.name == "AskUserQuestion" {
+            if t.name == agent::tools::ASK_USER_QUESTION {
                 render_ask_user_card(t, ix, theme, tool_ctx, cx)
             } else {
                 // Ordinary tool calls fold into `Thinking`; a top-level
@@ -2287,7 +2287,7 @@ fn render_tool_output(
     // copy-selection yields the display text while the LLM still sees numbered
     // output on the next turn. Non-`read_file` tools borrow the raw output
     // without allocating.
-    let display: std::borrow::Cow<'_, str> = if item.name == "Read" {
+    let display: std::borrow::Cow<'_, str> = if item.name == agent::tools::READ {
         std::borrow::Cow::Owned(strip_hashline_numbering(&display_output))
     } else {
         std::borrow::Cow::Borrowed(&display_output)
@@ -2833,7 +2833,7 @@ pub fn build_items(
                             }
                         }
                         MessageContent::ToolUse(tu) => {
-                            if tu.name.as_ref() == "Agent" {
+                            if tu.name.as_ref() == agent::tools::AGENT {
                                 // Sub-agent tasks stay as standalone top-level
                                 // cards (their expand panel reuses the full
                                 // sub-conversation renderer); never folded.
@@ -2851,7 +2851,7 @@ pub fn build_items(
                                     is_error: false,
                                     metrics: None,
                                 }));
-                            } else if tu.name.as_ref() == "AskUserQuestion" {
+                            } else if tu.name.as_ref() == agent::tools::ASK_USER_QUESTION {
                                 // An inline clarify card: stays a top-level
                                 // ToolCall so `render_ask_user_card` can drive
                                 // its interactive snapshot while pending; the
@@ -3389,7 +3389,7 @@ mod tests {
             _ => None,
         });
         let ask = items.iter().find_map(|i| match i {
-            ConvItem::ToolCall(t) if t.name == "AskUserQuestion" => Some(t),
+            ConvItem::ToolCall(t) if t.name == agent::tools::ASK_USER_QUESTION => Some(t),
             _ => None,
         });
         let seg = items.iter().find_map(|i| match i {
