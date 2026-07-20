@@ -7,11 +7,12 @@
 
 use agent::i18n;
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement,
-    Render, ScrollHandle, SharedString, Subscription, Window, prelude::*,
+    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement, Render,
+    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, prelude::*,
+    uniform_list,
 };
 use gpui_component::{
-    ActiveTheme as _, WindowExt as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, Size, WindowExt as _,
     input::{Input, InputEvent, InputState},
     notification::Notification,
     v_flex,
@@ -20,7 +21,7 @@ use gpui_component::{
 use crate::CopySelectedTurn;
 use crate::conversation::ConvItem;
 use crate::views::popup_menu::{
-    self, EMPTY_HEIGHT, MAX_LIST_HEIGHT, ROW_HEIGHT, SEARCH_HEIGHT,
+    self, EMPTY_HEIGHT, LIST_HORIZONTAL_PADDING, MAX_LIST_HEIGHT, ROW_HEIGHT, SEARCH_HEIGHT,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +93,7 @@ pub(crate) struct TurnNavigator {
     filtered: Vec<usize>,
     selected: usize,
     search: Entity<InputState>,
-    scroll_handle: ScrollHandle,
+    scroll_handle: UniformListScrollHandle,
     _search_sub: Subscription,
     #[cfg(test)]
     last_event: Option<TurnNavigatorEvent>,
@@ -110,7 +111,7 @@ impl TurnNavigator {
             filtered,
             selected: 0,
             search,
-            scroll_handle: ScrollHandle::new(),
+            scroll_handle: UniformListScrollHandle::new(),
             _search_sub,
             #[cfg(test)]
             last_event: None,
@@ -147,8 +148,10 @@ impl TurnNavigator {
             InputEvent::Change => {
                 let query = search.read(cx).value().to_string();
                 self.filtered = filter_turns(&self.all, &query);
-                // Keep selection within bounds; reset to first match.
-                self.selected = if self.filtered.is_empty() { 0 } else { 0 };
+                self.selected = 0;
+                if !self.filtered.is_empty() {
+                    self.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+                }
                 cx.notify();
             }
             InputEvent::PressEnter { shift: false, .. } => {
@@ -167,7 +170,8 @@ impl TurnNavigator {
         next = ((next % n) + n) % n;
         self.selected = next as usize;
         // Scroll the selected item into view.
-        self.scroll_handle.scroll_to_item(self.selected);
+        self.scroll_handle
+            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
@@ -196,22 +200,48 @@ impl TurnNavigator {
         cx.emit(TurnNavigatorEvent::Dismiss);
     }
 
-    fn navigate_up(&mut self, _: &crate::CompletionUp, _window: &mut Window, cx: &mut Context<Self>) {
+    fn navigate_up(
+        &mut self,
+        _: &crate::CompletionUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.move_selection(-1);
         cx.notify();
         cx.stop_propagation();
     }
 
-    fn navigate_down(&mut self, _: &crate::CompletionDown, _window: &mut Window, cx: &mut Context<Self>) {
+    fn navigate_down(
+        &mut self,
+        _: &crate::CompletionDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.move_selection(1);
         cx.notify();
         cx.stop_propagation();
     }
 
-    fn on_dismiss(&mut self, _: &crate::CompletionDismiss, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_dismiss(
+        &mut self,
+        _: &crate::CompletionDismiss,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.dismiss(cx);
         cx.stop_propagation();
     }
+
+    fn confirm_selected(
+        &mut self,
+        _: &crate::CompletionConfirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm(cx);
+        cx.stop_propagation();
+    }
+
     fn copy_selected(&mut self, _: &CopySelectedTurn, window: &mut Window, cx: &mut Context<Self>) {
         let Some(&entry_ix) = self.filtered.get(self.selected) else {
             return;
@@ -230,66 +260,65 @@ impl EventEmitter<TurnNavigatorEvent> for TurnNavigator {}
 impl Render for TurnNavigator {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let filtered = self.filtered.clone();
-        let all_for_closure = self.all.clone();
+        let filtered_len = self.filtered.len();
         let all_empty = self.all.is_empty();
-        let selected = self.selected;
         let scroll_handle = self.scroll_handle.clone();
-        let hover = popup_menu::hover_bg(&theme);
-        let selected_bg = popup_menu::selected_bg(&theme);
-        let radius = theme.radius;
-        let is_empty = filtered.is_empty();
+        let is_empty = filtered_len == 0;
+        let panel_height = self.panel_height(cx);
         let entity = cx.entity();
+        let list_theme = theme.clone();
 
-        let list = v_flex()
-            .id("turn-navigator-list")
-            .w_full()
-            .max_h(MAX_LIST_HEIGHT)
-            .overflow_y_scroll()
-            .track_scroll(&scroll_handle)
-            .min_w_0()
-            .children(filtered.iter().enumerate().map(move |(row_ix, &entry_ix)| {
-                let entity = entity.clone();
-                let is_selected = row_ix == selected;
-                let Some(turn) = all_for_closure.get(entry_ix) else {
-                    return gpui::div().into_any_element();
-                };
-                let display = turn.display.clone();
-                let item_ix = turn.item_ix;
-                let navigate_item_ix = turn.item_ix;
-
-                let mut row = gpui::div()
-                    .id(("turn-navigator-row", row_ix))
-                    .w_full()
-                    .h(ROW_HEIGHT)
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .rounded(radius)
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover));
-
-                if is_selected {
-                    row = row.bg(selected_bg);
-                }
-
-                row.child(
-                    gpui::div()
-                        .w_full()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .debug_selector(|| format!("TURN_NAVIGATOR_ROW_{}", item_ix))
-                        .child(SharedString::from(display)),
-                )
-                .on_click(move |_, _, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.selected = row_ix;
-                        cx.emit(TurnNavigatorEvent::Navigate { item_ix: navigate_item_ix });
-                    });
-                })
-                .into_any_element()
-            }));
+        let list = uniform_list(
+            "turn-navigator-list",
+            filtered_len,
+            move |visible_range, _window, cx| {
+                visible_range
+                    .filter_map(|row_ix| {
+                        let (display, item_ix, is_selected) = {
+                            let navigator = entity.read(cx);
+                            let entry_ix = *navigator.filtered.get(row_ix)?;
+                            let turn = navigator.all.get(entry_ix)?;
+                            (
+                                turn.display.clone(),
+                                turn.item_ix,
+                                row_ix == navigator.selected,
+                            )
+                        };
+                        let entity = entity.clone();
+                        Some(
+                            popup_menu::render_popup_row(
+                                row_ix,
+                                "turn-navigator-row",
+                                is_selected,
+                                &list_theme,
+                                gpui::div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .debug_selector(move || {
+                                        format!("TURN_NAVIGATOR_ROW_{}", item_ix)
+                                    })
+                                    .child(SharedString::from(display)),
+                                move |_, _, cx| {
+                                    entity.update(cx, |this, cx| {
+                                        this.selected = row_ix;
+                                        this.confirm(cx);
+                                    });
+                                },
+                            )
+                            .into_any_element(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .w_full()
+        .flex_1()
+        .min_h_0()
+        .px(LIST_HORIZONTAL_PADDING)
+        .track_scroll(&scroll_handle)
+        .min_w_0();
 
         let body = if is_empty {
             popup_menu::render_empty_state(
@@ -309,12 +338,14 @@ impl Render for TurnNavigator {
             .id("turn-navigator")
             .key_context("TurnNavigator")
             .w_full()
+            .h(panel_height)
             .overflow_hidden()
             .bg(theme.popover)
             .text_color(theme.popover_foreground)
             .on_action(cx.listener(Self::navigate_up))
             .on_action(cx.listener(Self::navigate_down))
             .on_action(cx.listener(Self::on_dismiss))
+            .on_action(cx.listener(Self::confirm_selected))
             .on_action(cx.listener(Self::copy_selected))
             .child(
                 gpui::div()
@@ -326,10 +357,12 @@ impl Render for TurnNavigator {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(
-                        gpui::div()
-                            .w_full()
-                            .h_full()
-                            .child(Input::new(&self.search).appearance(false))
+                        Input::new(&self.search)
+                            .with_size(Size::Small)
+                            .prefix(Icon::new(IconName::Search).text_color(theme.muted_foreground))
+                            .cleanable(true)
+                            .p_0()
+                            .appearance(false),
                     ),
             )
             .child(body)
@@ -406,6 +439,7 @@ mod tests {
     #[gpui::test]
     fn keyboard_mouse_search_navigation_copy_and_dismiss(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
+        cx.update(|cx| cx.bind_keys(crate::turn_navigator_key_bindings()));
         let slot = Rc::new(RefCell::new(None));
         let slot_for_window = slot.clone();
         let turns = vec![
@@ -446,7 +480,7 @@ mod tests {
 
         navigator.update(cx, |navigator, _| navigator.last_event = None);
         let older_row = cx
-            .debug_bounds("TURN_NAVIGATOR_ROW_0")
+            .debug_bounds("turn-navigator-row_1")
             .expect("filtered row rendered");
         cx.simulate_click(older_row.center(), Modifiers::default());
         navigator.read_with(cx, |navigator, _| {

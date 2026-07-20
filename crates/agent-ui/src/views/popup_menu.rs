@@ -4,7 +4,7 @@
 //! panels with selectable rows. This module centralizes their visual tokens so
 //! the two surfaces stay consistent.
 
-use gpui::{Pixels, prelude::*, px};
+use gpui::{App, ClickEvent, Pixels, Window, prelude::*, px};
 use gpui_component::{Theme, v_flex};
 
 /// Height of a single row in the popup menu.
@@ -18,6 +18,9 @@ pub const EMPTY_HEIGHT: Pixels = px(72.0);
 
 /// Maximum height of the scrollable list area.
 pub const MAX_LIST_HEIGHT: Pixels = px(300.0);
+
+/// Horizontal inset between popup rows and the panel edge.
+pub const LIST_HORIZONTAL_PADDING: Pixels = px(4.0);
 
 /// Hover background tint — muted foreground at very low opacity.
 pub fn hover_bg(theme: &Theme) -> gpui::Hsla {
@@ -41,6 +44,7 @@ pub fn render_popup_row(
     is_selected: bool,
     theme: &Theme,
     content: impl IntoElement,
+    on_select: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let hover = hover_bg(theme);
     let selected = selected_bg(theme);
@@ -50,24 +54,22 @@ pub fn render_popup_row(
         .id((id_prefix, ix))
         .w_full()
         .h(ROW_HEIGHT)
+        .flex()
         .items_center()
         .gap_2()
         .px_2()
         .rounded(radius)
-        .cursor_pointer()
-        .hover(move |s| s.bg(hover));
+        .debug_selector(move || format!("{}_{}", id_prefix, ix))
+        .cursor_pointer();
 
     if is_selected {
         row = row.bg(selected);
+    } else {
+        row = row.hover(move |s| s.bg(hover));
     }
 
-    row.child(
-        gpui::div()
-            .w_full()
-            .min_w_0()
-            .items_center()
-            .child(content),
-    )
+    row.child(gpui::div().w_full().min_w_0().items_center().child(content))
+        .on_click(on_select)
 }
 
 /// Wrap a list of rows in the standard popup container: popover background,
@@ -81,6 +83,7 @@ pub fn popup_container(theme: &Theme, content: impl IntoElement) -> gpui::Div {
         .border_color(theme.border)
         .rounded(theme.radius)
         .shadow_md()
+        .overflow_hidden()
         .child(content)
 }
 

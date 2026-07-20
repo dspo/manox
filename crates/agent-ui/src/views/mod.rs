@@ -8,10 +8,10 @@ pub mod management_shell;
 pub mod member_panel;
 pub mod message;
 pub mod plugin_manager;
+pub mod popup_menu;
 pub mod settings;
 pub mod sidebar;
 pub mod title_menu;
-pub mod popup_menu;
 pub mod turn_navigator;
 
 use gpui::prelude::*;

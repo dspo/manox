@@ -49,3 +49,26 @@ gpui::actions!(
         CopySelectedTurn
     ]
 );
+
+/// Keybindings owned by the user-turn navigator.
+///
+/// Keeping these beside the actions lets the application and GPUI interaction
+/// tests install the exact same bindings. The descendant context is more
+/// specific than the input's own bindings, so navigation keys are intercepted
+/// only while the navigator search field is focused.
+pub fn turn_navigator_key_bindings() -> Vec<gpui::KeyBinding> {
+    vec![
+        #[cfg(target_os = "macos")]
+        gpui::KeyBinding::new("cmd-m", ToggleTurnNavigator, None),
+        #[cfg(not(target_os = "macos"))]
+        gpui::KeyBinding::new("ctrl-m", ToggleTurnNavigator, None),
+        #[cfg(target_os = "macos")]
+        gpui::KeyBinding::new("cmd-c", CopySelectedTurn, Some("TurnNavigator > Input")),
+        #[cfg(not(target_os = "macos"))]
+        gpui::KeyBinding::new("ctrl-c", CopySelectedTurn, Some("TurnNavigator > Input")),
+        gpui::KeyBinding::new("up", CompletionUp, Some("TurnNavigator > Input")),
+        gpui::KeyBinding::new("down", CompletionDown, Some("TurnNavigator > Input")),
+        gpui::KeyBinding::new("enter", CompletionConfirm, Some("TurnNavigator > Input")),
+        gpui::KeyBinding::new("escape", CompletionDismiss, Some("TurnNavigator > Input")),
+    ]
+}

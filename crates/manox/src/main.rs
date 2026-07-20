@@ -139,25 +139,6 @@ fn main() {
             gpui::KeyBinding::new("cmd-,", agent_ui::OpenSettings, None),
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-,", agent_ui::OpenSettings, None),
-            // Search and navigate the active thread's user turns.
-            #[cfg(target_os = "macos")]
-            gpui::KeyBinding::new("cmd-m", agent_ui::ToggleTurnNavigator, None),
-            #[cfg(not(target_os = "macos"))]
-            gpui::KeyBinding::new("ctrl-m", agent_ui::ToggleTurnNavigator, None),
-            // While the navigator is open, copy the selected
-            // turn's full text rather than the input selection.
-            #[cfg(target_os = "macos")]
-            gpui::KeyBinding::new(
-                "cmd-c",
-                agent_ui::CopySelectedTurn,
-                Some("TurnNavigator"),
-            ),
-            #[cfg(not(target_os = "macos"))]
-            gpui::KeyBinding::new(
-                "ctrl-c",
-                agent_ui::CopySelectedTurn,
-                Some("TurnNavigator"),
-            ),
             // Ask drawer: left/right arrows navigate questions, escape closes.
             gpui::KeyBinding::new("left", agent_ui::AskPrev, Some("AskDrawer")),
             gpui::KeyBinding::new("right", agent_ui::AskNext, Some("AskDrawer")),
@@ -244,6 +225,7 @@ fn main() {
             // on the active Workspace (see `Workspace::Render`).
             gpui::KeyBinding::new("shift-tab", agent_ui::CycleCollaborationMode, None),
         ]);
+        cx.bind_keys(agent_ui::turn_navigator_key_bindings());
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &ToggleFullscreen, cx: &mut App| {
             if let Some(handle) = cx.active_window() {

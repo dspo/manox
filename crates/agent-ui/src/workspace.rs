@@ -56,6 +56,7 @@ use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
 };
 use crate::views::member_panel::MemberPanel;
+use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
@@ -1750,18 +1751,11 @@ impl Workspace {
                         .items_center()
                         .pt(TITLE_BAR_HEIGHT + px(8.0))
                         .child(
-                            gpui::div()
+                            popup_menu::popup_container(theme, navigator)
                                 .id("turn-navigator-panel")
                                 .w(layout.panel_width)
                                 .h(panel_height)
-                                .overflow_hidden()
-                                .rounded(theme.radius)
-                                .border_1()
-                                .border_color(theme.border)
-                                .shadow_md()
-                                .bg(theme.popover)
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(navigator),
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
                         ),
                 )
                 .into_any_element(),
