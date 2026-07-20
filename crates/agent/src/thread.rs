@@ -400,11 +400,14 @@ fn normalize_assistant_content(content: &mut Vec<MessageContent>) {
 /// `Continue` loops back to `build_completion_request` with the failure fed
 /// back into history (a max-tokens directive or an error tool_result, both
 /// append-only so the prefix cache stays intact); `Abort` ends the turn on the
-/// recovery-retry cap.
+/// recovery-retry cap. `CompactAndRetry` answers a context overflow: shrink
+/// history with one compaction, then re-request — the only recovery that can
+/// make an unsendable request sendable.
 enum RecoveryAction {
     Done,
     Continue,
     Abort,
+    CompactAndRetry,
 }
 
 pub struct Thread {
@@ -499,6 +502,17 @@ pub struct Thread {
     /// `run_turn_loop` entry — it accumulates within a single turn's retries,
     /// not across turns.
     recovery_retries: u32,
+    /// Set alongside `pending_stream_error` when the mid-stream error is a
+    /// classified `ContextOverflow` — the empty-tool-use branch then routes to
+    /// a single compact-and-retry instead of the generic nudge, because
+    /// re-sending the identical oversized request can never succeed.
+    pending_context_overflow: bool,
+    /// Whether this turn already spent its one compact-and-retry after a
+    /// context overflow. Set when the recovery fires; cleared when a request
+    /// completes without a stream error (and at turn entry), so a later,
+    /// genuinely-new overflow earns its own recovery while a repeated one
+    /// aborts the turn instead of looping compactions.
+    overflow_recovery_attempted: bool,
     /// The `StopReason` of the most recent completion, inspected by the
     /// empty-tool-use branch to detect max-tokens truncation. Reset at the top
     /// of each round-trip and after a recovery turn so a prior stop reason
@@ -767,6 +781,8 @@ impl Thread {
                 pending_parse_error: false,
                 pending_stream_error: None,
                 recovery_retries: 0,
+                pending_context_overflow: false,
+                overflow_recovery_attempted: false,
                 last_stop_reason: None,
                 running_turn: None,
                 turn_started_at: None,
@@ -854,6 +870,8 @@ impl Thread {
                 pending_parse_error: false,
                 pending_stream_error: None,
                 recovery_retries: 0,
+                pending_context_overflow: false,
+                overflow_recovery_attempted: false,
                 last_stop_reason: None,
                 running_turn: None,
                 turn_started_at: None,
@@ -945,6 +963,8 @@ impl Thread {
                 pending_parse_error: false,
                 pending_stream_error: None,
                 recovery_retries: 0,
+                pending_context_overflow: false,
+                overflow_recovery_attempted: false,
                 last_stop_reason: None,
                 running_turn: None,
                 turn_started_at: None,
@@ -1574,18 +1594,6 @@ impl Thread {
         self.token_meter.cumulative()
     }
 
-    /// Usage of the most recent user message that already has a reported usage
-    /// — the latest *single* request's fill, not the cross-turn cumulative. This
-    /// mirrors the selection the auto-compaction trigger uses, so the cockpit
-    /// budget display and the trigger agree on what "current" means.
-    pub fn latest_request_usage(&self) -> Option<TokenUsage> {
-        crate::compact::latest_reported_request_usage(
-            &self.messages,
-            self.token_meter.per_request(),
-        )
-        .map(|(_, usage)| usage)
-    }
-
     /// Per-user-message usage, keyed by `Message::id`.
     pub fn request_token_usage(&self) -> &HashMap<String, TokenUsage> {
         self.token_meter.per_request()
@@ -2124,16 +2132,15 @@ impl Thread {
 
     /// The index at which a compaction should be inserted right now under
     /// auto-trigger rules, or `None` when auto-compaction is off, the window is
-    /// too small, no usage has been reported, a compaction already covers the
-    /// region, or the threshold has not been crossed. Sub-agents never
-    /// auto-compact — a delegated sub-thread should not silently rewrite its
-    /// own context under the parent's nose.
+    /// too small, a compaction already covers the region, or the threshold has
+    /// not been crossed. Sub-agents never auto-compact — a delegated
+    /// sub-thread should not silently rewrite its own context under the
+    /// parent's nose (its overflow rescue path is separate and unconditional).
     ///
-    /// Two independent trigger paths:
-    /// 1. **Token threshold**: `active_tokens >= max_input * threshold_pct`
-    /// 2. **Body size**: estimated request body `>= MAX_REQUEST_BODY_BYTES` (6 MiB)
-    ///
-    /// Either one fires compaction.
+    /// The trigger fires when the effective context fill — the larger of the
+    /// provider-reported usage and a local bytes/4 estimate of the live
+    /// history — crosses `max_input * threshold_pct` (see
+    /// `compact::effective_context_tokens`).
     fn auto_compaction_target(&self) -> Option<usize> {
         if self.depth != 0 {
             return None;
@@ -2141,14 +2148,6 @@ impl Thread {
         let settings = crate::settings::load();
         if !settings.auto_compact.enabled {
             return None;
-        }
-        // Body size trigger: fires regardless of the token threshold or
-        // model window size. Providers reject oversized request bodies, so
-        // compaction is mandatory even on models with a small context window
-        // (where the token-based path would bail on MIN_COMPACTION_CONTEXT_WINDOW).
-        let body_bytes = crate::compact::estimate_request_body_bytes(&self.messages);
-        if body_bytes >= crate::compact::MAX_REQUEST_BODY_BYTES {
-            return crate::compact::forced_compaction_target_ix(&self.messages);
         }
         let model = self.model.as_ref()?;
         // Claude Code parity: an explicit auto-compact window from the
@@ -2210,6 +2209,29 @@ impl Thread {
     /// the prefix-cache fingerprint. The summary request is built and streamed
     /// outside any `this` write lease; only the final insert + bookkeeping hold
     /// the lease. Returns the summary text on success.
+    /// The overflow recovery shared by the handshake and mid-stream failure
+    /// paths: compact history once so the re-request can fit the window.
+    /// Returns `false` when there is nothing left to compact — the caller
+    /// then aborts the turn with guidance. Unlike threshold auto-compaction
+    /// this rescue runs regardless of `settings.auto_compact.enabled` and of
+    /// `depth`: a sub-agent drowning in oversized tool results needs the
+    /// same lifeline as the main thread.
+    async fn compact_for_overflow_retry(
+        this: &gpui::WeakEntity<Self>,
+        model: &AnyLanguageModel,
+        cancel: &CancellationToken,
+        cx: &mut AsyncApp,
+    ) -> Result<bool> {
+        let insertion_ix = this.read_with(cx, |this, _| {
+            crate::compact::forced_compaction_target_ix(&this.messages)
+        })?;
+        let Some(insertion_ix) = insertion_ix else {
+            return Ok(false);
+        };
+        Self::perform_compaction(this, model, insertion_ix, cancel, cx).await?;
+        Ok(true)
+    }
+
     async fn perform_compaction(
         this: &WeakEntity<Self>,
         model: &AnyLanguageModel,
@@ -2406,7 +2428,9 @@ impl Thread {
             // recovery round-trips, then resets here on the next user turn.
             this.pending_parse_error = false;
             this.pending_stream_error = None;
+            this.pending_context_overflow = false;
             this.recovery_retries = 0;
+            this.overflow_recovery_attempted = false;
             this.last_stop_reason = None;
         })?;
         loop {
@@ -2421,6 +2445,7 @@ impl Thread {
                 this.turn_count += 1;
                 this.pending_parse_error = false;
                 this.pending_stream_error = None;
+                this.pending_context_overflow = false;
                 this.last_stop_reason = None;
             })?;
 
@@ -2474,6 +2499,28 @@ impl Thread {
                 s = model.stream_completion(request, cx) => match s {
                     Ok(s) => s,
                     Err(e) => {
+                        // A context-overflow rejection is deterministic: the
+                        // identical request can never succeed, so skip the
+                        // nudge-and-retry and spend the turn's single
+                        // compact-and-retry instead.
+                        if e.downcast_ref::<crate::provider::overflow::ContextOverflow>().is_some() {
+                            let already_attempted = this.update(cx, |this, _| {
+                                std::mem::replace(&mut this.overflow_recovery_attempted, true)
+                            })?;
+                            if already_attempted {
+                                return Err(anyhow::anyhow!(
+                                    "context overflow: the request still exceeds the model's \
+                                     input limit after one compaction retry. Run /compact or \
+                                     start a new thread. Last error: {e}"
+                                ));
+                            }
+                            if !Self::compact_for_overflow_retry(this, model, cancel, cx).await? {
+                                return Err(anyhow::anyhow!(
+                                    "context overflow: nothing left to compact. Start a new thread."
+                                ));
+                            }
+                            continue;
+                        }
                         let abort_err = this.update(cx, |this, cx| {
                             this.recovery_retries += 1;
                             let round = this.turn_count;
@@ -2583,6 +2630,14 @@ impl Thread {
             if cancelled {
                 break;
             }
+            // A round that streamed without an error proves the request was
+            // sendable: any overflow recovery spent earlier has done its job,
+            // so a later, genuinely-new overflow earns its own single retry.
+            this.update(cx, |this, _| {
+                if this.pending_stream_error.is_none() {
+                    this.overflow_recovery_attempted = false;
+                }
+            })?;
 
             // Categorize tool_uses into free / approval / auto-review queues.
             // The auto-review queue is settled in a second pass below — we
@@ -2720,6 +2775,25 @@ impl Thread {
                     {
                         return RecoveryAction::Done;
                     }
+                    // A context-overflow stream error is deterministic: the
+                    // identical request can never succeed, so it neither
+                    // consumes the generic retry budget nor gets a nudge —
+                    // compact once and retry. A second overflow after the
+                    // recovery aborts the turn with guidance.
+                    if stream_err.is_some() && this.pending_context_overflow {
+                        this.pending_context_overflow = false;
+                        this.last_stop_reason = None;
+                        if this.overflow_recovery_attempted {
+                            cx.emit(ThreadEvent::Error(anyhow::anyhow!(
+                                "context overflow: the request still exceeds the model's \
+                                 input limit after one compaction retry. Run /compact or \
+                                 start a new thread."
+                            )));
+                            return RecoveryAction::Abort;
+                        }
+                        this.overflow_recovery_attempted = true;
+                        return RecoveryAction::CompactAndRetry;
+                    }
                     this.recovery_retries += 1;
                     if this.recovery_retries > MAX_RECOVERY_ATTEMPTS {
                         cx.emit(ThreadEvent::Error(anyhow::anyhow!(
@@ -2802,6 +2876,23 @@ impl Thread {
                     }
                     RecoveryAction::Abort => break,
                     RecoveryAction::Continue => continue,
+                    RecoveryAction::CompactAndRetry => {
+                        let compacted = match model.as_ref() {
+                            Some(model) => {
+                                Self::compact_for_overflow_retry(this, model, cancel, cx).await?
+                            }
+                            None => false,
+                        };
+                        if !compacted {
+                            this.update(cx, |_, cx| {
+                                cx.emit(ThreadEvent::Error(anyhow::anyhow!(
+                                    "context overflow: nothing left to compact. Start a new thread."
+                                )))
+                            })?;
+                            break;
+                        }
+                        continue;
+                    }
                 }
             }
 
@@ -3156,6 +3247,16 @@ impl Thread {
             Ok(o) => (o, false),
             Err(e) => (e, true),
         };
+        // Every tool result enters the conversation bounded: the UI event, the
+        // persisted messages, and the PostToolUse hook all share this one
+        // capped text. The `agent` envelope is exempt — it is bounded at
+        // construction and the UI parses it as JSON, which truncation would
+        // corrupt.
+        let output_str = if tu.name.as_ref() == "agent" {
+            output_str
+        } else {
+            crate::tools::truncate::truncate_result(&output_str).into_owned()
+        };
 
         this.update(cx, |_, cx| {
             cx.emit(ThreadEvent::ToolCall {
@@ -3400,6 +3501,11 @@ impl Thread {
                 // a half-finished assistant message (thread 0b80401d). When a
                 // tool_use was already produced the flag is moot — the tool path
                 // runs and the loop re-requests; it is cleared at round-trip top.
+                // A classified overflow is remembered so the recovery compacts
+                // once instead of nudging an unsendable request.
+                self.pending_context_overflow = e
+                    .downcast_ref::<crate::provider::overflow::ContextOverflow>()
+                    .is_some();
                 self.pending_stream_error = Some(format!("{e}"));
                 cx.emit(ThreadEvent::Error(e));
             }
@@ -5435,6 +5541,250 @@ mod tests {
             super::MAX_RECOVERY_ATTEMPTS as usize,
             "a recovery nudge must be appended on each continued mid-stream-error retry"
         );
+    }
+
+    /// A model playing a scripted sequence of per-call outcomes, for overflow
+    /// recovery tests: `Overflow` fails the request mid-stream with a
+    /// classified `ContextOverflow`; `Text` completes with visible output.
+    struct OverflowScriptMockModel {
+        id: Arc<str>,
+        calls: Arc<std::sync::atomic::AtomicU64>,
+        script: Arc<Vec<OverflowCall>>,
+    }
+
+    enum OverflowCall {
+        Overflow,
+        Text(&'static str),
+    }
+
+    impl crate::language_model::LanguageModel for OverflowScriptMockModel {
+        fn id(&self) -> String {
+            self.id.to_string()
+        }
+        fn name(&self) -> String {
+            self.id.to_string()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            let calls = self.calls.clone();
+            let script = self.script.clone();
+            Box::pin(async move {
+                use futures::StreamExt as _;
+                use std::sync::atomic::Ordering;
+                let n = calls.fetch_add(1, Ordering::SeqCst) as usize;
+                let call = script.get(n).or(script.last()).expect("non-empty script");
+                let events: Vec<anyhow::Result<LanguageModelCompletionEvent>> = match call {
+                    OverflowCall::Overflow => vec![Err(anyhow::Error::new(
+                        crate::provider::overflow::ContextOverflow(
+                            "Anthropic API returned 400 Bad Request: prompt is too long".into(),
+                        ),
+                    ))],
+                    OverflowCall::Text(t) => vec![
+                        Ok(LanguageModelCompletionEvent::Text((*t).into())),
+                        Ok(LanguageModelCompletionEvent::Stop(
+                            crate::language_model::StopReason::EndTurn,
+                        )),
+                    ],
+                };
+                Ok(futures::stream::iter(events).boxed())
+            })
+        }
+    }
+
+    /// Drives one scripted thread to completion and returns
+    /// `(calls, message snapshot)`. `depth` exercises the sub-agent path.
+    #[cfg(test)]
+    fn run_scripted_overflow_thread(
+        script: Vec<OverflowCall>,
+        depth: u32,
+    ) -> (u64, Vec<crate::message::Message>) {
+        use crate::message::Message;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(|cx| {
+            crate::runtime::init(cx);
+        });
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open mem db"),
+        );
+        cx.update(|cx| {
+            crate::thread_store::init_for_test(db, cx);
+        });
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(OverflowScriptMockModel {
+            id: "test/overflow-script".into(),
+            calls: calls.clone(),
+            script: Arc::new(script),
+        });
+
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                "reg-overflow-recovery",
+                "/tmp",
+                vec![Message::user("summarize the work and deliver".into())],
+            );
+            rec.title = Some("overflow recovery".into());
+            let thread = super::Thread::restore(rec, Some(model), cx);
+            thread.update(cx, |t, _| t.depth = depth);
+            thread
+        });
+
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| t.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            let done = cx.update(|cx| thread.read_with(cx, |t, _| !t.is_running()));
+            if done {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run_turn did not finish within 30s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.run_until_parked();
+
+        let messages = cx.update(|cx| thread.read_with(cx, |t, _| t.messages.clone()));
+        let call_count = calls.load(std::sync::atomic::Ordering::SeqCst);
+        (call_count, messages)
+    }
+
+    #[cfg(test)]
+    fn count_nudges(messages: &[crate::message::Message]) -> usize {
+        messages
+            .iter()
+            .filter(|m| m.role == crate::language_model::Role::User)
+            .filter(|m| {
+                m.content.iter().any(|c| match c {
+                    crate::language_model::MessageContent::Text(t) => {
+                        t.contains("previous model request failed")
+                    }
+                    _ => false,
+                })
+            })
+            .count()
+    }
+
+    #[cfg(test)]
+    fn count_compactions(messages: &[crate::message::Message]) -> usize {
+        messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .iter()
+                    .any(|c| matches!(c, crate::language_model::MessageContent::Compaction(_)))
+            })
+            .count()
+    }
+
+    /// A context-overflow stream error must NOT produce a recovery nudge (the
+    /// identical request can never succeed); instead the turn compacts once
+    /// and retries — and the retry then succeeds.
+    #[test]
+    fn run_turn_recovers_context_overflow_via_single_compaction() {
+        let (calls, messages) = run_scripted_overflow_thread(
+            vec![
+                OverflowCall::Overflow,
+                OverflowCall::Text("compacted summary"),
+                OverflowCall::Text("final answer"),
+            ],
+            0,
+        );
+        assert_eq!(calls, 3, "request + compaction side call + retried request");
+        assert_eq!(count_nudges(&messages), 0, "overflow never injects a nudge");
+        assert_eq!(
+            count_compactions(&messages),
+            1,
+            "exactly one compaction ran"
+        );
+        let final_text: String = messages
+            .iter()
+            .filter(|m| m.role == crate::language_model::Role::Assistant)
+            .filter_map(|m| {
+                m.content.iter().find_map(|c| match c {
+                    crate::language_model::MessageContent::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(
+            final_text.contains("final answer"),
+            "turn completes: {final_text}"
+        );
+    }
+
+    /// The recovery budget is one: when the post-compaction retry overflows
+    /// again, the turn aborts instead of looping compactions.
+    #[test]
+    fn run_turn_aborts_on_repeated_context_overflow() {
+        let (calls, messages) = run_scripted_overflow_thread(
+            vec![
+                OverflowCall::Overflow,
+                OverflowCall::Text("compacted summary"),
+                OverflowCall::Overflow,
+            ],
+            0,
+        );
+        assert_eq!(
+            calls, 3,
+            "request + compaction + failed retry; no fourth call"
+        );
+        assert_eq!(count_compactions(&messages), 1, "no second compaction");
+        assert_eq!(count_nudges(&messages), 0, "overflow never injects a nudge");
+    }
+
+    /// Sub-agents get the same overflow lifeline: depth does not disable the
+    /// compact-and-retry rescue.
+    #[test]
+    fn run_turn_recovers_context_overflow_in_subagent() {
+        let (calls, messages) = run_scripted_overflow_thread(
+            vec![
+                OverflowCall::Overflow,
+                OverflowCall::Text("compacted summary"),
+                OverflowCall::Text("final answer"),
+            ],
+            1,
+        );
+        assert_eq!(calls, 3);
+        assert_eq!(count_compactions(&messages), 1);
     }
 
     /// `run_enter_plan_mode` flips `plan_mode` on, emits a success ToolCall,

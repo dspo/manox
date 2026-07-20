@@ -5,6 +5,7 @@
 pub mod anthropic;
 pub mod anthropic_cache;
 pub mod completions;
+pub mod overflow;
 pub mod registry;
 pub mod responses;
 pub mod retry;

@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use agent::compact::{MIN_COMPACTION_CONTEXT_WINDOW, active_tokens};
+use agent::compact::MIN_COMPACTION_CONTEXT_WINDOW;
 use agent::language_model::TokenUsage;
 
 /// Lifecycle of a single plan-derived milestone. `Blocked` / `Completed` /
@@ -173,24 +173,24 @@ fn strip_list_marker(line: &str) -> Option<&str> {
     }
 }
 
-/// Estimate the remaining context budget. `None` only when the window is zero
-/// — the caller always supplies a usage value (the latest single request's
-/// fill), so the indicator never falls back to a placeholder. When auto-summary
-/// is enabled and the window qualifies (≥ [`MIN_COMPACTION_CONTEXT_WINDOW`]),
-/// the budget is measured against the trigger threshold; otherwise against the
-/// raw window. The active token count is the latest request's fill, matching
-/// the auto-compaction trigger's notion of "current" usage, so the percentage
-/// reads as "share of the context window the latest request occupies".
+/// Estimate the remaining context budget. `None` only when the window is zero.
+/// The active token count is the thread's effective context fill (the larger
+/// of provider-reported usage and the local history estimate), matching the
+/// auto-compaction trigger's notion of "current" usage, so the percentage
+/// reads as "share of the context window the current history occupies". When
+/// auto-summary is enabled and the window qualifies (≥
+/// [`MIN_COMPACTION_CONTEXT_WINDOW`]), the budget is measured against the
+/// trigger threshold; otherwise against the raw window.
 pub fn context_budget_pct(
     max_input_tokens: u64,
-    last_usage: TokenUsage,
+    active_tokens: u64,
     auto_compact_enabled: bool,
     threshold: f64,
 ) -> Option<ContextBudget> {
     if max_input_tokens == 0 {
         return None;
     }
-    let active = active_tokens(last_usage) as f64;
+    let active = active_tokens as f64;
     let cap = max_input_tokens as f64;
     let trigger = if auto_compact_enabled && max_input_tokens >= MIN_COMPACTION_CONTEXT_WINDOW {
         cap * threshold
@@ -218,19 +218,6 @@ pub fn format_tokens(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1_000.0)
     } else {
         n.to_string()
-    }
-}
-
-/// Compact MiB rendering for the request-body budget: `6m` / `1.2m`. Integer
-/// magnitudes drop the decimal so the 6 MiB cap reads as `6m` not `6.0m`.
-/// Inputs are raw bytes under the 1024² convention used by
-/// [`agent::compact::MAX_REQUEST_BODY_BYTES`].
-pub fn format_mib(bytes: usize) -> String {
-    let m = bytes as f64 / (1024.0 * 1024.0);
-    if m.fract() == 0.0 {
-        format!("{}m", m as i64)
-    } else {
-        format!("{:.1}m", m)
     }
 }
 
@@ -334,13 +321,7 @@ mod tests {
     #[test]
     fn context_budget_pct_basic() {
         // 200k window, auto-compact on (threshold 0.9 → trigger 180k), 90k active.
-        let usage = TokenUsage {
-            input_tokens: 90_000,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
-        let b = context_budget_pct(200_000, usage, true, 0.9).unwrap();
+        let b = context_budget_pct(200_000, 90_000, true, 0.9).unwrap();
         // remaining = (180k - 90k)/180k = 50%
         assert!((b.remaining_pct - 50.0).abs() < 0.01);
         assert!(b.is_estimate);
@@ -348,38 +329,20 @@ mod tests {
 
     #[test]
     fn context_budget_pct_zero_window() {
-        let usage = TokenUsage {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
-        assert_eq!(context_budget_pct(0, usage, true, 0.9), None);
+        assert_eq!(context_budget_pct(0, 0, true, 0.9), None);
     }
 
     #[test]
     fn context_budget_pct_small_window_uses_raw_cap() {
         // Window < MIN_COMPACTION_CONTEXT_WINDOW (80k): budget vs raw cap, not trigger.
-        let usage = TokenUsage {
-            input_tokens: 40_000,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
-        let b = context_budget_pct(50_000, usage, true, 0.9).unwrap();
+        let b = context_budget_pct(50_000, 40_000, true, 0.9).unwrap();
         // remaining = (50k - 40k)/50k = 20%
         assert!((b.remaining_pct - 20.0).abs() < 0.01);
     }
 
     #[test]
     fn context_budget_pct_clamps_at_zero_when_over() {
-        let usage = TokenUsage {
-            input_tokens: 500_000,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
-        let b = context_budget_pct(200_000, usage, true, 0.9).unwrap();
+        let b = context_budget_pct(200_000, 500_000, true, 0.9).unwrap();
         assert_eq!(b.remaining_pct, 0.0);
     }
 
@@ -390,16 +353,6 @@ mod tests {
         assert_eq!(format_tokens(8_100), "8.1k");
         assert_eq!(format_tokens(22_700), "22.7k");
         assert_eq!(format_tokens(1_100_000), "1.1m");
-    }
-
-    #[test]
-    fn format_mib_cases() {
-        // 6 MiB cap (MAX_REQUEST_BODY_BYTES) renders as "6m", not "6.0m".
-        assert_eq!(format_mib(6 * 1024 * 1024), "6m");
-        // 1.2 MiB keeps one decimal.
-        assert_eq!(format_mib(1_258_291), "1.2m");
-        // Zero body → "0m".
-        assert_eq!(format_mib(0), "0m");
     }
 
     #[test]

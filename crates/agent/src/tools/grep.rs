@@ -33,6 +33,13 @@ struct GrepInput {
     /// Optional filename glob filter (e.g. `*.rs`).
     #[serde(default)]
     glob: Option<String>,
+    /// Maximum matches to return (defaults to 200, hard-capped at 1000).
+    #[serde(default)]
+    limit: Option<u32>,
+    /// Number of leading matches to skip, for paging through large result
+    /// sets (defaults to 0).
+    #[serde(default)]
+    offset: Option<u32>,
 }
 
 impl AgentTool for GrepTool {
@@ -40,7 +47,9 @@ impl AgentTool for GrepTool {
         "Grep"
     }
     fn description(&self) -> &str {
-        "Search file contents by regex, returning matching lines (with line numbers)."
+        "Search file contents by regex, returning matching lines (with line numbers). \
+         Results are capped per line and by count; use limit/offset to page, or \
+         narrow the search with path/glob/pattern when results are truncated."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<GrepInput>()
@@ -67,7 +76,14 @@ impl AgentTool for GrepTool {
             .unwrap_or_else(|| self.cwd.as_ref().clone());
         let read_policy = self.read_policy.clone();
         cx.background_spawn(async move {
-            run_grep(&parsed.pattern, &base, parsed.glob.as_deref(), &read_policy)
+            run_grep(
+                &parsed.pattern,
+                &base,
+                parsed.glob.as_deref(),
+                parsed.limit,
+                parsed.offset,
+                &read_policy,
+            )
         })
     }
 }
@@ -87,7 +103,12 @@ impl Sink for GrepSink {
         mat: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         let line = mat.line_number().unwrap_or(0);
-        let content = String::from_utf8_lossy(mat.bytes()).trim_end().to_string();
+        let content = String::from_utf8_lossy(mat.bytes());
+        let content = content.trim_end();
+        // A match on a minified/dumped mega-line (JSON blobs, bundled JS)
+        // must not flood the result: cap the line, the total cap in
+        // `truncate_result` stays a backstop rather than the only defense.
+        let content = crate::tools::truncate::truncate_line(content);
         self.results
             .push(format!("{}:{}:{}", self.path, line, content));
         Ok(true)
@@ -98,8 +119,12 @@ fn run_grep(
     pattern: &str,
     root: &Path,
     glob: Option<&str>,
+    limit: Option<u32>,
+    offset: Option<u32>,
     read_policy: &ReadPolicy,
 ) -> Result<String, String> {
+    let limit = limit.unwrap_or(200).min(1000) as usize;
+    let offset = offset.unwrap_or(0) as usize;
     // Deny a search rooted in a sensitive subtree outright.
     read_policy.check(root)?;
     // Canonicalized denied roots for walk pruning — a search rooted at a
@@ -143,7 +168,9 @@ fn run_grep(
         .build();
 
     let mut all_results: Vec<String> = Vec::new();
-    for result in walker.build() {
+    let mut seen = 0usize;
+    let mut has_more = false;
+    'walk: for result in walker.build() {
         let entry = match result {
             Ok(e) => e,
             Err(_) => continue,
@@ -169,7 +196,19 @@ fn run_grep(
         {
             continue;
         }
-        all_results.append(&mut sink.results);
+        for r in sink.results {
+            seen += 1;
+            if seen <= offset {
+                continue;
+            }
+            if all_results.len() >= limit {
+                // One extra match past the page proves the page is partial;
+                // stop the walk rather than counting the rest.
+                has_more = true;
+                break 'walk;
+            }
+            all_results.push(r);
+        }
     }
 
     // Record hashline snapshots for matched files so the model can directly
@@ -197,6 +236,85 @@ fn run_grep(
     if all_results.is_empty() {
         Ok("No matches".to_string())
     } else {
-        Ok(all_results.join("\n"))
+        let mut out = all_results.join("\n");
+        let start = offset + 1;
+        let end = offset + all_results.len();
+        if has_more {
+            out.push_str(&format!(
+                "\n[Showing matches {start}-{end}; more matches follow — narrow with path/glob/pattern, or use offset: {end} for the next page]"
+            ));
+        } else if offset > 0 {
+            out.push_str(&format!("\n[Showing matches {start}-{end} of {seen}]"));
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        crate::hashline::init();
+        let dir =
+            std::env::temp_dir().join(format!("manox-grep-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        dir
+    }
+
+    #[test]
+    fn mega_line_match_is_capped() {
+        // The incident shape: a single-line JSON dump must not flood the result.
+        let dir = fixture_dir("mega-line");
+        let blob = format!("{{\"data\":\"{}\"}}", "y".repeat(1024 * 1024));
+        std::fs::write(dir.join("dump.json"), blob).expect("write fixture");
+        let policy = ReadPolicy::for_project(&dir);
+        let out = run_grep("data", &dir, None, None, None, &policy).expect("grep");
+        assert!(out.contains("bytes truncated"), "line cap marker: {out}");
+        assert!(
+            out.len() < 1024,
+            "mega line collapsed, got {} bytes",
+            out.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn limit_and_offset_page_results() {
+        let dir = fixture_dir("paging");
+        let body: String = (1..=10).map(|i| format!("match line {i}\n")).collect();
+        std::fs::write(dir.join("a.txt"), body).expect("write fixture");
+        let policy = ReadPolicy::for_project(&dir);
+
+        let page1 = run_grep("match", &dir, None, Some(3), None, &policy).expect("page1");
+        assert!(page1.contains("match line 1"));
+        assert!(page1.contains("match line 3"));
+        assert!(!page1.contains("match line 4"));
+        assert!(page1.contains("more matches follow"), "page1: {page1}");
+        assert!(page1.contains("offset: 3"), "page1: {page1}");
+
+        let page2 = run_grep("match", &dir, None, Some(3), Some(3), &policy).expect("page2");
+        assert!(page2.contains("match line 4"));
+        assert!(page2.contains("match line 6"));
+        assert!(page2.contains("more matches follow"), "page2: {page2}");
+
+        let last = run_grep("match", &dir, None, Some(3), Some(9), &policy).expect("last page");
+        assert!(last.contains("match line 10"));
+        assert!(last.contains("Showing matches 10-10 of 10"), "last: {last}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_limit_is_200() {
+        let dir = fixture_dir("default-limit");
+        let body: String = (1..=500).map(|i| format!("hit {i}\n")).collect();
+        std::fs::write(dir.join("b.txt"), body).expect("write fixture");
+        let policy = ReadPolicy::for_project(&dir);
+        let out = run_grep("hit", &dir, None, None, None, &policy).expect("grep");
+        let shown = out.matches("b.txt:").count();
+        assert_eq!(shown, 200);
+        assert!(out.contains("more matches follow"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -563,7 +563,6 @@ cockpit-completed-summary = +{$count} completed
 # Context-budget two rows. {$pct} is the remaining percent (0–100),
 # {$used}/{$cap} are pre-formatted used/cap counts.
 cockpit-context-remaining-ctx = {$pct}% context left {$used} / {$cap}
-cockpit-context-remaining-body = {$pct}% request body left {$used} / {$cap}
 # Hide/show tasks hint appended to the milestone section header. Generic —
 # the header is also clickable to toggle.
 cockpit-hide-tasks-hint = click to collapse

@@ -51,15 +51,6 @@ pub const CLAUDE_CODE_AUTO_COMPACT_THRESHOLD: f64 = 0.8;
 /// results and prior compactions are never retained raw.
 const RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 
-/// Hard cap on the estimated request body size (in bytes) before
-/// auto-compaction fires regardless of the token threshold. Providers reject
-/// requests whose serialized body exceeds their limit; this triggers a
-/// compaction pass before that happens. 6 MiB is a conservative estimate —
-/// the actual wire size is larger than raw text (JSON framing, tool specs,
-/// system prompt) so firing at 6 MiB of text keeps the real body well under
-/// a typical 10 MiB provider limit.
-pub const MAX_REQUEST_BODY_BYTES: usize = 6 * 1024 * 1024;
-
 /// Tokens that count toward the context limit for compaction triggering:
 /// input (cache-creation + cache-read + uncached) plus output. Cache-read
 /// tokens still occupy KV cache slots, so they count against the window.
@@ -115,12 +106,13 @@ pub fn latest_reported_request_usage(
 /// Returns the insertion index when all hold:
 /// - auto-compaction is enabled;
 /// - the model's input window is at least [`MIN_COMPACTION_CONTEXT_WINDOW`];
-/// - a prior user message has reported usage (`per_request` keyed by
-///   `Message::id`);
-/// - no compaction already sits after that usage point (avoid re-compacting
-///   the same region twice);
-/// - that usage's [`active_tokens`] meets the threshold (`max_input_tokens *
-///   threshold_pct`).
+/// - no compaction already sits after the latest reported usage point (a
+///   post-compaction tail has not re-filled yet);
+/// - the thread does not already end on a compaction (nothing new arrived);
+/// - [`effective_context_tokens`] meets the threshold (`max_input_tokens *
+///   threshold_pct`). Usage is *not* required: the local estimate alone can
+///   cross the threshold, so a run of requests that all fail (no usage ever
+///   reported) still compacts.
 ///
 /// The insertion index is `len - 1` when the last message is an untracked user
 /// prompt (just submitted, no usage yet) so the new prompt stays raw after the
@@ -139,18 +131,24 @@ pub fn auto_compaction_target_ix(
         return None;
     }
     // Most recent user message that already has reported usage — the last
-    // request's token count is the trigger signal. Shared with the cockpit
-    // budget display so the UI and the trigger agree on "current" usage.
-    let (usage_ix, usage) = latest_reported_request_usage(messages, per_request)?;
+    // request's token count is part of the trigger signal. Shared with the
+    // cockpit budget display so the UI and the trigger agree on "current"
+    // usage.
+    let usage = latest_reported_request_usage(messages, per_request);
     // If a compaction already covers the region past the usage point, the
     // post-compaction tail has not re-filled yet — nothing to do.
-    if let Some(c_ix) = latest_compaction_ix(messages, messages.len())
+    if let Some((usage_ix, _)) = usage
+        && let Some(c_ix) = latest_compaction_ix(messages, messages.len())
         && c_ix > usage_ix
     {
         return None;
     }
+    // A thread that already ends on a compaction has nothing new to summarize.
+    if messages.last().is_some_and(is_compaction) {
+        return None;
+    }
     let threshold = ((max_input_tokens as f64) * threshold_pct).ceil() as u64;
-    if active_tokens(usage) < threshold {
+    if effective_context_tokens(messages, per_request) < threshold {
         return None;
     }
     // Insert before a trailing untracked user prompt so it survives raw; a
@@ -163,6 +161,23 @@ pub fn auto_compaction_target_ix(
         _ => messages.len(),
     };
     Some(insertion_ix)
+}
+
+/// The context fill shared by the auto-compaction trigger and the cockpit
+/// budget display: the larger of the provider-reported usage and a local
+/// bytes/4 estimate of the live history. The estimate keeps the trigger
+/// honest when usage is missing or untrustworthy — a request rejected by the
+/// provider (e.g. 400) reports no usage at all, so a purely usage-driven
+/// trigger stays blind exactly when the context is oversize.
+pub fn effective_context_tokens(
+    messages: &[Message],
+    per_request: &HashMap<String, TokenUsage>,
+) -> u64 {
+    let provider = latest_reported_request_usage(messages, per_request)
+        .map(|(_, u)| active_tokens(u))
+        .unwrap_or(0);
+    let local_estimate = (estimate_request_body_bytes(messages) / 4) as u64;
+    provider.max(local_estimate)
 }
 
 /// Insertion index for a manual `/compact`, or `None` when there is nothing to
@@ -497,10 +512,58 @@ mod tests {
     }
 
     #[test]
-    fn auto_target_none_without_usage() {
+    fn auto_target_none_without_usage_and_small_estimate() {
+        // No reported usage and a tiny local estimate — nothing to compact.
         let msgs = vec![user("u1", "hi")];
         assert_eq!(
             auto_compaction_target_ix(&msgs, &HashMap::new(), true, 200_000, 0.9),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_target_fires_on_local_estimate_without_usage() {
+        // The floor: a giant history with NO reported usage (e.g. every
+        // request so far failed with a 400, which reports nothing) must still
+        // trigger compaction — this is the thread-2b1a37c7 regression. The
+        // trailing untracked message (the flood itself) stays raw; everything
+        // before it is summarized.
+        let big = "x".repeat(900 * 1024); // ~225k estimated tokens > 180k threshold
+        let msgs = vec![user("u1", "start"), user("u2", &big)];
+        assert_eq!(
+            auto_compaction_target_ix(&msgs, &HashMap::new(), true, 200_000, 0.9),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn auto_target_estimate_wins_over_smaller_provider_usage() {
+        // effective = max(provider, estimate): the estimate dominates when the
+        // provider under-reports (middleware-rewritten bodies, missing usage).
+        let big = "x".repeat(900 * 1024);
+        let msgs = vec![user("u1", "start"), user("u2", &big)];
+        let mut per = HashMap::new();
+        per.insert(
+            "u1".to_string(),
+            TokenUsage {
+                input_tokens: 1_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn auto_target_none_when_thread_ends_on_compaction() {
+        // Nothing new arrived after the last compaction — never re-compact.
+        let msgs = vec![user("u1", "old"), compaction("c1", "sum")];
+        let mut per = HashMap::new();
+        per.insert("u1".to_string(), huge_usage());
+        assert_eq!(
+            auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
             None
         );
     }

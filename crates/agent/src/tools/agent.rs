@@ -149,6 +149,7 @@ impl AgentToolTrait for SpawnAgentTool {
         let child = setup.child;
         let done_rx = setup.done_rx;
         let child_errored = setup.child_errored;
+        let child_error_text = setup.child_error_text;
         let metrics = setup.metrics;
         let sub = setup.sub;
 
@@ -166,10 +167,16 @@ impl AgentToolTrait for SpawnAgentTool {
                 });
             }
 
-            // Capture the sub-agent's full conversation and extract its final
-            // assistant text as the tool result.
-            let msgs = child.read_with(cx, |c, _| c.messages().to_vec());
-            let final_text = last_assistant_text(&msgs);
+            // Capture the sub-agent's conversation (bounded for the envelope)
+            // and extract its final text as the tool result. A crashed child
+            // reports its error as the final text so the parent model sees an
+            // actionable failure, not a bare sentinel.
+            let msgs = bound_envelope_messages(child.read_with(cx, |c, _| c.messages().to_vec()));
+            let error_text = child_error_text
+                .lock()
+                .expect("subagent error text poisoned")
+                .clone();
+            let final_text = envelope_final_text(&msgs, error_text);
             let errored = child_errored.load(std::sync::atomic::Ordering::Relaxed)
                 || final_text == NO_FINAL_SENTINEL;
             drop(sub);
@@ -222,13 +229,15 @@ impl AgentToolTrait for SpawnAgentTool {
 /// Everything `run_streaming` builds synchronously before spawning the await
 /// task. `child` and `sub` are moved into that task; `done_rx` resolves when
 /// the sub-agent emits `Stop`; `child_errored` is set by the subscription when
-/// the sub-agent emits `ThreadEvent::Error`; `metrics` accumulates the child's
-/// tool-use / token / activity telemetry so `run_streaming` can stamp the final
-/// snapshot into the result envelope.
+/// the sub-agent emits `ThreadEvent::Error` (with the error text stashed in
+/// `child_error_text` for the envelope's failure summary); `metrics`
+/// accumulates the child's tool-use / token / activity telemetry so
+/// `run_streaming` can stamp the final snapshot into the result envelope.
 struct SubagentSetup {
     child: gpui::Entity<Thread>,
     done_rx: async_channel::Receiver<()>,
     child_errored: Arc<AtomicBool>,
+    child_error_text: Arc<std::sync::Mutex<Option<String>>>,
     metrics: Arc<std::sync::Mutex<ProgressAccumulator>>,
     sub: gpui::Subscription,
 }
@@ -372,6 +381,7 @@ fn setup_child(
     // crashed is a failure, not a silent success).
     let (done_tx, done_rx) = async_channel::bounded(1);
     let child_errored = Arc::new(AtomicBool::new(false));
+    let child_error_text = Arc::new(std::sync::Mutex::new(None::<String>));
     let metrics = Arc::new(std::sync::Mutex::new(ProgressAccumulator {
         metrics: SubagentMetrics {
             status: Some(ToolCallStatus::Running),
@@ -388,6 +398,7 @@ fn setup_child(
     let subagent_type_cb = def.name.clone();
     let child_weak = child.downgrade();
     let errored_cb = child_errored.clone();
+    let error_text_cb = child_error_text.clone();
     let metrics_cb = metrics.clone();
     let sub = cx.subscribe(
         &child,
@@ -397,6 +408,7 @@ fn setup_child(
             }
             ThreadEvent::Error(e) => {
                 errored_cb.store(true, std::sync::atomic::Ordering::Relaxed);
+                *error_text_cb.lock().expect("subagent error text poisoned") = Some(e.to_string());
                 sink_cb.try_emit(&e.to_string());
                 // A sub-agent error is terminal: unblock the parent so it can
                 // collect whatever partial output was produced.
@@ -515,6 +527,7 @@ fn setup_child(
         child,
         done_rx,
         child_errored,
+        child_error_text,
         metrics,
         sub,
     })
@@ -616,6 +629,62 @@ fn last_assistant_text(msgs: &[Message]) -> String {
         }
     }
     NO_FINAL_SENTINEL.to_string()
+}
+
+/// The envelope's `final` for a finished child. A child that emitted a
+/// `ThreadEvent::Error` reports the error as its final text — the parent
+/// model gets an actionable failure ("sub-agent failed: context overflow…")
+/// instead of a bare sentinel or whatever partial text preceded the crash.
+fn envelope_final_text(msgs: &[Message], error_text: Option<String>) -> String {
+    match error_text {
+        Some(e) => format!("sub-agent failed: {e}"),
+        None => last_assistant_text(msgs),
+    }
+}
+
+/// Serialized-byte budget for an envelope's `messages` transcript. The parent
+/// model only ever sees `final`; the transcript exists for the UI's
+/// expandable panel and reload path, so its size is a persistence/parse
+/// concern, not a context one — beyond ~1 MB it is bounded.
+const ENVELOPE_MESSAGES_BUDGET: usize = 1024 * 1024;
+
+/// Bound an envelope transcript to [`ENVELOPE_MESSAGES_BUDGET`] serialized
+/// bytes: keep the first user message (the delegation prompt) plus the newest
+/// messages that fit, inserting a marker after the first when middle messages
+/// were omitted. A sub-agent whose tool results flooded its history (the
+/// thread-2b1a37c7 failure mode) can no longer persist a 10 MB envelope into
+/// the parent thread blob.
+fn bound_envelope_messages(msgs: Vec<Message>) -> Vec<Message> {
+    let size_of = |m: &Message| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0);
+    let total: usize = msgs.iter().map(size_of).sum();
+    if total <= ENVELOPE_MESSAGES_BUDGET {
+        return msgs;
+    }
+    let mut out: Vec<Message> = Vec::new();
+    let Some(first) = msgs.first() else {
+        return msgs;
+    };
+    let mut used = size_of(first);
+    out.push(first.clone());
+    // Reserve headroom for the omission marker so the tail still fits.
+    let mut tail: Vec<Message> = Vec::new();
+    for m in msgs.iter().skip(1).rev() {
+        let len = size_of(m);
+        if used + len > ENVELOPE_MESSAGES_BUDGET {
+            break;
+        }
+        used += len;
+        tail.push(m.clone());
+    }
+    tail.reverse();
+    let omitted = msgs.len() - out.len() - tail.len();
+    if omitted > 0 {
+        out.push(Message::user(format!(
+            "[{omitted} earlier sub-agent messages omitted]"
+        )));
+    }
+    out.extend(tail);
+    out
 }
 
 /// Persisted `agent` tool-result envelope: the model-facing final text plus the
@@ -1129,15 +1198,77 @@ mod tests {
         // the max-turns summary instruction) back as the "result" — that would
         // mislead the parent model into thinking the sub-agent answered.
         let msgs = vec![Message::user("hi".to_string())];
-        assert_eq!(
-            last_assistant_text(&msgs),
-            "sub-agent ended without producing a final message"
-        );
+        assert_eq!(last_assistant_text(&msgs), NO_FINAL_SENTINEL);
         // Truly no text anywhere → same sentinel, never an empty string.
         let msgs: Vec<Message> = vec![Message::user_with_content(vec![])];
+        assert_eq!(last_assistant_text(&msgs), NO_FINAL_SENTINEL);
+    }
+
+    #[test]
+    fn envelope_final_text_reports_child_error() {
+        let msgs = vec![
+            Message::user("do work".to_string()),
+            Message::assistant(vec![MessageContent::Text("partial".to_string())]),
+        ];
         assert_eq!(
-            last_assistant_text(&msgs),
-            "sub-agent ended without producing a final message"
+            envelope_final_text(&msgs, Some("context overflow".to_string())),
+            "sub-agent failed: context overflow"
+        );
+        assert_eq!(envelope_final_text(&msgs, None), "partial");
+    }
+
+    #[test]
+    fn envelope_messages_under_budget_pass_through() {
+        let msgs = vec![
+            Message::user("task".to_string()),
+            Message::assistant(vec![MessageContent::Text("done".to_string())]),
+        ];
+        let bound = bound_envelope_messages(msgs.clone());
+        assert_eq!(bound.len(), msgs.len());
+        assert!(!bound.iter().any(|m| matches!(
+            m.content.first(),
+            Some(MessageContent::Text(t)) if t.contains("omitted")
+        )));
+    }
+
+    #[test]
+    fn envelope_messages_over_budget_keep_head_and_tail() {
+        // A flood of oversized tool-result-style messages in the middle must
+        // collapse: first message (the prompt) + marker + fitting tail.
+        let blob = "y".repeat(ENVELOPE_MESSAGES_BUDGET / 4);
+        let mut msgs = vec![Message::user("the task".to_string())];
+        for i in 0..8 {
+            msgs.push(Message::user(format!("flood-{i}-{blob}")));
+        }
+        msgs.push(Message::assistant(vec![MessageContent::Text(
+            "final".to_string(),
+        )]));
+        let bound = bound_envelope_messages(msgs);
+        let first_text = match bound.first().and_then(|m| m.content.first()) {
+            Some(MessageContent::Text(t)) => t.clone(),
+            _ => panic!("first message must be the prompt"),
+        };
+        assert_eq!(first_text, "the task");
+        assert!(
+            bound.iter().any(|m| matches!(
+                m.content.first(),
+                Some(MessageContent::Text(t)) if t.contains("earlier sub-agent messages omitted")
+            )),
+            "omission marker present: {:?}",
+            bound.len()
+        );
+        let last = bound.last().expect("tail preserved");
+        assert!(matches!(
+            last.content.first(),
+            Some(MessageContent::Text(t)) if t == "final"
+        ));
+        let serialized: usize = bound
+            .iter()
+            .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            serialized <= ENVELOPE_MESSAGES_BUDGET + 2048,
+            "bounded to ~budget, got {serialized}"
         );
     }
 

@@ -80,7 +80,19 @@ impl AgentTool for ListTool {
                 lines.push(format!("{name}{tag}"));
             }
             lines.sort();
+            // A flat directory can hold tens of thousands of entries (node
+            // caches, build outputs); cap the listing and say so.
+            if lines.len() > MAX_ENTRIES {
+                let total = lines.len();
+                lines.truncate(MAX_ENTRIES);
+                lines.push(format!(
+                    "[Showing first {MAX_ENTRIES} of {total} entries; use glob/grep to find specific files]"
+                ));
+            }
             Ok(lines.join("\n"))
         })
     }
 }
+
+/// Entries returned by `list_directory` before the listing is cut.
+const MAX_ENTRIES: usize = 1000;

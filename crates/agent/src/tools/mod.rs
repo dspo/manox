@@ -24,6 +24,7 @@ pub mod path_selector;
 pub mod read_file;
 pub mod self_info;
 pub mod skill;
+pub mod truncate;
 pub mod web_explore;
 pub mod web_fetch;
 pub mod worktree;

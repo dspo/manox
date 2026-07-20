@@ -620,7 +620,7 @@ impl ResponsesEventMapper {
                     .and_then(Value::as_str)
                     .map(String::from)
                     .unwrap_or_else(|| "Responses API returned an error".to_string());
-                out.push(Err(anyhow!(msg)));
+                out.push(Err(crate::provider::overflow::stream_error(msg)));
             }
             _ => {}
         }

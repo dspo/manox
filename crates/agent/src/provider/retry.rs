@@ -237,7 +237,9 @@ where
                 let body = resp.text().await.unwrap_or_default();
                 if !should_retry_status(status) || attempt >= MAX_ATTEMPTS {
                     let _ = tx
-                        .send(Err(anyhow!("{label} returned {status}: {body}")))
+                        .send(Err(crate::provider::overflow::terminal_error(
+                            label, status, &body,
+                        )))
                         .await;
                     return Err(anyhow!("{label} returned {status}"));
                 }
