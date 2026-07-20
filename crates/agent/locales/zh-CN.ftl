@@ -386,6 +386,7 @@ workspace-yolo-on-notice = 完全访问已开启：工具调用免审批，bash 
 workspace-yolo-off-notice = 已切换到请求审批模式：恢复审批与沙箱。
 workspace-empty-prompt = 我们该做什么？
 workspace-effort-section = 推理强度
+workspace-provider-reload-failed = 重新加载 provider 配置失败，已保留原有 providers：{$error}
 
 ### views/composer_menu.rs
 composer-add-label = 添加

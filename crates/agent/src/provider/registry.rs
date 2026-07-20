@@ -3,8 +3,14 @@
 //! `init(cx)` reads the cx yaml → builds the matching `LanguageModel` for each
 //! `ResolvedModel` by `wire_api` → stores them in a global
 //! `Vec<Arc<dyn LanguageModel>>`. `list_models` / `get_model` serve the UI and `Thread`.
+//!
+//! The registry is a single process-wide snapshot behind an `RwLock<Arc<_>>`:
+//! `reload()` rebuilds from the config file and atomically swaps the snapshot,
+//! so every reader (model menus, thread restore, sub-agents) observes the same
+//! latest set of models. Readers hold an `Arc` snapshot; models already in use
+//! by live threads stay alive through their own `Arc` handles.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use gpui::App;
 
@@ -15,8 +21,9 @@ use crate::provider::resolve_apikey;
 use crate::provider::responses::{ResponsesModel, ResponsesModelConfig};
 use crate::provider::{CxConfig, ResolvedModel, WireApi};
 
-/// Global provider registry.
-static REGISTRY: OnceLock<ProviderRegistry> = OnceLock::new();
+/// Global provider registry. The `Arc` inside is swapped as a whole by
+/// `reload()` — individual entries are never mutated in place.
+static REGISTRY: OnceLock<RwLock<Arc<ProviderRegistry>>> = OnceLock::new();
 
 pub struct ProviderRegistry {
     models: Vec<AnyLanguageModel>,
@@ -256,14 +263,37 @@ pub fn init(_cx: &mut App) {
     if registry.models().is_empty() {
         tracing::error!("ProviderRegistry initialized with no available models");
     }
-    let _ = REGISTRY.set(registry);
+    let _ = REGISTRY.set(RwLock::new(Arc::new(registry)));
 }
 
-/// Returns the global registry. Panics if `init` was not called.
-pub fn global() -> &'static ProviderRegistry {
+/// Reload the registry from the cx config file, atomically swapping the global
+/// snapshot on success. The previous registry is kept on failure so a broken
+/// config never strands a running app. Building (which may resolve api keys
+/// through the OS keychain or shell commands) happens outside the lock and can
+/// block — call from a background thread.
+pub fn reload() -> anyhow::Result<()> {
+    let config = CxConfig::load_default()?;
+    let registry = ProviderRegistry::from_config(config);
+    if registry.models().is_empty() {
+        tracing::error!("ProviderRegistry reloaded with no available models");
+    }
+    let lock = REGISTRY
+        .get()
+        .expect("ProviderRegistry not initialized; call agent::init first");
+    *lock.write().unwrap() = Arc::new(registry);
+    Ok(())
+}
+
+/// Returns a snapshot of the global registry. Cheap `Arc` clone; the snapshot
+/// stays valid even if a later `reload()` swaps the global. Panics if `init`
+/// was not called.
+pub fn global() -> Arc<ProviderRegistry> {
     REGISTRY
         .get()
         .expect("ProviderRegistry not initialized; call agent::init first")
+        .read()
+        .unwrap()
+        .clone()
 }
 
 #[cfg(test)]
