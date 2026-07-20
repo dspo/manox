@@ -579,7 +579,8 @@ fn resolve_model(
         // configured): fall back to the parent model so a plugin agent can
         // still run. Log so the fallback is visible but never block spawn.
         tracing::info!(
-            "sub-agent model alias `{id}` not found in provider config;              falling back to parent thread's model"
+            "sub-agent model alias `{id}` not found in provider config; \
+             falling back to parent thread's model"
         );
     }
     if let Ok(Some(m)) = parent.read_with(cx, |t, _| t.model().cloned()) {
