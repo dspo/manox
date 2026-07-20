@@ -11,9 +11,9 @@
 
 pub mod agent;
 pub mod ask_user;
+pub mod background_shell;
 pub mod bash;
 pub mod bash_output;
-pub mod background_shell;
 pub mod edit_file;
 pub mod file_lock;
 pub mod glob;
@@ -301,7 +301,11 @@ pub(crate) fn base_tools_with_policy(
             read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
         }),
         Arc::new(if let Some(root) = &plugin_root {
-            bash::BashTool::new_with_plugin_root(cwd.as_ref().clone(), sandbox.clone(), root.clone())
+            bash::BashTool::new_with_plugin_root(
+                cwd.as_ref().clone(),
+                sandbox.clone(),
+                root.clone(),
+            )
         } else {
             bash::BashTool::new(cwd.as_ref().clone(), sandbox.clone())
         }),

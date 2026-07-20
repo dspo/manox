@@ -132,13 +132,16 @@ impl AgentDefinitionRegistry {
             }
             let ns = plugin.name.clone();
             let root_for_plugin = plugin.root.clone();
-            scan_dir(&dir, &mut |path| match load_file(path, Some(root_for_plugin.clone())) {
-                Ok(file) => {
-                    let key = format!("{ns}:{}", file.def.name);
-                    defs.insert(key, Arc::new(file));
-                }
-                Err(e) => tracing::warn!("skipping agent def {}: {e:#}", path.display()),
-            });
+            scan_dir(
+                &dir,
+                &mut |path| match load_file(path, Some(root_for_plugin.clone())) {
+                    Ok(file) => {
+                        let key = format!("{ns}:{}", file.def.name);
+                        defs.insert(key, Arc::new(file));
+                    }
+                    Err(e) => tracing::warn!("skipping agent def {}: {e:#}", path.display()),
+                },
+            );
         }
         Self { defs }
     }
@@ -215,7 +218,10 @@ fn parse_definition(raw: &str, source: &str, root: Option<PathBuf>) -> Result<Ag
 /// silently skipped.
 fn builtin_definitions() -> Vec<AgentDefinitionFile> {
     const EXPLORE: &str = include_str!("agents/explore.md");
-    vec![parse_definition(EXPLORE, "builtin:explore", None).expect("builtin explore agent must parse")]
+    vec![
+        parse_definition(EXPLORE, "builtin:explore", None)
+            .expect("builtin explore agent must parse"),
+    ]
 }
 
 static REGISTRY: OnceLock<AgentDefinitionRegistry> = OnceLock::new();

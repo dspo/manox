@@ -92,7 +92,10 @@ impl PollResult {
         } else {
             self.new_output
         };
-        format!("Shell status: {status}\nTotal bytes: {}\n\n{body}", self.total_bytes)
+        format!(
+            "Shell status: {status}\nTotal bytes: {}\n\n{body}",
+            self.total_bytes
+        )
     }
 }
 
@@ -106,7 +109,12 @@ struct BackgroundShellRegistry {
 
 /// Access the process-global registry. Lazily initialized on first call.
 fn registry() -> &'static std::sync::Mutex<BackgroundShellRegistry> {
-    REGISTRY.get_or_init(|| std::sync::Mutex::new(BackgroundShellRegistry { shells: HashMap::new(), next_id: 1 }))
+    REGISTRY.get_or_init(|| {
+        std::sync::Mutex::new(BackgroundShellRegistry {
+            shells: HashMap::new(),
+            next_id: 1,
+        })
+    })
 }
 
 /// Spawn `command` under `sh -c` in the background, register it, and return
@@ -137,14 +145,18 @@ pub fn spawn(
         cmd.env("CLAUDE_PLUGIN_ROOT", root);
     }
 
-    let mut child: Child = cmd.spawn().map_err(|e| format!("failed to spawn background shell: {e}"))?;
+    let mut child: Child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn background shell: {e}"))?;
     let pid = child.id();
 
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
     let shell_id = {
-        let mut reg = registry().lock().expect("background shell registry poisoned");
+        let mut reg = registry()
+            .lock()
+            .expect("background shell registry poisoned");
         let id = format!("bash_{}", reg.next_id);
         reg.next_id += 1;
         reg.shells.insert(
@@ -165,8 +177,14 @@ pub fn spawn(
     };
 
     let state = {
-        let reg = registry().lock().expect("background shell registry poisoned");
-        reg.shells.get(&shell_id).expect("just inserted").state.clone()
+        let reg = registry()
+            .lock()
+            .expect("background shell registry poisoned");
+        reg.shells
+            .get(&shell_id)
+            .expect("just inserted")
+            .state
+            .clone()
     };
 
     // Spawn the drain + wait task. Use the global tokio runtime when available
@@ -254,7 +272,9 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
 /// Poll a background shell by id. Returns the output produced since the last
 /// poll, plus running/exit status. Returns an error string for an unknown id.
 pub fn poll(shell_id: &str) -> Result<PollResult, String> {
-    let reg = registry().lock().expect("background shell registry poisoned");
+    let reg = registry()
+        .lock()
+        .expect("background shell registry poisoned");
     let Some(shell) = reg.shells.get(shell_id) else {
         return Err(format!("Unknown shell id: {shell_id}"));
     };
@@ -279,7 +299,9 @@ pub fn poll(shell_id: &str) -> Result<PollResult, String> {
 
 /// Kill a background shell's process group. No-op if the shell already exited.
 pub fn kill(shell_id: &str) -> Result<(), String> {
-    let reg = registry().lock().expect("background shell registry poisoned");
+    let reg = registry()
+        .lock()
+        .expect("background shell registry poisoned");
     let Some(shell) = reg.shells.get(shell_id) else {
         return Err(format!("Unknown shell id: {shell_id}"));
     };
@@ -305,7 +327,9 @@ pub fn kill(shell_id: &str) -> Result<(), String> {
 /// `GC_AFTER_EXIT` ago. Called opportunistically by `spawn`/`poll` to bound
 /// memory without a dedicated timer.
 fn gc() {
-    let mut reg = registry().lock().expect("background shell registry poisoned");
+    let mut reg = registry()
+        .lock()
+        .expect("background shell registry poisoned");
     let now = Instant::now();
     reg.shells.retain(|_, shell| {
         let s = shell.state.lock().expect("shell state poisoned");
@@ -315,7 +339,6 @@ fn gc() {
         }
     });
 }
-
 
 /// Kill the child's whole process group. On Unix the child runs in its own
 /// group (set via `process_group(0)`), so `killpg` reaps grandchildren too.
@@ -393,6 +416,10 @@ mod tests {
         let r2 = poll(&id).expect("poll 2");
         assert!(r2.new_output.contains('b'), "got: {}", r2.new_output);
         assert!(r2.new_output.contains('c'), "got: {}", r2.new_output);
-        assert!(!r2.new_output.contains('a'), "a already consumed: {}", r2.new_output);
+        assert!(
+            !r2.new_output.contains('a'),
+            "a already consumed: {}",
+            r2.new_output
+        );
     }
 }

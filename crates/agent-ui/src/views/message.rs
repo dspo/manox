@@ -1552,10 +1552,7 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     .to_string();
                 globs.insert(p);
             }
-            "WebFetch"
-            | "WebExploreReadText"
-            | "WebExploreReadDom"
-            | "WebExploreScreenshot" => {
+            "WebFetch" | "WebExploreReadText" | "WebExploreReadDom" | "WebExploreScreenshot" => {
                 // Read-side network activity: fetching a doc URL or reading a
                 // browser tab's content. Counted by invocation.
                 fetching += 1;
