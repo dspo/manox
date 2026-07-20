@@ -84,11 +84,11 @@ struct ExitWorktreeInput {
 }
 
 const ENTER_DESCRIPTION: &str = "Enter a git worktree on an isolated branch and switch the session working directory to it. \
-     All subsequent tools (read_file, write_file, edit_file, bash, …) operate in the worktree \
+     All subsequent tools (Read, Write, Edit, Bash, …) operate in the worktree \
      automatically — no manual `cd`. While in a worktree, git operations (commit, rebase, push, \
      fetch) run without approval: the bound repo's `.git` is writable and network is enabled, \
      so `git push` works frictionlessly. Use this when branching off for isolated work, or when \
-     explicitly told to work in a worktree. Exit with `exit_worktree` (keep or remove). Enter \
+     explicitly told to work in a worktree. Exit with `ExitWorktree` (keep or remove). Enter \
      re-baselines the provider prefix cache (the cwd line in the system prompt changes) — that \
      is expected. Pass `name` to create a new worktree+branch under `<project>/.claude/worktrees/`, \
      or `path` to re-enter an existing one. The base ref is `origin/<default-branch>` (fallback \
@@ -96,13 +96,13 @@ const ENTER_DESCRIPTION: &str = "Enter a git worktree on an isolated branch and 
 
 const EXIT_DESCRIPTION: &str = "Leave the active git worktree. `action=keep` (default) switches the session cwd back to the \
      prior directory but leaves the worktree and branch on disk — you can re-enter it later with \
-     `enter_worktree` (passing `path`). `action=remove` deletes the worktree and its branch; it is \
+     `EnterWorktree` (passing `path`). `action=remove` deletes the worktree and its branch; it is \
      refused when the working tree is dirty unless `discard_changes=true`. Only available while \
      inside a worktree.";
 
 impl AgentTool for EnterWorktreeTool {
     fn name(&self) -> &str {
-        "enter_worktree"
+        "EnterWorktree"
     }
     fn description(&self) -> &str {
         ENTER_DESCRIPTION
@@ -256,7 +256,7 @@ impl AgentTool for EnterWorktreeTool {
 
 impl AgentTool for ExitWorktreeTool {
     fn name(&self) -> &str {
-        "exit_worktree"
+        "ExitWorktree"
     }
     fn description(&self) -> &str {
         EXIT_DESCRIPTION

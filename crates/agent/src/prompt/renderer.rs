@@ -473,7 +473,7 @@ mod tests {
                 PromptTemplate::SideCallApprovalUser,
                 &crate::prompt::ApprovalReviewPromptData {
                     cwd: "/c".to_string(),
-                    tool_name: "bash".to_string(),
+                    tool_name: "Bash".to_string(),
                     tool_title: "Bash".to_string(),
                     tool_input: "{}".to_string(),
                 },

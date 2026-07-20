@@ -13,7 +13,7 @@ pub struct WebExploreYieldTool;
 
 impl AgentTool for WebExploreYieldTool {
     fn name(&self) -> &str {
-        "web_explore_yield"
+        "WebExploreYield"
     }
     fn description(&self) -> &str {
         "Yield control of the tab to the user (e.g. for a login / captcha handshake). \

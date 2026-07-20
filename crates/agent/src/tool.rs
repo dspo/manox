@@ -380,7 +380,7 @@ mod tests {
         let ro_names: Vec<&str> = ro.iter().map(|t| t.name.as_str()).collect();
 
         // Write/exec tools present in full are absent from the filtered set.
-        for blocked in ["write_file", "edit_file", "bash"] {
+        for blocked in ["Write", "Edit", "Bash"] {
             assert!(full_names.contains(&blocked), "{blocked} in full set");
             assert!(
                 !ro_names.contains(&blocked),
@@ -389,10 +389,10 @@ mod tests {
         }
         // Read-only tools survive the filter.
         for allowed in [
-            "read_file",
-            "list_directory",
-            "grep",
-            "glob",
+            "Read",
+            "List",
+            "Grep",
+            "Glob",
             "AskUserQuestion",
         ] {
             assert!(

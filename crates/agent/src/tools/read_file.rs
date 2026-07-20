@@ -16,7 +16,7 @@ use crate::tool::AgentTool;
 use super::path_selector::{Selector, split_path_and_sel};
 use super::{resolve_path, schema};
 
-pub struct ReadFileTool {
+pub struct ReadTool {
     pub(crate) cwd: Arc<PathBuf>,
     pub(crate) read_policy: ReadPolicy,
 }
@@ -31,9 +31,9 @@ struct ReadFileInput {
     path: String,
 }
 
-impl AgentTool for ReadFileTool {
+impl AgentTool for ReadTool {
     fn name(&self) -> &str {
-        "read_file"
+        "Read"
     }
     fn description(&self) -> &str {
         "Read a file with optional line-range selectors. Output format: first line \

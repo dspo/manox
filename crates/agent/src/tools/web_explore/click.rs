@@ -23,7 +23,7 @@ struct ClickInput {
 
 impl AgentTool for WebExploreClickTool {
     fn name(&self) -> &str {
-        "web_explore_click"
+        "WebExploreClick"
     }
     fn description(&self) -> &str {
         "Click the first element matching `selector` in the tab. Requires approval \

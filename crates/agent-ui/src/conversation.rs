@@ -869,7 +869,7 @@ impl ConversationState {
                 status,
                 input,
             } => {
-                if name == "agent" {
+                if name == "Agent" {
                     if let Some(ix) = self.find_agent_task(id, cx) {
                         self.items[ix].update(cx, |item, cx| {
                             if let ConvItem::AgentTask(t) = item.kind_mut() {
@@ -1616,7 +1616,7 @@ mod tests {
         let mut tr = msg_with_id("u2", Role::User, "");
         tr.content = vec![MessageContent::ToolResult(LanguageModelToolResult {
             tool_use_id: "tu_1".to_string(),
-            tool_name: Arc::from("read_file"),
+            tool_name: Arc::from("Read"),
             is_error: false,
             content: "done".to_string(),
         })];
@@ -1691,7 +1691,7 @@ mod tests {
                 MessageContent::Text("let me read it".to_string()),
                 MessageContent::ToolUse(LanguageModelToolUse {
                     id: "tu_1".to_string(),
-                    name: Arc::from("read_file"),
+                    name: Arc::from("Read"),
                     raw_input: String::new(),
                     input: serde_json::Value::Null,
                     is_input_complete: true,
@@ -1700,7 +1700,7 @@ mod tests {
             ]),
             Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tu_1".to_string(),
-                tool_name: Arc::from("read_file"),
+                tool_name: Arc::from("Read"),
                 is_error: false,
                 content: "file contents here".to_string(),
             })]),
@@ -1722,7 +1722,7 @@ mod tests {
         let messages = vec![Message::user_with_content(vec![
             MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tu_x".to_string(),
-                tool_name: Arc::from("bash"),
+                tool_name: Arc::from("Bash"),
                 is_error: true,
                 content: "boom".to_string(),
             }),
@@ -1732,7 +1732,7 @@ mod tests {
         assert_eq!(tool.output, "boom");
         assert_eq!(tool.status, ToolCallStatus::Error);
         assert!(tool.is_error);
-        assert_eq!(tool.name, "bash");
+        assert_eq!(tool.name, "Bash");
     }
 
     /// Locate a tool-call entry by id within any `ThinkingContainer`. Used by
@@ -1765,7 +1765,7 @@ mod tests {
         let messages = vec![
             Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
                 id: "tu_agent".to_string(),
-                name: Arc::from("agent"),
+                name: Arc::from("Agent"),
                 raw_input: String::new(),
                 input: serde_json::json!({"subagent_type": "researcher", "prompt": "research foo"}),
                 is_input_complete: true,
@@ -1773,7 +1773,7 @@ mod tests {
             })]),
             Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tu_agent".to_string(),
-                tool_name: Arc::from("agent"),
+                tool_name: Arc::from("Agent"),
                 is_error: false,
                 content: envelope,
             })]),
@@ -1817,7 +1817,7 @@ mod tests {
         let messages = vec![
             Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
                 id: "tu_agent".to_string(),
-                name: Arc::from("agent"),
+                name: Arc::from("Agent"),
                 raw_input: String::new(),
                 input: serde_json::json!({"subagent_type": "explore", "prompt": "x"}),
                 is_input_complete: true,
@@ -1825,7 +1825,7 @@ mod tests {
             })]),
             Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tu_agent".to_string(),
-                tool_name: Arc::from("agent"),
+                tool_name: Arc::from("Agent"),
                 is_error: false,
                 content: envelope,
             })]),
@@ -1875,7 +1875,7 @@ mod tests {
                 MessageContent::Text("opening two files".to_string()),
                 MessageContent::ToolUse(LanguageModelToolUse {
                     id: "tu_a".to_string(),
-                    name: Arc::from("read_file"),
+                    name: Arc::from("Read"),
                     raw_input: String::new(),
                     input: serde_json::Value::Null,
                     is_input_complete: true,
@@ -1883,7 +1883,7 @@ mod tests {
                 }),
                 MessageContent::ToolUse(LanguageModelToolUse {
                     id: "tu_b".to_string(),
-                    name: Arc::from("read_file"),
+                    name: Arc::from("Read"),
                     raw_input: String::new(),
                     input: serde_json::Value::Null,
                     is_input_complete: true,
@@ -1893,13 +1893,13 @@ mod tests {
             Message::user_with_content(vec![
                 MessageContent::ToolResult(LanguageModelToolResult {
                     tool_use_id: "tu_a".to_string(),
-                    tool_name: Arc::from("read_file"),
+                    tool_name: Arc::from("Read"),
                     is_error: false,
                     content: "a".to_string(),
                 }),
                 MessageContent::ToolResult(LanguageModelToolResult {
                     tool_use_id: "tu_b".to_string(),
-                    tool_name: Arc::from("read_file"),
+                    tool_name: Arc::from("Read"),
                     is_error: false,
                     content: "b".to_string(),
                 }),
@@ -1976,7 +1976,7 @@ mod tests {
         });
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             title: String::new(),
             status: ToolCallStatus::Success,
             output: String::new(),
@@ -2037,7 +2037,7 @@ mod tests {
         });
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             title: String::new(),
             status: ToolCallStatus::Success,
             output: String::new(),
@@ -2080,7 +2080,7 @@ mod tests {
         });
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             title: String::new(),
             status: ToolCallStatus::Success,
             output: String::new(),
@@ -2151,7 +2151,7 @@ mod tests {
         // A tool entry after it does not affect the search.
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "t1".into(),
-            name: "bash".into(),
+            name: "Bash".into(),
             title: String::new(),
             status: ToolCallStatus::Running,
             output: String::new(),
@@ -2179,7 +2179,7 @@ mod tests {
         });
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "tu_1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             title: String::new(),
             status: ToolCallStatus::Success,
             output: String::new(),

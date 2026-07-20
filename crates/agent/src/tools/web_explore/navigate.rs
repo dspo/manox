@@ -23,7 +23,7 @@ struct NavigateInput {
 
 impl AgentTool for WebExploreNavigateTool {
     fn name(&self) -> &str {
-        "web_explore_navigate"
+        "WebExploreNavigate"
     }
     fn description(&self) -> &str {
         "Navigate an existing browser tab (identified by `tab_id`) to a new `url`. \

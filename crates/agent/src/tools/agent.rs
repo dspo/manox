@@ -82,7 +82,7 @@ struct AgentToolInput {
 
 impl AgentToolTrait for SpawnAgentTool {
     fn name(&self) -> &str {
-        "agent"
+        "Agent"
     }
 
     fn description(&self) -> &str {
@@ -344,6 +344,7 @@ fn setup_child(
                 def,
                 child_depth,
                 weak,
+                def_file.root.clone(),
             )
         },
         cx,
@@ -684,12 +685,12 @@ pub fn agent_metrics(content: &str) -> Option<SubagentMetrics> {
 /// `disallowed_tools` takes precedence; an absent `tools` whitelist inherits all.
 fn is_tool_allowed(name: &str, def: &AgentDefinition) -> bool {
     if let Some(d) = &def.disallowed_tools
-        && d.iter().any(|x| x == name)
+        && d.as_vec().iter().any(|x| x == name)
     {
         return false;
     }
     if let Some(a) = &def.tools {
-        return a.iter().any(|x| x == name);
+        return a.as_vec().iter().any(|x| x == name);
     }
     true
 }
@@ -710,9 +711,10 @@ fn build_child_registry_with_policy(
     def: &AgentDefinition,
     child_depth: u32,
     child_weak: WeakEntity<Thread>,
+    plugin_root: Option<PathBuf>,
 ) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
-    for tool in super::base_tools_with_policy(cwd.clone(), sandbox) {
+    for tool in super::base_tools_with_policy(cwd.clone(), sandbox, plugin_root) {
         if is_tool_allowed(tool.name(), def) {
             reg.register(tool);
         }
@@ -721,7 +723,7 @@ fn build_child_registry_with_policy(
     // register it here subject to the same allow/disallow filter. It is
     // stateless now (reads the per-call `ToolContext`), but stays main+child
     // only — never in `base_tools`.
-    if is_tool_allowed("self_info", def) {
+    if is_tool_allowed("SelfInfo", def) {
         reg.register(super::self_info::new());
     }
     if can_nest(def, child_depth) {
@@ -801,6 +803,7 @@ pub(crate) fn spawn_team_member(
                 def,
                 depth,
                 weak,
+                def_file.root.clone(),
             );
             for tool in crate::team::tools::shared_tools() {
                 reg.register(tool);
@@ -877,8 +880,8 @@ pub(crate) fn spawn_team_member(
 /// `plan` sub-agents were asked to write files they could not touch and each
 /// replied "I'm in read-only mode".
 fn capability_tag(def: &AgentDefinition) -> &'static str {
-    let can_write = is_tool_allowed("write_file", def) || is_tool_allowed("edit_file", def);
-    let can_bash = is_tool_allowed("bash", def);
+    let can_write = is_tool_allowed("Write", def) || is_tool_allowed("Edit", def);
+    let can_bash = is_tool_allowed("Bash", def);
     match (can_write, can_bash) {
         (true, true) => "write+bash",
         (true, false) => "write",
@@ -998,8 +1001,8 @@ mod tests {
         AgentDefinition {
             name: "test".to_string(),
             description: "test".to_string(),
-            tools,
-            disallowed_tools: disallowed,
+            tools: tools.map(crate::agent_def::ToolsList::List),
+            disallowed_tools: disallowed.map(crate::agent_def::ToolsList::List),
             model: None,
             max_turns: None,
             allow_nesting: nesting,
@@ -1009,47 +1012,47 @@ mod tests {
     #[test]
     fn whitelist_keeps_only_listed_tools() {
         let d = def(
-            Some(vec!["read_file".to_string(), "grep".to_string()]),
+            Some(vec!["Read".to_string(), "Grep".to_string()]),
             None,
             false,
         );
-        assert!(is_tool_allowed("read_file", &d));
-        assert!(is_tool_allowed("grep", &d));
-        assert!(!is_tool_allowed("write_file", &d));
-        assert!(!is_tool_allowed("bash", &d));
+        assert!(is_tool_allowed("Read", &d));
+        assert!(is_tool_allowed("Grep", &d));
+        assert!(!is_tool_allowed("Write", &d));
+        assert!(!is_tool_allowed("Bash", &d));
     }
 
     #[test]
     fn blacklist_removes_tools() {
         let d = def(
             None,
-            Some(vec!["bash".to_string(), "write_file".to_string()]),
+            Some(vec!["Bash".to_string(), "Write".to_string()]),
             false,
         );
-        assert!(!is_tool_allowed("bash", &d));
-        assert!(!is_tool_allowed("write_file", &d));
-        assert!(is_tool_allowed("read_file", &d));
+        assert!(!is_tool_allowed("Bash", &d));
+        assert!(!is_tool_allowed("Write", &d));
+        assert!(is_tool_allowed("Read", &d));
     }
 
     #[test]
     fn no_filters_inherits_all() {
         let d = def(None, None, false);
-        assert!(is_tool_allowed("read_file", &d));
-        assert!(is_tool_allowed("bash", &d));
-        assert!(is_tool_allowed("agent", &d));
+        assert!(is_tool_allowed("Read", &d));
+        assert!(is_tool_allowed("Bash", &d));
+        assert!(is_tool_allowed("Agent", &d));
     }
 
     #[test]
     fn blacklist_wins_over_whitelist() {
         // When both are set, blacklist takes precedence over the whitelist.
         let d = def(
-            Some(vec!["read_file".to_string(), "bash".to_string()]),
-            Some(vec!["bash".to_string()]),
+            Some(vec!["Read".to_string(), "Bash".to_string()]),
+            Some(vec!["Bash".to_string()]),
             false,
         );
-        assert!(is_tool_allowed("read_file", &d));
-        assert!(!is_tool_allowed("bash", &d));
-        assert!(!is_tool_allowed("grep", &d));
+        assert!(is_tool_allowed("Read", &d));
+        assert!(!is_tool_allowed("Bash", &d));
+        assert!(!is_tool_allowed("Grep", &d));
     }
 
     #[test]
@@ -1068,11 +1071,11 @@ mod tests {
         // write/exec tools disallowed. Must advertise `read-only` so the parent
         // model does not delegate write work here (thread 6cd3d096).
         let d = def(
-            Some(vec!["read_file".to_string(), "grep".to_string()]),
+            Some(vec!["Read".to_string(), "Grep".to_string()]),
             Some(vec![
-                "write_file".to_string(),
-                "edit_file".to_string(),
-                "bash".to_string(),
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Bash".to_string(),
             ]),
             false,
         );
@@ -1081,12 +1084,12 @@ mod tests {
 
     #[test]
     fn capability_tag_reflects_write_and_bash_availability() {
-        let write_only = def(Some(vec!["write_file".to_string()]), None, false);
+        let write_only = def(Some(vec!["Write".to_string()]), None, false);
         assert_eq!(capability_tag(&write_only), "write");
-        let bash_only = def(Some(vec!["bash".to_string()]), None, false);
+        let bash_only = def(Some(vec!["Bash".to_string()]), None, false);
         assert_eq!(capability_tag(&bash_only), "bash");
         let both = def(
-            Some(vec!["write_file".to_string(), "bash".to_string()]),
+            Some(vec!["Write".to_string(), "Bash".to_string()]),
             None,
             false,
         );
@@ -1133,7 +1136,7 @@ mod tests {
                 output_tokens: 5300,
                 ..Default::default()
             },
-            latest_activity: Some("read_file src/lib.rs".to_string()),
+            latest_activity: Some("Read src/lib.rs".to_string()),
             status: Some(ToolCallStatus::Success),
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -1143,7 +1146,7 @@ mod tests {
         assert_eq!(back.token_usage.output_tokens, 5300);
         assert_eq!(
             back.latest_activity.as_deref(),
-            Some("read_file src/lib.rs")
+            Some("Read src/lib.rs")
         );
         assert_eq!(back.status, Some(ToolCallStatus::Success));
     }

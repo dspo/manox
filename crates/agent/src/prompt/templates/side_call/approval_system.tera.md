@@ -43,14 +43,14 @@ ambiguous. When in doubt, ASK — `verdict: "ASK"` is the safer failure mode.
 
 ## Examples
 
-Input: `{"tool_name": "read_file", "tool_input": {"path": "src/main.rs"}}`
+Input: `{"tool_name": "Read", "tool_input": {"path": "src/main.rs"}}`
 Output: `{"verdict": "ALLOW", "reason": "read-only"}`
 
-Input: `{"tool_name": "bash", "tool_input": {"command": "rm -rf /"}}`
+Input: `{"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}`
 Output: `{"verdict": "ASK", "reason": "destructive, runs unsandboxed"}`
 
-Input: `{"tool_name": "bash", "tool_input": {"command": "curl https://example.com"}}`
+Input: `{"tool_name": "Bash", "tool_input": {"command": "curl https://example.com"}}`
 Output: `{"verdict": "ASK", "reason": "network access"}`
 
-Input: `{"tool_name": "write_file", "tool_input": {"path": "/etc/hosts", "content": "x"}}`
+Input: `{"tool_name": "Write", "tool_input": {"path": "/etc/hosts", "content": "x"}}`
 Output: `{"verdict": "ASK", "reason": "writes outside the working directory"}`

@@ -44,7 +44,7 @@ struct SelfInfoInput {}
 
 impl AgentToolTrait for SelfInfoTool {
     fn name(&self) -> &str {
-        "self_info"
+        "SelfInfo"
     }
 
     fn description(&self) -> &str {
@@ -110,10 +110,10 @@ mod tests {
 
     #[test]
     fn name_is_self_info() {
-        // provider API tool name charset is [a-zA-Z0-9_-]; "self_info" is valid
+        // provider API tool name charset is [a-zA-Z0-9_-]; "SelfInfo" is valid
         // and reads like `self.info()` in OOP style.
         let tool = SelfInfoTool::new();
-        assert_eq!(tool.name(), "self_info");
+        assert_eq!(tool.name(), "SelfInfo");
     }
 
     #[test]

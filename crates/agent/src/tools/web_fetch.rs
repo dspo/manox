@@ -43,7 +43,7 @@ struct WebFetchInput {
 
 impl AgentTool for WebFetchTool {
     fn name(&self) -> &str {
-        "web_fetch"
+        "WebFetch"
     }
     fn description(&self) -> &str {
         "Fetch a web document over HTTP/HTTPS GET and return its text. Use this for \
@@ -87,7 +87,7 @@ impl AgentTool for WebFetchTool {
         cx.background_spawn(async move {
             rx.recv()
                 .await
-                .map_err(|_| "web_fetch cancelled".to_string())
+                .map_err(|_| "WebFetch cancelled".to_string())
                 .and_then(|r| r)
         })
     }
@@ -104,18 +104,18 @@ async fn fetch(
 ) -> Result<String, String> {
     if !is_http_url(&url) {
         return Err(format!(
-            "web_fetch only supports http/https URLs; got: {url}"
+            "WebFetch only supports http/https URLs; got: {url}"
         ));
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
-        .map_err(|e| format!("web_fetch client build failed: {e}"))?;
+        .map_err(|e| format!("WebFetch client build failed: {e}"))?;
 
     let response = tokio::select! {
-        r = client.get(&url).send() => r.map_err(|e| format!("web_fetch request failed: {e}"))?,
-        _ = cancel.cancelled() => return Err("web_fetch cancelled".to_string()),
+        r = client.get(&url).send() => r.map_err(|e| format!("WebFetch request failed: {e}"))?,
+        _ = cancel.cancelled() => return Err("WebFetch cancelled".to_string()),
     };
 
     let final_url = response.url().to_string();
@@ -137,9 +137,9 @@ async fn fetch(
     let mut truncated = false;
     while let Some(chunk_res) = stream.next().await {
         if cancel.is_cancelled() {
-            return Err("web_fetch cancelled".to_string());
+            return Err("WebFetch cancelled".to_string());
         }
-        let chunk = chunk_res.map_err(|e| format!("web_fetch body read failed: {e}"))?;
+        let chunk = chunk_res.map_err(|e| format!("WebFetch body read failed: {e}"))?;
         total_received += chunk.len();
         if buf.len() < cap {
             let remaining = cap - buf.len();
@@ -212,7 +212,7 @@ mod tests {
             .block_on(fetch("https://".into(), 1024, 5, cancel))
             .unwrap_err();
         // reqwest rejects a host-less URL with a builder or send error.
-        assert!(r.contains("web_fetch"));
+        assert!(r.contains("WebFetch"));
     }
 
     #[test]

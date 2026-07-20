@@ -12,6 +12,8 @@
 pub mod agent;
 pub mod ask_user;
 pub mod bash;
+pub mod bash_output;
+pub mod background_shell;
 pub mod edit_file;
 pub mod file_lock;
 pub mod glob;
@@ -270,7 +272,7 @@ pub(crate) fn truncate_output(s: &str, max: usize) -> TruncatedText<'_> {
 #[allow(dead_code)] // convenience constructor; the live paths use _with_policy
 pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
     let sandbox = crate::sandbox::SandboxPolicy::for_project(cwd.as_ref());
-    base_tools_with_policy(cwd, sandbox)
+    base_tools_with_policy(cwd, sandbox, None)
 }
 
 /// Same as [`base_tools`] but with an explicit sandbox policy. The worktree
@@ -279,25 +281,30 @@ pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
 pub(crate) fn base_tools_with_policy(
     cwd: Arc<PathBuf>,
     sandbox: crate::sandbox::SandboxPolicy,
+    plugin_root: Option<PathBuf>,
 ) -> Vec<AnyAgentTool> {
     let mut tools = vec![
-        Arc::new(read_file::ReadFileTool {
+        Arc::new(read_file::ReadTool {
             cwd: cwd.clone(),
             read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
         }) as AnyAgentTool,
-        Arc::new(write_file::WriteFileTool {
+        Arc::new(write_file::WriteTool {
             cwd: cwd.clone(),
             sandbox: sandbox.clone(),
         }),
-        Arc::new(edit_file::EditFileTool {
+        Arc::new(edit_file::EditTool {
             cwd: cwd.clone(),
             sandbox: sandbox.clone(),
         }),
-        Arc::new(list_directory::ListDirectoryTool {
+        Arc::new(list_directory::ListTool {
             cwd: cwd.clone(),
             read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
         }),
-        Arc::new(bash::BashTool::new(cwd.as_ref().clone(), sandbox.clone())),
+        Arc::new(if let Some(root) = &plugin_root {
+            bash::BashTool::new_with_plugin_root(cwd.as_ref().clone(), sandbox.clone(), root.clone())
+        } else {
+            bash::BashTool::new(cwd.as_ref().clone(), sandbox.clone())
+        }),
         Arc::new(grep::GrepTool {
             cwd: cwd.clone(),
             read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
@@ -308,6 +315,13 @@ pub(crate) fn base_tools_with_policy(
         }),
         Arc::new(ask_user::AskUserQuestionTool),
         Arc::new(skill::SkillTool),
+        // BashOutput: poll a background shell started by Bash with run_in_background.
+        Arc::new(bash_output::BashOutputTool) as AnyAgentTool,
+        // Monitor: stream a long-running command line by line. Now shared with
+        // sub-agents so a plugin sub-agent (e.g. remora) can watch a long
+        // process. Previously main-only; the main-thread-only registration in
+        // main_registry was removed when this was added here.
+        Arc::new(monitor::MonitorTool) as AnyAgentTool,
         // Lightweight HTTP GET for public docs. Read-only and shared with
         // sub-agents so a read-only `explore`/`plan` sub-agent can pull docs
         // without the full browser. The JS/auth-gated counterpart stays in the
@@ -353,15 +367,11 @@ pub fn main_registry_with_policy(
 ) -> ToolRegistry {
     let cwd = Arc::new(cwd);
     let mut reg = ToolRegistry::new();
-    for tool in base_tools_with_policy(cwd.clone(), sandbox) {
+    for tool in base_tools_with_policy(cwd.clone(), sandbox, None) {
         reg.register(tool);
     }
     reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone())) as AnyAgentTool);
     reg.register(self_info::new());
-    // `monitor` is main-thread-only (not in `base_tools`, so sub-agents do not
-    // get it): streaming a long-running command is a top-level orchestration
-    // concern, and like `agent` it should not nest into sub-agent contexts.
-    reg.register(Arc::new(monitor::MonitorTool) as AnyAgentTool);
     // Worktree harness tools: main-thread-only, they mutate the owning
     // Thread's cwd and rebuild its tool registry on enter/exit.
     reg.register(Arc::new(worktree::EnterWorktreeTool::new(parent.clone())) as AnyAgentTool);
@@ -418,22 +428,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_tools_has_ten_tools() {
+    fn base_tools_has_twelve_tools() {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 12);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"write_file"));
-        assert!(names.contains(&"edit_file"));
-        assert!(names.contains(&"list_directory"));
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"grep"));
-        assert!(names.contains(&"glob"));
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Write"));
+        assert!(names.contains(&"Edit"));
+        assert!(names.contains(&"List"));
+        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&"Grep"));
+        assert!(names.contains(&"Glob"));
         assert!(names.contains(&"AskUserQuestion"));
-        assert!(names.contains(&"skill"));
-        assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"Skill"));
+        assert!(names.contains(&"WebFetch"));
+        assert!(names.contains(&"BashOutput"));
+        assert!(names.contains(&"Monitor"));
         // The sub-agent tool is registered by `main_registry`, not `base_tools`.
-        assert!(!names.contains(&"agent"));
+        assert!(!names.contains(&"Agent"));
     }
 
     #[test]
@@ -596,17 +608,18 @@ mod tests {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
         let by_name = |n: &str| tools.iter().find(|t| t.name() == n).unwrap();
         for n in [
-            "read_file",
-            "list_directory",
-            "grep",
-            "glob",
+            "Read",
+            "List",
+            "Grep",
+            "Glob",
             "AskUserQuestion",
-            "skill",
-            "web_fetch",
+            "Skill",
+            "WebFetch",
+            "BashOutput",
         ] {
             assert!(by_name(n).is_read_only(), "{n} should be read-only");
         }
-        for n in ["write_file", "edit_file", "bash"] {
+        for n in ["Write", "Edit", "Bash", "Monitor"] {
             assert!(!by_name(n).is_read_only(), "{n} should NOT be read-only");
         }
     }

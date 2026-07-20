@@ -729,7 +729,7 @@ mod tests {
                 cache: false,
             }],
             tools: vec![LanguageModelRequestTool {
-                name: "bash".to_string(),
+                name: "Bash".to_string(),
                 description: "run a shell command".to_string(),
                 input_schema: json!({"type": "object", "properties": {"cmd": {"type": "string"}}}),
                 use_input_streaming: false,
@@ -783,7 +783,7 @@ mod tests {
         let tools = body.get("tools").and_then(Value::as_array).expect("tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
-        assert_eq!(tools[0]["function"]["name"], "bash");
+        assert_eq!(tools[0]["function"]["name"], "Bash");
         assert!(tools[0]["function"]["description"].is_string());
         assert!(tools[0]["function"]["parameters"].is_object());
     }
@@ -817,7 +817,7 @@ mod tests {
     fn messages_to_openai_emits_tool_calls_and_tool_role() {
         let tu = LanguageModelToolUse {
             id: "call_1".to_string(),
-            name: Arc::from("bash"),
+            name: Arc::from("Bash"),
             raw_input: r#"{"cmd":"ls"}"#.to_string(),
             input: json!({"cmd": "ls"}),
             is_input_complete: true,
@@ -825,7 +825,7 @@ mod tests {
         };
         let tr = LanguageModelToolResult {
             tool_use_id: "call_1".to_string(),
-            tool_name: Arc::from("bash"),
+            tool_name: Arc::from("Bash"),
             is_error: false,
             content: "file.rs".to_string(),
         };
@@ -846,7 +846,7 @@ mod tests {
         assert_eq!(out[0]["role"], "assistant");
         assert_eq!(out[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(out[0]["tool_calls"][0]["type"], "function");
-        assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "bash");
+        assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "Bash");
         assert_eq!(
             out[0]["tool_calls"][0]["function"]["arguments"],
             r#"{"cmd":"ls"}"#
@@ -945,7 +945,7 @@ mod tests {
     fn map_chunk_assembles_streamed_tool_input() {
         let mut m = CompletionsEventMapper::new();
         let events = vec![
-            make_tool_delta(0, Some("call_1"), Some("bash"), None),
+            make_tool_delta(0, Some("call_1"), Some("Bash"), None),
             make_tool_delta(0, None, None, Some(r#"{"cmd":"#)),
             make_tool_delta(0, None, None, Some(r#""ls"}"#)),
             json!({
@@ -970,7 +970,7 @@ mod tests {
         let finals: Vec<_> = tools.iter().filter(|t| t.is_input_complete).collect();
         assert_eq!(finals.len(), 1);
         assert_eq!(finals[0].id, "call_1");
-        assert_eq!(&*finals[0].name, "bash");
+        assert_eq!(&*finals[0].name, "Bash");
         assert_eq!(finals[0].input["cmd"], "ls");
         let stop = all.iter().find_map(|r| match r {
             Ok(LanguageModelCompletionEvent::Stop(s)) => Some(*s),

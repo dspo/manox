@@ -91,18 +91,18 @@ mod tests {
     use super::*;
 
     const WRITE_TOOLS: &[&str] = &[
-        "web_explore_open",
-        "web_explore_navigate",
-        "web_explore_click",
-        "web_explore_type",
-        "web_explore_scroll",
-        "web_explore_yield",
-        "web_explore_close",
+        "WebExploreOpen",
+        "WebExploreNavigate",
+        "WebExploreClick",
+        "WebExploreType",
+        "WebExploreScroll",
+        "WebExploreYield",
+        "WebExploreClose",
     ];
     const READ_TOOLS: &[&str] = &[
-        "web_explore_read_text",
-        "web_explore_read_dom",
-        "web_explore_screenshot",
+        "WebExploreReadText",
+        "WebExploreReadDom",
+        "WebExploreScreenshot",
     ];
 
     #[test]

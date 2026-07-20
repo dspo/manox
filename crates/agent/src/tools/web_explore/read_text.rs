@@ -11,7 +11,7 @@ pub struct WebExploreReadTextTool;
 
 impl AgentTool for WebExploreReadTextTool {
     fn name(&self) -> &str {
-        "web_explore_read_text"
+        "WebExploreReadText"
     }
     fn description(&self) -> &str {
         "Read the main text content of the tab's current page (readability-extracted) as \

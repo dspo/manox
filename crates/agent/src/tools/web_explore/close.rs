@@ -11,7 +11,7 @@ pub struct WebExploreCloseTool;
 
 impl AgentTool for WebExploreCloseTool {
     fn name(&self) -> &str {
-        "web_explore_close"
+        "WebExploreClose"
     }
     fn description(&self) -> &str {
         "Close and reclaim the browser tab identified by `tab_id`. Requires approval \

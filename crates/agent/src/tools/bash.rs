@@ -85,6 +85,11 @@ pub struct BashTool {
     /// c5aefe4d escape was `cd` into a sibling worktree then git ops against
     /// its `.git`.
     sandbox: crate::sandbox::SandboxPolicy,
+    /// Plugin install root for plugin-sourced agents (used to inject
+    /// `CLAUDE_PLUGIN_ROOT` into the bash env); `None` for built-in and
+    /// user-authored agents. Set by `build_child_registry_with_policy` from
+    /// `AgentDefinitionFile.root`.
+    plugin_root: Option<PathBuf>,
 }
 
 impl BashTool {
@@ -93,6 +98,21 @@ impl BashTool {
             cwd,
             shell: Arc::new(tokio::sync::Mutex::new(None)),
             sandbox,
+            plugin_root: None,
+        }
+    }
+
+    /// Construct with a plugin root for `CLAUDE_PLUGIN_ROOT` env injection.
+    pub fn new_with_plugin_root(
+        cwd: PathBuf,
+        sandbox: crate::sandbox::SandboxPolicy,
+        plugin_root: PathBuf,
+    ) -> Self {
+        Self {
+            cwd,
+            shell: Arc::new(tokio::sync::Mutex::new(None)),
+            sandbox,
+            plugin_root: Some(plugin_root),
         }
     }
 }
@@ -158,11 +178,18 @@ struct BashInput {
     /// completion (no SIGPIPE) — prefer this over piping into `tail`.
     #[serde(default)]
     tail_lines: Option<usize>,
+    /// When true, start the command in the background and return immediately
+    /// with a shell id. Poll the shell id with `BashOutput` to read incremental
+    /// output until the process exits. Mirrors Claude Code's `run_in_background`
+    /// bash flag. Background shells are tracked in the process-global
+    /// `background_shell` registry; they keep running across turns.
+    #[serde(default, deserialize_with = "lenient_bool_opt")]
+    run_in_background: Option<bool>,
 }
 
 impl AgentTool for BashTool {
     fn name(&self) -> &str {
-        "bash"
+        "Bash"
     }
     fn description(&self) -> &str {
         "Run a bash command and return stdout. Runs inside an OS sandbox by default (macOS seatbelt: writes \
@@ -233,6 +260,7 @@ impl AgentTool for BashTool {
         let shell = self.shell.clone();
         let base_cwd = self.cwd.clone();
         let sandbox = self.sandbox.clone();
+        let plugin_root = self.plugin_root.clone();
         let cwd_override = parsed.cwd.clone();
         let timeout = Duration::from_secs(parsed.timeout_secs.unwrap_or(BASH_DEFAULT_TIMEOUT_SECS));
         let command = parsed.command.clone();
@@ -243,6 +271,49 @@ impl AgentTool for BashTool {
         let unsandboxed = parsed.unsandboxed.unwrap_or(false) || yolo;
         let head_lines = parsed.head_lines;
         let tail_lines = parsed.tail_lines;
+        let run_in_background = parsed.run_in_background.unwrap_or(false);
+        // Background path: spawn and return immediately with a shell id.
+        // The model polls with BashOutput to collect incremental output.
+        if run_in_background {
+            let cwd_for_bg = cwd_override
+                .as_deref()
+                .map(|c| super::resolve_path(c, &base_cwd))
+                .unwrap_or_else(|| base_cwd.clone());
+            let timeout_bg = if parsed.timeout_secs.is_some() {
+                Some(timeout)
+            } else {
+                None
+            };
+            let plugin_root_bg = plugin_root.clone();
+            let sandbox_bg = sandbox.clone();
+            // Spawn on the tokio runtime (tokio::process::Command needs an
+            // active tokio reactor on the calling thread); bridge the result
+            // back to the gpui executor via async_channel, mirroring monitor.
+            let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
+            crate::runtime::handle().spawn(async move {
+                let result = super::background_shell::spawn(
+                    command,
+                    &cwd_for_bg,
+                    timeout_bg,
+                    plugin_root_bg.as_deref(),
+                    &sandbox_bg,
+                )
+                .map(|shell_id| {
+                    format!(
+                        "Background shell started. shell_id: {shell_id}\n\
+Poll with BashOutput (shell_id: \"{shell_id}\") to read incremental output \
+until the process exits."
+                    )
+                });
+                let _ = tx.send(result).await;
+            });
+            return cx.background_spawn(async move {
+                rx.recv()
+                    .await
+                    .map_err(|_| "background shell cancelled".to_string())
+                    .and_then(|r| r)
+            });
+        }
         bridge_tokio(cx, async move {
             if unsandboxed {
                 // Approved escalation / YOLO: brush's persistent shell, no confinement.
@@ -257,8 +328,8 @@ impl AgentTool for BashTool {
                     sink,
                     head_lines,
                     tail_lines,
-                )
-                .await
+                    plugin_root.as_deref(),
+                ).await
             } else if crate::sandbox::is_available() {
                 // Sandboxed default: seatbelt-wrapped subprocess, no approval.
                 #[cfg(target_os = "macos")]
@@ -273,8 +344,8 @@ impl AgentTool for BashTool {
                         sink,
                         head_lines,
                         tail_lines,
-                    )
-                    .await
+                        plugin_root.as_deref(),
+                    ).await
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -296,8 +367,8 @@ impl AgentTool for BashTool {
                     sink,
                     head_lines,
                     tail_lines,
-                )
-                .await
+                    plugin_root.as_deref(),
+                ).await
             }
         })
     }
@@ -338,6 +409,7 @@ async fn run_bash(
     sink: ToolOutputSink,
     head_lines: Option<usize>,
     tail_lines: Option<usize>,
+    plugin_root: Option<&Path>,
 ) -> Result<String, anyhow::Error> {
     // Reject a cwd override outside the writable set or inside a protected
     // subtree before brush executes it. `cd <sibling-worktree>` is the exact
@@ -406,6 +478,17 @@ async fn run_bash(
                     s.set_env_global(k, exported_shell_var((*v).to_string()))
                         .map_err(brush_err)?;
                 }
+            }
+            // Inject CLAUDE_PLUGIN_ROOT so plugin-authored agent prompts
+            // that reference ${CLAUDE_PLUGIN_ROOT} resolve correctly in
+            // bash. Only set when the tool was constructed with a plugin
+            // root (sub-agent spawned from a plugin agent definition).
+            if let Some(root) = plugin_root {
+                s.set_env_global(
+                    "CLAUDE_PLUGIN_ROOT",
+                    exported_shell_var(root.display().to_string()),
+                )
+                .map_err(brush_err)?;
             }
             *guard = Some(s);
         }
@@ -761,6 +844,7 @@ async fn run_sandboxed_bash(
     sink: ToolOutputSink,
     head_lines: Option<usize>,
     tail_lines: Option<usize>,
+    plugin_root: Option<&Path>,
 ) -> Result<String, anyhow::Error> {
     use std::process::Stdio;
     use tokio::process::Child;
@@ -772,6 +856,11 @@ async fn run_sandboxed_bash(
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
+    // Inject CLAUDE_PLUGIN_ROOT so plugin-authored agent prompts that
+    // reference ${CLAUDE_PLUGIN_ROOT} resolve in sandboxed bash too.
+    if let Some(root) = plugin_root {
+        cmd.env("CLAUDE_PLUGIN_ROOT", root);
+    }
 
     let mut child: Child = match cmd.spawn() {
         Ok(c) => c,
@@ -907,8 +996,8 @@ mod tests {
             null_sink(),
             None,
             None,
-        )
-        .await
+            None,
+        ).await
         .unwrap();
         assert_eq!(out, "hello");
     }
@@ -933,8 +1022,8 @@ mod tests {
             null_sink(),
             None,
             None,
-        )
-        .await
+            None,
+        ).await
         .expect("fast exit must not panic and must report Ok");
         assert!(out.is_empty(), "expected empty output, got: {out}");
     }
@@ -952,8 +1041,8 @@ mod tests {
             null_sink(),
             None,
             None,
-        )
-        .await
+            None,
+        ).await
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("exit code 7"), "got: {msg}");
@@ -981,8 +1070,8 @@ mod tests {
             null_sink(),
             None,
             None,
-        )
-        .await
+            None,
+        ).await
         .expect("printenv must succeed when PATH is exported");
         assert_eq!(
             out.trim(),
@@ -1005,8 +1094,8 @@ mod tests {
             null_sink(),
             None,
             None,
-        )
-        .await
+            None,
+        ).await
         .unwrap_err();
         // The 1s timeout must reap the process, not wait out the full 30s sleep.
         assert!(
@@ -1037,8 +1126,8 @@ mod tests {
             null_sink(),
             None,
             None,
-        )
-        .await
+            None,
+        ).await
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("cancelled"), "got: {msg}");
@@ -1061,8 +1150,8 @@ mod tests {
             null_sink(),
             None,
             None,
-        )
-        .await;
+            None,
+        ).await;
         assert!(
             start.elapsed() < std::time::Duration::from_secs(10),
             "elapsed {:?}",
@@ -1086,8 +1175,8 @@ mod tests {
             null_sink(),
             None,
             None,
-        )
-        .await
+            None,
+        ).await
         .unwrap();
         let out = run_bash(
             shell,
@@ -1100,8 +1189,8 @@ mod tests {
             null_sink(),
             None,
             None,
-        )
-        .await
+            None,
+        ).await
         .unwrap();
         assert_eq!(out.trim_end(), "/tmp");
     }

@@ -23,11 +23,38 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
+use std::path::PathBuf;
 
 use crate::paths;
 use crate::plugin::PluginManager;
 
-/// A single subagent definition (frontmatter only).
+/// `tools` / `disallowed_tools` may be a YAML list or a comma-separated
+// string (Claude Code uses both forms across its agent corpus). Deserialize
+// into a `Vec<String>`, matching `command.rs`'s `AllowedTools` pattern.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+pub enum ToolsList {
+    #[default]
+    Empty,
+    List(Vec<String>),
+    Str(String),
+}
+
+impl ToolsList {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            ToolsList::Empty => Vec::new(),
+            ToolsList::List(v) => v,
+            ToolsList::Str(s) => s.split(',').map(|t| t.trim().to_string()).collect(),
+        }
+    }
+
+    pub fn as_vec(&self) -> Vec<String> {
+        self.clone().into_vec()
+    }
+}
+
+// A single subagent definition (frontmatter only).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentDefinition {
     /// Unique key; the `subagent_type` the parent model passes to the `agent` tool.
@@ -39,11 +66,11 @@ pub struct AgentDefinition {
     /// cap), so listing `agent` here is a no-op and listing it in
     /// `disallowed_tools` will not block nesting.
     #[serde(default)]
-    pub tools: Option<Vec<String>>,
+    pub tools: Option<ToolsList>,
     /// Tool blacklist. Takes precedence over `tools` when both are present.
     /// Ignored for the `agent` tool (see `tools`).
     #[serde(default)]
-    pub disallowed_tools: Option<Vec<String>>,
+    pub disallowed_tools: Option<ToolsList>,
     /// Model id resolvable via `ProviderRegistry::get_model`. `None` = inherit
     /// the parent `Thread`'s model.
     #[serde(default)]
@@ -58,10 +85,14 @@ pub struct AgentDefinition {
 }
 
 /// A loaded definition file: frontmatter + the body used as system prompt.
+/// `root` is the plugin install root for plugin-sourced agents (used to
+/// inject `CLAUDE_PLUGIN_ROOT` into the sub-agent's bash env); `None` for
+/// built-in and user-authored agents.
 #[derive(Debug, Clone)]
 pub struct AgentDefinitionFile {
     pub def: AgentDefinition,
     pub system_prompt: String,
+    pub root: Option<PathBuf>,
 }
 
 /// Process-wide registry of subagent definitions, keyed by `name`.
@@ -86,7 +117,7 @@ impl AgentDefinitionRegistry {
         }
         // User-authored definitions: bare frontmatter `name`, no namespace.
         if let Ok(dir) = paths::agents_dir() {
-            scan_dir(&dir, &mut |path| match load_file(path) {
+            scan_dir(&dir, &mut |path| match load_file(path, None) {
                 Ok(file) => {
                     defs.insert(file.def.name.clone(), Arc::new(file));
                 }
@@ -100,7 +131,8 @@ impl AgentDefinitionRegistry {
                 continue;
             }
             let ns = plugin.name.clone();
-            scan_dir(&dir, &mut |path| match load_file(path) {
+            let root_for_plugin = plugin.root.clone();
+            scan_dir(&dir, &mut |path| match load_file(path, Some(root_for_plugin.clone())) {
                 Ok(file) => {
                     let key = format!("{ns}:{}", file.def.name);
                     defs.insert(key, Arc::new(file));
@@ -150,16 +182,16 @@ fn scan_dir(dir: &std::path::Path, on_file: &mut dyn FnMut(&std::path::Path)) {
 
 /// Parse one agent definition markdown file: split frontmatter from body,
 /// deserialize the frontmatter, keep the body verbatim as the system prompt.
-fn load_file(path: &std::path::Path) -> Result<AgentDefinitionFile> {
+fn load_file(path: &std::path::Path, root: Option<PathBuf>) -> Result<AgentDefinitionFile> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    parse_definition(&raw, &format!("{}", path.display()))
+    parse_definition(&raw, &format!("{}", path.display()), root)
 }
 
 /// Parse a definition from a raw markdown string. `source` is used only for
 /// error context (a path or a builtin id). Shared by the file loader and the
 /// built-in definition loader so they apply the same validation.
-fn parse_definition(raw: &str, source: &str) -> Result<AgentDefinitionFile> {
+fn parse_definition(raw: &str, source: &str, root: Option<PathBuf>) -> Result<AgentDefinitionFile> {
     let parsed = crate::frontmatter::parse::<AgentDefinition>(raw)
         .map_err(|e| anyhow::anyhow!("parsing frontmatter in {source}: {e:#}"))?;
     let def = parsed.front;
@@ -172,6 +204,7 @@ fn parse_definition(raw: &str, source: &str) -> Result<AgentDefinitionFile> {
     Ok(AgentDefinitionFile {
         def,
         system_prompt: parsed.body,
+        root,
     })
 }
 
@@ -182,7 +215,7 @@ fn parse_definition(raw: &str, source: &str) -> Result<AgentDefinitionFile> {
 /// silently skipped.
 fn builtin_definitions() -> Vec<AgentDefinitionFile> {
     const EXPLORE: &str = include_str!("agents/explore.md");
-    vec![parse_definition(EXPLORE, "builtin:explore").expect("builtin explore agent must parse")]
+    vec![parse_definition(EXPLORE, "builtin:explore", None).expect("builtin explore agent must parse")]
 }
 
 static REGISTRY: OnceLock<AgentDefinitionRegistry> = OnceLock::new();
@@ -219,12 +252,12 @@ mod tests {
         assert_eq!(def.name, "researcher");
         assert_eq!(def.description, "只读代码探索");
         assert_eq!(
-            def.tools.as_deref(),
-            Some(&["read_file".to_string(), "grep".to_string()][..])
+            def.tools.as_ref().map(|t| t.as_vec()),
+            Some(vec!["read_file".to_string(), "grep".to_string()])
         );
         assert_eq!(
-            def.disallowed_tools.as_deref(),
-            Some(&["bash".to_string()][..])
+            def.disallowed_tools.as_ref().map(|t| t.as_vec()),
+            Some(vec!["bash".to_string()])
         );
         assert_eq!(def.max_turns, Some(20));
         assert!(!def.allow_nesting);
@@ -255,7 +288,7 @@ mod tests {
     fn load_file_rejects_empty_name() {
         let tmp = std::env::temp_dir().join("manox_agent_def_test.md");
         std::fs::write(&tmp, "---\nname: ''\ndescription: x\n---\nbody\n").unwrap();
-        let r = load_file(&tmp);
+        let r = load_file(&tmp, None);
         assert!(r.is_err());
         let _ = std::fs::remove_file(&tmp);
     }
@@ -283,9 +316,10 @@ mod tests {
                 .disallowed_tools
                 .as_ref()
                 .expect("read-only builtin has disallowed_tools");
-            for blocked in ["write_file", "edit_file", "bash", "agent"] {
+            let dis_vec = dis.as_vec();
+            for blocked in ["Write", "Edit", "Bash", "Agent"] {
                 assert!(
-                    dis.iter().any(|x| x == blocked),
+                    dis_vec.iter().any(|x| x == blocked),
                     "{} must disallow {blocked}",
                     f.def.name
                 );
@@ -312,6 +346,7 @@ mod tests {
                 parse_definition(
                     "---\nname: explore\ndescription: d\n---\nbody",
                     "builtin:explore",
+                    None,
                 )
                 .expect("parse"),
             ),
@@ -322,6 +357,7 @@ mod tests {
                 parse_definition(
                     "---\nname: remora-task\ndescription: d\n---\nbody",
                     "plugin:remora",
+                    None,
                 )
                 .expect("parse"),
             ),

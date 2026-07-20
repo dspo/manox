@@ -16,7 +16,7 @@ pub struct WebExploreScreenshotTool;
 
 impl AgentTool for WebExploreScreenshotTool {
     fn name(&self) -> &str {
-        "web_explore_screenshot"
+        "WebExploreScreenshot"
     }
     fn description(&self) -> &str {
         "Return a DOM snapshot of the tab's visible viewport (structure + scroll/viewport \

@@ -338,7 +338,7 @@ mod tests {
             Message::assistant(vec![MessageContent::Text("旧回复".into())]),
             Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tu_1".into(),
-                tool_name: Arc::<str>::from("read_file"),
+                tool_name: Arc::<str>::from("Read"),
                 is_error: false,
                 content: "file contents".into(),
             })]),
@@ -348,7 +348,7 @@ mod tests {
             // the topic-shift request of a user turn.
             Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tu_2".into(),
-                tool_name: Arc::<str>::from("bash"),
+                tool_name: Arc::<str>::from("Bash"),
                 is_error: false,
                 content: "ok".into(),
             })]),

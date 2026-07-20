@@ -13,7 +13,7 @@ use crate::tool::AgentTool;
 
 use super::{resolve_path, schema};
 
-pub struct ListDirectoryTool {
+pub struct ListTool {
     pub(crate) cwd: Arc<PathBuf>,
     pub(crate) read_policy: ReadPolicy,
 }
@@ -26,9 +26,9 @@ struct ListDirectoryInput {
     path: Option<String>,
 }
 
-impl AgentTool for ListDirectoryTool {
+impl AgentTool for ListTool {
     fn name(&self) -> &str {
-        "list_directory"
+        "List"
     }
     fn description(&self) -> &str {
         "List the direct children (files and directories) of a directory."

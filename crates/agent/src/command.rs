@@ -192,17 +192,19 @@ fn tool_id_from_spec(spec: &str) -> Option<String> {
         return None;
     }
     Some(match head.to_lowercase().as_str() {
-        "read" | "read_file" => "read_file".to_string(),
-        "write" | "write_file" => "write_file".to_string(),
-        "edit" | "edit_file" | "multiedit" => "edit_file".to_string(),
-        "list" | "list_directory" | "ls" => "list_directory".to_string(),
-        "bash" => "bash".to_string(),
-        "grep" => "grep".to_string(),
-        "glob" => "glob".to_string(),
-        "askuserquestion" | "ask_user" => "ask_user".to_string(),
-        "agent" | "task" => "agent".to_string(),
-        "skill" => "skill".to_string(),
-        "self_info" => "self_info".to_string(),
+        "read" | "read_file" => "Read".to_string(),
+        "write" | "write_file" => "Write".to_string(),
+        "edit" | "edit_file" | "multiedit" => "Edit".to_string(),
+        "list" | "list_directory" | "ls" => "List".to_string(),
+        "bash" => "Bash".to_string(),
+        "bashoutput" | "bash_output" => "BashOutput".to_string(),
+        "grep" => "Grep".to_string(),
+        "glob" => "Glob".to_string(),
+        "askuserquestion" | "ask_user" => "AskUserQuestion".to_string(),
+        "agent" | "task" => "Agent".to_string(),
+        "skill" => "Skill".to_string(),
+        "self_info" | "selfinfo" => "SelfInfo".to_string(),
+        "monitor" => "Monitor".to_string(),
         other => other.to_string(),
     })
 }
@@ -254,13 +256,13 @@ allowed-tools: Bash(node:*), AskUserQuestion, Read\n\
 
     #[test]
     fn tool_id_from_spec_maps_clude_names() {
-        assert_eq!(tool_id_from_spec("Bash(node:*)"), Some("bash".to_string()));
-        assert_eq!(tool_id_from_spec("Read"), Some("read_file".to_string()));
+        assert_eq!(tool_id_from_spec("Bash(node:*)"), Some("Bash".to_string()));
+        assert_eq!(tool_id_from_spec("Read"), Some("Read".to_string()));
         assert_eq!(
             tool_id_from_spec("AskUserQuestion"),
-            Some("ask_user".to_string())
+            Some("AskUserQuestion".to_string())
         );
-        assert_eq!(tool_id_from_spec("Agent"), Some("agent".to_string()));
+        assert_eq!(tool_id_from_spec("Agent"), Some("Agent".to_string()));
         assert_eq!(tool_id_from_spec(""), None);
     }
 

@@ -305,7 +305,7 @@ impl MessageItem {
             // list_directory / …) and MCP tools are manox abstractions, not
             // terminal commands — they render the body only, without the cwd
             // preamble that would imply "run this in a shell".
-            let is_terminal_command = entry.name.as_str() == "bash";
+            let is_terminal_command = entry.name.as_str() == "Bash";
             let command = if is_terminal_command {
                 entry
                     .input
@@ -1114,7 +1114,7 @@ pub fn render_retry(
 /// syntax highlighting can colour the output.
 fn lang_hint_for_tool(name: &str) -> Option<&'static str> {
     match name {
-        "bash" => Some("bash"),
+        "Bash" => Some("bash"),
         "python" => Some("python"),
         _ => None,
     }
@@ -1484,13 +1484,13 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
     for e in entries {
         let ActivityEntry::Tool(e) = e else { continue };
         match e.name.as_str() {
-            "read_file" | "write_file" | "list_directory" => {
+            "Read" | "Write" | "List" => {
                 if let Some(p) = e.input.get("path").and_then(|v| v.as_str()) {
                     match e.name.as_str() {
-                        "read_file" => {
+                        "Read" => {
                             reads.insert(p.to_string());
                         }
-                        "write_file" => {
+                        "Write" => {
                             writes.insert(p.to_string());
                         }
                         _ => {
@@ -1499,10 +1499,10 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     }
                 } else {
                     match e.name.as_str() {
-                        "read_file" => {
+                        "Read" => {
                             reads.insert(String::new());
                         }
-                        "write_file" => {
+                        "Write" => {
                             writes.insert(String::new());
                         }
                         _ => {
@@ -1511,7 +1511,7 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     }
                 }
             }
-            "edit_file" => {
+            "Edit" => {
                 // The patch's first `[PATH#TAG]` header names the target file.
                 // Everything before the last `#` is the path (paths with `#`
                 // survive). Mirrors `tool_title`'s edit_file extraction.
@@ -1529,12 +1529,12 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     .unwrap_or_default();
                 edits.insert(path);
             }
-            "bash" => {
+            "Bash" => {
                 // Commands count by invocation, not by unique command text —
                 // running `cargo build` twice is "2 commands", not 1.
                 running += 1;
             }
-            "grep" => {
+            "Grep" => {
                 let p = e
                     .input
                     .get("pattern")
@@ -1543,7 +1543,7 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     .to_string();
                 searches.insert(p);
             }
-            "glob" => {
+            "Glob" => {
                 let p = e
                     .input
                     .get("pattern")
@@ -1552,23 +1552,23 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     .to_string();
                 globs.insert(p);
             }
-            "web_fetch"
-            | "web_explore_read_text"
-            | "web_explore_read_dom"
-            | "web_explore_screenshot" => {
+            "WebFetch"
+            | "WebExploreReadText"
+            | "WebExploreReadDom"
+            | "WebExploreScreenshot" => {
                 // Read-side network activity: fetching a doc URL or reading a
                 // browser tab's content. Counted by invocation.
                 fetching += 1;
             }
-            "web_explore_open"
-            | "web_explore_navigate"
-            | "web_explore_click"
-            | "web_explore_type"
-            | "web_explore_scroll"
-            | "web_explore_yield"
+            "WebExploreOpen"
+            | "WebExploreNavigate"
+            | "WebExploreClick"
+            | "WebExploreType"
+            | "WebExploreScroll"
+            | "WebExploreYield"
             | "web_explore_read_wait"
             | "web_explore_write"
-            | "web_explore_close" => {
+            | "WebExploreClose" => {
                 // Driving the browser tab itself — navigation and interaction.
                 browsing += 1;
             }
@@ -2244,7 +2244,7 @@ fn render_tool_output(
     // copy-selection yields the display text while the LLM still sees numbered
     // output on the next turn. Non-`read_file` tools borrow the raw output
     // without allocating.
-    let display: std::borrow::Cow<'_, str> = if item.name == "read_file" {
+    let display: std::borrow::Cow<'_, str> = if item.name == "Read" {
         std::borrow::Cow::Owned(strip_hashline_numbering(&display_output))
     } else {
         std::borrow::Cow::Borrowed(&display_output)
@@ -2444,7 +2444,7 @@ pub fn render_agent_task(
                     .py_2()
                     .gap_1()
                     .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                        render_item(sitem, six, "agent", theme, agent_ctx, tool_ctx, None, cx)
+                        render_item(sitem, six, "Agent", theme, agent_ctx, tool_ctx, None, cx)
                     })),
             );
         }
@@ -2496,13 +2496,13 @@ fn tool_panel_body(entry: &ToolCallItem) -> (PanelKind, String) {
         entry.output.clone()
     };
     match entry.name.as_ref() {
-        "read_file" => (PanelKind::File, strip_hashline_numbering(&raw)),
+        "Read" => (PanelKind::File, strip_hashline_numbering(&raw)),
         // write_file's `output` is a one-line confirmation ("Wrote N bytes"), not
         // the file content; the content lives in the tool input. Show the written
         // content with a line-number gutter on success. On failure (`is_error`)
         // `output` carries the error — surface that as plain text via the default
         // arm so the user sees what went wrong, not just what was attempted.
-        "write_file" if !entry.is_error => {
+        "Write" if !entry.is_error => {
             let content = entry
                 .input
                 .get("content")
@@ -2511,7 +2511,7 @@ fn tool_panel_body(entry: &ToolCallItem) -> (PanelKind, String) {
                 .to_string();
             (PanelKind::File, content)
         }
-        "edit_file" => (PanelKind::Diff, raw),
+        "Edit" => (PanelKind::Diff, raw),
         _ => (PanelKind::Plain, raw),
     }
 }
@@ -2789,7 +2789,7 @@ pub fn build_items(
                             }
                         }
                         MessageContent::ToolUse(tu) => {
-                            if tu.name.as_ref() == "agent" {
+                            if tu.name.as_ref() == "Agent" {
                                 // Sub-agent tasks stay as standalone top-level
                                 // cards (their expand panel reuses the full
                                 // sub-conversation renderer); never folded.
@@ -3071,7 +3071,7 @@ mod tests {
             });
             thinking.entries.push(ActivityEntry::Tool(ToolCallItem {
                 id: "tool-long-final-output".into(),
-                name: "bash".into(),
+                name: "Bash".into(),
                 title: "bash: a very long final command title that should never force the message list wider than its host".into(),
                 status: ToolCallStatus::Success,
                 output: format!("{}\n{}", "x".repeat(2048), "y".repeat(2048)),
@@ -3084,7 +3084,7 @@ mod tests {
             }));
             thinking.entries.push(ActivityEntry::Tool(ToolCallItem {
                 id: "tool-long-streaming-output".into(),
-                name: "bash".into(),
+                name: "Bash".into(),
                 title: "bash: a very long streaming command title that should keep horizontal scroll local".into(),
                 status: ToolCallStatus::Running,
                 output: format!("{}\n{}", "z".repeat(2048), "w".repeat(2048)),
@@ -3196,22 +3196,22 @@ mod tests {
             Message::user("do the task".to_string()),
             Message::assistant(vec![tu(
                 "tu_1",
-                "read_file",
+                "Read",
                 serde_json::json!({"path": "a.rs"}),
             )]),
-            Message::user_with_content(vec![tr("tu_1", "read_file", "a contents")]),
+            Message::user_with_content(vec![tr("tu_1", "Read", "a contents")]),
             Message::assistant(vec![tu(
                 "tu_2",
-                "edit_file",
+                "Edit",
                 serde_json::json!({"patch": "[a.rs#T1]\nINS x"}),
             )]),
-            Message::user_with_content(vec![tr("tu_2", "edit_file", "ok")]),
+            Message::user_with_content(vec![tr("tu_2", "Edit", "ok")]),
             Message::assistant(vec![tu(
                 "tu_3",
-                "bash",
+                "Bash",
                 serde_json::json!({"command": "cargo build"}),
             )]),
-            Message::user_with_content(vec![tr("tu_3", "bash", "Built.")]),
+            Message::user_with_content(vec![tr("tu_3", "Bash", "Built.")]),
         ];
         let items = build_items(&messages, &HashMap::new(), false);
         let segments: Vec<&ThinkingContainer> = items
@@ -3254,10 +3254,10 @@ mod tests {
             Message::user("do it".to_string()),
             Message::assistant(vec![tu(
                 "tu_1",
-                "read_file",
+                "Read",
                 serde_json::json!({"path": "a.rs"}),
             )]),
-            Message::user_with_content(vec![tr("tu_1", "read_file", "a contents")]),
+            Message::user_with_content(vec![tr("tu_1", "Read", "a contents")]),
             // Second user prompt closes the first turn's segment.
             Message::user("next".to_string()),
         ];
@@ -3278,25 +3278,25 @@ mod tests {
             Message::user("turn one".to_string()),
             Message::assistant(vec![tu(
                 "tu_1",
-                "read_file",
+                "Read",
                 serde_json::json!({"path": "a.rs"}),
             )]),
             // tool-result user message — NOT a turn boundary.
-            Message::user_with_content(vec![tr("tu_1", "read_file", "a")]),
+            Message::user_with_content(vec![tr("tu_1", "Read", "a")]),
             Message::assistant(vec![tu(
                 "tu_2",
-                "bash",
+                "Bash",
                 serde_json::json!({"command": "ls"}),
             )]),
-            Message::user_with_content(vec![tr("tu_2", "bash", "files")]),
+            Message::user_with_content(vec![tr("tu_2", "Bash", "files")]),
             // New user prompt — IS a turn boundary.
             Message::user("turn two".to_string()),
             Message::assistant(vec![tu(
                 "tu_3",
-                "read_file",
+                "Read",
                 serde_json::json!({"path": "b.rs"}),
             )]),
-            Message::user_with_content(vec![tr("tu_3", "read_file", "b")]),
+            Message::user_with_content(vec![tr("tu_3", "Read", "b")]),
         ];
         let items = build_items(&messages, &HashMap::new(), false);
         let segments: Vec<&ThinkingContainer> = items
@@ -3319,10 +3319,10 @@ mod tests {
         let messages = vec![
             Message::user("go".to_string()),
             Message::assistant(vec![
-                tu("tu_1", "read_file", serde_json::json!({"path": "a.rs"})),
+                tu("tu_1", "Read", serde_json::json!({"path": "a.rs"})),
                 tu(
                     "tu_agent",
-                    "agent",
+                    "Agent",
                     serde_json::json!({"subagent_type": "r", "prompt": "p"}),
                 ),
                 tu(
@@ -3332,8 +3332,8 @@ mod tests {
                 ),
             ]),
             Message::user_with_content(vec![
-                tr("tu_1", "read_file", "a"),
-                tr("tu_agent", "agent", "{\"final\":\"done\"}"),
+                tr("tu_1", "Read", "a"),
+                tr("tu_agent", "Agent", "{\"final\":\"done\"}"),
                 tr("tu_ask", "AskUserQuestion", "answered"),
             ]),
         ];
@@ -3373,7 +3373,7 @@ mod tests {
         let entries: Vec<ActivityEntry> = vec![
             ActivityEntry::Tool(ToolCallItem {
                 id: "1".into(),
-                name: "edit_file".into(),
+                name: "Edit".into(),
                 title: String::new(),
                 status: ToolCallStatus::Success,
                 output: String::new(),
@@ -3386,7 +3386,7 @@ mod tests {
             }),
             ActivityEntry::Tool(ToolCallItem {
                 id: "2".into(),
-                name: "edit_file".into(),
+                name: "Edit".into(),
                 title: String::new(),
                 status: ToolCallStatus::Success,
                 output: String::new(),
@@ -3400,7 +3400,7 @@ mod tests {
             }),
             ActivityEntry::Tool(ToolCallItem {
                 id: "3".into(),
-                name: "edit_file".into(),
+                name: "Edit".into(),
                 title: String::new(),
                 status: ToolCallStatus::Success,
                 output: String::new(),
@@ -3414,7 +3414,7 @@ mod tests {
             }),
             ActivityEntry::Tool(ToolCallItem {
                 id: "4".into(),
-                name: "bash".into(),
+                name: "Bash".into(),
                 title: String::new(),
                 status: ToolCallStatus::Success,
                 output: String::new(),
@@ -3427,7 +3427,7 @@ mod tests {
             }),
             ActivityEntry::Tool(ToolCallItem {
                 id: "5".into(),
-                name: "bash".into(),
+                name: "Bash".into(),
                 title: String::new(),
                 status: ToolCallStatus::Success,
                 output: String::new(),
@@ -3465,7 +3465,7 @@ mod tests {
         t.collapsed = true;
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             title: String::new(),
             status: ToolCallStatus::Success,
             output: String::new(),
@@ -3478,7 +3478,7 @@ mod tests {
         }));
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "2".into(),
-            name: "bash".into(),
+            name: "Bash".into(),
             title: String::new(),
             status: ToolCallStatus::Success,
             output: String::new(),
@@ -3582,7 +3582,7 @@ mod tests {
                 },
                 MessageContent::ToolUse(LanguageModelToolUse {
                     id: "tu_1".to_string(),
-                    name: Arc::from("read_file"),
+                    name: Arc::from("Read"),
                     raw_input: String::new(),
                     input: serde_json::json!({"path": "a.rs"}),
                     is_input_complete: true,
@@ -3591,7 +3591,7 @@ mod tests {
             ]),
             Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tu_1".to_string(),
-                tool_name: Arc::from("read_file"),
+                tool_name: Arc::from("Read"),
                 is_error: false,
                 content: "file contents".to_string(),
             })]),
@@ -3631,7 +3631,7 @@ mod tests {
                 },
                 MessageContent::ToolUse(LanguageModelToolUse {
                     id: "tu_1".to_string(),
-                    name: Arc::from("read_file"),
+                    name: Arc::from("Read"),
                     raw_input: String::new(),
                     input: serde_json::Value::Null,
                     is_input_complete: true,
@@ -3640,7 +3640,7 @@ mod tests {
             ]),
             Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: "tu_1".to_string(),
-                tool_name: Arc::from("read_file"),
+                tool_name: Arc::from("Read"),
                 is_error: false,
                 content: "done".to_string(),
             })]),
@@ -3697,7 +3697,7 @@ mod tests {
         });
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "t1".into(),
-            name: "read_file".into(),
+            name: "Read".into(),
             title: String::new(),
             status: ToolCallStatus::Success,
             output: String::new(),
@@ -3710,7 +3710,7 @@ mod tests {
         }));
         t.entries.push(ActivityEntry::Tool(ToolCallItem {
             id: "t2".into(),
-            name: "bash".into(),
+            name: "Bash".into(),
             title: String::new(),
             status: ToolCallStatus::Success,
             output: String::new(),
@@ -3749,9 +3749,9 @@ mod tests {
                     text: "round 1".to_string(),
                     signature: None,
                 },
-                tu("tu_1", "read_file", serde_json::json!({"path": "a.rs"})),
+                tu("tu_1", "Read", serde_json::json!({"path": "a.rs"})),
             ]),
-            Message::user_with_content(vec![tr("tu_1", "read_file", "a")]),
+            Message::user_with_content(vec![tr("tu_1", "Read", "a")]),
             Message::assistant(vec![
                 MessageContent::Text("the answer".to_string()),
                 MessageContent::Thinking {

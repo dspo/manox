@@ -14,7 +14,7 @@ use crate::tool::AgentTool;
 
 use super::{resolve_path_for_write, schema};
 
-pub struct WriteFileTool {
+pub struct WriteTool {
     pub(crate) cwd: Arc<PathBuf>,
     pub(crate) sandbox: SandboxPolicy,
 }
@@ -30,9 +30,9 @@ struct WriteFileInput {
     content: String,
 }
 
-impl AgentTool for WriteFileTool {
+impl AgentTool for WriteTool {
     fn name(&self) -> &str {
-        "write_file"
+        "Write"
     }
     fn description(&self) -> &str {
         "Write content to the specified file (overwrite). Use to create or rewrite a file."

@@ -28,7 +28,7 @@ struct TypeInput {
 
 impl AgentTool for WebExploreTypeTool {
     fn name(&self) -> &str {
-        "web_explore_type"
+        "WebExploreType"
     }
     fn description(&self) -> &str {
         "Focus the first element matching `selector` and type `text` into it (sets the \

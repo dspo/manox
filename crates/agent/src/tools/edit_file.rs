@@ -14,7 +14,7 @@ use crate::tool::AgentTool;
 
 use super::{resolve_path_for_write, schema};
 
-pub struct EditFileTool {
+pub struct EditTool {
     pub(crate) cwd: Arc<PathBuf>,
     pub(crate) sandbox: SandboxPolicy,
 }
@@ -54,9 +54,9 @@ struct EditFileInput {
     patch: String,
 }
 
-impl AgentTool for EditFileTool {
+impl AgentTool for EditTool {
     fn name(&self) -> &str {
-        "edit_file"
+        "Edit"
     }
     fn description(&self) -> &str {
         "Edit an existing file via a hashline patch (line-anchored + TAG validation). See the input.patch field docs."

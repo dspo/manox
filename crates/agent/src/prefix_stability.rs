@@ -369,7 +369,7 @@ mod tests {
             content: vec![MessageContent::ToolResult(
                 crate::language_model::LanguageModelToolResult {
                     tool_use_id: "id-1".into(),
-                    tool_name: Arc::from("read_file"),
+                    tool_name: Arc::from("Read"),
                     is_error: false,
                     content: "out".into(),
                 },
@@ -512,14 +512,14 @@ mod tests {
             cache: false,
         });
         let tools = match mode {
-            ModeKind::Plan => vec![tool("read_file"), tool("grep"), tool("list_directory")],
+            ModeKind::Plan => vec![tool("Read"), tool("Grep"), tool("List")],
             ModeKind::Default => vec![
-                tool("read_file"),
-                tool("write_file"),
-                tool("edit_file"),
-                tool("bash"),
-                tool("grep"),
-                tool("list_directory"),
+                tool("Read"),
+                tool("Write"),
+                tool("Edit"),
+                tool("Bash"),
+                tool("Grep"),
+                tool("List"),
             ],
         };
         LanguageModelRequest {

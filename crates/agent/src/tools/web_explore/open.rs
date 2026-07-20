@@ -20,7 +20,7 @@ struct OpenInput {
 
 impl AgentTool for WebExploreOpenTool {
     fn name(&self) -> &str {
-        "web_explore_open"
+        "WebExploreOpen"
     }
     fn description(&self) -> &str {
         "Open a new browser tab in the manox sidebar navigated to `url` and return its \

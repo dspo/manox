@@ -25,7 +25,7 @@ struct ScrollInput {
 
 impl AgentTool for WebExploreScrollTool {
     fn name(&self) -> &str {
-        "web_explore_scroll"
+        "WebExploreScroll"
     }
     fn description(&self) -> &str {
         "Scroll the tab's page by (dx, dy) device pixels (positive = right/down, \

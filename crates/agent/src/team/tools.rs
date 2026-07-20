@@ -861,7 +861,7 @@ mod tests {
                     "plan::child1".into(),
                     member.downgrade(),
                     "child1".into(),
-                    "write_file".into(),
+                    "Write".into(),
                     "[plan] write_file /tmp/x".into(),
                     serde_json::json!({}),
                     cx,

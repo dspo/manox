@@ -3867,14 +3867,14 @@ pub(crate) fn message_has_text(m: &Message) -> bool {
 /// Build a human-readable title for a tool call.
 pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
     match name {
-        "read_file" | "write_file" | "list_directory" => {
+        "Read" | "Write" | "List" => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
             format!("{name} {path}")
         }
         // edit_file's input is a single `patch` string whose first `[PATH#TAG]`
         // header names the target file. The path is everything before the last
         // `#`, so paths containing `#` survive.
-        "edit_file" => {
+        "Edit" => {
             let patch = input.get("patch").and_then(|v| v.as_str()).unwrap_or("");
             let path = patch
                 .lines()
@@ -3884,9 +3884,9 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
                     Some(inner.rsplit_once('#')?.0.to_string())
                 })
                 .unwrap_or_default();
-            format!("edit_file {path}")
+            format!("Edit {path}")
         }
-        "bash" => {
+        "Bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             let single = cmd.lines().next().unwrap_or("").trim().to_string();
             if single.chars().count() > 80 {
@@ -3896,15 +3896,15 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
                 single
             }
         }
-        "grep" => {
+        "Grep" => {
             let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            format!("grep {p}")
+            format!("Grep {p}")
         }
-        "glob" => {
+        "Glob" => {
             let p = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            format!("glob {p}")
+            format!("Glob {p}")
         }
-        "agent" => {
+        "Agent" => {
             let st = input
                 .get("subagent_type")
                 .and_then(|v| v.as_str())
@@ -3916,7 +3916,7 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
             } else {
                 prompt.to_string()
             };
-            format!("agent: {st} — {trimmed}")
+            format!("Agent: {st} — {trimmed}")
         }
         "AskUserQuestion" => {
             let q = input
@@ -3941,15 +3941,15 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
         }
         // `web_fetch` and the read-side browser tools surface the target URL so
         // the activity line reads like a Claude Code Fetch/Read action.
-        "web_fetch" => {
+        "WebFetch" => {
             let u = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
             format!("Fetch {u}")
         }
-        "web_explore_open" | "web_explore_navigate" => {
+        "WebExploreOpen" | "WebExploreNavigate" => {
             let u = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
             format!("{name} {u}")
         }
-        "web_explore_read_text" | "web_explore_read_dom" | "web_explore_screenshot" => {
+        "WebExploreReadText" | "WebExploreReadDom" | "WebExploreScreenshot" => {
             // Tab-scoped reads surface the tab id when present; fall back to the
             // tool name so a tab-less historical entry still reads cleanly.
             let tab = input
@@ -3985,20 +3985,20 @@ mod tests {
     fn edit_file_title_extracts_path_not_tag() {
         // The `[PATH#TAG]` header must surface the path, not the 4-hex tag.
         let input = json!({ "patch": "[src/main.rs#1A2B]\nSWAP 5.=5:\n+X" });
-        assert_eq!(tool_title("edit_file", &input), "edit_file src/main.rs");
+        assert_eq!(tool_title("Edit", &input), "Edit src/main.rs");
     }
 
     #[test]
     fn edit_file_title_path_with_hash_survives() {
         // A path containing `#` keeps everything before the LAST `#`.
         let input = json!({ "patch": "[a/b#issue.rs#FF0E]\nDEL 1" });
-        assert_eq!(tool_title("edit_file", &input), "edit_file a/b#issue.rs");
+        assert_eq!(tool_title("Edit", &input), "Edit a/b#issue.rs");
     }
 
     #[test]
     fn edit_file_title_missing_header_is_empty() {
         let input = json!({ "patch": "SWAP 5.=5:\n+X" });
-        assert_eq!(tool_title("edit_file", &input), "edit_file ");
+        assert_eq!(tool_title("Edit", &input), "Edit ");
     }
 
     #[test]
@@ -4027,22 +4027,22 @@ mod tests {
     fn bash_title_strips_prefix_and_uses_first_line() {
         let input = json!({ "command": "gh pr create -R dspo/manox --title foo" });
         assert_eq!(
-            tool_title("bash", &input),
+            tool_title("Bash", &input),
             "gh pr create -R dspo/manox --title foo"
         );
 
         let long = "a".repeat(120);
         let input = json!({ "command": long.clone() });
-        let out = tool_title("bash", &input);
+        let out = tool_title("Bash", &input);
         assert_eq!(out.chars().count(), 81);
         assert!(out.ends_with('…'));
 
         let multi = "git status\ncargo build --release";
         let input = json!({ "command": multi });
-        assert_eq!(tool_title("bash", &input), "git status");
+        assert_eq!(tool_title("Bash", &input), "git status");
 
         let input = json!({});
-        assert_eq!(tool_title("bash", &input), "");
+        assert_eq!(tool_title("Bash", &input), "");
     }
 
     /// The `agent` tool's persisted ToolResult carries a JSON envelope
@@ -4079,7 +4079,7 @@ mod tests {
     fn model_facing_content_passes_non_agent_through() {
         let tr = MessageContent::ToolResult(LanguageModelToolResult {
             tool_use_id: "tu_2".to_string(),
-            tool_name: Arc::from("bash"),
+            tool_name: Arc::from("Bash"),
             is_error: false,
             content: "command output".to_string(),
         });
@@ -4087,7 +4087,7 @@ mod tests {
             panic!("expected ToolResult");
         };
         assert_eq!(out.content, "command output");
-        assert_eq!(out.tool_name.as_ref(), "bash");
+        assert_eq!(out.tool_name.as_ref(), "Bash");
     }
 
     /// A legacy `agent` result (plain text, no envelope) falls back to the raw
@@ -4149,7 +4149,7 @@ mod tests {
         });
         let tu = LanguageModelToolUse {
             id: "tu_1".to_string(),
-            name: Arc::from("self_info"),
+            name: Arc::from("SelfInfo"),
             raw_input: "{}".to_string(),
             input: serde_json::json!({}),
             is_input_complete: true,
@@ -4898,7 +4898,7 @@ mod tests {
                 LanguageModelCompletionEvent::Text("let me read the file".into()),
                 LanguageModelCompletionEvent::ToolUseJsonParseError {
                     id: "tu_parse_1".into(),
-                    tool_name: Arc::from("read_file"),
+                    tool_name: Arc::from("Read"),
                     raw_input: "{bad".into(),
                     json_parse_error: "expected `}`".into(),
                 },
@@ -5862,7 +5862,7 @@ mod tests {
             "Let me search the codebase now."
         ));
         assert!(super::announces_tool_intent_without_call(
-            "I'll call the read_file tool."
+            "I'll call the Read tool."
         ));
         assert!(super::announces_tool_intent_without_call(
             "接下来我先看一下配置"

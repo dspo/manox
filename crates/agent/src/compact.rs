@@ -678,7 +678,7 @@ mod tests {
         use crate::language_model::{LanguageModelToolResult, MessageContent};
         let tr = MessageContent::ToolResult(LanguageModelToolResult {
             tool_use_id: "tu1".to_string(),
-            tool_name: "bash".into(),
+            tool_name: "Bash".into(),
             is_error: false,
             content: "out".to_string(),
         });

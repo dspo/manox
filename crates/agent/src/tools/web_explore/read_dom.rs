@@ -25,7 +25,7 @@ struct ReadDomInput {
 
 impl AgentTool for WebExploreReadDomTool {
     fn name(&self) -> &str {
-        "web_explore_read_dom"
+        "WebExploreReadDom"
     }
     fn description(&self) -> &str {
         "Read the `outerHTML` of the first element matching `selector`, or the whole \
