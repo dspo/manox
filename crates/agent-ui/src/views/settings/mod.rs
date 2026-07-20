@@ -155,9 +155,6 @@ pub struct SettingsView {
     /// Bumped on every click so the click-flash animation re-fires.
     click_gen: u64,
 
-    /// Multi-line text input backing the "Custom instructions" textarea.
-    custom_instructions_input: Entity<InputState>,
-
     // --- General panel state ---
     work_mode: WorkMode,
     permission_default: bool,
@@ -192,9 +189,6 @@ pub struct SettingsView {
     personality: SharedString,
     memory_enabled: bool,
     memory_skip_tool: bool,
-    /// `true` for ~2s after a successful save, then reverts. Drives the save
-    /// button's transient "Saved" label.
-    just_saved: bool,
 
     // --- MCP panel state ---
     /// Servers currently "on" in the UI. The toggle is visual only — the
@@ -218,17 +212,6 @@ impl SettingsView {
         let search = cx.new(|cx| {
             InputState::new(window, cx).placeholder(i18n::t("settings-search-placeholder"))
         });
-        let custom_instructions_input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .placeholder(i18n::t("settings-input-custom-instructions"));
-            // Pre-fill the textarea with the persisted value, if any, so the
-            // user can edit their previous instructions rather than start over.
-            if let Some(prior) = user_settings::load().custom_instructions {
-                state = state.default_value(prior);
-            }
-            state
-        });
-
         // Seed MCP enabled set from the on-disk config so every configured
         // server starts in the "on" position.
         let mut mcp_enabled = HashSet::new();
@@ -241,7 +224,6 @@ impl SettingsView {
             plugins: cx.new(|cx| PluginManagerView::new(window, cx)),
             selected: None,
             click_gen: 0,
-            custom_instructions_input,
             work_mode: WorkMode::default(),
             permission_default: true,
             permission_auto_review: false,
@@ -281,44 +263,7 @@ impl SettingsView {
             personality: i18n::t("settings-value-friendly"),
             memory_enabled: false,
             memory_skip_tool: false,
-            just_saved: false,
             mcp_enabled,
-        }
-    }
-
-    fn persist_custom_instructions(&mut self, cx: &mut Context<Self>) {
-        // Read the current value out of the InputState entity.
-        let value = self.custom_instructions_input.read(cx).value();
-        let mut settings = user_settings::load();
-        let trimmed = value.trim().to_string();
-        settings.custom_instructions = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        };
-        match user_settings::save(&settings) {
-            Ok(()) => {
-                self.just_saved = true;
-                cx.notify();
-                // Revert the button label back to "Save" after a short delay
-                // so the user sees the confirmation without it sticking.
-                let weak = cx.weak_entity();
-                cx.spawn(async move |_this, cx| {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(1600))
-                        .await;
-                    if let Some(this) = weak.upgrade() {
-                        this.update(cx, |view, cx| {
-                            view.just_saved = false;
-                            cx.notify();
-                        });
-                    }
-                })
-                .detach();
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to save custom_instructions");
-            }
         }
     }
 

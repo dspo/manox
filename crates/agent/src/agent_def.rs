@@ -93,6 +93,11 @@ pub struct AgentDefinitionFile {
     pub def: AgentDefinition,
     pub system_prompt: String,
     pub root: Option<PathBuf>,
+    /// Compiled into the binary rather than loaded from disk. The built-in
+    /// `explore` agent is the one definition that skips CLAUDE.md instruction
+    /// injection (Claude Code's Explore/Plan carve-out); user-authored
+    /// overrides with the same name are not built-in and keep instructions.
+    pub builtin: bool,
 }
 
 /// Process-wide registry of subagent definitions, keyed by `name`.
@@ -188,13 +193,18 @@ fn scan_dir(dir: &std::path::Path, on_file: &mut dyn FnMut(&std::path::Path)) {
 fn load_file(path: &std::path::Path, root: Option<PathBuf>) -> Result<AgentDefinitionFile> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    parse_definition(&raw, &format!("{}", path.display()), root)
+    parse_definition(&raw, &format!("{}", path.display()), root, false)
 }
 
 /// Parse a definition from a raw markdown string. `source` is used only for
 /// error context (a path or a builtin id). Shared by the file loader and the
 /// built-in definition loader so they apply the same validation.
-fn parse_definition(raw: &str, source: &str, root: Option<PathBuf>) -> Result<AgentDefinitionFile> {
+fn parse_definition(
+    raw: &str,
+    source: &str,
+    root: Option<PathBuf>,
+    builtin: bool,
+) -> Result<AgentDefinitionFile> {
     let parsed = crate::frontmatter::parse::<AgentDefinition>(raw)
         .map_err(|e| anyhow::anyhow!("parsing frontmatter in {source}: {e:#}"))?;
     let def = parsed.front;
@@ -208,6 +218,7 @@ fn parse_definition(raw: &str, source: &str, root: Option<PathBuf>) -> Result<Ag
         def,
         system_prompt: parsed.body,
         root,
+        builtin,
     })
 }
 
@@ -219,7 +230,7 @@ fn parse_definition(raw: &str, source: &str, root: Option<PathBuf>) -> Result<Ag
 fn builtin_definitions() -> Vec<AgentDefinitionFile> {
     const EXPLORE: &str = include_str!("agents/explore.md");
     vec![
-        parse_definition(EXPLORE, "builtin:explore", None)
+        parse_definition(EXPLORE, "builtin:explore", None, true)
             .expect("builtin explore agent must parse"),
     ]
 }
@@ -353,6 +364,7 @@ mod tests {
                     "---\nname: explore\ndescription: d\n---\nbody",
                     "builtin:explore",
                     None,
+                    true,
                 )
                 .expect("parse"),
             ),
@@ -364,6 +376,7 @@ mod tests {
                     "---\nname: remora-task\ndescription: d\n---\nbody",
                     "plugin:remora",
                     None,
+                    false,
                 )
                 .expect("parse"),
             ),

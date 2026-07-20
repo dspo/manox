@@ -18,10 +18,9 @@ use gpui::{
 };
 use gpui_component::theme::Theme;
 use gpui_component::{
-    ActiveTheme as _, Disableable, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants},
     h_flex,
-    input::Input,
     menu::{DropdownMenu, PopupMenuItem},
     switch::Switch,
     v_flex,
@@ -1093,60 +1092,6 @@ pub fn render_personalization(
         section_card(&theme, children)
     };
 
-    let custom_instructions_section = {
-        let entity = entity.clone();
-        let input = view.custom_instructions_input.clone();
-        let input_for_render = input.clone();
-        let save_label: SharedString = if view.just_saved {
-            i18n::t("settings-btn-saved")
-        } else {
-            i18n::t("settings-btn-save")
-        };
-        let initial_empty = view
-            .custom_instructions_input
-            .read(cx)
-            .value()
-            .trim()
-            .is_empty()
-            && !view.just_saved;
-        let children = vec![
-            section_header("settings-section-custom-instructions"),
-            v_flex()
-                .px_3()
-                .py_2()
-                .gap_2()
-                .child(muted_text(
-                    i18n::t("settings-desc-custom-instructions"),
-                    muted,
-                ))
-                .child(
-                    Input::new(&input_for_render)
-                        .w_full()
-                        .h(px(120.))
-                        .bordered(true),
-                )
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .child(
-                            Button::new("save-custom-instructions")
-                                .label(save_label)
-                                .outline()
-                                .disabled(initial_empty)
-                                .on_click(move |_ev, _window, cx| {
-                                    entity.update(cx, |view, cx| {
-                                        view.persist_custom_instructions(cx);
-                                    });
-                                })
-                                .into_any_element(),
-                        )
-                        .into_any_element(),
-                )
-                .into_any_element(),
-        ];
-        section_card(&theme, children)
-    };
-
     let memory_section = {
         let entity = entity.clone();
         let children = vec![
@@ -1198,7 +1143,6 @@ pub fn render_personalization(
             .w_full()
             .gap_4()
             .child(personality_section)
-            .child(custom_instructions_section)
             .child(memory_section),
     )
 }

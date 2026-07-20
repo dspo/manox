@@ -350,6 +350,13 @@ fn setup_child(
         cx,
     );
 
+    // The built-in `explore` agent skips CLAUDE.md instruction injection to
+    // stay fast (Claude Code's Explore/Plan carve-out). A user-authored agent
+    // named `explore` overrides the built-in and keeps instructions.
+    if def_file.builtin && def_file.def.name == "explore" {
+        child.update(cx, |c, _cx| c.set_instructions_enabled(false));
+    }
+
     // If the child was spawned into a worktree, record the worktree state on
     // the child so its system prompt advertises it, its sandbox stays
     // worktree-aware, and session-end auto-cleanup can remove it when clean.
@@ -826,6 +833,12 @@ pub(crate) fn spawn_team_member(
         },
         cx,
     );
+
+    // Same Explore carve-out as the `agent` tool path: the built-in explore
+    // definition skips CLAUDE.md instructions; overrides keep them.
+    if def_file.builtin && def_file.def.name == "explore" {
+        member.update(cx, |t, _cx| t.set_instructions_enabled(false));
+    }
 
     // Attach the team so the member's task_*/send_message reach the shared
     // list + router. This is the member→team strong edge; `Team::disband`

@@ -156,6 +156,23 @@ pub struct CompactionPreambleData {
     pub summary: String,
 }
 
+/// One loaded CLAUDE.md instruction file for the eager `<instructions>` block.
+/// `content` arrives import-expanded and comment-stripped from `claude_md`;
+/// the template owns only the tag wrapper and spacing.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstructionSourcePromptData {
+    pub scope: &'static str,
+    pub path: String,
+    pub content: String,
+}
+
+/// The multi-level CLAUDE.md eager block, injected as a fixed-slot user
+/// message right after the system head.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstructionsEagerPromptData {
+    pub sources: Vec<InstructionSourcePromptData>,
+}
+
 // --- side-call prompts ---
 
 #[derive(Debug, Clone, Serialize)]

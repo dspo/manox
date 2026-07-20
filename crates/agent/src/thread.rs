@@ -465,6 +465,11 @@ pub struct Thread {
     pending_child_auth: HashMap<String, ChildAuthRoute>,
     /// Sub-agent system prompt; `None` for the main thread (no system prompt injected).
     system: Option<String>,
+    /// Whether the multi-level CLAUDE.md eager block is injected into this
+    /// thread's requests. Always on except for the built-in `explore`
+    /// sub-agent, which skips instruction files to stay fast and cheap
+    /// (Claude Code's Explore/Plan carve-out).
+    instructions_enabled: bool,
     /// Nesting depth. Main thread = 0; a sub-agent = parent depth + 1.
     depth: u32,
     /// Human-readable owner label: "lead" for the main thread, the
@@ -759,6 +764,7 @@ impl Thread {
                 pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
+                instructions_enabled: true,
                 depth: 0,
                 agent_label: "lead".to_string(),
                 max_turns: None,
@@ -846,6 +852,7 @@ impl Thread {
                 pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
+                instructions_enabled: true,
                 depth: rec.depth as u32,
                 agent_label: "lead".to_string(),
                 max_turns: None,
@@ -937,6 +944,7 @@ impl Thread {
                 pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: Some(system),
+                instructions_enabled: true,
                 depth,
                 agent_label,
                 max_turns: Some(max_turns),
@@ -1633,6 +1641,13 @@ impl Thread {
 
     pub fn turn_count(&self) -> u32 {
         self.turn_count
+    }
+
+    /// Toggle the multi-level CLAUDE.md eager block for this thread. Disabled
+    /// only for the built-in `explore` sub-agent (Claude Code's Explore/Plan
+    /// carve-out); every other thread keeps instructions on.
+    pub fn set_instructions_enabled(&mut self, enabled: bool) {
+        self.instructions_enabled = enabled;
     }
 
     pub fn max_turns(&self) -> Option<u32> {
@@ -3675,6 +3690,25 @@ impl Thread {
             content: vec![MessageContent::Text(system)],
             cache: true,
         });
+        // Multi-level CLAUDE.md instructions ride as a per-request user
+        // message in the fixed slot right after the system head — the same
+        // contract as the `<collaboration_mode>` block below: never written
+        // into `self.messages`, byte-stable while the files on disk are
+        // unchanged, so the prefix cache treats it as part of the system
+        // head. An empty load set omits the message entirely, keeping the
+        // prefix byte-identical to a session with no instruction files.
+        if self.instructions_enabled
+            && let Some(text) = crate::claude_md::render_eager(&crate::claude_md::load(
+                &self.cwd,
+                &crate::settings::claude_md_load_context(),
+            ))
+        {
+            messages.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text(text)],
+                cache: true,
+            });
+        }
         // Inject the active mode's `developer_instructions` as a fixed-position
         // user-role message wrapped in a `<collaboration_mode>` tag — the
         // codex port's equivalent of the developer-role message. manox has no
@@ -4366,6 +4400,72 @@ mod tests {
             sys_text.contains("Ultracode mode"),
             "ultracode grant must be in the system prompt, got: {sys_text}"
         );
+    }
+
+    /// The multi-level CLAUDE.md block rides as a per-request user message in
+    /// the fixed slot right after the system head: present when instruction
+    /// files exist under cwd, byte-stable across builds while the files are
+    /// unchanged (prefix-cache contract), and omitted entirely when the
+    /// thread disables instructions (the built-in explore carve-out) or when
+    /// nothing loads.
+    #[test]
+    fn build_completion_request_injects_instructions_at_fixed_slot() {
+        use crate::language_model::Role;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "manox_thread_claude_md_{}_{}",
+            std::process::id(),
+            "slot"
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("CLAUDE.md"), "PROJECT RULE MARKER").unwrap();
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let cwd = tmp.to_string_lossy().to_string();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("claude-md-slot", &cwd, Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        assert_eq!(req.messages[0].role, Role::System, "system head first");
+        assert_eq!(req.messages[1].role, Role::User, "instructions slot");
+        let block = text_of_req(&req.messages[1]);
+        assert!(block.contains("PROJECT RULE MARKER"), "{block}");
+        assert!(block.contains("scope=\"project\""), "{block}");
+        assert!(req.messages[1].cache, "instructions block is cacheable");
+
+        // Byte-stable across builds while the files on disk are unchanged.
+        let req2 = cx.update(|cx| thread.read(cx).build_completion_request());
+        assert_eq!(block, text_of_req(&req2.messages[1]));
+
+        // Disabled (built-in explore carve-out) → the slot vanishes.
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| t.set_instructions_enabled(false));
+        });
+        let req3 = cx.update(|cx| thread.read(cx).build_completion_request());
+        assert!(
+            req3.messages
+                .iter()
+                .all(|m| !text_of_req(m).contains("PROJECT RULE MARKER")),
+            "disabled thread must not carry instructions"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn text_of_req(m: &crate::language_model::LanguageModelRequestMessage) -> String {
+        m.content
+            .iter()
+            .filter_map(|c| match c {
+                crate::language_model::MessageContent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// A model declaring `supports_tools: false` runs in pure-conversation mode:
