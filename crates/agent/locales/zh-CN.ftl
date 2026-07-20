@@ -495,9 +495,8 @@ cockpit-milestones-header = 计划
 cockpit-blocked-by = 被 {$deps} 阻塞
 # 折叠的已完成里程碑汇总。{$count} 为数字。
 cockpit-completed-summary = +{$count} 已完成
-# 上下文预算两行。{$pct} 为剩余百分比（0–100），{$used}/{$cap} 为已用/上限的预格式化计数。
+# 上下文预算行。{$pct} 为剩余百分比（0–100），{$used}/{$cap} 为已用/上限的预格式化计数。
 cockpit-context-remaining-ctx = 剩余上下文大小 {$pct}% {$used} / {$cap}
-cockpit-context-remaining-body = 剩余请求体大小 {$pct}% {$used} / {$cap}
 # 里程碑区段标题末尾的隐藏/显示提示。通用——标题也可点击切换。
 cockpit-hide-tasks-hint = 点击折叠
 cockpit-show-tasks-hint = 点击展开

@@ -838,33 +838,35 @@ impl ContextRail {
             .into_any_element()
     }
 
-    /// Context-budget block — two lines: (1) remaining context-window budget
+    /// Context-budget block — one line: remaining context-window budget
     /// (tokens, against the auto-compact trigger or raw window), omitted when
-    /// the thread has no model / zero window; (2) remaining request-body budget
-    /// (bytes, against `MAX_REQUEST_BODY_BYTES`), independent of the model so
-    /// it shows whenever there are messages. The cumulative token total moved
-    /// to the usage row; this block is the two remaining percentages.
+    /// the thread has no model / zero window. The active fill is the thread's
+    /// effective context tokens — the same max(provider usage, local estimate)
+    /// the auto-compaction trigger uses, so the display and the trigger agree.
+    /// The cumulative token total lives in the usage row.
     fn render_cockpit_context_budget(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let thread = self.thread.read(cx);
         let max_input = thread.model().map(|m| m.max_token_count()).unwrap_or(0);
         let budget = context_budget_pct(
             max_input,
-            thread.latest_request_usage().unwrap_or_default(),
+            agent::compact::effective_context_tokens(
+                thread.messages(),
+                thread.request_token_usage(),
+            ),
             self.cockpit_auto_compact_enabled,
             self.cockpit_auto_compact_threshold,
         );
         let muted = theme.muted_foreground;
         let warn = theme.warning;
 
-        // Both budget lines share a fixed-width leading slot so the label
-        // text starts at the same x regardless of whether the slot holds an
-        // icon (context line) or is empty (request-body line).
+        // The label starts at a fixed x whether or not the leading slot holds
+        // the icon (kept for alignment with sibling rows).
         const LEAD_W: f32 = 14.;
 
         let mut rows = v_flex().w_full().gap_0p5();
 
-        // Line 1: context-window budget (tokens). Omitted when the thread has
-        // no model / zero window — no honest percentage to show.
+        // Context-window budget (tokens). Omitted when the thread has no
+        // model / zero window — no honest percentage to show.
         if let Some(budget) = budget {
             let pct = (budget.remaining_pct.round() as i64).clamp(0, 100);
             let used = crate::cockpit::format_tokens(budget.active_tokens);
@@ -897,43 +899,6 @@ impl ContextRail {
                     ),
             );
         }
-
-        // Line 2: request-body budget (bytes). Fires compaction before the
-        // serialized body exceeds the provider limit; independent of the model
-        // window so it renders whenever the thread has any messages.
-        let body = agent::compact::estimate_request_body_bytes(thread.messages());
-        let body_cap = agent::compact::MAX_REQUEST_BODY_BYTES;
-        let body_pct = if body_cap > 0 {
-            (body_cap.saturating_sub(body) as f64 / body_cap as f64 * 100.0).clamp(0.0, 100.0)
-        } else {
-            0.0
-        };
-        let body_pct_i = (body_pct.round() as i64).clamp(0, 100);
-        let body_used = crate::cockpit::format_mib(body);
-        let body_cap_str = crate::cockpit::format_mib(body_cap);
-        let body_near = body_pct <= 10.0;
-        let body_color = if body_near { warn } else { muted };
-        rows = rows.child(
-            h_flex()
-                .items_center()
-                .gap_2()
-                .child(gpui::div().w(px(LEAD_W)).h(px(LEAD_W)))
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(body_color)
-                        .child(i18n::t_str(
-                            "cockpit-context-remaining-body",
-                            &[
-                                ("pct", &body_pct_i.to_string()),
-                                ("used", &body_used),
-                                ("cap", &body_cap_str),
-                            ],
-                        )),
-                ),
-        );
 
         rows.into_any_element()
     }

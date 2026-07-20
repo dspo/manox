@@ -16,6 +16,9 @@ use crate::tool::AgentTool;
 use super::path_selector::{Selector, split_path_and_sel};
 use super::{resolve_path, schema};
 
+/// Lines returned by an unqualified `read_file` (no `:start-end` selector).
+const MAX_READ_LINES: usize = 2000;
+
 pub struct ReadTool {
     pub(crate) cwd: Arc<PathBuf>,
     pub(crate) read_policy: ReadPolicy,
@@ -41,7 +44,8 @@ impl AgentTool for ReadTool {
          (1-indexed). Append `:<sel>` to the path for partial reads: `:50-200` (inclusive \
          range), `:50+150` (150 lines from 50), `:5-16,960-973` (multiple ranges), \
          `:raw` (verbatim, no anchors/line numbers), `:raw:1-50` (compound). \
-         Without a selector the full file is returned."
+         Without a selector the first 2000 lines are returned; use a range selector \
+         to page through longer files."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<ReadFileInput>()
@@ -82,10 +86,11 @@ impl AgentTool for ReadTool {
                 .record(&path, &text);
 
             match selector {
-                None => Ok(crate::hashline::format_numbered(
+                None => Ok(format_full_read(
                     &path_display,
                     &text,
                     &snap.tag,
+                    &parsed.path,
                 )),
                 Some(Selector::Lines(ref ranges)) => Ok(crate::hashline::format_numbered_range(
                     &path_display,
@@ -99,5 +104,53 @@ impl AgentTool for ReadTool {
                 }
             }
         })
+    }
+}
+
+/// Format an unqualified (selector-less) read. The output caps at
+/// [`MAX_READ_LINES`] lines — a full-file dump of a 100k-line file would
+/// flood the context; the selector syntax pages through the rest.
+fn format_full_read(path_display: &str, text: &str, tag: &str, path_arg: &str) -> String {
+    let line_count = text.lines().count();
+    if line_count <= MAX_READ_LINES {
+        return crate::hashline::format_numbered(path_display, text, tag);
+    }
+    let ranges = [crate::tools::path_selector::LineRange {
+        start: 1,
+        end: Some(MAX_READ_LINES),
+    }];
+    let mut out = crate::hashline::format_numbered_range(path_display, text, tag, &ranges);
+    out.push_str(&format!(
+        "\n[Showing lines 1-{MAX_READ_LINES} of {line_count}. \
+         Use a line-range selector for more, e.g. `{path_arg}:{}-{}`]",
+        MAX_READ_LINES + 1,
+        MAX_READ_LINES * 2,
+    ));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_file_is_not_capped() {
+        let text = "a\nb\nc";
+        let out = format_full_read("/tmp/f.txt", text, "AB12", "f.txt");
+        assert!(out.contains("3:c"));
+        assert!(!out.contains("Showing lines"));
+    }
+
+    #[test]
+    fn large_file_caps_at_max_lines_with_selector_hint() {
+        let text: String = (1..=5000).map(|i| format!("line {i}\n")).collect();
+        let out = format_full_read("/tmp/big.txt", &text, "AB12", "big.txt");
+        assert!(out.contains("1:line 1"));
+        assert!(out.contains("2000:line 2000"));
+        // format_numbered_range appends 3 trailing context lines; nothing
+        // beyond those may appear.
+        assert!(!out.contains("2004:line 2004"));
+        assert!(out.contains("Showing lines 1-2000 of 5000"));
+        assert!(out.contains("big.txt:2001-4000"), "selector hint: {out}");
     }
 }

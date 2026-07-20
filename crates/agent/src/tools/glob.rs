@@ -40,9 +40,9 @@ struct GlobInput {
     /// When true, also yield directory entries that match the pattern.
     #[serde(default)]
     include_dirs: bool,
-    /// Max results to return. Default 100. No hard ceiling — raising this
-    /// risks blowing up your own context window with a huge repo; narrow
-    /// `pattern` instead of raising `limit` when possible.
+    /// Max results to return. Default 100, hard-capped at 1000 — raising
+    /// beyond that risks blowing up your own context window with a huge
+    /// repo; narrow `pattern` instead of raising `limit` when possible.
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -52,7 +52,7 @@ impl AgentTool for GlobTool {
         "Glob"
     }
     fn description(&self) -> &str {
-        "Find file paths matching a glob pattern (relative to cwd). Honors .gitignore and skips hidden files by default; returns relative paths, capped at 100. Pass no_ignore/include_hidden/include_dirs/limit to relax. Note: limit has no hard ceiling — raising it can blow up the context, so prefer narrowing the pattern first."
+        "Find file paths matching a glob pattern (relative to cwd). Honors .gitignore and skips hidden files by default; returns relative paths, capped at 100. Pass no_ignore/include_hidden/include_dirs/limit to relax. Note: limit is hard-capped at 1000 — prefer narrowing the pattern over raising limit."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<GlobInput>()
@@ -92,7 +92,7 @@ impl AgentTool for GlobTool {
                 .add(Glob::new(&parsed.pattern).map_err(|e| format!("glob invalid pattern: {e}"))?)
                 .build()
                 .map_err(|e| format!("glob build failed: {e}"))?;
-            let limit = parsed.limit.unwrap_or(100);
+            let limit = parsed.limit.unwrap_or(100).min(1000);
             // Default flags enforce the strongest filtering; each toggle relaxes one axis.
             let mut builder = WalkBuilder::new(&walk_root);
             builder

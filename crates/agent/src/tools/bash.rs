@@ -434,9 +434,11 @@ async fn run_bash(
     let (err_r, err_w) = std::io::pipe()?;
     let out_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(
         BASH_OUTPUT_MAX_BYTES,
+        "stdout",
     )));
     let err_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(
         BASH_OUTPUT_MAX_BYTES,
+        "stderr",
     )));
     // Clone the sink and buffers for each reader task; the originals stay here
     // so we can pull the final captured text once the readers finish.
@@ -542,14 +544,22 @@ async fn run_bash(
     // Drain readers within the IO deadline, then extract the captured text.
     drain(&mut out_task).await;
     drain(&mut err_task).await;
-    let (out_str, _out_trunc, out_dropped) =
+    let (out_str, _out_trunc, out_dropped, out_artifact) =
         out_buf.lock().expect("capture buffer lock poisoned").take();
-    let (err_str, _err_trunc, err_dropped) =
+    let (err_str, _err_trunc, err_dropped, err_artifact) =
         err_buf.lock().expect("capture buffer lock poisoned").take();
 
     let out_str = select_lines(&out_str, head_lines, tail_lines);
     let err_str = select_lines(&err_str, head_lines, tail_lines);
-    format_result(ran, out_str, out_dropped, err_str, err_dropped)
+    format_result(
+        ran,
+        out_str,
+        out_dropped,
+        out_artifact,
+        err_str,
+        err_dropped,
+        err_artifact,
+    )
 }
 
 /// Format the outcome: success returns stdout (or stderr when stdout is empty);
@@ -559,15 +569,15 @@ fn format_result(
     ran: Outcome,
     stdout: String,
     stdout_dropped: usize,
+    stdout_artifact: Option<std::path::PathBuf>,
     stderr: String,
     stderr_dropped: usize,
+    stderr_artifact: Option<std::path::PathBuf>,
 ) -> Result<String, anyhow::Error> {
     // `truncated == dropped > 0` is the `CaptureBuffer` invariant, so the bool
     // is derivable and not passed separately.
-    let stdout = crate::tools::TruncatedText::new(&stdout, BASH_OUTPUT_MAX_BYTES, stdout_dropped)
-        .render(BASH_TRUNCATION_HINT);
-    let stderr = crate::tools::TruncatedText::new(&stderr, BASH_OUTPUT_MAX_BYTES, stderr_dropped)
-        .render(BASH_TRUNCATION_HINT);
+    let stdout = render_stream(&stdout, stdout_dropped, &stdout_artifact);
+    let stderr = render_stream(&stderr, stderr_dropped, &stderr_artifact);
     match ran {
         Outcome::Ran(Ok(er)) => {
             if er.exit_code.is_success() {
@@ -591,6 +601,17 @@ fn format_result(
             "bash cancelled\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )),
     }
+}
+
+/// Render one captured stream with the truncation advisory. When the full
+/// stream was tee'd to an artifact, the notice points at it so the model can
+/// read the complete output instead of re-running a narrower command blind.
+fn render_stream(text: &str, dropped: usize, artifact: &Option<std::path::PathBuf>) -> String {
+    let hint = match artifact {
+        Some(p) => format!("full output: {}", p.display()),
+        None => BASH_TRUNCATION_HINT.to_string(),
+    };
+    crate::tools::TruncatedText::new(text, BASH_OUTPUT_MAX_BYTES, dropped).render(&hint)
 }
 
 /// Numeric exit code for the model-facing message. brush maps well-known codes
@@ -658,6 +679,11 @@ fn read_pipe(
 /// while still tallying the total bytes seen. The total lets the truncation
 /// notice tell the model how much it is missing, so it knows to narrow the
 /// command rather than guess at the truncated tail.
+///
+/// Once the cap is hit, the full stream is tee'd into a temp-file artifact
+/// (buffered head + everything that follows) and the truncation notice
+/// carries its path — the model can `read_file`/`grep` the complete output
+/// instead of re-running a narrower command blind.
 struct CaptureBuffer {
     buf: Vec<u8>,
     max: usize,
@@ -665,21 +691,29 @@ struct CaptureBuffer {
     /// Bytes seen after the cap was hit; reported in the truncation notice.
     /// Only accrued once `truncated` is set, so this is the dropped tail size.
     dropped: usize,
+    /// Stream label (`stdout`/`stderr`) used in the artifact filename.
+    stream: &'static str,
+    artifact: Option<std::fs::File>,
+    artifact_path: Option<std::path::PathBuf>,
 }
 
 impl CaptureBuffer {
-    fn new(max: usize) -> Self {
+    fn new(max: usize, stream: &'static str) -> Self {
         Self {
             buf: Vec::with_capacity(8 * 1024),
             max,
             truncated: false,
             dropped: 0,
+            stream,
+            artifact: None,
+            artifact_path: None,
         }
     }
 
     fn push(&mut self, data: &[u8]) {
         if self.truncated {
             self.dropped = self.dropped.saturating_add(data.len());
+            self.tee_artifact(data);
             return;
         }
         let remaining = self.max.saturating_sub(self.buf.len());
@@ -689,17 +723,44 @@ impl CaptureBuffer {
             self.buf.extend_from_slice(&data[..remaining]);
             self.dropped = self.dropped.saturating_add(data.len() - remaining);
             self.truncated = true;
+            self.start_artifact();
+            self.tee_artifact(&data[remaining..]);
         }
     }
 
-    /// Returns `(text, truncated, dropped_bytes)`.
-    fn take(&mut self) -> (String, bool, usize) {
+    /// Open the artifact with everything buffered so far as its head. Best
+    /// effort: a filesystem failure drops the artifact, never the capture.
+    fn start_artifact(&mut self) {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!(
+            "manox-bash-{}-{}.log",
+            uuid::Uuid::new_v4(),
+            self.stream
+        ));
+        if let Ok(mut f) = std::fs::File::create(&path)
+            && f.write_all(&self.buf).is_ok()
+        {
+            self.artifact_path = Some(path);
+            self.artifact = Some(f);
+        }
+    }
+
+    fn tee_artifact(&mut self, data: &[u8]) {
+        use std::io::Write as _;
+        if let Some(f) = self.artifact.as_mut() {
+            let _ = f.write_all(data);
+        }
+    }
+
+    /// Returns `(text, truncated, dropped_bytes, artifact_path)`.
+    fn take(&mut self) -> (String, bool, usize, Option<std::path::PathBuf>) {
         let data = std::mem::take(&mut self.buf);
         let dropped = std::mem::take(&mut self.dropped);
         (
             String::from_utf8_lossy(&data).into_owned(),
             self.truncated,
             dropped,
+            self.artifact_path.take(),
         )
     }
 }
@@ -754,19 +815,19 @@ enum SandboxOutcome {
 
 /// Format a sandboxed run. Mirrors [`format_result`] but over `ExitStatus`
 /// instead of brush's `ExecutionResult`; the truncation rendering is shared
-/// via [`crate::tools::TruncatedText`].
+/// via [`render_stream`].
 #[cfg(target_os = "macos")]
 fn format_sandboxed_result(
     ran: SandboxOutcome,
     stdout: String,
     stdout_dropped: usize,
+    stdout_artifact: Option<std::path::PathBuf>,
     stderr: String,
     stderr_dropped: usize,
+    stderr_artifact: Option<std::path::PathBuf>,
 ) -> Result<String, anyhow::Error> {
-    let stdout = crate::tools::TruncatedText::new(&stdout, BASH_OUTPUT_MAX_BYTES, stdout_dropped)
-        .render(BASH_TRUNCATION_HINT);
-    let stderr = crate::tools::TruncatedText::new(&stderr, BASH_OUTPUT_MAX_BYTES, stderr_dropped)
-        .render(BASH_TRUNCATION_HINT);
+    let stdout = render_stream(&stdout, stdout_dropped, &stdout_artifact);
+    let stderr = render_stream(&stderr, stderr_dropped, &stderr_artifact);
     match ran {
         SandboxOutcome::Exited(status) => {
             if status.success() {
@@ -872,8 +933,10 @@ async fn run_sandboxed_bash(
                 SandboxOutcome::SpawnFailed(e),
                 String::new(),
                 0,
+                None,
                 String::new(),
                 0,
+                None,
             );
         }
     };
@@ -882,9 +945,11 @@ async fn run_sandboxed_bash(
 
     let out_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(
         BASH_OUTPUT_MAX_BYTES,
+        "stdout",
     )));
     let err_buf = Arc::new(std::sync::Mutex::new(CaptureBuffer::new(
         BASH_OUTPUT_MAX_BYTES,
+        "stderr",
     )));
     let out_sink = sink.clone();
     let err_sink = sink;
@@ -926,20 +991,28 @@ async fn run_sandboxed_bash(
         err_task.abort();
     }
 
-    let (out_str, out_dropped) = {
+    let (out_str, out_dropped, out_artifact) = {
         let mut b = out_buf.lock().expect("capture buffer lock poisoned");
-        let (t, _, d) = b.take();
-        (t, d)
+        let (t, _, d, a) = b.take();
+        (t, d, a)
     };
-    let (err_str, err_dropped) = {
+    let (err_str, err_dropped, err_artifact) = {
         let mut b = err_buf.lock().expect("capture buffer lock poisoned");
-        let (t, _, d) = b.take();
-        (t, d)
+        let (t, _, d, a) = b.take();
+        (t, d, a)
     };
 
     let out_str = select_lines(&out_str, head_lines, tail_lines);
     let err_str = select_lines(&err_str, head_lines, tail_lines);
-    format_sandboxed_result(ran, out_str, out_dropped, err_str, err_dropped)
+    format_sandboxed_result(
+        ran,
+        out_str,
+        out_dropped,
+        out_artifact,
+        err_str,
+        err_dropped,
+        err_artifact,
+    )
 }
 
 /// Signal every tracked job's process group. With `NewProcessGroup` each
@@ -1209,21 +1282,37 @@ mod tests {
 
     #[test]
     fn capture_buffer_caps_and_tracks_dropped_total() {
-        let mut buf = CaptureBuffer::new(64 * 1024);
+        let mut buf = CaptureBuffer::new(64 * 1024, "stdout");
         // First 64 KiB fills the cap exactly without truncation.
         buf.push(&vec![b'x'; 64 * 1024]);
-        let (_, truncated, dropped) = buf.take();
+        let (_, truncated, dropped, artifact) = buf.take();
         assert!(!truncated, "exactly at cap is not truncated");
         assert_eq!(dropped, 0);
+        assert!(artifact.is_none(), "no artifact without truncation");
 
         // Now overflow: cap + 10 KiB more. The tail is dropped but tallied.
-        let mut buf = CaptureBuffer::new(64 * 1024);
+        let mut buf = CaptureBuffer::new(64 * 1024, "stdout");
         buf.push(&vec![b'x'; 64 * 1024]);
         buf.push(&vec![b'y'; 10 * 1024]);
-        let (text, truncated, dropped) = buf.take();
+        let (text, truncated, dropped, artifact) = buf.take();
         assert!(truncated);
         assert_eq!(dropped, 10 * 1024);
         assert!(!text.contains('y'), "dropped tail must not appear in text");
+        // The artifact preserves the full stream: 64 KiB head + dropped tail.
+        let path = artifact.expect("overflow tees the full stream to an artifact");
+        let full = std::fs::read_to_string(&path).expect("read artifact");
+        assert_eq!(full.len(), 64 * 1024 + 10 * 1024);
+        assert!(full.ends_with(&"y".repeat(10 * 1024)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn truncation_notice_points_at_artifact_when_present() {
+        let path = std::path::PathBuf::from("/tmp/manox-bash-test-stdout.log");
+        let out = render_stream("head", 10 * 1024, &Some(path));
+        assert!(out.contains("full output: /tmp/manox-bash-test-stdout.log"));
+        let out = render_stream("head", 0, &None);
+        assert!(!out.contains("full output:"), "no artifact, no pointer");
     }
 
     #[test]

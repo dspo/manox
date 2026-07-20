@@ -688,7 +688,10 @@ impl AnthropicEventMapper {
                 vec![Ok(LanguageModelCompletionEvent::Stop(self.stop_reason))]
             }
             AnthropicEvent::Error { error } => {
-                vec![Err(anyhow!("Anthropic stream error: {}", error.message))]
+                vec![Err(crate::provider::overflow::stream_error(format!(
+                    "Anthropic stream error: {}",
+                    error.message
+                )))]
             }
             AnthropicEvent::Other => Vec::new(),
         }
