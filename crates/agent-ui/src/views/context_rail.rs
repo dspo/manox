@@ -25,17 +25,20 @@ use std::time::Duration;
 use agent::{Thread, ThreadEvent, i18n};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, Entity, Render,
-    SharedString, Window, deferred, ease_out_quint, prelude::*, px,
+    SharedString, WeakEntity, Window, deferred, ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, h_flex, v_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, h_flex,
+    tooltip::Tooltip, v_flex,
 };
 
+use crate::Workspace;
 use crate::cockpit::{
     CockpitPhase, Milestone, MilestoneStatus, cache_read_ratio, cockpit_phase_tag,
     context_budget_pct,
 };
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
+use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_display_title};
 
 // ── Geometry ─────────────────────────────────────────────────────────────
 
@@ -88,11 +91,8 @@ pub(crate) struct ContextRail {
     /// per-frame file read in the context-budget render.
     pub(crate) cockpit_auto_compact_enabled: bool,
     pub(crate) cockpit_auto_compact_threshold: f64,
-    /// In-flight sub-agent tool-use ids, fed by `SubagentProgress` events.
-    /// An id is inserted while its status is non-terminal and removed once the
-    /// child thread reports `Success` / `Error`. Drives the cockpit's
-    /// "Running N Explore agents…" aggregation row.
-    pub(crate) active_agents: std::collections::HashSet<String>,
+    weak_workspace: WeakEntity<Workspace>,
+    agents: Vec<SubagentInfo>,
     /// Per-cell scoreboard state, keyed by `"{model_name}|{field}"` where
     /// `field ∈ {in, out, cache_create, cache_read}`. Stored as
     /// `(gen, last_value)`: `gen` is bumped on every value delta so the
@@ -118,6 +118,7 @@ pub(crate) struct ContextRail {
 impl ContextRail {
     pub(crate) fn new(
         thread: Entity<Thread>,
+        weak_workspace: WeakEntity<Workspace>,
         auto_compact_enabled: bool,
         auto_compact_threshold: f64,
     ) -> Self {
@@ -130,7 +131,8 @@ impl ContextRail {
             cockpit_hide_tasks: false,
             cockpit_auto_compact_enabled: auto_compact_enabled,
             cockpit_auto_compact_threshold: auto_compact_threshold,
-            active_agents: std::collections::HashSet::new(),
+            weak_workspace,
+            agents: Vec::new(),
             env_counter_state: HashMap::new(),
             git_change_stats: None,
             git_branch_display: None,
@@ -157,7 +159,7 @@ impl ContextRail {
     /// placeholders until its own refresh lands.
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.env_counter_state.clear();
-        self.active_agents.clear();
+        self.agents.clear();
         let new_phase = if running {
             CockpitPhase::Streaming
         } else {
@@ -226,26 +228,9 @@ impl ContextRail {
         cx.notify();
     }
 
-    /// Track an in-flight sub-agent for the cockpit's "Running N Explore
-    /// agents…" aggregation row. Non-terminal statuses insert the id; a
-    /// terminal `Success` / `Error` / `Denied` / `Cancelled` removes it so
-    /// the count reflects only children still working.
-    pub(crate) fn record_subagent_progress(
-        &mut self,
-        id: &str,
-        status: agent::ToolCallStatus,
-        cx: &mut Context<Self>,
-    ) {
-        use agent::ToolCallStatus as S;
-        let terminal = matches!(status, S::Success | S::Error | S::Denied | S::Cancelled);
-        let changed = if terminal {
-            self.active_agents.remove(id)
-        } else {
-            self.active_agents.insert(id.to_string())
-        };
-        if changed {
-            cx.notify();
-        }
+    pub(crate) fn set_agents(&mut self, agents: Vec<SubagentInfo>, cx: &mut Context<Self>) {
+        self.agents = agents;
+        cx.notify();
     }
 
     /// Mark the first `Pending` milestone `InProgress` so the panel signals
@@ -309,13 +294,7 @@ impl ContextRail {
                     .child(i18n::t("context-rail-title")),
             )
             .child(self.render_cockpit_status_row(theme, cx))
-            .children(self.render_active_agents_row(theme))
-            .child(env_row(
-                IconName::Bot,
-                self.thread.read(cx).display_title().into(),
-                None,
-                theme,
-            ))
+            .child(self.render_agents_section(theme, cx))
             .child(self.render_branch_block(&project, theme, cx))
             .child(self.render_usage_section(theme, cx, per_model))
             .child(self.render_cockpit_context_budget(theme, cx))
@@ -722,27 +701,119 @@ impl ContextRail {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(value));
     }
 
-    /// Aggregation row shown while sub-agents are in flight: "Running N
-    /// Explore agents…". Rendered only when `active_agents` is non-empty, so
-    /// the row vanishes the moment the last child reports a terminal status.
-    fn render_active_agents_row(&self, theme: &Theme) -> Option<AnyElement> {
-        let n = self.active_agents.len();
-        if n == 0 {
-            return None;
+    fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        fn append_children(
+            parent_id: Option<&str>,
+            depth: usize,
+            agents: &[SubagentInfo],
+            weak_workspace: &WeakEntity<Workspace>,
+            theme: &Theme,
+            rows: &mut Vec<AnyElement>,
+        ) {
+            for info in agents
+                .iter()
+                .filter(|info| info.parent_id.as_deref() == parent_id)
+            {
+                let title = subagent_display_title(info);
+                let tooltip_text = title.clone();
+                let id = info.id.clone();
+                let weak = weak_workspace.clone();
+                rows.push(
+                    h_flex()
+                        .id(SharedString::from(format!("context-agent-{}", info.id)))
+                        .w_full()
+                        .min_w_0()
+                        .pl(px(12. + depth as f32 * 12.))
+                        .py_0p5()
+                        .gap_1p5()
+                        .items_center()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.secondary.opacity(0.5)))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(tooltip_text.clone()).build(window, cx)
+                        })
+                        .on_click(move |_, _window, cx: &mut App| {
+                            let _ = weak.update(cx, |workspace, cx| {
+                                workspace.open_subagent_tab_by_id(&id, cx);
+                            });
+                        })
+                        .child(status_indicator(info.status, theme))
+                        .child(
+                            gpui::div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.foreground)
+                                .child(title),
+                        )
+                        .into_any_element(),
+                );
+                append_children(
+                    Some(&info.id),
+                    depth + 1,
+                    agents,
+                    weak_workspace,
+                    theme,
+                    rows,
+                );
+            }
         }
-        Some(
+
+        let main_status = if self.cockpit_phase == CockpitPhase::Failed {
+            agent::ToolCallStatus::Error
+        } else if self.thread.read(cx).is_running() {
+            agent::ToolCallStatus::Running
+        } else {
+            agent::ToolCallStatus::Success
+        };
+        let mut rows = vec![
             h_flex()
-                .items_center()
+                .w_full()
+                .py_0p5()
                 .gap_1p5()
-                .child(Icon::new(IconName::Bot).text_color(theme.primary).size_3())
+                .items_center()
+                .child(status_indicator(main_status, theme))
                 .child(
                     gpui::div()
                         .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(i18n::t_count("agent-metrics-running-agents", n as i64)),
+                        .text_color(theme.foreground)
+                        .child(i18n::t("context-agents-main")),
                 )
                 .into_any_element(),
-        )
+        ];
+        append_children(
+            None,
+            0,
+            &self.agents,
+            &self.weak_workspace,
+            theme,
+            &mut rows,
+        );
+
+        v_flex()
+            .w_full()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Bot)
+                            .xsmall()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(i18n::t("context-agents-title")),
+                    ),
+            )
+            .children(rows)
+            .into_any_element()
     }
 
     /// Run-status row: a sliding three-tag pill (生成中 / 思考中 / 待输入) +
@@ -1055,30 +1126,6 @@ impl Render for ContextRail {
 }
 
 // ── Free helpers (moved from workspace.rs) ────────────────────────────────
-
-fn env_row(
-    icon: IconName,
-    label: SharedString,
-    trailing: Option<AnyElement>,
-    theme: &Theme,
-) -> AnyElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .child(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
-        .child(
-            gpui::div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(label),
-        )
-        .children(trailing)
-        .into_any_element()
-}
 
 /// Multi-line run-status block. The phase slot is now an arbitrary element
 /// (the sliding three-tag pill) rather than a plain label, so the caller owns

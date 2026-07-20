@@ -131,13 +131,25 @@ pub enum ThreadEvent {
     /// Accumulated into the matching tool-call item's `output` until the
     /// final `ToolResult` overwrites it with the canonical (truncated) text.
     ToolOutput { id: String, chunk: String },
+    /// Emitted once when a sub-agent's child `Thread` is constructed and its
+    /// first turn is about to start. Carries the parent-side `tool_use_id`,
+    /// the sub-agent type + short description (from the model's `description`
+    /// input field), and the live child `Entity<Thread>` so the UI can
+    /// subscribe to it for the observation panel. UI-only: never enters the
+    /// model's message history.
+    SubagentStarted {
+        id: String,
+        subagent_type: String,
+        description: String,
+        child: gpui::Entity<Thread>,
+    },
     /// A spawned sub-agent's aggregated progress, forwarded to the parent so
-    /// the UI can render tool-use / token counters on the agent task card
-    /// while the sub-agent runs. UI-only: never enters the model's message
-    /// history. `id` is the parent-side `agent` tool_use_id, so the UI maps the
-    /// update to the right `AgentTaskItem`. Emitted by `SpawnAgentTool`'s
-    /// subscription on the child thread's `ToolCall` / `ToolResult` /
-    /// `TokenUsageUpdated` events.
+    /// observers can track lifecycle status while the sub-agent runs. Metrics
+    /// remain available to the backend result envelope but are not rendered in
+    /// the compact parent message row. UI-only: never enters the model's
+    /// message history. `id` is the parent-side `agent` tool_use_id. Emitted by
+    /// `SpawnAgentTool`'s subscription on the child thread's `ToolCall` /
+    /// `ToolResult` / `TokenUsageUpdated` events.
     SubagentProgress {
         id: String,
         subagent_type: String,
@@ -4135,14 +4147,21 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
                 .get("subagent_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-            let trimmed = if prompt.chars().count() > 60 {
-                let t: String = prompt.chars().take(60).collect();
+            let description = input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let trimmed = if description.chars().count() > 60 {
+                let t: String = description.chars().take(60).collect();
                 format!("{t}…")
             } else {
-                prompt.to_string()
+                description.to_string()
             };
-            format!("Agent: {st} — {trimmed}")
+            if trimmed.is_empty() {
+                st.to_string()
+            } else {
+                format!("{st} · {trimmed}")
+            }
         }
         x if x == tools::ASK_USER_QUESTION => {
             let q = input
