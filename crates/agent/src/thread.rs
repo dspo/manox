@@ -3990,7 +3990,9 @@ impl Thread {
 /// mapper.
 pub(crate) fn model_facing_content(c: &MessageContent) -> MessageContent {
     match c {
-        MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == "Agent" => {
+        MessageContent::ToolResult(tr)
+            if tr.tool_name.as_ref() == crate::tools::agent::AGENT_TOOL_NAME =>
+        {
             MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: tr.tool_use_id.clone(),
                 tool_name: tr.tool_name.clone(),

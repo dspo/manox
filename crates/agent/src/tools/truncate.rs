@@ -100,10 +100,9 @@ pub fn truncate_result(text: &str) -> Cow<'_, str> {
 /// Whether a tool result passes through the output cap in
 /// `Thread::run_tool_inner`. The `Agent` tool's JSON envelope is exempt: it
 /// is bounded at construction (see `tools::agent::ENVELOPE_MESSAGES_BUDGET`)
-/// and the UI parses it as JSON, which byte-truncation would corrupt. The
-/// comparison matches `SpawnAgentTool::name()` — PascalCase `"Agent"`.
+/// and the UI parses it as JSON, which byte-truncation would corrupt.
 pub fn should_cap_tool_result(tool_name: &str) -> bool {
-    tool_name != "Agent"
+    tool_name != crate::tools::agent::AGENT_TOOL_NAME
 }
 
 #[cfg(test)]

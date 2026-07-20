@@ -36,6 +36,13 @@ use crate::tool::{AgentTool as AgentToolTrait, AnyAgentTool, ToolOutputSink, Too
 /// spawned at depth `MAX_DEPTH` cannot itself register the `agent` tool.
 const MAX_DEPTH: u32 = 5;
 
+/// The tool's registered name — the single source of truth every name
+/// comparison must use (envelope stripping in `model_facing_content`, the
+/// output-cap exemption in `tools::truncate`). PascalCase like every
+/// built-in tool; a scattered lowercase literal once disabled both guards
+/// (#273, #279).
+pub const AGENT_TOOL_NAME: &str = "Agent";
+
 /// The `agent` tool. `parent` weakly references the `Thread` that owns this
 /// tool so it can read the parent's model and route bubbled authorizations.
 pub struct SpawnAgentTool {
@@ -82,7 +89,7 @@ struct AgentToolInput {
 
 impl AgentToolTrait for SpawnAgentTool {
     fn name(&self) -> &str {
-        "Agent"
+        AGENT_TOOL_NAME
     }
 
     fn description(&self) -> &str {
