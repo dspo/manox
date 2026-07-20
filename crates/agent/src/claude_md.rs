@@ -81,6 +81,9 @@ pub struct InstructionSource {
 #[derive(Debug, Clone)]
 pub struct ScopedRule {
     pub path: PathBuf,
+    /// User rule or project rule — feeds the `scope` tag attribute when the
+    /// rule is injected by the lazy layer.
+    pub kind: SourceKind,
     /// The directory owning the `.claude/rules` tree; `patterns` match paths
     /// relative to this base.
     pub base_dir: PathBuf,
@@ -232,6 +235,128 @@ pub fn load(cwd: &Path, ctx: &LoadContext) -> InstructionSet {
     out
 }
 
+/// Discover instruction files triggered by reading `read_path` — the lazy
+/// half of the hierarchy:
+///
+/// - nested `CLAUDE.md` / `.claude/CLAUDE.md` / `CLAUDE.local.md` in every
+///   directory strictly between `cwd` and the file's directory (inclusive),
+///   top-down, same within-directory order as the eager sweep;
+/// - `scoped` rules whose globs match the read path relativized to the rule's
+///   `base_dir`.
+///
+/// Paths in `already` (and duplicates within one call) are skipped; the
+/// caller folds the returned paths into its injected set. Reads outside the
+/// `cwd` subtree only match scoped rules whose `base_dir` contains them.
+pub fn discover_for_read(
+    read_path: &Path,
+    cwd: &Path,
+    scoped: &[ScopedRule],
+    already: &HashSet<PathBuf>,
+    ctx: &LoadContext,
+) -> Vec<InstructionSource> {
+    let cwd = canonicalize_best_effort(cwd);
+    let home = ctx.home.as_ref().map(|h| canonicalize_best_effort(h));
+    let excludes = ExcludeSet::compile(&ctx.excludes);
+    let read_path = canonicalize_best_effort(read_path);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    // Lazy-discovered files' own external imports stay withheld here; the
+    // approval preflight reports only eager-chain externals (PR3's scope).
+    let mut externals = Vec::new();
+
+    // Nested chain, cwd-exclusive → the read file's directory, top-down.
+    if let Ok(rel) = read_path.strip_prefix(&cwd) {
+        let mut dir = cwd.clone();
+        for comp in rel
+            .parent()
+            .map(|p| p.components().collect::<Vec<_>>())
+            .unwrap_or_default()
+        {
+            dir.push(comp);
+            for (name, kind) in [
+                ("CLAUDE.md", SourceKind::Project),
+                (".claude/CLAUDE.md", SourceKind::Project),
+                ("CLAUDE.local.md", SourceKind::ProjectLocal),
+            ] {
+                let Ok(canon) = dir.join(name).canonicalize() else {
+                    continue;
+                };
+                if !canon.is_file()
+                    || already.contains(&canon)
+                    || !seen.insert(canon.clone())
+                    || excludes.is_excluded(&canon)
+                {
+                    continue;
+                }
+                let raw = match std::fs::read_to_string(&canon) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(path = %canon.display(), error = %e, "nested instruction file unreadable");
+                        continue;
+                    }
+                };
+                let content = prepare(&raw, &canon, &cwd, &home, ctx, &mut externals);
+                out.push(InstructionSource {
+                    path: canon,
+                    kind,
+                    content,
+                });
+            }
+        }
+    }
+
+    // Path-scoped rules whose glob matches the read path (relative to the
+    // rule's base directory). `scoped` order (user before project) is
+    // preserved so rendering stays deterministic.
+    for rule in scoped {
+        if already.contains(&rule.path) || seen.contains(&rule.path) {
+            continue;
+        }
+        let Ok(rel) = read_path.strip_prefix(&rule.base_dir) else {
+            continue;
+        };
+        let matched = rule.patterns.iter().any(|p| {
+            globset::Glob::new(p)
+                .map(|g| g.compile_matcher().is_match(rel))
+                .unwrap_or(false)
+        });
+        if matched {
+            seen.insert(rule.path.clone());
+            out.push(InstructionSource {
+                path: rule.path.clone(),
+                kind: rule.kind,
+                content: rule.content.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// Render lazy discoveries as a `<system-reminder>` appended to the triggering
+/// `read_file` tool result. `None` when empty (no reminder attached).
+pub fn render_lazy(sources: &[InstructionSource]) -> Option<String> {
+    if sources.is_empty() {
+        return None;
+    }
+    let data = crate::prompt::InstructionsPromptData {
+        sources: sources
+            .iter()
+            .map(|s| crate::prompt::InstructionSourcePromptData {
+                scope: s.kind.scope(),
+                path: s.path.display().to_string(),
+                content: s.content.trim_end().to_string(),
+            })
+            .collect(),
+    };
+    Some(
+        crate::prompt::render(
+            crate::prompt::PromptTemplate::WrapperInstructionsLazy,
+            &data,
+        )
+        .expect("instructions lazy template render"),
+    )
+}
+
 /// Render the eager block via the `wrapper/instructions_eager` template.
 /// `None` when nothing loaded, so the caller can omit the message entirely
 /// and keep the request prefix byte-identical to a no-instructions session.
@@ -239,7 +364,7 @@ pub fn render_eager(set: &InstructionSet) -> Option<String> {
     if set.eager.is_empty() {
         return None;
     }
-    let data = crate::prompt::InstructionsEagerPromptData {
+    let data = crate::prompt::InstructionsPromptData {
         sources: set
             .eager
             .iter()
@@ -386,6 +511,7 @@ fn load_rules(
         } else {
             out.scoped.push(ScopedRule {
                 path,
+                kind,
                 base_dir: base_dir.to_path_buf(),
                 patterns,
                 content,
@@ -1077,6 +1203,7 @@ mod tests {
         assert!(text.contains("scope=\"project\""), "{text}");
         assert!(text.contains("scope=\"project-local\""), "{text}");
         assert!(text.contains("<instructions"), "{text}");
+        assert!(text.contains("</instructions>"), "{text}");
         // Stable across renders of the same set (prefix-cache requirement).
         assert_eq!(text, render_eager(&set).unwrap());
     }
@@ -1094,5 +1221,151 @@ mod tests {
             set.scoped[0].patterns,
             vec!["src/**/*.{ts,tsx}".to_string()]
         );
+    }
+
+    #[test]
+    fn discover_nested_chain_top_down() {
+        let t = TestDir::new("lazychain");
+        let a = t.write("proj/sub/CLAUDE.md", "sub rule");
+        let b = t.write("proj/sub/deep/CLAUDE.md", "deep rule");
+        let local = t.write("proj/sub/deep/CLAUDE.local.md", "deep local");
+        let set = load(&t.0.join("proj"), &ctx_with(None, None));
+        let found = discover_for_read(
+            &t.0.join("proj/sub/deep/f.rs"),
+            &t.0.join("proj"),
+            &set.scoped,
+            &HashSet::new(),
+            &ctx_with(None, None),
+        );
+        let paths: Vec<&Path> = found.iter().map(|s| s.path.as_path()).collect();
+        assert_eq!(paths, vec![a.as_path(), b.as_path(), local.as_path()]);
+        assert_eq!(found[0].kind, SourceKind::Project);
+        assert_eq!(found[2].kind, SourceKind::ProjectLocal);
+        assert!(found[0].content.contains("sub rule"));
+        assert!(found[2].content.contains("deep local"));
+    }
+
+    #[test]
+    fn discover_skips_already_injected_and_files_beside_cwd() {
+        let t = TestDir::new("lazydedup");
+        let sub = t.write("proj/sub/CLAUDE.md", "sub rule");
+        let set = load(&t.0.join("proj"), &ctx_with(None, None));
+        // Already injected → nothing returned.
+        let already = HashSet::from([sub.clone()]);
+        let found = discover_for_read(
+            &t.0.join("proj/sub/f.rs"),
+            &t.0.join("proj"),
+            &set.scoped,
+            &already,
+            &ctx_with(None, None),
+        );
+        assert!(found.is_empty());
+        // Reading a file directly in cwd discovers nothing (no dirs between).
+        let found = discover_for_read(
+            &t.0.join("proj/f.rs"),
+            &t.0.join("proj"),
+            &set.scoped,
+            &HashSet::new(),
+            &ctx_with(None, None),
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn discover_matches_scoped_rule_by_glob() {
+        let t = TestDir::new("lazyscoped");
+        let rule = t.write(
+            "proj/.claude/rules/rust.md",
+            "---\npaths:\n  - \"src/**/*.rs\"\n---\nrust rule",
+        );
+        let set = load(&t.0.join("proj"), &ctx_with(None, None));
+        assert_eq!(set.scoped.len(), 1);
+
+        let found = discover_for_read(
+            &t.0.join("proj/src/main.rs"),
+            &t.0.join("proj"),
+            &set.scoped,
+            &HashSet::new(),
+            &ctx_with(None, None),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, rule);
+        assert_eq!(found[0].kind, SourceKind::ProjectRule);
+        assert!(found[0].content.contains("rust rule"));
+
+        // Non-matching path → nothing.
+        let found = discover_for_read(
+            &t.0.join("proj/README.md"),
+            &t.0.join("proj"),
+            &set.scoped,
+            &HashSet::new(),
+            &ctx_with(None, None),
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn discover_scoped_rule_matches_outside_cwd_via_base_dir() {
+        // A user-level scoped rule still fires for a read outside cwd when the
+        // path sits under the rule's base dir (home).
+        let home = TestDir::new("lazyhome");
+        let rule = home.write(
+            ".claude/rules/dotfiles.md",
+            "---\npaths:\n  - \".claude/**/*.md\"\n---\ndotfile rule",
+        );
+        let proj = TestDir::new("lazyproj");
+        let set = load(&proj.0, &ctx_with(Some(home.0.clone()), None));
+        assert_eq!(set.scoped.len(), 1);
+        let found = discover_for_read(
+            &home.0.join(".claude/skills/x/SKILL.md"),
+            &proj.0,
+            &set.scoped,
+            &HashSet::new(),
+            &ctx_with(Some(home.0.clone()), None),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, rule);
+        assert_eq!(found[0].kind, SourceKind::UserRule);
+    }
+
+    #[test]
+    fn discover_applies_excludes_to_nested_files() {
+        let t = TestDir::new("lazyexcl");
+        let excluded = t.write("proj/sub/CLAUDE.md", "excluded");
+        let set = load(&t.0.join("proj"), &ctx_with(None, None));
+        let ctx = LoadContext {
+            excludes: vec![excluded.display().to_string()],
+            ..ctx_with(None, None)
+        };
+        let found = discover_for_read(
+            &t.0.join("proj/sub/f.rs"),
+            &t.0.join("proj"),
+            &set.scoped,
+            &HashSet::new(),
+            &ctx,
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn render_lazy_none_when_empty_and_reminder_when_present() {
+        assert!(render_lazy(&[]).is_none());
+        let t = TestDir::new("lazyrender");
+        t.write("proj/sub/CLAUDE.md", "sub body");
+        let set = load(&t.0.join("proj"), &ctx_with(None, None));
+        let found = discover_for_read(
+            &t.0.join("proj/sub/f.rs"),
+            &t.0.join("proj"),
+            &set.scoped,
+            &HashSet::new(),
+            &ctx_with(None, None),
+        );
+        let text = render_lazy(&found).expect("non-empty render");
+        assert!(text.starts_with("<system-reminder>"), "{text}");
+        assert!(text.ends_with("</system-reminder>\n"), "{text}");
+        assert!(text.contains("sub body"), "{text}");
+        assert!(text.contains("scope=\"project\""), "{text}");
+        // Deterministic across renders (history byte-stability).
+        assert_eq!(text, render_lazy(&found).unwrap());
     }
 }

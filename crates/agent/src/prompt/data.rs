@@ -166,10 +166,11 @@ pub struct InstructionSourcePromptData {
     pub content: String,
 }
 
-/// The multi-level CLAUDE.md eager block, injected as a fixed-slot user
-/// message right after the system head.
+/// A block of loaded CLAUDE.md instruction files: the eager block injected
+/// as a fixed-slot user message after the system head, or the lazy
+/// `<system-reminder>` appended to a triggering `read_file` tool result.
 #[derive(Debug, Clone, Serialize)]
-pub struct InstructionsEagerPromptData {
+pub struct InstructionsPromptData {
     pub sources: Vec<InstructionSourcePromptData>,
 }
 
