@@ -382,6 +382,7 @@ mod tests {
             text: text.to_string(),
             images: Vec::new(),
             meta: None,
+            display_state: crate::conversation::UserMessageDisplayState::Normal,
         }
     }
 

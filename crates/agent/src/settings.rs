@@ -56,30 +56,12 @@ pub struct Settings {
     #[serde(default)]
     pub auto_compact: AutoCompactSettings,
 
-    /// Controls how a user message submitted while a turn is running is
-    /// handled: `Queue` parks it until the turn ends, `Steer` marks it for
-    /// injection at the next safe join point so the running turn can absorb it.
-    #[serde(default)]
-    pub follow_up_behavior: FollowUpBehavior,
-
     /// Per-collaboration-mode overrides (`[modes.plan]` / `[modes.default]`)
     /// layered over the built-in presets: `model`, `reasoning_effort`, and
     /// `developer_instructions`. Resolved at request-build time in
     /// `thread::build_completion_request`.
     #[serde(default, skip_serializing_if = "ModeSettingsMap::is_empty")]
     pub modes: ModeSettingsMap,
-}
-
-/// Follow-up disposition for a message submitted while a turn is running. The
-/// per-item `steer` flag on a queued follow-up overrides this default; the
-/// setting only seeds the default disposition of newly submitted items. The
-/// shipped default is `Steer` so a fresh install matches Codex's steer mode —
-/// new follow-ups are flagged for mid-turn injection by default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub enum FollowUpBehavior {
-    Queue,
-    #[default]
-    Steer,
 }
 
 /// Auto-compaction knobs. Read at the top of each turn loop iteration; a flip
@@ -145,34 +127,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn follow_up_behavior_defaults_to_steer() {
-        // Shipped default matches Codex steer mode: new follow-ups are flagged
-        // for mid-turn injection unless the user picks Queue.
-        assert_eq!(
-            Settings::default().follow_up_behavior,
-            FollowUpBehavior::Steer
+    fn legacy_follow_up_behavior_is_ignored() {
+        // Serde ignores unknown fields by default, so existing settings files
+        // keep loading after the Queue/Steer preference is removed.
+        let raw = r#"
+language = "en"
+follow_up_behavior = "Steer"
+"#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.language.as_deref(), Some("en"));
+        assert!(
+            !toml::to_string(&settings)
+                .unwrap()
+                .contains("follow_up_behavior")
         );
-    }
-
-    #[test]
-    fn follow_up_behavior_round_trips() {
-        for variant in [FollowUpBehavior::Queue, FollowUpBehavior::Steer] {
-            let s = Settings {
-                follow_up_behavior: variant,
-                ..Default::default()
-            };
-            let raw = toml::to_string(&s).unwrap();
-            let back: Settings = toml::from_str(&raw).unwrap();
-            assert_eq!(back.follow_up_behavior, variant);
-        }
-    }
-
-    #[test]
-    fn follow_up_behavior_absent_field_defaults_to_steer() {
-        // A settings.toml that predates the field still parses and yields the
-        // shipped default (no backward-compat shims — missing means default).
-        let raw = r#"language = "en""#;
-        let s: Settings = toml::from_str(raw).unwrap();
-        assert_eq!(s.follow_up_behavior, FollowUpBehavior::Steer);
     }
 }

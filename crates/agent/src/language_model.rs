@@ -322,6 +322,9 @@ pub enum StopReason {
     MaxTokens,
     ToolUse,
     Refusal,
+    /// The user explicitly interrupted the active turn. Kept distinct from a
+    /// natural `EndTurn` so queued follow-ups are not auto-submitted.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]

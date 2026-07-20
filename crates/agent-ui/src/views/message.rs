@@ -544,9 +544,31 @@ pub fn render_item(
     cx: &mut App,
 ) -> gpui::AnyElement {
     match item {
-        ConvItem::User { text, images, meta } => {
-            render_user(text, images, meta.as_ref(), ix, role, theme, cx)
-        }
+        ConvItem::User {
+            text,
+            images,
+            meta,
+            display_state,
+        } => match display_state {
+            crate::conversation::UserMessageDisplayState::RolledBackSteer { .. } => {
+                gpui::div().hidden().into_any_element()
+            }
+            display_state => render_user(
+                UserRenderContent {
+                    text,
+                    images,
+                    meta: meta.as_ref(),
+                    pending_steer: matches!(
+                        display_state,
+                        crate::conversation::UserMessageDisplayState::PendingSteer { .. }
+                    ),
+                },
+                ix,
+                role,
+                theme,
+                cx,
+            ),
+        },
         ConvItem::Assistant {
             text,
             streaming: _,
@@ -632,15 +654,26 @@ fn copy_button_hoverable(
 /// the accent border; the bottom edge keeps only the two corners so the center
 /// stays open. `min_w_0` end to end keeps long CJK / unbreakable runs from
 /// collapsing the block to min-content (the failure mode of the old bubble).
-pub fn render_user(
-    text: &str,
-    images: &[UserImage],
-    meta: Option<&UserTurnMeta>,
+struct UserRenderContent<'a> {
+    text: &'a str,
+    images: &'a [UserImage],
+    meta: Option<&'a UserTurnMeta>,
+    pending_steer: bool,
+}
+
+fn render_user(
+    content: UserRenderContent<'_>,
     ix: usize,
     model: &str,
     theme: &Theme,
     cx: &mut App,
 ) -> gpui::AnyElement {
+    let UserRenderContent {
+        text,
+        images,
+        meta,
+        pending_steer,
+    } = content;
     let model_id = meta
         .map(|m| m.model_id.as_str())
         .filter(|m| !m.is_empty())
@@ -663,22 +696,35 @@ pub fn render_user(
     // via the steer-queue drain (mid-turn injection) rather than starting a
     // fresh turn. Survives reload because it is read back from
     // `MessageUiMetadata::steered` in `from_message`.
-    let steered_badge = meta.filter(|m| m.steered).map(|_| {
-        gpui::div()
-            .px_1()
-            .py_0p5()
-            .rounded(theme.radius)
-            .bg(accent.opacity(0.15))
-            .text_xs()
-            .text_color(accent)
-            .child(i18n::t("message-steered-badge"))
-    });
+    let steer_badge = if pending_steer {
+        Some(
+            gpui::div()
+                .px_1()
+                .py_0p5()
+                .rounded(theme.radius)
+                .bg(accent.opacity(0.15))
+                .text_xs()
+                .text_color(accent)
+                .child(i18n::t("message-steer-pending-badge")),
+        )
+    } else {
+        meta.filter(|m| m.steered).map(|_| {
+            gpui::div()
+                .px_1()
+                .py_0p5()
+                .rounded(theme.radius)
+                .bg(accent.opacity(0.15))
+                .text_xs()
+                .text_color(accent)
+                .child(i18n::t("message-steered-badge"))
+        })
+    };
 
     let mut header_el = h_flex()
         .items_center()
         .gap_1()
         .child(SharedString::from(header));
-    if let Some(badge) = steered_badge {
+    if let Some(badge) = steer_badge {
         header_el = header_el.child(badge);
     }
 
@@ -2711,6 +2757,7 @@ pub fn build_items(
                         text,
                         images,
                         meta: Some(crate::conversation::UserTurnMeta::from_message(m)),
+                        display_state: crate::conversation::UserMessageDisplayState::Normal,
                     });
                 }
                 for c in &m.content {
