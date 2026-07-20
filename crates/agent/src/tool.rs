@@ -388,13 +388,7 @@ mod tests {
             );
         }
         // Read-only tools survive the filter.
-        for allowed in [
-            "Read",
-            "List",
-            "Grep",
-            "Glob",
-            "AskUserQuestion",
-        ] {
+        for allowed in ["Read", "List", "Grep", "Glob", "AskUserQuestion"] {
             assert!(
                 ro_names.contains(&allowed),
                 "{allowed} missing from plan-mode set"

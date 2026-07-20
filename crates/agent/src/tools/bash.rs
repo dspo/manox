@@ -329,7 +329,8 @@ until the process exits."
                     head_lines,
                     tail_lines,
                     plugin_root.as_deref(),
-                ).await
+                )
+                .await
             } else if crate::sandbox::is_available() {
                 // Sandboxed default: seatbelt-wrapped subprocess, no approval.
                 #[cfg(target_os = "macos")]
@@ -345,7 +346,8 @@ until the process exits."
                         head_lines,
                         tail_lines,
                         plugin_root.as_deref(),
-                    ).await
+                    )
+                    .await
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -368,7 +370,8 @@ until the process exits."
                     head_lines,
                     tail_lines,
                     plugin_root.as_deref(),
-                ).await
+                )
+                .await
             }
         })
     }
@@ -997,7 +1000,8 @@ mod tests {
             None,
             None,
             None,
-        ).await
+        )
+        .await
         .unwrap();
         assert_eq!(out, "hello");
     }
@@ -1023,7 +1027,8 @@ mod tests {
             None,
             None,
             None,
-        ).await
+        )
+        .await
         .expect("fast exit must not panic and must report Ok");
         assert!(out.is_empty(), "expected empty output, got: {out}");
     }
@@ -1042,7 +1047,8 @@ mod tests {
             None,
             None,
             None,
-        ).await
+        )
+        .await
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("exit code 7"), "got: {msg}");
@@ -1071,7 +1077,8 @@ mod tests {
             None,
             None,
             None,
-        ).await
+        )
+        .await
         .expect("printenv must succeed when PATH is exported");
         assert_eq!(
             out.trim(),
@@ -1095,7 +1102,8 @@ mod tests {
             None,
             None,
             None,
-        ).await
+        )
+        .await
         .unwrap_err();
         // The 1s timeout must reap the process, not wait out the full 30s sleep.
         assert!(
@@ -1127,7 +1135,8 @@ mod tests {
             None,
             None,
             None,
-        ).await
+        )
+        .await
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("cancelled"), "got: {msg}");
@@ -1151,7 +1160,8 @@ mod tests {
             None,
             None,
             None,
-        ).await;
+        )
+        .await;
         assert!(
             start.elapsed() < std::time::Duration::from_secs(10),
             "elapsed {:?}",
@@ -1176,7 +1186,8 @@ mod tests {
             None,
             None,
             None,
-        ).await
+        )
+        .await
         .unwrap();
         let out = run_bash(
             shell,
@@ -1190,7 +1201,8 @@ mod tests {
             None,
             None,
             None,
-        ).await
+        )
+        .await
         .unwrap();
         assert_eq!(out.trim_end(), "/tmp");
     }
