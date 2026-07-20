@@ -163,6 +163,15 @@ pub enum ThreadEvent {
     TurnStarted,
     /// A completion turn ended.
     Stop(StopReason),
+    /// The completion loop has unwound and released the `running_turn` slot, so
+    /// `is_running()` is now false. Unlike `Stop`, which is emitted for each
+    /// provider round before recovery and steer-drain decisions, this is the
+    /// safe boundary for starting queued follow-ups.
+    TurnFinished {
+        cancelled: bool,
+        failed: bool,
+        stranded_steer_ids: Vec<String>,
+    },
     /// The provider is retrying the HTTP handshake after a transient failure
     /// (429 / 5xx / network error). The UI shows a retry badge; the next
     /// non-`Retry` event resolves it. `reason` / `detail` feed the badge and
@@ -1933,6 +1942,7 @@ impl Thread {
 
         let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
             let result = Self::run_turn_loop(&this, &model, &cancel, cx).await;
+            let turn_failed = result.is_err();
             if let Err(e) = result {
                 let _ = this.update(cx, |_, cx| {
                     cx.emit(ThreadEvent::Error(e));
@@ -1951,8 +1961,9 @@ impl Thread {
                     // cancel/error/max-turns). Any steer still queued here was
                     // never absorbed — it is stranded. Drop it so a later turn
                     // does not silently drain it into the model; the UI already
-                    // marked the matching parked cards `Failed` via the terminal
-                    // `Stop`/`Error` event, and the user retries from those cards.
+                    // marks the matching optimistic bubbles `Failed` from the
+                    // `TurnFinished` payload, and the user retries there.
+                    let stranded_steer_ids = this.pending_steer_ids();
                     this.pending_steer.clear();
                     // A natural (non-cancelled) turn end is the trigger point for
                     // title re-evaluation. `maybe_generate_title` self-gates on
@@ -1960,8 +1971,14 @@ impl Thread {
                     if !cancel.is_cancelled() {
                         this.maybe_generate_title(cx);
                     }
+                    let cancelled = cancel.is_cancelled();
+                    cx.emit(ThreadEvent::TurnFinished {
+                        cancelled,
+                        failed: turn_failed,
+                        stranded_steer_ids: stranded_steer_ids.clone(),
+                    });
                     cx.notify();
-                    cancel.is_cancelled()
+                    cancelled
                 })
                 .ok()
                 .unwrap_or(true);
@@ -1976,19 +1993,27 @@ impl Thread {
             // the indicator here unconditionally; both are idempotent alongside
             // any overlapping event-driven save/clear, and a dropped entity
             // (the workspace already switched away) just skips.
-            if let Some(entity) = this.upgrade() {
+            let successor_running = if let Some(entity) = this.upgrade() {
                 cx.update(|cx: &mut gpui::App| {
                     let thread_id = entity.read(cx).id.0.clone();
+                    let successor_running = entity.read(cx).is_running();
                     crate::thread_store::save_thread(entity, true, cx);
-                    let store = crate::thread_store::global();
-                    store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
-                });
-            }
+                    if !successor_running {
+                        let store = crate::thread_store::global();
+                        store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                    }
+                    successor_running
+                })
+            } else {
+                // A dropped entity cannot continue a goal and needs no store
+                // update. Treat it like a successor so both paths are skipped.
+                true
+            };
             // Goal auto-continuation: on a natural (non-cancelled) turn end
             // with an active goal, run the evaluator and either continue or
             // clear. A cancelled turn (user stop / `/goal clear` during a turn)
             // skips this so cancel is terminal. Sub-agents never carry a goal.
-            if !turn_cancelled {
+            if !turn_cancelled && !successor_running {
                 Self::maybe_continue_goal(&this, &model, cx).await;
             }
         });
@@ -2339,7 +2364,7 @@ impl Thread {
             // Attribute partial usage from the cancelled turn and reset the
             // per-request counter so the next turn's delta starts from zero.
             self.finalize_request_usage();
-            cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
+            cx.emit(ThreadEvent::Stop(StopReason::Cancelled));
             cx.notify();
         }
 
@@ -4250,6 +4275,41 @@ mod tests {
                 );
             });
         });
+    }
+
+    #[test]
+    fn cancel_emits_explicit_cancelled_stop_reason() {
+        use crate::language_model::StopReason;
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        use super::ThreadEvent;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reg-cancel-reason", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let reasons = Arc::new(Mutex::new(Vec::new()));
+        let captured = reasons.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&thread, move |_, event: &ThreadEvent, _| {
+                if let ThreadEvent::Stop(reason) = event {
+                    captured.lock().unwrap().push(*reason);
+                }
+            })
+        });
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.turn_cancel = Some(CancellationToken::new());
+                thread.cancel(cx);
+            });
+        });
+        assert_eq!(reasons.lock().unwrap().as_slice(), &[StopReason::Cancelled]);
     }
 
     /// A leader `cancel` propagates to every worker member: their in-flight

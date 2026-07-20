@@ -26,7 +26,7 @@ use agent::{
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle,
     DismissEvent, DragMoveEvent, Entity, FocusHandle, MouseButton, MouseUpEvent, Pixels, Render,
-    ScrollHandle, SharedString, Subscription, WeakEntity, Window, anchored, deferred, ease_in_out,
+    ScrollHandle, SharedString, Subscription, WeakEntity, Window, anchored, deferred,
     ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
@@ -187,17 +187,16 @@ struct BackgroundThread {
     _sub: Subscription,
 }
 
-/// Lifecycle of a follow-up parked while a turn is running. The card only
-/// enters the message list when the running turn actually drains it (the
-/// `SteerInjected` event), so a parked item's stream position marks the turn
-/// it steered — not the moment the user clicked.
+/// Lifecycle of a follow-up submitted while a turn is running. A queued item
+/// renders above the composer; clicking Steer moves an optimistic bubble into
+/// the conversation immediately while the canonical message waits for a safe
+/// join point in `Thread::pending_steer`.
 enum FollowUpState {
     /// Parked, waiting to flush as the next user turn at terminal Stop (or to
     /// be promoted to a steer via the Steer action).
     Queued,
-    /// Handed to the thread's steer queue; the running turn absorbs it at the
-    /// next safe join point. Stays parked (bouncing-arrow "待引导") until the
-    /// `SteerInjected` event for `message_id` moves it into the conversation.
+    /// Handed to the thread's steer queue and represented by a pending bubble
+    /// in the message list. Hidden from the composer queue while in flight.
     SteerPending { message_id: String },
     /// The running turn exited (Abort/Error) before draining it — stranded.
     /// Carries the steer message id so a later `SteerInjected` (if the drain
@@ -207,11 +206,8 @@ enum FollowUpState {
     Failed { message_id: String },
 }
 
-/// A follow-up submitted while a turn is running. `state` tracks the card
-/// through Queued → SteerPending → (drained into the conversation) or
-/// SteerPending → Failed (stranded). The default disposition of a newly
-/// submitted item is seeded from `Settings::follow_up_behavior`: `Steer`
-/// enters `SteerPending` immediately, `Queue` parks as `Queued`.
+/// A follow-up submitted while a turn is running. Every new item starts queued;
+/// only an explicit Steer action promotes it to `SteerPending`.
 struct QueuedFollowUp {
     turn: DeferredUserTurn,
     state: FollowUpState,
@@ -336,6 +332,9 @@ pub struct Workspace {
     /// into the running turn at the next safe join point; queue items flush as
     /// the next user turn on terminal Stop.
     queued_follow_ups: std::collections::VecDeque<QueuedFollowUp>,
+    /// Session-only per-thread queue stash. Switching tasks moves the active
+    /// deque here and restores it on return; no database persistence is used.
+    queued_follow_ups_by_thread: HashMap<String, std::collections::VecDeque<QueuedFollowUp>>,
     /// Tracks which composer placeholder is installed, so render only mutates
     /// the input state on mode transitions.
     composer_placeholder_mode: ComposerPlaceholderMode,
@@ -625,6 +624,7 @@ impl Workspace {
             pending_plan_review: None,
             pending_plans: HashMap::new(),
             queued_follow_ups: std::collections::VecDeque::new(),
+            queued_follow_ups_by_thread: HashMap::new(),
             composer_placeholder_mode: ComposerPlaceholderMode::Normal,
             pending_attachments: Vec::new(),
             project_picker_pending: false,
@@ -764,6 +764,38 @@ impl Workspace {
                         r.promote_first_milestone_in_progress(cx);
                     });
                 }
+                ThreadEvent::TurnFinished {
+                    cancelled,
+                    failed,
+                    stranded_steer_ids,
+                } => {
+                    // This is the authoritative end-of-turn boundary: unlike a
+                    // provider Stop event, `Thread::is_running()` is already
+                    // false, so a queued follow-up can safely start a new turn.
+                    this.mark_stranded_steers_failed(stranded_steer_ids, cx);
+                    let thread_id = this.thread.read(cx).id.0.clone();
+                    save_thread(this.thread.clone(), true, cx);
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                    this.turn_active = false;
+                    this.context_rail.update(cx, |r, _cx| {
+                        r.cockpit_phase = if *failed {
+                            CockpitPhase::Failed
+                        } else {
+                            CockpitPhase::Stopped
+                        };
+                    });
+                    this.background_threads
+                        .retain(|b| b.entity.read(cx).id.0 != thread_id);
+                    this.spawn_git_status_refresh(cx);
+                    // Dispatch last: `run_turn` emits `TurnStarted`
+                    // synchronously, so no terminal bookkeeping above may run
+                    // afterward and overwrite the new turn's running state.
+                    if !cancelled {
+                        this.flush_queued_follow_ups(cx);
+                    }
+                    cx.notify();
+                }
                 ThreadEvent::Stop(reason) => {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -801,25 +833,9 @@ impl Workspace {
                         this.pending_inbounds.clear();
                         let thread_id = this.thread.read(cx).id.0.clone();
                         save_thread(this.thread.clone(), true, cx);
-                        // Terminal stop → this thread is no longer running.
-                        let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
-                        this.turn_active = false;
-                        this.context_rail.update(cx, |r, _cx| {
-                            r.cockpit_phase = CockpitPhase::Stopped;
-                        });
-                        // Clean up background reference if this thread was parked.
-                        this.background_threads
-                            .retain(|b| b.entity.read(cx).id.0 != thread_id);
-                        // A normal EndTurn drains pending steers first (the
-                        // turn loop continues until the steer queue is empty),
-                        // so stranded steers here only appear on an abnormal
-                        // exit — mark them Failed before flushing the rest.
-                        this.mark_stranded_steers_failed(cx);
-                        this.flush_queued_follow_ups(cx);
-                        // A turn's worth of file writes just landed; refresh
-                        // the rail's change/branch stats.
-                        this.spawn_git_status_refresh(cx);
+                        // `Stop` is a provider-round boundary. Queue draining,
+                        // idle state, and git refresh wait for `TurnFinished`.
+                        let _ = thread_id;
                     }
                     cx.notify();
                 }
@@ -861,12 +877,9 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::SteerInjected { message_id } => {
-                    // The running turn just drained a queued steer into its
-                    // message history — ground-truth receipt that the steer
-                    // took effect. Move the matching parked card into the
-                    // conversation at this stream position (between the prior
-                    // round's tool results and the next generation), so the
-                    // bubble's placement marks the turn that was steered.
+                    // The running turn drained the steer. Confirm the bubble
+                    // that was inserted optimistically when the user clicked;
+                    // do not push a duplicate.
                     this.consume_steered_follow_up(message_id, cx);
                 }
                 ThreadEvent::InboundAuthorization { id, intent, .. } => {
@@ -914,11 +927,9 @@ impl Workspace {
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong, anchored to the failed turn.
                         this.record_ui_note(agent::db::UiNoteKind::Error, e.to_string(), cx);
-                        // Error is terminal; flush queued follow-ups the same way
-                        // a terminal Stop does so the queue never desyncs from
-                        // the running state (mirrors the Stop arm above).
-                        this.mark_stranded_steers_failed(cx);
-                        this.flush_queued_follow_ups(cx);
+                        // The run task emits `TurnFinished` after it has cleared
+                        // `running_turn`; queue recovery and follow-up dispatch
+                        // happen there.
                     }
                     // Cockpit phase tracking for the streaming/tool variants
                     // that flow through this generic arm. `Error` is handled
@@ -966,11 +977,10 @@ impl Workspace {
     }
 
     /// Minimal subscription for a thread parked in `background_threads`. Unlike
-    /// `subscribe_thread`, this only reacts to terminal `Stop`/`Error`: it clears
-    /// the running indicator and marks the thread unread (the user is not
-    /// viewing it, so its finished turn deserves a red dot). It never touches
-    /// `conversation` or `self.thread`, so a background thread's streaming
-    /// deltas and tool events cannot be misrouted into the foreground view.
+    /// `subscribe_thread`, this only coordinates running state and the parked
+    /// follow-up stash. It never touches `conversation` or `self.thread`, so a
+    /// background thread's streaming deltas and tool events cannot be
+    /// misrouted into the foreground view.
     /// The parked entry is left in `background_threads` (reclaimed on a later
     /// `open_thread`); self-removal from within the callback would drop the very
     /// subscription running it.
@@ -980,21 +990,38 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Subscription {
         let id = thread.read(cx).id.0.clone();
-        cx.subscribe(&thread, move |_this, _thread, ev: &ThreadEvent, cx| {
-            let terminal = match ev {
-                ThreadEvent::Stop(reason) => !matches!(reason, StopReason::ToolUse),
-                ThreadEvent::Error(_) => true,
-                _ => false,
-            };
-            if !terminal {
-                return;
-            }
-            let store = agent::thread_store_global();
-            store.update(cx, |s, cx| {
-                s.mark_idle(&id, cx);
-                s.set_unread(&id, true, cx);
-            });
-        })
+        let parked_thread = thread.clone();
+        cx.subscribe(
+            &thread,
+            move |this, _thread, ev: &ThreadEvent, cx| match ev {
+                ThreadEvent::TurnStarted => {
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.mark_running(&id, cx));
+                }
+                ThreadEvent::SteerInjected { message_id } => {
+                    this.consume_background_steer(&id, message_id);
+                }
+                ThreadEvent::TurnFinished {
+                    cancelled,
+                    stranded_steer_ids,
+                    ..
+                } => {
+                    this.finish_background_follow_ups(
+                        &id,
+                        &parked_thread,
+                        *cancelled,
+                        stranded_steer_ids,
+                        cx,
+                    );
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| {
+                        s.mark_idle(&id, cx);
+                        s.set_unread(&id, true, cx);
+                    });
+                }
+                _ => {}
+            },
+        )
     }
 
     fn subscribe_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> Subscription {
@@ -1791,6 +1818,16 @@ impl Workspace {
             self.pending_plans.insert(old_id.clone(), review);
         }
 
+        // Queue state is session-local but belongs to a thread, not to the
+        // currently visible workspace. Move it aside before rebinding.
+        let outgoing_follow_ups = std::mem::take(&mut self.queued_follow_ups);
+        if outgoing_follow_ups.is_empty() {
+            self.queued_follow_ups_by_thread.remove(&old_id);
+        } else {
+            self.queued_follow_ups_by_thread
+                .insert(old_id.clone(), outgoing_follow_ups);
+        }
+
         // If the old thread is still running a turn, park it in the background
         // so its `run_turn_loop` task stays alive (the entity is otherwise only
         // held by `self.thread`; overwriting that field would drop it and
@@ -1870,7 +1907,7 @@ impl Workspace {
             self.auto_follow = true;
             self.message_scroll.scroll_to_bottom();
         }
-        self.queued_follow_ups.clear();
+        self.restore_queued_follow_ups(&new_id, &messages, running, cx);
         self.thread_sub = Some(self.subscribe_thread(cx));
         // The thinking ticker belongs to the outgoing thread: bump its
         // generation so the old ticker self-terminates, then mirror the incoming
@@ -2271,30 +2308,13 @@ impl Workspace {
         // messages to discuss or revise the plan. The drawer buttons (implement /
         // clear-context / stay) provide the explicit verdict, while free-form
         // input lets the user refine the plan through conversation.
-        // A turn is running — park the message as a visible follow-up instead
-        // of interrupting the in-flight tool calls. The default disposition
-        // (Queue vs Steer) comes from the setting: `Steer` hands the message
-        // straight to the thread's steer queue (card parks as SteerPending
-        // with a bouncing-arrow indicator and only enters the message list on
-        // the drain event); `Queue` parks it as Queued to flush as the next
-        // user turn at terminal Stop.
+        // A turn is running — every new message first parks as a visible
+        // follow-up. Steering is an explicit per-item action.
         if self.thread.read(cx).is_running() {
-            let default_steer = agent::settings::load().follow_up_behavior
-                == agent::settings::FollowUpBehavior::Steer;
-            if default_steer {
-                let mut item = QueuedFollowUp {
-                    turn,
-                    state: FollowUpState::Queued,
-                };
-                let id = self.enqueue_steer_pending(&mut item.turn, cx);
-                item.state = FollowUpState::SteerPending { message_id: id };
-                self.queued_follow_ups.push_back(item);
-            } else {
-                self.queued_follow_ups.push_back(QueuedFollowUp {
-                    turn,
-                    state: FollowUpState::Queued,
-                });
-            }
+            self.queued_follow_ups.push_back(QueuedFollowUp {
+                turn,
+                state: FollowUpState::Queued,
+            });
             cx.notify();
             return;
         }
@@ -2357,12 +2377,9 @@ impl Workspace {
 
     /// Hand a parked follow-up to the thread's steer queue — the running turn
     /// absorbs it at the next safe join point. No conversation bubble is pushed
-    /// here: the bubble lands when the `SteerInjected` event confirms the drain,
-    /// so the message-list position marks the turn that actually saw it. Returns
-    /// the steer message id so the caller can stamp it on the queue card for
-    /// later correlation. The queue card retains the turn's display fields
-    /// (`text`, `user_images`, `meta`) for the eventual `push_user`; the
-    /// model-bound `images`/`ui` are drained out here.
+    /// here. The caller immediately pushes an optimistic pending bubble; the
+    /// later `SteerInjected` event confirms it. Returns the message id used to
+    /// correlate the pending bubble and the canonical history message.
     fn enqueue_steer_pending(
         &mut self,
         turn: &mut DeferredUserTurn,
@@ -2383,6 +2400,163 @@ impl Workspace {
             .update(cx, |thread, cx| thread.enqueue_steer(content, Some(ui), cx))
     }
 
+    /// Restore a thread's session-local follow-up queue after a task switch.
+    /// Canonical steers that drained while the thread was in the background are
+    /// already present in `messages` and are discarded from the stash; a still
+    /// pending steer recreates its optimistic bubble.
+    fn restore_queued_follow_ups(
+        &mut self,
+        thread_id: &str,
+        messages: &[agent::Message],
+        running: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let canonical_ids: std::collections::HashSet<&str> =
+            messages.iter().map(|message| message.id.as_str()).collect();
+        let pending_ids: std::collections::HashSet<String> = self
+            .thread
+            .read(cx)
+            .pending_steer_ids()
+            .into_iter()
+            .collect();
+        let mut restored = self
+            .queued_follow_ups_by_thread
+            .remove(thread_id)
+            .unwrap_or_default();
+        let mut pending_bubbles = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+
+        while let Some(mut item) = restored.pop_front() {
+            let steer_id = match &item.state {
+                FollowUpState::SteerPending { message_id }
+                | FollowUpState::Failed { message_id } => Some(message_id.clone()),
+                FollowUpState::Queued => None,
+            };
+            if steer_id
+                .as_deref()
+                .is_some_and(|id| canonical_ids.contains(id))
+            {
+                continue;
+            }
+            if let FollowUpState::SteerPending { message_id } = &item.state {
+                if running && pending_ids.contains(message_id) {
+                    pending_bubbles.push((
+                        item.turn.text.clone(),
+                        item.turn.user_images.clone(),
+                        item.turn.meta.clone(),
+                        message_id.clone(),
+                    ));
+                } else {
+                    item.state = FollowUpState::Failed {
+                        message_id: message_id.clone(),
+                    };
+                }
+            }
+            kept.push_back(item);
+        }
+        self.queued_follow_ups = kept;
+
+        let weak = cx.weak_entity();
+        for (text, images, meta, message_id) in pending_bubbles {
+            self.conversation.update(cx, |conversation, cx| {
+                conversation.push_pending_steer(text, images, meta, message_id, weak.clone(), cx)
+            });
+        }
+        if !self.queued_follow_ups.is_empty() {
+            self.auto_follow = true;
+            self.message_scroll.scroll_to_bottom();
+        }
+    }
+
+    fn consume_background_steer(&mut self, thread_id: &str, message_id: &str) {
+        let Some(queue) = self.queued_follow_ups_by_thread.get_mut(thread_id) else {
+            return;
+        };
+        if let Some(index) = queue.iter().position(|item| {
+            matches!(
+                &item.state,
+                FollowUpState::SteerPending { message_id: id }
+                    | FollowUpState::Failed { message_id: id }
+                    if id == message_id
+            )
+        }) {
+            queue.remove(index);
+        }
+        if queue.is_empty() {
+            self.queued_follow_ups_by_thread.remove(thread_id);
+        }
+    }
+
+    fn finish_background_follow_ups(
+        &mut self,
+        thread_id: &str,
+        thread: &Entity<Thread>,
+        cancelled: bool,
+        stranded_steer_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let stranded: std::collections::HashSet<&str> =
+            stranded_steer_ids.iter().map(String::as_str).collect();
+        let mut queue = self
+            .queued_follow_ups_by_thread
+            .remove(thread_id)
+            .unwrap_or_default();
+        for item in &mut queue {
+            if let FollowUpState::SteerPending { message_id } = &item.state
+                && stranded.contains(message_id.as_str())
+            {
+                item.state = FollowUpState::Failed {
+                    message_id: message_id.clone(),
+                };
+            }
+        }
+
+        let mut retained = std::collections::VecDeque::new();
+        let mut started_follow_up = false;
+        while let Some(item) = queue.pop_front() {
+            if !cancelled && matches!(item.state, FollowUpState::Queued) {
+                append_deferred_turn_to_thread(thread, item.turn, cx);
+                started_follow_up = true;
+            } else {
+                retained.push_back(item);
+            }
+        }
+        if !retained.is_empty() {
+            self.queued_follow_ups_by_thread
+                .insert(thread_id.to_string(), retained);
+        }
+        if started_follow_up {
+            save_thread(thread.clone(), true, cx);
+            let thread = thread.clone();
+            cx.defer(move |cx| {
+                thread.update(cx, |thread, cx| thread.run_turn(cx));
+            });
+        }
+    }
+
+    /// Render the optimistic message-list bubble for a steer that is still
+    /// waiting in `Thread::pending_steer`.
+    fn push_pending_steer_bubble(
+        &mut self,
+        turn: &DeferredUserTurn,
+        message_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let weak = cx.weak_entity();
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.push_pending_steer(
+                turn.text.clone(),
+                turn.user_images.clone(),
+                turn.meta.clone(),
+                message_id.to_string(),
+                weak,
+                cx,
+            )
+        });
+        self.auto_follow = true;
+        self.message_scroll.scroll_to_bottom();
+    }
+
     fn append_and_run_user_turn(
         &mut self,
         turn: DeferredUserTurn,
@@ -2396,11 +2570,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Drain every parked follow-up into a single new turn. Multiple messages
-    /// coalesce into one user block, keeping the request prefix stable
-    /// (mirrors the team inbox flush). Steer-flagged items that were not
-    /// explicitly promoted to a mid-turn injection land here as ordinary
-    /// follow-up messages — the run is over, so the steer disposition is moot.
     /// Drain every parked `Queued` follow-up into a single new turn. Multiple
     /// messages coalesce into one user block, keeping the request prefix stable
     /// (mirrors the team inbox flush). `Failed` cards stay parked for the user
@@ -2434,24 +2603,26 @@ impl Workspace {
     /// steer queue as `Failed` — the running turn exited (terminal Stop/Error)
     /// before draining them, so they are stranded. Called at terminal states so
     /// the cards stop spinning and surface a retry instead of hanging forever.
-    fn mark_stranded_steers_failed(&mut self, cx: &mut Context<Self>) {
-        let stranded: std::collections::HashSet<String> = self
-            .thread
-            .read(cx)
-            .pending_steer_ids()
-            .into_iter()
-            .collect();
+    fn mark_stranded_steers_failed(
+        &mut self,
+        stranded_steer_ids: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let stranded: std::collections::HashSet<&str> =
+            stranded_steer_ids.iter().map(String::as_str).collect();
         if stranded.is_empty() {
             return;
         }
         let mut any = false;
         for item in self.queued_follow_ups.iter_mut() {
             if let FollowUpState::SteerPending { message_id } = &item.state
-                && stranded.contains(message_id)
+                && stranded.contains(message_id.as_str())
             {
+                self.conversation.update(cx, |conversation, cx| {
+                    conversation.rollback_pending_steer(message_id, cx);
+                });
                 // Keep the id so a later `SteerInjected` can still heal this
-                // card (the Stop fires before the recovery drain decides to
-                // continue, so a "stranded" call here may yet be drained).
+                // provisional rollback.
                 let message_id = message_id.clone();
                 item.state = FollowUpState::Failed { message_id };
                 any = true;
@@ -2462,16 +2633,8 @@ impl Workspace {
         }
     }
 
-    /// Move the parked steer card whose steer was just drained into the
-    /// conversation. The drain already pushed the canonical message into
-    /// `thread.messages`, so this only adds the UI-side bubble (via
-    /// `push_user`) at the exact stream position the model next sees it —
-    /// landing there is the ground-truth receipt that the steer took effect.
-    /// Matches `SteerPending` cards, and also `Failed` cards: the terminal
-    /// `Stop(EndTurn)` event fires before the recovery drain decides to
-    /// continue, so `mark_stranded_steers_failed` may have prematurely marked
-    /// a still-drainable steer `Failed` — a following `SteerInjected` heals it
-    /// back into a real steered bubble rather than leaving a false failure.
+    /// Confirm the optimistic bubble whose canonical message was just drained.
+    /// `Failed` also matches so a late drain can heal a provisional rollback.
     fn consume_steered_follow_up(&mut self, message_id: &str, cx: &mut Context<Self>) {
         // Match either SteerPending or the prematurely-marked Failed card
         // (see the doc comment above) by the steer message id.
@@ -2483,14 +2646,11 @@ impl Workspace {
         let Some(idx) = self.queued_follow_ups.iter().position(id_matches) else {
             return;
         };
-        let Some(item) = self.queued_follow_ups.remove(idx) else {
+        let Some(_item) = self.queued_follow_ups.remove(idx) else {
             return;
         };
-        let mut turn = item.turn;
-        turn.meta.steered = true;
-        let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
-            c.push_user(turn.text, turn.user_images, turn.meta, weak, cx)
+            c.confirm_pending_steer(message_id, cx);
         });
         // Only re-engage tail-follow if the user hasn't scrolled away —
         // a steer injection is event-driven, not user-initiated, so it
@@ -2501,14 +2661,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Promote a parked follow-up to a steer. While a turn is running, hand it
-    /// to the thread's steer queue and park the card as SteerPending (the
-    /// running turn absorbs it at the next safe join point; the card enters the
-    /// message list only on the `SteerInjected` event). While idle, no turn can
-    /// absorb a steer — degrade to a fresh user turn (the Codex-style fallback
-    /// the user accepted). A Failed card retries through the same paths, and
-    /// first cancels its stale message (it may still sit in the thread's steer
-    /// queue in the window between the terminal `Stop` and the loop clearing it).
+    /// Promote a parked follow-up to a steer. While running, enqueue it and
+    /// immediately move an optimistic bubble into the message list. While idle,
+    /// send it as a fresh ordinary turn.
     fn steer_follow_up(&mut self, idx: usize, cx: &mut Context<Self>) {
         let running = self.thread.read(cx).is_running();
         let Some(mut item) = self.queued_follow_ups.remove(idx) else {
@@ -2518,6 +2673,7 @@ impl Workspace {
             FollowUpState::Queued => {
                 if running {
                     let id = self.enqueue_steer_pending(&mut item.turn, cx);
+                    self.push_pending_steer_bubble(&item.turn, &id, cx);
                     item.state = FollowUpState::SteerPending { message_id: id };
                     self.queued_follow_ups.insert(idx, item);
                     cx.notify();
@@ -2533,6 +2689,7 @@ impl Workspace {
                     .update(cx, |thread, _cx| thread.cancel_pending_steer(&message_id));
                 if running {
                     let id = self.enqueue_steer_pending(&mut item.turn, cx);
+                    self.push_pending_steer_bubble(&item.turn, &id, cx);
                     item.state = FollowUpState::SteerPending { message_id: id };
                     self.queued_follow_ups.insert(idx, item);
                     cx.notify();
@@ -2564,6 +2721,9 @@ impl Workspace {
             if let Some(id) = steer_id {
                 self.thread
                     .update(cx, |thread, _cx| thread.cancel_pending_steer(&id));
+                self.conversation.update(cx, |conversation, cx| {
+                    conversation.rollback_pending_steer(&id, cx);
+                });
             }
             cx.notify();
         }
@@ -2579,6 +2739,9 @@ impl Workspace {
             if let Some(id) = steer_id {
                 self.thread
                     .update(cx, |thread, _cx| thread.cancel_pending_steer(&id));
+                self.conversation.update(cx, |conversation, cx| {
+                    conversation.rollback_pending_steer(&id, cx);
+                });
             }
             cx.notify();
         }
@@ -4117,19 +4280,20 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Render the compact queue of follow-ups parked above the composer while a
-    /// turn is running. Each row carries the message summary, a Steer badge
-    /// when the item is flagged for mid-turn injection, and Steer / Remove /
-    /// More affordances. Steer promotes the item to a mid-turn injection;
-    /// Remove drops it before it lands.
+    /// Render the compact queue above the composer. Pending steers live in the
+    /// message list, so this area contains only ordinary queued rows and failed
+    /// steers that need an explicit retry or deletion.
     fn render_queued_follow_ups(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut rows = Vec::with_capacity(self.queued_follow_ups.len());
         for (idx, item) in self.queued_follow_ups.iter().enumerate() {
+            if matches!(item.state, FollowUpState::SteerPending { .. }) {
+                continue;
+            }
             let summary = truncate_follow_up(&item.turn.text);
             let delete_btn = Button::new(format!("queue-delete-{idx}"))
                 .ghost()
                 .xsmall()
-                .icon(IconName::Close)
+                .icon(IconName::Delete)
                 .tooltip(i18n::t("queued-delete-action"))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.delete_follow_up(idx, cx);
@@ -4140,125 +4304,67 @@ impl Workspace {
                 .icon(IconName::Ellipsis)
                 .tooltip(i18n::t("queued-more-action"));
 
-            // Left indicator + right action vary by state. Queued offers a
-            // Steer button; SteerPending shows a bouncing up-arrow (the running
-            // turn has not yet absorbed it) and no action — it is in flight;
-            // Failed shows a retry Steer button. The badge labels each state.
-            let (indicator, action_btn, badge): (
-                Option<AnyElement>,
-                Option<AnyElement>,
-                Option<AnyElement>,
-            ) = match &item.state {
+            let (action_btn, danger): (AnyElement, bool) = match &item.state {
                 FollowUpState::Queued => {
                     let steer_btn = Button::new(format!("queue-steer-{idx}"))
                         .ghost()
                         .xsmall()
-                        .icon(IconName::Map)
+                        .icon(IconName::Redo2)
+                        .label(i18n::t("queued-steer-action"))
                         .tooltip(i18n::t("queued-steer-action"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.steer_follow_up(idx, cx);
                         }));
-                    (None, Some(steer_btn.into_any_element()), None)
-                }
-                FollowUpState::SteerPending { .. } => {
-                    // Bouncing up-arrow: the steer is enqueued but the running
-                    // turn has not drained it yet. `delta` runs 0→1 over the
-                    // period with ease_in_out; `sin(0→π)` lifts the arrow up to
-                    // 3px and drops it back, looping forever. The arrow is an
-                    // absolutely-positioned child of a relative box so the
-                    // animated `top` actually moves it (mirrors the sidebar
-                    // shimmer in `views/sidebar.rs`). Attached only in this
-                    // state so idle cards pay no animation cost.
-                    let accent = theme.accent;
-                    let arrow = gpui::div().relative().w(px(14.)).h(px(14.)).with_animation(
-                        format!("queue-steer-bounce-{idx}"),
-                        Animation::new(std::time::Duration::from_millis(1000))
-                            .repeat()
-                            .with_easing(ease_in_out),
-                        move |el, delta| {
-                            el.child(
-                                gpui::div()
-                                    .absolute()
-                                    .top(px(-3. * (delta * std::f32::consts::PI).sin()))
-                                    .child(
-                                        Icon::new(IconName::ArrowUp).xsmall().text_color(accent),
-                                    ),
-                            )
-                        },
-                    );
-                    let badge = gpui::div()
-                        .px_1()
-                        .py_0p5()
-                        .rounded(theme.radius)
-                        .bg(theme.accent.opacity(0.15))
-                        .text_xs()
-                        .text_color(theme.accent)
-                        .child(i18n::t("queued-steer-pending"));
-                    (
-                        Some(arrow.into_any_element()),
-                        None,
-                        Some(badge.into_any_element()),
-                    )
+                    (steer_btn.into_any_element(), false)
                 }
                 FollowUpState::Failed { .. } => {
                     let retry_btn = Button::new(format!("queue-steer-{idx}"))
                         .ghost()
                         .xsmall()
-                        .icon(IconName::Map)
+                        .icon(IconName::Redo2)
+                        .label(i18n::t("queued-steer-retry-action"))
                         .tooltip(i18n::t("queued-steer-retry-action"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.steer_follow_up(idx, cx);
                         }));
-                    let badge = gpui::div()
-                        .px_1()
-                        .py_0p5()
-                        .rounded(theme.radius)
-                        .bg(theme.danger.opacity(0.15))
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .child(i18n::t("queued-steer-failed"));
-                    (
-                        None,
-                        Some(retry_btn.into_any_element()),
-                        Some(badge.into_any_element()),
-                    )
+                    (retry_btn.into_any_element(), true)
                 }
+                FollowUpState::SteerPending { .. } => unreachable!(),
             };
 
-            let danger = matches!(item.state, FollowUpState::Failed { .. });
-            let row_bg = if danger {
-                theme.danger.opacity(0.08)
-            } else {
-                theme.secondary
-            };
             let summary_color = if danger {
                 theme.danger
             } else {
                 theme.foreground
             };
 
-            let mut left = h_flex().items_center().gap_1().min_w_0().flex_1();
-            if let Some(ind) = indicator {
-                left = left.child(ind);
-            }
-            left = left.child(
-                gpui::div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_x_hidden()
-                    .text_xs()
-                    .text_color(summary_color)
-                    .child(summary),
-            );
-            if let Some(b) = badge {
-                left = left.child(b);
-            }
+            let left = h_flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .flex_1()
+                .child(Icon::new(IconName::Redo2).xsmall().text_color(if danger {
+                    theme.danger
+                } else {
+                    theme.muted_foreground
+                }))
+                .child(
+                    gpui::div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_x_hidden()
+                        .text_xs()
+                        .text_color(summary_color)
+                        .child(summary),
+                );
 
-            let mut right = h_flex().items_center().gap_0p5().flex_shrink_0();
-            if let Some(a) = action_btn {
-                right = right.child(a);
-            }
-            right = right.child(delete_btn).child(more_btn);
+            let right = h_flex()
+                .items_center()
+                .gap_0p5()
+                .flex_shrink_0()
+                .child(action_btn)
+                .child(delete_btn)
+                .child(more_btn);
 
             rows.push(
                 h_flex()
@@ -4267,8 +4373,9 @@ impl Workspace {
                     .gap_2()
                     .px_2()
                     .py_1()
-                    .rounded(theme.radius)
-                    .bg(row_bg)
+                    .border_b_1()
+                    .border_color(theme.border.opacity(0.6))
+                    .when(danger, |row| row.bg(theme.danger.opacity(0.08)))
                     .child(left)
                     .child(right)
                     .into_any_element(),
@@ -6617,6 +6724,30 @@ fn truncate_follow_up(s: &str) -> String {
     let mut t: String = s.chars().take(MAX).collect();
     t.push('…');
     t
+}
+
+/// Append a deferred follow-up to a parked thread without touching the
+/// foreground conversation view. The canonical history is rebuilt when the
+/// user switches back to this task.
+fn append_deferred_turn_to_thread(
+    thread: &Entity<Thread>,
+    turn: DeferredUserTurn,
+    cx: &mut Context<Workspace>,
+) {
+    use agent::language_model::MessageContent;
+
+    thread.update(cx, |thread, cx| {
+        if turn.images.is_empty() {
+            thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui), cx);
+        } else {
+            let mut content = Vec::with_capacity(turn.images.len() + 1);
+            if !turn.text.trim().is_empty() {
+                content.push(MessageContent::Text(turn.text));
+            }
+            content.extend(turn.images);
+            thread.insert_user_message_with_content_and_ui_metadata(content, Some(turn.ui), cx);
+        }
+    });
 }
 
 #[cfg(test)]
