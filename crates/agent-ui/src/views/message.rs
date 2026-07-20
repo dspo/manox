@@ -1266,7 +1266,7 @@ fn render_activity_entry(
 }
 
 /// Render a reasoning round entry in the activity tree: a lightweight node
-/// labeled "思考 #N" that expands to show the raw thinking text. No card
+/// labeled "思考" that expands to show the raw thinking text. No card
 /// chrome — just a subtle hover affordance and muted styling.
 #[allow(clippy::too_many_arguments)]
 fn render_reasoning_entry(
@@ -1282,7 +1282,7 @@ fn render_reasoning_entry(
     cx: &mut App,
 ) -> gpui::AnyElement {
     let weak_workspace = tool_ctx.map(|c| c.weak.clone());
-    let label = format!("{} {}", i18n::t("message-reasoning"), eix + 1);
+    let label = i18n::t("message-reasoning").to_string();
     // Default-collapsed: the live stream does not auto-play the reasoning
     // text — only a manual expand (user_toggled → collapsed=false) reveals
     // the body. The streaming spinner on the header still shows work in
