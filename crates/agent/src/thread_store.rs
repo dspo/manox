@@ -139,11 +139,31 @@ impl ThreadStore {
     }
 
     /// Mark a thread as running (turn started). Emits `RunningChanged` so the
-    /// sidebar re-renders the affected row.
+    /// sidebar re-renders the affected row. Also clears the `errored` flag —
+    /// a new turn means the previous terminal error is no longer relevant.
     pub fn mark_running(&mut self, id: &str, cx: &mut Context<Self>) {
         if self.running.insert(id.to_string()) {
             cx.emit(ThreadStoreEvent::RunningChanged);
+        }
+        // Clear the error flag: a new turn supersedes any prior terminal error.
+        if let Some(s) = self.summaries.iter_mut().find(|s| s.id == id)
+            && s.errored
+        {
+            s.errored = false;
+            cx.emit(ThreadStoreEvent::SummariesUpdated);
             cx.notify();
+            let db = self.db.clone();
+            let id = id.to_string();
+            cx.spawn(async move |_, cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move { db.set_errored(&id, false) })
+                    .await;
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "Failed to clear thread errored");
+                }
+            })
+            .detach();
         }
     }
 
@@ -194,6 +214,45 @@ impl ThreadStore {
                 .await;
             if let Err(e) = res {
                 tracing::warn!(error = %e, "Failed to set thread unread");
+            }
+        })
+        .detach();
+    }
+
+    /// Set the errored flag on a thread. Symmetric to `set_unread`: updates the
+    /// in-memory summary immediately, then persists fire-and-forget. A no-op
+    /// when the value is unchanged.
+    pub fn set_errored(&mut self, id: &str, errored: bool, cx: &mut Context<Self>) {
+        let Some(s) = self.summaries.iter_mut().find(|s| s.id == id) else {
+            let db = self.db.clone();
+            let id = id.to_string();
+            cx.spawn(async move |_, cx| {
+                let res = cx
+                    .background_executor()
+                    .spawn(async move { db.set_errored(&id, errored) })
+                    .await;
+                if let Err(e) = res {
+                    tracing::warn!(error = %e, "Failed to set thread errored");
+                }
+            })
+            .detach();
+            return;
+        };
+        if s.errored == errored {
+            return;
+        }
+        s.errored = errored;
+        cx.emit(ThreadStoreEvent::SummariesUpdated);
+        cx.notify();
+        let db = self.db.clone();
+        let id = id.to_string();
+        cx.spawn(async move |_, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { db.set_errored(&id, errored) })
+                .await;
+            if let Err(e) = res {
+                tracing::warn!(error = %e, "Failed to set thread errored");
             }
         })
         .detach();

@@ -869,6 +869,7 @@ struct SidebarThreadItem {
     updated: String,
     pinned: bool,
     has_unread: bool,
+    errored: bool,
     running: bool,
     selected: bool,
     indent: gpui::Pixels,
@@ -901,6 +902,7 @@ impl SidebarThreadItem {
             updated: format_relative(summary.interacted_at),
             pinned: summary.pinned,
             has_unread: summary.has_unread,
+            errored: summary.errored,
             running,
             selected,
             indent,
@@ -940,6 +942,7 @@ impl SidebarThreadItem {
             updated: format_relative(summary.created_at),
             pinned: false,
             has_unread: false,
+            errored: false,
             running: false,
             selected,
             indent,
@@ -967,7 +970,11 @@ fn render_thread_item(
     let short_id = item.short_id.clone();
     let title = item.title.clone();
     let updated = item.updated.clone();
-    let title_color = theme.foreground;
+    let title_color = if item.errored {
+        theme.danger
+    } else {
+        theme.foreground
+    };
     let wash = item.wash;
     let icon = item.icon.clone();
     let open_kind = item.kind.clone();
@@ -1117,11 +1124,18 @@ fn render_thread_item(
                                     .w(px(8.))
                                     .h(px(8.))
                                     .rounded_full()
-                                    .bg(theme.danger),
+                                    .bg(theme.info),
                             )
                         })
                         .when(item.pinned, |this| {
                             this.child(Icon::new(IconName::Star).xsmall().text_color(theme.accent))
+                        })
+                        .when(item.errored, |this| {
+                            this.child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .xsmall()
+                                    .text_color(theme.danger),
+                            )
                         })
                         .child(
                             gpui::div()
