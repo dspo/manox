@@ -458,6 +458,14 @@ completion-tag-command = Command
 completion-tag-skill = Skill
 completion-tag-agent = Agent
 
+### User turn navigator
+turn-navigator-search-placeholder = Search user messages…
+turn-navigator-empty = No user messages
+turn-navigator-no-results = No matching messages
+turn-navigator-attachment-only = Attachment-only message
+turn-navigator-empty-message = Empty message
+turn-navigator-copied = Message copied to clipboard.
+
 ### slash_command.rs
 slash-yolo-desc = Switch to Full access (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
 slash-plan-desc = Cycle collaboration mode (Plan ↔ Default); bare `/plan` toggles, `/plan <prompt>` enters Plan with a prompt

@@ -406,6 +406,14 @@ completion-tag-command = 命令
 completion-tag-skill = 技能
 completion-tag-agent = Agent
 
+### 用户消息导航
+turn-navigator-search-placeholder = 搜索用户消息…
+turn-navigator-empty = 暂无用户消息
+turn-navigator-no-results = 没有匹配的消息
+turn-navigator-attachment-only = 仅附件消息
+turn-navigator-empty-message = 空消息
+turn-navigator-copied = 消息已复制到剪贴板。
+
 ### slash_command.rs
 slash-yolo-desc = 切换到完全访问（免审批 + bash 沙箱外）；带提示词则切换后直接开工
 slash-plan-desc = 切换协作模式（计划 ↔ 默认）；裸 `/plan` 切换，`/plan <提示>` 带提示进入计划模式

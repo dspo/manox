@@ -15,6 +15,7 @@ use gpui::{AnyElement, App, ScrollHandle, SharedString, Window, prelude::*, px};
 use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 
 use crate::slash_command::SlashCommandRegistry;
+use crate::views::popup_menu::{self, LIST_HORIZONTAL_PADDING, MAX_LIST_HEIGHT};
 
 /// What a completion row represents — drives its icon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,20 +245,17 @@ pub fn render_completion(
     let trigger = state.trigger;
     let items = state.items.clone();
     let selected = state.selected;
-    let fg = theme.foreground;
+    let fg = theme.popover_foreground;
     let muted = theme.muted_foreground;
-    let secondary = theme.secondary;
-    let border = theme.border;
-    let radius = theme.radius;
     let mono = theme.mono_font_family.clone();
     let on_select = on_select.clone();
     let scroll_handle = state.scroll_handle.clone();
-    let hover_bg = theme.muted_foreground.opacity(0.08);
 
     let list = v_flex()
         .id("completion-list")
         .w_full()
-        .max_h(px(300.))
+        .max_h(MAX_LIST_HEIGHT)
+        .px(LIST_HORIZONTAL_PADDING)
         .overflow_y_scroll()
         .track_scroll(&scroll_handle)
         .min_w_0()
@@ -282,24 +280,12 @@ pub fn render_completion(
                 gpui::FontWeight::LIGHT
             };
 
-            let mut row = h_flex()
-                .id(("completion-row", ix))
+            let mut content = h_flex()
                 .w_full()
                 .items_center()
                 .gap_2()
-                .px_2()
-                .py_1()
-                .cursor_pointer()
                 .font_family(mono)
                 .font_weight(gpui::FontWeight::LIGHT)
-                // Hover tint for affordance — selected already has its own bg.
-                .hover(move |s| s.bg(hover_bg));
-
-            if is_selected {
-                row = row.bg(secondary);
-            }
-
-            row = row
                 .child(Icon::new(item.kind.icon()).small().text_color(muted))
                 .child(
                     gpui::div()
@@ -309,7 +295,7 @@ pub fn render_completion(
                         .child(gpui::StyledText::new(label)),
                 );
             if let Some(desc) = desc {
-                row = row.child(
+                content = content.child(
                     gpui::div()
                         .flex_1()
                         .min_w_0()
@@ -319,23 +305,20 @@ pub fn render_completion(
                         .child(desc),
                 );
             }
-            row = row.child(gpui::div().text_xs().text_color(muted).child(tag.clone()));
-            row.on_click(move |_, window, cx| on_select(ix, window, cx))
-                .into_any_element()
+            content = content.child(gpui::div().text_xs().text_color(muted).child(tag.clone()));
+            popup_menu::render_popup_row(
+                ix,
+                "completion-row",
+                is_selected,
+                theme,
+                content,
+                move |_, window, cx| on_select(ix, window, cx),
+            )
+            .into_any_element()
         }));
 
-    v_flex()
+    popup_menu::popup_container(theme, list)
         .w(px(520.))
-        .child(
-            v_flex()
-                .w_full()
-                .bg(theme.background)
-                .border_1()
-                .border_color(border)
-                .rounded(radius)
-                .shadow_md()
-                .child(list),
-        )
         .into_any_element()
 }
 

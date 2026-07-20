@@ -25,8 +25,8 @@ use agent::{
 };
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle,
-    DismissEvent, DragMoveEvent, Entity, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle,
-    SharedString, Subscription, WeakEntity, Window, anchored, deferred, ease_in_out,
+    DismissEvent, DragMoveEvent, Entity, FocusHandle, MouseButton, MouseUpEvent, Pixels, Render,
+    ScrollHandle, SharedString, Subscription, WeakEntity, Window, anchored, deferred, ease_in_out,
     ease_out_quint, prelude::*, px,
 };
 use gpui_component::{
@@ -56,11 +56,13 @@ use crate::views::composer_menu::{
     PendingAttachment, build_plus_menu, load_attachment, render_attachment_chips,
 };
 use crate::views::member_panel::MemberPanel;
+use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
+use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
 use crate::{
     CloseBrowserTab, CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab,
-    OpenBrowserTab, OpenSettings,
+    OpenBrowserTab, OpenSettings, ToggleTurnNavigator,
 };
 use terminal::Terminal;
 use terminal_ui::TerminalView;
@@ -167,6 +169,12 @@ struct DeferredUserTurn {
     meta: UserTurnMeta,
     ui: agent::MessageUiMetadata,
     user_images: Vec<UserImage>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PendingMessageReveal {
+    generation: u64,
+    item_ix: usize,
 }
 
 /// A thread parked in the background while still running a turn. The held
@@ -304,6 +312,10 @@ pub struct Workspace {
     /// overlay — it never grabs focus, so the `InputState` keeps focus and the
     /// query filters live on every keystroke.
     completion: Option<CompletionState>,
+    /// Searchable, newest-first snapshot of the active thread's user turns.
+    turn_navigator: Option<Entity<TurnNavigator>>,
+    turn_navigator_sub: Option<Subscription>,
+    turn_navigator_previous_focus: Option<FocusHandle>,
     /// Title bar "..." dropdown (conversation menu). Mirrors the
     /// model selector pattern: a button toggles `title_menu_open`; the
     /// `PopupMenu` entity and its dismiss subscription are created on open.
@@ -355,6 +367,12 @@ pub struct Workspace {
     /// in); scrolled away means hold the absolute pixel offset so the user's
     /// readback survives the stream.
     auto_follow: bool,
+    /// Holds tail-follow off while a navigator jump crosses GPUI's prepaint
+    /// boundary. The first protected frame drains any previously queued
+    /// `scroll_to_bottom`; the second applies `scroll_to_top_of_item` without
+    /// that stale request overriding it.
+    pending_message_reveal: Option<PendingMessageReveal>,
+    message_reveal_generation: u64,
     /// Sub-agent task ids whose cards are expanded to show the child
     /// conversation. Toggled by clicking the card header; shared across all
     /// nesting levels so nested agent tasks expand in place.
@@ -453,6 +471,45 @@ const SIDEBAR_MAX_WIDTH: f32 = 480.;
 const SIDEBAR_DIVIDER_WIDTH: f32 = 6.;
 /// Floor for the main column width when the editor pane is dragged wide.
 const MAIN_MIN_WIDTH: f32 = 160.;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TurnNavigatorLayout {
+    left_inset: Pixels,
+    right_inset: Pixels,
+    panel_width: Pixels,
+}
+
+fn turn_navigator_layout(
+    window_width: Pixels,
+    sidebar_width: Pixels,
+    right_pane_width: Option<Pixels>,
+    show_context_rail: bool,
+) -> TurnNavigatorLayout {
+    let left_inset = sidebar_width + px(SIDEBAR_DIVIDER_WIDTH);
+    let right_pane_inset = right_pane_width
+        .map(|width| width + px(EDITOR_DIVIDER_WIDTH))
+        .unwrap_or(px(0.));
+    let context_inset = if show_context_rail {
+        px(crate::views::context_rail::ENV_CONTENT_INSET)
+    } else {
+        px(0.)
+    };
+    let right_inset = right_pane_inset + context_inset;
+    let available = window_width - left_inset - right_inset - px(24.);
+    let panel_width = if available <= px(0.) {
+        px(0.)
+    } else if available < px(480.) {
+        available
+    } else {
+        px(480.)
+    };
+
+    TurnNavigatorLayout {
+        left_inset,
+        right_inset,
+        panel_width,
+    }
+}
 
 /// Settings overlay slide duration. The enter animation glides the panel in
 /// from the left edge, the exit animation glides it out to the right.
@@ -559,6 +616,9 @@ impl Workspace {
             project_chip_menu: None,
             project_chip_menu_sub: None,
             completion: None,
+            turn_navigator: None,
+            turn_navigator_sub: None,
+            turn_navigator_previous_focus: None,
             title_menu_open: false,
             title_menu: None,
             title_menu_sub: None,
@@ -576,6 +636,8 @@ impl Workspace {
             editor_sub: None,
             message_scroll: ScrollHandle::new(),
             auto_follow: true,
+            pending_message_reveal: None,
+            message_reveal_generation: 0,
             expanded_tasks: HashSet::new(),
             view_mode: ViewMode::default(),
             exiting_settings: false,
@@ -1534,6 +1596,173 @@ impl Workspace {
         self.project_chip_menu_sub = None;
     }
 
+    fn blocking_overlay_active(&self) -> bool {
+        self.pending_plan_review.is_some()
+            || !self.pending_auths.is_empty()
+            || !self.pending_inbounds.is_empty()
+            || self.blank_project_parent.is_some()
+    }
+
+    fn toggle_turn_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.turn_navigator.is_some() {
+            self.close_turn_navigator(window, cx);
+            return;
+        }
+        if !matches!(self.view_mode, ViewMode::Workspace) || self.blocking_overlay_active() {
+            return;
+        }
+
+        let turns = collect_user_turns(
+            self.conversation
+                .read(cx)
+                .items()
+                .iter()
+                .enumerate()
+                .map(|(ix, item)| (ix, item.read(cx).kind())),
+        );
+        let previous_focus = window.focused(cx);
+        let navigator = cx.new(|cx| TurnNavigator::new(turns, window, cx));
+        let sub = cx.subscribe_in(
+            &navigator,
+            window,
+            |this, _navigator, event: &TurnNavigatorEvent, window, cx| match event {
+                TurnNavigatorEvent::Navigate { item_ix } => {
+                    let target = *item_ix;
+                    this.close_turn_navigator(window, cx);
+                    this.reveal_message(target, window, cx);
+                }
+                TurnNavigatorEvent::Dismiss => this.close_turn_navigator(window, cx),
+            },
+        );
+        self.turn_navigator = Some(navigator.clone());
+        self.turn_navigator_sub = Some(sub);
+        self.turn_navigator_previous_focus = previous_focus;
+        navigator.update(cx, |navigator, cx| navigator.focus(window, cx));
+        cx.notify();
+    }
+
+    fn cancel_pending_message_reveal(&mut self) {
+        self.message_reveal_generation = self.message_reveal_generation.wrapping_add(1);
+        self.pending_message_reveal = None;
+    }
+
+    fn follow_message_tail(&mut self) {
+        self.cancel_pending_message_reveal();
+        self.auto_follow = true;
+        self.message_scroll.scroll_to_bottom();
+    }
+
+    fn reveal_message(&mut self, item_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.message_reveal_generation = self.message_reveal_generation.wrapping_add(1);
+        let pending = PendingMessageReveal {
+            generation: self.message_reveal_generation,
+            item_ix,
+        };
+        self.pending_message_reveal = Some(pending);
+        self.auto_follow = false;
+
+        // A tail-follow render may already have queued `scroll_to_bottom` on
+        // the handle. GPUI applies an active-item jump before consuming that
+        // flag, so submitting both for one prepaint always leaves us at the
+        // bottom. The first protected frame only consumes the stale flag; its
+        // next-frame callback then queues the jump for a second protected
+        // frame. Protection is released before the third frame renders.
+        cx.on_next_frame(window, move |this, window, cx| {
+            if this.pending_message_reveal != Some(pending) {
+                return;
+            }
+            cx.notify();
+            cx.on_next_frame(window, move |this, window, cx| {
+                if this.pending_message_reveal != Some(pending) {
+                    return;
+                }
+                this.message_scroll.scroll_to_top_of_item(pending.item_ix);
+                cx.notify();
+                cx.on_next_frame(window, move |this, _window, cx| {
+                    if this.pending_message_reveal == Some(pending) {
+                        this.pending_message_reveal = None;
+                        this.auto_follow = false;
+                        cx.notify();
+                    }
+                });
+            });
+        });
+        cx.notify();
+    }
+
+    fn close_turn_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.turn_navigator.take().is_none() {
+            return;
+        }
+        self.turn_navigator_sub = None;
+        if let Some(previous) = self.turn_navigator_previous_focus.take() {
+            window.focus(&previous, cx);
+        }
+        cx.notify();
+    }
+
+    fn drop_turn_navigator(&mut self, cx: &mut Context<Self>) {
+        if self.turn_navigator.take().is_some() {
+            self.turn_navigator_sub = None;
+            self.turn_navigator_previous_focus = None;
+            cx.notify();
+        }
+    }
+
+    fn render_turn_navigator_overlay(
+        &self,
+        window: &mut Window,
+        theme: &Theme,
+        right_pane_open: bool,
+        show_context_rail: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let navigator = self.turn_navigator.clone()?;
+        let layout = turn_navigator_layout(
+            window.bounds().size.width,
+            self.sidebar_width,
+            right_pane_open.then_some(self.editor_width),
+            show_context_rail,
+        );
+        let panel_height = navigator.read(cx).panel_height(cx);
+
+        Some(
+            v_flex()
+                .id("turn-navigator-overlay")
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_turn_navigator(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .absolute()
+                        .top_0()
+                        .right(layout.right_inset)
+                        .bottom_0()
+                        .left(layout.left_inset)
+                        .items_center()
+                        .pt(TITLE_BAR_HEIGHT + px(8.0))
+                        .child(
+                            popup_menu::popup_container(theme, navigator)
+                                .id("turn-navigator-panel")
+                                .w(layout.panel_width)
+                                .h(panel_height)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
     fn attach_thread(
         &mut self,
@@ -1541,6 +1770,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_turn_navigator(window, cx);
         let old_thread = self.thread.clone();
         let old_id = old_thread.read(cx).id.0.clone();
         let new_id = new_thread.read(cx).id.0.clone();
@@ -1617,8 +1847,7 @@ impl Workspace {
         // (re-pinned each frame while at the bottom); a completed history
         // thread stays at the bottom once revealed, and scrolling up holds
         // because the per-frame arbitration disengages follow on upward scroll.
-        self.auto_follow = true;
-        self.message_scroll.scroll_to_bottom();
+        self.follow_message_tail();
         self.pending_auths.clear();
         self.pending_ask = None;
         // Restore the incoming thread's stashed pending plan, if any. A reloaded
@@ -1971,8 +2200,7 @@ impl Workspace {
         });
         // Re-engage tail-follow so the streaming reply stays in view: the
         // per-frame arbitration re-pins to the bottom while the user rides it.
-        self.auto_follow = true;
-        self.message_scroll.scroll_to_bottom();
+        self.follow_message_tail();
         let hit = self
             .thread
             .update(cx, |thread, cx| thread.submit_command(name, args, cx));
@@ -2005,8 +2233,7 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(display_text, Vec::new(), meta, weak, cx)
         });
-        self.auto_follow = true;
-        self.message_scroll.scroll_to_bottom();
+        self.follow_message_tail();
         let hit = self
             .thread
             .update(cx, |thread, cx| thread.submit_skill(key, args, cx));
@@ -2112,8 +2339,7 @@ impl Workspace {
         });
         // Re-engage tail-follow so the streaming reply stays pinned as it grows.
         if follow_tail {
-            self.auto_follow = true;
-            self.message_scroll.scroll_to_bottom();
+            self.follow_message_tail();
         }
         self.thread.update(cx, |thread, cx| {
             if turn.images.is_empty() {
@@ -2595,8 +2821,7 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(text.clone(), Vec::new(), meta, weak, cx)
         });
-        self.auto_follow = true;
-        self.message_scroll.scroll_to_bottom();
+        self.follow_message_tail();
         self.thread.update(cx, |thread, cx| {
             thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
             thread.run_turn(cx);
@@ -5183,6 +5408,9 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !matches!(self.view_mode, ViewMode::Workspace) {
+            self.drop_turn_navigator(cx);
+        }
         // Settings overlay replaces the entire window content; the underlying
         // Workspace state (sidebar, conversation, composer) is preserved and
         // returns unchanged when the user clicks "Back to app".
@@ -5363,10 +5591,10 @@ impl Render for Workspace {
 
         self.ensure_blank_project_input(window, cx);
 
-        let overlay = self
-            .render_auth_overlay(&theme, cx)
-            .or_else(|| self.render_inbound_overlay(&theme, cx))
-            .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
+        if self.blocking_overlay_active() && self.turn_navigator.is_some() {
+            self.close_turn_navigator(window, cx);
+        }
+
         let editor_open = self.editor_open;
         let right_pane_open = !self.right_tabs.is_empty();
         let editor_preview = self.editor_preview;
@@ -5383,6 +5611,24 @@ impl Render for Workspace {
         // hoisted into a vertically-centered hero (heading + composer + "Choose
         // project"); once the conversation starts it drops to the bottom footer.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
+        let main_body_w = window.bounds().size.width
+            - self.sidebar_width
+            - px(SIDEBAR_DIVIDER_WIDTH)
+            - if right_pane_open {
+                editor_width + px(EDITOR_DIVIDER_WIDTH)
+            } else {
+                px(0.)
+            };
+        let show_rail = !first_screen
+            && !editor_open
+            && self.thread.read(cx).has_interacted()
+            && crate::views::context_rail::ContextRail::rail_width_for(main_body_w).is_some();
+        let overlay = self
+            .render_auth_overlay(&theme, cx)
+            .or_else(|| self.render_inbound_overlay(&theme, cx))
+            .or_else(|| self.render_blank_project_overlay(window, &theme, cx));
+        let turn_navigator_overlay =
+            self.render_turn_navigator_overlay(window, &theme, right_pane_open, show_rail, cx);
         // The inline composer stays visible while inline AskUserQuestion cards
         // are open; submitting text resolves the ask as a free-form response.
         // The editor pane still hides the inline composer while editing there.
@@ -5733,6 +5979,7 @@ impl Render for Workspace {
 
         h_flex()
             .size_full()
+            .relative()
             .bg(theme.background)
             .text_color(theme.foreground)
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
@@ -5748,6 +5995,10 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &crate::CloseEditor, window, cx| {
                 this.close_editor(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTurnNavigator, window, cx| {
+                this.toggle_turn_navigator(window, cx);
+                cx.stop_propagation();
             }))
             .on_action(cx.listener(|this, _: &FocusTerminal, _window, cx| {
                 this.focus_terminal(cx);
@@ -5818,13 +6069,6 @@ impl Render for Workspace {
             // conversation alone. The editor pane is a third top-level column to
             // the right.
             .child({
-                let main_body_w =
-                    window.bounds().size.width - self.sidebar_width - px(SIDEBAR_DIVIDER_WIDTH);
-                let show_rail = !first_screen
-                    && !editor_open
-                    && self.thread.read(cx).has_interacted()
-                    && crate::views::context_rail::ContextRail::rail_width_for(main_body_w)
-                        .is_some();
                 v_flex()
                     .flex_1()
                     .h_full()
@@ -5838,7 +6082,9 @@ impl Render for Workspace {
                         // growth at the tail stays in view. Scrolled away => hold
                         // the absolute pixel offset so the user's readback of an
                         // earlier turn survives the stream below.
-                        let at_bottom = {
+                        if self.pending_message_reveal.is_some() {
+                            self.auto_follow = false;
+                        } else {
                             let max_y = self.message_scroll.max_offset().y;
                             let off_y = self.message_scroll.offset().y;
                             // gpui scroll offset is non-positive: 0 at the top,
@@ -5851,11 +6097,11 @@ impl Render for Workspace {
                             // follow alive while a streaming/history body is still
                             // shorter than the viewport (max == 0, no overflow),
                             // so the first frame that overflows still re-pins.
-                            max_y <= px(0.5) || off_y <= -max_y + px(1.0)
-                        };
-                        self.auto_follow = at_bottom;
-                        if at_bottom {
-                            self.message_scroll.scroll_to_bottom();
+                            let at_bottom = max_y <= px(0.5) || off_y <= -max_y + px(1.0);
+                            self.auto_follow = at_bottom;
+                            if at_bottom {
+                                self.message_scroll.scroll_to_bottom();
+                            }
                         }
                         // Body wrapper: hero / list / footer / overlay. `pt`
                         // reserves space for the title-bar overlay; `pr` (when
@@ -5996,6 +6242,7 @@ impl Render for Workspace {
             .when(right_pane_open, |this| {
                 this.child(editor_divider).child(editor_pane)
             })
+            .children(turn_navigator_overlay)
             .on_drag_move(cx.listener(
                 |this, e: &DragMoveEvent<DraggedEditorDivider>, _window, cx| {
                     // The root fills the window, so its right edge is the
@@ -6370,4 +6617,50 @@ fn truncate_follow_up(s: &str) -> String {
     let mut t: String = s.chars().take(MAX).collect();
     t.push('…');
     t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn visual_axis(window_width: Pixels, layout: TurnNavigatorLayout) -> Pixels {
+        layout.left_inset + (window_width - layout.left_inset - layout.right_inset) / 2.
+    }
+
+    #[test]
+    fn turn_navigator_centers_on_conversation_without_context_rail() {
+        let window_width = px(960.);
+        let layout = turn_navigator_layout(window_width, px(260.), None, false);
+
+        assert_eq!(layout.left_inset, px(266.));
+        assert_eq!(layout.right_inset, px(0.));
+        assert_eq!(visual_axis(window_width, layout), px(613.));
+    }
+
+    #[test]
+    fn turn_navigator_centers_on_conversation_with_context_rail() {
+        let window_width = px(960.);
+        let layout = turn_navigator_layout(window_width, px(260.), None, true);
+
+        assert_eq!(layout.right_inset, px(296.));
+        assert_eq!(visual_axis(window_width, layout), px(465.));
+    }
+
+    #[test]
+    fn turn_navigator_accounts_for_resized_sidebar_and_right_pane() {
+        let window_width = px(1440.);
+        let layout = turn_navigator_layout(window_width, px(320.), Some(px(480.)), false);
+
+        assert_eq!(layout.left_inset, px(326.));
+        assert_eq!(layout.right_inset, px(486.));
+        assert_eq!(visual_axis(window_width, layout), px(640.));
+        assert_eq!(layout.panel_width, px(480.));
+    }
+
+    #[test]
+    fn turn_navigator_keeps_twelve_pixel_margins_in_narrow_conversation() {
+        let layout = turn_navigator_layout(px(600.), px(260.), None, false);
+
+        assert_eq!(layout.panel_width, px(310.));
+    }
 }
