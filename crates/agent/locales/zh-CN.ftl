@@ -64,15 +64,10 @@ status-denied = 已拒绝
 status-cancelled = 已取消
 
 ### views/message.rs — Thinking 状态行
-agent-metrics-tools = { $count ->
-    [one] {$count} 个工具
-   *[other] {$count} 个工具
-}
-agent-metrics-tokens = {$count} tokens
-agent-metrics-running-agents = { $count ->
-    [one] 运行 {$count} 个 Explore agent…
-   *[other] 运行 {$count} 个 Explore agent…
-}
+context-agents-title = 智能体
+context-agents-main = 主任务
+subagent-panel-read-only = 只读
+subagent-tab-fallback = 智能体
 thinking-tool-result = 工具结果
 thinking-reading = 读取 { $count } 个文件
 thinking-writing = 写入 { $count } 个文件

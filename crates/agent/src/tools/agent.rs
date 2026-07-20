@@ -7,8 +7,8 @@
 //!   list, a restricted `ToolRegistry`, and an independent `PermissionCache`.
 //! - The parent-side `tool_use_id` (from `ToolOutputSink::tool_call_id`) is the
 //!   stable key for snapshot storage and for composing bubbled-auth ids.
-//! - The sub-agent's `AgentText`/`AgentThinking`/`Error` events stream back to
-//!   the parent's tool card via the sink; `ToolCallAuthorization` is re-emitted
+//! - The sub-agent's conversation is observed through its child `Thread` by the
+//!   UI; `ToolCallAuthorization` is re-emitted
 //!   on the parent under a composite id `<parent_tool_use_id>::<child_id>` so
 //!   the existing approval overlay resolves it transparently, and the decision
 //!   is routed back to the child.
@@ -78,6 +78,10 @@ struct AgentToolInput {
     /// inspection. Absent / `"none"` = share the parent's cwd (default).
     #[serde(default)]
     isolation: Option<String>,
+    /// A short one-line title for the sub-agent task (e.g. "Review auth flow").
+    /// Displayed in the UI as `"{subagent_type} · {description}"`. Separate from
+    /// the full `prompt` so the status row stays compact.
+    description: String,
 }
 
 impl AgentToolTrait for SpawnAgentTool {
@@ -141,7 +145,7 @@ impl AgentToolTrait for SpawnAgentTool {
         // which is unavailable inside `cx.spawn`'s `&mut AsyncApp`. Resolve them
         // synchronously, then move the live handles into the spawned task that
         // awaits completion.
-        let setup = match setup_child(&cwd, depth, &parent, &input, &sink, &ptu, cx) {
+        let setup = match setup_child(&cwd, depth, &parent, &input, &ptu, cx) {
             Ok(s) => s,
             Err(e) => return cx.background_spawn(async move { Err(e) }),
         };
@@ -199,10 +203,10 @@ impl AgentToolTrait for SpawnAgentTool {
             // "metrics":...}. The envelope in the parent's ToolResult is the
             // single source of truth: build_completion_request strips it to
             // `final` for the model (context isolation), and the UI parses
-            // `messages` / `metrics` from it for the expandable panel + header
-            // counters — both live and after reload. No separate in-memory
-            // snapshot map is kept, so there is nothing to leak across a long
-            // session with many sub-agent calls.
+            // `messages` / `metrics` from it for the read-only observation
+            // panel — both live and after reload. The UI's live registry is
+            // scoped to the active main task and can be rebuilt from this
+            // envelope after it is released.
             //
             // Returning the envelope as `Err` (rather than `Ok`) when the
             // sub-agent errored or produced no final message routes through
@@ -258,7 +262,6 @@ fn setup_child(
     depth: u32,
     parent: &WeakEntity<Thread>,
     input: &serde_json::Value,
-    sink: &ToolOutputSink,
     ptu: &str,
     cx: &mut App,
 ) -> Result<SubagentSetup, String> {
@@ -396,7 +399,6 @@ fn setup_child(
         },
         seen_tools: std::collections::HashSet::new(),
     }));
-    let sink_cb = sink.clone();
     let parent_cb = parent.clone();
     let ptu_cb = ptu.to_string();
     // Capture the sub-agent type so bubbled authorization prompts can be
@@ -410,13 +412,9 @@ fn setup_child(
     let sub = cx.subscribe(
         &child,
         move |_child, ev: &ThreadEvent, cx: &mut App| match ev {
-            ThreadEvent::AgentText(t) | ThreadEvent::AgentThinking(t) => {
-                sink_cb.try_emit(t);
-            }
             ThreadEvent::Error(e) => {
                 errored_cb.store(true, std::sync::atomic::Ordering::Relaxed);
                 *error_text_cb.lock().expect("subagent error text poisoned") = Some(e.to_string());
-                sink_cb.try_emit(&e.to_string());
                 // A sub-agent error is terminal: unblock the parent so it can
                 // collect whatever partial output was produced.
                 forward_progress(
@@ -525,7 +523,21 @@ fn setup_child(
         },
     );
 
-    // Start the sub-agent's first turn. Its events drive `done_rx`/the sink.
+    // Emit SubagentStarted so the UI can subscribe to the child thread
+    // for the observation panel.
+    if let Some(p) = parent.upgrade() {
+        p.update(cx, |_t, cx| {
+            cx.emit(ThreadEvent::SubagentStarted {
+                id: ptu.to_string(),
+                subagent_type: parsed.subagent_type.clone(),
+                description: parsed.description.clone(),
+                child: child.clone(),
+            });
+        });
+    }
+
+    // Start the sub-agent's first turn. Its events drive `done_rx` and the
+    // read-only observation panel.
     child.update(cx, |c, cx| {
         c.run_turn(cx);
     });
@@ -695,14 +707,12 @@ fn bound_envelope_messages(msgs: Vec<Message>) -> Vec<Message> {
 }
 
 /// Persisted `agent` tool-result envelope: the model-facing final text plus the
-/// full sub-agent conversation, so the expandable panel survives a reload. The
-/// envelope is the canonical ToolResult content (persisted to DB, used by the UI
-/// to rebuild `sub_messages`); `build_completion_request` strips it to `final`
-/// before the request reaches the model, so the sub-conversation never leaks
-/// into the parent's context. `metrics` carries the aggregated sub-agent
-/// telemetry (tool-use count, token usage, latest activity, terminal status) so
-/// the agent task card's header counters survive a reload too — absent on older
-/// envelopes, which the UI treats as empty metrics.
+/// full sub-agent conversation, so the observation panel survives a reload.
+/// The envelope is the canonical ToolResult content persisted to the DB;
+/// `build_completion_request` strips it to `final` before the request reaches
+/// the model, so the sub-conversation never leaks into the parent's context.
+/// `metrics` keeps backend telemetry and the terminal status available for
+/// snapshot restoration, but is not rendered in the main message row.
 #[derive(Deserialize)]
 pub(crate) struct AgentToolResultPayload {
     #[serde(rename = "final")]
@@ -713,11 +723,11 @@ pub(crate) struct AgentToolResultPayload {
     metrics: Option<SubagentMetrics>,
 }
 
-/// Aggregated telemetry for one `agent` tool invocation, surfaced to the UI
-/// while the sub-agent runs (via `ThreadEvent::SubagentProgress`) and persisted
-/// in the result envelope so the header counters survive a reload. Never enters
-/// the model's message history — the parent model still only sees the `final`
-/// text. `status` is `None` until the sub-agent's lifecycle pins it.
+/// Aggregated telemetry for one `agent` tool invocation, emitted live through
+/// `ThreadEvent::SubagentProgress` and persisted in the result envelope. It
+/// never enters the model's message history or the compact main-message UI;
+/// the parent model still only sees the `final` text. `status` is `None` until
+/// the sub-agent's lifecycle pins it.
 ///
 /// Modeled on the `AgentProgress` shape (toolCount / tokens / recentTools /
 /// currentTool) used by the pi/oh-my-pi coding-agent, kept lean: the
@@ -754,8 +764,7 @@ pub fn agent_final_text(content: &str) -> String {
 }
 
 /// The persisted sub-agent conversation, when the content is the JSON envelope.
-/// Used by the UI to rebuild the expandable panel after a reload (the in-memory
-/// snapshot map is empty on restart, so the envelope is the only source).
+/// Used by the UI to rebuild the read-only observation panel after a reload.
 pub fn agent_sub_messages(content: &str) -> Option<Vec<Message>> {
     serde_json::from_str::<AgentToolResultPayload>(content)
         .ok()
@@ -763,8 +772,7 @@ pub fn agent_sub_messages(content: &str) -> Option<Vec<Message>> {
 }
 
 /// The persisted sub-agent telemetry, when the content is the JSON envelope.
-/// `None` on legacy envelopes written before `metrics` existed — the UI renders
-/// empty counters in that case.
+/// `None` on legacy envelopes written before `metrics` existed.
 pub fn agent_metrics(content: &str) -> Option<SubagentMetrics> {
     serde_json::from_str::<AgentToolResultPayload>(content)
         .ok()
@@ -1159,6 +1167,17 @@ mod tests {
         assert!(can_nest(&on, MAX_DEPTH - 1));
         assert!(!can_nest(&on, MAX_DEPTH));
         assert!(!can_nest(&off, 1));
+    }
+
+    #[test]
+    fn input_schema_requires_short_description() {
+        let schema = super::super::schema::<AgentToolInput>();
+        let required = schema["required"]
+            .as_array()
+            .expect("agent schema required fields");
+        assert!(required.iter().any(|field| field == "description"));
+        assert!(required.iter().any(|field| field == "subagent_type"));
+        assert!(required.iter().any(|field| field == "prompt"));
     }
 
     #[test]

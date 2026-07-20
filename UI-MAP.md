@@ -23,7 +23,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### ContextRail
 
-- [ContextRail](#contextrail) · [ContextRailPanel](#contextrailpanel) · [ContextRailCollapseBtn](#contextrailcollapsebtn) · [ContextRailChangesRow](#contextrailchangesrow) · [ContextRailBranchRow](#contextrailbranchrow) · [ContextRailBranchMenu](#contextrailbranchmenu)
+- [ContextRail](#contextrail) · [ContextRailPanel](#contextrailpanel) · [ContextRailAgents](#contextrailagents) · [ContextRailCollapseBtn](#contextrailcollapsebtn) · [ContextRailChangesRow](#contextrailchangesrow) · [ContextRailBranchRow](#contextrailbranchrow) · [ContextRailBranchMenu](#contextrailbranchmenu)
 
 ### Hero
 
@@ -55,7 +55,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### EditorPane
 
-- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [MemberTab](#membertab) · [MemberPanel](#memberpanel) · [BrowserView](#browserview) · [PlanPreviewTab](#planpreviewtab)
+- [EditorDivider](#editordivider) · [RightPane](#rightpane) · [RightTabBar](#righttabbar) · [EditorWriteTab](#editorwritetab) · [EditorPreviewTab](#editorpreviewtab) · [MemberTab](#membertab) · [MemberPanel](#memberpanel) · [SubagentPanel](#subagentpanel) · [BrowserView](#browserview) · [PlanPreviewTab](#planpreviewtab)
 
 ### Composer (team)
 
@@ -324,7 +324,7 @@ Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see
 
 #### AgentTaskCard
 
-Expandable sub-agent card: title + status + collapsed tail / expanded nested conversation. Header carries a metrics chip — tool-use count + token count + latest activity — populated from the agent tool result envelope's optional `metrics` field (live during the run via `SubagentProgress`, restamped on terminal `ToolResult`, restored on reload).
+Compact, single-line sub-agent row: `[status] type · short title`. Running and pending rows use an animated spinner; terminal rows use check, error, or minus icons. The title is always one line with truncation and a full-title tooltip. It deliberately renders no child text, nested messages, copy control, metrics, or expansion affordance. Clicking the row opens or focuses the corresponding read-only [SubagentPanel](#subagentpanel) in the right pane.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -590,7 +590,7 @@ Contents, top to bottom:
 
 - **Header**: bold title (i18n `context-rail-title`) + a [ContextRailCollapseBtn](#contextrailcollapsebtn) ghost button.
 - **Status block** (`cockpit_status_block`): a two-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2. Elapsed refreshes per-second via the thinking ticker.
-- **Active agents row** (rendered only when `active_agents` is non-empty): a `Bot` icon + i18n `agent-metrics-running-agents` plural ("Running N Explore agents…"). Driven by in-flight subagent tool_use ids — `record_subagent_progress` inserts on non-terminal status, removes on terminal (Success/Error/Denied/Cancelled); cleared on thread switch. Vanishes the moment the last child reports a terminal status.
+- **Agents tree**: [ContextRailAgents](#contextrailagents), with `Main` as the root and every direct or nested sub-agent underneath it.
 - **Context budget row**: `context_budget_pct` reads the thread's effective context fill — `agent::compact::effective_context_tokens(thread.messages(), thread.request_token_usage())`, the same max(provider-reported usage, local bytes/4 estimate) the auto-compaction trigger uses, so the display and the trigger agree — against the model window and the `cockpit_auto_compact_threshold` cached on the rail. Renders one line with `pct%` remaining + explicit `used / cap` token counts (i18n `cockpit-context-remaining-ctx`); warning-colored within 10% of the trigger. Hidden entirely when no model is configured.
 - **Milestone section** (collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): plan steps parsed from the approved `<proposed_plan>` block (seeded when the user picks Implement / Implement-clear-context on the [PlanReviewCard](#planreviewcard)). All `Pending` outside a turn; the first is promoted to `InProgress` while the thread runs, demoted back to `Pending` on terminal stop.
 - **Changes row**: [ContextRailChangesRow](#contextrailchangesrow).
@@ -604,6 +604,12 @@ Contents, top to bottom:
 Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `ContextRail`, rebuilt every render inside `render_usage_section` to auto-prune cells whose model disappeared.
 
 > Source: `agent-ui/src/views/context_rail.rs` (`render_panel`)
+
+#### ContextRailAgents
+
+Compact navigation tree headed by `Agents`. `Main` is the root row and reflects the current main thread state; direct and nested sub-agents are indented according to the parent tool-use id recorded by `Workspace`. Every sub-agent row shows the same spinner/terminal status language as [AgentTaskCard](#agenttaskcard), displays `type · short title` with single-line truncation and a tooltip, and opens or focuses its [SubagentPanel](#subagentpanel) when clicked. Completed nodes remain visible for the lifetime of the current main task, including nodes recursively recovered from persisted Agent result envelopes.
+
+> Source: `agent-ui/src/views/context_rail.rs`, `agent-ui/src/workspace.rs`
 
 #### ContextRailCollapseBtn
 
@@ -666,13 +672,13 @@ Right-side panel, shown when `editor_open` is true. 640px default (320–960 dra
 
 #### RightPane
 
-Vertical flex, right panel. A tab container holding one Editor slot (the markdown scratchpad) plus one slot per team worker member. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
+Vertical flex, right panel. A tab container holding the markdown editor, team-member observers, sub-agent observers, browser tabs, and plan preview as peer tab types. Visible while `right_tabs` is non-empty; the active tab's content fills the body.
 
 > Source: `agent-ui/src/workspace.rs`
 
 #### RightTabBar
 
-Top-level underline tab bar over `right_tabs`: `[Editor] [member:plan] [member:expl] [browser:url] [plan] …`. Selecting a tab switches `active_right_tab`. Member, Browser, and PlanPreview tabs carry a `×` suffix that closes the tab (click stops propagation so it does not also select). The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`).
+Top-level underline tab bar over `right_tabs`: `[Editor] [member:plan] [Explore · title] [browser:url] [plan] …`. Selecting a tab switches `active_right_tab`. Member, Subagent, Browser, and PlanPreview tabs carry a `×` suffix that closes the tab (click stops propagation so it does not also select). A sub-agent id can appear only once: a repeat open focuses the existing tab. The Editor tab has no close affordance — it keeps its keyboard toggle (`ToggleEditor` / `CloseEditor`). Switching the main task closes all sub-agent tabs and binds the Agents tree to the newly active task.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -699,6 +705,12 @@ A right-pane tab observing one team worker member. Content is the [MemberPanel](
 Read-only observation panel for a single team worker member. Subscribes to the member `Thread`'s events and feeds them into a private [ConversationState](#conversation-state), reusing the full [message](#message) rendering pipeline (agent text, reasoning folds, tool-call cards, peer-message bubbles). Header: member name + status dot (idle/running/gone) + role. A compact task board shows this member's owned tasks plus the unassigned pool, read from the shared team `TaskList`. No composer — the leader is the sole input face.
 
 > Source: `agent-ui/src/views/member_panel.rs`
+
+#### SubagentPanel
+
+Read-only observation panel for one Agent tool invocation (`RightTab::Subagent(tool_use_id)`). A live panel holds a strong child `Entity<Thread>`, subscribes to its `ThreadEvent`s, and applies them to a private [ConversationState](#conversation-state), reusing the main-column `MessageItem` rendering, scrolling, and tail-follow behavior without a composer. Nested `SubagentStarted` events register child nodes back into the current task's `Workspace` registry. Completed live children remain observable until the main task changes. Reloaded tasks recursively scan the Agent ToolUse/ToolResult envelope's stored `messages` and create frozen snapshot panels, requiring no additional database schema.
+
+> Source: `agent-ui/src/views/subagent_panel.rs`, `agent-ui/src/workspace.rs`
 
 #### BrowserView
 

@@ -17,13 +17,12 @@
 //! a plain monospace run and only mount the syntax-highlighted `Markdown` once
 //! the final `ToolResult` lands.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::thread::ApprovalMode;
-use agent::tools::agent::{agent_final_text, agent_metrics, agent_sub_messages};
 use agent::{Message, TokenUsage, ToolCallStatus, i18n};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
@@ -36,7 +35,9 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex,
+    spinner::Spinner,
     tag::{Tag, TagVariant},
+    tooltip::Tooltip,
     v_flex,
 };
 use manox_components::markdown::terminal_panel::GitSummary;
@@ -52,13 +53,11 @@ use crate::conversation::{
 use crate::views::centered;
 use crate::workspace::AskCardSnapshot;
 
-/// Render-time context for sub-agent task cards: which task ids are currently
-/// expanded, and a weak handle to toggle expansion on the owning `Workspace`.
-/// `None` when the owning `Workspace` is already dropped (renders collapsed,
-/// clicks no-op).
+/// Render-time context for sub-agent task rows. `None` when the owning
+/// workspace has been dropped; the row remains visible but clicks become a
+/// no-op.
 #[derive(Clone)]
 pub struct AgentTaskCtx {
-    pub expanded: HashSet<String>,
     pub weak: WeakEntity<Workspace>,
 }
 
@@ -123,8 +122,8 @@ pub struct MessageItem {
     kind: ConvItem,
     role: String,
     id: usize,
-    /// Weak handle to the owning `Workspace`, used to read/toggle the shared
-    /// `expanded_tasks` set from `AgentTask` cards.
+    /// Weak handle to the owning `Workspace`, used by interactive message
+    /// rows such as `AgentTask` to open their peer right-pane view.
     weak_workspace: WeakEntity<Workspace>,
     markdown: Option<Entity<Markdown>>,
 }
@@ -448,7 +447,7 @@ impl MessageItem {
                     t.collapsed = !t.user_toggled;
                 }
             }
-            ConvItem::AgentTask(t) => t.streaming = false,
+            ConvItem::AgentTask(_) => {}
             _ => {}
         }
         if let Some(md) = &self.markdown {
@@ -484,12 +483,8 @@ impl Render for MessageItem {
         cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let agent_ctx = self.weak_workspace.upgrade().map(|ws| {
-            let expanded = ws.read(cx).expanded_tasks.clone();
-            AgentTaskCtx {
-                expanded,
-                weak: ws.downgrade(),
-            }
+        let agent_ctx = self.weak_workspace.upgrade().map(|ws| AgentTaskCtx {
+            weak: ws.downgrade(),
         });
         let tool_ctx = self.weak_workspace.upgrade().map(|ws| {
             let tool_id = match &self.kind {
@@ -2320,208 +2315,114 @@ fn render_tool_output(
         .into_any_element()
 }
 
-/// Render a sub-agent task card: title + status icon + chevron to expand the
-/// child conversation. Collapsed shows the live streamed tail (or the final
-/// result once the sub-agent stops); expanded rebuilds the child `Thread`'s
-/// messages into a nested conversation and renders each item recursively.
-/// `tool_ctx` is forwarded to recursive `render_item` calls so any nested
-/// tool-call cards keep their own collapse state.
-/// Compact the sub-agent's aggregate telemetry into a header chip:
-/// `{n} tools · {tokens} tokens · {latest activity}`. `None` until the first
-/// `SubagentProgress` event arrives and on legacy envelopes, so the header
-/// stays clean for a freshly-spawned or pre-telemetry task. The activity line
-/// is the same `tool_title` text the cockpit's current-activity row uses.
-fn agent_metrics_chip(item: &AgentTaskItem, theme: &Theme) -> Option<gpui::AnyElement> {
-    let m = item.metrics.as_ref()?;
-    let tool_label = i18n::t_count("agent-metrics-tools", m.tool_uses as i64);
-    let token_total = m.token_usage.total_tokens();
-    let token_label = i18n::t_str(
-        "agent-metrics-tokens",
-        &[("count", format_tokens(token_total).as_str())],
-    );
-    let core = format!("{tool_label} · {token_label}");
-    let full = match m.latest_activity.as_deref() {
-        Some(a) if !a.is_empty() => format!("{core} · {}", truncate(a, 40)),
-        _ => core,
-    };
-    Some(
-        gpui::div()
-            .text_xs()
-            .font_family(theme.mono_font_family.clone())
-            .text_color(theme.muted_foreground)
-            .child(full)
-            .into_any_element(),
-    )
-}
-
-/// Render a token count with a `k` suffix above 999 (one decimal), matching the
-/// density of Claude Code's activity line. 17300 → "17.3k", 512 → "512".
-fn format_tokens(n: u64) -> String {
-    if n >= 1000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        n.to_string()
+fn agent_status_icon_name(status: ToolCallStatus) -> IconName {
+    use agent::ToolCallStatus;
+    match status {
+        ToolCallStatus::Running | ToolCallStatus::PendingApproval => IconName::LoaderCircle,
+        ToolCallStatus::Success | ToolCallStatus::Continued => IconName::CircleCheck,
+        ToolCallStatus::Error | ToolCallStatus::Denied => IconName::CircleX,
+        ToolCallStatus::Cancelled => IconName::Minus,
     }
 }
 
+/// Status icon for a sub-agent task row. Running/Pending get a spinning accent
+/// loader; Success/Continued get a green check; Error/Denied get a red cross;
+/// Cancelled gets a muted minus.
+fn agent_status_icon(status: ToolCallStatus, theme: &Theme) -> (IconName, gpui::Hsla) {
+    use agent::ToolCallStatus;
+    let color = match status {
+        ToolCallStatus::Running | ToolCallStatus::PendingApproval => theme.accent,
+        ToolCallStatus::Success | ToolCallStatus::Continued => theme.success,
+        ToolCallStatus::Error | ToolCallStatus::Denied => theme.danger,
+        ToolCallStatus::Cancelled => theme.muted_foreground,
+    };
+    (agent_status_icon_name(status), color)
+}
+
+/// Render a sub-agent task as a single-line clickable item:
+/// `[status_icon] {subagent_type} · {description}`.
+/// Clicking opens (or focuses) a read-only `SubagentPanel` tab in the right
+/// pane. No expand/collapse, no inline body, no metrics chip.
 pub fn render_agent_task(
     item: &AgentTaskItem,
     ix: usize,
     theme: &Theme,
     agent_ctx: Option<&AgentTaskCtx>,
-    tool_ctx: Option<&ToolCallCtx>,
-    cx: &mut App,
+    _tool_ctx: Option<&ToolCallCtx>,
+    _cx: &mut App,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
-    let (status_color, status_label): (gpui::Hsla, SharedString) = match item.status {
-        ToolCallStatus::PendingApproval => (theme.muted_foreground, i18n::t("status-pending")),
-        ToolCallStatus::Running => (theme.muted_foreground, i18n::t("status-running")),
-        ToolCallStatus::Success => (theme.success, i18n::t("status-success")),
-        ToolCallStatus::Continued => (theme.muted_foreground, i18n::t("status-continued")),
-        ToolCallStatus::Error => (theme.danger, i18n::t("status-error")),
-        ToolCallStatus::Denied => (theme.danger, i18n::t("status-denied")),
-        ToolCallStatus::Cancelled => (theme.muted_foreground, i18n::t("status-cancelled")),
-    };
+    let (icon_name, icon_color) = agent_status_icon(item.status, theme);
+    let is_running = matches!(
+        item.status,
+        ToolCallStatus::Running | ToolCallStatus::PendingApproval
+    );
 
-    let expanded = agent_ctx.is_some_and(|c| c.expanded.contains(&item.id));
-    let chevron = if expanded {
-        IconName::ChevronDown
-    } else {
-        IconName::ChevronRight
-    };
-    let id_for_toggle = item.id.clone();
-    let weak = agent_ctx.map(|c| c.weak.clone());
-    let copy_text = if item.final_text.is_empty() {
-        item.sub_text.clone()
-    } else {
-        item.final_text.clone()
-    };
-
-    let metrics_chip = agent_metrics_chip(item, theme);
-
-    let mut card = v_flex()
-        .group(format!("agent-{ix}"))
-        .w_full()
-        .min_w_0()
-        // A sub-agent task is tool-call kin, so its chrome and nested output
-        // render as Lilex italic alongside tool-call cards.
-        .italic()
-        .child(
-            h_flex()
-                .id(("agent-header", ix))
-                .w_full()
-                .min_w_0()
-                .px_2()
-                .py_1()
-                .gap_1p5()
-                .items_center()
-                .rounded(theme.radius)
-                .cursor_pointer()
-                .hover(|s| s.bg(theme.secondary.opacity(0.5)))
-                .on_click(move |_, _window, cx: &mut App| {
-                    let Some(weak) = weak.clone() else {
-                        return;
-                    };
-                    let _ = weak.update(cx, |w, cx| {
-                        if !w.expanded_tasks.insert(id_for_toggle.clone()) {
-                            w.expanded_tasks.remove(&id_for_toggle);
-                        }
-                        cx.notify();
-                    });
-                })
-                .child(
-                    Icon::new(chevron)
-                        .xsmall()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    gpui::div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_x_hidden()
-                        .text_xs()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.muted_foreground)
-                        .child(truncate(&item.title, 80)),
-                )
-                .child(copy_button_hoverable(
-                    ix,
-                    "copy-agent",
-                    format!("agent-{ix}"),
-                    copy_text,
-                ))
-                .children(metrics_chip)
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(status_color)
-                        .child(status_label),
-                ),
-        );
-
-    let collapsed_body = if item.streaming {
-        live_tail(&item.sub_text)
-    } else if !item.final_text.is_empty() {
-        item.final_text.clone()
-    } else {
-        item.sub_text.clone()
-    };
-
-    if expanded {
-        // Expanded: rebuild the child conversation from its snapshot and render
-        // each item recursively. Nested agent tasks share the same expansion
-        // set (keyed by id), so they expand/collapse in place too.
-        let sub_items = build_items(&item.sub_messages, &HashMap::new(), false);
-        if sub_items.is_empty() {
-            if !collapsed_body.is_empty() {
-                card = card.child(render_agent_body(&collapsed_body, ix, theme, cx));
-            }
+    // Build the display title: "Type · Description", falling back gracefully.
+    let display_title = if item.description.is_empty() {
+        if item.subagent_type.is_empty() {
+            item.id.clone()
         } else {
-            card = card.child(
-                v_flex()
-                    .w_full()
-                    .min_w_0()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .px_3()
-                    .py_2()
-                    .gap_1()
-                    .children(sub_items.iter().enumerate().map(|(six, sitem)| {
-                        render_item(sitem, six, "Agent", theme, agent_ctx, tool_ctx, None, cx)
-                    })),
-            );
+            item.subagent_type.clone()
         }
-    } else if !collapsed_body.is_empty() {
-        card = card.child(render_agent_body(&collapsed_body, ix, theme, cx));
-    }
-    card.into_any_element()
-}
+    } else if item.subagent_type.is_empty() {
+        item.description.clone()
+    } else {
+        format!("{} · {}", item.subagent_type, item.description)
+    };
 
-/// Prose markdown body for a sub-agent card (collapsed tail or fallback when
-/// the snapshot is empty). The sub-agent's natural-language output renders the
-/// same way an assistant message does — flowing prose, not a fenced code dump —
-/// while keeping the shared tool-call-kin card chrome (inherited italic, text_xs).
-fn render_agent_body(text: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::AnyElement {
-    if text.is_empty() {
-        return gpui::div().into_any_element();
-    }
-    gpui::div()
-        .id(("agent-body", ix))
+    let id_for_click = item.id.clone();
+    let weak = agent_ctx.map(|c| c.weak.clone());
+
+    let tooltip_text = display_title.clone();
+    let row = h_flex()
+        .id(("agent-row", ix))
+        .debug_selector(move || format!("message-overflow-agent-row-{ix}"))
         .w_full()
         .min_w_0()
-        .px_3()
-        .py_2()
-        .border_t_1()
-        .border_color(theme.border)
-        .text_xs()
-        .text_color(theme.foreground)
-        .child(markdown_tv(
-            ("agent-body-text", ix),
-            text.to_string(),
-            theme,
-            false,
-            cx,
-        ))
+        .px_2()
+        .py_1()
+        .gap_1p5()
+        .items_center()
+        .rounded(theme.radius)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.secondary.opacity(0.5)))
+        .tooltip(move |window, cx| Tooltip::new(tooltip_text.clone()).build(window, cx))
+        .on_click(move |_, _window, cx: &mut App| {
+            let Some(weak) = weak.clone() else {
+                return;
+            };
+            let _ = weak.update(cx, |w, cx| {
+                w.open_subagent_tab_by_id(&id_for_click, cx);
+            });
+        });
+
+    let icon_el: gpui::AnyElement = if is_running {
+        Spinner::new()
+            .icon(icon_name)
+            .xsmall()
+            .color(icon_color)
+            .into_any_element()
+    } else {
+        Icon::new(icon_name)
+            .xsmall()
+            .text_color(icon_color)
+            .into_any_element()
+    };
+
+    row.child(icon_el)
+        .child(
+            gpui::div()
+                .debug_selector(move || format!("message-overflow-agent-title-{ix}"))
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .whitespace_nowrap()
+                .text_xs()
+                .font_family(theme.mono_font_family.clone())
+                .text_color(theme.muted_foreground)
+                .child(display_title),
+        )
         .into_any_element()
 }
 
@@ -2834,22 +2735,19 @@ pub fn build_items(
                         }
                         MessageContent::ToolUse(tu) => {
                             if tu.name.as_ref() == agent::tools::AGENT {
-                                // Sub-agent tasks stay as standalone top-level
-                                // cards (their expand panel reuses the full
-                                // sub-conversation renderer); never folded.
+                                // Sub-agent tasks stay as standalone compact
+                                // rows; their full conversation lives in a
+                                // read-only right-pane tab.
                                 close_segment(&mut items, active_segment_ix);
                                 active_segment_ix = None;
-                                let title = agent::thread::tool_title(tu.name.as_ref(), &tu.input);
+                                let (subagent_type, description) =
+                                    crate::conversation::agent_task_labels(&tu.input);
                                 items.push(ConvItem::AgentTask(AgentTaskItem {
                                     id: tu.id.clone(),
-                                    title,
+                                    subagent_type,
+                                    description,
                                     status: ToolCallStatus::Success,
-                                    streaming: false,
-                                    sub_text: String::new(),
-                                    sub_messages: Vec::new(),
-                                    final_text: String::new(),
                                     is_error: false,
-                                    metrics: None,
                                 }));
                             } else if tu.name.as_ref() == agent::tools::ASK_USER_QUESTION {
                                 // An inline clarify card: stays a top-level
@@ -2963,11 +2861,11 @@ pub fn build_items(
     items
 }
 
-/// Attach a tool_result to its matching item by id. Sub-agent results land in
-/// `AgentTaskItem::final_text`; ordinary tool results stamp the entry inside the
-/// owning `ThinkingContainer`. A result with no matching ToolUse becomes a
-/// standalone single-entry `ThinkingContainer` so an orphan result still renders
-/// as a `⎿`.
+/// Attach a tool_result to its matching item by id. Sub-agent results only
+/// stamp their compact row's terminal state; ordinary tool results stamp the
+/// entry inside the owning `ThinkingContainer`. A result with no matching
+/// ToolUse becomes a standalone single-entry `ThinkingContainer` so an orphan
+/// result still renders as a `⎿`.
 fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
     let status = if tr.is_error {
         ToolCallStatus::Error
@@ -3019,11 +2917,6 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
     };
     match &mut items[ix] {
         ConvItem::AgentTask(t) => {
-            // On reload the in-memory snapshot map is empty, so restore the
-            // sub-conversation from the persisted JSON envelope.
-            t.final_text = agent_final_text(&tr.content);
-            t.sub_messages = agent_sub_messages(&tr.content).unwrap_or_default();
-            t.metrics = agent_metrics(&tr.content);
             t.is_error = tr.is_error;
             t.status = status;
         }
@@ -3095,6 +2988,41 @@ mod tests {
         assert!(out.contains('中'));
     }
 
+    #[test]
+    fn agent_statuses_use_the_expected_icons() {
+        fn path(icon: IconName) -> SharedString {
+            gpui_component::IconNamed::path(icon)
+        }
+        assert_eq!(
+            path(agent_status_icon_name(ToolCallStatus::PendingApproval)),
+            path(IconName::LoaderCircle)
+        );
+        assert_eq!(
+            path(agent_status_icon_name(ToolCallStatus::Running)),
+            path(IconName::LoaderCircle)
+        );
+        assert_eq!(
+            path(agent_status_icon_name(ToolCallStatus::Success)),
+            path(IconName::CircleCheck)
+        );
+        assert_eq!(
+            path(agent_status_icon_name(ToolCallStatus::Continued)),
+            path(IconName::CircleCheck)
+        );
+        assert_eq!(
+            path(agent_status_icon_name(ToolCallStatus::Error)),
+            path(IconName::CircleX)
+        );
+        assert_eq!(
+            path(agent_status_icon_name(ToolCallStatus::Denied)),
+            path(IconName::CircleX)
+        );
+        assert_eq!(
+            path(agent_status_icon_name(ToolCallStatus::Cancelled)),
+            path(IconName::Minus)
+        );
+    }
+
     struct MessageOverflowProbe;
 
     impl Render for MessageOverflowProbe {
@@ -3141,6 +3069,13 @@ mod tests {
             }));
 
             let thinking_item = ConvItem::Thinking(thinking);
+            let agent_item = ConvItem::AgentTask(AgentTaskItem {
+                id: "agent-long-title".into(),
+                subagent_type: "Explore".into(),
+                description: "检查一段非常长的中英文混合标题 and verify that it remains a single truncated line without rendering metrics or child output".into(),
+                status: ToolCallStatus::Success,
+                is_error: false,
+            });
             let theme = cx.theme().clone();
             gpui::div()
                 .id("message-overflow-probe")
@@ -3157,6 +3092,16 @@ mod tests {
                         .child(render_item(
                             &thinking_item,
                             0,
+                            "test-model",
+                            &theme,
+                            None,
+                            None,
+                            None,
+                            cx,
+                        ))
+                        .child(render_item(
+                            &agent_item,
+                            1,
                             "test-model",
                             &theme,
                             None,
@@ -3199,12 +3144,23 @@ mod tests {
             "message-overflow-activity-entry-0-2",
             "message-overflow-activity-entry-body-0-2",
             "message-overflow-tool-output-2",
+            "message-overflow-agent-row-1",
+            "message-overflow-agent-title-1",
         ] {
             let bounds = cx
                 .debug_bounds(selector)
                 .unwrap_or_else(|| panic!("missing debug bounds for {selector}"));
             assert_width_within(bounds, px(260.), selector);
         }
+
+        let row = cx
+            .debug_bounds("message-overflow-agent-row-1")
+            .expect("agent row bounds");
+        assert!(
+            row.size.height <= px(40.),
+            "agent task must remain a compact single row, got {:?}",
+            row.size.height
+        );
     }
 
     /// Helper: build a `MessageContent::ToolUse` for a tool name + JSON input.
@@ -3367,7 +3323,11 @@ mod tests {
                 tu(
                     "tu_agent",
                     "Agent",
-                    serde_json::json!({"subagent_type": "r", "prompt": "p"}),
+                    serde_json::json!({
+                        "subagent_type": "r",
+                        "description": "inspect p",
+                        "prompt": "p"
+                    }),
                 ),
                 tu(
                     "tu_ask",

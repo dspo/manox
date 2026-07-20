@@ -7,7 +7,7 @@
 //!
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -59,6 +59,9 @@ use crate::views::member_panel::MemberPanel;
 use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::sidebar::{Sidebar, SidebarEvent};
+use crate::views::subagent_panel::{
+    SubagentInfo, SubagentPanel, SubagentSnapshot, snapshots_from_messages, subagent_display_title,
+};
 use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
 use crate::{
     CloseBrowserTab, CloseTerminalTab, FocusConversation, FocusTerminal, NewTerminalTab,
@@ -69,14 +72,54 @@ use terminal_ui::TerminalView;
 
 /// A tab in the right observation pane. `Editor` is the markdown composer
 /// (Write/Preview); `Member(name)` is a read-only [`MemberPanel`] over a team
-/// worker's conversation + tasks; `Browser(id)` is an untrusted embedded
-/// webview (see [`BrowserView`]).
+/// worker's conversation + tasks; `Subagent(id)` is a read-only
+/// [`SubagentPanel`]; `Browser(id)` is an untrusted embedded webview (see
+/// [`BrowserView`]).
 #[derive(Clone, Debug)]
 enum RightTab {
     Editor,
     Member(String),
+    Subagent(String),
     Browser(BrowserTabId),
     PlanPreview,
+}
+
+fn ensure_subagent_tab(tabs: &mut Vec<RightTab>, id: &str) -> usize {
+    if let Some(ix) = tabs
+        .iter()
+        .position(|tab| matches!(tab, RightTab::Subagent(open_id) if open_id == id))
+    {
+        return ix;
+    }
+    tabs.push(RightTab::Subagent(id.to_string()));
+    tabs.len() - 1
+}
+
+fn remove_subagent_tabs(tabs: &mut Vec<RightTab>, active: &mut usize) {
+    let mut ix = 0;
+    while ix < tabs.len() {
+        if matches!(tabs.get(ix), Some(RightTab::Subagent(_))) {
+            tabs.remove(ix);
+            if *active > ix {
+                *active -= 1;
+            } else if *active >= tabs.len() {
+                *active = tabs.len().saturating_sub(1);
+            }
+        } else {
+            ix += 1;
+        }
+    }
+}
+
+struct SubagentRecord {
+    info: SubagentInfo,
+    panel: Entity<SubagentPanel>,
+}
+
+#[derive(Default)]
+struct SubagentSession {
+    records: BTreeMap<String, SubagentRecord>,
+    order: Vec<String>,
 }
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
@@ -251,14 +294,18 @@ pub struct Workspace {
     /// Plan text for the `RightTab::PlanPreview` tab. `None` when no plan
     /// preview tab is open.
     plan_preview_text: Option<String>,
-    /// Right-pane tabs: the markdown Editor plus one Member tab per observed
-    /// worker. The pane renders while non-empty; `editor_open` tracks whether
-    /// the Editor tab specifically is active.
+    /// Peer right-pane tabs for the editor, member/sub-agent observers,
+    /// browser, and plan preview. The pane renders while non-empty;
+    /// `editor_open` tracks whether the Editor tab specifically is active.
     right_tabs: Vec<RightTab>,
     active_right_tab: usize,
     /// Lazily-built MemberPanel entities, keyed by member name. A member tab
     /// keeps its panel across tab switches; dropped when the tab closes.
     member_panels: BTreeMap<String, Entity<MemberPanel>>,
+    /// Read-only sub-agent observations keyed by the active root thread id.
+    /// Switching main tasks releases the outgoing registry; completed panels
+    /// can later be rebuilt recursively from persisted result envelopes.
+    subagent_sessions: HashMap<String, SubagentSession>,
     /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
@@ -372,10 +419,6 @@ pub struct Workspace {
     /// that stale request overriding it.
     pending_message_reveal: Option<PendingMessageReveal>,
     message_reveal_generation: u64,
-    /// Sub-agent task ids whose cards are expanded to show the child
-    /// conversation. Toggled by clicking the card header; shared across all
-    /// nesting levels so nested agent tasks expand in place.
-    pub(crate) expanded_tasks: HashSet<String>,
     /// Top-level view mode. `Settings` replaces the entire window content
     /// with the SettingsView overlay until the user requests exit.
     view_mode: ViewMode,
@@ -568,9 +611,11 @@ impl Workspace {
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
         let conversation = cx.new(|_| ConversationState::new());
+        let weak_workspace = cx.weak_entity();
         let context_rail = cx.new(|_| {
             crate::views::context_rail::ContextRail::new(
                 thread.clone(),
+                weak_workspace,
                 auto_compact.enabled,
                 auto_compact.threshold,
             )
@@ -593,6 +638,7 @@ impl Workspace {
             right_tabs: Vec::new(),
             active_right_tab: 0,
             member_panels: BTreeMap::new(),
+            subagent_sessions: HashMap::new(),
             browser_views: BTreeMap::new(),
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
@@ -638,7 +684,6 @@ impl Workspace {
             auto_follow: true,
             pending_message_reveal: None,
             message_reveal_generation: 0,
-            expanded_tasks: HashSet::new(),
             view_mode: ViewMode::default(),
             exiting_settings: false,
             settings_transition_gen: 0,
@@ -937,13 +982,29 @@ impl Workspace {
                     // Streaming; text/thinking deltas mark Thinking/Streaming.
                     this.context_rail
                         .update(cx, |r, cx| r.update_cockpit_phase(ev, cx));
-                    // Sub-agent telemetry: the cockpit's "Running N Explore
-                    // agents…" row tracks in-flight child ids. The AgentTask
-                    // card's per-agent metrics are fed separately in the
-                    // conversation apply below.
-                    if let agent::ThreadEvent::SubagentProgress { id, status, .. } = ev {
-                        this.context_rail
-                            .update(cx, |r, cx| r.record_subagent_progress(id, *status, cx));
+                    let root_thread_id = this.thread.read(cx).id.0.clone();
+                    match ev {
+                        ThreadEvent::SubagentStarted {
+                            id,
+                            subagent_type,
+                            description,
+                            child,
+                        } => this.register_live_subagent(
+                            root_thread_id,
+                            SubagentInfo {
+                                id: id.clone(),
+                                parent_id: None,
+                                subagent_type: subagent_type.clone(),
+                                description: description.clone(),
+                                status: agent::ToolCallStatus::Running,
+                            },
+                            child.clone(),
+                            cx,
+                        ),
+                        ThreadEvent::SubagentProgress { id, status, .. } => {
+                            this.update_subagent_status(&root_thread_id, id, *status, cx);
+                        }
+                        _ => {}
                     }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
@@ -958,16 +1019,6 @@ impl Workspace {
                             cx,
                         )
                     });
-                    // Sub-agent tool results carry the child conversation in
-                    // their JSON envelope; feed it into the matching AgentTask
-                    // card's expandable panel. The envelope is the single
-                    // source of truth (also used on reload).
-                    if let ThreadEvent::ToolResult { id, output, .. } = ev
-                        && let Some(msgs) = agent::tools::agent::agent_sub_messages(output)
-                    {
-                        this.conversation
-                            .update(cx, |c, cx| c.set_agent_sub_messages(id, msgs, cx));
-                    }
                     cx.notify();
                 }
             }
@@ -1799,6 +1850,10 @@ impl Workspace {
         let old_thread = self.thread.clone();
         let old_id = old_thread.read(cx).id.0.clone();
         let new_id = new_thread.read(cx).id.0.clone();
+        self.close_subagent_tabs();
+        if old_id != new_id {
+            self.subagent_sessions.remove(&old_id);
+        }
 
         // Save the outgoing thread's unsent composer text before switching, so
         // a draft survives a round-trip through another thread (Bug 1). A
@@ -1851,6 +1906,7 @@ impl Workspace {
         self.thread = new_thread;
         let id = self.thread.read(cx).id.0.clone();
         let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
+        let subagent_snapshots = snapshots_from_messages(&messages);
         let usage = self.thread.read(cx).request_token_usage().clone();
         let notes = self.thread.read(cx).ui_notes().to_vec();
         let role = self.model_label(cx);
@@ -1935,6 +1991,11 @@ impl Workspace {
             r.cockpit_auto_compact_threshold = auto_compact.threshold;
             cx.notify();
         });
+        if self.subagent_sessions.contains_key(&new_id) {
+            self.sync_subagents_to_rail(cx);
+        } else {
+            self.rebuild_subagent_observations(subagent_snapshots, cx);
+        }
         // If the new thread has pending authorizations (e.g. it was parked
         // while waiting for tool approval), re-surface them so the overlay
         // appears immediately upon switching back.
@@ -2897,6 +2958,116 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(crate) fn register_live_subagent(
+        &mut self,
+        root_thread_id: String,
+        info: SubagentInfo,
+        child: Entity<Thread>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = info.id.clone();
+        let panel = SubagentPanel::live(
+            child,
+            root_thread_id.clone(),
+            info.clone(),
+            cx.weak_entity(),
+            cx,
+        );
+        let session = self
+            .subagent_sessions
+            .entry(root_thread_id.clone())
+            .or_default();
+        if !session.records.contains_key(&id) {
+            session.order.push(id.clone());
+        }
+        session.records.insert(id, SubagentRecord { info, panel });
+        if self.thread.read(cx).id.0 == root_thread_id {
+            self.sync_subagents_to_rail(cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn update_subagent_status(
+        &mut self,
+        root_thread_id: &str,
+        id: &str,
+        status: agent::ToolCallStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self
+            .subagent_sessions
+            .get_mut(root_thread_id)
+            .and_then(|session| session.records.get_mut(id))
+        else {
+            return;
+        };
+        record.info.status = status;
+        record
+            .panel
+            .update(cx, |panel, cx| panel.set_status(status, cx));
+        if self.thread.read(cx).id.0 == root_thread_id {
+            self.sync_subagents_to_rail(cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_subagent_tab_by_id(&mut self, id: &str, cx: &mut Context<Self>) {
+        let root_thread_id = self.thread.read(cx).id.0.clone();
+        if !self
+            .subagent_sessions
+            .get(&root_thread_id)
+            .is_some_and(|session| session.records.contains_key(id))
+        {
+            return;
+        }
+        let ix = ensure_subagent_tab(&mut self.right_tabs, id);
+        self.set_active_right_tab(ix, cx);
+    }
+
+    fn sync_subagents_to_rail(&mut self, cx: &mut Context<Self>) {
+        let root_thread_id = self.thread.read(cx).id.0.clone();
+        let agents = self
+            .subagent_sessions
+            .get(&root_thread_id)
+            .map(|session| {
+                session
+                    .order
+                    .iter()
+                    .filter_map(|id| session.records.get(id).map(|record| record.info.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.context_rail
+            .update(cx, |rail, cx| rail.set_agents(agents, cx));
+    }
+
+    fn rebuild_subagent_observations(
+        &mut self,
+        snapshots: Vec<SubagentSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        let root_thread_id = self.thread.read(cx).id.0.clone();
+        let mut session = SubagentSession::default();
+        let weak = cx.weak_entity();
+        for snapshot in snapshots {
+            let id = snapshot.info.id.clone();
+            let info = snapshot.info.clone();
+            let panel = SubagentPanel::snapshot(snapshot, weak.clone(), cx);
+            session.order.push(id.clone());
+            session.records.insert(id, SubagentRecord { info, panel });
+        }
+        self.subagent_sessions.insert(root_thread_id, session);
+        self.sync_subagents_to_rail(cx);
+    }
+
+    fn close_subagent_tabs(&mut self) {
+        remove_subagent_tabs(&mut self.right_tabs, &mut self.active_right_tab);
+        self.editor_open = self
+            .right_tabs
+            .get(self.active_right_tab)
+            .is_some_and(|tab| matches!(tab, RightTab::Editor));
+    }
+
     /// Focus a member's observation tab, creating it if absent. The panel is
     /// built from the member's `Thread` + role, read off the leader's active
     /// team; no-op if no team or no such member.
@@ -2953,6 +3124,17 @@ impl Workspace {
                 .get(self.active_right_tab)
                 .is_some_and(|t| matches!(t, RightTab::Editor));
             cx.notify();
+            return;
+        }
+        if matches!(self.right_tabs.get(ix), Some(RightTab::Subagent(_))) {
+            self.right_tabs.remove(ix);
+            self.reseat_active_after_close(ix);
+            self.editor_open = self
+                .right_tabs
+                .get(self.active_right_tab)
+                .is_some_and(|t| matches!(t, RightTab::Editor));
+            cx.notify();
+            return;
         }
         if let Some(RightTab::PlanPreview) = self.right_tabs.get(ix).cloned() {
             self.right_tabs.remove(ix);
@@ -5912,10 +6094,10 @@ impl Render for Workspace {
                     }
                 }),
             );
-        // Right pane is a tab container: one Editor slot (the markdown
-        // scratchpad) plus one slot per team member (a MemberPanel). The
-        // top-level TabBar is built from `right_tabs`; the content below
-        // dispatches on the active tab.
+        // Right pane is a peer tab container for the editor, member/sub-agent
+        // observers, browser views, and plan preview. The top-level TabBar is
+        // built from `right_tabs`; the content below dispatches on the active
+        // tab.
         let active_tab = self.right_tabs.get(self.active_right_tab).cloned();
         let right_tab_children: Vec<Tab> = self
             .right_tabs
@@ -5927,6 +6109,16 @@ impl Render for Workspace {
                     RightTab::Member(name) => {
                         Tab::new().label(i18n::t_str("member-tab", &[("name", name)]))
                     }
+                    RightTab::Subagent(id) => {
+                        let root_thread_id = self.thread.read(cx).id.0.clone();
+                        let label = self
+                            .subagent_sessions
+                            .get(&root_thread_id)
+                            .and_then(|session| session.records.get(id))
+                            .map(|record| subagent_display_title(&record.info))
+                            .unwrap_or_else(|| i18n::t("subagent-tab-fallback").to_string());
+                        Tab::new().label(label)
+                    }
                     RightTab::Browser(id) => {
                         let url = self
                             .browser_views
@@ -5937,29 +6129,31 @@ impl Render for Workspace {
                     }
                     RightTab::PlanPreview => Tab::new().label(i18n::t("plan-card-title")),
                 };
-                // Member and Browser tabs carry a close affordance; the
-                // Editor tab keeps its keyboard toggle (`ToggleEditor` /
+                // Every observational/preview tab carries a close affordance;
+                // the Editor tab keeps its keyboard toggle (`ToggleEditor` /
                 // `CloseEditor`).
                 match tab {
-                    RightTab::Member(_) | RightTab::Browser(_) | RightTab::PlanPreview => base
-                        .suffix(
-                            gpui::div()
-                                .id(("right-tab-close", ix))
-                                .cursor_pointer()
-                                .child(
-                                    Icon::new(IconName::Close)
-                                        .xsmall()
-                                        .text_color(theme.muted_foreground),
-                                )
-                                // Stop the click from also selecting the tab
-                                // underneath the ×.
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.close_right_tab(ix, window, cx);
-                                })),
-                        ),
+                    RightTab::Member(_)
+                    | RightTab::Subagent(_)
+                    | RightTab::Browser(_)
+                    | RightTab::PlanPreview => base.suffix(
+                        gpui::div()
+                            .id(("right-tab-close", ix))
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(IconName::Close)
+                                    .xsmall()
+                                    .text_color(theme.muted_foreground),
+                            )
+                            // Stop the click from also selecting the tab
+                            // underneath the ×.
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_right_tab(ix, window, cx);
+                            })),
+                    ),
                     RightTab::Editor => base,
                 }
             })
@@ -6068,6 +6262,14 @@ impl Render for Workspace {
                             .get(&name)
                             .map(|p| p.clone().into_any_element())
                             .unwrap_or_else(|| gpui::div().into_any_element()),
+                        Some(RightTab::Subagent(id)) => {
+                            let root_thread_id = self.thread.read(cx).id.0.clone();
+                            self.subagent_sessions
+                                .get(&root_thread_id)
+                                .and_then(|session| session.records.get(&id))
+                                .map(|record| record.panel.clone().into_any_element())
+                                .unwrap_or_else(|| gpui::div().into_any_element())
+                        }
                         Some(RightTab::Browser(id)) => self
                             .browser_views
                             .get(&id)
@@ -6823,5 +7025,38 @@ mod tests {
         let layout = turn_navigator_layout(px(600.), px(260.), None, false);
 
         assert_eq!(layout.panel_width, px(310.));
+    }
+
+    #[test]
+    fn subagent_tabs_deduplicate_and_focus_by_tool_use_id() {
+        let mut tabs = vec![RightTab::Editor];
+        let first = ensure_subagent_tab(&mut tabs, "agent-a");
+        let repeated = ensure_subagent_tab(&mut tabs, "agent-a");
+        let second = ensure_subagent_tab(&mut tabs, "agent-b");
+
+        assert_eq!(first, repeated);
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(tabs.len(), 3);
+        assert!(matches!(&tabs[1], RightTab::Subagent(id) if id == "agent-a"));
+        assert!(matches!(&tabs[2], RightTab::Subagent(id) if id == "agent-b"));
+    }
+
+    #[test]
+    fn clearing_subagent_tabs_preserves_peer_tabs_and_reseats_active() {
+        let mut tabs = vec![
+            RightTab::Editor,
+            RightTab::Subagent("agent-a".into()),
+            RightTab::PlanPreview,
+            RightTab::Subagent("agent-b".into()),
+        ];
+        let mut active = 3;
+
+        remove_subagent_tabs(&mut tabs, &mut active);
+
+        assert_eq!(tabs.len(), 2);
+        assert!(matches!(tabs[0], RightTab::Editor));
+        assert!(matches!(tabs[1], RightTab::PlanPreview));
+        assert_eq!(active, 1);
     }
 }
