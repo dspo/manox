@@ -2,7 +2,7 @@
 //!
 //! A standalone gpui Entity that subscribes to `ThreadStore` and lists past threads. Clicking a
 //! conversation entry emits `OpenThread(id)`; the "+" button on each project folder header and
-//! the "Conversations" section header opens a new-session popup menu (Manox Thread / Claude Code /
+//! the "Conversations" section header opens a new-session popup menu (Manox / Claude Code /
 //! Codex / GitHub Copilot). Workspace subscribes to these events.
 //!
 //! Threads bound to a project (chosen on the first screen) are grouped under a collapsible folder
@@ -139,7 +139,7 @@ pub struct Sidebar {
     /// list. Merged into the Conversations list by recency (an `external:` id
     /// in `selected` highlights the active one).
     external_sessions: Vec<crate::external_session::ExternalSessionSummary>,
-    /// Whether the new-session `PopupMenu` (Manox Thread / Claude Code / Codex /
+    /// Whether the new-session `PopupMenu` (Manox / Claude Code / Codex /
     /// GitHub Copilot) is open.
     new_session_open: bool,
     new_session_menu: Option<Entity<PopupMenu>>,
@@ -214,7 +214,7 @@ impl Sidebar {
     /// Open the new-session `PopupMenu`. `project` is `None` when opened from
     /// the Conversations header, `Some(path)` when opened from a project
     /// folder's `+` button — the path determines the CWD for external CLI
-    /// sessions and whether "Manox Thread" binds to the project.
+    /// sessions and whether the new Manox session binds to the project.
     fn open_new_session_menu(
         &mut self,
         project: Option<PathBuf>,
@@ -229,23 +229,27 @@ impl Sidebar {
                 .max_w(gpui::px(280.))
                 .label(i18n::t("sidebar-new-session-label"));
             let sidebar_manox = sidebar.clone();
-            menu = menu.item(new_session_item(
-                IconName::Plus,
-                i18n::t("sidebar-new-session-manox"),
-                &theme,
-                move |_, _window, cx| {
-                    let _ = sidebar_manox.update(cx, |this, cx| {
-                        let project = this.new_session_project.take();
-                        this.close_new_session_menu();
-                        if let Some(p) = project {
-                            cx.emit(SidebarEvent::NewThreadWithProject(p));
-                        } else {
-                            cx.emit(SidebarEvent::NewThread);
-                        }
-                        cx.notify();
-                    });
-                },
-            ));
+            menu = menu.item(
+                PopupMenuItem::new(i18n::t("sidebar-new-session-manox"))
+                    .icon(
+                        Icon::default()
+                            .path("icons/manox.svg")
+                            .small()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .on_click(move |_, _window, cx| {
+                        let _ = sidebar_manox.update(cx, |this, cx| {
+                            let project = this.new_session_project.take();
+                            this.close_new_session_menu();
+                            if let Some(p) = project {
+                                cx.emit(SidebarEvent::NewThreadWithProject(p));
+                            } else {
+                                cx.emit(SidebarEvent::NewThread);
+                            }
+                            cx.notify();
+                        });
+                    }),
+            );
             for kind in [
                 crate::external_session::SessionKind::ClaudeCode,
                 crate::external_session::SessionKind::Codex,
@@ -758,28 +762,6 @@ fn section_header(label: SharedString, theme: &Theme, action: Option<AnyElement>
     }
 
     row.into_any_element()
-}
-
-/// One row of the new-session `PopupMenu`: icon + label.
-fn new_session_item(
-    icon: IconName,
-    label: impl Into<SharedString>,
-    theme: &Theme,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> PopupMenuItem {
-    let fg = theme.foreground;
-    let muted = theme.muted_foreground;
-    let icon = icon.clone();
-    let label = label.into();
-    PopupMenuItem::element(move |_window, _cx| {
-        h_flex()
-            .items_center()
-            .gap_2()
-            .child(Icon::new(icon.clone()).small().text_color(muted))
-            .child(gpui::div().text_sm().text_color(fg).child(label.clone()))
-            .into_any_element()
-    })
-    .on_click(on_click)
 }
 
 /// Build the provider→model cascade inside an external-agent submenu. Models
