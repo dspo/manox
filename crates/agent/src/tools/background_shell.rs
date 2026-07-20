@@ -132,10 +132,20 @@ pub fn spawn(
     plugin_root: Option<&std::path::Path>,
     sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<String, String> {
-    // Wrap the command through the sandbox policy (seatbelt on macOS) so
-    // background shells get the same write/network/.git confinement as
-    // foreground sandboxed bash.
+    // Wrap the command through the sandbox policy. On macOS this produces
+    // a seatbelt-wrapped `sandbox-exec` command with the same write/network/
+    // `.git` confinement as foreground sandboxed bash. On platforms without
+    // a sandbox backend, fall back to a raw `sh -c` (matching the foreground
+    // bash behavior on those platforms).
+    #[cfg(target_os = "macos")]
     let mut cmd = sandbox.wrap_command(&command, cwd);
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(&command);
+        c.current_dir(cwd);
+        c
+    };
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(false);
     // Own process group so kill reaches grandchildren.
