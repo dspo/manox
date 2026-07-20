@@ -6,6 +6,7 @@
 
 pub mod agent_def;
 pub mod approval;
+pub mod claude_md;
 pub mod collaboration_mode;
 pub mod command;
 pub mod compact;

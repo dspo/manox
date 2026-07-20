@@ -289,11 +289,7 @@ settings-row-personality = Personality
 settings-desc-personality = Choose the default tone of manox's replies
 settings-value-friendly = Friendly
 
-settings-section-custom-instructions = Custom instructions
-settings-desc-custom-instructions = Provide additional instructions and context for all tasks on this machine to manox
-settings-input-custom-instructions = Add custom instructions…
 settings-btn-save = Save
-settings-btn-saved = Saved
 
 settings-section-memory = Memory
 settings-tag-experimental = Experimental

@@ -41,6 +41,9 @@ pub enum PromptTemplate {
     WrapperToolDenied,
     WrapperGoalContinuation,
     WrapperCompactionPreamble,
+    /// Multi-level CLAUDE.md eager block: one `<instructions>` tag per loaded
+    /// file, concatenated broadest → most specific.
+    WrapperInstructionsEager,
 
     // --- side-call system + user prompts ---
     SideCallApprovalSystem,
@@ -82,6 +85,7 @@ impl PromptTemplate {
             Self::WrapperToolDenied => "wrapper/tool_denied.tera.md",
             Self::WrapperGoalContinuation => "wrapper/goal_continuation.tera.md",
             Self::WrapperCompactionPreamble => "wrapper/compaction_preamble.tera.md",
+            Self::WrapperInstructionsEager => "wrapper/instructions_eager.tera.md",
             Self::SideCallApprovalSystem => "side_call/approval_system.tera.md",
             Self::SideCallApprovalUser => "side_call/approval_user.tera.md",
             Self::SideCallGoalSystem => "side_call/goal_system.tera.md",
@@ -100,7 +104,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 24] = [
+pub const ALL: [PromptTemplate; 25] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::ModeGoalAddendum,
@@ -115,6 +119,7 @@ pub const ALL: [PromptTemplate; 24] = [
     PromptTemplate::WrapperToolDenied,
     PromptTemplate::WrapperGoalContinuation,
     PromptTemplate::WrapperCompactionPreamble,
+    PromptTemplate::WrapperInstructionsEager,
     PromptTemplate::SideCallApprovalSystem,
     PromptTemplate::SideCallApprovalUser,
     PromptTemplate::SideCallGoalSystem,

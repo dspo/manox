@@ -237,11 +237,7 @@ settings-row-personality = 个性
 settings-desc-personality = 选择 manox 回复的默认语气
 settings-value-friendly = 亲和
 
-settings-section-custom-instructions = 自定义指令
-settings-desc-custom-instructions = 为此主机上的所有任务向 manox 提供额外说明和上下文
-settings-input-custom-instructions = 添加自定义指令…
 settings-btn-save = 保存
-settings-btn-saved = 已保存
 
 settings-section-memory = 记忆
 settings-tag-experimental = 实验性

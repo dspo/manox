@@ -1,10 +1,9 @@
 //! User settings — `~/.config/cx/manox/settings.toml`.
 //!
 //! Plain-file preferences read once at startup. The `language` field is
-//! consumed by [`crate::i18n`]; `custom_instructions` is consumed by the
-//! settings overlay (display + persist round-trip) and may be wired into the
-//! agent system prompt in a follow-up. Absent file or parse failure is
-//! non-fatal: every failure path warns once and yields the default, so a
+//! consumed by [`crate::i18n`]; `claude_md_excludes` filters which CLAUDE.md
+//! instruction files [`crate::claude_md`] loads. Absent file or parse failure
+//! is non-fatal: every failure path warns once and yields the default, so a
 //! malformed file never blocks startup.
 
 use anyhow::{Context as _, Result};
@@ -34,6 +33,36 @@ pub fn modes() -> ModeSettingsMap {
     MODES.get().cloned().unwrap_or_default()
 }
 
+/// Build the [`crate::claude_md::LoadContext`] for instruction loading.
+///
+/// Production reads the real home dir, the platform managed-policy path, and
+/// the session-cached `claude_md_excludes`. Test builds are hermetic (an
+/// empty context loads nothing user- or machine-level), so thread tests never
+/// observe the developer's actual `~/.claude` tree or managed policy.
+pub fn claude_md_load_context() -> crate::claude_md::LoadContext {
+    #[cfg(test)]
+    let ctx = crate::claude_md::LoadContext::default();
+    #[cfg(not(test))]
+    let ctx = crate::claude_md::LoadContext {
+        home: paths::home_dir(),
+        managed: crate::claude_md::managed_policy_path(),
+        excludes: claude_md_excludes(),
+        // External imports stay withheld until the approval flow (a later PR)
+        // wires the persisted per-anchor decision in here.
+        allow_external: false,
+    };
+    ctx
+}
+
+/// The session-cached `claude_md_excludes` list. Lazily settled on first use
+/// so `agent::init` ordering does not matter; a mid-session settings edit
+/// takes effect next launch, matching the modes snapshot.
+#[cfg(not(test))]
+fn claude_md_excludes() -> Vec<String> {
+    static EXCLUDES: OnceLock<Vec<String>> = OnceLock::new();
+    EXCLUDES.get_or_init(|| load().claude_md_excludes).clone()
+}
+
 /// Parsed view of `settings.toml`. Every field is optional so a missing or
 /// partial file still yields a usable (defaulted) result.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -42,11 +71,12 @@ pub struct Settings {
     #[serde(default)]
     pub language: Option<String>,
 
-    /// Free-form instructions appended to the agent's system prompt. Persisted
-    /// by the settings overlay; not yet injected into the prompt (TODO:
-    /// surface via `system_prompt::build_main_system_prompt`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub custom_instructions: Option<String>,
+    /// Glob patterns matched against the canonical absolute paths of CLAUDE.md
+    /// instruction files; matching files are excluded from the loaded set (the
+    /// managed-policy file is exempt). Read once per session via
+    /// [`claude_md_load_context`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claude_md_excludes: Vec<String>,
 
     /// Auto-compaction: summarize older history into a handoff message when the
     /// live context window fills, so long sessions keep going. The trigger

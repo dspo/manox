@@ -46,6 +46,8 @@ const TPL_WRAPPER_GOAL_CONTINUATION: &str =
     include_str!("templates/wrapper/goal_continuation.tera.md");
 const TPL_WRAPPER_COMPACTION_PREAMBLE: &str =
     include_str!("templates/wrapper/compaction_preamble.tera.md");
+const TPL_WRAPPER_INSTRUCTIONS_EAGER: &str =
+    include_str!("templates/wrapper/instructions_eager.tera.md");
 const TPL_SIDECALL_APPROVAL_SYSTEM: &str =
     include_str!("templates/side_call/approval_system.tera.md");
 const TPL_SIDECALL_APPROVAL_USER: &str = include_str!("templates/side_call/approval_user.tera.md");
@@ -115,6 +117,10 @@ fn tera() -> &'static tera::Tera {
             (
                 PromptTemplate::WrapperCompactionPreamble,
                 TPL_WRAPPER_COMPACTION_PREAMBLE,
+            ),
+            (
+                PromptTemplate::WrapperInstructionsEager,
+                TPL_WRAPPER_INSTRUCTIONS_EAGER,
             ),
             (
                 PromptTemplate::SideCallApprovalSystem,
@@ -321,7 +327,7 @@ mod tests {
         // over the enum. The count is hand-maintained and must be bumped when a
         // variant is added — this tripwire makes a forgotten bump fail loudly
         // here rather than letting a new variant ship unregistered.
-        assert_eq!(template::ALL.len(), 24);
+        assert_eq!(template::ALL.len(), 25);
     }
 
     /// Every data-bearing template must fully substitute its variables against
@@ -394,6 +400,20 @@ mod tests {
             )
             .unwrap(),
             PromptTemplate::WrapperMaxTurnsSummary,
+        );
+        assert_clean(
+            &render(
+                PromptTemplate::WrapperInstructionsEager,
+                &crate::prompt::InstructionsEagerPromptData {
+                    sources: vec![crate::prompt::InstructionSourcePromptData {
+                        scope: "project",
+                        path: "/p/CLAUDE.md".to_string(),
+                        content: "body".to_string(),
+                    }],
+                },
+            )
+            .unwrap(),
+            PromptTemplate::WrapperInstructionsEager,
         );
         assert_clean(
             &render(
