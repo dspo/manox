@@ -3884,7 +3884,7 @@ impl Thread {
 /// mapper.
 pub(crate) fn model_facing_content(c: &MessageContent) -> MessageContent {
     match c {
-        MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == "agent" => {
+        MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == "Agent" => {
             MessageContent::ToolResult(LanguageModelToolResult {
                 tool_use_id: tr.tool_use_id.clone(),
                 tool_name: tr.tool_name.clone(),
@@ -4115,7 +4115,7 @@ mod tests {
         let envelope = json!({ "final": "found 3 files", "messages": sub }).to_string();
         let tr = MessageContent::ToolResult(LanguageModelToolResult {
             tool_use_id: "tu_1".to_string(),
-            tool_name: Arc::from("agent"),
+            tool_name: Arc::from("Agent"),
             is_error: false,
             content: envelope,
         });
@@ -4124,7 +4124,7 @@ mod tests {
             panic!("expected ToolResult");
         };
         assert_eq!(out.content, "found 3 files");
-        assert_eq!(out.tool_name.as_ref(), "agent");
+        assert_eq!(out.tool_name.as_ref(), "Agent");
         // Original canonical content is untouched (still the envelope).
         let MessageContent::ToolResult(orig) = tr else {
             unreachable!()
@@ -4155,7 +4155,7 @@ mod tests {
     fn model_facing_content_agent_legacy_falls_back() {
         let tr = MessageContent::ToolResult(LanguageModelToolResult {
             tool_use_id: "tu_3".to_string(),
-            tool_name: Arc::from("agent"),
+            tool_name: Arc::from("Agent"),
             is_error: false,
             content: "plain summary".to_string(),
         });
