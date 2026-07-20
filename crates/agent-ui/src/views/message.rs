@@ -553,12 +553,21 @@ pub fn render_item(
             crate::conversation::UserMessageDisplayState::RolledBackSteer { .. } => {
                 gpui::div().hidden().into_any_element()
             }
-            crate::conversation::UserMessageDisplayState::PendingSteer { .. } => {
-                render_user(text, images, meta.as_ref(), true, ix, role, theme, cx)
-            }
-            crate::conversation::UserMessageDisplayState::Normal => {
-                render_user(text, images, meta.as_ref(), false, ix, role, theme, cx)
-            }
+            display_state => render_user(
+                UserRenderContent {
+                    text,
+                    images,
+                    meta: meta.as_ref(),
+                    pending_steer: matches!(
+                        display_state,
+                        crate::conversation::UserMessageDisplayState::PendingSteer { .. }
+                    ),
+                },
+                ix,
+                role,
+                theme,
+                cx,
+            ),
         },
         ConvItem::Assistant {
             text,
@@ -645,16 +654,26 @@ fn copy_button_hoverable(
 /// the accent border; the bottom edge keeps only the two corners so the center
 /// stays open. `min_w_0` end to end keeps long CJK / unbreakable runs from
 /// collapsing the block to min-content (the failure mode of the old bubble).
-pub fn render_user(
-    text: &str,
-    images: &[UserImage],
-    meta: Option<&UserTurnMeta>,
+struct UserRenderContent<'a> {
+    text: &'a str,
+    images: &'a [UserImage],
+    meta: Option<&'a UserTurnMeta>,
     pending_steer: bool,
+}
+
+fn render_user(
+    content: UserRenderContent<'_>,
     ix: usize,
     model: &str,
     theme: &Theme,
     cx: &mut App,
 ) -> gpui::AnyElement {
+    let UserRenderContent {
+        text,
+        images,
+        meta,
+        pending_steer,
+    } = content;
     let model_id = meta
         .map(|m| m.model_id.as_str())
         .filter(|m| !m.is_empty())
