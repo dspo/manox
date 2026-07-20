@@ -813,7 +813,7 @@ fn build_child_registry_with_policy(
     // register it here subject to the same allow/disallow filter. It is
     // stateless now (reads the per-call `ToolContext`), but stays main+child
     // only — never in `base_tools`.
-    if is_tool_allowed("SelfInfo", def) {
+    if is_tool_allowed(super::SELF_INFO, def) {
         reg.register(super::self_info::new());
     }
     if can_nest(def, child_depth) {
@@ -976,8 +976,8 @@ pub(crate) fn spawn_team_member(
 /// `plan` sub-agents were asked to write files they could not touch and each
 /// replied "I'm in read-only mode".
 fn capability_tag(def: &AgentDefinition) -> &'static str {
-    let can_write = is_tool_allowed("Write", def) || is_tool_allowed("Edit", def);
-    let can_bash = is_tool_allowed("Bash", def);
+    let can_write = is_tool_allowed(super::WRITE, def) || is_tool_allowed(super::EDIT, def);
+    let can_bash = is_tool_allowed(super::BASH, def);
     match (can_write, can_bash) {
         (true, true) => "write+bash",
         (true, false) => "write",

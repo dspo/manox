@@ -1160,7 +1160,7 @@ pub fn render_retry(
 /// syntax highlighting can colour the output.
 fn lang_hint_for_tool(name: &str) -> Option<&'static str> {
     match name {
-        "Bash" => Some("bash"),
+        x if x == agent::tools::BASH => Some("bash"),
         "python" => Some("python"),
         _ => None,
     }
@@ -1530,13 +1530,13 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
     for e in entries {
         let ActivityEntry::Tool(e) = e else { continue };
         match e.name.as_str() {
-            "Read" | "Write" | "List" => {
+            x if x == agent::tools::READ || x == agent::tools::WRITE || x == agent::tools::LIST => {
                 if let Some(p) = e.input.get("path").and_then(|v| v.as_str()) {
                     match e.name.as_str() {
-                        "Read" => {
+                        x if x == agent::tools::READ => {
                             reads.insert(p.to_string());
                         }
-                        "Write" => {
+                        x if x == agent::tools::WRITE => {
                             writes.insert(p.to_string());
                         }
                         _ => {
@@ -1545,10 +1545,10 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     }
                 } else {
                     match e.name.as_str() {
-                        "Read" => {
+                        x if x == agent::tools::READ => {
                             reads.insert(String::new());
                         }
-                        "Write" => {
+                        x if x == agent::tools::WRITE => {
                             writes.insert(String::new());
                         }
                         _ => {
@@ -1557,7 +1557,7 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     }
                 }
             }
-            "Edit" => {
+            x if x == agent::tools::EDIT => {
                 // The patch's first `[PATH#TAG]` header names the target file.
                 // Everything before the last `#` is the path (paths with `#`
                 // survive). Mirrors `tool_title`'s edit_file extraction.
@@ -1575,12 +1575,12 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     .unwrap_or_default();
                 edits.insert(path);
             }
-            "Bash" => {
+            x if x == agent::tools::BASH => {
                 // Commands count by invocation, not by unique command text —
                 // running `cargo build` twice is "2 commands", not 1.
                 running += 1;
             }
-            "Grep" => {
+            x if x == agent::tools::GREP => {
                 let p = e
                     .input
                     .get("pattern")
@@ -1589,7 +1589,7 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     .to_string();
                 searches.insert(p);
             }
-            "Glob" => {
+            x if x == agent::tools::GLOB => {
                 let p = e
                     .input
                     .get("pattern")
@@ -1598,7 +1598,7 @@ fn thinking_summary(entries: &[ActivityEntry]) -> String {
                     .to_string();
                 globs.insert(p);
             }
-            "WebFetch" | "WebExploreReadText" | "WebExploreReadDom" | "WebExploreScreenshot" => {
+            x if x == agent::tools::WEB_FETCH => {
                 // Read-side network activity: fetching a doc URL or reading a
                 // browser tab's content. Counted by invocation.
                 fetching += 1;
@@ -2538,14 +2538,14 @@ fn tool_panel_body(entry: &ToolCallItem) -> (PanelKind, String) {
     } else {
         entry.output.clone()
     };
-    match entry.name.as_ref() {
-        "Read" => (PanelKind::File, strip_hashline_numbering(&raw)),
+    match entry.name.as_str() {
+        x if x == agent::tools::READ => (PanelKind::File, strip_hashline_numbering(&raw)),
         // write_file's `output` is a one-line confirmation ("Wrote N bytes"), not
         // the file content; the content lives in the tool input. Show the written
         // content with a line-number gutter on success. On failure (`is_error`)
         // `output` carries the error — surface that as plain text via the default
         // arm so the user sees what went wrong, not just what was attempted.
-        "Write" if !entry.is_error => {
+        x if x == agent::tools::WRITE && !entry.is_error => {
             let content = entry
                 .input
                 .get("content")
@@ -2554,7 +2554,7 @@ fn tool_panel_body(entry: &ToolCallItem) -> (PanelKind, String) {
                 .to_string();
             (PanelKind::File, content)
         }
-        "Edit" => (PanelKind::Diff, raw),
+        x if x == agent::tools::EDIT => (PanelKind::Diff, raw),
         _ => (PanelKind::Plain, raw),
     }
 }
