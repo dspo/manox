@@ -2,7 +2,7 @@
 //! `gpui-component-assets`.
 //!
 //! `gpui-component-assets` ships the icon set `IconName` resolves to, but it
-//! cannot carry manox's own brand icons (the Claude / Codex / GitHub Copilot
+//! cannot carry manox's own brand icons (the Manox / Claude / Codex / GitHub Copilot
 //! marks used in the sidebar and the new-session menu). `ExtrasAssetSource`
 //! layers those on top: a `rust-embed` lookup of `assets/icons/**` wins, then
 //! it falls through to `gpui-component-assets` for everything else. The manox
@@ -75,5 +75,22 @@ impl AssetSource for ExtrasAssetSource {
         }
 
         Ok(children)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embeds_every_new_session_brand_icon() {
+        for path in [
+            "icons/manox.svg",
+            "icons/claude.svg",
+            "icons/codex.svg",
+            "icons/githubcopilot.svg",
+        ] {
+            assert!(LocalAssets::get(path).is_some(), "missing {path}");
+        }
     }
 }
