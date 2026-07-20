@@ -56,7 +56,7 @@ struct EditFileInput {
 
 impl AgentTool for EditTool {
     fn name(&self) -> &str {
-        "Edit"
+        super::EDIT
     }
     fn description(&self) -> &str {
         "Edit an existing file via a hashline patch (line-anchored + TAG validation). See the input.patch field docs."

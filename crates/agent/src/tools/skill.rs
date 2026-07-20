@@ -27,7 +27,7 @@ struct SkillInput {
 
 impl AgentTool for SkillTool {
     fn name(&self) -> &str {
-        "Skill"
+        super::SKILL
     }
     fn description(&self) -> &str {
         "Consult the full body of a named skill. Skill names appear in the system prompt's \

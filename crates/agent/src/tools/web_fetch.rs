@@ -43,7 +43,7 @@ struct WebFetchInput {
 
 impl AgentTool for WebFetchTool {
     fn name(&self) -> &str {
-        "WebFetch"
+        super::WEB_FETCH
     }
     fn description(&self) -> &str {
         "Fetch a web document over HTTP/HTTPS GET and return its text. Use this for \

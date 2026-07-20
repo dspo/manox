@@ -56,7 +56,7 @@ pub struct MonitorTool;
 
 impl AgentTool for MonitorTool {
     fn name(&self) -> &str {
-        "Monitor"
+        super::MONITOR
     }
 
     fn description(&self) -> &str {

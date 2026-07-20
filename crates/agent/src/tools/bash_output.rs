@@ -40,7 +40,7 @@ struct BashOutputInput {
 
 impl AgentTool for BashOutputTool {
     fn name(&self) -> &str {
-        "BashOutput"
+        super::BASH_OUTPUT
     }
 
     fn description(&self) -> &str {

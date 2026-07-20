@@ -189,7 +189,7 @@ struct BashInput {
 
 impl AgentTool for BashTool {
     fn name(&self) -> &str {
-        "Bash"
+        super::BASH
     }
     fn description(&self) -> &str {
         "Run a bash command and return stdout. Runs inside an OS sandbox by default (macOS seatbelt: writes \

@@ -334,7 +334,12 @@ mod tests {
                 .as_ref()
                 .expect("read-only builtin has disallowed_tools");
             let dis_vec = dis.as_vec();
-            for blocked in ["Write", "Edit", "Bash", "Agent"] {
+            for blocked in [
+                crate::tools::WRITE,
+                crate::tools::EDIT,
+                crate::tools::BASH,
+                crate::tools::AGENT,
+            ] {
                 assert!(
                     dis_vec.iter().any(|x| x == blocked),
                     "{} must disallow {blocked}",

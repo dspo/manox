@@ -988,7 +988,7 @@ impl ConversationState {
                 status,
                 input,
             } => {
-                if name == "Agent" {
+                if name == agent::tools::AGENT {
                     if let Some(ix) = self.find_agent_task(id, cx) {
                         self.items[ix].update(cx, |item, cx| {
                             if let ConvItem::AgentTask(t) = item.kind_mut() {
@@ -1018,7 +1018,7 @@ impl ConversationState {
                             )
                         }));
                     }
-                } else if name == "AskUserQuestion" {
+                } else if name == agent::tools::ASK_USER_QUESTION {
                     // Top-level card, never folded into an activity segment.
                     // `AskUserQuestion` drives an inline clarify card via
                     // `render_ask_user_card` while pending and a plain answered

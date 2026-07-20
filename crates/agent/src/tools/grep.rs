@@ -44,7 +44,7 @@ struct GrepInput {
 
 impl AgentTool for GrepTool {
     fn name(&self) -> &str {
-        "Grep"
+        super::GREP
     }
     fn description(&self) -> &str {
         "Search file contents by regex, returning matching lines (with line numbers). \

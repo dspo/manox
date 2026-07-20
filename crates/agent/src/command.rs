@@ -192,19 +192,19 @@ fn tool_id_from_spec(spec: &str) -> Option<String> {
         return None;
     }
     Some(match head.to_lowercase().as_str() {
-        "read" | "read_file" => "Read".to_string(),
-        "write" | "write_file" => "Write".to_string(),
-        "edit" | "edit_file" | "multiedit" => "Edit".to_string(),
-        "list" | "list_directory" | "ls" => "List".to_string(),
-        "bash" => "Bash".to_string(),
-        "bashoutput" | "bash_output" => "BashOutput".to_string(),
-        "grep" => "Grep".to_string(),
-        "glob" => "Glob".to_string(),
-        "askuserquestion" | "ask_user" => "AskUserQuestion".to_string(),
-        "agent" | "task" => "Agent".to_string(),
-        "skill" => "Skill".to_string(),
-        "self_info" | "selfinfo" => "SelfInfo".to_string(),
-        "monitor" => "Monitor".to_string(),
+        "read" | "read_file" => crate::tools::READ.to_string(),
+        "write" | "write_file" => crate::tools::WRITE.to_string(),
+        "edit" | "edit_file" | "multiedit" => crate::tools::EDIT.to_string(),
+        "list" | "list_directory" | "ls" => crate::tools::LIST.to_string(),
+        "bash" => crate::tools::BASH.to_string(),
+        "bashoutput" | "bash_output" => crate::tools::BASH_OUTPUT.to_string(),
+        "grep" => crate::tools::GREP.to_string(),
+        "glob" => crate::tools::GLOB.to_string(),
+        "askuserquestion" | "ask_user" => crate::tools::ASK_USER_QUESTION.to_string(),
+        "agent" | "task" => crate::tools::AGENT.to_string(),
+        "skill" => crate::tools::SKILL.to_string(),
+        "self_info" | "selfinfo" => crate::tools::SELF_INFO.to_string(),
+        "monitor" => crate::tools::MONITOR.to_string(),
         other => other.to_string(),
     })
 }

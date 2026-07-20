@@ -36,7 +36,7 @@ struct ReadFileInput {
 
 impl AgentTool for ReadTool {
     fn name(&self) -> &str {
-        "Read"
+        super::READ
     }
     fn description(&self) -> &str {
         "Read a file with optional line-range selectors. Output format: first line \
