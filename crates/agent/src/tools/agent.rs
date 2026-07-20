@@ -558,6 +558,14 @@ fn forward_progress(
 /// via the alias layer so `sonnet`/`opus`/`haiku`/`gpt-5`/`o3` bridge to a live
 /// model), else the parent `Thread`'s current model, else the registry's first
 /// model.
+///
+/// When the definition's `model` id is set but cannot be resolved (e.g. a
+/// Claude Code plugin frontmatter pins `model: sonnet` but the manox provider
+/// config has no Anthropic models), fall back to the parent `Thread`'s model
+/// rather than erroring out. This is the Claude Code ecosystem compatibility
+/// contract: plugin agents are portable across manox instances with different
+/// provider configurations, and an unresolvable model alias should not block
+/// spawning — the parent's current model is a reasonable substitute.
 fn resolve_model(
     def_model: &Option<String>,
     parent: &WeakEntity<Thread>,
@@ -567,7 +575,12 @@ fn resolve_model(
         if let Some(m) = crate::model_alias::resolve_model_ref(id) {
             return Ok(m);
         }
-        return Err(format!("sub-agent model not found: {id}"));
+        // Unresolvable alias (e.g. `sonnet` with no Anthropic provider
+        // configured): fall back to the parent model so a plugin agent can
+        // still run. Log so the fallback is visible but never block spawn.
+        tracing::info!(
+            "sub-agent model alias `{id}` not found in provider config;              falling back to parent thread's model"
+        );
     }
     if let Ok(Some(m)) = parent.read_with(cx, |t, _| t.model().cloned()) {
         return Ok(m);
