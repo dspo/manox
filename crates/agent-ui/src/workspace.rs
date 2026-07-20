@@ -946,7 +946,11 @@ impl Workspace {
                     if let ThreadEvent::Error(e) = ev {
                         let thread_id = this.thread.read(cx).id.0.clone();
                         let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| s.mark_idle(&thread_id, cx));
+                        store.update(cx, |s, cx| {
+                            s.mark_idle(&thread_id, cx);
+                            s.set_errored(&thread_id, true, cx);
+                            s.set_unread(&thread_id, true, cx);
+                        });
                         this.turn_active = false;
                         this.background_threads
                             .retain(|b| b.entity.read(cx).id.0 != thread_id);
@@ -1065,6 +1069,14 @@ impl Workspace {
                     let store = agent::thread_store_global();
                     store.update(cx, |s, cx| {
                         s.mark_idle(&id, cx);
+                        s.set_unread(&id, true, cx);
+                    });
+                }
+                ThreadEvent::Error(_) => {
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| {
+                        s.mark_idle(&id, cx);
+                        s.set_errored(&id, true, cx);
                         s.set_unread(&id, true, cx);
                     });
                 }
