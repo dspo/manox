@@ -48,6 +48,8 @@ const TPL_WRAPPER_COMPACTION_PREAMBLE: &str =
     include_str!("templates/wrapper/compaction_preamble.tera.md");
 const TPL_WRAPPER_INSTRUCTIONS_EAGER: &str =
     include_str!("templates/wrapper/instructions_eager.tera.md");
+const TPL_WRAPPER_INSTRUCTIONS_LAZY: &str =
+    include_str!("templates/wrapper/instructions_lazy.tera.md");
 const TPL_SIDECALL_APPROVAL_SYSTEM: &str =
     include_str!("templates/side_call/approval_system.tera.md");
 const TPL_SIDECALL_APPROVAL_USER: &str = include_str!("templates/side_call/approval_user.tera.md");
@@ -121,6 +123,10 @@ fn tera() -> &'static tera::Tera {
             (
                 PromptTemplate::WrapperInstructionsEager,
                 TPL_WRAPPER_INSTRUCTIONS_EAGER,
+            ),
+            (
+                PromptTemplate::WrapperInstructionsLazy,
+                TPL_WRAPPER_INSTRUCTIONS_LAZY,
             ),
             (
                 PromptTemplate::SideCallApprovalSystem,
@@ -327,7 +333,7 @@ mod tests {
         // over the enum. The count is hand-maintained and must be bumped when a
         // variant is added — this tripwire makes a forgotten bump fail loudly
         // here rather than letting a new variant ship unregistered.
-        assert_eq!(template::ALL.len(), 25);
+        assert_eq!(template::ALL.len(), 26);
     }
 
     /// Every data-bearing template must fully substitute its variables against
@@ -404,7 +410,7 @@ mod tests {
         assert_clean(
             &render(
                 PromptTemplate::WrapperInstructionsEager,
-                &crate::prompt::InstructionsEagerPromptData {
+                &crate::prompt::InstructionsPromptData {
                     sources: vec![crate::prompt::InstructionSourcePromptData {
                         scope: "project",
                         path: "/p/CLAUDE.md".to_string(),
@@ -414,6 +420,20 @@ mod tests {
             )
             .unwrap(),
             PromptTemplate::WrapperInstructionsEager,
+        );
+        assert_clean(
+            &render(
+                PromptTemplate::WrapperInstructionsLazy,
+                &crate::prompt::InstructionsPromptData {
+                    sources: vec![crate::prompt::InstructionSourcePromptData {
+                        scope: "project",
+                        path: "/p/sub/CLAUDE.md".to_string(),
+                        content: "nested body".to_string(),
+                    }],
+                },
+            )
+            .unwrap(),
+            PromptTemplate::WrapperInstructionsLazy,
         );
         assert_clean(
             &render(

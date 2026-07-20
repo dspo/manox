@@ -12,7 +12,7 @@
 //! `ToolAuthorizationResponse` (a permission decision or, for `AskUserQuestion`,
 //! the user's answers), which the task `await`s on the gpui executor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -482,6 +482,12 @@ pub struct Thread {
     /// sub-agent, which skips instruction files to stay fast and cheap
     /// (Claude Code's Explore/Plan carve-out).
     instructions_enabled: bool,
+    /// Instruction files already injected by the lazy layer (nested CLAUDE.md
+    /// and path-scoped rules discovered via `read_file`), so a directory's
+    /// instructions ride exactly one tool result. Cleared when a compaction
+    /// lands, since the summary may drop the reminders from the request —
+    /// re-reading the directory then re-injects them.
+    lazy_instructions_injected: HashSet<PathBuf>,
     /// Nesting depth. Main thread = 0; a sub-agent = parent depth + 1.
     depth: u32,
     /// Human-readable owner label: "lead" for the main thread, the
@@ -788,6 +794,7 @@ impl Thread {
                 pending_child_auth: HashMap::new(),
                 system: None,
                 instructions_enabled: true,
+                lazy_instructions_injected: HashSet::new(),
                 depth: 0,
                 agent_label: "lead".to_string(),
                 max_turns: None,
@@ -878,6 +885,7 @@ impl Thread {
                 pending_child_auth: HashMap::new(),
                 system: None,
                 instructions_enabled: true,
+                lazy_instructions_injected: HashSet::new(),
                 depth: rec.depth as u32,
                 agent_label: "lead".to_string(),
                 max_turns: None,
@@ -972,6 +980,7 @@ impl Thread {
                 pending_child_auth: HashMap::new(),
                 system: Some(system),
                 instructions_enabled: true,
+                lazy_instructions_injected: HashSet::new(),
                 depth,
                 agent_label,
                 max_turns: Some(max_turns),
@@ -2325,6 +2334,12 @@ impl Thread {
             let compaction_msg =
                 Message::user_with_content(vec![MessageContent::Compaction(summary.clone())]);
             this.messages.insert(insertion_ix, compaction_msg);
+            // The summary may absorb the lazy instruction reminders injected
+            // into earlier tool results; clearing the injected set lets a
+            // re-read of the same directory re-inject them (matching Claude
+            // Code, which reloads nested CLAUDE.md on the next read after a
+            // compaction).
+            this.lazy_instructions_injected.clear();
             // A compaction rewrites the message prefix, so the provider's KV
             // cache misses once on the next request. That is the unavoidable
             // cost of reclaiming context; invalidate the fingerprint so the
@@ -3560,6 +3575,7 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<()> {
         this.update(cx, |this, cx| {
+            let output = this.maybe_augment_read_instructions(&tu, output, is_error);
             let result = LanguageModelToolResult {
                 tool_use_id: tu.id.clone(),
                 tool_name: tu.name.clone(),
@@ -3569,6 +3585,50 @@ impl Thread {
             this.push_tool_result(result, cx);
         })?;
         Ok(())
+    }
+
+    /// The lazy half of the multi-level CLAUDE.md hierarchy: a successful
+    /// `read_file` appends newly-discovered nested instruction files (and
+    /// matching path-scoped rules) to its own tool result as a
+    /// `<system-reminder>` — Claude Code's trigger semantics ("loads when
+    /// Claude reads files in those directories"). The reminder rides the tool
+    /// result rather than a standalone message: append-only history, no user
+    /// bubble in the UI, and the prefix cache stays stable once written.
+    /// `lazy_instructions_injected` dedups across reads; a compaction clears
+    /// it so reminders the summary dropped re-inject on the next read.
+    fn maybe_augment_read_instructions(
+        &mut self,
+        tu: &LanguageModelToolUse,
+        output: String,
+        is_error: bool,
+    ) -> String {
+        if tu.name.as_ref() != "read_file" || is_error || !self.instructions_enabled {
+            return output;
+        }
+        let Some(raw_path) = tu.input.get("path").and_then(|v| v.as_str()) else {
+            return output;
+        };
+        let (path_str, _selector) = crate::tools::path_selector::split_path_and_sel(raw_path);
+        let read_path = if Path::new(path_str).is_absolute() {
+            PathBuf::from(path_str)
+        } else {
+            self.cwd.join(path_str)
+        };
+        let ctx = crate::settings::claude_md_load_context();
+        let set = crate::claude_md::load(&self.cwd, &ctx);
+        let found = crate::claude_md::discover_for_read(
+            &read_path,
+            &self.cwd,
+            &set.scoped,
+            &self.lazy_instructions_injected,
+            &ctx,
+        );
+        let Some(reminder) = crate::claude_md::render_lazy(&found) else {
+            return output;
+        };
+        self.lazy_instructions_injected
+            .extend(found.iter().map(|s| s.path.clone()));
+        format!("{output}\n\n{reminder}")
     }
 
     /// Append a tool_result to a user message. Per the Anthropic wire contract,
@@ -4620,6 +4680,131 @@ mod tests {
                 .all(|m| !text_of_req(m).contains("PROJECT RULE MARKER")),
             "disabled thread must not carry instructions"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A successful `read_file` appends newly-discovered nested CLAUDE.md
+    /// files to its own tool result as a `<system-reminder>` — exactly once
+    /// per directory (`lazy_instructions_injected` dedups), while error
+    /// results, other tools, selector-suffixed paths, and the explore
+    /// carve-out stay untouched.
+    #[test]
+    fn read_file_tool_result_injects_nested_instructions_once() {
+        let tmp = std::env::temp_dir().join(format!(
+            "manox_thread_lazy_{}_{}",
+            std::process::id(),
+            "inject"
+        ));
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::create_dir_all(tmp.join("other")).unwrap();
+        std::fs::write(tmp.join("sub/CLAUDE.md"), "NESTED RULE MARKER").unwrap();
+        std::fs::write(tmp.join("sub/file.rs"), "fn main() {}").unwrap();
+        std::fs::write(tmp.join("other/CLAUDE.md"), "OTHER DIR MARKER").unwrap();
+        std::fs::write(tmp.join("other/f.rs"), "fn f() {}").unwrap();
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let cwd = tmp.to_string_lossy().to_string();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("lazy-inject", &cwd, Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let tool_use = |path: &str, name: &str| crate::language_model::LanguageModelToolUse {
+            id: "t1".into(),
+            name: name.into(),
+            raw_input: String::new(),
+            input: serde_json::json!({"path": path}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+
+        // Successful read of a file under `sub/`: reminder rides the result.
+        let out = cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.maybe_augment_read_instructions(
+                    &tool_use("sub/file.rs", "read_file"),
+                    "FILE BODY".to_string(),
+                    false,
+                )
+            })
+        });
+        assert!(out.starts_with("FILE BODY"), "{out}");
+        assert!(out.contains("<system-reminder>"), "{out}");
+        assert!(out.contains("NESTED RULE MARKER"), "{out}");
+
+        // Second read in the same directory: no duplicate injection.
+        let out = cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.maybe_augment_read_instructions(
+                    &tool_use("sub/file.rs", "read_file"),
+                    "FILE BODY".to_string(),
+                    false,
+                )
+            })
+        });
+        assert_eq!(out, "FILE BODY");
+
+        // Selector suffixes are stripped before discovery (`other/` fires).
+        let out = cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.maybe_augment_read_instructions(
+                    &tool_use("other/f.rs:raw", "read_file"),
+                    "RAW BODY".to_string(),
+                    false,
+                )
+            })
+        });
+        assert!(out.contains("OTHER DIR MARKER"), "{out}");
+
+        // Error results and non-read_file tools are never augmented.
+        let out = cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.maybe_augment_read_instructions(
+                    &tool_use("sub/file.rs", "read_file"),
+                    "ERR".to_string(),
+                    true,
+                )
+            })
+        });
+        assert_eq!(out, "ERR");
+        let out = cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.maybe_augment_read_instructions(
+                    &tool_use("sub/file.rs", "bash"),
+                    "SHELL OUT".to_string(),
+                    false,
+                )
+            })
+        });
+        assert_eq!(out, "SHELL OUT");
+
+        // The explore carve-out (`instructions_enabled = false`) also gates
+        // the lazy layer: a fresh thread with instructions disabled leaves
+        // the result untouched and marks nothing injected.
+        let thread2 = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("lazy-inject-off", &cwd, Vec::new()),
+                None,
+                cx,
+            )
+        });
+        cx.update(|cx| {
+            thread2.update(cx, |t, _cx| t.set_instructions_enabled(false));
+        });
+        let out = cx.update(|cx| {
+            thread2.update(cx, |t, _cx| {
+                t.maybe_augment_read_instructions(
+                    &tool_use("sub/file.rs", "read_file"),
+                    "FILE BODY".to_string(),
+                    false,
+                )
+            })
+        });
+        assert_eq!(out, "FILE BODY");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
