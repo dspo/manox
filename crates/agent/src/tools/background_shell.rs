@@ -130,7 +130,8 @@ pub fn spawn(
     cwd: &std::path::Path,
     timeout: Option<Duration>,
     plugin_root: Option<&std::path::Path>,
-    sandbox: &crate::sandbox::SandboxPolicy,
+    #[cfg(target_os = "macos")] sandbox: &crate::sandbox::SandboxPolicy,
+    #[cfg(not(target_os = "macos"))] _sandbox: &crate::sandbox::SandboxPolicy,
 ) -> Result<String, String> {
     // Wrap the command through the sandbox policy. On macOS this produces
     // a seatbelt-wrapped `sandbox-exec` command with the same write/network/
