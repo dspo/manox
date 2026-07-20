@@ -330,7 +330,7 @@ pub struct Workspace {
     pending_plans: HashMap<String, PendingPlanReview>,
     /// Follow-ups submitted while a turn is running. Steer items are injected
     /// into the running turn at the next safe join point; queue items flush as
-    /// the next user turn on terminal Stop.
+    /// the next user turn at `TurnFinished`.
     queued_follow_ups: std::collections::VecDeque<QueuedFollowUp>,
     /// Session-only per-thread queue stash. Switching tasks moves the active
     /// deque here and restores it on return; no database persistence is used.
@@ -831,11 +831,9 @@ impl Workspace {
                             host.clear_yields_for_thread(this, cx);
                         }
                         this.pending_inbounds.clear();
-                        let thread_id = this.thread.read(cx).id.0.clone();
                         save_thread(this.thread.clone(), true, cx);
                         // `Stop` is a provider-round boundary. Queue draining,
                         // idle state, and git refresh wait for `TurnFinished`.
-                        let _ = thread_id;
                     }
                     cx.notify();
                 }
@@ -2432,12 +2430,18 @@ impl Workspace {
                 | FollowUpState::Failed { message_id } => Some(message_id.clone()),
                 FollowUpState::Queued => None,
             };
+            // Canonical history wins over the session stash: this steer was
+            // injected while the task was in the background, so showing the
+            // parked item again would duplicate it.
             if steer_id
                 .as_deref()
                 .is_some_and(|id| canonical_ids.contains(id))
             {
                 continue;
             }
+            // Recreate an optimistic bubble only while the same steer remains
+            // pending on a running turn. Otherwise surface it as retryable;
+            // it was never confirmed by canonical history.
             if let FollowUpState::SteerPending { message_id } = &item.state {
                 if running && pending_ids.contains(message_id) {
                     pending_bubbles.push((
@@ -2528,6 +2532,9 @@ impl Workspace {
         if started_follow_up {
             save_thread(thread.clone(), true, cx);
             let thread = thread.clone();
+            // TurnFinished is delivered from the parked Thread's entity
+            // update. Defer the successor so `run_turn` cannot re-enter that
+            // update and so the terminal store bookkeeping finishes first.
             cx.defer(move |cx| {
                 thread.update(cx, |thread, cx| thread.run_turn(cx));
             });
@@ -2646,7 +2653,7 @@ impl Workspace {
         let Some(idx) = self.queued_follow_ups.iter().position(id_matches) else {
             return;
         };
-        let Some(_item) = self.queued_follow_ups.remove(idx) else {
+        let Some(_) = self.queued_follow_ups.remove(idx) else {
             return;
         };
         self.conversation.update(cx, |c, cx| {
