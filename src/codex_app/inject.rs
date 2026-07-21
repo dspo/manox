@@ -312,10 +312,7 @@ mod tests {
     fn rm(id: &str) -> ResolvedModel {
         ResolvedModel {
             id: id.into(),
-            swe_pro: "—".into(),
-            hle: "—".into(),
             desc: String::new(),
-            context: "—".into(),
             wire_api: WireApi::Responses,
             model_wire_apis: vec![WireApi::Responses],
             provider_name: "DashScope".into(),

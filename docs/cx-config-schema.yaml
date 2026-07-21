@@ -23,13 +23,15 @@ providers:
         url: "string (required)"
     models:
       model-id:
-        swe_pro: "string (optional; SWE-bench Pro 成绩)"
-        hle: "string (optional; Humanity's Last Exam 成绩)"
         desc: "string (optional)"
         wire_apis: ["enum: anthropic | responses | completions"]
         agents: ["string (optional override filter)"]
         env:
           VAR_NAME: "string (optional; 启动时注入的环境变量，仅用于配置值，不要存放密钥——密钥请用 apikey_source 或专用 env 文件)"
+        max_tokens: "integer (optional; model context window size in tokens, e.g. 1000000)"
+        max_output_tokens: "integer (optional; max tokens per response; defaults to a heuristic from max_tokens)"
+        supports_tools: "bool (optional; default true)"
+        supports_images: "bool (optional; default false)"
 
 agents:
   - id: "string (required, unique)"

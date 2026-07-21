@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 pub const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
 pub const LEGACY_PROVIDER_CONFIG_FILE_NAME: &str = "config.yaml";
 
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // Wire protocol + auth strategy
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 
 /// Wire protocol. `priority` picks the default when a model exposes multiple wires (anthropic wins).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -135,9 +135,9 @@ impl ApiKeySourceKind {
     }
 }
 
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // Deserialization structs (mirror the YAML schema)
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct CxConfig {
@@ -190,13 +190,7 @@ pub struct EndpointConfig {
 pub struct ModelConfig {
     pub id: String,
     #[serde(default)]
-    pub swe_pro: Option<String>,
-    #[serde(default)]
-    pub hle: Option<String>,
-    #[serde(default)]
     pub desc: Option<String>,
-    #[serde(default)]
-    pub context: Option<String>,
     #[serde(default)]
     pub wire_apis: Vec<String>,
     #[serde(default)]
@@ -224,13 +218,7 @@ pub struct ModelConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ProviderModelConfig {
     #[serde(default)]
-    pub swe_pro: Option<String>,
-    #[serde(default)]
-    pub hle: Option<String>,
-    #[serde(default)]
     pub desc: Option<String>,
-    #[serde(default)]
-    pub context: Option<String>,
     #[serde(default)]
     pub wire_apis: Vec<String>,
     #[serde(default)]
@@ -260,9 +248,9 @@ pub struct AgentConfig {
     pub env: BTreeMap<String, String>,
 }
 
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // Normalization + resolution
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 
 impl ProviderConfig {
     /// Cross-normalize `endpoints` against `models`: each endpoint carries the models it supports.
@@ -290,10 +278,7 @@ impl ProviderConfig {
                     })
                     .map(|(id, model)| ModelConfig {
                         id: id.clone(),
-                        swe_pro: model.swe_pro.clone(),
-                        hle: model.hle.clone(),
                         desc: model.desc.clone(),
-                        context: model.context.clone(),
                         wire_apis: model.wire_apis.clone(),
                         agents: model.agents.clone(),
                         env: model.env.clone(),
@@ -326,10 +311,7 @@ impl ProviderConfig {
 #[derive(Debug, Clone)]
 pub struct ResolvedModel {
     pub id: String,
-    pub swe_pro: String,
-    pub hle: String,
     pub desc: String,
-    pub context: String,
     pub wire_api: WireApi,
     pub model_wire_apis: Vec<WireApi>,
     pub provider_name: String,
@@ -343,7 +325,7 @@ pub struct ResolvedModel {
     /// a heuristic from the context window.
     pub max_output_tokens: Option<u64>,
     /// Model context window size in tokens. `None` = consumer falls back to the
-    /// `context` display string or id bracket suffix.
+    /// id bracket suffix.
     pub max_tokens: Option<u64>,
     /// Whether the model accepts tool definitions. `true` when the model did
     /// not opt out, so existing models keep tool access by default.
@@ -383,10 +365,7 @@ impl ResolvedModel {
 
         Self {
             id: model.id.clone(),
-            swe_pro: model.swe_pro.clone().unwrap_or_default(),
-            hle: model.hle.clone().unwrap_or_default(),
             desc: model.desc.clone().unwrap_or_default(),
-            context: model.context.clone().unwrap_or_default(),
             wire_api: WireApi::from_str(&endpoint.wire_api),
             model_wire_apis,
             provider_name: provider.name.clone(),
@@ -550,9 +529,9 @@ impl FromStr for CxConfig {
     }
 }
 
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // Path resolution + legacy migration
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 
 /// `$HOME/.config/cx`.
 pub fn cx_state_dir() -> Result<PathBuf> {
@@ -606,9 +585,9 @@ pub fn read_config_file(path: &Path) -> Result<CxConfig> {
     serde_yaml::from_str(&content).with_context(|| format!("解析配置文件失败: {}", path.display()))
 }
 
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // apikey_source resolution
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 
 /// Resolve an `apikey_source` into the actual API key string.
 pub fn resolve_apikey(source: &str) -> Result<String> {
@@ -663,9 +642,9 @@ fn keychain_secret(service: &str) -> Result<String> {
         .to_string())
 }
 
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 // Agent resolution
-// ══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════
 
 /// A fully resolved, launchable agent. Built from `AgentConfig` (user YAML) plus
 /// built-in hidden agents (e.g. `codex+`) that `resolved_agents` appends

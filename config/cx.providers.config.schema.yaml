@@ -1,0 +1,33 @@
+# cx providers config schema — for downstream validation (e.g. manox).
+# Mirror of docs/cx-config-schema.yaml; update both when the shape changes.
+
+providers:
+  - name: "string (required, unique)"
+    apikey_source: "string (optional)"
+    endpoints:
+      anthropic:
+        url: "string (required)"
+        agents: ["string (optional override filter)"]
+        copilot_auth: "enum: api_key | bearer_token (optional)"
+      responses:
+        url: "string (required)"
+      completions:
+        url: "string (required)"
+    models:
+      model-id:
+        desc: "string (optional)"
+        wire_apis: ["enum: anthropic | responses | completions"]
+        agents: ["string (optional override filter)"]
+        env:
+          VAR_NAME: "string (optional)"
+        max_tokens: "integer (optional; context window size in tokens)"
+        max_output_tokens: "integer (optional; max tokens per response)"
+        supports_tools: "bool (optional; default true)"
+        supports_images: "bool (optional; default false)"
+
+agents:
+  - id: "string (required, unique)"
+    bin: "string (required; binary is accepted as alias)"
+    wire_apis: ["enum: anthropic | responses | completions"]
+    env:
+      VAR_NAME: "string (optional)"

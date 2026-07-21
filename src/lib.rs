@@ -125,7 +125,7 @@ enum TextInputAction {
 // crate's manox-style `from_config` does not assume.
 
 /// Build a `ResolvedModel` with cx semantics: `visible_agents` filters by cross-model
-/// compatibility, `env` merges provider base + model overrides, missing scores show "—".
+/// compatibility, `env` merges provider base + model overrides.
 fn resolved_model_from_config(
     config: &CxConfig,
     provider: &ProviderConfig,
@@ -148,10 +148,7 @@ fn resolved_model_from_config(
 
     ResolvedModel {
         id: model.id.clone(),
-        swe_pro: model.swe_pro.clone().unwrap_or_else(|| "—".to_string()),
-        hle: model.hle.clone().unwrap_or_else(|| "—".to_string()),
         desc: model.desc.clone().unwrap_or_default(),
-        context: model.context.clone().unwrap_or_else(|| "—".to_string()),
         wire_api: WireApi::from_str(&endpoint.wire_api),
         model_wire_apis,
         provider_name: provider.name.clone(),
@@ -180,10 +177,7 @@ fn resolved_model_supports_agent(model: &ResolvedModel, agent_id: &str) -> bool 
 struct ModelOption {
     selection_key: String,
     id: String,
-    swe_pro: String,
-    hle: String,
     desc: String,
-    context: String,
     variants: Vec<ResolvedModel>,
 }
 
@@ -195,10 +189,7 @@ impl ModelOption {
         Self {
             selection_key: format!("{}\t{}", first.provider_name, first.id),
             id: first.id.clone(),
-            swe_pro: first.swe_pro.clone(),
-            hle: first.hle.clone(),
             desc: first.desc.clone(),
-            context: first.context.clone(),
             variants,
         }
     }
@@ -244,12 +235,9 @@ impl ModelOption {
     ) -> String {
         let selected = self.selected_variant(selected_wire_apis, agent_wire_apis);
         format!(
-            "{:<24} {:>7} {:>6}  {:<11} {:>8}  {}",
+            "{:<24} {:<11}  {}",
             self.id,
-            self.swe_pro,
-            self.hle,
             selected.wire_api.display(),
-            self.context,
             self.desc
         )
     }
@@ -262,8 +250,8 @@ fn model_header_row() -> Line<'static> {
         .fg(Color::White)
         .add_modifier(Modifier::BOLD);
     let header_text = format!(
-        "{:<24} {:>7} {:>6}  {:<11} {:>8}",
-        "Model", "SWE", "HLE", "wire_api", "context"
+        "{:<24} {:<11}",
+        "Model", "wire_api"
     );
     Line::from(vec![
         Span::styled("   ", Style::default()),
@@ -1030,15 +1018,9 @@ fn model_options_for_provider(
         .collect()
 }
 
-/// 解析 swe_pro 字符串（如 "56.6%"）为可比较的分数；"—" 等无法解析的视为 0.0。
-fn swe_pro_score(s: &str) -> f64 {
-    s.trim().trim_end_matches('%').parse::<f64>().unwrap_or(0.0)
-}
-
 /// 收集某 provider 下所有支持 Codex.app（即 wire 含 Responses）的模型，作为注入桌面端的完整列表。
 ///
-/// 同一 model id 仅保留一条（取 swe_pro 最优的变体），并按「默认模型优先」排序：
-/// swe_pro 高者在前，平局按 model id 升序。首个元素即默认模型。
+/// 同一 model id 仅保留一条，按 model id 升序排序。首个元素即默认模型。
 fn injected_models_for_codex_app(
     all_models: &[ResolvedModel],
     provider_name: &str,
@@ -1055,12 +1037,7 @@ fn injected_models_for_codex_app(
         })
         .cloned()
         .collect();
-    models.sort_by(|a, b| {
-        swe_pro_score(&b.swe_pro)
-            .partial_cmp(&swe_pro_score(&a.swe_pro))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    models.sort_by(|a, b| a.id.cmp(&b.id));
     let mut seen = std::collections::HashSet::new();
     models.retain(|m| seen.insert(m.id.clone()));
     models
@@ -2753,32 +2730,6 @@ fn collect_model_draft(
         PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
     };
 
-    let swe_pro = match prompt_text(
-        terminal,
-        "cx add",
-        "可选：输入 SWE-bench Pro 成绩；留空则不写入",
-        "",
-        "示例：45.3%",
-        |value| Ok(value.trim().to_string()),
-    )? {
-        PromptOutcome::Submit(value) => value,
-        PromptOutcome::Back => return Ok(PromptOutcome::Back),
-        PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
-    };
-
-    let hle = match prompt_text(
-        terminal,
-        "cx add",
-        "可选：输入 Humanity's Last Exam 成绩；留空则不写入",
-        "",
-        "示例：30.2%",
-        |value| Ok(value.trim().to_string()),
-    )? {
-        PromptOutcome::Submit(value) => value,
-        PromptOutcome::Back => return Ok(PromptOutcome::Back),
-        PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
-    };
-
     let desc = match prompt_text(
         terminal,
         "cx add",
@@ -2792,26 +2743,10 @@ fn collect_model_draft(
         PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
     };
 
-    let context = match prompt_text(
-        terminal,
-        "cx add",
-        "可选：输入 model 上下文大小；留空则不写入",
-        "",
-        "示例：1M, 128K, 200K",
-        |value| Ok(value.trim().to_string()),
-    )? {
-        PromptOutcome::Submit(value) => value,
-        PromptOutcome::Back => return Ok(PromptOutcome::Back),
-        PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
-    };
-
     Ok(PromptOutcome::Submit((
         model_id,
         ProviderModelConfig {
-            swe_pro: empty_string_as_none(&swe_pro),
-            hle: empty_string_as_none(&hle),
             desc: empty_string_as_none(&desc),
-            context: empty_string_as_none(&context),
             wire_apis: vec![wire_api.display().to_string()],
             agents: model_agents,
             env: BTreeMap::new(),
@@ -3994,10 +3929,7 @@ mod tests {
     fn test_resolved_model(model_id: &str, endpoint_url: &str, wire_api: WireApi) -> ResolvedModel {
         ResolvedModel {
             id: model_id.into(),
-            swe_pro: "—".into(),
-            hle: "—".into(),
             desc: String::new(),
-            context: "—".into(),
             wire_api,
             model_wire_apis: vec![wire_api],
             provider_name: "DashScope".into(),
@@ -4021,10 +3953,7 @@ mod tests {
                 models: BTreeMap::from([(
                     "mimo-v2.5-pro".into(),
                     ProviderModelConfig {
-                        swe_pro: Some("80%".into()),
-                        hle: Some("70%".into()),
                         desc: Some("thinking".into()),
-                        context: None,
                         wire_apis: vec![],
                         agents: Vec::new(),
                         env: BTreeMap::new(),
@@ -4346,10 +4275,7 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "qwen3.6-plus".into(),
-                swe_pro: "—".into(),
-                hle: "—".into(),
                 desc: String::new(),
-                context: "—".into(),
                 wire_api: WireApi::Anthropic,
                 model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "DashScope".into(),
@@ -4420,10 +4346,7 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "glm-5.2[1m]".into(),
-                swe_pro: "—".into(),
-                hle: "—".into(),
                 desc: String::new(),
-                context: "—".into(),
                 wire_api: WireApi::Anthropic,
                 model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "DashScope".into(),
@@ -4467,10 +4390,7 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "claude-opus-4-7".into(),
-                swe_pro: "—".into(),
-                hle: "—".into(),
                 desc: String::new(),
-                context: "—".into(),
                 wire_api: WireApi::Anthropic,
                 model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "Packy API".into(),
@@ -4523,10 +4443,7 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "glm-5.2[1m]".into(),
-                swe_pro: "—".into(),
-                hle: "—".into(),
                 desc: String::new(),
-                context: "—".into(),
                 wire_api: WireApi::Completions,
                 model_wire_apis: vec![WireApi::Completions],
                 provider_name: "Packy API".into(),
@@ -4571,10 +4488,7 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "claude-opus-4-7".into(),
-                swe_pro: "—".into(),
-                hle: "—".into(),
                 desc: String::new(),
-                context: "—".into(),
                 wire_api: WireApi::Anthropic,
                 model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "Packy API".into(),
@@ -4674,10 +4588,7 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "glm-5.1".into(),
-                swe_pro: "—".into(),
-                hle: "—".into(),
                 desc: String::new(),
-                context: "—".into(),
                 wire_api: WireApi::Anthropic,
                 model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "DashScope".into(),
@@ -4726,10 +4637,7 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "glm-5.1".into(),
-                swe_pro: "—".into(),
-                hle: "—".into(),
                 desc: String::new(),
-                context: "—".into(),
                 wire_api: WireApi::Anthropic,
                 model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "DashScope".into(),
@@ -4815,10 +4723,7 @@ mod tests {
             },
             model: Some(ResolvedModel {
                 id: "glm-5.1".into(),
-                swe_pro: "—".into(),
-                hle: "—".into(),
                 desc: String::new(),
-                context: "—".into(),
                 wire_api: WireApi::Anthropic,
                 model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "DashScope".into(),
@@ -4858,10 +4763,7 @@ mod tests {
             models: BTreeMap::from([(
                 "m1".into(),
                 ProviderModelConfig {
-                    swe_pro: None,
-                    hle: None,
                     desc: None,
-                    context: None,
                     wire_apis: vec![],
                     agents: Vec::new(),
                     env: model_only_env,
@@ -5132,10 +5034,7 @@ mod tests {
                 wire_api: WireApi::Responses,
                 model_id: "qwen3.6-plus".into(),
                 model: ProviderModelConfig {
-                    swe_pro: Some("45.3%".into()),
-                    hle: None,
                     desc: Some("Agent/终端最强".into()),
-                    context: None,
                     wire_apis: vec!["responses".into()],
                     agents: vec!["codex".into()],
                     env: BTreeMap::new(),
@@ -5176,10 +5075,7 @@ mod tests {
                 models: BTreeMap::from([(
                     "claude-opus-4-7".into(),
                     ProviderModelConfig {
-                        swe_pro: None,
-                        hle: None,
                         desc: None,
-                        context: None,
                         wire_apis: vec!["anthropic".into()],
                         agents: Vec::new(),
                         env: BTreeMap::new(),
@@ -6001,8 +5897,10 @@ trust_level = "trusted"
 
     /// 向前兼容测试：旧配置文件中含已移除的 lcb_pro 字段时，
     /// serde 应静默忽略该未知键，不报错。
+    /// Removed fields (`swe_pro`, `hle`, `context`, `lcb_pro`) in old YAML are
+    /// silently ignored by serde (no `deny_unknown_fields`).
     #[test]
-    fn deserialization_ignores_removed_lcb_pro_field() {
+    fn deserialization_ignores_removed_benchmark_fields() {
         let old_yaml = r#"
 providers:
   - name: Test
@@ -6012,8 +5910,8 @@ providers:
         swe_pro: "56.6%"
         lcb_pro: "1226"
         hle: "28.8%"
-        desc: "test"
         context: "1M"
+        desc: "test"
         wire_apis: [responses]
 agents:
   - id: claude
@@ -6022,9 +5920,9 @@ agents:
 "#;
         let config: CxConfig = serde_yaml::from_str(old_yaml).unwrap();
         let model = config.providers[0].models.get("test-model").unwrap();
-        assert_eq!(model.swe_pro.as_deref(), Some("56.6%"));
-        assert_eq!(model.hle.as_deref(), Some("28.8%"));
-        // lcb_pro 已从结构体中移除，旧 YAML 的 lcb_pro 键被 serde 静默忽略
+        assert_eq!(model.desc.as_deref(), Some("test"));
+        // swe_pro / hle / context / lcb_pro are no longer struct fields;
+        // serde silently ignores unknown keys in old YAML.
     }
 
     #[test]
