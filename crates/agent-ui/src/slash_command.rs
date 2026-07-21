@@ -577,7 +577,6 @@ mod tests {
         assert_eq!(p.args, "");
     }
 
-
     #[test]
     fn skill_adapter_name_and_kind() {
         // A mirrored skill surfaces under its full registry key and renders with
