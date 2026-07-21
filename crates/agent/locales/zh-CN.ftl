@@ -485,17 +485,16 @@ cockpit-status-thinking = 思考中
 cockpit-status-streaming = 生成中
 # "待输入"标签归并 idle / stopped / failed / awaiting approval。
 cockpit-status-awaiting-input = 待输入
-# 里程碑区段标题。
+# 计划区段标题。
 cockpit-milestones-header = 计划
-# 被阻塞里程碑的尾注。{$deps} 为逗号分隔的列表。
-cockpit-blocked-by = 被 {$deps} 阻塞
-# 折叠的已完成里程碑汇总。{$count} 为数字。
-cockpit-completed-summary = +{$count} 已完成
+# 计划进度计数，显示在标题栏右侧。{$done}/{$total} 为已完成/总数。
+cockpit-plan-progress = {$done}/{$total}
+# 折叠态下当前任务之外的剩余任务数。{$count} 为数字。
+cockpit-plan-remaining = +{$count} 项待办
+# 折叠态下全部任务完成的提示。
+cockpit-plan-all-done = 全部完成
 # 上下文预算行。{$pct} 为剩余百分比（0–100），{$used}/{$cap} 为已用/上限的预格式化计数。
 cockpit-context-remaining-ctx = 剩余上下文大小 {$pct}% {$used} / {$cap}
-# 里程碑区段标题末尾的隐藏/显示提示。通用——标题也可点击切换。
-cockpit-hide-tasks-hint = 点击折叠
-cockpit-show-tasks-hint = 点击展开
 
 composer-pasted-image = 粘贴的图片
 composer-image-process-failed = 部分粘贴的图片无法发送（格式不支持或过大）

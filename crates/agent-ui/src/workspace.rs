@@ -460,9 +460,9 @@ pub struct Workspace {
     /// The terminal tab's view, lazily created on the first `FocusTerminal` /
     /// `NewTerminalTab`. `None` until then. Dropped on `CloseTerminalTab`.
     terminal_view: Option<Entity<TerminalView>>,
-    /// Right-hand context rail. Owns the cockpit state (run phase, milestones,
-    /// per-cell counter animation state) that used to live directly on
-    /// `Workspace`, plus strong handles to the active thread and conversation
+    /// Right-hand context rail. Owns the cockpit state (run phase, the model's
+    /// plan snapshot, per-cell counter animation state) that used to live
+    /// directly on `Workspace`, plus strong handles to the active thread and conversation
     /// it renders against. Writes flow through `self.context_rail.update`.
     context_rail: Entity<crate::views::context_rail::ContextRail>,
     /// Live external agent CLI sessions (claude / codex / copilot) launched from
@@ -770,6 +770,12 @@ impl Workspace {
                     this.message_scroll.scroll_to_bottom();
                     cx.notify();
                 }
+                ThreadEvent::PlanUpdated { snapshot } => {
+                    let snapshot = snapshot.clone();
+                    this.context_rail.update(cx, |r, cx| {
+                        r.set_plan(snapshot, cx);
+                    });
+                }
                 ThreadEvent::ApprovalModeChanged { .. } => {
                     // Refresh the access chip + YOLO badge; no conversation item.
                     cx.notify();
@@ -804,9 +810,8 @@ impl Workspace {
                     // `turn_active` and self-terminates on the terminal stop.
                     this.turn_active = true;
                     this.spawn_thinking_ticker(cx);
-                    this.context_rail.update(cx, |r, cx| {
+                    this.context_rail.update(cx, |r, _cx| {
                         r.cockpit_phase = CockpitPhase::Thinking;
-                        r.promote_first_milestone_in_progress(cx);
                     });
                 }
                 ThreadEvent::TurnFinished {
@@ -1983,15 +1988,17 @@ impl Workspace {
         if running {
             self.spawn_thinking_ticker(cx);
         }
-        // Cockpit state is per-thread: the outgoing thread's milestones,
+        // Cockpit state is per-thread: the outgoing thread's plan,
         // running-tool title, and per-model counter state do not apply to the
-        // incoming one. Milestones are not persisted (a plan review never
-        // enters the store's event stream), so a reloaded thread starts with
-        // an empty panel; a still-running parked thread resumes mid-stream. Refresh
-        // cached auto-compact knobs in case the user edited settings while
-        // viewing another thread — cheap, and keeps the budget accurate.
+        // incoming one. The execution plan, unlike the
+        // proposed-plan review, IS recoverable — each `UpdatePlan` call is an
+        // ordinary tool round-trip in history, so the rail's plan is re-derived
+        // from `messages` below. Refresh cached auto-compact knobs in case the
+        // user edited settings while viewing another thread — cheap, and keeps
+        // the budget accurate.
         let auto_compact = settings::load().auto_compact;
         let new_thread_for_rail = self.thread.clone();
+        let restored_plan = agent::plan::rebuild_from_messages(&messages);
         self.context_rail.update(cx, |r, cx| {
             // Rebind the rail to the incoming thread. Without this the rail
             // keeps reading the construction-time thread's `per_model` usage /
@@ -2001,6 +2008,9 @@ impl Workspace {
             r.reset_for_thread_switch(running, cx);
             r.cockpit_auto_compact_enabled = auto_compact.enabled;
             r.cockpit_auto_compact_threshold = auto_compact.threshold;
+            if let Some(snapshot) = restored_plan {
+                r.set_plan(snapshot, cx);
+            }
             cx.notify();
         });
         if self.subagent_sessions.contains_key(&new_id) {
@@ -3609,10 +3619,11 @@ impl Workspace {
     }
 
     /// Resolve the pending plan review with the user's three-way verdict.
-    /// Implement (with or without a context clear) seeds the cockpit
-    /// milestone panel and delegates to the thread, which exits Plan mode and
-    /// re-injects the plan as the implement turn's seed. Staying in Plan mode is
-    /// not a verdict — the user simply keeps typing.
+    /// Implement (with or without a context clear) delegates to the thread,
+    /// which exits Plan mode and re-injects the plan as the implement turn's
+    /// seed; the rail's plan overview seeds later from the model's first
+    /// `UpdatePlan` call. Staying in Plan mode is not a verdict — the user
+    /// simply keeps typing.
     pub(crate) fn respond_plan_review(
         &mut self,
         choice: PlanReviewChoice,
@@ -3662,9 +3673,10 @@ impl Workspace {
             // run_turn marks it running so the sidebar row shows the spinner.
             save_thread(self.thread.clone(), true, cx);
             self.thread.update(cx, |t, cx| t.run_turn(cx));
-            self.context_rail.update(cx, |r, cx| {
-                r.set_milestones_from_plan(&review.plan_text, cx)
-            });
+            // The rail's plan is no longer seeded from the approved plan text.
+            // The model publishes its execution plan via `UpdatePlan` once work
+            // begins; until then the section stays empty (an empty rail beats a
+            // stale 27-bullet dump of the plan's implementation details).
             // Retire the old thread from the active list (consistent with any
             // archived thread — no "show archived" UI today).
             agent::thread_store_global().update(cx, |s, cx| s.archive_thread(&old_id, true, cx));
@@ -3681,9 +3693,8 @@ impl Workspace {
             });
             self.auto_follow = true;
             self.message_scroll.scroll_to_bottom();
-            self.context_rail.update(cx, |r, cx| {
-                r.set_milestones_from_plan(&review.plan_text, cx)
-            });
+            // The rail's plan seeds from the model's first `UpdatePlan` call, not
+            // the approved plan text — see the continue-in-plan branch above.
             self.thread.update(cx, |thread, cx| {
                 thread.implement_approved_plan(plan_text, Some(ui), cx);
             });

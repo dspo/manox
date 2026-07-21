@@ -1,32 +1,15 @@
-//! Agent cockpit view-model logic: milestone parsing, run-phase enum, and
-//! context-budget estimation. Pure functions over [`agent`] types — no GPUI,
-//! no rendering (the workspace reads these and lays them into the
-//! "Conversation info" card).
+//! Agent cockpit view-model logic: run-phase enum and context-budget
+//! estimation. Pure functions over [`agent`] types — no GPUI, no rendering
+//! (the workspace reads these and lays them into the "Conversation info" card).
+//!
+//! The execution plan overview is no longer inferred here — the model publishes
+//! it explicitly through the `UpdatePlan` tool, and the rail consumes the
+//! [`agent::PlanSnapshot`] directly.
 
 use std::time::Duration;
 
 use agent::compact::MIN_COMPACTION_CONTEXT_WINDOW;
 use agent::language_model::TokenUsage;
-
-/// Lifecycle of a single plan-derived milestone. `Blocked` / `Completed` /
-/// `Failed` are declared for the future model-driven update interface; in v1
-/// only `Pending` / `InProgress` are populated by the conservative cockpit
-/// logic (never auto-marks a step done — no reliable signal exists).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MilestoneStatus {
-    Pending,
-    InProgress,
-    Blocked { by: Vec<usize> },
-    Completed,
-    Failed,
-}
-
-/// A parsed plan step. The cockpit never reorders; list order is preserved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Milestone {
-    pub title: String,
-    pub status: MilestoneStatus,
-}
 
 /// Coarse run phase shown in the status row. Derived from `ThreadEvent`s in
 /// the workspace's `subscribe_thread` closure.
@@ -75,102 +58,6 @@ pub struct ContextBudget {
     /// The budget cap the percentage is measured against: the auto-summary
     /// trigger when enabled and the window qualifies, else the raw window.
     pub cap_tokens: u64,
-}
-
-/// Parse a plan's markdown body into milestones. Best-effort: each **top-level**
-/// list item (ordered `1.` / `1)` or unordered `-` / `*` / `+` at the shallowest
-/// indent) yields one milestone. Nested sub-items are ignored — the cockpit
-/// tracks high-level steps, not granular implementation details. Non-list prose
-/// lines are dropped. When no list item is found, the whole plan is kept as a
-/// single milestone so the panel never regresses to empty. All milestones start
-/// `Pending`; the workspace promotes the first to `InProgress` while running.
-pub fn parse_milestones(plan_text: &str) -> Vec<Milestone> {
-    let mut out: Vec<Milestone> = Vec::new();
-    // First pass: detect the indent width of the first list item. Subsequent
-    // items at a deeper indent are nested sub-steps and skipped.
-    let base_indent = detect_base_indent(plan_text);
-    for line in plan_text.lines() {
-        let indent = leading_indent(line);
-        // Only accept items at the base indent (or unindented). Deeper items
-        // are sub-steps folded into the parent milestone.
-        if indent > base_indent {
-            continue;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Some(title) = strip_list_marker(trimmed) else {
-            continue;
-        };
-        let title = title.trim();
-        if title.is_empty() {
-            continue;
-        }
-        out.push(Milestone {
-            title: title.to_string(),
-            status: MilestoneStatus::Pending,
-        });
-    }
-    if out.is_empty() {
-        let fallback = plan_text.trim();
-        if fallback.is_empty() {
-            return Vec::new();
-        }
-        out.push(Milestone {
-            title: fallback.to_string(),
-            status: MilestoneStatus::Pending,
-        });
-    }
-    out
-}
-
-/// Detect the indent (in spaces) of the first list item in the plan text.
-/// Falls back to 0 when no list item is found. Reuses [`strip_list_marker`]
-/// semantics — a digit-start line like "2026 plan" is **not** a list item
-/// because it lacks the required `.` / `)` after the digits.
-fn detect_base_indent(text: &str) -> usize {
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if strip_list_marker(trimmed).is_some() {
-            return leading_indent(line);
-        }
-    }
-    0
-}
-
-/// Count leading space characters in a line.
-fn leading_indent(line: &str) -> usize {
-    line.len() - line.trim_start().len()
-}
-
-/// Strip a leading ordered or unordered list marker, returning the remainder.
-/// Returns `None` for lines that do not open with a list marker (callers drop
-/// them). Pure byte scan — no regex.
-fn strip_list_marker(line: &str) -> Option<&str> {
-    let b = line.as_bytes();
-    if b.is_empty() {
-        return None;
-    }
-    // Ordered: one or more digits followed by '.' or ')'.
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i > 0 {
-        if i < b.len() && (b[i] == b'.' || b[i] == b')') {
-            return Some(&line[i + 1..]);
-        }
-        return None;
-    }
-    // Unordered: a single leading '-' / '*' / '+'.
-    match b[0] {
-        b'-' | b'*' | b'+' => Some(&line[1..]),
-        _ => None,
-    }
 }
 
 /// Estimate the remaining context budget. `None` only when the window is zero.
@@ -254,69 +141,6 @@ pub fn format_elapsed(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_milestones_ordered_and_unordered() {
-        let plan =
-            "1. First step\n2. Second step\n- Third step\n* Fourth step\nprose intro\n3) Sixth";
-        let ms = parse_milestones(plan);
-        let titles: Vec<&str> = ms.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(
-            titles,
-            vec![
-                "First step",
-                "Second step",
-                "Third step",
-                "Fourth step",
-                "Sixth"
-            ]
-        );
-        assert!(ms.iter().all(|m| m.status == MilestoneStatus::Pending));
-    }
-
-    #[test]
-    fn parse_milestones_drops_non_list_prose() {
-        let plan = "This plan does X.\n1. Real step\nSome closing remark.";
-        let ms = parse_milestones(plan);
-        assert_eq!(ms.len(), 1);
-        assert_eq!(ms[0].title, "Real step");
-    }
-
-    #[test]
-    fn parse_milestones_fallback_single_when_no_list() {
-        let plan = "Free-form prose plan with no markers.";
-        let ms = parse_milestones(plan);
-        assert_eq!(ms.len(), 1);
-        assert_eq!(ms[0].title, plan);
-    }
-
-    #[test]
-    fn parse_milestones_empty_plan() {
-        assert!(parse_milestones("").is_empty());
-        assert!(parse_milestones("   \n  ").is_empty());
-    }
-
-    #[test]
-    fn strip_list_marker_cases() {
-        assert_eq!(strip_list_marker("1. foo"), Some(" foo"));
-        assert_eq!(strip_list_marker("12) bar"), Some(" bar"));
-        assert_eq!(strip_list_marker("- baz"), Some(" baz"));
-        assert_eq!(strip_list_marker("* qux"), Some(" qux"));
-        assert_eq!(strip_list_marker("+ quux"), Some(" quux"));
-        assert_eq!(strip_list_marker("plain text"), None);
-        assert_eq!(strip_list_marker("2026 plan"), None); // digits, no marker
-    }
-
-    #[test]
-    fn parse_milestones_digit_prefix_non_list_does_not_set_base_indent() {
-        // A line starting with digits but lacking '.'/' )' (e.g. "2026 plan")
-        // must not be treated as a list item. The indented real list item
-        // below it should still be captured as a top-level milestone.
-        let plan = "2026 plan\n  - Real step\n  - Another step";
-        let ms = parse_milestones(plan);
-        let titles: Vec<&str> = ms.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(titles, vec!["Real step", "Another step"]);
-    }
 
     #[test]
     fn context_budget_pct_basic() {

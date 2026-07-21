@@ -810,7 +810,11 @@ impl ConversationState {
             // workspace's review overlay, not the conversation list — there is
             // no ToolCall card to backfill (the plan arrives as a text block,
             // not a tool call).
-            ThreadEvent::PlanDelta { .. } | ThreadEvent::PlanReady { .. } => {}
+            // `PlanUpdated` mirrors to the Context Rail (handled in the
+            // workspace subscription), not the conversation list.
+            ThreadEvent::PlanDelta { .. }
+            | ThreadEvent::PlanReady { .. }
+            | ThreadEvent::PlanUpdated { .. } => {}
             // Token usage + model/effort changes are surfaced elsewhere (sidebar /
             // model-history overlay). No conversation item.
             ThreadEvent::TokenUsageUpdated(_)

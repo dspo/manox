@@ -542,19 +542,19 @@ cockpit-status-streaming = Streaming
 # The "awaiting input" tag label (collapsed state of idle/stopped/failed/
 # awaiting-approval).
 cockpit-status-awaiting-input = Awaiting input
-# Milestone section header.
+# Plan section header.
 cockpit-milestones-header = Plan
-# Trailing note for a blocked milestone. {$deps} is a comma-separated list.
-cockpit-blocked-by = blocked by {$deps}
-# Collapsed summary of completed milestones. {$count} is a number.
-cockpit-completed-summary = +{$count} completed
+# Plan progress count shown at the right of the header. {$done}/{$total} are
+# completed/total step counts.
+cockpit-plan-progress = {$done}/{$total}
+# Remaining tasks beyond the current one, shown when collapsed. {$count} is a
+# number.
+cockpit-plan-remaining = +{$count} to do
+# Collapsed-state note when every step is completed.
+cockpit-plan-all-done = All done
 # Context-budget two rows. {$pct} is the remaining percent (0–100),
 # {$used}/{$cap} are pre-formatted used/cap counts.
 cockpit-context-remaining-ctx = {$pct}% context left {$used} / {$cap}
-# Hide/show tasks hint appended to the milestone section header. Generic —
-# the header is also clickable to toggle.
-cockpit-hide-tasks-hint = click to collapse
-cockpit-show-tasks-hint = click to expand
 
 composer-pasted-image = Pasted image
 composer-image-process-failed = Some pasted images could not be sent (unsupported format or too large)
