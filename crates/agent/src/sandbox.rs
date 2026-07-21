@@ -113,7 +113,15 @@ impl NetworkPolicy {
     ///
     /// Malformed entries are warned and skipped so a typo doesn't silently
     /// block the whole list.
+    #[cfg_attr(test, allow(clippy::needless_return))]
     pub fn for_project() -> Self {
+        // Test builds are hermetic: never read the developer's real
+        // settings.toml (which may have a non-empty allowlist that would
+        // make this return Restricted, breaking sandbox tests that expect
+        // Blocked). Production reads the real file.
+        if cfg!(test) {
+            return NetworkPolicy::Blocked;
+        }
         let patterns: Vec<http_proxy::HostPattern> = crate::settings::load()
             .network
             .allowlist
@@ -386,8 +394,9 @@ impl SandboxPolicy {
                 // Deny all network, then re-allow outbound to the local proxy
                 // port only. The proxy (running outside the sandbox) enforces
                 // the hostname allowlist. `network-bind` is re-allowed for
-                // localhost so the proxy itself isn't needed inside the
-                // sandbox — the sandboxed process only connects out.
+                // localhost so TCP connect() (which implicitly binds an
+                // ephemeral port) and tools that listen on localhost (e.g.
+                // dev servers) work inside the sandbox.
                 let port = proxy_port.unwrap_or(0);
                 s.push_str("(deny network*)\n");
                 s.push_str(&format!(
@@ -396,6 +405,7 @@ impl SandboxPolicy {
                 s.push_str(&format!(
                     "(allow network-outbound (remote tcp \"127.0.0.1:{port}\"))\n"
                 ));
+                s.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
             }
         }
         s
@@ -705,6 +715,10 @@ mod tests {
         assert!(
             s.contains("(allow network-outbound (remote tcp \"127.0.0.1:54321\"))"),
             "127.0.0.1 proxy port allow missing: {s}"
+        );
+        assert!(
+            s.contains("(allow network-bind (local ip \"localhost:*\"))"),
+            "network-bind for localhost missing: {s}"
         );
     }
 

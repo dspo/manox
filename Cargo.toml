@@ -83,7 +83,7 @@ httparse = "1"
 # idna — RFC 1035 / 3492 hostname canonicalization (Punycode) for the network
 # allowlist. Internationalized domain names entered as UTF-8 are converted to
 # the A-label form that TLS SNI and HTTP Host headers carry on the wire.
-idna = "0.5"
+idna = "1"
 # thiserror — derive Error for the http_proxy crate's host-pattern and deny-reason types.
 thiserror = "1"
 # url — URL parsing for the sandbox network proxy (CONNECT authority-form,

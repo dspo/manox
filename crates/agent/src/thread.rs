@@ -1816,11 +1816,17 @@ impl Thread {
     /// proxy needed). If the proxy is already running, returns its port
     /// without re-spawning.
     pub fn ensure_network_proxy(&mut self) -> Option<u16> {
+        // Fast path: proxy already running, return its port without
+        // rebuilding the sandbox policy (which reads settings.toml and
+        // canonicalizes paths).
+        if let Some(port) = self.proxy.as_ref().map(|p| p.port()) {
+            return Some(port);
+        }
         let sandbox = self.sandbox_for_bash();
         match sandbox.network() {
             crate::sandbox::NetworkPolicy::Restricted { allowlist } => {
                 if self.proxy.is_none() {
-                    let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+                    let (events_tx, events_rx) = futures::channel::mpsc::unbounded();
                     let config = http_proxy::ProxyConfig {
                         allowlist: allowlist.clone(),
                         events: events_tx,
@@ -1828,6 +1834,56 @@ impl Thread {
                     match http_proxy::ProxyHandle::spawn(config) {
                         Ok(handle) => {
                             self.proxy = Some(handle);
+                            // Drain proxy events on a background thread so
+                            // the unbounded channel doesn't fill and block
+                            // connection threads (which send synchronously).
+                            // Events are logged at debug level for diagnostics.
+                            crate::runtime::handle().spawn(async move {
+                                use futures::StreamExt as _;
+                                let mut rx = events_rx;
+                                while let Some(event) = rx.next().await {
+                                    match event {
+                                        http_proxy::ProxyEvent::Ready { port } => {
+                                            tracing::debug!(port, "sandbox network proxy ready");
+                                        }
+                                        http_proxy::ProxyEvent::RequestAttempt {
+                                            host,
+                                            port,
+                                            method,
+                                            outcome,
+                                        } => {
+                                            tracing::debug!(
+                                                host,
+                                                port,
+                                                method = method.as_str(),
+                                                allowed = matches!(
+                                                    outcome,
+                                                    http_proxy::RequestOutcome::Allowed
+                                                ),
+                                                "proxy request"
+                                            );
+                                        }
+                                        http_proxy::ProxyEvent::RequestCompleted {
+                                            host,
+                                            port,
+                                            method,
+                                            bytes_to_remote,
+                                            bytes_from_remote,
+                                            duration_ms,
+                                        } => {
+                                            tracing::debug!(
+                                                host,
+                                                port,
+                                                method = method.as_str(),
+                                                bytes_to_remote,
+                                                bytes_from_remote,
+                                                duration_ms,
+                                                "proxy request completed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -3379,6 +3435,15 @@ impl Thread {
         // `this.update`: a write lease here would still block the drain spawn
         // below from re-entering the entity, and historically tripped gpui's
         // `double_lease_panic` when tools did their own `read_with`.
+        // Ensure the thread's in-process network proxy is running before
+        // building the ToolContextSnapshot. The proxy is spawned lazily on
+        // the first sandboxed bash call when the network policy is
+        // `Restricted`; the snapshot captures its port so the bash tool
+        // can inject it into `wrap_command`. `None` for `Blocked` /
+        // `Unrestricted` (no proxy needed). This must happen before
+        // `from_thread` so the snapshot sees a live proxy port.
+        this.update(cx, |t, _| t.ensure_network_proxy())?;
+
         let ctx = this.read_with(cx, |t, _| crate::tool::ToolContextSnapshot::from_thread(t))?;
         let result_task: Task<Result<String, String>> =
             cx.update(|cx| tool.run_streaming(input, cancel.clone(), sink, &ctx, cx));
