@@ -12,7 +12,6 @@ use dirs::home_dir;
 use rand::RngCore;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -886,87 +885,10 @@ fn random_urlsafe(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(raw)
 }
 
-// ═══════════════════════════════════════════════════
-// Remote models fetching
-// ═══════════════════════════════════════════════════
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RemoteModelsResponse {
-    data: Vec<RemoteModelEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RemoteModelEntry {
-    id: String,
-}
-
-async fn fetch_remote_models(
-    url: &str,
-    api_key: &str,
-) -> Result<BTreeMap<String, ProviderModelConfig>> {
-    // Reject non-http schemes early for a clear error message.
-    let parsed = Url::parse(url).with_context(|| format!("无效的 models URL: {url}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => bail!("models URL 必须使用 http/https 协议，当前为 `{other}`"),
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("创建 HTTP 客户端失败")?;
-
-    let response = client
-        .get(url)
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .with_context(|| format!("请求 models 接口失败: {url}"))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let truncated: String = body.chars().take(500).collect();
-        let suffix = if body.chars().count() > 500 { "…" } else { "" };
-        bail!("models 接口返回 HTTP {status}: {truncated}{suffix}");
-    }
-
-    let parsed: RemoteModelsResponse = response
-        .json()
-        .await
-        .context("解析 models 接口响应失败")?;
-
-    let mut models = BTreeMap::new();
-    for entry in parsed.data {
-        models.insert(entry.id, ProviderModelConfig::default());
-    }
-    Ok(models)
-}
-
-fn resolve_provider_models(
-    provider: &ProviderConfig,
-) -> Result<BTreeMap<String, ProviderModelConfig>> {
-    match &provider.models {
-        ProviderModels::Inline(map) => Ok(map.clone()),
-        ProviderModels::RemoteUrl(url) => {
-            let apikey = provider
-                .apikey_source
-                .as_deref()
-                .map(resolve_apikey)
-                .unwrap_or_else(|| bail!("远程 models 接口需要配置 apikey_source"))?;
-
-            probe::runtime().block_on(async { fetch_remote_models(url, &apikey).await })
-        }
-    }
-}
-
 fn build_all_models(config: &CxConfig) -> Vec<ResolvedModel> {
     let mut models = Vec::new();
     for provider in &config.providers {
-        let resolved_models = match resolve_provider_models(provider) {
+        let resolved_models = match probe::runtime().block_on(provider.list_models()) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!(

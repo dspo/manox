@@ -19,6 +19,12 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "remote-models")]
+use reqwest::Client as HttpClient;
+
+#[cfg(feature = "remote-models")]
+use url::Url;
+
 pub const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
 pub const LEGACY_PROVIDER_CONFIG_FILE_NAME: &str = "config.yaml";
 
@@ -283,6 +289,71 @@ impl<'de> Deserialize<'de> for ProviderModels {
     }
 }
 
+// ═══════════════════════════════════════════════════
+// Remote models fetching (OpenAI-compatible /models endpoint)
+// ═══════════════════════════════════════════════════
+
+#[cfg(feature = "remote-models")]
+#[derive(Deserialize)]
+struct RemoteModelsResponse {
+    data: Vec<RemoteModelEntry>,
+}
+
+#[cfg(feature = "remote-models")]
+#[derive(Deserialize)]
+struct RemoteModelEntry {
+    id: String,
+}
+
+/// Fetch models from a remote `/models` endpoint.
+///
+/// The endpoint is expected to return an OpenAI-compatible response:
+/// `{"data": [{"id": "model-name", ...}, ...]}`.
+/// Extra fields are ignored so the parser is robust across providers.
+#[cfg(feature = "remote-models")]
+async fn fetch_remote_models(
+    url: &str,
+    api_key: &str,
+) -> Result<BTreeMap<String, ProviderModelConfig>> {
+    let parsed = Url::parse(url).with_context(|| format!("无效的 models URL: {url}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => bail!("models URL 必须使用 http/https 协议，当前为 `{other}`"),
+    }
+
+    let client = HttpClient::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("创建 HTTP 客户端失败")?;
+
+    let response = client
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .with_context(|| format!("请求 models 接口失败: {url}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let truncated: String = body.chars().take(500).collect();
+        let suffix = if body.chars().count() > 500 { "…" } else { "" };
+        bail!("models 接口返回 HTTP {status}: {truncated}{suffix}");
+    }
+
+    let parsed: RemoteModelsResponse = response
+        .json()
+        .await
+        .context("解析 models 接口响应失败")?;
+
+    let mut models = BTreeMap::new();
+    for entry in parsed.data {
+        models.insert(entry.id, ProviderModelConfig::default());
+    }
+    Ok(models)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
     pub id: String,
@@ -389,6 +460,34 @@ impl ProviderConfig {
     /// providers report correctly before models are fetched.
     pub fn has_endpoints(&self) -> bool {
         !self.endpoints.is_empty()
+    }
+
+    /// List all models for this provider.
+    ///
+    /// For inline models the map is returned directly. For remote models
+    /// (configured via `models: <url>`) the endpoint is fetched with the
+    /// provider's API key.
+    ///
+    /// This is an async method so callers can integrate it into an existing
+    /// tokio runtime. In sync contexts, use `Handle::current().block_on(…)`.
+    #[cfg(feature = "remote-models")]
+    pub async fn list_models(&self) -> Result<BTreeMap<String, ProviderModelConfig>> {
+        match &self.models {
+            ProviderModels::Inline(map) => Ok(map.clone()),
+            ProviderModels::RemoteUrl(url) => {
+                let api_key = self
+                    .apikey_source
+                    .as_deref()
+                    .map(resolve_apikey)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "provider `{}` 配置了远程 models URL 但缺少 apikey_source",
+                            self.name
+                        )
+                    })??;
+                fetch_remote_models(url, &api_key).await
+            }
+        }
     }
 }
 
