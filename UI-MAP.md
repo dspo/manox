@@ -627,18 +627,19 @@ Stats come from `git diff --numstat HEAD` (binary rows `-`/`-` skipped) plus `gi
 
 #### ContextRailBranchRow
 
-Resolved git identity line in the panel body. `env_row_clickable` with `Github` icon — the whole row is a pointer cursor that opens [ContextRailBranchMenu](#contextrailbranchmenu). The label shows:
+Resolved git identity block in the panel body (`render_branch_block`). When the thread is inside a worktree, a leading worktree-name row precedes the branch row; both rows share the same `h_flex` (icon + label) layout, `text_sm` font, and `gap_2` spacing so they read as peer rows.
 
-- The branch name when on a normal branch.
-- The short sha + "(detached)" hint when in detached HEAD.
-- "(worktree)" suffix when the thread is inside a git worktree.
-- "Not a git repo" when `git rev-parse --show-toplevel` fails.
-- "git unavailable" when the `git` binary is missing.
-- "--" before the first refresh lands; "No project" when no project is bound.
+- **Worktree row** (rendered only while inside a worktree): lucide `workflow` icon (resolved via [assets](#assets) at `icons/workflow.svg`) + the worktree directory basename as the label. Non-interactive — no trailing, no cursor, no menu.
+- **Branch row**: `env_row_clickable` with lucide `git-branch` icon (`icons/git-branch.svg`) — the whole row is a pointer cursor that opens [ContextRailBranchMenu](#contextrailbranchmenu). The label shows:
+  - The branch name when on a normal branch.
+  - The short sha + "(detached)" hint when in detached HEAD.
+  - "Not a git repo" when `git rev-parse --show-toplevel` fails.
+  - "git unavailable" when the `git` binary is missing.
+  - "--" before the first refresh lands; "No project" when no project is bound.
 
-Branch resolution prefers `Thread::worktree().branch` when inside a worktree; otherwise shells out to `git branch --show-current`, falling back to `git rev-parse --short HEAD` for detached HEAD. All via [`crate::git_status`](#git_status).
+Both glyphs live in manox's local asset bundle (`ExtrasAssetSource` in `agent-ui/src/assets.rs`), not `gpui-component-assets` — `IconName` is generated at compile time from the latter's directory and cannot reference them, so the rows construct `Icon::default().path("icons/…")` instead of `Icon::new(IconName::…)`. Branch resolution prefers `Thread::worktree().branch` when inside a worktree; otherwise shells out to `git branch --show-current`, falling back to `git rev-parse --short HEAD` for detached HEAD. All via [`crate::git_status`](#git_status).
 
-> Source: `agent-ui/src/views/context_rail.rs` (`render_branch_row`)
+> Source: `agent-ui/src/views/context_rail.rs` (`render_branch_block`)
 
 #### ContextRailBranchMenu
 
@@ -1084,3 +1085,5 @@ Values selectable in [EffortMenu](#effortmenu).
 #### Max
 #### Ultracode
 #### Auto
+
+

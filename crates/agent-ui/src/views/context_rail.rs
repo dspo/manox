@@ -560,7 +560,7 @@ impl ContextRail {
 
         let menu_open = self.branch_menu.is_some();
         let trigger = env_row_clickable(
-            IconName::Github,
+            "icons/git-branch.svg".into(),
             branch_label,
             Some(changes_line),
             theme,
@@ -657,12 +657,24 @@ impl ContextRail {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             block = block.child(
-                gpui::div()
+                h_flex()
                     .w_full()
-                    .truncate()
-                    .text_xs()
-                    .text_color(theme.foreground)
-                    .child(SharedString::from(basename)),
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Icon::new(Icon::default().path("icons/workflow.svg"))
+                            .xsmall()
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(
+                        gpui::div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(theme.foreground)
+                            .child(SharedString::from(basename)),
+                    ),
             );
         }
         block = block.child(trigger);
@@ -1146,8 +1158,13 @@ fn cockpit_status_block(icon: IconName, phase: AnyElement, theme: &Theme) -> Any
 /// an `on_click` handler, and tints the icon foreground when `open` so the
 /// affordance matches an open dropdown below it. Used by the branch row to
 /// open its context menu.
+///
+/// `icon_path` is a `icons/…` asset path resolved through `ExtrasAssetSource`,
+/// not an `IconName` — the rail's branch / worktree glyphs (lucide
+/// `git-branch`, `workflow`) live in manox's local asset bundle, not the
+/// `gpui-component-assets` set that `IconName` is generated from.
 fn env_row_clickable(
-    icon: IconName,
+    icon_path: SharedString,
     label: SharedString,
     trailing: Option<AnyElement>,
     theme: &Theme,
@@ -1166,7 +1183,11 @@ fn env_row_clickable(
         .gap_2()
         .cursor_pointer()
         .on_click(on_click)
-        .child(Icon::new(icon).xsmall().text_color(icon_color))
+        .child(
+            Icon::new(Icon::default().path(icon_path))
+                .xsmall()
+                .text_color(icon_color),
+        )
         .child(
             gpui::div()
                 .flex_1()

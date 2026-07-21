@@ -93,4 +93,14 @@ mod tests {
             assert!(LocalAssets::get(path).is_some(), "missing {path}");
         }
     }
+
+    #[test]
+    fn embeds_context_rail_branch_and_worktree_glyphs() {
+        // Rail glyphs resolved via `ExtrasAssetSource`; a missing file would
+        // silently fall through to `gpui-component-assets`, which does not
+        // ship these names, rendering blank.
+        for path in ["icons/git-branch.svg", "icons/workflow.svg"] {
+            assert!(LocalAssets::get(path).is_some(), "missing {path}");
+        }
+    }
 }
