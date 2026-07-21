@@ -2,7 +2,8 @@
 //!
 //! Config file: `~/.config/cx/cx.providers.config.yaml`. Schema:
 //! - `providers: Vec<ProviderConfig>`, each with `name` / `apikey_source` /
-//!   `models: BTreeMap<id, ProviderModelConfig>` / `endpoints: BTreeMap<wire_api, spec>` / `env`.
+//!   `models` (inline `BTreeMap<id, ProviderModelConfig>` or a remote URL string) /
+//!   `endpoints: BTreeMap<wire_api, spec>` / `env`.
 //! - `agents: Vec<AgentConfig>`, each describing an external agent binary cx can launch.
 //! - Each model supports several `wire_apis` (anthropic / responses / completions).
 //! - `ResolvedModel` is a fully resolved, callable model (provider + endpoint + wire_api + auth).
@@ -153,7 +154,7 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub apikey_source: Option<String>,
     #[serde(default)]
-    pub models: BTreeMap<String, ProviderModelConfig>,
+    pub models: ProviderModels,
     #[serde(default)]
     pub endpoints: BTreeMap<String, ProviderEndpointSpec>,
     #[serde(default)]
@@ -235,6 +236,53 @@ pub struct ProviderModelConfig {
     pub supports_images: Option<bool>,
 }
 
+/// Models can be either inline definitions (map of model-id → config) or a
+/// URL pointing to a remote `/models` endpoint that returns an
+/// OpenAI-compatible model list at runtime.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ProviderModels {
+    Inline(BTreeMap<String, ProviderModelConfig>),
+    RemoteUrl(String),
+}
+
+impl Default for ProviderModels {
+    fn default() -> Self {
+        Self::Inline(BTreeMap::new())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderModels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(s) => Ok(ProviderModels::RemoteUrl(s)),
+            serde_yaml::Value::Mapping(map) => {
+                let mut models = BTreeMap::new();
+                for (key, val) in map {
+                    let key_str = key.as_str().ok_or_else(|| {
+                        serde::de::Error::custom("model key must be a string")
+                    })?;
+                    let model = if val.is_null() {
+                        ProviderModelConfig::default()
+                    } else {
+                        ProviderModelConfig::deserialize(val)
+                            .map_err(serde::de::Error::custom)?
+                    };
+                    models.insert(key_str.to_string(), model);
+                }
+                Ok(ProviderModels::Inline(models))
+            }
+            _ => Err(serde::de::Error::custom(
+                "models must be a map or a URL string",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentConfig {
     pub id: String,
@@ -253,8 +301,43 @@ pub struct AgentConfig {
 // ═══════════════════════════════════════════════════
 
 impl ProviderConfig {
-    /// Cross-normalize `endpoints` against `models`: each endpoint carries the models it supports.
+    /// Return the inline models map, or `None` when models are sourced from a remote URL.
+    pub fn models_map(&self) -> Option<&BTreeMap<String, ProviderModelConfig>> {
+        match &self.models {
+            ProviderModels::Inline(map) => Some(map),
+            ProviderModels::RemoteUrl(_) => None,
+        }
+    }
+
+    /// Return a mutable reference to the inline models map, or `None` for remote models.
+    pub fn models_map_mut(&mut self) -> Option<&mut BTreeMap<String, ProviderModelConfig>> {
+        match &mut self.models {
+            ProviderModels::Inline(map) => Some(map),
+            ProviderModels::RemoteUrl(_) => None,
+        }
+    }
+
+    /// True when models are fetched from a remote URL at runtime.
+    pub fn is_remote_models(&self) -> bool {
+        matches!(&self.models, ProviderModels::RemoteUrl(_))
+    }
+
+    /// Cross-normalize `endpoints` against the inline models. For remote-model
+    /// providers callers should use [`normalized_endpoints_resolved`] instead.
     pub fn normalized_endpoints(&self) -> Vec<EndpointConfig> {
+        match &self.models {
+            ProviderModels::Inline(map) => self.normalized_endpoints_resolved(map),
+            ProviderModels::RemoteUrl(_) => Vec::new(),
+        }
+    }
+
+    /// Cross-normalize `endpoints` against a resolved models map (from inline
+    /// config or fetched from a remote URL). Each endpoint carries the models it
+    /// supports.
+    pub fn normalized_endpoints_resolved(
+        &self,
+        models: &BTreeMap<String, ProviderModelConfig>,
+    ) -> Vec<EndpointConfig> {
         let mut endpoints = self
             .endpoints
             .iter()
@@ -267,8 +350,7 @@ impl ProviderConfig {
                         detail.copilot_auth.clone(),
                     ),
                 };
-                let models = self
-                    .models
+                let models = models
                     .iter()
                     .filter(|(_, model)| {
                         model.wire_apis.is_empty()
@@ -303,7 +385,7 @@ impl ProviderConfig {
     }
 
     pub fn has_endpoints(&self) -> bool {
-        !self.normalized_endpoints().is_empty()
+        !self.endpoints.is_empty()
     }
 }
 
@@ -321,11 +403,11 @@ pub struct ResolvedModel {
     pub env: BTreeMap<String, String>,
     /// apikey resolution source from the provider (`keychain:SERVICE` / `env:VAR` / `literal:` / `$(shell ...)`).
     pub apikey_source: Option<String>,
-    /// Maximum tokens a single response may emit. `None` = consumer derives
-    /// a heuristic from the context window.
+    /// Maximum tokens a single response may emit. Defaults to 384K when not
+    /// specified in config or by the remote models API.
     pub max_output_tokens: Option<u64>,
-    /// Model context window size in tokens. `None` = consumer falls back to the
-    /// id bracket suffix.
+    /// Model context window size in tokens. Defaults to 1M when not specified
+    /// in config or by the remote models API.
     pub max_tokens: Option<u64>,
     /// Whether the model accepts tool definitions. `true` when the model did
     /// not opt out, so existing models keep tool access by default.
@@ -336,6 +418,11 @@ pub struct ResolvedModel {
 }
 
 impl ResolvedModel {
+    /// Fallback context window when neither config nor remote API provides it: 1M tokens.
+    pub const DEFAULT_MAX_TOKENS: u64 = 1_000_000;
+    /// Fallback max output tokens: 384K.
+    pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 384_000;
+
     /// Build a resolved model with shared semantics: `visible_agents` is the
     /// effective set for this model (wire_api-compatible agents, filtered by the
     /// endpoint + model `agents` lists, empty filter = no restriction), `env`
@@ -374,8 +461,8 @@ impl ResolvedModel {
             copilot_auth: CopilotAuth::from_endpoint(endpoint),
             env: merged_env,
             apikey_source: provider.apikey_source.clone(),
-            max_output_tokens: model.max_output_tokens,
-            max_tokens: model.max_tokens,
+            max_output_tokens: Some(model.max_output_tokens.unwrap_or(Self::DEFAULT_MAX_OUTPUT_TOKENS)),
+            max_tokens: Some(model.max_tokens.unwrap_or(Self::DEFAULT_MAX_TOKENS)),
             supports_tools: model.supports_tools.unwrap_or(true),
             supports_images: model.supports_images.unwrap_or(false),
         }
@@ -509,10 +596,15 @@ impl CxConfig {
     }
 
     /// Cross-normalize all providers, yielding every `ResolvedModel` (manox semantics).
+    /// Remote-model providers are skipped — callers that can do HTTP should resolve
+    /// models first and iterate via `normalized_endpoints_resolved`.
     pub fn resolve_all_models(&self) -> Vec<ResolvedModel> {
         let mut out = Vec::new();
         for provider in &self.providers {
-            for endpoint in provider.normalized_endpoints() {
+            let Some(models) = provider.models_map() else {
+                continue; // RemoteUrl — manox cannot fetch; caller must resolve externally.
+            };
+            for endpoint in provider.normalized_endpoints_resolved(models) {
                 for model in &endpoint.models {
                     out.push(ResolvedModel::from_config(self, provider, &endpoint, model));
                 }
@@ -1213,8 +1305,14 @@ providers:
         let config: CxConfig = yaml.parse().expect("parse");
         let resolved = config.resolve_all_models();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].max_output_tokens, None);
-        assert_eq!(resolved[0].max_tokens, None);
+        assert_eq!(
+            resolved[0].max_output_tokens,
+            Some(ResolvedModel::DEFAULT_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(
+            resolved[0].max_tokens,
+            Some(ResolvedModel::DEFAULT_MAX_TOKENS)
+        );
         assert!(resolved[0].supports_tools, "tools default on");
         assert!(!resolved[0].supports_images, "images default off");
     }

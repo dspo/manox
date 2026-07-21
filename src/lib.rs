@@ -12,6 +12,7 @@ use dirs::home_dir;
 use rand::RngCore;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -30,8 +31,9 @@ use url::Url;
 use cx_providers::{
     AgentConfig, ApiKeySourceKind, CopilotAuth, CxConfig, EndpointConfig, ModelConfig,
     PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec, ProviderModelConfig,
-    ResolvedAgent, ResolvedModel, WireApi, active_provider_config_path, canonical_agent_id,
-    cx_state_dir, effective_agents_for_model, read_config_file, resolve_apikey, resolved_agents,
+    ProviderModels, ResolvedAgent, ResolvedModel, WireApi, active_provider_config_path,
+    canonical_agent_id, cx_state_dir, effective_agents_for_model, read_config_file,
+    resolve_apikey, resolved_agents,
 };
 
 mod codex_app;
@@ -157,8 +159,12 @@ fn resolved_model_from_config(
         copilot_auth: CopilotAuth::from_endpoint(endpoint),
         env: merged_env,
         apikey_source: provider.apikey_source.clone(),
-        max_output_tokens: model.max_output_tokens,
-        max_tokens: model.max_tokens,
+        max_output_tokens: Some(
+            model
+                .max_output_tokens
+                .unwrap_or(ResolvedModel::DEFAULT_MAX_OUTPUT_TOKENS),
+        ),
+        max_tokens: Some(model.max_tokens.unwrap_or(ResolvedModel::DEFAULT_MAX_TOKENS)),
         supports_tools: model.supports_tools.unwrap_or(true),
         supports_images: model.supports_images.unwrap_or(false),
     }
@@ -916,10 +922,86 @@ fn random_urlsafe(bytes: usize) -> String {
     URL_SAFE_NO_PAD.encode(raw)
 }
 
+// ═══════════════════════════════════════════════════
+// Remote models fetching
+// ═══════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+struct RemoteModelsResponse {
+    data: Vec<RemoteModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct RemoteModelEntry {
+    id: String,
+}
+
+async fn fetch_remote_models(
+    url: &str,
+    api_key: &str,
+) -> Result<BTreeMap<String, ProviderModelConfig>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("创建 HTTP 客户端失败")?;
+
+    let response = client
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .with_context(|| format!("请求 models 接口失败: {url}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("models 接口返回 HTTP {status}: {body}");
+    }
+
+    let parsed: RemoteModelsResponse = response
+        .json()
+        .await
+        .context("解析 models 接口响应失败")?;
+
+    let mut models = BTreeMap::new();
+    for entry in parsed.data {
+        models.insert(entry.id, ProviderModelConfig::default());
+    }
+    Ok(models)
+}
+
+fn resolve_provider_models(
+    provider: &ProviderConfig,
+) -> Result<BTreeMap<String, ProviderModelConfig>> {
+    match &provider.models {
+        ProviderModels::Inline(map) => Ok(map.clone()),
+        ProviderModels::RemoteUrl(url) => {
+            let apikey = provider
+                .apikey_source
+                .as_deref()
+                .map(resolve_apikey)
+                .unwrap_or_else(|| bail!("远程 models 接口需要配置 apikey_source"))?;
+
+            probe::runtime().block_on(async { fetch_remote_models(url, &apikey).await })
+        }
+    }
+}
+
 fn build_all_models(config: &CxConfig) -> Vec<ResolvedModel> {
     let mut models = Vec::new();
     for provider in &config.providers {
-        for endpoint in provider.normalized_endpoints() {
+        let resolved_models = match resolve_provider_models(provider) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "警告: 获取 Provider `{}` 的 models 失败: {e}",
+                    provider.name
+                );
+                continue;
+            }
+        };
+        for endpoint in provider.normalized_endpoints_resolved(&resolved_models) {
             for model in &endpoint.models {
                 models.push(resolved_model_from_config(
                     config, provider, &endpoint, model,
@@ -933,6 +1015,11 @@ fn build_all_models(config: &CxConfig) -> Vec<ResolvedModel> {
 fn provider_supports_agent(config: &CxConfig, provider: &ProviderConfig, agent_id: &str) -> bool {
     let agent_id = canonical_agent_id(agent_id);
     if !provider.has_endpoints() {
+        return true;
+    }
+    // Remote-model providers: assume compatible until models are fetched at
+    // selection time; the actual model list determines compatibility then.
+    if provider.is_remote_models() {
         return true;
     }
 
@@ -1650,11 +1737,19 @@ fn validate_apikey_payload(kind: ApiKeySourceKind, value: &str) -> Result<String
 
 fn validate_model_id(provider: &ProviderConfig, model_id: &str) -> Result<String> {
     let model_id = validate_required_text(model_id, "Model ID")?;
-    if provider.models.contains_key(&model_id) {
+    if provider.is_remote_models() {
         bail!(
-            "Provider `{}` 已存在 model `{model_id}`；当前配置以 model id 作为 key，不能重复创建",
+            "Provider `{}` 使用远程 models 接口，不支持手动添加 model",
             provider.name
         );
+    }
+    if let Some(map) = provider.models_map() {
+        if map.contains_key(&model_id) {
+            bail!(
+                "Provider `{}` 已存在 model `{model_id}`；当前配置以 model id 作为 key，不能重复创建",
+                provider.name
+            );
+        }
     }
     Ok(model_id)
 }
@@ -1712,7 +1807,13 @@ fn apply_add_operation(config: &mut CxConfig, operation: AddOperation) -> Result
                 );
             }
             let model_id = validate_model_id(provider, &model_id)?;
-            provider.models.insert(model_id.clone(), model);
+            let provider_name = provider.name.clone();
+            let map = provider.models_map_mut().with_context(|| {
+                format!(
+                    "Provider `{provider_name}` 使用远程 models 接口，不支持手动添加 model",
+                )
+            })?;
+            map.insert(model_id.clone(), model);
             Ok(AddResult::Model {
                 provider_name,
                 wire_api,
@@ -2557,7 +2658,7 @@ fn collect_new_provider_operation(
     let mut provider = ProviderConfig {
         name: provider_name.clone(),
         apikey_source,
-        models: BTreeMap::new(),
+        models: ProviderModels::Inline(BTreeMap::new()),
         endpoints,
         env: BTreeMap::new(),
     };
@@ -2565,7 +2666,9 @@ fn collect_new_provider_operation(
     if add_model_now {
         match collect_model_draft(terminal, config, &provider, first_wire_api)? {
             PromptOutcome::Submit((model_id, model)) => {
-                provider.models.insert(model_id, model);
+                if let Some(map) = provider.models_map_mut() {
+                    map.insert(model_id, model);
+                }
             }
             PromptOutcome::Back => {}
             PromptOutcome::Cancel => return Ok(PromptOutcome::Cancel),
@@ -3882,7 +3985,7 @@ mod tests {
             providers: vec![ProviderConfig {
                 name: "Test".into(),
                 apikey_source: Some("literal:test".into()),
-                models: BTreeMap::new(),
+                models: ProviderModels::Inline(BTreeMap::new()),
                 endpoints: BTreeMap::new(),
                 env: BTreeMap::new(),
             }],
@@ -3950,7 +4053,7 @@ mod tests {
             providers: vec![ProviderConfig {
                 name: "Xiaomi MIMO".into(),
                 apikey_source: Some("literal:test".into()),
-                models: BTreeMap::from([(
+                models: ProviderModels::Inline(BTreeMap::from([(
                     "mimo-v2.5-pro".into(),
                     ProviderModelConfig {
                         desc: Some("thinking".into()),
@@ -3959,7 +4062,7 @@ mod tests {
                         env: BTreeMap::new(),
                         ..Default::default()
                     },
-                )]),
+                )])),
                 endpoints: BTreeMap::from([
                     (
                         "anthropic".into(),
@@ -4760,7 +4863,7 @@ mod tests {
         let provider = ProviderConfig {
             name: "Test".into(),
             apikey_source: None,
-            models: BTreeMap::from([(
+            models: ProviderModels::Inline(BTreeMap::from([(
                 "m1".into(),
                 ProviderModelConfig {
                     desc: None,
@@ -4769,7 +4872,7 @@ mod tests {
                     env: model_only_env,
                     ..Default::default()
                 },
-            )]),
+            )])),
             endpoints: BTreeMap::from([(
                 "anthropic".into(),
                 ProviderEndpointSpec::Url("https://example.com".into()),
@@ -4798,14 +4901,14 @@ mod tests {
         let existing = vec![ProviderConfig {
             name: "A".into(),
             apikey_source: Some("literal:old".into()),
-            models: BTreeMap::new(),
+            models: ProviderModels::Inline(BTreeMap::new()),
             endpoints: BTreeMap::new(),
             env: BTreeMap::new(),
         }];
         let incoming = vec![ProviderConfig {
             name: "A".into(),
             apikey_source: Some("literal:new".into()),
-            models: BTreeMap::new(),
+            models: ProviderModels::Inline(BTreeMap::new()),
             endpoints: BTreeMap::new(),
             env: BTreeMap::new(),
         }];
@@ -4819,14 +4922,14 @@ mod tests {
         let existing = vec![ProviderConfig {
             name: "A".into(),
             apikey_source: None,
-            models: BTreeMap::new(),
+            models: ProviderModels::Inline(BTreeMap::new()),
             endpoints: BTreeMap::new(),
             env: BTreeMap::new(),
         }];
         let incoming = vec![ProviderConfig {
             name: "B".into(),
             apikey_source: None,
-            models: BTreeMap::new(),
+            models: ProviderModels::Inline(BTreeMap::new()),
             endpoints: BTreeMap::new(),
             env: BTreeMap::new(),
         }];
@@ -4840,21 +4943,21 @@ mod tests {
             ProviderConfig {
                 name: "A".into(),
                 apikey_source: Some("literal:a".into()),
-                models: BTreeMap::new(),
+                models: ProviderModels::Inline(BTreeMap::new()),
                 endpoints: BTreeMap::new(),
                 env: BTreeMap::new(),
             },
             ProviderConfig {
                 name: "B".into(),
                 apikey_source: Some("literal:old".into()),
-                models: BTreeMap::new(),
+                models: ProviderModels::Inline(BTreeMap::new()),
                 endpoints: BTreeMap::new(),
                 env: BTreeMap::new(),
             },
             ProviderConfig {
                 name: "C".into(),
                 apikey_source: Some("literal:c".into()),
-                models: BTreeMap::new(),
+                models: ProviderModels::Inline(BTreeMap::new()),
                 endpoints: BTreeMap::new(),
                 env: BTreeMap::new(),
             },
@@ -4863,14 +4966,14 @@ mod tests {
             ProviderConfig {
                 name: "B".into(),
                 apikey_source: Some("literal:new".into()),
-                models: BTreeMap::new(),
+                models: ProviderModels::Inline(BTreeMap::new()),
                 endpoints: BTreeMap::new(),
                 env: BTreeMap::new(),
             },
             ProviderConfig {
                 name: "D".into(),
                 apikey_source: Some("literal:d".into()),
-                models: BTreeMap::new(),
+                models: ProviderModels::Inline(BTreeMap::new()),
                 endpoints: BTreeMap::new(),
                 env: BTreeMap::new(),
             },
@@ -4980,7 +5083,7 @@ mod tests {
         let provider = ProviderConfig {
             name: "Packy API".into(),
             apikey_source: Some("env:PACKY_API_KEY".into()),
-            models: BTreeMap::new(),
+            models: ProviderModels::Inline(BTreeMap::new()),
             endpoints: BTreeMap::from([(
                 "anthropic".into(),
                 ProviderEndpointSpec::Url("https://example.com/anthropic".into()),
@@ -5045,7 +5148,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(result, AddResult::Model { .. }));
-        let stored = config.providers[0].models.get("qwen3.6-plus").unwrap();
+        let stored = config.providers[0].models_map().unwrap().get("qwen3.6-plus").unwrap();
         assert_eq!(stored.wire_apis, vec!["responses".to_string()]);
         assert_eq!(stored.desc.as_deref(), Some("Agent/终端最强"));
     }
@@ -5072,7 +5175,7 @@ mod tests {
             providers: vec![ProviderConfig {
                 name: "Packy API".into(),
                 apikey_source: None,
-                models: BTreeMap::from([(
+                models: ProviderModels::Inline(BTreeMap::from([(
                     "claude-opus-4-7".into(),
                     ProviderModelConfig {
                         desc: None,
@@ -5081,7 +5184,7 @@ mod tests {
                         env: BTreeMap::new(),
                         ..Default::default()
                     },
-                )]),
+                )])),
                 endpoints: BTreeMap::from([(
                     "anthropic".into(),
                     ProviderEndpointSpec::Url("https://example.com/anthropic".into()),
@@ -5919,7 +6022,7 @@ agents:
     wire_apis: [anthropic]
 "#;
         let config: CxConfig = serde_yaml::from_str(old_yaml).unwrap();
-        let model = config.providers[0].models.get("test-model").unwrap();
+        let model = config.providers[0].models_map().unwrap().get("test-model").unwrap();
         assert_eq!(model.desc.as_deref(), Some("test"));
         // swe_pro / hle / context / lcb_pro are no longer struct fields;
         // serde silently ignores unknown keys in old YAML.
@@ -5962,7 +6065,7 @@ agents:
         );
 
         // Model-level env preserved
-        let model = provider.models.get("glm-5.1").unwrap();
+        let model = provider.models_map().unwrap().get("glm-5.1").unwrap();
         assert_eq!(
             model.env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
             Some(&"1000000".to_string())
