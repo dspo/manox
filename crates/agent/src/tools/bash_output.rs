@@ -30,11 +30,11 @@ struct BashOutputInput {
     /// output has accumulated since the last poll. The blocking form is useful
     /// when the model knows the process emits output slowly and wants to avoid
     /// a busy-poll loop.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::bash::lenient_bool_opt")]
     block: Option<bool>,
     /// Seconds to wait when `block` is true (default 10, max 60). Ignored when
     /// `block` is false.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::bash::lenient_u64_opt")]
     timeout_secs: Option<u64>,
 }
 
@@ -164,5 +164,16 @@ mod tests {
         let p: BashOutputInput = serde_json::from_value(v).unwrap();
         assert_eq!(p.block, Some(true));
         assert_eq!(p.timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn input_parses_string_block_and_timeout() {
+        // Models occasionally emit `block: "true"` / `timeout_secs: "10"` as
+        // strings; the lenient deserializers accept both forms so the poll is
+        // not dropped on a parse failure.
+        let v = serde_json::json!({"shell_id": "bash_1", "block": "true", "timeout_secs": "10"});
+        let p: BashOutputInput = serde_json::from_value(v).unwrap();
+        assert_eq!(p.block, Some(true));
+        assert_eq!(p.timeout_secs, Some(10));
     }
 }
