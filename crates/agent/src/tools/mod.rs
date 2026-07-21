@@ -25,10 +25,13 @@ pub mod path_selector;
 pub mod read_file;
 pub mod self_info;
 pub mod skill;
+pub mod task_stop;
 pub mod truncate;
 pub mod update_plan;
 pub mod web_explore;
 pub mod web_fetch;
+pub mod websocket;
+
 pub mod worktree;
 pub mod write_file;
 
@@ -65,6 +68,8 @@ pub const UPDATE_PLAN: &str = "UpdatePlan";
 pub const WEB_FETCH: &str = "WebFetch";
 pub const ENTER_WORKTREE: &str = "EnterWorktree";
 pub const EXIT_WORKTREE: &str = "ExitWorktree";
+pub const TASK_STOP: &str = "TaskStop";
+
 pub const WRITE: &str = "Write";
 
 // ─── shared helpers ───────────────────────────────────────────────────────
@@ -103,6 +108,7 @@ pub(crate) fn schema_for_tool(name: &str) -> Value {
         "ExitWorktree" => schema::<worktree::ExitWorktreeInput>(),
         "BashOutput" => schema::<bash_output::BashOutputInput>(),
         "AskUserQuestion" => schema::<ask_user::AskUserQuestionInput>(),
+        "TaskStop" => schema::<task_stop::TaskStopInput>(),
         other => panic!("schema_for_tool: {other} is not a bilingualized tool"),
     }
 }
@@ -387,6 +393,7 @@ pub(crate) fn base_tools_with_policy(
         // without the full browser. The JS/auth-gated counterpart stays in the
         // main-thread-only `web_explore_*` set.
         Arc::new(web_fetch::WebFetchTool) as AnyAgentTool,
+        Arc::new(task_stop::TaskStopTool) as AnyAgentTool,
     ];
 
     // Status is always available so a broken shim or missing installation is
@@ -504,6 +511,7 @@ mod tests {
         assert!(names.contains(&"WebFetch"));
         assert!(names.contains(&"BashOutput"));
         assert!(names.contains(&"Monitor"));
+        assert!(names.contains(&"TaskStop"));
         // The sub-agent tool is registered by `main_registry`, not `base_tools`.
         assert!(!names.contains(&"Agent"));
     }

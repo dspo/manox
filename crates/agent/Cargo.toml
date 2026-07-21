@@ -50,6 +50,7 @@ http.workspace = true
 fluent.workspace = true
 unic-langid.workspace = true
 tera.workspace = true
+tokio-tungstenite = { workspace = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
