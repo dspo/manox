@@ -26,7 +26,7 @@ pub struct ReadTool {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ReadFileInput {
+pub(crate) struct ReadFileInput {
     /// Absolute or relative file path to read (relative to cwd). Append
     /// `:<sel>` for line ranges or raw mode: `:50-200` (inclusive range),
     /// `:50+150` (150 lines from 50), `:5-16,960-973` (multiple ranges),

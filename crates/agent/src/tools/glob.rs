@@ -23,7 +23,7 @@ pub struct GlobTool {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct GlobInput {
+pub(crate) struct GlobInput {
     /// Glob pattern (e.g. `**/*.rs`), relative to `path`/cwd.
     /// Supports `{a,b}` alternation, `[ab]` classes, `**` recursion.
     /// `*.rs` matches top-level only; use `**/*.rs` for recursion.

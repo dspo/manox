@@ -20,7 +20,7 @@ pub struct ListTool {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ListDirectoryInput {
+pub(crate) struct ListDirectoryInput {
     /// Directory path to list (defaults to cwd).
     #[serde(default)]
     path: Option<String>,

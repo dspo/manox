@@ -1,0 +1,76 @@
+{
+  "Read": "Read a file with optional line-range selectors. Output format: first line `[<abs-path>#<TAG>]` (4-hex snapshot tag), followed by `N:TEXT` numbered rows (1-indexed). Append `:<sel>` to the path for partial reads: `:50-200` (inclusive range), `:50+150` (150 lines from 50), `:5-16,960-973` (multiple ranges), `:raw` (verbatim, no anchors/line numbers), `:raw:1-50` (compound). Without a selector the first 2000 lines are returned; use a range selector to page through longer files.",
+  "Read/properties/path": "Absolute or relative file path to read (relative to cwd). Append `:<sel>` for line ranges or raw mode: `:50-200` (inclusive range), `:50+150` (150 lines from 50), `:5-16,960-973` (multiple ranges), `:raw` (verbatim, no anchors/line numbers), `:raw:1-50` (compound).",
+
+  "Write": "Write content to the specified file (overwrite). Use to create or rewrite a file.",
+  "Write/properties/path": "File path to write.",
+  "Write/properties/content": "Full content to write. If the model accidentally pastes `read_file` output (with `[path#tag]` header and `N:` line prefixes), those prefixes are stripped automatically.",
+
+  "Edit": "Edit an existing file via a hashline patch (line-anchored + TAG validation). See the input.patch field docs.",
+  "Edit/properties/patch": "Hashline patch text. Each file section starts with a header `[<abs-path>#<tag>]` — paste the exact absolute path and 4-hex tag returned by your latest `read_file` for that file; do NOT write the literal word `PATH`. Example: `[/Users/me/proj/CLAUDE.md#A557]`. Operations: `SWAP N.=M:` replace lines N..=M (inclusive) with the `+TEXT` body rows; `DEL N.=M` delete lines N..=M (no body); `INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` insert body rows; `SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:` operate on the bracket-block beginning at line N. Body rows are `+TEXT` (`+` alone = blank line; `+-x`/`++x` escapes a literal leading `-`/`+`); a `-`-prefixed markdown list item is NOT a body row — rewrite it with a `+` prefix. Line numbers reference the ORIGINAL file from read_file and do not shift across hunks. Ranges cover only changed lines; pure additions use `INS`, never a widened `SWAP`. On a stale-TAG rejection, re-`read_file` before retrying. Format gotchas (common miswrites): the range separator is `.=` not `:` — write `SWAP 37.=48:` not `SWAP 37:=48:`. The body starts on the NEXT line as `+`-prefixed rows, never on the same line as the directive. Complete example: ```text\n[/Users/me/proj/main.py#A557]\nSWAP 37.=48:\n+    if args.command == \"add\":\n+        handler.add(args.title)\n+    else:\n+        parser.print_help()\n```",
+
+  "Bash": "Run a bash command and return stdout. Runs inside an OS sandbox by default (macOS seatbelt: writes confined to the project root and temp dir, `.git` read-only, network disabled); each call is a one-shot `bash -c` — `cd`/`export` don't persist across calls, so chain steps with `&&` or use the `cwd` parameter. For out-of-sandbox capabilities (network, writing outside the project root) set `unsandboxed: true`, which after user approval runs in a persistent shell session (cd/export persist across calls). Default timeout is 120s (override with timeout_secs); on timeout or cancel the whole process group is terminated. stdout/stderr stream back to the UI live. Do NOT pipe output to `head`/`tail` to reduce volume — that truncates the upstream pipe and can SIGPIPE-kill a long-running command; use `head_lines`/`tail_lines` instead, which keep the selection (first N, last N, or both with middle elided) while letting the command finish naturally.",
+  "Bash/properties/command": "Bash command to run in the persistent session (`cd` / `export` persist).",
+  "Bash/properties/cwd": "Working directory override (persists across subsequent calls).",
+  "Bash/properties/timeout_secs": "Kill the command after this many seconds (defaults to 120).",
+  "Bash/properties/unsandboxed": "Run outside the OS sandbox (macOS seatbelt). Default false: the command is confined to project root + temp dir writes, `.git` read-only, network denied, and runs without approval. Set true only when the command genuinely needs the outside (network, writes outside the project) — it then runs in a persistent shell with no confinement, gated by user approval.",
+  "Bash/properties/head_lines": "Keep only the first N lines of stdout/stderr. The command still runs to completion (no SIGPIPE) — prefer this over piping into `head`, which truncates the upstream pipe and can SIGPIPE-kill a long-running command.",
+  "Bash/properties/tail_lines": "Keep only the last N lines of stdout/stderr. The command still runs to completion (no SIGPIPE) — prefer this over piping into `tail`.",
+  "Bash/properties/run_in_background": "When true, start the command in the background and return immediately with a shell id. Poll the shell id with `BashOutput` to read incremental output until the process exits. Mirrors Claude Code's `run_in_background` bash flag. Background shells are tracked in the process-global `background_shell` registry; they keep running across turns.",
+
+  "Grep": "Search file contents by regex, returning matching lines (with line numbers). Results are capped per line and by count; use limit/offset to page, or narrow the search with path/glob/pattern when results are truncated.",
+  "Grep/properties/pattern": "Regex pattern.",
+  "Grep/properties/path": "Search root directory (defaults to cwd).",
+  "Grep/properties/glob": "Optional filename glob filter (e.g. `*.rs`).",
+  "Grep/properties/limit": "Maximum matches to return (defaults to 200, hard-capped at 1000).",
+  "Grep/properties/offset": "Number of leading matches to skip, for paging through large result sets (defaults to 0).",
+
+  "Glob": "Find file paths matching a glob pattern (relative to cwd). Honors .gitignore and skips hidden files by default; returns relative paths, capped at 100. Pass no_ignore/include_hidden/include_dirs/limit to relax. Note: limit is hard-capped at 1000 — prefer narrowing the pattern over raising limit.",
+  "Glob/properties/pattern": "Glob pattern (e.g. `**/*.rs`), relative to `path`/cwd. Supports `{a,b}` alternation, `[ab]` classes, `**` recursion. `*.rs` matches top-level only; use `**/*.rs` for recursion.",
+  "Glob/properties/path": "Search root, defaults to cwd.",
+  "Glob/properties/no_ignore": "When true, ignore all `.gitignore`/`.ignore`/global gitignore rules.",
+  "Glob/properties/include_hidden": "When true, do not skip hidden (dot) files and directories.",
+  "Glob/properties/include_dirs": "When true, also yield directory entries that match the pattern.",
+  "Glob/properties/limit": "Max results to return. Default 100, hard-capped at 1000 — raising beyond that risks blowing up your own context window with a huge repo; narrow `pattern` instead of raising `limit` when possible.",
+
+  "List": "List the direct children (files and directories) of a directory.",
+  "List/properties/path": "Directory path to list (defaults to cwd).",
+
+  "WebFetch": "Fetch a web document over HTTP/HTTPS GET and return its text. Use this for public docs, articles, JSON/XML feeds, and raw file URLs. It performs no JS execution and carries no cookies or login state — for auth-gated or JS-rendered pages, use the `web_explore_*` tools instead. Output: a header block (final URL, HTTP status, content-type, received bytes, truncation advisory) followed by the body text (truncated on a UTF-8 boundary if it exceeds `max_bytes`).",
+  "WebFetch/properties/url": "Absolute `http://` or `https://` URL to fetch.",
+  "WebFetch/properties/max_bytes": "Cap on the returned body in bytes (UTF-8 boundary). Default 512 KiB; the effective value is clamped to 4 MiB regardless of what the caller asks.",
+  "WebFetch/properties/timeout_secs": "Overall request timeout in seconds (connect + body read). Default 30.",
+
+  "SelfInfo": "Read the current agent's runtime identity: thread id, current working directory, project root, model, turns used / cap, and nesting depth. Call this when the user asks for the thread id or you need to confirm the runtime environment — do not run SQL or dig into the persistence layer (threads.db) to look yourself up.",
+
+  "Skill": "Consult the full body of a named skill. Skill names appear in the system prompt's \"Available skills\" list; plugin skills use the `plugin:skill` form (e.g. `gitwork:review`). Call only when the task genuinely needs the skill's domain knowledge; don't re-fetch one you already know.",
+  "Skill/properties/name": "Skill name exactly as it appears in the system prompt's available-skills list. Plugin skills use the `plugin:skill` form (e.g. `gitwork:review`).",
+
+  "Monitor": "Stream stdout/stderr from a long-running shell command line by line. Each line becomes a live update while the command runs. Use for watching a build, a deploy, a log tail, or any process whose intermediate output matters. The command runs under `sh -c`. Filter the command so it emits only lines you would act on — do not pipe raw noisy logs. Cover terminal states: a crash, a hang, or an unexpected exit must all produce output. Returns the full captured text as the tool result.",
+  "Monitor/properties/command": "Shell command to run (`sh -c`). stdout and stderr are streamed line by line; each line becomes a live update. Filter the command to emit only lines you would act on — do not pipe raw noisy logs.",
+  "Monitor/properties/description": "One-line summary of what is being monitored, shown in the approval prompt so the user can tell apart concurrent monitors. Read by the UI from the raw input, not by the tool itself.",
+  "Monitor/properties/timeout_ms": "Wall-clock limit in milliseconds before the command is killed. Default 5 min; clamped to 1 hour.",
+
+  "EnterWorktree": "Enter a git worktree on an isolated branch and switch the session working directory to it. All subsequent tools (Read, Write, Edit, Bash, …) operate in the worktree automatically — no manual `cd`. While in a worktree, git operations (commit, rebase, push, fetch) run without approval: the bound repo's `.git` is writable and network is enabled, so `git push` works frictionlessly. Use this when branching off for isolated work, or when explicitly told to work in a worktree. Exit with `ExitWorktree` (keep or remove). Enter re-baselines the provider prefix cache (the cwd line in the system prompt changes) — that is expected. Pass `name` to create a new worktree+branch under `<project>/.claude/worktrees/`, or `path` to re-enter an existing one. The base ref is `origin/<default-branch>` (fallback `HEAD` when no remote tracking branch exists).",
+  "EnterWorktree/properties/name": "Name for a NEW worktree (and its branch). Auto-generated as `wt-<short>` when absent. Mutually exclusive with `path`.",
+  "EnterWorktree/properties/path": "Path to an EXISTING worktree to re-enter (e.g. one left by a prior `exit_worktree` with `action=keep`). Mutually exclusive with `name`.",
+
+  "ExitWorktree": "Leave the active git worktree. `action=keep` (default) switches the session cwd back to the prior directory but leaves the worktree and branch on disk — you can re-enter it later with `EnterWorktree` (passing `path`). `action=remove` deletes the worktree and its branch; it is refused when the working tree is dirty unless `discard_changes=true`. Only available while inside a worktree.",
+  "ExitWorktree/properties/action": "`keep` (default) leaves the worktree and branch on disk; `remove` deletes both.",
+  "ExitWorktree/properties/discard_changes": "When `action=remove` and the worktree has uncommitted changes, set `true` to discard them. Otherwise removal is refused so work is not lost silently.",
+
+  "BashOutput": "Poll a background shell started by `Bash` with `run_in_background: true`. Returns the incremental stdout/stderr produced since the last poll, plus the shell's running/exit status. Pass the `shell_id` returned by the original `Bash` call. Poll repeatedly until the status shows the process has exited, then read the final output. A 10+ minute run is normal — keep polling patiently; never return a placeholder like \"still running\" as the result.",
+  "BashOutput/properties/shell_id": "The shell id returned by `Bash` when it started the command with `run_in_background: true`.",
+  "BashOutput/properties/block": "When true, block (up to `timeout_secs`) waiting for new output before returning. When false (default), return immediately with whatever output has accumulated since the last poll. The blocking form is useful when the model knows the process emits output slowly and wants to avoid a busy-poll loop.",
+  "BashOutput/properties/timeout_secs": "Seconds to wait when `block` is true (default 10, max 60). Ignored when `block` is false.",
+
+  "AskUserQuestion": "Ask the user clarifying questions when multiple valid approaches exist and the answer changes what you do next. Use only for decisions that are genuinely the user's to make — not for facts you can verify yourself. Each call carries 1–3 questions, each with 2–3 options; mark the recommended default with recommended=true when one exists. The user may also type a supplemental note. Do not use this tool to ask for plan approval or to confirm obvious defaults.",
+  "AskUserQuestion/properties/questions": "1–3 questions to ask the user. Each becomes one step in the question drawer.",
+  "AskUserQuestion/properties/questions/items/properties/question": "The full question text to display.",
+  "AskUserQuestion/properties/questions/items/properties/header": "Short label for the question (max 12 characters).",
+  "AskUserQuestion/properties/questions/items/properties/options": "2–3 choices for the user to select from.",
+  "AskUserQuestion/properties/questions/items/properties/multiSelect": "When true, the user may select multiple options; otherwise exactly one.",
+  "AskUserQuestion/properties/questions/items/properties/options/items/properties/label": "Concise label for the choice (1–5 words).",
+  "AskUserQuestion/properties/questions/items/properties/options/items/properties/description": "Explanation of what the choice means or implies.",
+  "AskUserQuestion/properties/questions/items/properties/options/items/properties/recommended": "Whether this option is the recommended default."
+}

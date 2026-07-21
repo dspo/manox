@@ -21,7 +21,7 @@ pub struct WriteTool {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct WriteFileInput {
+pub(crate) struct WriteFileInput {
     /// File path to write.
     path: String,
     /// Full content to write. If the model accidentally pastes `read_file` output
