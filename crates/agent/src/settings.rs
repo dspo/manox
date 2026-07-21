@@ -103,6 +103,31 @@ pub struct Settings {
     /// `thread::build_completion_request`.
     #[serde(default, skip_serializing_if = "ModeSettingsMap::is_empty")]
     pub modes: ModeSettingsMap,
+
+    /// Network allowlist for sandboxed bash. Read by
+    /// `sandbox::NetworkPolicy::for_project` at registry-build time.
+    #[serde(default, skip_serializing_if = "NetworkSettings::is_empty")]
+    pub network: NetworkSettings,
+}
+
+/// Network allowlist settings for the sandbox. Read once at startup by
+/// `NetworkPolicy::for_project`. An empty `allowlist` yields `Blocked`
+/// (network fully denied at the seatbelt level); a non-empty list yields
+/// `Restricted` (the seatbelt narrows outbound to the local proxy port,
+/// and the in-process HTTP proxy enforces the hostname patterns).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct NetworkSettings {
+    /// Hostname patterns (exact or `*.subdomain` wildcards) the sandbox
+    /// proxy will allow. Examples: `"github.com"`, `"*.npmjs.org"`.
+    pub allowlist: Vec<String>,
+}
+
+impl NetworkSettings {
+    /// Whether the allowlist is empty (no network plumbing needed).
+    fn is_empty(&self) -> bool {
+        self.allowlist.is_empty()
+    }
 }
 
 /// Resolved language axes — the canonical [`Language`] values, with a missing

@@ -19,6 +19,7 @@ members = [
     "crates/supervisor",
     "crates/lsp",
     "crates/webview",
+    "crates/http_proxy",
     "crates/webview-macros",
 ]
 resolver = "2"
@@ -41,6 +42,7 @@ supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
 manox-webview = { path = "crates/webview" }
 manox-webview-macros = { path = "crates/webview-macros" }
+http_proxy = { path = "crates/http_proxy" }
 
 anyhow = "1"
 async-channel = "2"
@@ -74,6 +76,23 @@ markdown = "1"
 ropey = "2.0.0-beta.1"
 # vte — ANSI escape parser (alacritty/wezterm 的同款,仅解析器)。TerminalPanel 用其 Handler trait 解析工具输出着色。
 vte = { version = "0.13", default-features = false, features = ["ansi"] }
+# httparse — HTTP request/response parser for the in-process sandbox network proxy.
+# The proxy reads the first request line+headers off each client connection to
+# decide CONNECT vs HTTP forward and extract the destination host.
+httparse = "1"
+# idna — RFC 1035 / 3492 hostname canonicalization (Punycode) for the network
+# allowlist. Internationalized domain names entered as UTF-8 are converted to
+# the A-label form that TLS SNI and HTTP Host headers carry on the wire.
+idna = "1"
+# thiserror — derive Error for the http_proxy crate's host-pattern and deny-reason types.
+thiserror = "1"
+# url — URL parsing for the sandbox network proxy (CONNECT authority-form,
+# absolute-form request targets, Host headers). reqwest already pulls url in
+# transitively; declaring it here lets the http_proxy crate reference a stable version.
+url = "2"
+# log — facade for the http_proxy crate. The proxy runs on dedicated std::thread
+# workers (not tokio), so it uses the simpler `log` facade rather than `tracing`.
+log = "0.4"
 base64 = "0.22"
 # image —— clipboard image resize + PNG re-encode before sending to the provider
 # (Anthropic long-edge cap 1568px / 5MB). CPU-bound work runs on the background executor.

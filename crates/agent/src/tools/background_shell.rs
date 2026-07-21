@@ -132,14 +132,15 @@ pub fn spawn(
     plugin_root: Option<&std::path::Path>,
     #[cfg(target_os = "macos")] sandbox: &crate::sandbox::SandboxPolicy,
     #[cfg(not(target_os = "macos"))] _sandbox: &crate::sandbox::SandboxPolicy,
+    #[cfg(target_os = "macos")] proxy_port: Option<u16>,
+    #[cfg(not(target_os = "macos"))] _proxy_port: Option<u16>,
 ) -> Result<String, String> {
     // Wrap the command through the sandbox policy. On macOS this produces
     // a seatbelt-wrapped `sandbox-exec` command with the same write/network/
     // `.git` confinement as foreground sandboxed bash. On platforms without
     // a sandbox backend, fall back to a raw `sh -c` (matching the foreground
-    // bash behavior on those platforms).
     #[cfg(target_os = "macos")]
-    let mut cmd = sandbox.wrap_command(&command, cwd);
+    let mut cmd = sandbox.wrap_command(&command, cwd, proxy_port);
     #[cfg(not(target_os = "macos"))]
     let mut cmd = {
         let mut c = tokio::process::Command::new("sh");
@@ -382,6 +383,7 @@ mod tests {
             None,
             None,
             &crate::sandbox::SandboxPolicy::for_project(&cwd),
+            None,
         )
         .expect("spawn must succeed");
 
@@ -415,6 +417,7 @@ mod tests {
             None,
             None,
             &crate::sandbox::SandboxPolicy::for_project(&cwd),
+            None,
         )
         .expect("spawn");
 

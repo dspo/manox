@@ -46,11 +46,12 @@ pub struct SandboxPolicy {
     /// allowlist even when the FS check admits it for `write_file` scratch files.
     writable_roots: Vec<PathBuf>,
     protected_paths: Vec<PathBuf>,
-    /// Read only by the seatbelt renderer (macOS). Kept cross-platform as a
-    /// policy knob for future Linux bwrap / Windows backends; on non-macOS it
-    /// is written but not yet read.
+    /// Network policy for sandboxed bash. Read by the seatbelt renderer
+    /// (macOS) and the proxy lifecycle in `Thread`. Kept cross-platform as a
+    /// policy knob for future Linux bwrap / Windows backends; on non-macOS
+    /// it is written but not yet read.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    allow_network: bool,
+    network: NetworkPolicy,
     /// Subtrees of `protected_paths` explicitly re-opened for writes — the
     /// bound repo's shared `.git`, while a worktree is active. Empty in the
     /// default `for_project` case, so `.git` stays protected as before. A path
@@ -72,6 +73,92 @@ pub struct SandboxPolicy {
     /// (thread `56ed5d5f` msg226), but a sandboxed bash must not reach a
     /// sibling repo's `.git` under `/tmp`.
     admit_tmp_scratch: bool,
+}
+
+/// Outbound-network policy for a sandboxed bash command.
+///
+/// `Blocked` is the default (network fully denied at the seatbelt level).
+/// `Unrestricted` admits all network — used in worktree mode where git
+/// push/fetch is an approved workflow. `Restricted` is the allowlist mode:
+/// the seatbelt permits outbound only to a local proxy port, and an
+/// in-process HTTP proxy filters by hostname.
+#[derive(Clone, Debug)]
+pub enum NetworkPolicy {
+    /// Deny all outbound network: `(deny network*)`.
+    Blocked,
+    /// Allow all outbound network: `(allow network*)`. Used in worktree
+    /// mode (an approved isolation context where git push/fetch must work
+    /// frictionlessly).
+    Unrestricted,
+    /// Allow outbound only to the local proxy port; the in-process HTTP proxy
+    /// enforces a hostname allowlist. The seatbelt rule narrows
+    /// `network-outbound` to `localhost:<proxy_port>`.
+    Restricted {
+        /// Hostname patterns the proxy will allow (exact + `*.` subdomain
+        /// wildcards). The proxy owns the actual `Allowlist` instance; this
+        /// is the source-of-truth pattern list for re-spawning the proxy when
+        /// the policy changes.
+        allowlist: http_proxy::Allowlist,
+    },
+}
+
+impl NetworkPolicy {
+    /// Build the default project-level network policy from `settings.toml`.
+    ///
+    /// Reads `[network] allowlist` and parses each entry as a `HostPattern`.
+    /// An empty or absent allowlist yields `Blocked` (the historical default:
+    /// network fully denied). A non-empty allowlist yields `Restricted` —
+    /// the seatbelt will narrow outbound to the local proxy port, and the
+    /// proxy will enforce the hostname allowlist.
+    ///
+    /// Malformed entries are warned and skipped so a typo doesn't silently
+    /// block the whole list.
+    #[cfg_attr(test, allow(clippy::needless_return))]
+    pub fn for_project() -> Self {
+        // Test builds are hermetic: never read the developer's real
+        // settings.toml (which may have a non-empty allowlist that would
+        // make this return Restricted, breaking sandbox tests that expect
+        // Blocked). Production reads the real file.
+        if cfg!(test) {
+            return NetworkPolicy::Blocked;
+        }
+        let patterns: Vec<http_proxy::HostPattern> = crate::settings::load()
+            .network
+            .allowlist
+            .iter()
+            .filter_map(|raw| match http_proxy::HostPattern::parse(raw) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(
+                        raw = raw,
+                        error = %e,
+                        "skipping malformed network allowlist entry"
+                    );
+                    None
+                }
+            })
+            .collect();
+        if patterns.is_empty() {
+            NetworkPolicy::Blocked
+        } else {
+            NetworkPolicy::Restricted {
+                allowlist: http_proxy::Allowlist::from_patterns(patterns),
+            }
+        }
+    }
+
+    /// Whether the policy is `Restricted` (proxy-based allowlist mode).
+    pub fn is_restricted(&self) -> bool {
+        matches!(self, NetworkPolicy::Restricted { .. })
+    }
+
+    /// The hostname patterns the proxy will allow, if `Restricted`.
+    pub fn allowlist(&self) -> Option<&http_proxy::Allowlist> {
+        match self {
+            NetworkPolicy::Restricted { allowlist } => Some(allowlist),
+            _ => None,
+        }
+    }
 }
 
 /// The canonical `$TMPDIR` (`/var/folders/.../T` on macOS) as a writable root,
@@ -115,7 +202,7 @@ impl SandboxPolicy {
             return Self {
                 writable_roots: vec![temp_root()],
                 protected_paths: Vec::new(),
-                allow_network: false,
+                network: NetworkPolicy::for_project(),
                 git_allowed_roots: Vec::new(),
                 worktree_anchor: None,
                 admit_tmp_scratch: true,
@@ -124,7 +211,7 @@ impl SandboxPolicy {
         Self {
             writable_roots: vec![root.clone(), temp_root()],
             protected_paths: vec![root.join(".git")],
-            allow_network: false,
+            network: NetworkPolicy::for_project(),
             git_allowed_roots: Vec::new(),
             worktree_anchor: None,
             admit_tmp_scratch: true,
@@ -155,7 +242,7 @@ impl SandboxPolicy {
         self.writable_roots = vec![canonicalize_best_effort(worktree_path), temp_root()];
         self.git_allowed_roots
             .push(canonicalize_best_effort(main_repo_git_dir));
-        self.allow_network = true;
+        self.network = NetworkPolicy::Unrestricted;
         self.worktree_anchor = Some(canonicalize_best_effort(worktree_path));
         self.admit_tmp_scratch = false;
         self
@@ -172,7 +259,7 @@ impl SandboxPolicy {
         Self {
             writable_roots: vec![canonicalize_best_effort(worktree_path), temp_root()],
             protected_paths: Vec::new(),
-            allow_network: true,
+            network: NetworkPolicy::Unrestricted,
             git_allowed_roots: vec![canonicalize_best_effort(main_repo_git_dir)],
             worktree_anchor: Some(canonicalize_best_effort(worktree_path)),
             admit_tmp_scratch: false,
@@ -247,16 +334,23 @@ impl SandboxPolicy {
 
     /// Render a seatbelt (`.sbpl`) policy string. Denylist base
     /// (`(allow default)`) with an allowlist over writes: deny all writes,
-    /// re-allow to writable roots, deny to protected paths, deny all network
-    /// when `allow_network` is false. More-specific rules win, so the
-    /// `.git` deny overrides the project-root allow for that subtree.
+    /// re-allow to writable roots, deny to protected paths. Network policy:
+    /// `Blocked` → `(deny network*)`; `Unrestricted` → no network rule
+    /// (base `(allow default)` admits it); `Restricted` → deny all network
+    /// then re-allow outbound to `localhost:<proxy_port>` only, so the
+    /// sandboxed process can reach the in-process HTTP proxy and nothing
+    /// else. More-specific rules win, so the `.git` deny overrides the
+    /// project-root allow for that subtree.
     ///
     /// Character-device redirection targets (`/dev/null`, `/dev/zero`,
     /// `/dev/stdout`, `/dev/stderr`) are allowlisted as literals: they are not
     /// under any writable root, so `(deny file-write*)` would otherwise reject
     /// `cmd > /dev/null`. They are write-only sinks with no persistent state.
+    ///
+    /// `proxy_port` is required when `network` is `Restricted`; ignored
+    /// otherwise.
     #[cfg(target_os = "macos")]
-    fn render_seatbelt(&self) -> String {
+    fn render_seatbelt(&self, proxy_port: Option<u16>) -> String {
         let mut s = String::new();
         s.push_str("(version 1)\n");
         s.push_str("(allow default)\n");
@@ -288,8 +382,31 @@ impl SandboxPolicy {
                 escape_seatbelt_path(g)
             ));
         }
-        if !self.allow_network {
-            s.push_str("(deny network*)\n");
+        match &self.network {
+            NetworkPolicy::Blocked => {
+                s.push_str("(deny network*)\n");
+            }
+            NetworkPolicy::Unrestricted => {
+                // No network rule: the `(allow default)` base admits all
+                // network, matching the historical worktree behavior.
+            }
+            NetworkPolicy::Restricted { .. } => {
+                // Deny all network, then re-allow outbound to the local proxy
+                // port only. The proxy (running outside the sandbox) enforces
+                // the hostname allowlist. `network-bind` is re-allowed for
+                // localhost so TCP connect() (which implicitly binds an
+                // ephemeral port) and tools that listen on localhost (e.g.
+                // dev servers) work inside the sandbox.
+                let port = proxy_port.unwrap_or(0);
+                s.push_str("(deny network*)\n");
+                s.push_str(&format!(
+                    "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
+                ));
+                s.push_str(&format!(
+                    "(allow network-outbound (remote tcp \"127.0.0.1:{port}\"))\n"
+                ));
+                s.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
+            }
         }
         s
     }
@@ -304,11 +421,24 @@ impl SandboxPolicy {
     /// when unset so `git rebase --continue` / `git log` do not open an
     /// interactive `$EDITOR` / pager and hang the turn (thread `56ed5d5f`
     /// msg308). Other env (HOME, KEYCHAIN_*, LANG) is inherited as-is.
+    ///
+    /// `proxy_port` must be `Some(port)` when `network` is `Restricted`; the
+    /// seatbelt rule narrows outbound to `localhost:<port>` and the proxy env
+    /// vars (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` + lowercase variants) are
+    /// injected so the sandboxed command's HTTP clients route through the
+    /// in-process proxy. `NO_PROXY` is blanked so all egress goes through the
+    /// proxy unconditionally (an inherited `NO_PROXY` could let a host bypass
+    /// the allowlist).
     #[cfg(target_os = "macos")]
-    pub fn wrap_command(&self, command: &str, cwd: &Path) -> tokio::process::Command {
+    pub fn wrap_command(
+        &self,
+        command: &str,
+        cwd: &Path,
+        proxy_port: Option<u16>,
+    ) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
         cmd.arg("-p")
-            .arg(self.render_seatbelt())
+            .arg(self.render_seatbelt(proxy_port))
             .arg("--")
             .arg("bash")
             .arg("-c")
@@ -316,7 +446,31 @@ impl SandboxPolicy {
             .env("PATH", crate::path_env::resolved_login_path())
             .current_dir(cwd);
         inject_noninteractive_env(&mut cmd);
+        if let NetworkPolicy::Restricted { .. } = &self.network
+            && let Some(port) = proxy_port
+        {
+            let proxy_url = format!("http://127.0.0.1:{port}");
+            for key in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ] {
+                cmd.env(key, &proxy_url);
+            }
+            // Blank NO_PROXY so all egress goes through the proxy.
+            for key in ["NO_PROXY", "no_proxy"] {
+                cmd.env(key, "");
+            }
+        }
         cmd
+    }
+
+    /// The network policy for this sandbox.
+    pub fn network(&self) -> &NetworkPolicy {
+        &self.network
     }
 }
 
@@ -513,7 +667,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_allows_project_root_and_tmp() {
-        let s = policy().render_seatbelt();
+        let s = policy().render_seatbelt(None);
         assert!(s.contains("(allow default)"));
         assert!(s.contains("(deny file-write*)"));
         assert!(s.contains("allow file-write* (subpath"));
@@ -528,7 +682,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_denies_dot_git() {
-        let s = policy().render_seatbelt();
+        let s = policy().render_seatbelt(None);
         assert!(
             s.contains("deny file-write* (subpath"),
             ".git deny must appear: {s}"
@@ -539,8 +693,92 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn seatbelt_denies_network() {
-        let s = policy().render_seatbelt();
+        let s = policy().render_seatbelt(None);
         assert!(s.contains("(deny network*)"), "network denied: {s}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_restricted_network_narrows_to_proxy_port() {
+        let mut p = policy();
+        p.network = NetworkPolicy::Restricted {
+            allowlist: http_proxy::Allowlist::from_patterns(vec![
+                http_proxy::HostPattern::parse("github.com").unwrap(),
+            ]),
+        };
+        let s = p.render_seatbelt(Some(54321));
+        assert!(s.contains("(deny network*)"), "base deny: {s}");
+        assert!(
+            s.contains("(allow network-outbound (remote tcp \"localhost:54321\"))"),
+            "proxy port allow missing: {s}"
+        );
+        assert!(
+            s.contains("(allow network-outbound (remote tcp \"127.0.0.1:54321\"))"),
+            "127.0.0.1 proxy port allow missing: {s}"
+        );
+        assert!(
+            s.contains("(allow network-bind (local ip \"localhost:*\"))"),
+            "network-bind for localhost missing: {s}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_unrestricted_network_has_no_deny() {
+        let mut p = policy();
+        p.network = NetworkPolicy::Unrestricted;
+        let s = p.render_seatbelt(None);
+        assert!(
+            !s.contains("(deny network*)"),
+            "Unrestricted must not deny network: {s}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wrap_command_injects_proxy_env_for_restricted() {
+        let mut p = policy();
+        p.network = NetworkPolicy::Restricted {
+            allowlist: http_proxy::Allowlist::from_patterns(vec![
+                http_proxy::HostPattern::parse("github.com").unwrap(),
+            ]),
+        };
+        let cmd = p.wrap_command(
+            "curl github.com",
+            Path::new("/tmp/manox-sandbox-test"),
+            Some(54321),
+        );
+        let mut env = cmd.as_std().get_envs();
+        let proxy_val = env
+            .find(|(k, _)| *k == "HTTP_PROXY")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(
+            proxy_val.as_deref(),
+            Some("http://127.0.0.1:54321"),
+            "HTTP_PROXY must point at the proxy: {proxy_val:?}"
+        );
+        let no_proxy_val = env
+            .find(|(k, _)| *k == "NO_PROXY")
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_string_lossy().into_owned());
+        assert_eq!(no_proxy_val.as_deref(), Some(""), "NO_PROXY must be blank");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wrap_command_no_proxy_env_when_blocked() {
+        let p = policy();
+        let cmd = p.wrap_command(
+            "curl github.com",
+            Path::new("/tmp/manox-sandbox-test"),
+            None,
+        );
+        let mut env = cmd.as_std().get_envs();
+        assert!(
+            env.find(|(k, _)| *k == "HTTP_PROXY").is_none(),
+            "HTTP_PROXY must not be set when Blocked"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -555,7 +793,7 @@ mod tests {
         // regardless of location (component-based), so even an FS `/tmp` write
         // into a `.git` is blocked.
         let p = policy();
-        let s = p.render_seatbelt();
+        let s = p.render_seatbelt(None);
         // Project root + $TMPDIR writable on both sides.
         assert!(p.is_write_allowed(Path::new("/tmp/manox-sandbox-test/src/lib.rs")));
         assert!(s.contains("/tmp/manox-sandbox-test"));
@@ -586,7 +824,7 @@ mod tests {
         // `/dev/null` is a character device outside any writable root; without
         // an explicit literal allow, `cmd > /dev/null` is rejected. The same
         // applies to the other common redirection sinks.
-        let s = policy().render_seatbelt();
+        let s = policy().render_seatbelt(None);
         for dev in ["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr"] {
             assert!(
                 s.contains(&format!("(allow file-write* (literal \"{dev}\"))")),
@@ -604,7 +842,7 @@ mod tests {
         // The login-shell PATH must reach the sandboxed bash so Homebrew /
         // toolchain binaries are found (thread e5047fd2: `gh` not found).
         let p = policy();
-        let cmd = p.wrap_command("echo hi", Path::new("/tmp/manox-sandbox-test"));
+        let cmd = p.wrap_command("echo hi", Path::new("/tmp/manox-sandbox-test"), None);
         let path = cmd
             .as_std()
             .get_envs()
@@ -623,7 +861,7 @@ mod tests {
     #[test]
     fn wrap_command_uses_sandbox_exec_argv() {
         let p = policy();
-        let cmd = p.wrap_command("git status", Path::new("/tmp/manox-sandbox-test"));
+        let cmd = p.wrap_command("git status", Path::new("/tmp/manox-sandbox-test"), None);
         let prog = cmd.as_std().get_program();
         assert_eq!(prog, "/usr/bin/sandbox-exec");
         let args: Vec<String> = cmd
@@ -659,7 +897,7 @@ mod tests {
         // The worktree itself is writable.
         assert!(p.is_write_allowed(&worktree.join("src/lib.rs")));
         // Network is on.
-        assert!(p.allow_network);
+        assert!(matches!(p.network(), NetworkPolicy::Unrestricted));
     }
 
     #[test]
@@ -689,7 +927,7 @@ mod tests {
         let git_dir = project.join(".git");
         let worktree = Path::new("/tmp/manox-sandbox-test/.claude/worktrees/wt-1");
         let p = SandboxPolicy::for_project(project).with_worktree(worktree, &git_dir);
-        let s = p.render_seatbelt();
+        let s = p.render_seatbelt(None);
         // The bound .git allow appears after the .git deny.
         let deny_idx = s.find("(deny file-write* (subpath").unwrap();
         let allow_idx = s
@@ -735,7 +973,7 @@ mod tests {
             !p.is_write_allowed(&git_dir.join("config")),
             "FS tools must not write .git directly; bash seatbelt is the git-op path"
         );
-        assert!(p.allow_network);
+        assert!(matches!(p.network(), NetworkPolicy::Unrestricted));
     }
 
     #[test]
@@ -791,6 +1029,7 @@ mod tests {
         let cmd = p.wrap_command(
             "git rebase --continue",
             Path::new("/tmp/manox-sandbox-test"),
+            None,
         );
         let env = cmd.as_std().get_envs();
         // Only assert the vars we expect to be set; a host that pre-sets

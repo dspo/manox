@@ -133,6 +133,8 @@ The provider caches the longest byte-stable prefix of each request and charges f
 
 ## Tool sandbox boundary (OS-level, macOS)
 
-- bash runs inside an OS sandbox by default: writes are confined to the project root and the system temp directory, the `.git` directory is read-only, and network is disabled by default. Each sandboxed call is a one-shot `bash -c`; `cd`/`export` don't persist across calls — chain steps with `&&` or use the `cwd` parameter.
-- When a command needs out-of-sandbox capabilities (network, writing outside the project root), set `unsandboxed: true` — it triggers user approval, then runs outside the sandbox (persistent shell session, cd/export persist across calls). Don't set this flag to bypass the sandbox; use it only when there's a legitimate need.
+- bash runs inside an OS sandbox by default: writes are confined to the project root and the system temp directory, the `.git` directory is read-only, and network is policy-controlled. Each sandboxed call is a one-shot `bash -c`; `cd`/`export` don't persist across calls — chain steps with `&&` or use the `cwd` parameter.
+- Network policy: when `settings.toml` `[network] allowlist` is non-empty, sandboxed bash routes HTTP/HTTPS through an in-process proxy that enforces the hostname allowlist (exact match or `*.subdomain` wildcards, e.g. `github.com`, `*.npmjs.org`). Hosts outside the allowlist get a `511 Network Authentication Required` response. An empty/absent allowlist blocks all network. Tools like `git push`/`fetch` in a worktree run with unrestricted network (an approved isolation context).
+- When a command needs out-of-sandbox capabilities (unrestricted network, writing outside the project root), set `unsandboxed: true` — it triggers user approval, then runs outside the sandbox (persistent shell session, cd/export persist across calls). Don't set this flag to bypass the sandbox; use it only when there's a legitimate need.
 - macOS uses seatbelt for process-level enforcement; Linux/Windows have no OS sandbox for now, so bash runs in a persistent shell after user approval by default.
+
