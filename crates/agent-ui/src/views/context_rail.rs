@@ -1,9 +1,10 @@
 //! Right-hand context rail: a stable sidecar showing the active thread's
 //! environment/cockpit information (run status, changes, branch, per-model
-//! token usage, context budget, plan milestones, sources).
+//! token usage, context budget, execution plan, sources).
 //!
 //! The rail is a first-class view owned by [`crate::Workspace`]. It holds the
-//! cockpit state (run phase, milestones, per-cell counter animation state)
+//! cockpit state (run phase, the model's plan snapshot, per-cell counter
+//! animation state)
 //! that used to live directly on `Workspace`, plus strong handles to the
 //! active [`agent::Thread`] and [`crate::ConversationState`] it renders
 //! against. Writes to cockpit state flow through `Workspace` →
@@ -33,10 +34,9 @@ use gpui_component::{
 };
 
 use crate::Workspace;
-use crate::cockpit::{
-    CockpitPhase, Milestone, MilestoneStatus, cache_read_ratio, cockpit_phase_tag,
-    context_budget_pct,
-};
+use agent::{PlanSnapshot, PlanStepStatus};
+
+use crate::cockpit::{CockpitPhase, cache_read_ratio, cockpit_phase_tag, context_budget_pct};
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
 use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_display_title};
 
@@ -63,9 +63,10 @@ const ENV_MODEL_ID_MAX: usize = 22;
 
 // ── ContextRail view ──────────────────────────────────────────────────────
 
-/// Right-side context sidecar. Owns the cockpit state (run phase, milestones,
-/// per-cell counter animation state) and renders the environment/cockpit
-/// panel that used to float as an absolute card over the conversation.
+/// Right-side context sidecar. Owns the cockpit state (run phase, the model's
+/// plan snapshot, per-cell counter animation state) and renders the
+/// environment/cockpit panel that used to float as an absolute card over the
+/// conversation.
 pub(crate) struct ContextRail {
     pub(crate) thread: Entity<Thread>,
     /// Coarse run phase shown in the status row. Derived from `ThreadEvent`s
@@ -79,13 +80,18 @@ pub(crate) struct ContextRail {
     /// workspace's direct `cockpit_phase = …` assignments need no hook.
     pub(crate) cockpit_tag_prev: u8,
     pub(crate) cockpit_tag_gen: u64,
-    /// Plan steps parsed from the approved `exit_plan_mode` plan. All
-    /// `Pending` outside a turn; the first is promoted to `InProgress` while
-    /// the thread runs, demoted back to `Pending` on terminal stop.
-    pub(crate) cockpit_milestones: Vec<Milestone>,
-    /// Whether the milestone section is collapsed (`ToggleCockpitTasks` /
-    /// ctrl+t toggles). Hidden still renders the run-status row.
+    /// The model's current execution plan, published via `UpdatePlan` and
+    /// recovered from history on reload. `None` until the model publishes one
+    /// (or after it clears its list). The rail renders the snapshot's own
+    /// step statuses verbatim — nothing here infers progress.
+    pub(crate) plan: Option<PlanSnapshot>,
+    /// Whether the plan section is collapsed (`ToggleCockpitTasks` /
+    /// cmd/ctrl-shift-m toggles). Hidden still renders the run-status row.
     pub(crate) cockpit_hide_tasks: bool,
+    /// Whether a plan has been seen for the current thread yet. The first
+    /// snapshot auto-collapses when it is long enough; subsequent updates
+    /// preserve whatever collapse state the user last chose.
+    pub(crate) plan_seen: bool,
     /// Cached `settings.auto_compact.{enabled,threshold}`, refreshed on
     /// construction and when the user exits the Settings overlay. Avoids a
     /// per-frame file read in the context-budget render.
@@ -127,8 +133,9 @@ impl ContextRail {
             cockpit_phase: CockpitPhase::Idle,
             cockpit_tag_prev: cockpit_phase_tag(CockpitPhase::Idle),
             cockpit_tag_gen: 0,
-            cockpit_milestones: Vec::new(),
+            plan: None,
             cockpit_hide_tasks: false,
+            plan_seen: false,
             cockpit_auto_compact_enabled: auto_compact_enabled,
             cockpit_auto_compact_threshold: auto_compact_threshold,
             weak_workspace,
@@ -153,7 +160,7 @@ impl ContextRail {
     }
 
     /// Reset per-thread cockpit state on thread switch: the outgoing thread's
-    /// milestones, running-tool title, and per-model counter state do not
+    /// plan, running-tool title, and per-model counter state do not
     /// apply to the incoming one. Mirrors the old `Workspace::set_active_thread`
     /// reset. Also clears the cached git stats so the incoming thread shows
     /// placeholders until its own refresh lands.
@@ -167,7 +174,11 @@ impl ContextRail {
         };
         self.cockpit_phase = new_phase;
         self.cockpit_tag_prev = cockpit_phase_tag(new_phase);
-        self.cockpit_milestones = Vec::new();
+        // The incoming thread's plan is seeded separately from its history by
+        // `set_plan`; clear here so a thread with no plan starts empty rather
+        // than inheriting the outgoing thread's list.
+        self.plan = None;
+        self.plan_seen = false;
         self.git_change_stats = None;
         self.git_branch_display = None;
         self.close_branch_menu();
@@ -233,25 +244,25 @@ impl ContextRail {
         cx.notify();
     }
 
-    /// Mark the first `Pending` milestone `InProgress` so the panel signals
-    /// which step is currently being worked. Called on `TurnStarted`. Only the
-    /// first pending item is promoted — the cockpit never claims to know the
-    /// model's exact progress within a step.
-    pub(crate) fn promote_first_milestone_in_progress(&mut self, cx: &mut Context<Self>) {
-        for m in &mut self.cockpit_milestones {
-            if m.status == MilestoneStatus::Pending {
-                m.status = MilestoneStatus::InProgress;
-                break;
-            }
-        }
-        cx.notify();
-    }
+    /// Threshold above which a freshly-seen plan auto-collapses so a long list
+    /// does not dominate the rail. At or below this, the plan starts expanded.
+    const PLAN_AUTOCOLLAPSE_ABOVE: usize = 5;
 
-    /// Seed milestones from an approved plan. Continue-in-plan does not — the
-    /// user asked for another planning round, so the prior steps no longer
-    /// describe committed work.
-    pub(crate) fn set_milestones_from_plan(&mut self, plan_text: &str, cx: &mut Context<Self>) {
-        self.cockpit_milestones = crate::cockpit::parse_milestones(plan_text);
+    /// Adopt a plan snapshot published by the model (or recovered from history).
+    /// An empty snapshot clears the plan. The first plan seen for a thread sets
+    /// the collapse state by length; later updates preserve the user's choice,
+    /// so an update never yanks a plan the user manually expanded back closed.
+    pub(crate) fn set_plan(&mut self, snapshot: PlanSnapshot, cx: &mut Context<Self>) {
+        if snapshot.is_empty() {
+            self.plan = None;
+            cx.notify();
+            return;
+        }
+        if !self.plan_seen {
+            self.plan_seen = true;
+            self.cockpit_hide_tasks = snapshot.steps.len() > Self::PLAN_AUTOCOLLAPSE_ABOVE;
+        }
+        self.plan = Some(snapshot);
         cx.notify();
     }
 
@@ -298,7 +309,7 @@ impl ContextRail {
             .child(self.render_branch_block(&project, theme, cx))
             .child(self.render_usage_section(theme, cx, per_model))
             .child(self.render_cockpit_context_budget(theme, cx))
-            .child(self.render_cockpit_milestones(theme, cx))
+            .child(self.render_plan_section(theme, cx))
             .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
             // Sources section.
             .child(
@@ -687,7 +698,7 @@ impl ContextRail {
             .clone()
             .expect("branch_menu exists when open");
         // `deferred` + `with_priority(1)` paints the dropdown after the whole
-        // rail panel tree, so it floats above the usage/budget/milestone rows
+        // rail panel tree, so it floats above the usage/budget/plan rows
         // that follow the branch block instead of being overpainted by them.
         gpui::div()
             .relative()
@@ -987,30 +998,28 @@ impl ContextRail {
         rows.into_any_element()
     }
 
-    /// Milestone section: the parsed plan steps with status glyphs. Collapsible
-    /// by clicking the header or pressing `ToggleCockpitTasks`
-    /// (cmd-shift-m / ctrl-shift-m). When collapsed, only the header renders
-    /// so the user always has an affordance to expand again. Hidden entirely
-    /// when there are no milestones (no plan yet).
-    fn render_cockpit_milestones(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        if self.cockpit_milestones.is_empty() {
+    /// Plan section: the model's `UpdatePlan` snapshot rendered as an execution
+    /// overview. Collapsible by clicking the header or pressing
+    /// `ToggleCockpitTasks` (cmd/ctrl-shift-m). The header carries the
+    /// `done/total` count and a chevron; the count and chevron are the only
+    /// expand/collapse affordance (no hint text). Collapsed shows just the
+    /// current task and the remaining count so the rail stays glanceable;
+    /// expanded lists every step in a bounded, scrollable region. Hidden
+    /// entirely when there is no plan.
+    fn render_plan_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(plan) = self.plan.clone() else {
             return gpui::div().into_any_element();
-        }
+        };
         let muted = theme.muted_foreground;
         let hidden = self.cockpit_hide_tasks;
-        let hint_key = if hidden {
-            "cockpit-show-tasks-hint"
-        } else {
-            "cockpit-hide-tasks-hint"
-        };
-        // Header is a clickable toggle — `cursor_pointer` signals it, and the
-        // chevron indicates expand/collapse state so the row is readable even
-        // without the trailing hint.
+        let (done, total) = plan.progress();
         let chevron = if hidden {
             IconName::ChevronRight
         } else {
             IconName::ChevronDown
         };
+        // Header is a clickable toggle; the chevron plus the `done/total` count
+        // signal collapse state, so no separate hint text is needed.
         let header = h_flex()
             .id("cockpit-milestones-header")
             .w_full()
@@ -1034,66 +1043,82 @@ impl ContextRail {
             .child(
                 gpui::div()
                     .text_xs()
-                    .text_color(muted.opacity(0.6))
-                    .child(i18n::t(hint_key)),
+                    .text_color(muted.opacity(0.7))
+                    .child(i18n::t_str(
+                        "cockpit-plan-progress",
+                        &[("done", &done.to_string()), ("total", &total.to_string())],
+                    )),
             );
+
         if hidden {
-            return v_flex().w_full().gap_1().child(header).into_any_element();
-        }
-        // Render the most recent completed milestone plus a collapsed summary
-        // of any earlier ones, so a long list of done steps doesn't drown out
-        // the live one. The cockpit only ever marks Pending/InProgress, so the
-        // completed/failed branches are forward-compat render paths.
-        let mut completed_tail: Option<&Milestone> = None;
-        let mut completed_count = 0usize;
-        for m in &self.cockpit_milestones {
-            if m.status == MilestoneStatus::Completed {
-                completed_count += 1;
-                completed_tail = Some(m);
+            // Collapsed: surface the current task (or a done summary) plus the
+            // remaining count, so the header row alone tells the user where the
+            // work stands without expanding.
+            let mut section = v_flex().w_full().gap_1().child(header);
+            if plan.all_completed() {
+                section = section.child(
+                    gpui::div()
+                        .pl(px(12.))
+                        .text_xs()
+                        .text_color(muted)
+                        .child(i18n::t("cockpit-plan-all-done")),
+                );
+            } else if let Some(current) = plan.current() {
+                let remaining = total.saturating_sub(done);
+                section = section.child(self.render_plan_row(current, theme));
+                if remaining > 1 {
+                    section =
+                        section.child(gpui::div().pl(px(12.)).text_xs().text_color(muted).child(
+                            i18n::t_str(
+                                "cockpit-plan-remaining",
+                                &[("count", &(remaining - 1).to_string())],
+                            ),
+                        ));
+                }
             }
+            return section.into_any_element();
         }
-        let mut section = v_flex().w_full().gap_1().child(header);
-        for m in &self.cockpit_milestones {
-            if m.status == MilestoneStatus::Completed && Some(m) != completed_tail {
-                continue;
-            }
-            section = section.child(self.render_milestone_row(m, theme));
+
+        // Expanded: every step, in a bounded scroll region so a long plan does
+        // not push the rest of the rail off-screen.
+        let mut list = v_flex().w_full().gap_1();
+        for step in &plan.steps {
+            list = list.child(self.render_plan_row(step, theme));
         }
-        if completed_count > 1 {
-            section = section.child(gpui::div().pl(px(12.)).text_xs().text_color(muted).child(
-                i18n::t_count("cockpit-completed-summary", (completed_count - 1) as i64),
-            ));
-        }
-        section.into_any_element()
+        v_flex()
+            .w_full()
+            .gap_1()
+            .child(header)
+            .child(
+                gpui::div()
+                    .id("cockpit-plan-steps")
+                    .w_full()
+                    .max_h(px(160.))
+                    .overflow_y_scroll()
+                    .child(list),
+            )
+            .into_any_element()
     }
 
-    /// One milestone row: status glyph + title (+blocked-by note). The
-    /// in-progress step is foreground-bold; others are muted so the live step
-    /// stands out.
-    fn render_milestone_row(&self, m: &Milestone, theme: &Theme) -> AnyElement {
+    /// One plan step row: status glyph + title. The in-progress step is
+    /// foreground-bold; others are muted so the live step stands out. The title
+    /// truncates to one line with a tooltip carrying the full text.
+    fn render_plan_row(&self, step: &agent::PlanStep, theme: &Theme) -> AnyElement {
         let muted = theme.muted_foreground;
-        let (glyph, glyph_color) = match m.status {
-            MilestoneStatus::Pending => ("◻", muted),
-            MilestoneStatus::InProgress => ("▶", theme.foreground),
-            MilestoneStatus::Blocked { .. } => ("⏳", theme.warning),
-            MilestoneStatus::Completed => ("✔", muted.opacity(0.7)),
-            MilestoneStatus::Failed => ("✕", theme.danger),
+        let (glyph, glyph_color) = match step.status {
+            PlanStepStatus::Pending => ("◻", muted),
+            PlanStepStatus::InProgress => ("▶", theme.foreground),
+            PlanStepStatus::Completed => ("✔", muted.opacity(0.7)),
         };
-        let (title_color, weight) = match m.status {
-            MilestoneStatus::InProgress => (theme.foreground, gpui::FontWeight::SEMIBOLD),
+        let (title_color, weight) = match step.status {
+            PlanStepStatus::InProgress => (theme.foreground, gpui::FontWeight::SEMIBOLD),
             _ => (muted, gpui::FontWeight::NORMAL),
         };
-        let mut title = m.title.clone();
-        if let MilestoneStatus::Blocked { by } = &m.status
-            && !by.is_empty()
-        {
-            let deps: Vec<String> = by.iter().map(|i| format!("#{i}")).collect();
-            title.push(' ');
-            title.push_str(&i18n::t_str(
-                "cockpit-blocked-by",
-                &[("deps", &deps.join(", "))],
-            ));
-        }
+        let title = SharedString::from(step.step.clone());
+        // The element id is derived from the (unique) step title so a stateful
+        // tooltip can attach; uniqueness is guaranteed by `PlanSnapshot`
+        // validation, which rejects duplicate titles.
+        let row_id = SharedString::from(format!("plan-step-{}", step.step));
         h_flex()
             .w_full()
             .pl(px(12.))
@@ -1108,12 +1133,14 @@ impl ContextRail {
             )
             .child(
                 gpui::div()
+                    .id(gpui::ElementId::Name(row_id))
                     .flex_1()
                     .min_w_0()
                     .truncate()
                     .text_color(title_color)
                     .font_weight(weight)
-                    .child(SharedString::from(title)),
+                    .child(title.clone())
+                    .tooltip(move |window, cx| Tooltip::new(title.clone()).build(window, cx)),
             )
             .into_any_element()
     }

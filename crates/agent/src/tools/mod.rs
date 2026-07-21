@@ -26,6 +26,7 @@ pub mod read_file;
 pub mod self_info;
 pub mod skill;
 pub mod truncate;
+pub mod update_plan;
 pub mod web_explore;
 pub mod web_fetch;
 pub mod worktree;
@@ -60,6 +61,7 @@ pub const MONITOR: &str = "Monitor";
 pub const READ: &str = "Read";
 pub const SELF_INFO: &str = "SelfInfo";
 pub const SKILL: &str = "Skill";
+pub const UPDATE_PLAN: &str = "UpdatePlan";
 pub const WEB_FETCH: &str = "WebFetch";
 pub const ENTER_WORKTREE: &str = "EnterWorktree";
 pub const EXIT_WORKTREE: &str = "ExitWorktree";
@@ -437,6 +439,11 @@ pub fn main_registry_with_policy(
         Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone(), lang)) as AnyAgentTool,
     );
     reg.register(self_info::new());
+    // UpdatePlan: main-thread-only. Planning an overview is the lead agent's
+    // concern; sub-agents run scoped work under their own turn caps and never
+    // drive the rail. Not read-only, so plan mode's filter hides it and the
+    // backstop rejects a hallucinated call there.
+    reg.register(Arc::new(update_plan::UpdatePlanTool) as AnyAgentTool);
     // Worktree harness tools: main-thread-only, they mutate the owning
     // Thread's cwd and rebuild its tool registry on enter/exit.
     reg.register(Arc::new(worktree::EnterWorktreeTool::new(parent.clone())) as AnyAgentTool);
@@ -687,5 +694,48 @@ mod tests {
         for n in ["Write", "Edit", "Bash", "Monitor"] {
             assert!(!by_name(n).is_read_only(), "{n} should NOT be read-only");
         }
+    }
+
+    #[test]
+    fn update_plan_is_main_only_and_hidden_in_plan_mode() {
+        // The main registry builds the `agent` spawn tool, which reads the
+        // agent-definition registry; initialize it so construction succeeds.
+        crate::agent_def::init();
+        // UpdatePlan is a main-agent tool: absent from the shared base set
+        // (so sub-agents never get it), present in the main registry, and not
+        // read-only — so plan mode's read-only filter hides it and the
+        // `run_tool_inner` backstop rejects a hallucinated call there.
+        let base = base_tools(Arc::new(PathBuf::from(".")));
+        assert!(
+            !base.iter().any(|t| t.name() == UPDATE_PLAN),
+            "UpdatePlan must not be in the sub-agent base set"
+        );
+
+        let reg = main_registry(
+            PathBuf::from("."),
+            WeakEntity::new_invalid(),
+            crate::language::Language::En,
+        );
+        let tool = reg.get(UPDATE_PLAN).expect("UpdatePlan in main registry");
+        assert!(!tool.is_read_only(), "UpdatePlan must not be read-only");
+
+        let plan_mode_names: Vec<String> = reg
+            .to_request_tools_read_only(crate::language::Language::En)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            !plan_mode_names.iter().any(|n| n == UPDATE_PLAN),
+            "UpdatePlan leaked into the plan-mode tool set"
+        );
+        let full_names: Vec<String> = reg
+            .to_request_tools(crate::language::Language::En)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(
+            full_names.iter().any(|n| n == UPDATE_PLAN),
+            "UpdatePlan missing from the Default-mode tool set"
+        );
     }
 }

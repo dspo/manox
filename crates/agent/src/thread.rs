@@ -206,6 +206,12 @@ pub enum ThreadEvent {
     /// Plan Implementation overlay; the user's choice arrives via the
     /// workspace's plan-review handler. UI-only: never enters history.
     PlanReady { plan_text: String },
+    /// The model published a structured task list via `UpdatePlan`. The Context
+    /// Rail renders `snapshot` as an execution overview. This is a UI mirror of
+    /// the tool call — the authoritative record is the `ToolUse`/`ToolResult`
+    /// pair in history, from which `plan::rebuild_from_messages` recovers the
+    /// snapshot on reload. An empty snapshot means the model cleared its plan.
+    PlanUpdated { snapshot: crate::plan::PlanSnapshot },
     /// The prefix-stability fingerprint for this turn vs. the previous one.
     /// Emitted every turn with the current stability ratio plus the drift
     /// flags so subscribers (e.g. future telemetry or debug views) can
@@ -3564,6 +3570,19 @@ impl Thread {
         })?;
 
         Self::emit_tool_result(&this, &id, &name, &title, &output_str, is_error, cx)?;
+
+        // A successful UpdatePlan mirrors its accepted snapshot to the rail. The
+        // tool already validated the input (an error result kept the last valid
+        // snapshot), so re-validation here cannot fail; `ok()` is defensive.
+        if !is_error
+            && name == crate::tools::UPDATE_PLAN
+            && let Ok(snapshot) = crate::plan::PlanSnapshot::from_input(&tu.input)
+        {
+            this.update(cx, |_, cx| {
+                cx.emit(ThreadEvent::PlanUpdated { snapshot });
+            })?;
+        }
+
         Self::append_tool_result(&this, tu, output_str.clone(), is_error, cx)?;
 
         // PostToolUse hooks fire after the result is recorded. The handler sees
