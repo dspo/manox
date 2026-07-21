@@ -125,6 +125,7 @@ pub fn init(_cx: &mut App) {
         Box::new(PlanCommand),
         Box::new(GoalCommand),
         Box::new(CompactCommand),
+        Box::new(ExitCommand),
     ];
     // Names already claimed by built-ins and (below) markdown macros, so a
     // skill sharing one is skipped — keeps one popover row per name and routes
@@ -134,6 +135,7 @@ pub fn init(_cx: &mut App) {
         "plan".to_string(),
         "goal".to_string(),
         "compact".to_string(),
+        "exit".to_string(),
     ]);
     // Mirror every loaded markdown prompt-macro (`/gitwork:deliver`, etc.) into
     // the registry so `parse` recognizes them and the `⁄` popover lists them.
@@ -448,6 +450,28 @@ impl SlashCommand for CompactCommand {
     }
 }
 
+/// `/exit` — archive the current thread and start a fresh one.
+struct ExitCommand;
+
+impl SlashCommand for ExitCommand {
+    fn name(&self) -> &str {
+        "exit"
+    }
+    fn description(&self) -> SharedString {
+        i18n::t("slash-exit-desc")
+    }
+    fn execute(
+        &self,
+        _args: &str,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> SlashResult {
+        workspace.archive_current_thread(window, cx);
+        SlashResult::Handled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +530,7 @@ mod tests {
         assert!(r.get("plan").is_some());
         assert!(r.get("goal").is_some());
         assert!(r.get("compact").is_some());
+        assert!(r.get("exit").is_some());
         assert!(r.get("nope").is_none());
     }
 
@@ -541,6 +566,14 @@ mod tests {
         assert_eq!(p.name, "compact");
         assert_eq!(p.args, "");
     }
+    #[test]
+    fn parse_exit_command() {
+        register_for_tests();
+        let p = parse("/exit").unwrap();
+        assert_eq!(p.name, "exit");
+        assert_eq!(p.args, "");
+    }
+
 
     #[test]
     fn skill_adapter_name_and_kind() {
@@ -622,6 +655,7 @@ mod tests {
             Box::new(PlanCommand),
             Box::new(GoalCommand),
             Box::new(CompactCommand),
+            Box::new(ExitCommand),
         ]));
     }
 }

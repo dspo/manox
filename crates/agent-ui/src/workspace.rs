@@ -2168,6 +2168,16 @@ impl Workspace {
         .detach();
     }
 
+    /// Archive the active thread and navigate to a fresh empty one. Shared
+    /// by the `/exit` slash command and the `cmd-;` keybinding.
+    pub(crate) fn archive_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.thread.read(cx).id.0.clone();
+        self.thread.update(cx, |t, cx| t.set_archived(true, cx));
+        let store = agent::thread_store_global();
+        store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
+        self.start_new_thread(None, window, cx);
+    }
+
     /// Park the active thread into the background (preserving its run + event
     /// subscriptions) and open a fresh empty thread in the same project — the
     /// explicit "background this task, switch to a new one" gesture, bound to
@@ -6409,6 +6419,11 @@ impl Render for Workspace {
                 cx.listener(|this, _: &crate::CompletionDismiss, _window, cx| {
                     this.close_completion(cx);
                     cx.stop_propagation();
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::ArchiveCurrentThread, window, cx| {
+                    this.archive_current_thread(window, cx);
                 }),
             )
             // Left sidebar with a draggable divider on its right edge.

@@ -459,6 +459,7 @@ slash-yolo-desc = Switch to Full access (no approvals + bash outside sandbox); w
 slash-plan-desc = Cycle collaboration mode (Plan ↔ Default); bare `/plan` toggles, `/plan <prompt>` enters Plan with a prompt
 slash-goal-desc = Set a completion condition the agent works toward until met (bare `/goal` shows status, `/goal <condition>` sets it, `/goal clear` stops)
 slash-compact-desc = Compact the conversation: summarize older history into a handoff note so the thread can keep going past the context limit
+slash-exit-desc = Archive the current thread and start a fresh one
 mode-chip-default = Default
 mode-chip-plan = Plan
 workspace-cycle-mode = Cycle collaboration mode
