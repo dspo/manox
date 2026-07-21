@@ -21,7 +21,7 @@ pub struct BashOutputTool;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct BashOutputInput {
+pub(crate) struct BashOutputInput {
     /// The shell id returned by `Bash` when it started the command with
     /// `run_in_background: true`.
     shell_id: String,

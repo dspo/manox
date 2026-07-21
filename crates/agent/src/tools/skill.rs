@@ -21,7 +21,7 @@ pub struct SkillTool {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct SkillInput {
+pub(crate) struct SkillInput {
     /// Skill name exactly as it appears in the system prompt's available-skills list.
     /// Plugin skills use the `plugin:skill` form (e.g. `gitwork:review`).
     name: String,

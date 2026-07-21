@@ -4261,15 +4261,17 @@ impl Thread {
             // `run_tool_inner` backstops any stray write call. Plan mode takes
             // precedence over `turn_tool_filter` — it is the stricter,
             // user-visible safety contract.
-            self.tools.to_request_tools_read_only()
+            self.tools.to_request_tools_read_only(self.agent_language)
         } else {
             // A slash command's `allowed-tools` whitelist is an intentional
             // narrowing of this turn's tool set. Respect it; the model enters
             // Plan mode only via an explicit user action (`/plan`, the `+` menu,
             // shift-tab), never by a synthesized tool.
             match self.turn_tool_filter.as_deref() {
-                Some(f) if !f.is_empty() => self.tools.to_request_tools_filtered(f),
-                _ => self.tools.to_request_tools(),
+                Some(f) if !f.is_empty() => {
+                    self.tools.to_request_tools_filtered(f, self.agent_language)
+                }
+                _ => self.tools.to_request_tools(self.agent_language),
             }
         };
         // Coalesce the fully assembled list so the fixed-position

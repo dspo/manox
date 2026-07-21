@@ -36,7 +36,7 @@ const MONITOR_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct MonitorInput {
+pub(crate) struct MonitorInput {
     /// Shell command to run (`sh -c`). stdout and stderr are streamed line by
     /// line; each line becomes a live update. Filter the command to emit only
     /// lines you would act on — do not pipe raw noisy logs.

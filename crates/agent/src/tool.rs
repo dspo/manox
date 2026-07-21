@@ -239,14 +239,27 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
-    /// Build the `LanguageModelRequestTool` list sent to the model.
-    pub fn to_request_tools(&self) -> Vec<LanguageModelRequestTool> {
+    /// Build the `LanguageModelRequestTool` list sent to the model, with tool
+    /// descriptions and schema field descriptions rendered in `lang`. Tools
+    /// whose prose is bilingualized are sourced from the descriptions asset;
+    /// others (template-rendered `Agent`, not-yet-bilingualized web_explore /
+    /// team / LSP / MCP) fall back to their own `description()` / schemars text.
+    pub fn to_request_tools(
+        &self,
+        lang: crate::language::Language,
+    ) -> Vec<LanguageModelRequestTool> {
         self.tools
             .values()
             .map(|tool| LanguageModelRequestTool {
                 name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                input_schema: tool.input_schema(),
+                description: crate::tools::descriptions::description_for(tool.name(), lang)
+                    .unwrap_or_else(|| tool.description())
+                    .to_string(),
+                input_schema: crate::tools::descriptions::override_schema(
+                    tool.input_schema(),
+                    tool.name(),
+                    lang,
+                ),
                 use_input_streaming: false,
             })
             .collect()
@@ -257,14 +270,24 @@ impl ToolRegistry {
     /// set. Empty `allowed` yields an empty list — callers should fall back to
     /// [`to_request_tools`] when the filter is unset rather than call this with
     /// an empty slice.
-    pub fn to_request_tools_filtered(&self, allowed: &[String]) -> Vec<LanguageModelRequestTool> {
+    pub fn to_request_tools_filtered(
+        &self,
+        allowed: &[String],
+        lang: crate::language::Language,
+    ) -> Vec<LanguageModelRequestTool> {
         self.tools
             .values()
             .filter(|tool| allowed.iter().any(|a| a == tool.name()))
             .map(|tool| LanguageModelRequestTool {
                 name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                input_schema: tool.input_schema(),
+                description: crate::tools::descriptions::description_for(tool.name(), lang)
+                    .unwrap_or_else(|| tool.description())
+                    .to_string(),
+                input_schema: crate::tools::descriptions::override_schema(
+                    tool.input_schema(),
+                    tool.name(),
+                    lang,
+                ),
                 use_input_streaming: false,
             })
             .collect()
@@ -275,14 +298,23 @@ impl ToolRegistry {
     /// `agent` tool is read-only (`SpawnAgentTool::is_read_only`), so it
     /// survives — letting the main thread delegate research to the `Explore`
     /// sub-agent with isolated context.
-    pub fn to_request_tools_read_only(&self) -> Vec<LanguageModelRequestTool> {
+    pub fn to_request_tools_read_only(
+        &self,
+        lang: crate::language::Language,
+    ) -> Vec<LanguageModelRequestTool> {
         self.tools
             .values()
             .filter(|t| t.is_read_only())
             .map(|tool| LanguageModelRequestTool {
                 name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                input_schema: tool.input_schema(),
+                description: crate::tools::descriptions::description_for(tool.name(), lang)
+                    .unwrap_or_else(|| tool.description())
+                    .to_string(),
+                input_schema: crate::tools::descriptions::override_schema(
+                    tool.input_schema(),
+                    tool.name(),
+                    lang,
+                ),
                 use_input_streaming: false,
             })
             .collect()
@@ -347,7 +379,7 @@ mod tests {
     fn to_request_tools_is_lexicographically_sorted() {
         let r = registry();
         let names: Vec<String> = r
-            .to_request_tools()
+            .to_request_tools(crate::language::Language::En)
             .iter()
             .map(|t| t.name.clone())
             .collect();
@@ -367,7 +399,7 @@ mod tests {
         r.register(stub("000_stub"));
         r.register(stub("zzz_stub"));
         let names: Vec<String> = r
-            .to_request_tools()
+            .to_request_tools(crate::language::Language::En)
             .iter()
             .map(|t| t.name.clone())
             .collect();
@@ -384,8 +416,8 @@ mod tests {
     #[test]
     fn filtered_excludes_write_tools_in_plan_mode() {
         let r = registry();
-        let full = r.to_request_tools();
-        let ro = r.to_request_tools_read_only();
+        let full = r.to_request_tools(crate::language::Language::En);
+        let ro = r.to_request_tools_read_only(crate::language::Language::En);
 
         let full_names: Vec<&str> = full.iter().map(|t| t.name.as_str()).collect();
         let ro_names: Vec<&str> = ro.iter().map(|t| t.name.as_str()).collect();

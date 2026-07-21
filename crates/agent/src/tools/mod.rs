@@ -14,6 +14,7 @@ pub mod ask_user;
 pub mod background_shell;
 pub mod bash;
 pub mod bash_output;
+pub mod descriptions;
 pub mod edit_file;
 pub mod file_lock;
 pub mod glob;
@@ -76,6 +77,32 @@ pub(crate) fn schema<T: JsonSchema>() -> Value {
     let mut value = serde_json::to_value(schemars::schema_for!(T)).expect("schema serialization");
     strip_schema_metadata(&mut value);
     value
+}
+
+/// The stripped schemars schema for the `*Input` struct of a bilingualized tool.
+/// Used by the descriptions parity test to derive the canonical set of
+/// `description` pointers — so a field added to an `*Input` without a matching
+/// asset entry, or a stray asset key, surfaces as a test failure.
+#[cfg(test)]
+pub(crate) fn schema_for_tool(name: &str) -> Value {
+    match name {
+        "Read" => schema::<read_file::ReadFileInput>(),
+        "Write" => schema::<write_file::WriteFileInput>(),
+        "Edit" => schema::<edit_file::EditFileInput>(),
+        "Bash" => schema::<bash::BashInput>(),
+        "Grep" => schema::<grep::GrepInput>(),
+        "Glob" => schema::<glob::GlobInput>(),
+        "List" => schema::<list_directory::ListDirectoryInput>(),
+        "WebFetch" => schema::<web_fetch::WebFetchInput>(),
+        "SelfInfo" => schema::<self_info::SelfInfoInput>(),
+        "Skill" => schema::<skill::SkillInput>(),
+        "Monitor" => schema::<monitor::MonitorInput>(),
+        "EnterWorktree" => schema::<worktree::EnterWorktreeInput>(),
+        "ExitWorktree" => schema::<worktree::ExitWorktreeInput>(),
+        "BashOutput" => schema::<bash_output::BashOutputInput>(),
+        "AskUserQuestion" => schema::<ask_user::AskUserQuestionInput>(),
+        other => panic!("schema_for_tool: {other} is not a bilingualized tool"),
+    }
 }
 
 /// Remove `$schema`/`title` metadata and inline `$defs`/`definitions`.

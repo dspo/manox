@@ -1,0 +1,76 @@
+{
+  "Read": "读取文件，支持行范围选择符。输出格式：首行 `[<abs-path>#<TAG>]`（4 位十六进制快照 tag），随后是 `N:TEXT` 编号行（1 基）。在路径后追加 `:<sel>` 进行部分读取：`:50-200`（闭区间范围）、`:50+150`（从第 50 行起取 150 行）、`:5-16,960-973`（多段范围）、`:raw`（原文直出，无锚点/行号）、`:raw:1-50`（复合）。不带选择符时返回前 2000 行；对更长的文件使用范围选择符翻页。",
+  "Read/properties/path": "要读取的文件绝对或相对路径（相对 cwd）。追加 `:<sel>` 指定行范围或 raw 模式：`:50-200`（闭区间范围）、`:50+150`（从第 50 行起取 150 行）、`:5-16,960-973`（多段范围）、`:raw`（原文直出，无锚点/行号）、`:raw:1-50`（复合）。",
+
+  "Write": "将内容写入指定文件（覆盖）。用于创建或重写文件。",
+  "Write/properties/path": "要写入的文件路径。",
+  "Write/properties/content": "要写入的完整内容。若模型误把 `read_file` 输出（带 `[path#tag]` 头和 `N:` 行前缀）粘贴进来，这些前缀会被自动剥离。",
+
+  "Edit": "通过 hashline patch 修改既有文件（行锚定 + TAG 校验）。详见 input.patch 字段说明。",
+  "Edit/properties/patch": "Hashline patch 文本。每个文件段以头部 `[<abs-path>#<tag>]` 起始——粘贴最近一次 `read_file` 返回的确切绝对路径与 4 位十六进制 tag；不要写 `PATH` 这个字面词。示例：`[/Users/me/proj/CLAUDE.md#A557]`。操作：`SWAP N.=M:` 将第 N..=M 行（闭区间）替换为 `+TEXT` 正文行；`DEL N.=M` 删除第 N..=M 行（无正文）；`INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / `INS.TAIL:` 插入正文行；`SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:` 作用于从第 N 行开始的括号块。正文行为 `+TEXT`（单独一个 `+` 表示空行；`+-x`/`++x` 用于转义以字面 `-`/`+` 开头的内容）；以 `-` 开头的 markdown 列表项不是正文行——请改用 `+` 前缀重写。行号引用 read_file 返回的原始文件，跨 hunk 不随偏移变化。范围只覆盖变更行；纯新增用 `INS`，绝不用扩张的 `SWAP`。若因 TAG 过期被拒绝，重试前重新 `read_file`。格式易错点（常见误写）：范围分隔符是 `.=` 而非 `:`——应写 `SWAP 37.=48:` 而非 `SWAP 37:=48:`。正文从下一行起以 `+` 前缀行给出，绝不与指令同行。完整示例：```text\n[/Users/me/proj/main.py#A557]\nSWAP 37.=48:\n+    if args.command == \"add\":\n+        handler.add(args.title)\n+    else:\n+        parser.print_help()\n```",
+
+  "Bash": "运行 bash 命令并返回 stdout。默认在 OS 沙箱内运行（macOS seatbelt：写入限定在项目根与临时目录，`.git` 只读，网络禁用）；每次调用是一次性 `bash -c`——`cd`/`export` 不会跨调用持久，请用 `&&` 串联步骤或改用 `cwd` 参数。需要沙箱外能力（网络、项目根之外的写入）时设 `unsandboxed: true`，经用户审批后在持久 shell 会话中运行（cd/export 跨调用持久）。默认超时 120s（用 timeout_secs 覆盖）；超时或取消时整个进程组被终止。stdout/stderr 实时回流到 UI。不要用管道把输出喂给 `head`/`tail` 来减量——那会截断上游管道并可能因 SIGPIPE 杀掉长跑命令；改用 `head_lines`/`tail_lines`，它们在让命令自然结束的同时保留所需切片（前 N 行、后 N 行，或两端保留中间省略）。",
+  "Bash/properties/command": "在持久会话中运行的 bash 命令（`cd` / `export` 持久）。",
+  "Bash/properties/cwd": "工作目录覆盖（跨后续调用持久）。",
+  "Bash/properties/timeout_secs": "多少秒后杀死命令（默认 120）。",
+  "Bash/properties/unsandboxed": "在 OS 沙箱（macOS seatbelt）之外运行。默认 false：命令被限定在项目根 + 临时目录写入，`.git` 只读，网络拒绝，且无需审批即运行。仅当命令确实需要沙箱外能力（网络、项目根之外的写入）时设 true——此时命令在无约束的持久 shell 中运行，并由用户审批把关。",
+  "Bash/properties/head_lines": "只保留 stdout/stderr 的前 N 行。命令仍会运行至完成（不会 SIGPIPE）——优先用此参数而非管道喂给 `head`，后者会截断上游管道并可能因 SIGPIPE 杀掉长跑命令。",
+  "Bash/properties/tail_lines": "只保留 stdout/stderr 的后 N 行。命令仍会运行至完成（不会 SIGPIPE）——优先用此参数而非管道喂给 `tail`。",
+  "Bash/properties/run_in_background": "为 true 时在后台启动命令并立即返回一个 shell id。用 `BashOutput` 轮询该 shell id 读取增量输出，直到进程退出。对应 Claude Code 的 `run_in_background` bash 标志。后台 shell 由进程级全局 `background_shell` 注册表跟踪；跨 turn 持续运行。",
+
+  "Grep": "按正则搜索文件内容，返回匹配行（带行号）。结果按行内字符数和总数设上限；用 limit/offset 翻页，或在结果被截断时用 path/glob/pattern 收窄搜索。",
+  "Grep/properties/pattern": "正则表达式。",
+  "Grep/properties/path": "搜索根目录（默认 cwd）。",
+  "Grep/properties/glob": "可选的文件名 glob 过滤（如 `*.rs`）。",
+  "Grep/properties/limit": "返回的最大匹配数（默认 200，硬上限 1000）。",
+  "Grep/properties/offset": "跳过的前导匹配数，用于在大结果集中翻页（默认 0）。",
+
+  "Glob": "查找匹配 glob 模式的文件路径（相对 cwd）。默认遵循 .gitignore 并跳过隐藏文件；返回相对路径，上限 100。传入 no_ignore/include_hidden/include_dirs/limit 放宽限制。注意：limit 硬上限为 1000——优先收窄 pattern 而非抬高 limit。",
+  "Glob/properties/pattern": "glob 模式（如 `**/*.rs`），相对 `path`/cwd。支持 `{a,b}` 枚举、`[ab]` 字符类、`**` 递归。`*.rs` 仅匹配顶层；递归用 `**/*.rs`。",
+  "Glob/properties/path": "搜索根，默认 cwd。",
+  "Glob/properties/no_ignore": "为 true 时忽略所有 `.gitignore`/`.ignore`/全局 gitignore 规则。",
+  "Glob/properties/include_hidden": "为 true 时不跳过隐藏（点开头）文件与目录。",
+  "Glob/properties/include_dirs": "为 true 时同时产出匹配该模式的目录项。",
+  "Glob/properties/limit": "返回结果上限。默认 100，硬上限 1000——超过此值有用巨大仓库撑爆自身上下文窗口的风险；尽可能收窄 `pattern` 而非抬高 `limit`。",
+
+  "List": "列出某个目录的直接子项（文件与目录）。",
+  "List/properties/path": "要列出的目录路径（默认 cwd）。",
+
+  "WebFetch": "通过 HTTP/HTTPS GET 抓取一个 web 文档并返回其文本。用于公开文档、文章、JSON/XML feed 与原始文件 URL。它不执行任何 JS，也不携带 cookie 或登录态——对需要登录或 JS 渲染的页面，改用 `web_explore_*` 工具。输出：头部块（最终 URL、HTTP 状态、content-type、已接收字节、截断提示）随后是正文文本（超过 `max_bytes` 时在 UTF-8 边界处截断）。",
+  "WebFetch/properties/url": "要抓取的绝对 `http://` 或 `https://` URL。",
+  "WebFetch/properties/max_bytes": "返回正文的字节上限（UTF-8 边界截断）。默认 512 KiB；无论调用方传入多少，实际值被钳制到 4 MiB。",
+  "WebFetch/properties/timeout_secs": "整体请求超时（秒，含连接 + 读取正文）。默认 30。",
+
+  "SelfInfo": "读取当前 agent 的运行时身份：thread id、当前工作目录、项目根、模型、已用 turn 数 / 上限，以及嵌套深度。当用户询问 thread id 或你需要确认运行时环境时调用此工具——不要跑 SQL 或翻持久层（threads.db）来查自己。",
+
+  "Skill": "查询某个具名 skill 的完整正文。skill 名出现在 system prompt 的 \"Available skills\" 列表中；插件 skill 用 `plugin:skill` 形式（如 `gitwork:review`）。仅当任务确实需要该 skill 的领域知识时调用；已知的 skill 不要重复拉取。",
+  "Skill/properties/name": "与 system prompt 的 available-skills 列表中完全一致的 skill 名。插件 skill 用 `plugin:skill` 形式（如 `gitwork:review`）。",
+
+  "Monitor": "逐行流式输出长跑 shell 命令的 stdout/stderr。命令运行期间每一行都是一条实时更新。用于观察构建、部署、日志 tail，或任何中间输出有意义的进程。命令在 `sh -c` 下运行。过滤命令使其只发出你会据以行动的行——不要把嘈杂的原始日志喂进管道。覆盖所有终止状态：崩溃、挂起、意外退出都必须产生输出。工具结果返回完整捕获文本。",
+  "Monitor/properties/command": "要运行的 shell 命令（`sh -c`）。stdout 与 stderr 逐行流式输出；每行成为一条实时更新。过滤命令使其只发出你会据以行动的行——不要把嘈杂的原始日志喂进管道。",
+  "Monitor/properties/description": "一行关于被监控对象的摘要，显示在审批提示中以便用户区分并发的 monitor。由 UI 从原始输入读取，而非工具自身读取。",
+  "Monitor/properties/timeout_ms": "杀死命令前的挂钟时间上限（毫秒）。默认 5 min；钳制到 1 hour。",
+
+  "EnterWorktree": "进入一个位于隔离分支上的 git worktree，并将会话工作目录切到该处。之后所有工具（Read、Write、Edit、Bash、……）自动在 worktree 内操作——无需手动 `cd`。在 worktree 内时，git 操作（commit、rebase、push、fetch）无需审批：绑定仓库的 `.git` 可写且网络启用，故 `git push` 顺畅无阻。当为隔离工作切出分支，或被显式要求在 worktree 中工作时使用此工具。用 `ExitWorktree` 退出（保留或移除）。Enter 会重定 provider 前缀缓存基线（system prompt 中的 cwd 行变化）——这是预期行为。传入 `name` 在 `<project>/.claude/worktrees/` 下创建新 worktree+分支，或传 `path` 重新进入已存在的 worktree。基准 ref 为 `origin/<default-branch>`（无远端跟踪分支时回退到 `HEAD`）。",
+  "EnterWorktree/properties/name": "新 worktree（及其分支）的名字。缺省时自动生成为 `wt-<short>`。与 `path` 互斥。",
+  "EnterWorktree/properties/path": "要重新进入的已存在 worktree 的路径（如先前一次 `action=keep` 的 `exit_worktree` 留下的）。与 `name` 互斥。",
+
+  "ExitWorktree": "离开当前活动的 git worktree。`action=keep`（默认）将会话 cwd 切回先前目录，但把 worktree 和分支留在磁盘上——之后可通过 `EnterWorktree`（传入 `path`）重新进入。`action=remove` 删除该 worktree 及其分支；若工作树有未提交改动则被拒绝，除非 `discard_changes=true`。仅在处于 worktree 内时可用。",
+  "ExitWorktree/properties/action": "`keep`（默认）把 worktree 和分支留在磁盘上；`remove` 删除两者。",
+  "ExitWorktree/properties/discard_changes": "当 `action=remove` 且 worktree 有未提交改动时，设为 `true` 丢弃之。否则移除会被拒绝，以免静默丢失工作成果。",
+
+  "BashOutput": "轮询由 `Bash` 以 `run_in_background: true` 启动的后台 shell。返回自上次轮询以来产出的增量 stdout/stderr，以及该 shell 的运行/退出状态。传入原始 `Bash` 调用返回的 `shell_id`。反复轮询直到状态显示进程已退出，然后读取最终输出。10 分钟以上的运行是正常的——耐心持续轮询；绝不要返回诸如 \"still running\" 之类的占位结果。",
+  "BashOutput/properties/shell_id": "`Bash` 以 `run_in_background: true` 启动命令时返回的 shell id。",
+  "BashOutput/properties/block": "为 true 时阻塞（最长 `timeout_secs`）等待新输出后再返回。为 false（默认）时立即返回自上次轮询以来累积的输出。当模型知道进程输出缓慢、希望避免忙轮询循环时，阻塞形式很有用。",
+  "BashOutput/properties/timeout_secs": "`block` 为 true 时等待的秒数（默认 10，上限 60）。`block` 为 false 时忽略。",
+
+  "AskUserQuestion": "当存在多种合理方案且答案会改变你下一步行动时，向用户提出澄清性问题。仅用于确属用户决定的决策——而非你能自行查证的事实。每次调用携带 1–3 个问题，每个含 2–3 个选项；当存在推荐默认时用 recommended=true 标注。用户也可附写补充备注。不要用此工具请求方案审批或确认显然的默认值。",
+  "AskUserQuestion/properties/questions": "要问用户的 1–3 个问题。每个成为问题抽屉中的一步。",
+  "AskUserQuestion/properties/questions/items/properties/question": "要显示的完整问题文本。",
+  "AskUserQuestion/properties/questions/items/properties/header": "问题的简短标签（最多 12 个字符）。",
+  "AskUserQuestion/properties/questions/items/properties/options": "供用户选择的 2–3 个选项。",
+  "AskUserQuestion/properties/questions/items/properties/multiSelect": "为 true 时用户可选多个选项；否则恰好选一个。",
+  "AskUserQuestion/properties/questions/items/properties/options/items/properties/label": "该选项的简明标签（1–5 个词）。",
+  "AskUserQuestion/properties/questions/items/properties/options/items/properties/description": "对该选项含义或影响的说明。",
+  "AskUserQuestion/properties/questions/items/properties/options/items/properties/recommended": "此选项是否为推荐默认。"
+}

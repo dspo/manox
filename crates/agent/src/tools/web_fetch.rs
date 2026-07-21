@@ -29,7 +29,7 @@ pub struct WebFetchTool;
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct WebFetchInput {
+pub(crate) struct WebFetchInput {
     /// Absolute `http://` or `https://` URL to fetch.
     url: String,
     /// Cap on the returned body in bytes (UTF-8 boundary). Default 512 KiB; the

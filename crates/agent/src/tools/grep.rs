@@ -24,7 +24,7 @@ pub struct GrepTool {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct GrepInput {
+pub(crate) struct GrepInput {
     /// Regex pattern.
     pattern: String,
     /// Search root directory (defaults to cwd).

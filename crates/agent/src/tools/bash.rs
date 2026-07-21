@@ -198,7 +198,7 @@ where
 
 #[derive(Deserialize, JsonSchema, Debug)]
 #[serde(deny_unknown_fields)]
-struct BashInput {
+pub(crate) struct BashInput {
     /// Bash command to run in the persistent session (`cd` / `export` persist).
     command: String,
     /// Working directory override (persists across subsequent calls).

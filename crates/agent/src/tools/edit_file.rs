@@ -21,7 +21,7 @@ pub struct EditTool {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct EditFileInput {
+pub(crate) struct EditFileInput {
     /// Hashline patch text. Each file section starts with a header
     /// `[<abs-path>#<tag>]` — paste the exact absolute path and 4-hex tag
     /// returned by your latest `read_file` for that file; do NOT write the

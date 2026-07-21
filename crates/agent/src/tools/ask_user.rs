@@ -25,7 +25,7 @@ pub struct AskUserQuestionTool;
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
-struct AskUserQuestionInput {
+pub(crate) struct AskUserQuestionInput {
     /// 1–3 questions to ask the user. Each becomes one step in the question drawer.
     #[schemars(length(min = 1, max = 3))]
     questions: Vec<Question>,
