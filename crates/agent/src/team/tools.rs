@@ -565,9 +565,7 @@ impl AgentTool for TeamSpawnTool {
             return Task::ready(Err("leader thread dropped".to_string()));
         };
         let Some(team) = leader.read(cx).team().cloned() else {
-            return Task::ready(Err(
-                "no active team; create one with TeamCreate".to_string()
-            ));
+            return Task::ready(Err("no active team; create one with TeamCreate".to_string()));
         };
         if !team.read(cx).has_room() {
             return Task::ready(Err("team is full (5 workers max)".to_string()));
@@ -809,13 +807,7 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "duplicate tool names: {names:?}");
-        for expected in [
-            TASK_CREATE,
-            TASK_LIST,
-            TASK_UPDATE,
-            TASK_GET,
-            SEND_MESSAGE,
-        ] {
+        for expected in [TASK_CREATE, TASK_LIST, TASK_UPDATE, TASK_GET, SEND_MESSAGE] {
             assert!(names.contains(&expected), "missing {expected}: {names:?}");
         }
     }
