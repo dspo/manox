@@ -8,6 +8,18 @@
 //! go through `LspRegistry::client_for`, which ensures + bounded-waits
 //! (≤5s) and returns an "indexing, retry" error instead of blocking forever.
 
+// ─── tool name constants ────────────────────────────────────────────────────
+
+pub const LSP_STATUS: &str = "LspStatus";
+pub const LSP_ENSURE: &str = "LspEnsure";
+pub const LSP_WAIT_READY: &str = "LspWaitReady";
+pub const GO_TO_DEFINITION: &str = "GoToDefinition";
+pub const FIND_REFERENCES: &str = "FindReferences";
+pub const HOVER: &str = "Hover";
+pub const DOCUMENT_SYMBOLS: &str = "DocumentSymbols";
+pub const WORKSPACE_SYMBOLS: &str = "WorkspaceSymbols";
+pub const DIAGNOSTICS: &str = "Diagnostics";
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -52,13 +64,13 @@ struct LspStatusInput {
 
 impl AgentTool for LspStatusTool {
     fn name(&self) -> &str {
-        "lsp_status"
+        LSP_STATUS
     }
     fn description(&self) -> &str {
         "Report the status of language servers (rust-analyzer/gopls/pyright/typescript-language-server) for the current project. \
          Returns `not_started` (installed, not spawned yet — the default), `starting`, `ready`, `failed`, or `not_installed` per server. \
          Cheap: does not spawn a server. Optional `language` filters to one. \
-         Use this before code-intel tools to decide whether to call lsp_ensure/lsp_wait_ready."
+         Use this before code-intel tools to decide whether to call LspEnsure/LspWaitReady."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<LspStatusInput>()
@@ -111,12 +123,12 @@ struct LspEnsureInput {
 
 impl AgentTool for LspEnsureTool {
     fn name(&self) -> &str {
-        "lsp_ensure"
+        LSP_ENSURE
     }
     fn description(&self) -> &str {
         "Ensure a language server is spawned for the current project. Non-blocking: kicks off spawn+initialize in the background and returns `starting` immediately, or `ready`/`failed`/`not_installed`. \
-         Idempotent — call repeatedly. Pair with lsp_wait_ready when you need to block until ready. \
-         Code-intel tools (go_to_definition etc.) also ensure implicitly, so calling this is optional but lets you warm a server before first use."
+         Idempotent — call repeatedly. Pair with LspWaitReady when you need to block until ready. \
+         Code-intel tools (GoToDefinition etc.) also ensure implicitly, so calling this is optional but lets you warm a server before first use."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<LspEnsureInput>()
@@ -169,11 +181,11 @@ fn default_wait_secs() -> u64 {
 
 impl AgentTool for LspWaitReadyTool {
     fn name(&self) -> &str {
-        "lsp_wait_ready"
+        LSP_WAIT_READY
     }
     fn description(&self) -> &str {
         "Block until a language server is ready (or the timeout elapses). Returns `ready`/`starting`(timed out, still indexing)/`failed`/`not_installed`. \
-         This is the explicit 'I decide to wait' entry point — lsp_ensure kicks off spawn non-blocking, then lsp_wait_ready blocks on it. \
+         This is the explicit 'I decide to wait' entry point — LspEnsure kicks off spawn non-blocking, then LspWaitReady blocks on it. \
          Call before a burst of code-intel calls if you want them to hit a warm server."
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -268,12 +280,12 @@ struct PositionInput {
 
 impl AgentTool for GoToDefinitionTool {
     fn name(&self) -> &str {
-        "go_to_definition"
+        GO_TO_DEFINITION
     }
     fn description(&self) -> &str {
         "Find where a symbol is defined (LSP textDocument/definition). Input: path + 1-indexed line + the symbol text on that line. \
          Returns `path:line:col` triples (feed straight to read_file). Routes by file extension: .rs→rust-analyzer, .go→gopls, .py→pyright, .ts/.tsx/...→typescript-language-server. \
-         The server must be installed and warmed (lsp_ensure/lsp_wait_ready); returns an 'indexing, retry' note if not ready yet."
+         The server must be installed and warmed (LspEnsure/LspWaitReady); returns an 'indexing, retry' note if not ready yet."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<PositionInput>()
@@ -299,8 +311,8 @@ impl AgentTool for GoToDefinitionTool {
                 .await?;
             Ok(render_locs(
                 locs,
-                "No definitions found (server may still be indexing; call lsp_status or retry shortly).",
-                "narrow the symbol or call document_symbols first",
+                "No definitions found (server may still be indexing; call LspStatus or retry shortly).",
+                "narrow the symbol or call DocumentSymbols first",
             ))
         })
     }
@@ -324,11 +336,11 @@ fn default_true() -> bool {
 
 impl AgentTool for FindReferencesTool {
     fn name(&self) -> &str {
-        "find_references"
+        FIND_REFERENCES
     }
     fn description(&self) -> &str {
         "Find all references to a symbol (LSP textDocument/references). Semantically accurate — unlike grep, won't be swamped by same-name identifiers in other scopes. \
-         Input: path + 1-indexed line + symbol text. Returns `path:line:col` triples. include_declaration defaults true. Same routing/ready rules as go_to_definition."
+         Input: path + 1-indexed line + symbol text. Returns `path:line:col` triples. include_declaration defaults true. Same routing/ready rules as GoToDefinition."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<ReferencesInput>()
@@ -359,8 +371,8 @@ impl AgentTool for FindReferencesTool {
                 .await?;
             Ok(render_locs(
                 locs,
-                "No references found (server may still be indexing; call lsp_status or retry shortly).",
-                "narrow the symbol or call document_symbols first",
+                "No references found (server may still be indexing; call LspStatus or retry shortly).",
+                "narrow the symbol or call DocumentSymbols first",
             ))
         })
     }
@@ -370,11 +382,11 @@ pub struct HoverTool;
 
 impl AgentTool for HoverTool {
     fn name(&self) -> &str {
-        "hover"
+        HOVER
     }
     fn description(&self) -> &str {
         "Get hover info for a symbol (LSP textDocument/hover): type signature, doc comments. \
-         Input: path + 1-indexed line + symbol text. Returns markdown/plaintext, or 'no hover' if the server has nothing. Same routing/ready rules as go_to_definition."
+         Input: path + 1-indexed line + symbol text. Returns markdown/plaintext, or 'no hover' if the server has nothing. Same routing/ready rules as GoToDefinition."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<PositionInput>()
@@ -412,11 +424,11 @@ struct PathInput {
 
 impl AgentTool for DocumentSymbolsTool {
     fn name(&self) -> &str {
-        "document_symbols"
+        DOCUMENT_SYMBOLS
     }
     fn description(&self) -> &str {
         "List the symbol tree of a file (LSP textDocument/documentSymbol): functions, structs, methods, etc. with kind and 1-indexed line. \
-         Input: path only. Use before go_to_definition/find_references to pick exact symbol names and lines."
+         Input: path only. Use before GoToDefinition/FindReferences to pick exact symbol names and lines."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<PathInput>()
@@ -440,7 +452,7 @@ impl AgentTool for DocumentSymbolsTool {
             let syms = client.document_symbols(&abs).await?;
             if syms.is_empty() {
                 return Ok(
-                    "No symbols (server may still be indexing; call lsp_status or retry shortly)."
+                    "No symbols (server may still be indexing; call LspStatus or retry shortly)."
                         .to_string(),
                 );
             }
@@ -465,11 +477,11 @@ struct QueryInput {
 
 impl AgentTool for WorkspaceSymbolsTool {
     fn name(&self) -> &str {
-        "workspace_symbols"
+        WORKSPACE_SYMBOLS
     }
     fn description(&self) -> &str {
         "Search symbols across the whole workspace (LSP workspace/symbol). Input: query string. \
-         Returns `path:line:col name` triples. Which server answers depends on the servers warmed for the current project — call lsp_ensure for the language(s) you care about first. \
+         Returns `path:line:col name` triples. Which server answers depends on the servers warmed for the current project — call LspEnsure for the language(s) you care about first. \
          Note: a server only returns symbols it has indexed; an empty result may mean indexing isn't done."
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -514,7 +526,7 @@ impl AgentTool for WorkspaceSymbolsTool {
                 }
             }
             if all.is_empty() {
-                return Ok("No symbols matched (warm the servers with lsp_ensure, or indexing may be incomplete).".to_string());
+                return Ok("No symbols matched (warm the servers with LspEnsure, or indexing may be incomplete).".to_string());
             }
             all.sort_by_key(|(_, _, line, _)| *line);
             let body = all
@@ -538,11 +550,11 @@ struct DiagnosticsInput {
 
 impl AgentTool for DiagnosticsTool {
     fn name(&self) -> &str {
-        "diagnostics"
+        DIAGNOSTICS
     }
     fn description(&self) -> &str {
         "Report LSP diagnostics (errors/warnings) for a file or the whole project. These are what the language server pushes as it indexes; \
-         an empty result may mean no problems OR none pushed yet (check lsp_status). Input: optional path. \
+         an empty result may mean no problems OR none pushed yet (check LspStatus). Input: optional path. \
          NOTE: diagnostics reflect on-disk state (the server watches files); they may be stale during initial indexing. Re-run after edits settle."
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -591,7 +603,7 @@ impl AgentTool for DiagnosticsTool {
                 }
             }
             if bodies.is_empty() {
-                return Ok("No cached diagnostics (call lsp_ensure to warm servers, then re-run; indexing may be incomplete).".to_string());
+                return Ok("No cached diagnostics (call LspEnsure to warm servers, then re-run; indexing may be incomplete).".to_string());
             }
             Ok(truncate_output(&bodies.join("\n\n"), OUTPUT_CAP)
                 .render("scope to a single file via the `path` argument"))

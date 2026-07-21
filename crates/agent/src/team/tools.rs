@@ -12,6 +12,17 @@
 //! that DO mutate the world (write_file, bash, …) still bubble their own
 //! authorizations up to the leader via the team's auth subscription.
 
+// ─── tool name constants ────────────────────────────────────────────────────
+
+pub const TASK_CREATE: &str = "TaskCreate";
+pub const TASK_LIST: &str = "TaskList";
+pub const TASK_UPDATE: &str = "TaskUpdate";
+pub const TASK_GET: &str = "TaskGet";
+pub const SEND_MESSAGE: &str = "SendMessage";
+pub const TEAM_CREATE: &str = "TeamCreate";
+pub const TEAM_SPAWN: &str = "TeamSpawn";
+pub const TEAM_DISBAND: &str = "TeamDisband";
+
 use std::sync::Arc;
 
 use gpui::{App, Task, WeakEntity};
@@ -56,10 +67,10 @@ where
 fn team_or_err(ctx: &dyn ToolContext) -> Result<gpui::Entity<Team>, String> {
     ctx.team()
         .cloned()
-        .ok_or_else(|| "no active team: create one with team_create first".to_string())
+        .ok_or_else(|| "no active team: create one with TeamCreate first".to_string())
 }
 
-// ─── task_create ──────────────────────────────────────────────────────────
+// ─── TaskCreate ─────────────────────────────────────────────────────────────
 
 pub struct TaskCreateTool;
 
@@ -74,12 +85,12 @@ struct TaskCreateInput {
 
 impl AgentTool for TaskCreateTool {
     fn name(&self) -> &str {
-        "task_create"
+        TASK_CREATE
     }
     fn description(&self) -> &str {
         "Create a task on the shared team task list. Returns the new task id (e.g. T1). \
          Use for the team's coordination board — the leader breaks work into tasks, members \
-         claim and update them. Requires an active team (team_create)."
+         claim and update them. Requires an active team (TeamCreate)."
     }
     fn input_schema(&self) -> serde_json::Value {
         crate::tools::schema::<TaskCreateInput>()
@@ -104,7 +115,7 @@ impl AgentTool for TaskCreateTool {
     }
 }
 
-// ─── task_list ────────────────────────────────────────────────────────────
+// ─── TaskList ───────────────────────────────────────────────────────────────
 
 pub struct TaskListTool;
 
@@ -113,7 +124,7 @@ struct TaskListInput {}
 
 impl AgentTool for TaskListTool {
     fn name(&self) -> &str {
-        "task_list"
+        TASK_LIST
     }
     fn description(&self) -> &str {
         "List all tasks on the shared team task list (id, status, owner, subject). \
@@ -156,7 +167,7 @@ impl AgentTool for TaskListTool {
     }
 }
 
-// ─── task_update ──────────────────────────────────────────────────────────
+// ─── TaskUpdate ─────────────────────────────────────────────────────────────
 
 pub struct TaskUpdateTool;
 
@@ -178,7 +189,7 @@ struct TaskUpdateInput {
 
 impl AgentTool for TaskUpdateTool {
     fn name(&self) -> &str {
-        "task_update"
+        TASK_UPDATE
     }
     fn description(&self) -> &str {
         "Update a task's status, owner, or subject. Each field is optional — omit a \
@@ -225,7 +236,7 @@ impl AgentTool for TaskUpdateTool {
     }
 }
 
-// ─── task_get ─────────────────────────────────────────────────────────────
+// ─── TaskGet ────────────────────────────────────────────────────────────────
 
 pub struct TaskGetTool;
 
@@ -237,7 +248,7 @@ struct TaskGetInput {
 
 impl AgentTool for TaskGetTool {
     fn name(&self) -> &str {
-        "task_get"
+        TASK_GET
     }
     fn description(&self) -> &str {
         "Read a single task by id (full subject, description, status, owner)."
@@ -277,7 +288,7 @@ impl AgentTool for TaskGetTool {
     }
 }
 
-// ─── send_message ─────────────────────────────────────────────────────────
+// ─── SendMessage ────────────────────────────────────────────────────────────
 
 pub struct SendMessageTool;
 
@@ -293,7 +304,7 @@ struct SendMessageInput {
 
 impl AgentTool for SendMessageTool {
     fn name(&self) -> &str {
-        "send_message"
+        SEND_MESSAGE
     }
     fn description(&self) -> &str {
         "Send a peer message to a teammate (\"lead\", a member name, or \"all\" for \
@@ -331,8 +342,8 @@ impl AgentTool for SendMessageTool {
 
 /// The shared team tools, registered for both the leader (in `main_registry`)
 /// and every worker member (in `build_member_registry`). These are the
-/// coordination primitives — `task_*` and `send_message`. Team-management
-/// tools (`team_create` / `team_spawn` / `team_disband`) are leader-only and
+/// coordination primitives — `Task*` and `SendMessage`. Team-management
+/// tools (`TeamCreate` / `TeamSpawn` / `TeamDisband`) are leader-only and
 /// appended separately.
 pub fn shared_tools() -> Vec<AnyAgentTool> {
     vec![
@@ -346,8 +357,8 @@ pub fn shared_tools() -> Vec<AnyAgentTool> {
 
 // ─── leader-only team management ────────────────────────────────────────────
 
-/// The leader's team-management tools (`team_create` / `team_spawn` /
-/// `team_disband`), registered only in `main_registry`. Worker members never
+/// The leader's team-management tools (`TeamCreate` / `TeamSpawn` /
+/// `TeamDisband`), registered only in `main_registry`. Worker members never
 /// form or disband teams — only the leader does. Each tool holds a weak handle
 /// to the leader `Thread`; all spawning/teardown is synchronous entity work on
 /// `&mut App`, so these return `Task::ready`.
@@ -363,12 +374,12 @@ pub fn leader_tools(leader: WeakEntity<Thread>) -> Vec<AnyAgentTool> {
     ]
 }
 
-/// Shared input shape for a member spec — used by both `team_create`'s roster
-/// and `team_spawn`'s single-add path.
+/// Shared input shape for a member spec — used by both `TeamCreate`'s roster
+/// and `TeamSpawn`'s single-add path.
 #[derive(Deserialize, JsonSchema)]
 struct MemberSpecInput {
     /// Worker name (unique within the team; used as the routing handle for
-    /// `send_message` and the auth-bubble composite id).
+    /// `SendMessage` and the auth-bubble composite id).
     name: String,
     /// Short role label shown in the roster UI (e.g. "explorer").
     role: String,
@@ -406,7 +417,7 @@ struct TeamCreateInput {
 
 impl AgentTool for TeamCreateTool {
     fn name(&self) -> &str {
-        "team_create"
+        TEAM_CREATE
     }
     fn description(&self) -> &str {
         "Form a peer-agents team with you (the main agent) as leader and the \
@@ -415,7 +426,7 @@ impl AgentTool for TeamCreateTool {
          to completion and reports back. Use for parallel sub-tasks that need to \
          coordinate or share progress — NOT for independent fire-and-forget work \
          (use the `agent` tool for that). Only one team may be active at a time; \
-         disband with `team_disband` before forming another. Assign members \
+         disband with `TeamDisband` before forming another. Assign members
          disjoint write ranges to avoid file-write lock contention."
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -430,7 +441,7 @@ impl AgentTool for TeamCreateTool {
     ) -> Task<Result<String, String>> {
         let parsed = match serde_json::from_value::<TeamCreateInput>(input) {
             Ok(p) => p,
-            Err(e) => return Task::ready(Err(format!("team_create input parse failed: {e}"))),
+            Err(e) => return Task::ready(Err(format!("TeamCreate input parse failed: {e}"))),
         };
         let Some(leader) = self.leader.upgrade() else {
             return Task::ready(Err("leader thread dropped".to_string()));
@@ -439,7 +450,7 @@ impl AgentTool for TeamCreateTool {
         // at most one live team; a second would dangle the first's members.
         if leader.read(cx).team().is_some() {
             return Task::ready(Err(
-                "a team is already active; disband it with team_disband first".to_string(),
+                "a team is already active; disband it with TeamDisband first".to_string(),
             ));
         }
         let team = Team::new(parsed.name, leader.downgrade(), cx);
@@ -484,7 +495,7 @@ impl AgentTool for TeamCreateTool {
                         team.update(cx, |t, cx| t.disband(cx));
                         leader.update(cx, |t, cx| t.clear_team(cx));
                         return Task::ready(Err(format!(
-                            "team_create aborted: member '{member_name}' rejected: {e}"
+                            "TeamCreate aborted: member '{member_name}' rejected: {e}"
                         )));
                     }
                     team.update(cx, |t, _cx| t.set_member_sub(member_name, sub));
@@ -493,7 +504,7 @@ impl AgentTool for TeamCreateTool {
                     team.update(cx, |t, cx| t.disband(cx));
                     leader.update(cx, |t, cx| t.clear_team(cx));
                     return Task::ready(Err(format!(
-                        "team_create aborted: spawn of '{member_name}' failed: {e}"
+                        "TeamCreate aborted: spawn of '{member_name}' failed: {e}"
                     )));
                 }
             }
@@ -529,12 +540,12 @@ impl TeamSpawnInput {
 
 impl AgentTool for TeamSpawnTool {
     fn name(&self) -> &str {
-        "team_spawn"
+        TEAM_SPAWN
     }
     fn description(&self) -> &str {
         "Add a worker member to the active team. The team must already exist \
-         (team_create). The new member runs autonomously and reports back via \
-         `send_message`. Refused if the roster is full (5 workers max)."
+         (TeamCreate). The new member runs autonomously and reports back via \
+         `SendMessage`. Refused if the roster is full (5 workers max)."
     }
     fn input_schema(&self) -> serde_json::Value {
         crate::tools::schema::<TeamSpawnInput>()
@@ -548,14 +559,14 @@ impl AgentTool for TeamSpawnTool {
     ) -> Task<Result<String, String>> {
         let parsed = match serde_json::from_value::<TeamSpawnInput>(input) {
             Ok(p) => p,
-            Err(e) => return Task::ready(Err(format!("team_spawn input parse failed: {e}"))),
+            Err(e) => return Task::ready(Err(format!("TeamSpawn input parse failed: {e}"))),
         };
         let Some(leader) = self.leader.upgrade() else {
             return Task::ready(Err("leader thread dropped".to_string()));
         };
         let Some(team) = leader.read(cx).team().cloned() else {
             return Task::ready(Err(
-                "no active team; create one with team_create".to_string()
+                "no active team; create one with TeamCreate".to_string()
             ));
         };
         if !team.read(cx).has_room() {
@@ -588,7 +599,7 @@ struct TeamDisbandInput {}
 
 impl AgentTool for TeamDisbandTool {
     fn name(&self) -> &str {
-        "team_disband"
+        TEAM_DISBAND
     }
     fn description(&self) -> &str {
         "Disband the active team: drop all worker member threads, release the \
@@ -606,7 +617,7 @@ impl AgentTool for TeamDisbandTool {
         cx: &mut App,
     ) -> Task<Result<String, String>> {
         let Ok(_) = serde_json::from_value::<TeamDisbandInput>(input) else {
-            return Task::ready(Err("team_disband input parse failed".to_string()));
+            return Task::ready(Err("TeamDisband input parse failed".to_string()));
         };
         let Some(leader) = self.leader.upgrade() else {
             return Task::ready(Err("leader thread dropped".to_string()));
@@ -799,11 +810,11 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "duplicate tool names: {names:?}");
         for expected in [
-            "task_create",
-            "task_list",
-            "task_update",
-            "task_get",
-            "send_message",
+            TASK_CREATE,
+            TASK_LIST,
+            TASK_UPDATE,
+            TASK_GET,
+            SEND_MESSAGE,
         ] {
             assert!(names.contains(&expected), "missing {expected}: {names:?}");
         }
@@ -820,9 +831,9 @@ mod tests {
         });
         let tools = leader_tools(leader.downgrade());
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"team_create"), "got: {names:?}");
-        assert!(names.contains(&"team_spawn"), "got: {names:?}");
-        assert!(names.contains(&"team_disband"), "got: {names:?}");
+        assert!(names.contains(&TEAM_CREATE), "got: {names:?}");
+        assert!(names.contains(&TEAM_SPAWN), "got: {names:?}");
+        assert!(names.contains(&TEAM_DISBAND), "got: {names:?}");
     }
 
     /// The team subscription in `spawn_team_member` forwards a member's

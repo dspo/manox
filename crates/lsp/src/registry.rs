@@ -210,7 +210,7 @@ impl LspRegistry {
                 "LSP server `{spec_id}` is not on PATH; install it to enable code-intel"
             )),
             (ServerStatus::Starting, _) => Err(anyhow!(
-                "LSP server `{spec_id}` still indexing; call lsp_wait_ready or retry shortly"
+                "LSP server `{spec_id}` still indexing; call LspWaitReady or retry shortly"
             )),
             (ServerStatus::Failed, _) => Err(anyhow!(
                 "LSP server `{spec_id}` failed to start; see logs (reinstall or check PATH)"
@@ -222,7 +222,7 @@ impl LspRegistry {
     }
 
     /// Snapshot every available server's status for a given root, for
-    /// `lsp_status`. `Idle` (never spawned) surfaces as `NotStarted`.
+    /// `LspStatus`. `Idle` (never spawned) surfaces as `NotStarted`.
     pub async fn statuses_for(&self, root: &Path) -> Vec<(&'static str, ServerStatus)> {
         let mut out = Vec::with_capacity(self.available.len());
         for spec in &self.available {

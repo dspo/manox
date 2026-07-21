@@ -362,10 +362,10 @@ fn setup_child(
         cx,
     );
 
-    // The built-in `explore` agent skips CLAUDE.md instruction injection to
+    // The built-in `Explore` agent skips CLAUDE.md instruction injection to
     // stay fast (Claude Code's Explore/Plan carve-out). A user-authored agent
-    // named `explore` overrides the built-in and keeps instructions.
-    if def_file.builtin && def_file.def.name == "explore" {
+    // named `Explore` overrides the built-in and keeps instructions.
+    if def_file.builtin && def_file.def.name == "Explore" {
         child.update(cx, |c, _cx| c.set_instructions_enabled(false));
     }
 
@@ -845,12 +845,12 @@ pub(crate) struct MemberSpec {
 /// sharing the leader's cwd, inheriting the leader's model / approval mode /
 /// reasoning effort / always-allow permission grants, with the sub-agent
 /// definition's tool allowlist PLUS the shared team coordination tools
-/// (`task_*`, `send_message`). The member's `team` back-reference is set so
+/// (`Task*`, `SendMessage`). The member's `team` back-reference is set so
 /// those tools reach the shared [`crate::team::TaskList`] and the message
 /// router.
 ///
 /// Unlike a one-shot `agent` sub-agent, a member is fire-and-forget: it runs to
-/// self-completion or `max_turns`, reporting back via `send_message`. Its
+/// self-completion or `max_turns`, reporting back via `SendMessage`. Its
 /// `AgentText`/`AgentThinking` are NOT streamed to the leader — the member
 /// panel subscribes to the member `Thread` directly. `ToolCallAuthorization`
 /// bubbles to the leader as `<name>::<auth>` (reusing the composite-id route);
@@ -911,13 +911,12 @@ pub(crate) fn spawn_team_member(
         cx,
     );
 
-    // Same Explore carve-out as the `agent` tool path: the built-in explore
+    // Same Explore carve-out as the `agent` tool path: the built-in Explore
     // definition skips CLAUDE.md instructions; overrides keep them.
-    if def_file.builtin && def_file.def.name == "explore" {
+    if def_file.builtin && def_file.def.name == "Explore" {
         member.update(cx, |t, _cx| t.set_instructions_enabled(false));
     }
-
-    // Attach the team so the member's task_*/send_message reach the shared
+    // Attach the team so the member's Task*/SendMessage reach the shared
     // list + router. This is the member→team strong edge; `Team::disband`
     // clears it before dropping the roster.
     member.update(cx, |t, cx| t.set_team(team.clone(), cx));

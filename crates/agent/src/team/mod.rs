@@ -4,13 +4,13 @@
 //! registry like `agent_def` / `mcp`): long-lived members + a shared
 //! [`TaskList`] + peer messaging. The leader is the main thread itself; worker
 //! members are independent `Entity<Thread>`s that coordinate via
-//! `send_message` and the shared task list.
+//! `SendMessage` and the shared task list.
 //!
 //! Message routing: `deliver` pushes a [`PeerMessage`] onto the target's inbox
 //! and, if the target is idle, immediately flushes it (append a user-role
 //! message + emit [`ThreadEvent::PeerMessage`] + `run_turn`). A busy target
 //! keeps the message queued; the team's `Stop` subscription (wired at member
-//! spawn in `team_spawn`) calls `flush_inbox` on the target's turn end, after
+//! spawn in `TeamSpawn`) calls `flush_inbox` on the target's turn end, after
 //! `running_turn` has cleared — the `run_turn` guard prevents a double
 //! trigger, and `cx.defer` pushes the flush past the in-flight turn's
 //! teardown so the guard sees `running_turn == None`. This keeps peer

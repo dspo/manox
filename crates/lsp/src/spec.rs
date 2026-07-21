@@ -8,7 +8,7 @@
 ///   `PATH`. Run at startup (cheap); a server not on `PATH` is never spawned.
 /// - `spawn`: argv for the stdio server (pyright / ts-language-server need
 ///   `--stdio` to enter LSP mode; rust-analyzer / gopls are stdio by default).
-/// - `extensions`: file extensions routed to this server. `go_to_definition`
+/// - `extensions`: file extensions routed to this server. `GoToDefinition`
 ///   etc. pick the server by the path's extension.
 /// - `root_hints`: markers used to locate the workspace root (walk up from the
 ///   target file until one of these exists).
