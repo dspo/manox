@@ -122,52 +122,16 @@ enum TextInputAction {
     Cancel,
 }
 
-// ResolvedModel lives in cx-providers; cx builds it with TUI-specific semantics
-// (agent compatibility, provider+model env merge, "—" placeholders) that the shared
-// crate's manox-style `from_config` does not assume.
-
-/// Build a `ResolvedModel` with cx semantics: `visible_agents` filters by cross-model
-/// compatibility, `env` merges provider base + model overrides.
+// resolved_model_from_config delegates to the shared ResolvedModel::from_config
+// in cx-providers — the single source of truth for capability defaults and
+// agent/endpoint compatibility resolution.
 fn resolved_model_from_config(
     config: &CxConfig,
     provider: &ProviderConfig,
     endpoint: &EndpointConfig,
     model: &ModelConfig,
 ) -> ResolvedModel {
-    let model_wire_apis: Vec<WireApi> = if model.wire_apis.is_empty() {
-        vec![WireApi::from_str(&endpoint.wire_api)]
-    } else {
-        model
-            .wire_apis
-            .iter()
-            .map(|s| WireApi::from_str(s))
-            .filter(|w| *w != WireApi::Unavailable)
-            .collect()
-    };
-    // Merged env: provider is the base, model entries override.
-    let mut merged_env = provider.env.clone();
-    merged_env.extend(model.env.clone());
-
-    ResolvedModel {
-        id: model.id.clone(),
-        desc: model.desc.clone().unwrap_or_default(),
-        wire_api: WireApi::from_str(&endpoint.wire_api),
-        model_wire_apis,
-        provider_name: provider.name.clone(),
-        endpoint_url: endpoint.url.clone(),
-        visible_agents: effective_agents_for_model(config, provider, endpoint, model),
-        copilot_auth: CopilotAuth::from_endpoint(endpoint),
-        env: merged_env,
-        apikey_source: provider.apikey_source.clone(),
-        max_output_tokens: Some(
-            model
-                .max_output_tokens
-                .unwrap_or(ResolvedModel::DEFAULT_MAX_OUTPUT_TOKENS),
-        ),
-        max_tokens: Some(model.max_tokens.unwrap_or(ResolvedModel::DEFAULT_MAX_TOKENS)),
-        supports_tools: model.supports_tools.unwrap_or(true),
-        supports_images: model.supports_images.unwrap_or(false),
-    }
+    ResolvedModel::from_config(config, provider, endpoint, model)
 }
 
 /// True if `model` lists `agent_id` (modulo `canonical_agent_id` normalization).
@@ -927,11 +891,13 @@ fn random_urlsafe(bytes: usize) -> String {
 // ═══════════════════════════════════════════════════
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RemoteModelsResponse {
     data: Vec<RemoteModelEntry>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RemoteModelEntry {
     id: String,
 }
@@ -940,6 +906,13 @@ async fn fetch_remote_models(
     url: &str,
     api_key: &str,
 ) -> Result<BTreeMap<String, ProviderModelConfig>> {
+    // Reject non-http schemes early for a clear error message.
+    let parsed = Url::parse(url).with_context(|| format!("无效的 models URL: {url}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => bail!("models URL 必须使用 http/https 协议，当前为 `{other}`"),
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -956,7 +929,9 @@ async fn fetch_remote_models(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        bail!("models 接口返回 HTTP {status}: {body}");
+        let truncated: String = body.chars().take(500).collect();
+        let suffix = if body.chars().count() > 500 { "…" } else { "" };
+        bail!("models 接口返回 HTTP {status}: {truncated}{suffix}");
     }
 
     let parsed: RemoteModelsResponse = response

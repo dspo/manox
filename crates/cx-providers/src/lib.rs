@@ -384,6 +384,9 @@ impl ProviderConfig {
         endpoints
     }
 
+    /// True if the provider declares at least one endpoint. This checks the raw
+    /// config field rather than cross-referencing against models, so remote-model
+    /// providers report correctly before models are fetched.
     pub fn has_endpoints(&self) -> bool {
         !self.endpoints.is_empty()
     }
@@ -430,7 +433,7 @@ impl ResolvedModel {
     /// empty. This is the single source of truth — cx and manox both resolve
     /// through it, so the cascade wizard (manox) and cx's TUI see the same
     /// agent/model compatibility.
-    fn from_config(
+    pub fn from_config(
         config: &CxConfig,
         provider: &ProviderConfig,
         endpoint: &EndpointConfig,
@@ -1315,5 +1318,62 @@ providers:
         );
         assert!(resolved[0].supports_tools, "tools default on");
         assert!(!resolved[0].supports_images, "images default off");
+    }
+
+    #[test]
+    fn deserialize_models_remote_url() {
+        let yaml = r#"
+name: test
+models: https://api.example.com/models
+endpoints: {}
+"#;
+        let mut provider: ProviderConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert!(provider.is_remote_models());
+        assert!(provider.models_map().is_none());
+        assert!(provider.models_map_mut().is_none());
+    }
+
+    #[test]
+    fn deserialize_models_inline_with_null_values() {
+        let yaml = r#"
+name: test
+models:
+  m1:
+  m2:
+    desc: "with desc"
+endpoints: {}
+"#;
+        let provider: ProviderConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert!(!provider.is_remote_models());
+        let map = provider.models_map().expect("inline models");
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("m1"));
+        assert!(map.contains_key("m2"));
+        // m1 has all defaults (null value in YAML)
+        let m1 = &map["m1"];
+        assert!(m1.desc.is_none());
+        assert!(m1.wire_apis.is_empty());
+        // m2 has an explicit desc
+        let m2 = &map["m2"];
+        assert_eq!(m2.desc.as_deref(), Some("with desc"));
+    }
+
+    #[test]
+    fn deserialize_models_inline_with_nested_fields() {
+        let yaml = r#"
+name: test
+models:
+  m1:
+    wire_apis: [anthropic]
+    max_tokens: 200000
+    supports_tools: false
+endpoints: {}
+"#;
+        let provider: ProviderConfig = serde_yaml::from_str(yaml).expect("parse");
+        let map = provider.models_map().expect("inline models");
+        let m1 = &map["m1"];
+        assert_eq!(m1.wire_apis, vec!["anthropic".to_string()]);
+        assert_eq!(m1.max_tokens, Some(200_000));
+        assert_eq!(m1.supports_tools, Some(false));
     }
 }
