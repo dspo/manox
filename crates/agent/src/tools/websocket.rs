@@ -94,26 +94,27 @@ pub fn validate_protocols(protocols: &[String]) -> Result<(), String> {
 /// An HTTP token (RFC 2616 §2.2) is one or more characters from the set
 /// `!#$%&'*+-.^_`|~``, digits, or letters.
 fn is_valid_http_token(s: &str) -> bool {
-    s.bytes().all(|b| {
-        b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'!' | b'#'
-                    | b'$'
-                    | b'%'
-                    | b'&'
-                    | b'\''
-                    | b'*'
-                    | b'+'
-                    | b'-'
-                    | b'.'
-                    | b'^'
-                    | b'_'
-                    | b'`'
-                    | b'|'
-                    | b'~'
-            )
-    })
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 /// Resolve a host:port pair and reject private/loopback/link-local/unspecified

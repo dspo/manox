@@ -728,6 +728,11 @@ impl Drop for Thread {
     /// worktrees (`subagent_created == false`) are never auto-removed here;
     /// they live until `exit_worktree` with `action=remove`.
     fn drop(&mut self) {
+        // Cancel all background tasks owned by this thread so persistent
+        // monitors and background bash are not orphaned.
+        crate::background_task::cancel_all_for_thread(&self.id.0);
+        crate::background_task::remove_thread_event_rx(&self.id.0);
+
         let Some(wt) = self.worktree.take() else {
             return;
         };
@@ -2126,10 +2131,54 @@ impl Thread {
         }
         drained
     }
+    /// Drain any background task events (Monitor / background Bash) that have
+    /// accumulated since the last drain. Each event becomes a user-role message
+    /// injected into the conversation as untrusted external data. The model is
+    /// trained to treat these as informational, not as user authorization or
+    /// instructions.
+    fn drain_background_events(&mut self, cx: &mut Context<Self>) {
+        let Some(rx) = crate::background_task::take_thread_event_rx(&self.id.0) else {
+            return;
+        };
+        // Collect all ready events, then re-store the receiver so subsequent
+        // drains in the same turn can pick up more events.
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        // Re-store the receiver.
+        crate::background_task::store_thread_event_rx(self.id.0.clone(), rx);
+
+        if events.is_empty() {
+            return;
+        }
+        // Inject all events as a single user message. Each event is prefixed
+        // with the untrusted-external-data warning.
+        let mut body = String::new();
+        for event in &events {
+            // Infer the task kind from the task id prefix.
+            let kind = if event.task_id.0.starts_with("ws_") {
+                crate::background_task::TaskKind::MonitorWebSocket
+            } else if event.task_id.0.starts_with("monitor_") {
+                crate::background_task::TaskKind::MonitorCommand
+            } else {
+                crate::background_task::TaskKind::BackgroundBash
+            };
+            body.push_str(&crate::background_task::format_event_for_model(
+                event, &kind,
+            ));
+            body.push('\n');
+        }
+        self.insert_user_message(body, cx);
+        cx.notify();
+    }
 
     /// Resolve and run a slash command. The command body (with `$ARGUMENTS`
     /// substituted) is appended as a user message, and the command's
     /// `allowed-tools` whitelist narrows the turn's tool set for the duration
+    /// of the run. Returns `false` when no command named `name` is registered,
+    /// leaving the thread untouched so the UI can surface an error. `name` may
+    /// be `plugin:command` or a bare `command`.
     /// of the run. Returns `false` when no command named `name` is registered,
     /// leaving the thread untouched so the UI can surface an error. `name` may
     /// be `plugin:command` or a bare `command`.
@@ -2743,13 +2792,12 @@ impl Thread {
 
             let request = this.update(cx, |this, cx| {
                 this.pending_tool_uses.clear();
-                // Pair any orphaned tool_uses (truncated MaxTokens rounds,
-                // interrupted sessions) with error tool_results *before*
-                // draining a steer — otherwise the steer user message lands
-                // last and `reconcile_tool_uses` skips the pairing, shipping an
-                // unpaired `tool_use` to the provider (Anthropic 400).
                 this.reconcile_tool_uses(cx);
                 this.drain_pending_steer(cx);
+                // Drain any background task events that arrived while the
+                // system was idle. Each event becomes an untrusted-external-data
+                // user message injected into the conversation.
+                this.drain_background_events(cx);
                 this.build_completion_request()
             })?;
 
