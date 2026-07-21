@@ -36,7 +36,18 @@ use crate::language::Language;
 use crate::prompt::{LanguagePromptData, MainSystemPromptData, PromptTemplate, render};
 use crate::thread::ApprovalMode;
 
-const STATIC_PROMPT: &str = include_str!("system_prompt.md");
+const STATIC_PROMPT_EN: &str = include_str!("system_prompt.en.md");
+const STATIC_PROMPT_ZH_CN: &str = include_str!("system_prompt.zh-CN.md");
+
+/// The static prose half of the main system prompt, in `lang`. The volatile
+/// identity block lands at the very end (see [`build_main_system_prompt`]), so
+/// the language-specific prose is a byte-stable prefix per agent language.
+fn static_prompt(lang: Language) -> &'static str {
+    match lang {
+        Language::En => STATIC_PROMPT_EN,
+        Language::ZhCn => STATIC_PROMPT_ZH_CN,
+    }
+}
 
 /// Build the main-thread system prompt from live thread state.
 ///
@@ -77,7 +88,7 @@ pub fn build_main_system_prompt(
     };
 
     let data = MainSystemPromptData {
-        static_body: STATIC_PROMPT,
+        static_body: static_prompt(agent_language),
         skills: crate::skill::summaries_or_empty(),
         language: language_data(agent_language),
         runtime: crate::prompt::RuntimeIdentityPromptData {
@@ -97,7 +108,7 @@ pub fn build_main_system_prompt(
             approval_mode,
         },
     };
-    render(PromptTemplate::SystemMain, &data).expect("system main template render")
+    render(PromptTemplate::SystemMain, agent_language, &data).expect("system main template render")
 }
 
 /// Session-stable runtime versions for the identity block: `python3` and
@@ -396,6 +407,37 @@ mod tests {
         assert!(
             !p.contains("YOLO"),
             "yolo must not appear when disabled: {p}"
+        );
+    }
+
+    #[test]
+    fn zh_cn_prompt_renders_chinese_prose_and_directive() {
+        // The zh-CN static body, identity block, and language directive must
+        // all land in Chinese when the thread's agent language is ZhCn. Guards
+        // against `system_prompt.zh-CN.md` prose regressions and a miswired
+        // `static_prompt(lang)` selector that silently falls back to English.
+        let p = build_main_system_prompt(
+            Path::new("/tmp/some-proj"),
+            None,
+            ApprovalMode::Yolo,
+            None,
+            Language::ZhCn,
+        );
+        assert!(p.contains("工程立场"), "zh-CN static prose missing: {p}");
+        assert!(p.contains("## 运行时身份"), "zh-CN identity heading: {p}");
+        assert!(p.contains("今天："), "zh-CN today row: {p}");
+        assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
+        assert!(
+            p.contains("用Simplified Chinese撰写"),
+            "zh-CN language directive missing: {p}"
+        );
+        assert!(
+            p.contains("YOLO"),
+            "yolo must still be advertised in zh-CN: {p}"
+        );
+        assert!(
+            !p.contains("## Runtime identity"),
+            "english identity heading must not leak into zh-CN: {p}"
         );
     }
 

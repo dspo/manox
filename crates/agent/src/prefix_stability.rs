@@ -494,7 +494,8 @@ mod tests {
         // instructions (those ride a User message), so its bytes are fixed.
         let mut messages = vec![system_msg("main system prompt")];
         // Fixed-position developer-instructions injection (User role, cache).
-        let instructions = resolve(mode, &Default::default()).developer_instructions;
+        let instructions = resolve(mode, &Default::default(), crate::language::Language::En)
+            .developer_instructions;
         messages.push(LanguageModelRequestMessage {
             role: Role::User,
             content: vec![MessageContent::Text(format!(

@@ -801,11 +801,12 @@ impl Thread {
                 .cloned();
             let provider_id = model.as_ref().map(|m| m.provider_id());
             let now = chrono::Utc::now().timestamp();
+            let agent_language = crate::settings::load().resolve().agent;
             Self {
                 id,
                 messages: Vec::new(),
                 model,
-                tools: Arc::new(tools::main_registry(cwd.clone(), weak)),
+                tools: Arc::new(tools::main_registry(cwd.clone(), weak, agent_language)),
                 permission: Arc::new(PermissionCache::default()),
                 approval_mode: ApprovalMode::default(),
                 approval_ask_reasons: HashMap::new(),
@@ -820,7 +821,7 @@ impl Thread {
                 pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
-                agent_language: crate::settings::load().resolve().agent,
+                agent_language,
                 instructions_enabled: true,
                 lazy_instructions_injected: HashSet::new(),
                 depth: 0,
@@ -894,11 +895,22 @@ impl Thread {
                 .provider_id
                 .clone()
                 .or_else(|| model.as_ref().map(|m| m.provider_id()));
+            let agent_language = crate::language::Language::from_token(&rec.agent_language)
+                .unwrap_or_else(|| {
+                    // Mirrors `settings::resolve_axis`'s warn-and-fallback
+                    // so a garbage persisted token surfaces rather than
+                    // silently coercing to English.
+                    tracing::warn!(
+                        token = %rec.agent_language,
+                        "unknown persisted agent_language token; defaulting to English"
+                    );
+                    crate::language::Language::En
+                });
             Self {
                 id: ThreadId(rec.id),
                 messages: rec.messages,
                 model,
-                tools: Arc::new(tools::main_registry(cwd.clone(), weak)),
+                tools: Arc::new(tools::main_registry(cwd.clone(), weak, agent_language)),
                 permission: Arc::new(PermissionCache::default()),
                 approval_mode: ApprovalMode::from_i64(rec.approval_mode),
                 approval_ask_reasons: HashMap::new(),
@@ -913,17 +925,7 @@ impl Thread {
                 pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
-                agent_language: crate::language::Language::from_token(&rec.agent_language)
-                    .unwrap_or_else(|| {
-                        // Mirrors `settings::resolve_axis`'s warn-and-fallback
-                        // so a garbage persisted token surfaces rather than
-                        // silently coercing to English.
-                        tracing::warn!(
-                            token = %rec.agent_language,
-                            "unknown persisted agent_language token; defaulting to English"
-                        );
-                        crate::language::Language::En
-                    }),
+                agent_language,
                 instructions_enabled: true,
                 lazy_instructions_injected: HashSet::new(),
                 depth: rec.depth as u32,
@@ -1211,8 +1213,13 @@ impl Thread {
     /// [`TitleState::maybe_generate`], passing this thread's depth / model /
     /// messages as runtime context. See that method for the gating + cadence.
     fn maybe_generate_title(&mut self, cx: &mut Context<Self>) {
-        self.title_state
-            .maybe_generate(self.depth, self.model.as_ref(), &self.messages, cx);
+        self.title_state.maybe_generate(
+            self.depth,
+            self.model.as_ref(),
+            &self.messages,
+            self.agent_language,
+            cx,
+        );
     }
 
     /// Called after the UI resolves authorization: route the response to the
@@ -1369,6 +1376,7 @@ impl Thread {
             self.insert_user_message(
                 crate::prompt::render(
                     crate::prompt::PromptTemplate::WrapperPeerMessage,
+                    self.agent_language,
                     &crate::prompt::PeerMessageData {
                         from: msg.from.clone(),
                         content: msg.content.clone(),
@@ -1453,7 +1461,11 @@ impl Thread {
     /// reads this for the tool set, `reasoning_effort`, `model`, and the
     /// `developer_instructions` injection.
     fn active_mode_settings(&self) -> ModeSettings {
-        crate::collaboration_mode::resolve(self.collaboration_mode, &crate::settings::modes())
+        crate::collaboration_mode::resolve(
+            self.collaboration_mode,
+            &crate::settings::modes(),
+            self.agent_language,
+        )
     }
 
     /// The model that serves this request: the mode's `model` override
@@ -1741,7 +1753,11 @@ impl Thread {
             return;
         }
         self.cwd = dir.clone();
-        self.tools = Arc::new(tools::main_registry(dir.clone(), cx.weak_entity()));
+        self.tools = Arc::new(tools::main_registry(
+            dir.clone(),
+            cx.weak_entity(),
+            self.agent_language,
+        ));
         self.project = Some(dir);
         cx.notify();
     }
@@ -1782,6 +1798,7 @@ impl Thread {
             path.clone(),
             sandbox,
             cx.weak_entity(),
+            self.agent_language,
         ));
         self.worktree = Some(WorktreeState {
             path,
@@ -1819,6 +1836,7 @@ impl Thread {
             prior_cwd,
             sandbox,
             cx.weak_entity(),
+            self.agent_language,
         ));
         self.prefix_stability.invalidate();
         cx.notify();
@@ -2132,6 +2150,7 @@ impl Thread {
         };
         let rendered = crate::prompt::render(
             crate::prompt::PromptTemplate::SkillBody,
+            self.agent_language,
             &crate::prompt::SkillBodyData {
                 description: (!s.description.is_empty()).then(|| s.description.clone()),
                 body: s.body.clone(),
@@ -2291,11 +2310,12 @@ impl Thread {
         };
 
         // Snapshot the message list for the evaluator under a short lease.
-        let messages = this
-            .read_with(cx, |this, _| this.messages.clone())
+        let (messages, lang) = this
+            .read_with(cx, |this, _| (this.messages.clone(), this.agent_language))
             .unwrap_or_default();
 
-        let verdict: GoalVerdict = goal::evaluate(model, &condition, &messages, cancel, cx).await;
+        let verdict: GoalVerdict =
+            goal::evaluate(model, &condition, &messages, lang, cancel, cx).await;
 
         // Write the verdict back and decide continue vs. clear vs. abort.
         let action = this
@@ -2355,6 +2375,7 @@ impl Thread {
                         }
                         let directive = crate::prompt::render(
                             crate::prompt::PromptTemplate::WrapperGoalContinuation,
+                            this.agent_language,
                             &crate::prompt::GoalContinuationData {
                                 condition: condition.clone(),
                             },
@@ -2405,6 +2426,7 @@ impl Thread {
             settings.auto_compact.enabled,
             max_input,
             threshold,
+            self.agent_language,
         )
     }
 
@@ -2497,7 +2519,11 @@ impl Thread {
             cx.notify();
         })?;
         let request = this.read_with(cx, |this, _| {
-            crate::compact::build_compaction_request(&this.messages, insertion_ix)
+            crate::compact::build_compaction_request(
+                &this.messages,
+                insertion_ix,
+                this.agent_language,
+            )
         })?;
         let (summary, usage) =
             crate::compact::stream_summary(model, request, cancel.clone(), cx).await?;
@@ -2896,6 +2922,7 @@ impl Thread {
                 model,
                 cancel_for_review,
                 cwd,
+                lang,
             ) = this.update(cx, |this, _cx| {
                 let tool_uses = std::mem::take(&mut this.pending_tool_uses);
                 let mut free = Vec::new();
@@ -2948,6 +2975,7 @@ impl Thread {
                     model,
                     cancel,
                     this.cwd.clone(),
+                    this.agent_language,
                 )
             })?;
 
@@ -3063,6 +3091,7 @@ impl Thread {
                         this.insert_user_message(
                             crate::prompt::render(
                                 crate::prompt::PromptTemplate::WrapperRecoveryFailure,
+                                this.agent_language,
                                 &crate::prompt::RecoveryFailureData {
                                     reason: reason.to_string(),
                                 },
@@ -3082,6 +3111,7 @@ impl Thread {
                         this.insert_user_message(
                             crate::prompt::render_static(
                                 crate::prompt::PromptTemplate::WrapperUnfulfilledToolIntentNudge,
+                                this.agent_language,
                             )
                             .expect("unfulfilled tool intent nudge render"),
                             cx,
@@ -3092,6 +3122,7 @@ impl Thread {
                         this.insert_user_message(
                             crate::prompt::render(
                                 crate::prompt::PromptTemplate::WrapperEmptyTurnNudge,
+                                this.agent_language,
                                 &crate::prompt::EmptyTurnNudgeData {
                                     in_plan: this.collaboration_mode == ModeKind::Plan,
                                 },
@@ -3165,6 +3196,7 @@ impl Thread {
                                 &tu.input,
                                 &title,
                                 &cwd,
+                                lang,
                                 cancel_for_review.clone(),
                                 cx,
                             )
@@ -3281,6 +3313,7 @@ impl Thread {
                     this.insert_user_message(
                         crate::prompt::render(
                             crate::prompt::PromptTemplate::WrapperMaxTurnsSummary,
+                            this.agent_language,
                             &crate::prompt::MaxTurnsSummaryData { max },
                         )
                         .expect("max turns summary render"),
@@ -3312,7 +3345,9 @@ impl Thread {
         let name = tu.name.to_string();
         let title = tool_title(&name, &tu.input);
 
-        let tool = this.read_with(cx, |this, _| this.tools.get(&name).cloned())?;
+        let (tool, lang) = this.read_with(cx, |this, _| {
+            (this.tools.get(&name).cloned(), this.agent_language)
+        })?;
 
         let Some(tool) = tool else {
             let msg = format!("Unknown tool: {name}");
@@ -3396,6 +3431,7 @@ impl Thread {
                 ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {
                     let msg = crate::prompt::render_static(
                         crate::prompt::PromptTemplate::WrapperToolDenied,
+                        lang,
                     )
                     .expect("tool denied render");
                     Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
@@ -3409,6 +3445,7 @@ impl Thread {
                 ToolAuthorizationResponse::AskUserQuestion { answers, response } => {
                     let output = crate::prompt::render(
                         crate::prompt::PromptTemplate::WrapperAskUserQuestions,
+                        lang,
                         &crate::prompt::AskUserQuestionsData {
                             answers: answers
                                 .into_iter()
@@ -3822,7 +3859,7 @@ impl Thread {
             &self.lazy_instructions_injected,
             &ctx,
         );
-        let Some(reminder) = crate::claude_md::render_lazy(&found) else {
+        let Some(reminder) = crate::claude_md::render_lazy(&found, self.agent_language) else {
             return output;
         };
         self.lazy_instructions_injected
@@ -3868,6 +3905,7 @@ impl Thread {
             m.push_content(MessageContent::Text(
                 crate::prompt::render_static(
                     crate::prompt::PromptTemplate::WrapperMaxTokensDirective,
+                    self.agent_language,
                 )
                 .expect("max tokens directive render"),
             ));
@@ -4053,6 +4091,7 @@ impl Thread {
         };
         let system = crate::prompt::render(
             crate::prompt::PromptTemplate::SystemAssembly,
+            self.agent_language,
             &crate::prompt::SystemPromptAssembly {
                 base,
                 language: is_subagent
@@ -4090,10 +4129,10 @@ impl Thread {
         // head. An empty load set omits the message entirely, keeping the
         // prefix byte-identical to a session with no instruction files.
         if self.instructions_enabled
-            && let Some(text) = crate::claude_md::render_eager(&crate::claude_md::load(
-                &self.cwd,
-                &crate::settings::claude_md_load_context(),
-            ))
+            && let Some(text) = crate::claude_md::render_eager(
+                &crate::claude_md::load(&self.cwd, &crate::settings::claude_md_load_context()),
+                self.agent_language,
+            )
         {
             messages.push(LanguageModelRequestMessage {
                 role: Role::User,
@@ -4144,14 +4183,17 @@ impl Thread {
         let mapped: Vec<LanguageModelRequestMessage> = crate::compact::coalesce_same_role(
             match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
                 Some(c_ix) => {
-                    let mut rebuilt =
-                        crate::compact::retained_user_messages_before(&self.messages, c_ix);
+                    let mut rebuilt = crate::compact::retained_user_messages_before(
+                        &self.messages,
+                        c_ix,
+                        self.agent_language,
+                    );
                     // The compaction message itself (mapped to its preamble-wrapped
                     // text form). Always included — it is the boundary marker.
                     let compaction_content: Vec<MessageContent> = self.messages[c_ix]
                         .content
                         .iter()
-                        .map(model_facing_content)
+                        .map(|c| model_facing_content(c, self.agent_language))
                         .collect();
                     rebuilt.push(LanguageModelRequestMessage {
                         role: self.messages[c_ix].role,
@@ -4163,7 +4205,11 @@ impl Thread {
                     rebuilt.extend(self.messages[c_ix + 1..].iter().map(|m| {
                         LanguageModelRequestMessage {
                             role: m.role,
-                            content: m.content.iter().map(model_facing_content).collect(),
+                            content: m
+                                .content
+                                .iter()
+                                .map(|c| model_facing_content(c, self.agent_language))
+                                .collect(),
                             cache: false,
                         }
                     }));
@@ -4174,7 +4220,11 @@ impl Thread {
                     .iter()
                     .map(|m| LanguageModelRequestMessage {
                         role: m.role,
-                        content: m.content.iter().map(model_facing_content).collect(),
+                        content: m
+                            .content
+                            .iter()
+                            .map(|c| model_facing_content(c, self.agent_language))
+                            .collect(),
                         cache: false,
                     })
                     .collect(),
@@ -4249,7 +4299,10 @@ impl Thread {
 /// so the model reads the summary as user-supplied context rather than a raw
 /// opaque blob — the `Compaction` variant itself never reaches a provider wire
 /// mapper.
-pub(crate) fn model_facing_content(c: &MessageContent) -> MessageContent {
+pub(crate) fn model_facing_content(
+    c: &MessageContent,
+    lang: crate::language::Language,
+) -> MessageContent {
     match c {
         MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == crate::tools::AGENT => {
             MessageContent::ToolResult(LanguageModelToolResult {
@@ -4262,6 +4315,7 @@ pub(crate) fn model_facing_content(c: &MessageContent) -> MessageContent {
         MessageContent::Compaction(summary) => MessageContent::Text(
             crate::prompt::render(
                 crate::prompt::PromptTemplate::WrapperCompactionPreamble,
+                lang,
                 &crate::prompt::CompactionPreambleData {
                     summary: summary.clone(),
                 },
@@ -4494,7 +4548,7 @@ mod tests {
             is_error: false,
             content: envelope,
         });
-        let stripped = model_facing_content(&tr);
+        let stripped = model_facing_content(&tr, crate::language::Language::En);
         let MessageContent::ToolResult(out) = stripped else {
             panic!("expected ToolResult");
         };
@@ -4517,7 +4571,9 @@ mod tests {
             is_error: false,
             content: "command output".to_string(),
         });
-        let MessageContent::ToolResult(out) = model_facing_content(&tr) else {
+        let MessageContent::ToolResult(out) =
+            model_facing_content(&tr, crate::language::Language::En)
+        else {
             panic!("expected ToolResult");
         };
         assert_eq!(out.content, "command output");
@@ -4534,7 +4590,9 @@ mod tests {
             is_error: false,
             content: "plain summary".to_string(),
         });
-        let MessageContent::ToolResult(out) = model_facing_content(&tr) else {
+        let MessageContent::ToolResult(out) =
+            model_facing_content(&tr, crate::language::Language::En)
+        else {
             panic!("expected ToolResult");
         };
         assert_eq!(out.content, "plain summary");
@@ -4547,7 +4605,7 @@ mod tests {
     #[test]
     fn model_facing_content_rewrites_compaction_to_text() {
         let block = MessageContent::Compaction("Goal: ship recaps.".to_string());
-        let facing = model_facing_content(&block);
+        let facing = model_facing_content(&block, crate::language::Language::En);
         let MessageContent::Text(text) = facing else {
             panic!("expected Text, got {facing:?}");
         };

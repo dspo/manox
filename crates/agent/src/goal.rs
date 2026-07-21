@@ -12,8 +12,9 @@
 //! `Thread` bounds the loop either way.
 //!
 //! The evaluator prompt lives in the `side_call/goal_system.tera.md` template
-//! and is rendered at the request-build boundary. It is model-facing text and
-//! is therefore English-only — it is never routed through the `i18n` bundle.
+//! and is rendered at the request-build boundary. It is model-facing text; it
+//! is bilingual via the thread's `agent_language` (en / zh-CN mirrors) and is
+//! never routed through the `i18n` bundle (which only carries UI chrome).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,6 +68,7 @@ pub async fn evaluate(
     model: &AnyLanguageModel,
     condition: &str,
     messages: &[Message],
+    lang: crate::language::Language,
     cancel: CancellationToken,
     cx: &AsyncApp,
 ) -> GoalVerdict {
@@ -78,6 +80,7 @@ pub async fn evaluate(
         .unwrap_or_default();
     let user_prompt = crate::prompt::render(
         crate::prompt::PromptTemplate::SideCallGoalUser,
+        lang,
         &crate::prompt::GoalEvalPromptData {
             condition: condition.to_string(),
             last_user,
@@ -91,8 +94,11 @@ pub async fn evaluate(
             LanguageModelRequestMessage {
                 role: Role::System,
                 content: vec![MessageContent::Text(
-                    crate::prompt::render_static(crate::prompt::PromptTemplate::SideCallGoalSystem)
-                        .expect("goal system prompt render"),
+                    crate::prompt::render_static(
+                        crate::prompt::PromptTemplate::SideCallGoalSystem,
+                        lang,
+                    )
+                    .expect("goal system prompt render"),
                 )],
                 cache: true,
             },

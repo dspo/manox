@@ -49,8 +49,13 @@ pub struct SpawnAgentTool {
 }
 
 impl SpawnAgentTool {
-    pub fn new(cwd: Arc<PathBuf>, depth: u32, parent: WeakEntity<Thread>) -> Self {
-        let desc = build_description();
+    pub fn new(
+        cwd: Arc<PathBuf>,
+        depth: u32,
+        parent: WeakEntity<Thread>,
+        lang: crate::language::Language,
+    ) -> Self {
+        let desc = build_description(lang);
         Self {
             cwd,
             depth,
@@ -362,6 +367,7 @@ fn setup_child(
                 child_depth,
                 weak,
                 def_file.root.clone(),
+                parent_language,
             )
         },
         cx,
@@ -815,9 +821,10 @@ fn build_child_registry_with_policy(
     child_depth: u32,
     child_weak: WeakEntity<Thread>,
     plugin_root: Option<PathBuf>,
+    lang: crate::language::Language,
 ) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
-    for tool in super::base_tools_with_policy(cwd.clone(), sandbox, plugin_root) {
+    for tool in super::base_tools_with_policy(cwd.clone(), sandbox, plugin_root, lang) {
         if is_tool_allowed(tool.name(), def) {
             reg.register(tool);
         }
@@ -830,9 +837,12 @@ fn build_child_registry_with_policy(
         reg.register(super::self_info::new());
     }
     if can_nest(def, child_depth) {
-        reg.register(
-            Arc::new(SpawnAgentTool::new(cwd.clone(), child_depth, child_weak)) as AnyAgentTool,
-        );
+        reg.register(Arc::new(SpawnAgentTool::new(
+            cwd.clone(),
+            child_depth,
+            child_weak,
+            lang,
+        )) as AnyAgentTool);
     }
     reg
 }
@@ -909,6 +919,7 @@ pub(crate) fn spawn_team_member(
                 depth,
                 weak,
                 def_file.root.clone(),
+                parent_language,
             );
             for tool in crate::team::tools::shared_tools() {
                 reg.register(tool);
@@ -1080,7 +1091,7 @@ fn absolutize_path(worktree_dir: &Path, git_common_dir: &str) -> PathBuf {
 /// Compose the tool description advertised to the parent model, listing the
 /// available sub-agent types with a capability tag and their one-line
 /// descriptions.
-fn build_description() -> Arc<str> {
+fn build_description(lang: crate::language::Language) -> Arc<str> {
     let subagents: Vec<crate::prompt::SubagentTypeData> = agent_def::global()
         .entries()
         .into_iter()
@@ -1092,6 +1103,7 @@ fn build_description() -> Arc<str> {
         .collect();
     let s = crate::prompt::render(
         crate::prompt::PromptTemplate::AgentToolDescription,
+        lang,
         &crate::prompt::AgentToolDescriptionData { subagents },
     )
     .expect("agent tool description render");

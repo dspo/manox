@@ -16,11 +16,31 @@
 //! modes, since manox exposes `AskUserQuestion` generally (codex restricts
 //! `request_user_input` to Plan only).
 
+use crate::language::Language;
 use crate::language_model::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 
-const PLAN_INSTRUCTIONS: &str = include_str!("prompt/templates/mode/plan_instructions.md");
-const DEFAULT_INSTRUCTIONS: &str = include_str!("prompt/templates/mode/default_instructions.md");
+const PLAN_INSTRUCTIONS_EN: &str = include_str!("prompt/templates/en/mode/plan_instructions.md");
+const PLAN_INSTRUCTIONS_ZH_CN: &str =
+    include_str!("prompt/templates/zh-CN/mode/plan_instructions.md");
+const DEFAULT_INSTRUCTIONS_EN: &str =
+    include_str!("prompt/templates/en/mode/default_instructions.md");
+const DEFAULT_INSTRUCTIONS_ZH_CN: &str =
+    include_str!("prompt/templates/zh-CN/mode/default_instructions.md");
+
+fn plan_instructions(lang: Language) -> &'static str {
+    match lang {
+        Language::En => PLAN_INSTRUCTIONS_EN,
+        Language::ZhCn => PLAN_INSTRUCTIONS_ZH_CN,
+    }
+}
+
+fn default_instructions(lang: Language) -> &'static str {
+    match lang {
+        Language::En => DEFAULT_INSTRUCTIONS_EN,
+        Language::ZhCn => DEFAULT_INSTRUCTIONS_ZH_CN,
+    }
+}
 
 /// The collaboration mode a thread is in. `Default` is the execution mode;
 /// `Plan` is the read-only research-and-plan mode.
@@ -118,28 +138,30 @@ impl ModeSettingsMap {
     }
 }
 
-/// Built-in preset for a mode. Plan sets `reasoning_effort = Medium` and the
-/// plan-mode developer instructions; Default carries the default-mode
-/// instructions. Both are overlaid by any user `[modes.*]` override.
-pub fn preset_for(mode: ModeKind) -> ModeSettings {
+/// Built-in preset for a mode, in `lang`. Plan sets `reasoning_effort = Medium`
+/// and the plan-mode developer instructions; Default carries the default-mode
+/// instructions. Both are overlaid by any user `[modes.*]` override. The
+/// instructions are selected by the thread's agent language so a Chinese
+/// thread gets Chinese plan/default prose.
+pub fn preset_for(mode: ModeKind, lang: Language) -> ModeSettings {
     match mode {
         ModeKind::Plan => ModeSettings {
             model: None,
             reasoning_effort: Some(ReasoningEffort::Medium),
-            developer_instructions: Some(PLAN_INSTRUCTIONS.to_string()),
+            developer_instructions: Some(plan_instructions(lang).to_string()),
         },
         ModeKind::Default => ModeSettings {
             model: None,
             reasoning_effort: None,
-            developer_instructions: Some(DEFAULT_INSTRUCTIONS.to_string()),
+            developer_instructions: Some(default_instructions(lang).to_string()),
         },
     }
 }
 
-/// Resolve the effective settings for `mode`: built-in preset overlaid with the
-/// user's per-mode override. Called at request-build time.
-pub fn resolve(mode: ModeKind, user: &ModeSettingsMap) -> ModeSettings {
-    preset_for(mode).resolved(user.get(mode).unwrap_or(&ModeSettings::default()))
+/// Resolve the effective settings for `mode` in `lang`: built-in preset overlaid
+/// with the user's per-mode override. Called at request-build time.
+pub fn resolve(mode: ModeKind, user: &ModeSettingsMap, lang: Language) -> ModeSettings {
+    preset_for(mode, lang).resolved(user.get(mode).unwrap_or(&ModeSettings::default()))
 }
 
 /// The user's verdict on a turn-end proposed plan: implement the approved plan,
@@ -236,7 +258,7 @@ mod tests {
 
     #[test]
     fn preset_for_plan_sets_medium_effort_and_plan_instructions() {
-        let p = preset_for(ModeKind::Plan);
+        let p = preset_for(ModeKind::Plan, Language::En);
         assert_eq!(p.reasoning_effort, Some(ReasoningEffort::Medium));
         assert!(p.developer_instructions.is_some());
         assert!(p.model.is_none());
@@ -244,7 +266,7 @@ mod tests {
 
     #[test]
     fn preset_for_default_carries_default_instructions_no_effort() {
-        let p = preset_for(ModeKind::Default);
+        let p = preset_for(ModeKind::Default, Language::En);
         assert_eq!(p.reasoning_effort, None);
         assert!(p.developer_instructions.is_some());
         assert!(p.model.is_none());
@@ -253,10 +275,10 @@ mod tests {
     #[test]
     fn resolve_returns_preset_when_no_user_override() {
         let user = ModeSettingsMap::default();
-        let plan = resolve(ModeKind::Plan, &user);
+        let plan = resolve(ModeKind::Plan, &user, Language::En);
         assert_eq!(plan.reasoning_effort, Some(ReasoningEffort::Medium));
 
-        let default = resolve(ModeKind::Default, &user);
+        let default = resolve(ModeKind::Default, &user, Language::En);
         assert_eq!(default.reasoning_effort, None);
     }
 
@@ -270,7 +292,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let r = resolve(ModeKind::Plan, &user);
+        let r = resolve(ModeKind::Plan, &user, Language::En);
         assert_eq!(r.model.as_deref(), Some("custom-plan-model"));
         assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
         // Preset's developer_instructions survives (override didn't set it).
