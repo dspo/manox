@@ -1,7 +1,10 @@
 //! User settings — `~/.config/cx/manox/settings.toml`.
 //!
-//! Plain-file preferences read once at startup. The `language` field is
-//! consumed by [`crate::i18n`]; `claude_md_excludes` filters which CLAUDE.md
+//! Plain-file preferences. The two language fields are read at startup and on
+//! every save: `ui_language` drives the Fluent UI locale (and is swapped live
+//! by [`crate::i18n::set_ui_language`]); `agent_language` is snapshotted into
+//! each new [`crate::thread::Thread`] and selects that thread's harness / tool
+//! description language. `claude_md_excludes` filters which CLAUDE.md
 //! instruction files [`crate::claude_md`] loads. Absent file or parse failure
 //! is non-fatal: every failure path warns once and yields the default, so a
 //! malformed file never blocks startup.
@@ -11,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
 use crate::collaboration_mode::ModeSettingsMap;
+use crate::language::Language;
 use crate::paths;
 
 /// Process-global snapshot of `[modes.*]` overrides, settled once at `init`
@@ -67,9 +71,16 @@ fn claude_md_excludes() -> Vec<String> {
 /// partial file still yields a usable (defaulted) result.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Settings {
-    /// UI locale tag, e.g. `"en"` or `"zh-CN"`. `None` → default (English).
+    /// UI locale token (`"en"` / `"zh-CN"`). `None` → English. Drives the
+    /// Fluent bundle and is swapped live by [`crate::i18n::set_ui_language`].
     #[serde(default)]
-    pub language: Option<String>,
+    pub ui_language: Option<String>,
+
+    /// Agent language token (`"en"` / `"zh-CN"`). `None` → follow `ui_language`
+    /// at resolve time (see [`Settings::resolve`]). Snapshotted into each new
+    /// [`crate::thread::Thread`]; changing it never disturbs existing threads.
+    #[serde(default)]
+    pub agent_language: Option<String>,
 
     /// Glob patterns matched against the canonical absolute paths of CLAUDE.md
     /// instruction files; matching files are excluded from the loaded set (the
@@ -92,6 +103,47 @@ pub struct Settings {
     /// `thread::build_completion_request`.
     #[serde(default, skip_serializing_if = "ModeSettingsMap::is_empty")]
     pub modes: ModeSettingsMap,
+}
+
+/// Resolved language axes — the canonical [`Language`] values, with a missing
+/// `agent_language` falling back to the UI language rather than a hardcoded
+/// default, so a user who only ever set `ui_language` gets a coherent
+/// same-language agent axis for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedLanguages {
+    pub ui: Language,
+    pub agent: Language,
+}
+
+impl Settings {
+    /// Resolve both language axes to canonical [`Language`] values. An unknown
+    /// token warns once and resolves to English; a missing `agent_language`
+    /// follows `ui` (after `ui`'s own resolution), so the two axes stay aligned
+    /// until the user splits them.
+    pub fn resolve(&self) -> ResolvedLanguages {
+        let ui = self.resolve_axis(self.ui_language.as_deref());
+        let agent = self
+            .agent_language
+            .as_deref()
+            .map_or(ui, |tok| self.resolve_axis(Some(tok)));
+        ResolvedLanguages { ui, agent }
+    }
+
+    /// Resolve a single language token to a [`Language`], warning + falling
+    /// back to English on a non-canonical token so a typo never silently
+    /// coerces to the wrong locale.
+    fn resolve_axis(&self, token: Option<&str>) -> Language {
+        match token {
+            None => Language::En,
+            Some(tok) => match Language::from_token(tok) {
+                Some(lang) => lang,
+                None => {
+                    tracing::warn!(token = tok, "unknown language token; defaulting to English");
+                    Language::En
+                }
+            },
+        }
+    }
 }
 
 /// Auto-compaction knobs. Read at the top of each turn loop iteration; a flip
@@ -157,19 +209,90 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_follow_up_behavior_is_ignored() {
-        // Serde ignores unknown fields by default, so existing settings files
-        // keep loading after the Queue/Steer preference is removed.
+    fn unknown_top_level_field_is_ignored() {
+        // Serde ignores unknown fields by default, so a stale top-level key left
+        // in an old settings.toml never blocks load.
         let raw = r#"
-language = "en"
+ui_language = "en"
 follow_up_behavior = "Steer"
 "#;
         let settings: Settings = toml::from_str(raw).unwrap();
-        assert_eq!(settings.language.as_deref(), Some("en"));
+        assert_eq!(settings.ui_language.as_deref(), Some("en"));
         assert!(
             !toml::to_string(&settings)
                 .unwrap()
                 .contains("follow_up_behavior")
         );
+    }
+
+    #[test]
+    fn language_tokens_round_trip() {
+        let settings = Settings {
+            ui_language: Some("zh-CN".into()),
+            agent_language: Some("en".into()),
+            ..Default::default()
+        };
+        let s = toml::to_string_pretty(&settings).unwrap();
+        let back: Settings = toml::from_str(&s).unwrap();
+        assert_eq!(back.ui_language.as_deref(), Some("zh-CN"));
+        assert_eq!(back.agent_language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn old_language_field_does_not_serialize() {
+        // The legacy single `language` field is gone; a struct that carries only
+        // the new fields must not emit `language =` on serialize.
+        let settings = Settings {
+            ui_language: Some("en".into()),
+            agent_language: Some("zh-CN".into()),
+            ..Default::default()
+        };
+        let s = toml::to_string_pretty(&settings).unwrap();
+        assert!(!s.contains("\nlanguage ="));
+        assert!(s.contains("ui_language"));
+        assert!(s.contains("agent_language"));
+    }
+
+    #[test]
+    fn agent_language_follows_ui_when_absent() {
+        let settings = Settings {
+            ui_language: Some("zh-CN".into()),
+            agent_language: None,
+            ..Default::default()
+        };
+        let r = settings.resolve();
+        assert_eq!(r.ui, Language::ZhCn);
+        assert_eq!(r.agent, Language::ZhCn);
+    }
+
+    #[test]
+    fn agent_language_independent_when_set() {
+        let settings = Settings {
+            ui_language: Some("zh-CN".into()),
+            agent_language: Some("en".into()),
+            ..Default::default()
+        };
+        let r = settings.resolve();
+        assert_eq!(r.ui, Language::ZhCn);
+        assert_eq!(r.agent, Language::En);
+    }
+
+    #[test]
+    fn missing_axes_default_to_english() {
+        let r = Settings::default().resolve();
+        assert_eq!(r.ui, Language::En);
+        assert_eq!(r.agent, Language::En);
+    }
+
+    #[test]
+    fn unknown_token_resolves_to_english() {
+        let settings = Settings {
+            ui_language: Some("fr".into()),
+            agent_language: Some("zh".into()),
+            ..Default::default()
+        };
+        let r = settings.resolve();
+        assert_eq!(r.ui, Language::En);
+        assert_eq!(r.agent, Language::En);
     }
 }

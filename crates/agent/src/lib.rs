@@ -17,6 +17,7 @@ pub mod hashline;
 pub mod hook;
 pub mod i18n;
 pub mod image;
+pub mod language;
 pub mod language_model;
 pub mod lsp;
 pub mod mcp;

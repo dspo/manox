@@ -158,7 +158,8 @@ pub struct SettingsView {
     permission_auto_review: bool,
     permission_full_access: bool,
     file_target: SharedString,
-    language: SharedString,
+    ui_language: SharedString,
+    agent_language: SharedString,
     show_in_menu_bar: bool,
     bottom_panel: bool,
     terminal_location: SharedString,
@@ -225,17 +226,11 @@ impl SettingsView {
             permission_auto_review: false,
             permission_full_access: false,
             file_target: i18n::t("settings-value-vscode"),
-            language: {
-                // Display the saved token in a human-readable form; the
-                // underlying `Settings::language` holds the locale tag.
-                let saved = user_settings::load().language.unwrap_or_default();
-                match saved.as_str() {
-                    "" => i18n::t("settings-value-auto-detect"),
-                    "en" => i18n::t("settings-value-en"),
-                    "zh-CN" => i18n::t("settings-value-zh-CN"),
-                    _ => saved.into(),
-                }
-            },
+            // Endonyms are fixed per language and never re-localized, so the
+            // picker always reads `English` / `简体中文` regardless of the
+            // current UI locale. Seeded from the resolved settings axes.
+            ui_language: user_settings::load().resolve().ui.endonym().into(),
+            agent_language: user_settings::load().resolve().agent.endonym().into(),
             show_in_menu_bar: true,
             bottom_panel: true,
             terminal_location: i18n::t("settings-value-bottom"),
@@ -262,21 +257,74 @@ impl SettingsView {
         }
     }
 
-    fn persist_language(&mut self, value: SharedString, cx: &mut Context<Self>) {
-        // The dropdown option is a (display_label, persist_token) pair; only
-        // the token is written to settings.toml. An empty string means the user
-        // chose the "auto-detect" placeholder, which should leave the existing
-        // setting alone rather than clear it.
+    /// Persist `ui_language`. The dropdown carries a `(endonym, token)` pair;
+    /// only the token is written. Save must succeed before the runtime locale
+    /// and the displayed value flip, so a failed write leaves the UI in its
+    /// prior state and the error propagates to the caller for surfacing.
+    fn persist_ui_language(
+        &mut self,
+        value: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
         let token = value.to_string();
         if token.is_empty() {
-            return;
+            return Ok(());
+        }
+        if i18n::Language::from_token(&token).is_none() {
+            tracing::warn!(token = %token, "ignoring non-canonical ui_language token");
+            return Ok(());
         }
         let mut settings = user_settings::load();
-        settings.language = Some(token);
+        settings.ui_language = Some(token);
+        // Materialize both axes: once the user touches any language setting the
+        // resolved pair becomes explicit on disk, so a later flip of one axis
+        // no longer drags the other along via the "agent follows ui" default.
+        let resolved = settings.resolve();
+        settings.ui_language = Some(resolved.ui.token().into());
+        settings.agent_language = Some(resolved.agent.token().into());
         if let Err(e) = user_settings::save(&settings) {
-            tracing::warn!(error = %e, "failed to save language");
+            tracing::warn!(error = %e, "failed to save ui_language");
+            return Err(e.to_string());
         }
+        self.ui_language = resolved.ui.endonym().into();
+        self.agent_language = resolved.agent.endonym().into();
+        i18n::set_ui_language(resolved.ui, cx);
         cx.notify();
+        Ok(())
+    }
+
+    /// Persist `agent_language`. Only affects threads created after this save
+    /// — existing threads keep their snapshotted language, so this never
+    /// disturbs a running conversation or its prefix cache.
+    fn persist_agent_language(
+        &mut self,
+        value: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let token = value.to_string();
+        if token.is_empty() {
+            return Ok(());
+        }
+        if i18n::Language::from_token(&token).is_none() {
+            tracing::warn!(token = %token, "ignoring non-canonical agent_language token");
+            return Ok(());
+        }
+        let mut settings = user_settings::load();
+        settings.agent_language = Some(token);
+        // Materialize both axes (see `persist_ui_language`): the resolved pair
+        // is written in full so the implicit "agent follows ui" default stops
+        // applying once the user has split the axes.
+        let resolved = settings.resolve();
+        settings.ui_language = Some(resolved.ui.token().into());
+        settings.agent_language = Some(resolved.agent.token().into());
+        if let Err(e) = user_settings::save(&settings) {
+            tracing::warn!(error = %e, "failed to save agent_language");
+            return Err(e.to_string());
+        }
+        self.ui_language = resolved.ui.endonym().into();
+        self.agent_language = resolved.agent.endonym().into();
+        cx.notify();
+        Ok(())
     }
 }
 

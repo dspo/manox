@@ -352,6 +352,12 @@ fn main() {
             });
         });
 
+        // Register the native-menu rebuilder so a live UI-language change can
+        // re-resolve every menu label via the new locale (the bin owns
+        // `build_app_menus` — `Quit` and `Menu`/`MenuItem` live here, not in
+        // `agent` or `agent-ui`, so the rebuild closure stays in this crate).
+        agent::i18n::set_menu_rebuilder(|cx| cx.set_menus(build_app_menus()));
+
         cx.set_menus(build_app_menus());
 
         let window_options = WindowOptions {

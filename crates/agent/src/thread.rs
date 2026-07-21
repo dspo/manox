@@ -489,6 +489,14 @@ pub struct Thread {
     pending_child_auth: HashMap<String, ChildAuthRoute>,
     /// Sub-agent system prompt; `None` for the main thread (no system prompt injected).
     system: Option<String>,
+    /// Immutable agent-language axis: which language this thread's harness prose
+    /// (system prompt, wrappers, side calls) and tool descriptions render in.
+    /// Snapshotted from `settings::resolve().agent` at `new`; inherited by
+    /// sub-agents; restored from the persisted record on `restore`. Never
+    /// flips mid-life — a global settings change only affects threads created
+    /// afterwards, so an existing thread's prompt-cache prefix stays byte-stable
+    /// and two threads in different agent languages can run concurrently.
+    agent_language: crate::language::Language,
     /// Whether the multi-level CLAUDE.md eager block is injected into this
     /// thread's requests. Always on except for the built-in `Explore`
     /// sub-agent, which skips instruction files to stay fast and cheap
@@ -805,6 +813,7 @@ impl Thread {
                 pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
+                agent_language: crate::settings::load().resolve().agent,
                 instructions_enabled: true,
                 lazy_instructions_injected: HashSet::new(),
                 depth: 0,
@@ -896,6 +905,17 @@ impl Thread {
                 pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: None,
+                agent_language: crate::language::Language::from_token(&rec.agent_language)
+                    .unwrap_or_else(|| {
+                        // Mirrors `settings::resolve_axis`'s warn-and-fallback
+                        // so a garbage persisted token surfaces rather than
+                        // silently coercing to English.
+                        tracing::warn!(
+                            token = %rec.agent_language,
+                            "unknown persisted agent_language token; defaulting to English"
+                        );
+                        crate::language::Language::En
+                    }),
                 instructions_enabled: true,
                 lazy_instructions_injected: HashSet::new(),
                 depth: rec.depth as u32,
@@ -967,6 +987,7 @@ impl Thread {
         max_turns: u32,
         depth: u32,
         agent_label: String,
+        agent_language: crate::language::Language,
         tools_fn: impl FnOnce(WeakEntity<Self>) -> ToolRegistry,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -991,6 +1012,7 @@ impl Thread {
                 pending_inbound: HashMap::new(),
                 pending_child_auth: HashMap::new(),
                 system: Some(system),
+                agent_language,
                 instructions_enabled: true,
                 lazy_instructions_injected: HashSet::new(),
                 depth,
@@ -1051,6 +1073,7 @@ impl Thread {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            agent_language: self.agent_language.token().to_string(),
             approval_mode: self.approval_mode.as_i64(),
             reasoning_effort: self.reasoning_effort.as_i64(),
             depth: self.depth as i32,
@@ -1488,6 +1511,14 @@ impl Thread {
 
     pub fn reasoning_effort(&self) -> ReasoningEffort {
         self.reasoning_effort
+    }
+
+    /// The thread's immutable agent-language axis. Read by sub-agent spawn and
+    /// side-call render paths to select the harness language; never mutated
+    /// post-construction so a global settings change cannot disturb an existing
+    /// thread's prompt-cache prefix.
+    pub fn agent_language(&self) -> crate::language::Language {
+        self.agent_language
     }
 
     pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort, cx: &mut Context<Self>) {
@@ -3851,6 +3882,7 @@ impl Thread {
                 self.project.as_deref(),
                 self.approval_mode,
                 wt,
+                self.agent_language,
             ),
         };
         // Capability ground truth (tools / images) comes from the resolved
@@ -3867,7 +3899,8 @@ impl Thread {
             crate::prompt::PromptTemplate::SystemAssembly,
             &crate::prompt::SystemPromptAssembly {
                 base,
-                language: is_subagent.then(crate::system_prompt::language_data),
+                language: is_subagent
+                    .then(|| crate::system_prompt::language_data(self.agent_language)),
                 worktree_subagent: if is_subagent {
                     self.worktree
                         .as_ref()
@@ -4493,6 +4526,39 @@ mod tests {
                      still lingering — late composite-id response would \
                      traverse to child before no-oping)"
                 );
+            });
+        });
+    }
+
+    /// `Thread::restore` snapshots `agent_language` from the persisted record
+    /// and exposes it immutably — the value never re-reads `settings.toml`, so a
+    /// later settings flip cannot disturb a restored thread's render language.
+    #[test]
+    fn restore_snapshots_agent_language_from_record() {
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let mut rec = crate::db::ThreadRecord::for_test("reg-agent-language", "/tmp", Vec::new());
+        rec.agent_language = "zh-CN".into();
+        let thread = cx.update(|cx| super::Thread::restore(rec, None, cx));
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                assert_eq!(t.agent_language(), crate::language::Language::ZhCn);
+            });
+        });
+    }
+
+    /// `ThreadRecord::for_test` defaults to `"en"`, so a restored thread with
+    /// no explicit language surfaces as English.
+    #[test]
+    fn restore_defaults_agent_language_to_english() {
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let rec =
+            crate::db::ThreadRecord::for_test("reg-agent-language-default", "/tmp", Vec::new());
+        let thread = cx.update(|cx| super::Thread::restore(rec, None, cx));
+        cx.update(|cx| {
+            thread.read_with(cx, |t, _| {
+                assert_eq!(t.agent_language(), crate::language::Language::En);
             });
         });
     }

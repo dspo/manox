@@ -18,10 +18,11 @@ use gpui::{
 };
 use gpui_component::theme::Theme;
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants},
     h_flex,
     menu::{DropdownMenu, PopupMenuItem},
+    notification::Notification,
     switch::Switch,
     v_flex,
 };
@@ -153,8 +154,14 @@ fn muted_text(label: SharedString, muted: Hsla) -> AnyElement {
 
 type BoolApply = Arc<dyn Fn(&mut SettingsView, bool) + Send + Sync + 'static>;
 type StringApply = Arc<dyn Fn(&mut SettingsView, SharedString) + Send + Sync + 'static>;
+/// Persists a pick. The display value must flip only on a successful save, so
+/// the whole save-then-apply sequence lives in one closure that returns the
+/// outcome — the caller (which has the window) surfaces a failure as a toast.
 type PostApply = Arc<
-    dyn Fn(&mut SettingsView, &SharedString, &mut Context<SettingsView>) + Send + Sync + 'static,
+    dyn Fn(&mut SettingsView, &SharedString, &mut Context<SettingsView>) -> Result<(), String>
+        + Send
+        + Sync
+        + 'static,
 >;
 
 /// Build a Switch bound to a field via the view entity. The `apply` closure
@@ -206,15 +213,14 @@ fn mock_dropdown(
         .into_any_element()
 }
 
-/// Same as [`mock_dropdown`] but invokes `post` inside the entity update after
-/// `apply` has mutated state. Used by the language picker to persist
-/// `Settings::language` to disk alongside the in-memory field update.
+/// A dropdown whose pick persists via `post`. The display value flips only on
+/// a successful save (enforced inside `post`); a save failure is surfaced as an
+/// in-app toast here, where the window is in scope.
 fn mock_dropdown_with_post(
     id: impl Into<gpui::ElementId>,
     label: SharedString,
     options: Vec<(SharedString, SharedString)>,
     view: Entity<SettingsView>,
-    apply: StringApply,
     post: PostApply,
 ) -> AnyElement {
     Button::new(id)
@@ -226,15 +232,18 @@ fn mock_dropdown_with_post(
                 let display = display.clone();
                 let token = token.clone();
                 let view = view.clone();
-                let apply = apply.clone();
                 let post = post.clone();
                 menu.item(
-                    PopupMenuItem::new(display.clone()).on_click(move |_ev, _window, cx| {
-                        view.update(cx, |this, cx| {
-                            apply(this, display.clone());
-                            post(this, &token, cx);
-                            cx.notify();
-                        });
+                    PopupMenuItem::new(display.clone()).on_click(move |_ev, window, cx| {
+                        if let Err(msg) = view.update(cx, |this, cx| post(this, &token, cx))
+                            && !msg.is_empty()
+                        {
+                            window.push_notification(
+                                Notification::error(msg)
+                                    .title(i18n::t("settings-save-failed-title")),
+                                cx,
+                            );
+                        }
                     }),
                 )
             })
@@ -490,22 +499,32 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
             ),
             hairline(theme.border.opacity(0.6)),
             row_with_control(
-                i18n::t("settings-row-language"),
-                Some(muted_text(i18n::t("settings-desc-language"), muted)),
+                i18n::t("settings-row-ui-language"),
+                Some(muted_text(i18n::t("settings-desc-ui-language"), muted)),
                 mock_dropdown_with_post(
-                    "language",
-                    view.language.clone(),
+                    "ui-language",
+                    view.ui_language.clone(),
                     vec![
-                        (
-                            i18n::t("settings-value-auto-detect"),
-                            SharedString::from(""),
-                        ),
-                        (i18n::t("settings-value-en"), SharedString::from("en")),
-                        (i18n::t("settings-value-zh-CN"), SharedString::from("zh-CN")),
+                        (SharedString::from("English"), SharedString::from("en")),
+                        (SharedString::from("简体中文"), SharedString::from("zh-CN")),
                     ],
                     entity.clone(),
-                    Arc::new(|this, v| this.language = v),
-                    Arc::new(|this, value, cx| this.persist_language(value.clone(), cx)),
+                    Arc::new(|this, value, cx| this.persist_ui_language(value.clone(), cx)),
+                ),
+            ),
+            hairline(theme.border.opacity(0.6)),
+            row_with_control(
+                i18n::t("settings-row-agent-language"),
+                Some(muted_text(i18n::t("settings-desc-agent-language"), muted)),
+                mock_dropdown_with_post(
+                    "agent-language",
+                    view.agent_language.clone(),
+                    vec![
+                        (SharedString::from("English"), SharedString::from("en")),
+                        (SharedString::from("简体中文"), SharedString::from("zh-CN")),
+                    ],
+                    entity.clone(),
+                    Arc::new(|this, value, cx| this.persist_agent_language(value.clone(), cx)),
                 ),
             ),
             hairline(theme.border.opacity(0.6)),
