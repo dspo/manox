@@ -22,15 +22,17 @@
 //! toggle-volatile approval mode. Thread id is deliberately NOT injected — the
 //! model fetches it on demand via the `self_info` tool.
 //!
-//! The prompt prose is fixed English regardless of the UI locale (the model's
-//! context stays in one language). The user's preferred reply language is
-//! conveyed by a one-line directive baked into the main template via
-//! [`language_data`], and appended to a sub-agent's `system` string by the
-//! `system/assembly` template (sub-agents do not pass through this module).
+//! The prompt prose language follows the thread's immutable agent axis
+//! ([`crate::language::Language`]); this module renders the main-thread head,
+//! while sub-agents carry their own `system` field and get the same directive
+//! appended by the `system/assembly` template. The user's preferred reply
+//! language is conveyed by a one-line directive baked into the main template
+//! via [`language_data`].
 
 use std::path::Path;
 use std::sync::OnceLock;
 
+use crate::language::Language;
 use crate::prompt::{LanguagePromptData, MainSystemPromptData, PromptTemplate, render};
 use crate::thread::ApprovalMode;
 
@@ -42,6 +44,11 @@ const STATIC_PROMPT: &str = include_str!("system_prompt.md");
 /// `build_completion_request` takes the `unwrap_or_else` branch only for the
 /// main thread.
 ///
+/// `agent_language` is the thread's immutable agent axis (not the process-global
+/// UI locale) so two threads in different agent languages render distinct prose
+/// concurrently; it selects the reply-language directive baked into the main
+/// template.
+///
 /// Assembly order is static-first (see module docs): the volatile identity
 /// block lands at the very end so toggling `approval_mode` or a day rollover
 /// only invalidates the cached tail, not the static prose. The plan-mode
@@ -52,6 +59,7 @@ pub fn build_main_system_prompt(
     project: Option<&Path>,
     approval_mode: ApprovalMode,
     active_worktree: Option<(&str, &Path)>,
+    agent_language: Language,
 ) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
@@ -71,7 +79,7 @@ pub fn build_main_system_prompt(
     let data = MainSystemPromptData {
         static_body: STATIC_PROMPT,
         skills: crate::skill::summaries_or_empty(),
-        language: language_data(),
+        language: language_data(agent_language),
         runtime: crate::prompt::RuntimeIdentityPromptData {
             cwd: cwd.display().to_string(),
             project: project.map(|p| p.display().to_string()),
@@ -121,18 +129,18 @@ fn probe_version(bin: &str) -> String {
 }
 
 /// The language directive baked into the system prompt so the model addresses
-/// the user in the UI's chosen language. The prompt prose itself stays English;
-/// only this one directive varies with [`crate::i18n::current`]. Returned as a
-/// data payload; the `system/main` and `system/assembly` templates own the
-/// surrounding `## Language` layout.
-pub fn language_data() -> LanguagePromptData {
+/// the user in the thread's agent language. The directive is selected by the
+/// thread's immutable [`Language`] (not the process-global UI locale), so the
+/// render API stays explicit about which language a given conversation is in
+/// and two threads in different agent languages can run concurrently. Returned
+/// as a data payload; the `system/main` and `system/assembly` templates own
+/// the surrounding `## Language` layout.
+pub fn language_data(agent_language: Language) -> LanguagePromptData {
     // The name is always an English endonym ("English", "Simplified Chinese") —
     // the model parses the directive, the user never sees this string.
-    let language = match crate::i18n::current() {
-        crate::i18n::Language::En => "English",
-        crate::i18n::Language::ZhCn => "Simplified Chinese",
-    };
-    LanguagePromptData { language }
+    LanguagePromptData {
+        language: agent_language.english_name(),
+    }
 }
 
 #[cfg(test)]
@@ -142,7 +150,7 @@ mod tests {
     #[test]
     fn prompt_contains_cwd_and_identity() {
         let cwd = Path::new("/tmp/some-proj");
-        let p = build_main_system_prompt(cwd, None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(cwd, None, ApprovalMode::OnRequest, None, Language::En);
         assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
         assert!(p.contains("manox agent"), "identity must appear: {p}");
         assert!(p.contains("Today:"), "date row must appear: {p}");
@@ -158,7 +166,13 @@ mod tests {
         // The identity names the product, not the implementation: the model has
         // no use for "GPUI"/"brush" or other framework names, and exposing
         // them only invites tangents.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(!p.contains("GPUI"), "must not leak tech stack: {p}");
         assert!(!p.contains("gpui"), "must not leak tech stack: {p}");
         assert!(!p.contains("brush"), "must not leak tech stack: {p}");
@@ -169,7 +183,13 @@ mod tests {
         // Identity lands at the very end of the prompt — after the static
         // prose, skills, and language directive — so the cacheable static
         // prefix is maximal.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(!p.contains("{{"), "no placeholder syntax: {p}");
         assert!(
             p.contains("## Runtime identity"),
@@ -188,7 +208,13 @@ mod tests {
 
     #[test]
     fn prompt_includes_context_economy() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(
             p.contains("Context economy"),
             "context economy section: {p}"
@@ -203,13 +229,20 @@ mod tests {
     fn prompt_includes_project_when_set() {
         let cwd = Path::new("/tmp/some-proj");
         let proj = Path::new("/tmp/some-proj");
-        let p = build_main_system_prompt(cwd, Some(proj), ApprovalMode::OnRequest, None);
+        let p =
+            build_main_system_prompt(cwd, Some(proj), ApprovalMode::OnRequest, None, Language::En);
         assert!(p.contains("Project root"));
     }
 
     #[test]
     fn prompt_contains_engineering_stance() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(
             p.contains("Engineering stance"),
             "engineering stance section: {p}"
@@ -223,7 +256,13 @@ mod tests {
 
     #[test]
     fn prompt_contains_no_fabrication() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(
             p.contains("don't fabricate"),
             "no-fabrication discipline: {p}"
@@ -232,7 +271,13 @@ mod tests {
 
     #[test]
     fn prompt_contains_task_completion() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(
             p.contains("fully solved"),
             "task completion discipline: {p}"
@@ -241,7 +286,13 @@ mod tests {
 
     #[test]
     fn prompt_contains_validation_discipline() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(
             p.contains("Don't claim something passed without running it"),
             "validation discipline: {p}"
@@ -250,7 +301,13 @@ mod tests {
 
     #[test]
     fn prompt_contains_sandbox_boundary() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(
             p.contains("Tool sandbox boundary"),
             "sandbox boundary section: {p}"
@@ -271,7 +328,13 @@ mod tests {
         // prompt. The runtime identity block must not carry a thread id row —
         // the prose may mention "thread id" as a concept pointing to the tool,
         // but no concrete id value is injected here.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(
             !p.contains("Current thread id"),
             "no thread id row in runtime identity block: {p}"
@@ -281,7 +344,13 @@ mod tests {
     #[test]
     fn static_prompt_is_embedded_verbatim() {
         // Editing the markdown must show through without rebuilding logic.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(p.contains("Engineering stance"));
         assert!(p.contains("in-process native agent workbench"));
     }
@@ -289,7 +358,13 @@ mod tests {
     #[test]
     fn prompt_injects_language_directive() {
         // The current-locale language directive must land in the built prompt.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(p.contains("## Language"), "language section missing: {p}");
         assert!(
             p.contains("write your user-facing responses in"),
@@ -299,13 +374,25 @@ mod tests {
 
     #[test]
     fn yolo_mode_advertised_when_enabled() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::Yolo, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::Yolo,
+            None,
+            Language::En,
+        );
         assert!(p.contains("YOLO"), "yolo mode line missing: {p}");
     }
 
     #[test]
     fn yolo_mode_silent_when_disabled() {
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(
             !p.contains("YOLO"),
             "yolo must not appear when disabled: {p}"
@@ -318,7 +405,13 @@ mod tests {
         // the agent must answer first and ask before touching code (thread
         // bfb39601: agent started implementing on a "how do I add a
         // marketplace" question).
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(
             p.contains("Discussion vs implementation"),
             "discussion section: {p}"
@@ -344,7 +437,13 @@ mod tests {
         // success — the branch-tracking false-success regression (thread
         // e5047fd2) came from reporting push success without checking
         // `git log origin/<branch>`.
-        let p = build_main_system_prompt(Path::new("/tmp"), None, ApprovalMode::OnRequest, None);
+        let p = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
         assert!(p.contains("Git operations"), "git section: {p}");
         assert!(
             p.contains("git log origin/<branch>"),

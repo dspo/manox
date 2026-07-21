@@ -301,6 +301,10 @@ fn setup_child(
         .upgrade()
         .map(|p| p.read_with(cx, |t, _| t.reasoning_effort()))
         .unwrap_or_default();
+    let parent_language = parent
+        .upgrade()
+        .map(|p| p.read_with(cx, |t, _| t.agent_language()))
+        .unwrap_or_default();
     let max_turns = def.max_turns.unwrap_or(10);
     let system_prompt = def_file.system_prompt.clone();
 
@@ -349,6 +353,7 @@ fn setup_child(
         max_turns,
         child_depth,
         parsed.subagent_type.clone(),
+        parent_language,
         |weak| {
             build_child_registry_with_policy(
                 Arc::new(cwd_path.clone()),
@@ -878,6 +883,7 @@ pub(crate) fn spawn_team_member(
     let permission = Arc::new(PermissionCache::from_snapshot(parent_snapshot));
     let parent_mode = leader_ent.read_with(cx, |t, _| t.approval_mode());
     let parent_effort = leader_ent.read_with(cx, |t, _| t.reasoning_effort());
+    let parent_language = leader_ent.read_with(cx, |t, _| t.agent_language());
     let max_turns = def.max_turns.unwrap_or(10);
     let system_prompt = def_file.system_prompt.clone();
     let depth = 1u32;
@@ -894,6 +900,7 @@ pub(crate) fn spawn_team_member(
         max_turns,
         depth,
         spec.name.clone(),
+        parent_language,
         |weak| {
             let mut reg = build_child_registry_with_policy(
                 Arc::new(cwd.clone()),

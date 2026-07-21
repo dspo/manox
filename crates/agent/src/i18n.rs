@@ -1,63 +1,31 @@
-//! Process-global i18n via fluent.
+//! Process-global i18n via fluent, runtime-switchable on the UI axis.
 //!
-//! One `FluentBundle` per process; locale is fixed at `init` from
-//! `settings.toml` and never switched at runtime (no UI control yet). UI chrome
-//! reads strings through [`t`] / [`t_str`] / [`t_count`]. Model-facing content
-//! — the system prompt, tool descriptions, tool error strings — is always
-//! English and intentionally never routed through here, so the model's context
-//! stays in one language regardless of the UI locale.
+//! The [`Language`] type lives in [`crate::language`]; this module owns the
+//! Fluent bundle machinery and the UI-locale global. The UI locale is no longer
+//! frozen at `init` — [`set_ui_language`] swaps it live (rebuild bundles, refresh
+//! every window, rebuild native menus) so a user picking a language in settings
+//! sees it immediately. History notifications and user content are never
+//! retroactively rewritten; only chrome re-localizes on the next render.
 //!
-//! The current language is also surfaced to [`system_prompt`] via
-//! [`Language::english_name`], which injects a one-line directive telling the
-//! model which language to address the user in. The prompt prose itself stays
-//! English; only the user-facing reply language varies.
+//! The agent axis (which harness prompt / tool-description language a thread
+//! uses) is a separate, per-thread immutable value on [`crate::thread::Thread`]
+//! and never flows through here — model-facing prose is selected by that
+//! thread-local value in [`crate::system_prompt`] / [`crate::prompt`], not by
+//! this process-global UI locale, so a Chinese-UI / English-agent thread (or the
+//! reverse) renders consistently and two threads in different agent languages
+//! can run concurrently.
 
 use std::cell::RefCell;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use anyhow::Result;
 use fluent::{FluentArgs, FluentBundle, FluentResource, FluentValue};
-use gpui::SharedString;
-use unic_langid::LanguageIdentifier;
+use gpui::{App, SharedString};
+
+pub use crate::language::Language;
 
 const EN_FTL: &str = include_str!("../locales/en.ftl");
 const ZH_CN_FTL: &str = include_str!("../locales/zh-CN.ftl");
-
-/// Supported UI locales. Adding a language means: a new variant, a `.ftl`
-/// resource, and a match arm in [`Language::langid`] / [`Language::primary_resource`]
-/// / [`Language::english_name`] / [`parse_language`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Language {
-    #[default]
-    En,
-    ZhCn,
-}
-
-impl Language {
-    fn langid(self) -> LanguageIdentifier {
-        match self {
-            Language::En => "en".parse().expect("en is a valid BCP47 langid"),
-            Language::ZhCn => "zh-CN".parse().expect("zh-CN is a valid BCP47 langid"),
-        }
-    }
-
-    /// English endonym injected into the system prompt so the model knows which
-    /// language to address the user in. Always English regardless of locale —
-    /// the model parses the directive, the user doesn't see it.
-    pub fn english_name(self) -> &'static str {
-        match self {
-            Language::En => "English",
-            Language::ZhCn => "Simplified Chinese",
-        }
-    }
-
-    fn primary_resource(self) -> &'static str {
-        match self {
-            Language::En => EN_FTL,
-            Language::ZhCn => ZH_CN_FTL,
-        }
-    }
-}
 
 struct L10n {
     bundle: FluentBundle<FluentResource>,
@@ -67,45 +35,75 @@ struct L10n {
     fallback: Option<FluentBundle<FluentResource>>,
 }
 
-/// Chosen locale, settled once at `init`. `FluentBundle` itself is `!Send`
-/// (its intl-memoizer holds a `RefCell`), so the bundle lives in a thread-local
-/// — but the locale choice is process-global and `Copy`, and lives here.
-static LANG: OnceLock<Language> = OnceLock::new();
+/// Current UI locale. `RwLock` (not `OnceLock`) so [`set_ui_language`] can swap
+/// it at runtime; `FluentBundle` itself is `!Send` (its intl-memoizer holds a
+/// `RefCell`), so each thread's bundle lives in a thread-local and is rebuilt
+/// lazily against whatever locale this global reports when the thread next calls
+/// [`t`].
+static LANG: RwLock<Language> = RwLock::new(Language::En);
 
 thread_local! {
     static L10N: RefCell<Option<L10n>> = const { RefCell::new(None) };
 }
 
-/// Read `settings.toml`, resolve the locale, and build the bundle on the
+/// A menu rebuilder registered by the bin (which owns the native-menu
+/// construction — `Quit` action and `Menu`/`MenuItem` live there). When the UI
+/// locale changes the native menus must be re-`set_menus`'d with fresh
+/// `t()`-resolved labels; this indirection keeps the rebuilder out of the
+/// `agent` crate (it can't depend on the bin) without scattering menu-rebuild
+/// calls across the UI layer.
+type MenuRebuild = Box<dyn Fn(&mut App) + Send + Sync>;
+static MENU_REBUILDER: OnceLock<MenuRebuild> = OnceLock::new();
+
+/// Register the native-menu rebuilder. Called once from the bin at startup,
+/// after [`init`]. Subsequent [`set_ui_language`] calls invoke it so menu labels
+/// re-localize live.
+pub fn set_menu_rebuilder(rebuild: impl Fn(&mut App) + Send + Sync + 'static) {
+    let _ = MENU_REBUILDER.set(Box::new(rebuild));
+}
+
+/// Read `settings.toml`, resolve the UI locale, and build the bundle on the
 /// calling (startup) thread. Called once from `agent::init` before any UI
 /// render or system-prompt build. Any failure is non-fatal: warn and fall back
 /// to English so a malformed config never blocks startup.
 pub fn init() {
-    let lang = crate::settings::load()
-        .language
-        .as_deref()
-        .and_then(parse_language)
-        .unwrap_or_default();
-    let _ = LANG.set(lang);
+    let lang = crate::settings::load().resolve().ui;
+    *LANG.write().expect("i18n LANG lock poisoned") = lang;
     if init_with(lang).is_err() {
         tracing::warn!("i18n bundle build failed for {lang:?}; falling back to English");
+        *LANG.write().expect("i18n LANG lock poisoned") = Language::En;
         let _ = init_with(Language::En);
     }
 }
 
-/// Map a user-supplied language tag from `settings.toml` to a [`Language`].
-/// Tolerates common variants (`zh`, `zh-Hans`, `en-US`); unknown tags return
-/// `None` so the caller falls back to the default.
-fn parse_language(s: &str) -> Option<Language> {
-    match s.trim().to_lowercase().as_str() {
-        "en" | "en-us" | "en_us" => Some(Language::En),
-        "zh" | "zh-cn" | "zh_cn" | "zh-hans" | "zh-hans-cn" => Some(Language::ZhCn),
-        _ => None,
+/// Swap the UI locale live: update the global, drop every thread's cached
+/// bundle so the next [`t`] rebuilds against the new locale, refresh all
+/// windows so chrome re-renders, and rebuild native menus via the registered
+/// rebuilder. Existing notifications and user content are not rewritten — only
+/// chrome re-localizes from this point forward.
+///
+/// Callers must have already persisted the new locale to `settings.toml` (or be
+/// the persist path itself); this function touches only in-memory state and UI.
+pub fn set_ui_language(lang: Language, cx: &mut App) {
+    *LANG.write().expect("i18n LANG lock poisoned") = lang;
+    // Drop this thread's bundle; other threads' bundles rebuild lazily on
+    // their next `t()` call, reading the new locale from `LANG`.
+    L10N.with(|cell| *cell.borrow_mut() = None);
+    cx.refresh_windows();
+    if let Some(rebuild) = MENU_REBUILDER.get() {
+        rebuild(cx);
+    }
+}
+
+fn primary_resource(lang: Language) -> &'static str {
+    match lang {
+        Language::En => EN_FTL,
+        Language::ZhCn => ZH_CN_FTL,
     }
 }
 
 fn init_with(lang: Language) -> Result<()> {
-    let primary = FluentResource::try_new(lang.primary_resource().to_string())
+    let primary = FluentResource::try_new(primary_resource(lang).to_string())
         .map_err(|(_, errs)| anyhow::anyhow!("primary locale resource parse failed: {errs:?}"))?;
     let mut bundle = FluentBundle::new(vec![lang.langid()]);
     // manox is a code editor (LTR); the bidi isolate marks fluent wraps
@@ -134,23 +132,37 @@ fn init_with(lang: Language) -> Result<()> {
     Ok(())
 }
 
-/// Build the thread-local bundle for the current thread if not already built.
-/// Non-startup threads (e.g. a tokio worker) that call [`t`] get their own
-/// bundle lazily. Returns the resolved locale.
+/// Build the thread-local bundle for the current thread if not already built,
+/// or rebuild it if the cached locale drifts from the live global (e.g. after
+/// [`set_ui_language`] on another thread). Returns the resolved locale.
 fn ensure_init() -> Language {
-    let lang = *LANG.get().unwrap_or(&Language::En);
+    let lang = read_lang();
     L10N.with(|cell| {
-        if cell.borrow().is_none() {
-            let _ = init_with(lang);
+        let needs_rebuild = cell
+            .borrow()
+            .as_ref()
+            .is_none_or(|l| l.bundle.locales.first() != Some(&lang.langid()));
+        if needs_rebuild && let Err(e) = init_with(lang) {
+            // A corrupt .ftl would otherwise fall through to key-verbatim
+            // rendering in `format` with no trace; surface it here so the
+            // failure is diagnosable in the field.
+            tracing::warn!(error = %e, ?lang, "i18n bundle rebuild failed");
         }
     });
     lang
 }
 
 /// Current UI language. Returns [`Language::default`] (English) before `init`
-/// or on init failure, so callers during early startup still get a sane answer.
+/// or on lock poisoning, so callers during early startup still get a sane answer.
 pub fn current() -> Language {
-    *LANG.get().unwrap_or(&Language::default())
+    read_lang()
+}
+
+/// Read the live UI locale, falling back to English on a poisoned lock (a
+/// panicking lock holder is unrecoverable, so defaulting keeps startup robust
+/// rather than propagating the poisoning).
+fn read_lang() -> Language {
+    LANG.read().map(|g| *g).unwrap_or(Language::En)
 }
 
 /// Resolve `key` with no arguments. Missing keys render as the key itself so
@@ -227,22 +239,22 @@ fn format_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `t` / `t_count` read the process-global `LANG`, so any test that flips
+    /// it must hold this lock for its whole body — otherwise a parallel sibling
+    /// reassigning `LANG` mid-call makes `ensure_init` rebuild against the
+    /// wrong locale and the assertion sees the other language's string.
+    static TEST_LANG_LOCK: Mutex<()> = Mutex::new(());
 
     fn set_lang(lang: Language) {
-        let _ = LANG.set(lang);
+        *LANG.write().expect("i18n LANG lock poisoned") = lang;
         init_with(lang).expect("init_with should succeed for tests");
     }
 
     #[test]
-    fn en_fallback_for_missing_key() {
-        // Fallback (zh-CN bundle also carries the en resource) is wired in
-        // `init_with`; with both ftl files mirroring all keys it isn't
-        // exercised by real data, so we don't assert it here. The raw-key
-        // return for a fully-unknown id is covered by `missing_key_returns_key`.
-    }
-
-    #[test]
     fn missing_key_returns_key() {
+        let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::En);
         let v = t("does-not-exist-xyz");
         assert_eq!(v.as_ref(), "does-not-exist-xyz");
@@ -250,6 +262,7 @@ mod tests {
 
     #[test]
     fn en_plural_minutes() {
+        let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::En);
         assert_eq!(t_count("sidebar-time-minutes", 1).as_ref(), "1 minute ago");
         assert_eq!(t_count("sidebar-time-minutes", 5).as_ref(), "5 minutes ago");
@@ -257,6 +270,7 @@ mod tests {
 
     #[test]
     fn zh_cn_no_plural_minutes() {
+        let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::ZhCn);
         assert_eq!(t_count("sidebar-time-minutes", 1).as_ref(), "1 分钟前");
         assert_eq!(t_count("sidebar-time-minutes", 5).as_ref(), "5 分钟前");
@@ -264,6 +278,7 @@ mod tests {
 
     #[test]
     fn string_arg_interpolation() {
+        let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::En);
         let v = t_str("workspace-unknown-command", &[("name", "foo")]);
         assert!(v.contains("/foo"), "got: {v}");
@@ -271,19 +286,11 @@ mod tests {
     }
 
     #[test]
-    fn english_name_for_prompt_directive() {
-        assert_eq!(Language::En.english_name(), "English");
-        assert_eq!(Language::ZhCn.english_name(), "Simplified Chinese");
-    }
-
-    #[test]
-    fn parse_language_tolerant() {
-        assert_eq!(parse_language("en"), Some(Language::En));
-        assert_eq!(parse_language("En"), Some(Language::En));
-        assert_eq!(parse_language("en-US"), Some(Language::En));
-        assert_eq!(parse_language("zh"), Some(Language::ZhCn));
-        assert_eq!(parse_language("zh-Hans"), Some(Language::ZhCn));
-        assert_eq!(parse_language("ZH-CN"), Some(Language::ZhCn));
-        assert_eq!(parse_language("fr"), None);
+    fn current_reflects_set_language() {
+        let _g = TEST_LANG_LOCK.lock().unwrap();
+        set_lang(Language::En);
+        assert_eq!(current(), Language::En);
+        set_lang(Language::ZhCn);
+        assert_eq!(current(), Language::ZhCn);
     }
 }

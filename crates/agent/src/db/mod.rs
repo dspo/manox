@@ -128,6 +128,7 @@ mod tests {
             provider_id: Some("百炼".into()),
             cwd: "/tmp".into(),
             project: "/tmp".into(),
+            agent_language: "en".into(),
             approval_mode: 2,
             reasoning_effort: 4,
             depth: 0,
@@ -166,6 +167,7 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("关于登录"));
         assert_eq!(loaded.provider_id.as_deref(), Some("百炼"));
         assert_eq!(loaded.approval_mode, 2);
+        assert_eq!(loaded.agent_language, "en");
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].role, Role::User);
         assert!(!loaded.messages[0].id.is_empty());
@@ -179,6 +181,17 @@ mod tests {
             .unwrap();
         assert_eq!(pm.input_tokens, 100);
         assert_eq!(pm.output_tokens, 50);
+    }
+
+    #[test]
+    fn agent_language_round_trips_zh_cn() {
+        let db = open_mem();
+        let mut rec = sample_record("zh1");
+        rec.agent_language = "zh-CN".into();
+        db.upsert(&rec, true).unwrap();
+
+        let loaded = db.load("zh1").unwrap().unwrap();
+        assert_eq!(loaded.agent_language, "zh-CN");
     }
 
     #[test]
