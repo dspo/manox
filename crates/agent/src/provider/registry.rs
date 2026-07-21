@@ -134,35 +134,12 @@ pub(crate) fn default_max_output_tokens(max_token_count: u64) -> u64 {
     max_token_count.clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_CAP)
 }
 
-/// Resolve a model's context-window size in tokens. The numeric `max_tokens`
-/// field (operator-declared in the provider config) takes precedence — an
-/// explicit numeric field is unambiguous, unlike the legacy `context` string.
-/// Absent that, the `context` yaml field is parsed; an unparseable `context` is
-/// a hard error (warn + 8192 fallback) — it does NOT silently fall through to a
-/// bracket suffix on the id, because an explicit field means the operator chose
-/// a value and a typo should surface, not masquerade as a different number. When
-/// neither `max_tokens` nor `context` is set, a trailing bracket suffix on the
-/// id (e.g. `glm-5.2[1m123k]`) is parsed; absent all three, 8192.
+/// Resolve a model's context-window size in tokens. `max_tokens` is always
+/// populated by `ResolvedModel::from_config()` with a default of 1M when
+/// neither the config nor the remote models API provides one; the fallback
+/// to 8192 only covers manually constructed `ResolvedModel` values in tests.
 fn resolve_context_window(resolved: &ResolvedModel) -> u64 {
-    if let Some(n) = resolved.max_tokens {
-        return n;
-    }
-    let ctx = resolved.context.trim();
-    if !ctx.is_empty() {
-        match cx_providers::parse_context_window(ctx) {
-            Some(n) => n,
-            None => {
-                tracing::warn!(
-                    model_id = %resolved.id,
-                    context = %resolved.context,
-                    "context field unparseable; fallback 8192, no bracket fallback"
-                );
-                8192
-            }
-        }
-    } else {
-        cx_providers::context_window_from_suffix(&resolved.id).unwrap_or(8192)
-    }
+    resolved.max_tokens.unwrap_or(8192)
 }
 
 /// Resolve a model's `max_output_tokens` request field. The operator-declared
@@ -300,13 +277,10 @@ pub fn global() -> Arc<ProviderRegistry> {
 mod tests {
     use super::*;
 
-    fn model(id: &str, context: &str) -> ResolvedModel {
+    fn model(id: &str, max_tokens: Option<u64>) -> ResolvedModel {
         ResolvedModel {
             id: id.to_string(),
-            swe_pro: String::new(),
-            hle: String::new(),
             desc: String::new(),
-            context: context.to_string(),
             wire_api: WireApi::Anthropic,
             model_wire_apis: Vec::new(),
             provider_name: String::new(),
@@ -316,62 +290,27 @@ mod tests {
             env: std::collections::BTreeMap::new(),
             apikey_source: None,
             max_output_tokens: None,
-            max_tokens: None,
+            max_tokens,
             supports_tools: true,
             supports_images: false,
         }
     }
 
-    /// `model()` with an explicit numeric `max_tokens` capability field, so the
-    /// precedence rule (numeric `max_tokens` beats the `context` string and the
-    /// id bracket suffix) can be exercised.
-    fn model_with_max_tokens(id: &str, context: &str, max_tokens: u64) -> ResolvedModel {
-        let mut m = model(id, context);
-        m.max_tokens = Some(max_tokens);
-        m
-    }
-
     #[test]
     fn resolve_context_window_cases() {
-        // context field wins over a bracket suffix on the id.
+        // max_tokens populated from config.
         assert_eq!(
-            resolve_context_window(&model("glm-5.2[1m]", "244k")),
-            244_000
+            resolve_context_window(&model("m", Some(1_000_000))),
+            1_000_000
         );
-        // bracket suffix when no context field.
-        assert_eq!(resolve_context_window(&model("glm-5.2[1m]", "")), 1_000_000);
         assert_eq!(
-            resolve_context_window(&model("glm-5.2[1m1234k]", "")),
-            2_234_000
-        );
-        // unparseable context is a hard error: 8192, no bracket fallback.
-        assert_eq!(
-            resolve_context_window(&model("glm-5.2[1m]", "garbage")),
-            8192
-        );
-        // neither context nor suffix.
-        assert_eq!(resolve_context_window(&model("glm-5.2", "")), 8192);
-        // context is trimmed before parsing.
-        assert_eq!(resolve_context_window(&model("glm-5.2", " 1m ")), 1_000_000);
-    }
-
-    #[test]
-    fn resolve_context_window_prefers_max_tokens_field() {
-        // The numeric `max_tokens` config field is unambiguous and wins over
-        // the `context` string and the id bracket suffix — operator intent, not
-        // a string parse.
-        assert_eq!(
-            resolve_context_window(&model_with_max_tokens("glm-5.2[1m]", "244k", 131_072)),
+            resolve_context_window(&model("m", Some(131_072))),
             131_072
         );
+        // max_tokens absent → fallback 8192 (only in tests).
         assert_eq!(
-            resolve_context_window(&model_with_max_tokens("glm-5.2[1m1234k]", "", 200_000)),
-            200_000
-        );
-        // `max_tokens` absent falls back to the `context` string path.
-        assert_eq!(
-            resolve_context_window(&model("glm-5.2[1m]", "244k")),
-            244_000
+            resolve_context_window(&model("m", None)),
+            8192
         );
     }
 
@@ -379,20 +318,20 @@ mod tests {
     fn resolve_max_output_tokens_honors_config_then_heuristic() {
         // Explicit `max_output_tokens` is used verbatim, capped only at the
         // context window (a misconfigured output budget cannot exceed input).
-        let mut m = model_with_max_tokens("m", "", 131_072);
+        let mut m = model("m", Some(131_072));
         m.max_output_tokens = Some(131_072);
         assert_eq!(resolve_max_output_tokens(&m, 131_072), 131_072);
         // Capped at the context window when the declared output exceeds it.
-        let mut over = model_with_max_tokens("m", "", 8_192);
+        let mut over = model("m", Some(8_192));
         over.max_output_tokens = Some(65_536);
         assert_eq!(resolve_max_output_tokens(&over, 8_192), 8_192);
         // Absent `max_output_tokens` falls back to the heuristic clamp.
         assert_eq!(
-            resolve_max_output_tokens(&model("m", ""), 4_096),
+            resolve_max_output_tokens(&model("m", None), 4_096),
             MIN_OUTPUT_TOKENS
         );
         assert_eq!(
-            resolve_max_output_tokens(&model("m", ""), 1024 * 1024),
+            resolve_max_output_tokens(&model("m", None), 1024 * 1024),
             MAX_OUTPUT_TOKENS_CAP
         );
     }
@@ -415,6 +354,7 @@ mod tests {
             MAX_OUTPUT_TOKENS_CAP
         );
     }
+
     #[test]
     fn auto_compact_window_from_env_parses_and_falls_back() {
         use std::collections::BTreeMap;
