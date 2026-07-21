@@ -7,8 +7,12 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::http::{Request, Uri};
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    http::{HeaderValue, Uri},
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_util::sync::CancellationToken;
 
 /// Maximum frame size accepted (1 MiB). Frames larger than this are rejected
 /// with a size-placeholder event.
@@ -29,7 +33,10 @@ pub enum WsFrame {
     /// Binary frame with byte count (content is not forwarded).
     Binary { len: usize },
     /// Close frame with optional code and reason.
-    Close { code: Option<u16>, reason: Option<String> },
+    Close {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
 }
 
 /// Validate a WebSocket URL: must be `ws://` or `wss://`, no userinfo,
@@ -48,9 +55,16 @@ pub fn validate_ws_url(url: &str) -> Result<(), String> {
         .scheme_str()
         .ok_or("WebSocket URL must have a scheme (ws:// or wss://)")?;
     if scheme != "ws" && scheme != "wss" {
-        return Err(format!("unsupported scheme: {scheme} (expected ws:// or wss://)"));
+        return Err(format!(
+            "unsupported scheme: {scheme} (expected ws:// or wss://)"
+        ));
     }
-    if uri.authority().map(|a| a.as_str()).unwrap_or("").contains('@') {
+    if uri
+        .authority()
+        .map(|a| a.as_str())
+        .unwrap_or("")
+        .contains('@')
+    {
         return Err("WebSocket URL must not contain userinfo".into());
     }
     Ok(())
@@ -82,15 +96,33 @@ pub fn validate_protocols(protocols: &[String]) -> Result<(), String> {
 fn is_valid_http_token(s: &str) -> bool {
     s.bytes().all(|b| {
         b.is_ascii_alphanumeric()
-            || matches!(b, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*'
-                | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~')
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            )
     })
 }
 
 /// Resolve a host:port pair and reject private/loopback/link-local/unspecified
 /// addresses. Returns the resolved addresses so the caller can pin them and
 /// avoid DNS rebinding.
-pub fn resolve_and_validate_addrs(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
+pub fn resolve_and_validate_addrs(
+    host: &str,
+    port: u16,
+) -> Result<Vec<std::net::SocketAddr>, String> {
     let addr_str = format!("{host}:{port}");
     let addrs: Vec<std::net::SocketAddr> = addr_str
         .to_socket_addrs()
@@ -113,7 +145,6 @@ pub fn resolve_and_validate_addrs(host: &str, port: u16) -> Result<Vec<std::net:
         if ip.is_unspecified() {
             return Err(format!("rejected: {ip} is an unspecified address"));
         }
-        // Reject metadata addresses (IPv4-mapped IPv6 etc.)
         if let std::net::IpAddr::V6(v6) = ip
             && v6.to_ipv4_mapped().is_some()
         {
@@ -128,15 +159,11 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let octets = v4.octets();
-            // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
             octets[0] == 10
                 || (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
                 || (octets[0] == 192 && octets[1] == 168)
         }
-        std::net::IpAddr::V6(v6) => {
-            // fc00::/7 (unique local)
-            (v6.segments()[0] & 0xfe00) == 0xfc00
-        }
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
     }
 }
 
@@ -144,60 +171,51 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
 fn is_link_local_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            // 169.254.0.0/16
             let octets = v4.octets();
             octets[0] == 169 && octets[1] == 254
         }
-        std::net::IpAddr::V6(v6) => {
-            // fe80::/10
-            (v6.segments()[0] & 0xffc0) == 0xfe80
-        }
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
 
 /// Connect to the WebSocket target using the pinned addresses (DNS rebinding
-/// protection). Returns the stream handle.
+/// protection). Uses `IntoClientRequest` to generate proper WebSocket headers
+/// (Connection, Upgrade, Sec-WebSocket-Version, Sec-WebSocket-Key), then
+/// attaches subprotocols if any.
 pub async fn connect_pinned(
     target: &WsTarget,
     pinned_addrs: &[std::net::SocketAddr],
     timeout: Option<Duration>,
+    cancel: &CancellationToken,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
-    let uri: Uri = target
+    // Build a proper WebSocket request via `IntoClientRequest`, which adds
+    // Connection, Upgrade, Sec-WebSocket-Version, and Sec-WebSocket-Key.
+    let mut req = target
         .url
-        .parse()
-        .map_err(|e| format!("invalid URL: {e}"))?;
-    let host = uri
-        .host()
-        .ok_or("URL has no host")?
-        .to_string();
-    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
-        Some("wss") => 443,
-        _ => 80,
-    });
+        .as_str()
+        .into_client_request()
+        .map_err(|e| format!("failed to build WebSocket request: {e}"))?;
 
-    // Build the request with subprotocols.
-    let mut req = Request::builder()
-        .uri(&target.url)
-        .header("Host", format!("{host}:{port}"));
+    // Attach subprotocols if any.
     if !target.protocols.is_empty() {
-        req = req.header(
+        let val = target.protocols.join(", ");
+        req.headers_mut().insert(
             "Sec-WebSocket-Protocol",
-            target.protocols.join(", "),
+            HeaderValue::from_str(&val).map_err(|e| format!("invalid subprotocol header: {e}"))?,
         );
     }
-    let req = req
-        .body(())
-        .map_err(|e| format!("failed to build request: {e}"))?;
 
     // Connect to the first pinned address that works.
     let mut last_err = None;
     for addr in pinned_addrs {
         let connect_fut = async {
             let stream = match timeout {
-                Some(t) => tokio::time::timeout(t, TcpStream::connect(*addr)).await
+                Some(t) => tokio::time::timeout(t, TcpStream::connect(*addr))
+                    .await
                     .map_err(|_| "connection timeout".to_string())?
                     .map_err(|e| format!("TCP connect failed: {e}"))?,
-                None => TcpStream::connect(*addr).await
+                None => TcpStream::connect(*addr)
+                    .await
                     .map_err(|e| format!("TCP connect failed: {e}"))?,
             };
             let scheme = target.url.starts_with("wss://");
@@ -207,7 +225,7 @@ pub async fn connect_pinned(
                     .map_err(|e| format!("TLS handshake failed: {e}"))?;
                 stream
             } else {
-                let plain = tokio_tungstenite::MaybeTlsStream::Plain(stream);
+                let plain = MaybeTlsStream::Plain(stream);
                 let (stream, _) = tokio_tungstenite::client_async(req.clone(), plain)
                     .await
                     .map_err(|e| format!("WebSocket handshake failed: {e}"))?;
@@ -215,11 +233,19 @@ pub async fn connect_pinned(
             };
             Ok::<_, String>(ws_stream)
         };
-        match connect_fut.await {
-            Ok(stream) => return Ok(stream),
-            Err(e) => {
-                last_err = Some(e);
-                continue;
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err("WebSocket connection cancelled".into());
+            }
+            result = connect_fut => {
+                match result {
+                    Ok(stream) => return Ok(stream),
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -259,15 +285,10 @@ pub async fn read_frame(
                 return Ok(WsFrame::Close { code, reason });
             }
             Message::Ping(data) => {
-                // Auto-respond to pings.
-                let _ = stream
-                    .send(tokio_tungstenite::tungstenite::Message::Pong(data))
-                    .await;
+                let _ = stream.send(Message::Pong(data)).await;
             }
             Message::Pong(_) => {}
-            Message::Frame(_) => {
-                // Raw frames are not handled.
-            }
+            Message::Frame(_) => {}
         }
     }
 }

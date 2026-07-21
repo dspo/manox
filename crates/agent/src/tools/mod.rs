@@ -383,11 +383,14 @@ pub(crate) fn base_tools_with_policy(
         Arc::new(skill::SkillTool { lang }),
         // BashOutput: poll a background shell started by Bash with run_in_background.
         Arc::new(bash_output::BashOutputTool) as AnyAgentTool,
-        // Monitor: stream a long-running command line by line. Now shared with
-        // sub-agents so a plugin sub-agent (e.g. remora) can watch a long
-        // process. Previously main-only; the main-thread-only registration in
-        // main_registry was removed when this was added here.
-        Arc::new(monitor::MonitorTool) as AnyAgentTool,
+        // Monitor: runs background commands through the sandbox policy and
+        // WebSocket connections through validated addresses. Shared with
+        // sub-agents.
+        Arc::new(monitor::MonitorTool::new(
+            cwd.as_ref().clone(),
+            sandbox.clone(),
+            plugin_root.clone(),
+        )) as AnyAgentTool,
         // Lightweight HTTP GET for public docs. Read-only and shared with
         // sub-agents so a read-only `explore`/`plan` sub-agent can pull docs
         // without the full browser. The JS/auth-gated counterpart stays in the

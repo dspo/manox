@@ -4,13 +4,15 @@
 //!
 //! The tool returns immediately with a task ID; the monitor runs in the
 //! background, pushing each event (stdout line / WS text frame) into the
-//! owning Thread's steer queue. The Thread auto-wakes on new events when
-//! idle, or injects them at the next tool-use/tool-result boundary when
-//! running.
+//! owning Thread's event channel. The Thread drains this channel at safe join
+//! points (idle → auto-wakeup, or running → steer queue).
 //!
-//! `command` and `ws` are mutually exclusive. WebSocket connections are
+//! `command` and `ws` are mutually exclusive. Command Monitor runs through
+//! the same sandbox/supervisor path as Bash. WebSocket connections are
 //! validated (URL, DNS, private-address rejection) and never auto-reconnect.
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{App, AppContext as _, Task};
@@ -18,25 +20,19 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::background_task::{self, TaskEvent, TaskId, TaskKind};
+use crate::background_task::{self, TaskEvent, TaskId, TaskKind, TaskStatus};
 use crate::tool::{AgentTool, ToolOutputSink};
 use crate::tools::schema;
 
 use super::websocket;
 
-/// Default wall-clock limit before the monitor is killed.
 const DEFAULT_TIMEOUT_MS: u64 = 300_000;
-/// Upper bound on the user-supplied timeout.
 const MAX_TIMEOUT_MS: u64 = 3_600_000;
 
-/// WebSocket connection parameters.
 #[derive(Deserialize, JsonSchema, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WsInput {
-    /// WebSocket URL (`ws://` or `wss://`). Must be ASCII, no userinfo, no whitespace.
     url: String,
-    /// Subprotocols to negotiate (e.g. `["v12.stomp"]`). Each must be a valid
-    /// HTTP token; no duplicates allowed.
     #[serde(default)]
     protocols: Option<Vec<String>>,
 }
@@ -44,26 +40,17 @@ pub(crate) struct WsInput {
 #[derive(Deserialize, JsonSchema, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MonitorInput {
-    /// One-line summary of what is being monitored, shown in the status card.
     description: String,
-    /// Shell command to run under `sh -c`. stdout lines become events; stderr is
-    /// captured for diagnostics only. Mutually exclusive with `ws`.
     #[serde(default)]
     command: Option<String>,
-    /// WebSocket connection to monitor. Text frames become events; binary frames
-    /// produce a size-placeholder event. Mutually exclusive with `command`.
     #[serde(default)]
     ws: Option<WsInput>,
-    /// Wall-clock limit in milliseconds before the monitor is killed. Default
-    /// 5 min; clamped to 1 hour. Ignored when `persistent` is true.
     #[serde(default)]
     timeout_ms: Option<u64>,
-    /// When true, the monitor runs indefinitely (no timeout). Default false.
     #[serde(default)]
     persistent: Option<bool>,
 }
 
-/// The return value of a successful Monitor call.
 #[derive(serde::Serialize)]
 struct MonitorResult {
     #[serde(rename = "taskId")]
@@ -73,7 +60,25 @@ struct MonitorResult {
     persistent: bool,
 }
 
-pub struct MonitorTool;
+pub struct MonitorTool {
+    cwd: PathBuf,
+    sandbox: crate::sandbox::SandboxPolicy,
+    plugin_root: Option<PathBuf>,
+}
+
+impl MonitorTool {
+    pub fn new(
+        cwd: PathBuf,
+        sandbox: crate::sandbox::SandboxPolicy,
+        plugin_root: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            cwd,
+            sandbox,
+            plugin_root,
+        }
+    }
+}
 
 impl AgentTool for MonitorTool {
     fn name(&self) -> &str {
@@ -95,14 +100,10 @@ impl AgentTool for MonitorTool {
         schema::<MonitorInput>()
     }
 
-    /// Command Monitor requires approval (same contract as Bash); WebSocket
-    /// Monitor always requires approval (no AlwaysAllow).
     fn requires_approval(&self, input: &serde_json::Value) -> bool {
-        // WebSocket: always requires approval.
         if input.get("ws").is_some() {
             return true;
         }
-        // Command: same approval logic as Bash (unsandboxed or cross-app or no-sandbox-backend).
         let has_command = input.get("command").and_then(|v| v.as_str()).is_some();
         if has_command {
             let unsandboxed = input
@@ -126,6 +127,13 @@ impl AgentTool for MonitorTool {
             return !crate::sandbox::is_available();
         }
         false
+    }
+
+    fn is_always_allowable(&self, input: &serde_json::Value) -> bool {
+        if input.get("ws").is_some() {
+            return false;
+        }
+        true
     }
 
     fn run(
@@ -157,7 +165,10 @@ impl AgentTool for MonitorTool {
             }
         };
 
-        let has_command = parsed.command.as_ref().is_some_and(|c| !c.trim().is_empty());
+        let has_command = parsed
+            .command
+            .as_ref()
+            .is_some_and(|c| !c.trim().is_empty());
         let has_ws = parsed.ws.is_some();
 
         if !has_command && !has_ws {
@@ -173,7 +184,7 @@ impl AgentTool for MonitorTool {
 
         let persistent = parsed.persistent.unwrap_or(false);
         let timeout_ms = if persistent {
-            MAX_TIMEOUT_MS // effectively unlimited
+            MAX_TIMEOUT_MS
         } else {
             parsed
                 .timeout_ms
@@ -182,22 +193,20 @@ impl AgentTool for MonitorTool {
         };
         let timeout = Duration::from_millis(timeout_ms);
         let thread_id = ctx.thread_id().to_string();
-        let cwd = ctx.cwd().to_path_buf();
         let description = parsed.description.clone();
+        let proxy_port = ctx.network_proxy_port();
 
-        // Create the event channel for the owning thread.
-        let (event_tx, _event_rx) = async_channel::bounded::<TaskEvent>(256);
+        let (event_tx, event_rx) = async_channel::bounded::<TaskEvent>(256);
+        crate::background_task::store_thread_event_rx(thread_id.clone(), event_rx);
 
         let runtime = crate::runtime::handle().clone();
-        let (done_tx, _done_rx) = async_channel::bounded::<Result<String, String>>(1);
 
         if has_command {
             let command = parsed.command.expect("has_command");
-            // Register the task first.
             let task_cancel = CancellationToken::new();
             let (task_id, task) = background_task::register(
                 TaskKind::MonitorCommand,
-                thread_id.clone(),
+                thread_id,
                 description.clone(),
                 task_cancel.clone(),
                 event_tx,
@@ -205,37 +214,48 @@ impl AgentTool for MonitorTool {
             task.set_command(command.clone());
 
             let task_clone = task.clone();
-            let task_id_clone = task_id.clone();
-            let command_clone = command.clone();
-            let cwd_clone = cwd.clone();
-            let description_clone = description.clone();
+            let tid_run = task_id.clone();
+            let tid_log = task_id.clone();
+            let tid_result = task_id;
+            let cmd_c = command;
+            let desc_c = description;
+            let sandbox = self.sandbox.clone();
+            let plugin_root = self.plugin_root.clone();
+            let base_cwd = self.cwd.clone();
 
             runtime.spawn(async move {
                 let result = run_command_monitor(
-                    &command_clone,
-                    &cwd_clone,
-                    &description_clone,
+                    &cmd_c,
+                    &base_cwd,
+                    &desc_c,
                     timeout,
                     persistent,
                     task_cancel,
-                    task_id_clone,
+                    tid_run,
                     task_clone,
+                    &sandbox,
+                    proxy_port,
+                    plugin_root.as_deref(),
                 )
                 .await;
-                let _ = done_tx.send(result).await;
+                if let Err(ref e) = result {
+                    tracing::warn!(target: "monitor", %tid_log, "monitor failed: {e}");
+                }
             });
 
             let result_json = serde_json::to_string(&MonitorResult {
-                task_id: task_id.0.clone(),
+                task_id: tid_result.0,
                 timeout_ms,
                 persistent,
             })
-            .unwrap_or_else(|_| format!("{{\"taskId\":\"{}\",\"timeoutMs\":{timeout_ms},\"persistent\":{persistent}}}", task_id.0));
-
-            return cx.background_spawn(async move {
-                // Don't wait for done_rx; return immediately.
-                Ok(result_json)
+            .unwrap_or_else(|_| {
+                format!(
+                    "{{\"taskId\":\"{}\",\"timeoutMs\":{timeout_ms},\"persistent\":{persistent}}}",
+                    "unknown"
+                )
             });
+
+            return cx.background_spawn(async move { Ok(result_json) });
         }
 
         if has_ws {
@@ -243,16 +263,18 @@ impl AgentTool for MonitorTool {
             let task_cancel = CancellationToken::new();
             let (task_id, task) = background_task::register(
                 TaskKind::MonitorWebSocket,
-                thread_id.clone(),
+                thread_id,
                 description.clone(),
                 task_cancel.clone(),
                 event_tx,
             );
             task.set_ws_url(ws.url.clone());
 
-            let task_clone = task.clone();
-            let task_id_clone = task_id.clone();
-            let ws_url = ws.url.clone();
+            let task_clone = task;
+            let tid_run = task_id.clone();
+            let tid_log = task_id.clone();
+            let tid_result = task_id;
+            let ws_url = ws.url;
             let ws_protocols = ws.protocols.unwrap_or_default();
 
             runtime.spawn(async move {
@@ -262,34 +284,34 @@ impl AgentTool for MonitorTool {
                     timeout,
                     persistent,
                     task_cancel,
-                    task_id_clone,
+                    tid_run,
                     task_clone,
                 )
                 .await;
-                let _ = done_tx.send(result).await;
+                if let Err(ref e) = result {
+                    tracing::warn!(target: "monitor", %tid_log, "WS monitor failed: {e}");
+                }
             });
 
             let result_json = serde_json::to_string(&MonitorResult {
-                task_id: task_id.0.clone(),
+                task_id: tid_result.0,
                 timeout_ms,
                 persistent,
             })
-            .unwrap_or_else(|_| format!("{{\"taskId\":\"{}\",\"timeoutMs\":{timeout_ms},\"persistent\":{persistent}}}", task_id.0));
-
-            return cx.background_spawn(async move {
-                Ok(result_json)
+            .unwrap_or_else(|_| {
+                format!(
+                    "{{\"taskId\":\"{}\",\"timeoutMs\":{timeout_ms},\"persistent\":{persistent}}}",
+                    "unknown"
+                )
             });
+
+            return cx.background_spawn(async move { Ok(result_json) });
         }
 
         unreachable!()
     }
 }
 
-/// Run a command monitor: spawn `sh -c <command>`, stream stdout lines as
-/// events, capture stderr for diagnostics, and handle timeout/cancel/exit.
-/// The argument count mirrors the full subprocess-spawn + capture + cancel
-/// knob set; bundling into a config struct would diverge the two monitor
-/// signatures and obscure the trivial arg-forward.
 #[allow(clippy::too_many_arguments)]
 async fn run_command_monitor(
     command: &str,
@@ -299,31 +321,50 @@ async fn run_command_monitor(
     persistent: bool,
     cancel: CancellationToken,
     task_id: TaskId,
-    task: std::sync::Arc<background_task::BackgroundTask>,
-) -> Result<String, String> {
+    task: Arc<background_task::BackgroundTask>,
+    sandbox: &crate::sandbox::SandboxPolicy,
+    proxy_port: Option<u16>,
+    plugin_root: Option<&std::path::Path>,
+) -> Result<(), String> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c").arg(command);
-    cmd.stdout(Stdio::piped())
+    #[cfg(target_os = "macos")]
+    let mut c = if crate::sandbox::is_available() {
+        sandbox.wrap_command(command, cwd, proxy_port)
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(command);
+        c.current_dir(cwd);
+        c
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut c = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(command);
+        c.current_dir(cwd);
+        c
+    };
+
+    c.stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .current_dir(cwd)
         .kill_on_drop(true);
     #[cfg(unix)]
-    cmd.process_group(0);
+    c.process_group(0);
+    if let Some(root) = plugin_root {
+        c.env("CLAUDE_PLUGIN_ROOT", root);
+    }
 
-    let mut child = match cmd.spawn() {
+    let mut child = match c.spawn() {
         Ok(c) => c,
         Err(e) => {
-            task.set_terminal(background_task::TaskStatus::Failed);
+            task.set_terminal(TaskStatus::Failed);
             return Err(format!("failed to spawn monitor command: {e}"));
         }
     };
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
-    // Drain stderr into a diagnostic buffer (not forwarded as events).
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         let mut stderr_buf = String::new();
@@ -393,33 +434,28 @@ async fn run_command_monitor(
         }
     };
 
-    let _ = child.wait().await;
+    let status = child.wait().await;
     let stderr_text = stderr_task.await.unwrap_or_default();
 
     match exit_reason {
-        "cancelled" => {
-            task.set_terminal(background_task::TaskStatus::Stopped);
-        }
-        "timeout" => {
-            task.set_terminal(background_task::TaskStatus::TimedOut);
-        }
-        "eof" => {
-            task.set_terminal(background_task::TaskStatus::Completed);
-        }
+        "cancelled" => task.set_terminal(TaskStatus::Stopped),
+        "timeout" => task.set_terminal(TaskStatus::TimedOut),
         _ => {
-            task.set_terminal(background_task::TaskStatus::Failed);
+            let success = status.as_ref().is_ok_and(|s| s.success());
+            if success {
+                task.set_terminal(TaskStatus::Completed);
+            } else {
+                task.set_terminal(TaskStatus::Failed);
+            }
         }
     }
 
     if !stderr_text.is_empty() {
-        Ok(format!("Monitor completed. stderr:\n{stderr_text}"))
-    } else {
-        Ok("Monitor completed.".into())
+        tracing::info!(target: "monitor", %task_id, "monitor stderr:\n{stderr_text}");
     }
+    Ok(())
 }
 
-/// Run a WebSocket monitor: validate, resolve, connect, stream frames as
-/// events, and handle timeout/cancel/close.
 async fn run_ws_monitor(
     ws_url: &str,
     ws_protocols: &[String],
@@ -427,32 +463,57 @@ async fn run_ws_monitor(
     persistent: bool,
     cancel: CancellationToken,
     task_id: TaskId,
-    task: std::sync::Arc<background_task::BackgroundTask>,
-) -> Result<String, String> {
-    // Validate URL and protocols.
-    websocket::validate_ws_url(ws_url)?;
-    websocket::validate_protocols(ws_protocols)?;
+    task: Arc<background_task::BackgroundTask>,
+) -> Result<(), String> {
+    if let Err(e) = websocket::validate_ws_url(ws_url) {
+        task.set_terminal(TaskStatus::Failed);
+        return Err(e);
+    }
+    if let Err(e) = websocket::validate_protocols(ws_protocols) {
+        task.set_terminal(TaskStatus::Failed);
+        return Err(e);
+    }
 
-    // Parse host and port for DNS resolution.
-    let uri: tokio_tungstenite::tungstenite::http::Uri = ws_url
-        .parse()
-        .map_err(|e| format!("invalid URL: {e}"))?;
-    let host = uri.host().ok_or("URL has no host")?.to_string();
-    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
-        Some("wss") => 443,
-        _ => 80,
-    });
+    let uri: tokio_tungstenite::tungstenite::http::Uri = match ws_url.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            task.set_terminal(TaskStatus::Failed);
+            return Err(format!("invalid URL: {e}"));
+        }
+    };
+    let host = match uri.host() {
+        Some(h) => h.to_string(),
+        None => {
+            task.set_terminal(TaskStatus::Failed);
+            return Err("URL has no host".into());
+        }
+    };
+    let port = uri.port_u16().unwrap_or(80);
 
-    // Resolve and validate addresses (reject private/loopback).
-    let pinned_addrs = websocket::resolve_and_validate_addrs(&host, port)?;
+    let pinned_addrs = match websocket::resolve_and_validate_addrs(&host, port) {
+        Ok(a) => a,
+        Err(e) => {
+            task.set_terminal(TaskStatus::Failed);
+            return Err(e);
+        }
+    };
 
     let target = websocket::WsTarget {
         url: ws_url.to_string(),
         protocols: ws_protocols.to_vec(),
     };
 
-    let connect_timeout = if persistent { None } else { Some(timeout) };
-    let mut stream = websocket::connect_pinned(&target, &pinned_addrs, connect_timeout).await?;
+    let connect_timeout = Duration::from_secs(30);
+    let mut stream =
+        match websocket::connect_pinned(&target, &pinned_addrs, Some(connect_timeout), &cancel)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                task.set_terminal(TaskStatus::Failed);
+                return Err(e);
+            }
+        };
 
     let mut event_seq: u64 = 0;
     let deadline = if persistent {
@@ -463,18 +524,14 @@ async fn run_ws_monitor(
 
     let exit_reason = loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
-                break "cancelled";
-            }
+            _ = cancel.cancelled() => break "cancelled",
             _ = async {
                 if let Some(dl) = deadline {
                     tokio::time::sleep_until(dl).await;
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => {
-                break "timeout";
-            }
+            } => break "timeout",
             frame = websocket::read_frame(&mut stream) => {
                 match frame {
                     Ok(websocket::WsFrame::Text(text)) => {
@@ -498,7 +555,9 @@ async fn run_ws_monitor(
                     Ok(websocket::WsFrame::Close { code, reason }) => {
                         let reason_str = reason.unwrap_or_default();
                         let code_str = code.map(|c| c.to_string()).unwrap_or_default();
-                        let msg = format!("WebSocket closed by server (code={code_str}, reason={reason_str})");
+                        let msg = format!(
+                            "WebSocket closed by server (code={code_str}, reason={reason_str})"
+                        );
                         task.push_event(TaskEvent {
                             task_id: task_id.clone(),
                             text: msg,
@@ -522,25 +581,15 @@ async fn run_ws_monitor(
     };
 
     match exit_reason {
-        "cancelled" => {
-            task.set_terminal(background_task::TaskStatus::Stopped);
-        }
-        "timeout" => {
-            task.set_terminal(background_task::TaskStatus::TimedOut);
-        }
-        "close" => {
-            task.set_terminal(background_task::TaskStatus::Completed);
-        }
-        _ => {
-            task.set_terminal(background_task::TaskStatus::Failed);
-        }
+        "cancelled" => task.set_terminal(TaskStatus::Stopped),
+        "timeout" => task.set_terminal(TaskStatus::TimedOut),
+        "close" => task.set_terminal(TaskStatus::Completed),
+        _ => task.set_terminal(TaskStatus::Failed),
     }
 
-    Ok(format!("Monitor on {ws_url} completed."))
+    Ok(())
 }
 
-/// Kill the child's whole process group. On Unix the child runs in its own
-/// group (set via `process_group(0)`), so `killpg` reaps grandchildren too.
 #[cfg(unix)]
 fn kill_process_group(child: &tokio::process::Child) {
     if let Some(pid) = child.id() {
@@ -610,8 +659,6 @@ mod tests {
 
     #[test]
     fn parses_both_command_and_ws() {
-        // Both fields are optional; serde succeeds. The runtime check in
-        // run_streaming enforces mutual exclusivity.
         let v = serde_json::json!({
             "description": "d",
             "command": "x",

@@ -2947,7 +2947,11 @@ impl Thread {
                         .unwrap_or(false);
                     let requires_user_input =
                         tool.map(|t| t.requires_user_input()).unwrap_or(false);
-                    let always_allowed = this.permission.is_always_allowed(tu.name.as_ref());
+                    let always_allowable = tool
+                        .map(|t| t.is_always_allowable(&tu.input))
+                        .unwrap_or(true);
+                    let always_allowed =
+                        always_allowable && this.permission.is_always_allowed(tu.name.as_ref());
                     let bypassed = matches!(
                         this.approval_mode,
                         ApprovalMode::Yolo | ApprovalMode::AutoReview

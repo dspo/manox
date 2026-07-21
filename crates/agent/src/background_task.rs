@@ -3,9 +3,9 @@
 //! cancel token, and bounded output.
 //!
 //! The registry is process-global (session-scoped, since the session == the
-//! manox process). Each task is keyed by a unique id (`monitor_1`, `bash_1`,
-//! `ws_1`). Tasks persist after exit so a final poll or status card can observe
-//! the terminal state; a periodic GC sweep removes long-dead entries.
+//! manox process). Each task is keyed by a unique id. Tasks persist after exit
+//! so a final poll or status card can observe the terminal state; a periodic GC
+//! sweep removes long-dead entries.
 //!
 //! Event injection: when a task produces an external event (stdout line, WS
 //! text frame), it pushes the event into a per-thread channel. The owning
@@ -30,16 +30,8 @@ const MAX_BUFFER_BYTES: usize = 256 * 1024;
 pub struct TaskId(pub String);
 
 impl TaskId {
-    pub fn monitor(n: u64) -> Self {
-        Self(format!("monitor_{n}"))
-    }
-
-    pub fn bash(n: u64) -> Self {
-        Self(format!("bash_{n}"))
-    }
-
-    pub fn websocket(n: u64) -> Self {
-        Self(format!("ws_{n}"))
+    pub fn new(prefix: &str, n: u64) -> Self {
+        Self(format!("{prefix}_{n}"))
     }
 }
 
@@ -65,34 +57,28 @@ pub enum TaskKind {
 pub enum TaskStatus {
     Running,
     Completed,
-    /// The task ended with an error (non-zero exit, WS protocol error, etc.).
+    /// Non-zero exit, WS protocol error, spawn failure, etc.
     Failed,
-    /// The task was killed by its timeout.
+    /// Killed by timeout.
     TimedOut,
-    /// The task was stopped by `TaskStop`.
+    /// Stopped by `TaskStop`.
     Stopped,
     /// The session (manox process) ended before the task finished.
     SessionEnded,
 }
 
-/// An external event produced by a background task — a line of stdout, a WS
-/// text frame, or a binary-frame placeholder.
+/// An external event produced by a background task.
 #[derive(Debug, Clone)]
 pub struct TaskEvent {
-    /// The task that produced this event.
     pub task_id: TaskId,
-    /// The event text. For command Monitor this is a single stdout line; for
-    /// WebSocket this is a single text frame. Binary frames produce a size-only
-    /// placeholder.
     pub text: String,
     /// Monotonic sequence number within the task, 1-indexed.
     pub seq: u64,
-    /// Wall-clock instant the event was produced.
     pub at: Instant,
 }
 
-/// The serialized model-facing representation of a task event, injected into
-/// the message history as an untrusted-external-data notice.
+/// Serialize an event for injection into the model's message history as
+/// untrusted external data.
 pub fn format_event_for_model(event: &TaskEvent, task_kind: &TaskKind) -> String {
     let source = match task_kind {
         TaskKind::MonitorCommand => "Monitor (command)",
@@ -107,46 +93,33 @@ pub fn format_event_for_model(event: &TaskEvent, task_kind: &TaskKind) -> String
     )
 }
 
-/// Shared state for one background task, readable by the registry and the
-/// event-producing driver.
+/// Shared state for one background task.
 struct TaskState {
     kind: TaskKind,
     owner_thread_id: String,
     status: TaskStatus,
     cancel: CancellationToken,
-    /// Monotonic event counter.
     event_count: u64,
-    /// Bounded ring buffer of recent events (most recent up to MAX_BUFFER_BYTES).
+    /// Bounded event buffer. Most recent events, total byte count tracked.
     events: Vec<TaskEvent>,
-    /// Total bytes of event text accumulated (even after ring drops old events).
+    events_byte_count: usize,
     total_bytes: u64,
-    /// When the task was created.
     created_at: Instant,
-    /// When the task reached a terminal status.
     exited_at: Option<Instant>,
-    /// Human-readable description for the UI status card.
     description: String,
-    /// For command tasks: the shell command being run.
     command: Option<String>,
-    /// For WebSocket tasks: the URL being connected to.
     ws_url: Option<String>,
-    /// The tokio JoinHandle for the driver task, if we need to abort it.
-    /// Stored as a raw task handle; drop cancels.
     driver_abort: Option<tokio::task::AbortHandle>,
-    /// Channel sender for pushing events to the owning thread. The thread
-    /// drains this at safe join points.
     event_tx: Option<async_channel::Sender<TaskEvent>>,
 }
 
-/// A registered background task. The actual driver (tokio task) holds its own
-/// clone of the state and pushes events + updates status.
+/// A registered background task.
 pub struct BackgroundTask {
     state: Arc<std::sync::Mutex<TaskState>>,
 }
 
 impl BackgroundTask {
     fn new(
-        _id: TaskId,
         kind: TaskKind,
         owner_thread_id: String,
         description: String,
@@ -161,6 +134,7 @@ impl BackgroundTask {
                 cancel,
                 event_count: 0,
                 events: Vec::new(),
+                events_byte_count: 0,
                 total_bytes: 0,
                 created_at: Instant::now(),
                 exited_at: None,
@@ -173,24 +147,12 @@ impl BackgroundTask {
         }
     }
 
-    pub fn id(&self) -> TaskId {
-        // We don't store the id in TaskState; it's the key in the registry.
-        // For now, return a placeholder — callers should use the registry key.
-        TaskId("unknown".into())
-    }
-
     pub fn status(&self) -> TaskStatus {
-        self.state
-            .lock()
-            .expect("task state poisoned")
-            .status
+        self.state.lock().expect("task state poisoned").status
     }
 
     pub fn is_running(&self) -> bool {
-        self.state
-            .lock()
-            .expect("task state poisoned")
-            .status == TaskStatus::Running
+        self.state.lock().expect("task state poisoned").status == TaskStatus::Running
     }
 
     pub fn cancel(&self) {
@@ -202,17 +164,11 @@ impl BackgroundTask {
     }
 
     pub fn event_count(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("task state poisoned")
-            .event_count
+        self.state.lock().expect("task state poisoned").event_count
     }
 
     pub fn created_at(&self) -> Instant {
-        self.state
-            .lock()
-            .expect("task state poisoned")
-            .created_at
+        self.state.lock().expect("task state poisoned").created_at
     }
 
     pub fn description(&self) -> String {
@@ -224,11 +180,7 @@ impl BackgroundTask {
     }
 
     pub fn kind(&self) -> TaskKind {
-        self.state
-            .lock()
-            .expect("task state poisoned")
-            .kind
-            .clone()
+        self.state.lock().expect("task state poisoned").kind.clone()
     }
 
     pub fn command(&self) -> Option<String> {
@@ -256,17 +208,20 @@ impl BackgroundTask {
     }
 
     /// Push an event into the task's buffer and forward it to the owning thread.
+    /// The ring buffer evicts the oldest events when the byte cap is exceeded,
+    /// tracking the byte count correctly so it doesn't clear everything.
     pub fn push_event(&self, event: TaskEvent) {
         let mut s = self.state.lock().expect("task state poisoned");
-        // Append to bounded ring buffer.
+        let evt_len = event.text.len();
         s.events.push(event.clone());
-        let total = s.events.iter().map(|e| e.text.len()).sum::<usize>();
-        while total > MAX_BUFFER_BYTES && !s.events.is_empty() {
-            s.events.remove(0);
+        s.events_byte_count += evt_len;
+        // Evict oldest events if over the byte cap.
+        while s.events_byte_count > MAX_BUFFER_BYTES && !s.events.is_empty() {
+            let removed = s.events.remove(0);
+            s.events_byte_count = s.events_byte_count.saturating_sub(removed.text.len());
         }
         s.event_count += 1;
-        s.total_bytes = s.total_bytes.saturating_add(event.text.len() as u64);
-        // Forward to the owning thread.
+        s.total_bytes = s.total_bytes.saturating_add(evt_len as u64);
         if let Some(tx) = &s.event_tx {
             let _ = tx.try_send(event);
         }
@@ -281,14 +236,11 @@ impl BackgroundTask {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("task state poisoned")
-            .total_bytes
+        self.state.lock().expect("task state poisoned").total_bytes
     }
 
     /// Set the task to a terminal status. Idempotent: only the first call
-    /// takes effect; subsequent calls are ignored.
+    /// takes effect.
     pub fn set_terminal(&self, status: TaskStatus) {
         let mut s = self.state.lock().expect("task state poisoned");
         if s.status != TaskStatus::Running {
@@ -296,29 +248,19 @@ impl BackgroundTask {
         }
         s.status = status;
         s.exited_at = Some(Instant::now());
-        // Drop the event channel so the thread's drain loop exits.
         s.event_tx = None;
     }
 
     pub fn set_command(&self, cmd: String) {
-        self.state
-            .lock()
-            .expect("task state poisoned")
-            .command = Some(cmd);
+        self.state.lock().expect("task state poisoned").command = Some(cmd);
     }
 
     pub fn set_ws_url(&self, url: String) {
-        self.state
-            .lock()
-            .expect("task state poisoned")
-            .ws_url = Some(url);
+        self.state.lock().expect("task state poisoned").ws_url = Some(url);
     }
 
     pub fn set_driver_abort(&self, handle: tokio::task::AbortHandle) {
-        self.state
-            .lock()
-            .expect("task state poisoned")
-            .driver_abort = Some(handle);
+        self.state.lock().expect("task state poisoned").driver_abort = Some(handle);
     }
 }
 
@@ -339,6 +281,19 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
     })
 }
 
+/// Allocate a unique id for the given kind.
+fn next_id(kind: &TaskKind) -> (TaskId, u64) {
+    let mut reg = registry().lock().expect("registry poisoned");
+    let n = reg.next_id;
+    reg.next_id += 1;
+    let prefix = match kind {
+        TaskKind::MonitorCommand => "monitor",
+        TaskKind::MonitorWebSocket => "ws",
+        TaskKind::BackgroundBash => "bash",
+    };
+    (TaskId::new(prefix, n), n)
+}
+
 /// Register a new background task and return its id and handle.
 pub fn register(
     kind: TaskKind,
@@ -347,31 +302,15 @@ pub fn register(
     cancel: CancellationToken,
     event_tx: async_channel::Sender<TaskEvent>,
 ) -> (TaskId, Arc<BackgroundTask>) {
-    let mut reg = registry().lock().expect("registry poisoned");
-    let id = match kind {
-        TaskKind::MonitorCommand | TaskKind::BackgroundBash => {
-            let n = reg.next_id;
-            reg.next_id += 1;
-            match kind {
-                TaskKind::MonitorCommand => TaskId::monitor(n),
-                TaskKind::BackgroundBash => TaskId::bash(n),
-                _ => unreachable!(),
-            }
-        }
-        TaskKind::MonitorWebSocket => {
-            let n = reg.next_id;
-            reg.next_id += 1;
-            TaskId::websocket(n)
-        }
-    };
+    let (id, _) = next_id(&kind);
     let task = Arc::new(BackgroundTask::new(
-        id.clone(),
         kind,
         owner_thread_id,
         description,
         cancel,
         event_tx,
     ));
+    let mut reg = registry().lock().expect("registry poisoned");
     reg.tasks.insert(id.0.clone(), task.clone());
     (id, task)
 }
@@ -387,7 +326,7 @@ pub fn get(id: &TaskId) -> Option<Arc<BackgroundTask>> {
 }
 
 /// Remove a task from the registry. Used when setup fails before the driver
-/// starts — the task never reached Running, so no cleanup is needed.
+/// starts.
 pub fn remove(id: &TaskId) {
     registry()
         .lock()
@@ -396,10 +335,8 @@ pub fn remove(id: &TaskId) {
         .remove(&id.0);
 }
 
-/// List all tasks that are currently stoppable (running). Returns a summary
-/// string for the TaskStop "unknown id" response.
-pub fn list_stoppable() -> String {
-    let reg = registry().lock().expect("registry poisoned");
+/// Build a summary of currently running tasks from within a held registry lock.
+fn list_stoppable_under_lock(reg: &Registry) -> String {
     if reg.tasks.is_empty() {
         return "No background tasks are currently running.".into();
     }
@@ -426,16 +363,50 @@ pub fn list_stoppable() -> String {
     }
 }
 
+/// Per-thread event receiver map, stored here so the Thread can drain events
+/// from background tasks that target it.
+static THREAD_EVENT_RX: OnceLock<
+    std::sync::Mutex<HashMap<String, async_channel::Receiver<TaskEvent>>>,
+> = OnceLock::new();
+
+/// Store the event receiver for a thread so it can drain background task events.
+pub fn store_thread_event_rx(thread_id: String, rx: async_channel::Receiver<TaskEvent>) {
+    let mut map = THREAD_EVENT_RX
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("thread event rx poisoned");
+    map.insert(thread_id, rx);
+}
+
+/// Take the event receiver for a thread, returning None if no tasks are registered.
+pub fn take_thread_event_rx(thread_id: &str) -> Option<async_channel::Receiver<TaskEvent>> {
+    THREAD_EVENT_RX.get().and_then(|m| {
+        m.lock()
+            .expect("thread event rx poisoned")
+            .remove(thread_id)
+    })
+}
+
+/// Drop the event receiver for a thread (called when the thread is dropped).
+pub fn remove_thread_event_rx(thread_id: &str) {
+    if let Some(map) = THREAD_EVENT_RX.get() {
+        let _ = map
+            .lock()
+            .expect("thread event rx poisoned")
+            .remove(thread_id);
+    }
+}
+
+/// Stop a task by id. Returns Ok(()) if the task was found and stopped (or
 /// Stop a task by id. Returns Ok(()) if the task was found and stopped (or
 /// was already terminal). Returns Err with a summary of available tasks if
 /// the id is unknown.
 pub fn stop(id: &str) -> Result<(), String> {
     let reg = registry().lock().expect("registry poisoned");
     let Some(task) = reg.tasks.get(id) else {
-        return Err(format!(
-            "Unknown task id: {id}. {}",
-            list_stoppable()
-        ));
+        // Build the summary from the existing guard to avoid re-locking.
+        let summary = list_stoppable_under_lock(&reg);
+        return Err(format!("Unknown task id: {id}. {summary}"));
     };
     let task = task.clone();
     drop(reg);
@@ -456,8 +427,7 @@ pub fn stop(id: &str) -> Result<(), String> {
 }
 
 /// Run a garbage-collection pass: remove tasks whose process exited more than
-/// `GC_AFTER_EXIT` ago. Called opportunistically by `register` / `stop` to
-/// bound memory without a dedicated timer.
+/// `GC_AFTER_EXIT` ago.
 pub fn gc() {
     let mut reg = registry().lock().expect("registry poisoned");
     let now = Instant::now();
@@ -492,6 +462,19 @@ pub fn thread_has_running_tasks(thread_id: &str) -> bool {
         let s = task.state.lock().expect("task state poisoned");
         s.owner_thread_id == thread_id && s.status == TaskStatus::Running
     })
+}
+
+/// Cancel all running tasks across all threads. Called at application exit.
+pub fn shutdown_all() {
+    let reg = registry().lock().expect("registry poisoned");
+    for task in reg.tasks.values() {
+        let s = task.state.lock().expect("task state poisoned");
+        if s.status == TaskStatus::Running {
+            drop(s);
+            task.cancel();
+            task.set_terminal(TaskStatus::SessionEnded);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -533,7 +516,6 @@ mod tests {
         stop(&id.0).expect("stop should succeed");
         assert_eq!(task.status(), TaskStatus::Stopped);
 
-        // Idempotent: second stop does not change status.
         stop(&id.0).expect("stop should succeed");
         assert_eq!(task.status(), TaskStatus::Stopped);
     }
@@ -559,7 +541,7 @@ mod tests {
             tx,
         );
         task.push_event(TaskEvent {
-            task_id: TaskId("monitor_1".into()),
+            task_id: TaskId::new("monitor", 1),
             text: "hello".into(),
             seq: 1,
             at: Instant::now(),
@@ -583,5 +565,49 @@ mod tests {
         assert_eq!(task.status(), TaskStatus::Completed);
         task.set_terminal(TaskStatus::Failed);
         assert_eq!(task.status(), TaskStatus::Completed);
+    }
+
+    #[test]
+    fn ring_buffer_evicts_oldest_not_all() {
+        let cancel = CancellationToken::new();
+        let (tx, _rx) = async_channel::bounded::<TaskEvent>(8);
+        let (_id, task) = register(
+            TaskKind::MonitorCommand,
+            "thread-1".into(),
+            "test".into(),
+            cancel,
+            tx,
+        );
+
+        // Push events that total well over the cap.
+        let big = "X".repeat(200 * 1024);
+        task.push_event(TaskEvent {
+            task_id: TaskId::new("monitor", 1),
+            text: big.clone(),
+            seq: 1,
+            at: Instant::now(),
+        });
+        task.push_event(TaskEvent {
+            task_id: TaskId::new("monitor", 1),
+            text: big.clone(),
+            seq: 2,
+            at: Instant::now(),
+        });
+        task.push_event(TaskEvent {
+            task_id: TaskId::new("monitor", 1),
+            text: "last".into(),
+            seq: 3,
+            at: Instant::now(),
+        });
+
+        let events = task.recent_events();
+        // The first event should have been evicted (200K > 256K cap with two 200K events).
+        // The last event ("last") should still be present.
+        let texts: Vec<&str> = events.iter().map(|e| e.text.as_str()).collect();
+        assert!(
+            texts.contains(&"last"),
+            "last event should survive, got: {:?}",
+            texts
+        );
     }
 }

@@ -181,6 +181,13 @@ pub trait AgentTool: Send + Sync + 'static {
     fn is_read_only(&self) -> bool {
         false
     }
+    /// Whether this tool can be permanently allowed via the AlwaysAllow path.
+    /// The permission cache is keyed by tool name only; tools that need per-call
+    /// approval (e.g. WebSocket Monitor: each connection is a different target)
+    /// return false here to suppress the cache entry. Default true.
+    fn is_always_allowable(&self, _input: &serde_json::Value) -> bool {
+        true
+    }
     /// Whether the authorization flow is the tool's execution path rather than
     /// a permission gate — the tool produces its result from the
     /// `ToolAuthorizationResponse` itself and its `run` body is unreachable.
@@ -191,9 +198,6 @@ pub trait AgentTool: Send + Sync + 'static {
         false
     }
     /// Run the tool. `cancel` is the current turn's cancellation token; long-running
-    /// tools (e.g. `bash`) select on it so a user-initiated stop reaps the work
-    /// promptly. `Ok(output)` is a normal output string; `Err(output)` is an error
-    /// output string (still fed back to the model).
     fn run(
         &self,
         input: serde_json::Value,

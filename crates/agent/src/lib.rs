@@ -5,8 +5,8 @@
 //! `~/.config/cx/cx.providers.config.yaml`.
 
 pub mod agent_def;
-pub mod background_task;
 pub mod approval;
+pub mod background_task;
 pub mod claude_md;
 pub mod collaboration_mode;
 pub mod command;
@@ -92,4 +92,3 @@ pub fn init(cx: &mut App) {
     command::init();
     hook::init();
 }
-
