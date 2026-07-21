@@ -123,6 +123,7 @@ pub fn auto_compaction_target_ix(
     auto_compact_enabled: bool,
     max_input_tokens: u64,
     threshold_pct: f64,
+    lang: crate::language::Language,
 ) -> Option<usize> {
     if !auto_compact_enabled {
         return None;
@@ -148,7 +149,7 @@ pub fn auto_compaction_target_ix(
         return None;
     }
     let threshold = ((max_input_tokens as f64) * threshold_pct).ceil() as u64;
-    if effective_context_tokens(messages, per_request) < threshold {
+    if effective_context_tokens(messages, per_request, lang) < threshold {
         return None;
     }
     // Insert before a trailing untracked user prompt so it survives raw; a
@@ -172,11 +173,12 @@ pub fn auto_compaction_target_ix(
 pub fn effective_context_tokens(
     messages: &[Message],
     per_request: &HashMap<String, TokenUsage>,
+    lang: crate::language::Language,
 ) -> u64 {
     let provider = latest_reported_request_usage(messages, per_request)
         .map(|(_, u)| active_tokens(u))
         .unwrap_or(0);
-    let local_estimate = (estimate_request_body_bytes(messages) / 4) as u64;
+    let local_estimate = (estimate_request_body_bytes(messages, lang) / 4) as u64;
     provider.max(local_estimate)
 }
 
@@ -206,6 +208,7 @@ pub fn forced_compaction_target_ix(messages: &[Message]) -> Option<usize> {
 pub fn retained_user_messages_before(
     messages: &[Message],
     compaction_ix: usize,
+    lang: crate::language::Language,
 ) -> Vec<LanguageModelRequestMessage> {
     let mut remaining_bytes = RETAINED_USER_MESSAGES_BYTE_BUDGET;
     let mut retained: Vec<LanguageModelRequestMessage> = Vec::new();
@@ -227,7 +230,7 @@ pub fn retained_user_messages_before(
         if message.content.iter().all(MessageContent::is_empty) {
             continue;
         }
-        let request_message = to_request_message(message);
+        let request_message = to_request_message(message, lang);
         let byte_count = user_message_byte_len(&request_message);
         if let Some(bytes) = remaining_bytes.checked_sub(byte_count) {
             remaining_bytes = bytes;
@@ -249,10 +252,14 @@ pub fn retained_user_messages_before(
 /// [`model_facing_content`] per block so agent-tool envelopes are stripped and
 /// `Compaction` blocks become text — though retained messages exclude both, so
 /// for the retain path this is effectively identity over `Text` blocks.
-fn to_request_message(m: &Message) -> LanguageModelRequestMessage {
+fn to_request_message(m: &Message, lang: crate::language::Language) -> LanguageModelRequestMessage {
     LanguageModelRequestMessage {
         role: m.role,
-        content: m.content.iter().map(model_facing_content).collect(),
+        content: m
+            .content
+            .iter()
+            .map(|c| model_facing_content(c, lang))
+            .collect(),
         cache: false,
     }
 }
@@ -272,12 +279,12 @@ fn user_message_byte_len(msg: &LanguageModelRequestMessage) -> usize {
 /// This is a rough approximation — the actual wire size includes JSON framing,
 /// tool specs, and system prompt overhead, so the real body is larger than
 /// this estimate. Used to trigger compaction before hitting provider limits.
-pub fn estimate_request_body_bytes(messages: &[Message]) -> usize {
+pub fn estimate_request_body_bytes(messages: &[Message], lang: crate::language::Language) -> usize {
     messages
         .iter()
         .flat_map(|m| m.content.iter())
         .map(|c| {
-            model_facing_content(c)
+            model_facing_content(c, lang)
                 .to_str()
                 .map(|s| s.len())
                 .unwrap_or(0)
@@ -338,21 +345,32 @@ fn take_byte_prefix(text: &str, budget: usize) -> (String, usize) {
 /// prefixed by the handoff summarization prompt as a system message and tailed
 /// by a user turn requesting the summary. Sub-agent nesting is collapsed: the
 /// summarizer is a one-shot task, not the agent in agent-mode.
-pub fn build_compaction_request(messages: &[Message], insertion_ix: usize) -> LanguageModelRequest {
+pub fn build_compaction_request(
+    messages: &[Message],
+    insertion_ix: usize,
+    lang: crate::language::Language,
+) -> LanguageModelRequest {
     let bound = insertion_ix.min(messages.len());
     let mut request_messages: Vec<LanguageModelRequestMessage> = Vec::with_capacity(bound + 2);
     request_messages.push(LanguageModelRequestMessage {
         role: Role::System,
         content: vec![MessageContent::Text(
-            crate::prompt::render_static(crate::prompt::PromptTemplate::SideCallCompactSystem)
-                .expect("compact system prompt render"),
+            crate::prompt::render_static(
+                crate::prompt::PromptTemplate::SideCallCompactSystem,
+                lang,
+            )
+            .expect("compact system prompt render"),
         )],
         cache: false,
     });
     for m in &messages[..bound] {
         request_messages.push(LanguageModelRequestMessage {
             role: m.role,
-            content: m.content.iter().map(model_facing_content).collect(),
+            content: m
+                .content
+                .iter()
+                .map(|c| model_facing_content(c, lang))
+                .collect(),
             cache: false,
         });
     }
@@ -361,6 +379,7 @@ pub fn build_compaction_request(messages: &[Message], insertion_ix: usize) -> La
         content: vec![MessageContent::Text(
             crate::prompt::render_static(
                 crate::prompt::PromptTemplate::SideCallCompactFinalInstruction,
+                lang,
             )
             .expect("compact final instruction render"),
         )],
@@ -495,7 +514,14 @@ mod tests {
         let mut per = HashMap::new();
         per.insert("u1".to_string(), huge_usage());
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, false, 200_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                false,
+                200_000,
+                0.9,
+                crate::language::Language::En
+            ),
             None
         );
     }
@@ -506,7 +532,14 @@ mod tests {
         let mut per = HashMap::new();
         per.insert("u1".to_string(), huge_usage());
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, true, 10_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                true,
+                10_000,
+                0.9,
+                crate::language::Language::En
+            ),
             None
         );
     }
@@ -516,7 +549,14 @@ mod tests {
         // No reported usage and a tiny local estimate — nothing to compact.
         let msgs = vec![user("u1", "hi")];
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &HashMap::new(), true, 200_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &HashMap::new(),
+                true,
+                200_000,
+                0.9,
+                crate::language::Language::En
+            ),
             None
         );
     }
@@ -531,7 +571,14 @@ mod tests {
         let big = "x".repeat(900 * 1024); // ~225k estimated tokens > 180k threshold
         let msgs = vec![user("u1", "start"), user("u2", &big)];
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &HashMap::new(), true, 200_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &HashMap::new(),
+                true,
+                200_000,
+                0.9,
+                crate::language::Language::En
+            ),
             Some(1)
         );
     }
@@ -551,7 +598,14 @@ mod tests {
             },
         );
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                true,
+                200_000,
+                0.9,
+                crate::language::Language::En
+            ),
             Some(1)
         );
     }
@@ -563,7 +617,14 @@ mod tests {
         let mut per = HashMap::new();
         per.insert("u1".to_string(), huge_usage());
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                true,
+                200_000,
+                0.9,
+                crate::language::Language::En
+            ),
             None
         );
     }
@@ -581,7 +642,14 @@ mod tests {
         );
         // 1_000 < 200_000 * 0.9
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                true,
+                200_000,
+                0.9,
+                crate::language::Language::En
+            ),
             None
         );
     }
@@ -594,7 +662,14 @@ mod tests {
         let mut per = HashMap::new();
         per.insert("u1".to_string(), huge_usage());
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                true,
+                200_000,
+                0.9,
+                crate::language::Language::En
+            ),
             Some(1)
         );
     }
@@ -607,7 +682,14 @@ mod tests {
         per.insert("u1".to_string(), huge_usage());
         per.insert("u2".to_string(), huge_usage());
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                true,
+                200_000,
+                0.9,
+                crate::language::Language::En
+            ),
             Some(2)
         );
     }
@@ -628,7 +710,14 @@ mod tests {
             },
         );
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, true, window, 0.8),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                true,
+                window,
+                0.8,
+                crate::language::Language::En
+            ),
             None
         );
         // Exactly 80% → at threshold, fires.
@@ -640,7 +729,14 @@ mod tests {
             },
         );
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, true, window, 0.8),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                true,
+                window,
+                0.8,
+                crate::language::Language::En
+            ),
             Some(1)
         );
     }
@@ -656,7 +752,14 @@ mod tests {
         per.insert("u1".to_string(), huge_usage());
         // c1 (ix 1) > usage_ix (0) → already compacted past u1.
         assert_eq!(
-            auto_compaction_target_ix(&msgs, &per, true, 200_000, 0.9),
+            auto_compaction_target_ix(
+                &msgs,
+                &per,
+                true,
+                200_000,
+                0.9,
+                crate::language::Language::En
+            ),
             None
         );
     }
@@ -730,7 +833,7 @@ mod tests {
             user("u2", "recent prompt"),
             compaction("c1", "summary"),
         ];
-        let retained = retained_user_messages_before(&msgs, 2);
+        let retained = retained_user_messages_before(&msgs, 2, crate::language::Language::En);
         assert_eq!(retained.len(), 2);
         assert_eq!(retained[0].role, Role::User);
         assert_eq!(retained[1].string_contents(), "recent prompt");
@@ -753,7 +856,7 @@ mod tests {
             user("u1", "real prompt"),
             compaction("c1", "new summary"),
         ];
-        let retained = retained_user_messages_before(&msgs, 3);
+        let retained = retained_user_messages_before(&msgs, 3, crate::language::Language::En);
         // Only "real prompt" survives; prior compaction and tool result skipped.
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].string_contents(), "real prompt");
@@ -764,7 +867,7 @@ mod tests {
         // A single message larger than the budget is truncated to the budget.
         let big = "x".repeat(RETAINED_USER_MESSAGES_BYTE_BUDGET + 500);
         let msgs = vec![user("u1", &big), compaction("c1", "s")];
-        let retained = retained_user_messages_before(&msgs, 1);
+        let retained = retained_user_messages_before(&msgs, 1, crate::language::Language::En);
         assert_eq!(retained.len(), 1);
         let bytes = user_message_byte_len(&retained[0]);
         assert!(bytes <= RETAINED_USER_MESSAGES_BYTE_BUDGET);
@@ -831,7 +934,7 @@ mod tests {
             user("u1", "what is 1+1"),
             Message::assistant(vec![MessageContent::Text("2".into())]),
         ];
-        let req = build_compaction_request(&msgs, 2);
+        let req = build_compaction_request(&msgs, 2, crate::language::Language::En);
         // system + 2 history + trailing prompt = 4 after coalesce (no adjacent
         // same-role here: system, user, assistant, user).
         assert_eq!(req.messages.len(), 4);
@@ -851,7 +954,7 @@ mod tests {
             Message::assistant(vec![MessageContent::Text("a".into())]),
             user("u2", "follow-up"),
         ];
-        let req = build_compaction_request(&msgs, 3);
+        let req = build_compaction_request(&msgs, 3, crate::language::Language::En);
         // system + user + assistant + (user+user coalesced) = 4
         assert_eq!(req.messages.len(), 4);
         assert_eq!(req.messages[3].role, Role::User);

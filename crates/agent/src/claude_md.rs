@@ -334,7 +334,10 @@ pub fn discover_for_read(
 
 /// Render lazy discoveries as a `<system-reminder>` appended to the triggering
 /// `read_file` tool result. `None` when empty (no reminder attached).
-pub fn render_lazy(sources: &[InstructionSource]) -> Option<String> {
+pub fn render_lazy(
+    sources: &[InstructionSource],
+    lang: crate::language::Language,
+) -> Option<String> {
     if sources.is_empty() {
         return None;
     }
@@ -351,6 +354,7 @@ pub fn render_lazy(sources: &[InstructionSource]) -> Option<String> {
     Some(
         crate::prompt::render(
             crate::prompt::PromptTemplate::WrapperInstructionsLazy,
+            lang,
             &data,
         )
         .expect("instructions lazy template render"),
@@ -360,7 +364,7 @@ pub fn render_lazy(sources: &[InstructionSource]) -> Option<String> {
 /// Render the eager block via the `wrapper/instructions_eager` template.
 /// `None` when nothing loaded, so the caller can omit the message entirely
 /// and keep the request prefix byte-identical to a no-instructions session.
-pub fn render_eager(set: &InstructionSet) -> Option<String> {
+pub fn render_eager(set: &InstructionSet, lang: crate::language::Language) -> Option<String> {
     if set.eager.is_empty() {
         return None;
     }
@@ -378,6 +382,7 @@ pub fn render_eager(set: &InstructionSet) -> Option<String> {
     Some(
         crate::prompt::render(
             crate::prompt::PromptTemplate::WrapperInstructionsEager,
+            lang,
             &data,
         )
         .expect("instructions eager template render"),
@@ -1187,7 +1192,7 @@ mod tests {
     fn render_eager_none_when_empty() {
         let t = TestDir::new("empty");
         let set = load(&t.0, &ctx_with(None, None));
-        assert!(render_eager(&set).is_none());
+        assert!(render_eager(&set, crate::language::Language::En).is_none());
     }
 
     #[test]
@@ -1196,7 +1201,7 @@ mod tests {
         t.write("proj/CLAUDE.md", "shared body");
         t.write("proj/CLAUDE.local.md", "local body");
         let set = load(&t.0.join("proj"), &ctx_with(None, None));
-        let text = render_eager(&set).expect("non-empty render");
+        let text = render_eager(&set, crate::language::Language::En).expect("non-empty render");
         let shared_ix = text.find("shared body").unwrap();
         let local_ix = text.find("local body").unwrap();
         assert!(shared_ix < local_ix, "{text}");
@@ -1205,7 +1210,10 @@ mod tests {
         assert!(text.contains("<instructions"), "{text}");
         assert!(text.contains("</instructions>"), "{text}");
         // Stable across renders of the same set (prefix-cache requirement).
-        assert_eq!(text, render_eager(&set).unwrap());
+        assert_eq!(
+            text,
+            render_eager(&set, crate::language::Language::En).unwrap()
+        );
     }
 
     #[test]
@@ -1349,7 +1357,7 @@ mod tests {
 
     #[test]
     fn render_lazy_none_when_empty_and_reminder_when_present() {
-        assert!(render_lazy(&[]).is_none());
+        assert!(render_lazy(&[], crate::language::Language::En).is_none());
         let t = TestDir::new("lazyrender");
         t.write("proj/sub/CLAUDE.md", "sub body");
         let set = load(&t.0.join("proj"), &ctx_with(None, None));
@@ -1360,12 +1368,15 @@ mod tests {
             &HashSet::new(),
             &ctx_with(None, None),
         );
-        let text = render_lazy(&found).expect("non-empty render");
+        let text = render_lazy(&found, crate::language::Language::En).expect("non-empty render");
         assert!(text.starts_with("<system-reminder>"), "{text}");
         assert!(text.ends_with("</system-reminder>\n"), "{text}");
         assert!(text.contains("sub body"), "{text}");
         assert!(text.contains("scope=\"project\""), "{text}");
         // Deterministic across renders (history byte-stability).
-        assert_eq!(text, render_lazy(&found).unwrap());
+        assert_eq!(
+            text,
+            render_lazy(&found, crate::language::Language::En).unwrap()
+        );
     }
 }

@@ -16,8 +16,9 @@
 //!
 //! The reviewer prompt lives in the `side_call/approval_system.tera.md`
 //! template and is rendered at the request-build boundary. It is model-facing
-//! text and is therefore English-only — it is never routed through the `i18n`
-//! bundle.
+//! text; it is bilingual via the thread's `agent_language` (en / zh-CN
+//! mirrors) and is never routed through the `i18n` bundle (which only carries
+//! UI chrome).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -106,17 +107,24 @@ fn truncate_tool_input(v: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+// too_many_arguments: each parameter is a distinct review input the caller
+// already holds as a separate owned value; bundling them into a struct would
+// reshape the public side-call API for one call site. Mirrors the same allow
+// used on `claude_md::push_source` and the bash entry points.
+#[allow(clippy::too_many_arguments)]
 pub async fn review(
     model: &AnyLanguageModel,
     tool_name: &str,
     tool_input: &serde_json::Value,
     tool_title: &str,
     cwd: &Path,
+    lang: crate::language::Language,
     cancel: CancellationToken,
     cx: &AsyncApp,
 ) -> ReviewVerdict {
     let user_prompt = crate::prompt::render(
         crate::prompt::PromptTemplate::SideCallApprovalUser,
+        lang,
         &crate::prompt::ApprovalReviewPromptData {
             cwd: cwd.display().to_string(),
             tool_name: tool_name.to_string(),
@@ -134,6 +142,7 @@ pub async fn review(
                 content: vec![MessageContent::Text(
                     crate::prompt::render_static(
                         crate::prompt::PromptTemplate::SideCallApprovalSystem,
+                        lang,
                     )
                     .expect("approval system prompt render"),
                 )],

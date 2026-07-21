@@ -935,6 +935,7 @@ impl ContextRail {
             agent::compact::effective_context_tokens(
                 thread.messages(),
                 thread.request_token_usage(),
+                thread.agent_language(),
             ),
             self.cockpit_auto_compact_enabled,
             self.cockpit_auto_compact_threshold,

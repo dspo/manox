@@ -36,7 +36,10 @@ const MESSAGE_SAMPLE_CHARS: usize = 800;
 /// recent assistant reply (each truncated), then the title instruction. No
 /// tools, no system prompt. Callers gate on the presence of an assistant
 /// reply before invoking.
-pub fn build_title_request(messages: &[Message]) -> LanguageModelRequest {
+pub fn build_title_request(
+    messages: &[Message],
+    lang: crate::language::Language,
+) -> LanguageModelRequest {
     let mut req_messages: Vec<LanguageModelRequestMessage> = Vec::new();
 
     if let Some(text) = first_user_text(messages) {
@@ -62,8 +65,11 @@ pub fn build_title_request(messages: &[Message]) -> LanguageModelRequest {
     req_messages.push(LanguageModelRequestMessage {
         role: Role::User,
         content: vec![MessageContent::Text(
-            crate::prompt::render_static(crate::prompt::PromptTemplate::TitleFirstInstruction)
-                .expect("title first instruction render"),
+            crate::prompt::render_static(
+                crate::prompt::PromptTemplate::TitleFirstInstruction,
+                lang,
+            )
+            .expect("title first instruction render"),
         )],
         cache: false,
     });
@@ -109,6 +115,7 @@ pub fn is_unchanged(sanitized: &str) -> bool {
 pub fn build_topic_shift_request(
     current_title: &str,
     messages: &[Message],
+    lang: crate::language::Language,
 ) -> LanguageModelRequest {
     let mut req_messages: Vec<LanguageModelRequestMessage> = Vec::new();
 
@@ -134,6 +141,7 @@ pub fn build_topic_shift_request(
     }
     let instruction = crate::prompt::render(
         crate::prompt::PromptTemplate::TitleTopicShiftInstruction,
+        lang,
         &crate::prompt::TopicShiftData {
             current_title: current_title.to_string(),
             unchanged_sentinel: UNCHANGED_SENTINEL,
@@ -306,7 +314,7 @@ mod tests {
             Message::user("帮我看下登录".into()),
             Message::assistant(vec![MessageContent::Text("好的，我先读代码".into())]),
         ];
-        let req = build_title_request(&messages);
+        let req = build_title_request(&messages, crate::language::Language::En);
         assert!(req.tools.is_empty());
         assert_eq!(req.messages.len(), 3);
         assert_eq!(req.messages[0].role, Role::User);
@@ -320,7 +328,7 @@ mod tests {
     #[test]
     fn build_request_without_assistant_reply() {
         let messages = vec![Message::user("only user".into())];
-        let req = build_title_request(&messages);
+        let req = build_title_request(&messages, crate::language::Language::En);
         // user + instruction, no assistant turn.
         assert_eq!(req.messages.len(), 2);
     }
@@ -353,7 +361,7 @@ mod tests {
                 content: "ok".into(),
             })]),
         ];
-        let req = build_topic_shift_request("旧话题", &messages);
+        let req = build_topic_shift_request("旧话题", &messages, crate::language::Language::En);
         // user (latest real text) + assistant + instruction.
         assert_eq!(req.messages.len(), 3);
         assert_eq!(req.messages[0].role, Role::User);
@@ -398,7 +406,7 @@ mod tests {
             Message::user("现在帮我改下登录".into()),
             Message::assistant(vec![MessageContent::Text("好的".into())]),
         ];
-        let req = build_topic_shift_request("旧话题标题", &messages);
+        let req = build_topic_shift_request("旧话题标题", &messages, crate::language::Language::En);
         assert!(req.tools.is_empty());
         assert_eq!(req.messages.len(), 3);
         // Latest user + latest assistant, then the instruction.

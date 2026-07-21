@@ -84,6 +84,7 @@ impl TitleState {
         depth: u32,
         model: Option<&AnyLanguageModel>,
         messages: &[Message],
+        lang: crate::language::Language,
         cx: &mut Context<Thread>,
     ) {
         if depth != 0 || self.in_flight {
@@ -110,9 +111,13 @@ impl TitleState {
         }
         let is_first = self.title.is_none();
         let request: LanguageModelRequest = if is_first {
-            crate::title::build_title_request(messages)
+            crate::title::build_title_request(messages, lang)
         } else {
-            crate::title::build_topic_shift_request(self.title.as_deref().unwrap_or(""), messages)
+            crate::title::build_topic_shift_request(
+                self.title.as_deref().unwrap_or(""),
+                messages,
+                lang,
+            )
         };
         self.in_flight = true;
         self.last_eval_user_count = Some(user_count);

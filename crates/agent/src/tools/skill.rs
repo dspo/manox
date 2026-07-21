@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 use crate::tool::{AgentTool, ToolOutputSink};
 use crate::tools::schema;
 
-pub struct SkillTool;
+pub struct SkillTool {
+    pub lang: crate::language::Language,
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -55,11 +57,13 @@ impl AgentTool for SkillTool {
                 return cx.background_spawn(async move { Err(format!("input parse failed: {e}")) });
             }
         };
+        let lang = self.lang;
         cx.background_spawn(async move {
             let reg = crate::skill::global();
             match reg.get(&parsed.name) {
                 Some(s) => crate::prompt::render(
                     crate::prompt::PromptTemplate::SkillBody,
+                    lang,
                     &crate::prompt::SkillBodyData {
                         description: (!s.description.is_empty()).then(|| s.description.clone()),
                         body: s.body.clone(),

@@ -298,7 +298,7 @@ pub(crate) fn truncate_output(s: &str, max: usize) -> TruncatedText<'_> {
 #[allow(dead_code)] // convenience constructor; the live paths use _with_policy
 pub(crate) fn base_tools(cwd: Arc<PathBuf>) -> Vec<AnyAgentTool> {
     let sandbox = crate::sandbox::SandboxPolicy::for_project(cwd.as_ref());
-    base_tools_with_policy(cwd, sandbox, None)
+    base_tools_with_policy(cwd, sandbox, None, crate::language::Language::En)
 }
 
 /// Same as [`base_tools`] but with an explicit sandbox policy. The worktree
@@ -308,6 +308,7 @@ pub(crate) fn base_tools_with_policy(
     cwd: Arc<PathBuf>,
     sandbox: crate::sandbox::SandboxPolicy,
     plugin_root: Option<PathBuf>,
+    lang: crate::language::Language,
 ) -> Vec<AnyAgentTool> {
     let mut tools = vec![
         Arc::new(read_file::ReadTool {
@@ -344,7 +345,7 @@ pub(crate) fn base_tools_with_policy(
             read_policy: crate::read_policy::ReadPolicy::for_project(cwd.as_ref()),
         }),
         Arc::new(ask_user::AskUserQuestionTool),
-        Arc::new(skill::SkillTool),
+        Arc::new(skill::SkillTool { lang }),
         // BashOutput: poll a background shell started by Bash with run_in_background.
         Arc::new(bash_output::BashOutputTool) as AnyAgentTool,
         // Monitor: stream a long-running command line by line. Now shared with
@@ -382,9 +383,13 @@ pub(crate) fn base_tools_with_policy(
 /// Sub-agents do not use this — they build their own filtered registry from
 /// [`base_tools`] (plus their own `agent` tool), so `agent` / `self_info` /
 /// `monitor` / worktree / MCP stay main-thread-only.
-pub fn main_registry(cwd: PathBuf, parent: WeakEntity<Thread>) -> ToolRegistry {
+pub fn main_registry(
+    cwd: PathBuf,
+    parent: WeakEntity<Thread>,
+    lang: crate::language::Language,
+) -> ToolRegistry {
     let sandbox = crate::sandbox::SandboxPolicy::for_project(&cwd);
-    main_registry_with_policy(cwd, sandbox, parent)
+    main_registry_with_policy(cwd, sandbox, parent, lang)
 }
 
 /// Same as [`main_registry`] but with an explicit sandbox policy. The worktree
@@ -394,13 +399,16 @@ pub fn main_registry_with_policy(
     cwd: PathBuf,
     sandbox: crate::sandbox::SandboxPolicy,
     parent: WeakEntity<Thread>,
+    lang: crate::language::Language,
 ) -> ToolRegistry {
     let cwd = Arc::new(cwd);
     let mut reg = ToolRegistry::new();
-    for tool in base_tools_with_policy(cwd.clone(), sandbox, None) {
+    for tool in base_tools_with_policy(cwd.clone(), sandbox, None, lang) {
         reg.register(tool);
     }
-    reg.register(Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone())) as AnyAgentTool);
+    reg.register(
+        Arc::new(agent::SpawnAgentTool::new(cwd, 0, parent.clone(), lang)) as AnyAgentTool,
+    );
     reg.register(self_info::new());
     // Worktree harness tools: main-thread-only, they mutate the owning
     // Thread's cwd and rebuild its tool registry on enter/exit.
