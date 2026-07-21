@@ -46,7 +46,8 @@ gpui::actions!(
         BackgroundCurrentThread,
         CycleCollaborationMode,
         ToggleTurnNavigator,
-        CopySelectedTurn
+        CopySelectedTurn,
+        ArchiveCurrentThread
     ]
 );
 

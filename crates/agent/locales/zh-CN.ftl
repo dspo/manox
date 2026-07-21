@@ -407,6 +407,7 @@ slash-yolo-desc = 切换到完全访问（免审批 + bash 沙箱外）；带提
 slash-plan-desc = 切换协作模式（计划 ↔ 默认）；裸 `/plan` 切换，`/plan <提示>` 带提示进入计划模式
 slash-goal-desc = 设置完成条件，agent 持续工作直到满足（裸 `/goal` 显示状态，`/goal <条件>` 设置，`/goal clear` 停止）
 slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行
+slash-exit-desc = 归档当前会话并开始一个新会话
 mode-chip-default = 默认
 mode-chip-plan = 计划
 workspace-cycle-mode = 切换协作模式

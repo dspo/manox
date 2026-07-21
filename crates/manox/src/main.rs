@@ -224,6 +224,16 @@ fn main() {
             // the `+` menu row, and the composer mode chip. The handler lives
             // on the active Workspace (see `Workspace::Render`).
             gpui::KeyBinding::new("shift-tab", agent_ui::CycleCollaborationMode, None),
+            // Archive the current thread and start a fresh one.
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-;", agent_ui::ArchiveCurrentThread, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-;", agent_ui::ArchiveCurrentThread, None),
+            // Open turn navigator (additional binding alongside cmd-m).
+            #[cfg(target_os = "macos")]
+            gpui::KeyBinding::new("cmd-shift-;", agent_ui::ToggleTurnNavigator, None),
+            #[cfg(not(target_os = "macos"))]
+            gpui::KeyBinding::new("ctrl-shift-;", agent_ui::ToggleTurnNavigator, None),
         ]);
         cx.bind_keys(agent_ui::turn_navigator_key_bindings());
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
