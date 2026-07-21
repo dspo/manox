@@ -410,7 +410,7 @@ struct TeamCreateInput {
     /// Team name (display only).
     name: String,
     /// Initial roster of worker members to spawn alongside the team. Omit for
-    /// an empty team you grow later with `team_spawn`.
+    /// an empty team you grow later with `TeamSpawn`.
     #[serde(default)]
     members: Vec<MemberSpecInput>,
 }
@@ -422,11 +422,11 @@ impl AgentTool for TeamCreateTool {
     fn description(&self) -> &str {
         "Form a peer-agents team with you (the main agent) as leader and the \
          listed sub-agents as long-lived worker members. Members coordinate via \
-         the shared task list and `send_message`; each member runs autonomously \
+         the shared task list and `SendMessage`; each member runs autonomously \
          to completion and reports back. Use for parallel sub-tasks that need to \
          coordinate or share progress — NOT for independent fire-and-forget work \
          (use the `agent` tool for that). Only one team may be active at a time; \
-         disband with `TeamDisband` before forming another. Assign members
+         disband with `TeamDisband` before forming another. Assign members \
          disjoint write ranges to avoid file-write lock contention."
     }
     fn input_schema(&self) -> serde_json::Value {

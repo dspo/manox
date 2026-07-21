@@ -832,8 +832,8 @@ fn build_child_registry_with_policy(
     reg
 }
 
-/// Spec for spawning a long-lived team worker member. `team_create` /
-/// `team_spawn` tools build these from their input; [`spawn_team_member`] does
+/// Spec for spawning a long-lived team worker member. `TeamCreate` /
+/// `TeamSpawn` tools build these from their input; [`spawn_team_member`] does
 /// the actual `Thread` construction.
 pub(crate) struct MemberSpec {
     pub name: String,

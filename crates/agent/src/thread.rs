@@ -1304,7 +1304,7 @@ impl Thread {
         self.team.as_ref()
     }
 
-    /// Attach a team this thread leads. Called by `team_create`. Does not
+    /// Attach a team this thread leads. Called by `TeamCreate`. Does not
     /// touch the tool registry — team tools are advertised from the start and
     /// no-op until a team exists, so the request-tool prefix is unaffected.
     pub fn set_team(&mut self, team: Entity<crate::team::Team>, cx: &mut Context<Self>) {
@@ -1312,7 +1312,7 @@ impl Thread {
         cx.notify();
     }
 
-    /// Detach the team. `team_disband` calls this on the leader and on every
+    /// Detach the team. `TeamDisband` calls this on the leader and on every
     /// member to break the team↔member strong cycle before the roster drops.
     pub fn clear_team(&mut self, cx: &mut Context<Self>) {
         self.team = None;
