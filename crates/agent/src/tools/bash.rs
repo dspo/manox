@@ -136,7 +136,7 @@ fn lenient_bool_value(v: &serde_json::Value) -> Option<bool> {
 /// Deserialize `Option<bool>` accepting both a JSON bool and a lenient string
 /// form (see [`lenient_bool_value`]). Null yields `None`; any other shape is a
 /// hard error so a malformed value is surfaced rather than silently coerced.
-fn lenient_bool_opt<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+pub(crate) fn lenient_bool_opt<'de, D>(d: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -150,6 +150,52 @@ where
     }
 }
 
+/// Parse an unsigned integer from a JSON number or a numeric string. Models
+/// occasionally emit `"timeout_secs": "600"` (string) alongside the well-formed
+/// numeric form; strict serde would reject the whole input, dropping the tool
+/// call and burning a turn. Returns `None` for non-numeric shapes.
+fn lenient_unsigned_value(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Deserialize `Option<u64>` accepting both a JSON number and a numeric string
+/// (see [`lenient_unsigned_value`]). Null yields `None`; any other shape is a
+/// hard error so a malformed value is surfaced rather than silently coerced.
+pub(crate) fn lenient_u64_opt<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: serde_json::Value = serde::Deserialize::deserialize(d)?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    match lenient_unsigned_value(&v) {
+        Some(n) => Ok(Some(n)),
+        None => Err(serde::de::Error::custom(format!("expected u64, got {v}"))),
+    }
+}
+
+/// Deserialize `Option<usize>` accepting both a JSON number and a numeric
+/// string. Saturates on overflow so a pathologically large value clamps to
+/// `usize::MAX` instead of failing the whole tool call.
+pub(crate) fn lenient_usize_opt<'de, D>(d: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: serde_json::Value = serde::Deserialize::deserialize(d)?;
+    if v.is_null() {
+        return Ok(None);
+    }
+    match lenient_unsigned_value(&v) {
+        Some(n) => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
+        None => Err(serde::de::Error::custom(format!("expected usize, got {v}"))),
+    }
+}
+
 #[derive(Deserialize, JsonSchema, Debug)]
 #[serde(deny_unknown_fields)]
 struct BashInput {
@@ -159,7 +205,7 @@ struct BashInput {
     #[serde(default)]
     cwd: Option<String>,
     /// Kill the command after this many seconds (defaults to 120).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64_opt")]
     timeout_secs: Option<u64>,
     /// Run outside the OS sandbox (macOS seatbelt). Default false: the command
     /// is confined to project root + temp dir writes, `.git` read-only, network
@@ -172,11 +218,11 @@ struct BashInput {
     /// Keep only the first N lines of stdout/stderr. The command still runs to
     /// completion (no SIGPIPE) — prefer this over piping into `head`, which
     /// truncates the upstream pipe and can SIGPIPE-kill a long-running command.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_usize_opt")]
     head_lines: Option<usize>,
     /// Keep only the last N lines of stdout/stderr. The command still runs to
     /// completion (no SIGPIPE) — prefer this over piping into `tail`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_usize_opt")]
     tail_lines: Option<usize>,
     /// When true, start the command in the background and return immediately
     /// with a shell id. Poll the shell id with `BashOutput` to read incremental
@@ -1495,5 +1541,29 @@ mod tests {
         // A final line without a trailing newline is preserved as one line.
         assert_eq!(select_lines("a\nb\nca", Some(1), None), "a\n");
         assert_eq!(select_lines("a\nb\nca", None, Some(1)), "ca");
+    }
+
+    #[test]
+    fn bash_input_parses_numeric_string_timeout() {
+        // Models occasionally emit `"timeout_secs": "600"` (string); strict serde
+        // would drop the whole call. The lenient deserializer accepts both forms.
+        let v = serde_json::json!({"command": "sleep 1", "timeout_secs": "600"});
+        let p: BashInput = serde_json::from_value(v).unwrap();
+        assert_eq!(p.timeout_secs, Some(600));
+    }
+
+    #[test]
+    fn bash_input_parses_numeric_string_head_tail() {
+        let v = serde_json::json!({"command": "true", "head_lines": "3", "tail_lines": "5"});
+        let p: BashInput = serde_json::from_value(v).unwrap();
+        assert_eq!(p.head_lines, Some(3));
+        assert_eq!(p.tail_lines, Some(5));
+    }
+
+    #[test]
+    fn bash_input_rejects_non_numeric_timeout() {
+        let v = serde_json::json!({"command": "true", "timeout_secs": "soon"});
+        let err = serde_json::from_value::<BashInput>(v).unwrap_err();
+        assert!(err.to_string().contains("expected u64"), "{err}");
     }
 }

@@ -76,8 +76,10 @@ pub struct AgentDefinition {
     #[serde(default)]
     pub model: Option<String>,
     /// Max agentic turns before the subagent is force-stopped. Defaults to 10
-    /// when `None` at spawn time.
-    #[serde(default)]
+    /// when `None` at spawn time. Accepts the Claude Code-native `maxTurns`
+    /// (camelCase) alias so plugin agent files authored for Claude Code parse
+    /// unchanged.
+    #[serde(default, alias = "maxTurns")]
     pub max_turns: Option<u32>,
     /// Whether the subagent may itself spawn sub-agents (nesting). Defaults false.
     #[serde(default)]
@@ -299,6 +301,18 @@ mod tests {
         assert!(def.model.is_none());
         assert!(def.max_turns.is_none());
         assert!(!def.allow_nesting);
+    }
+
+    #[test]
+    fn max_turns_accepts_camelcase_alias() {
+        // Claude Code's subagent frontmatter uses `maxTurns` (camelCase). A
+        // plugin agent authored for CC must parse unchanged in manox so a
+        // long-running polling agent (e.g. remora-task) can declare a turn
+        // budget above the manox default of 10.
+        let raw = "---\nname: poller\ndescription: long-running\nmaxTurns: 60\n---\nbody\n";
+        let (front, _) = crate::frontmatter::split(raw);
+        let def: AgentDefinition = serde_yaml::from_str(front).unwrap();
+        assert_eq!(def.max_turns, Some(60));
     }
 
     #[test]
