@@ -321,6 +321,29 @@ pub fn ensure_thread_event_bus(
         .clone()
 }
 
+/// Register a task with an externally-assigned id (e.g. background Bash's
+/// `bash_N` from the old registry). The task is registered under the given
+/// id so TaskStop can find it.
+pub fn register_with_id(
+    id: String,
+    kind: TaskKind,
+    owner_thread_id: String,
+    description: String,
+    cancel: CancellationToken,
+) -> Arc<BackgroundTask> {
+    let (event_tx, _) = ensure_thread_event_bus(&owner_thread_id);
+    let task = Arc::new(BackgroundTask::new(
+        kind,
+        owner_thread_id,
+        description,
+        cancel,
+        event_tx,
+    ));
+    let mut reg = registry().lock().expect("registry poisoned");
+    reg.tasks.insert(id, task.clone());
+    task
+}
+
 /// Take the receiver for a thread's event bus. Returns None if the bus was
 /// never created.
 pub fn take_thread_event_rx(thread_id: &str) -> Option<async_channel::Receiver<TaskEvent>> {

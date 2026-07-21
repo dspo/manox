@@ -50,7 +50,6 @@
   "Monitor/properties/description": "One-line summary of what is being monitored, shown in the status card so the user can tell apart concurrent monitors.",
   "Monitor/properties/command": "Shell command to run under `sh -c`. stdout lines become events; stderr is captured for diagnostics only. Mutually exclusive with `ws`.",
   "Monitor/properties/ws": "WebSocket connection to monitor. Text frames become events; binary frames produce a size-placeholder event. Mutually exclusive with `command`.",
-  "Monitor/properties/ws/anyOf/0": "WebSocket connection to monitor. Text frames become events; binary frames produce a size-placeholder event. Mutually exclusive with `command`.",
   "Monitor/properties/ws/anyOf/0/properties/url": "WebSocket URL (`ws://` or `wss://`). Must be ASCII, no userinfo, no whitespace.",
   "Monitor/properties/ws/anyOf/0/properties/protocols": "Subprotocols to negotiate (e.g. `[\"v12.stomp\"]`). Each must be a valid HTTP token; no duplicates allowed.",
   "Monitor/properties/timeout_ms": "Wall-clock limit in milliseconds before the monitor is killed. Default 5 min; clamped to 1 hour. Ignored when `persistent` is true.",

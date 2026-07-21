@@ -3328,6 +3328,11 @@ impl Workspace {
         let id = self.thread.read(cx).id.0.clone();
         let next = !self.thread.read(cx).archived();
         self.thread.update(cx, |t, cx| t.set_archived(next, cx));
+        // Archiving cancels all background tasks owned by this thread.
+        if next {
+            agent::background_task::cancel_all_for_thread(&id);
+            agent::background_task::remove_all_for_thread(&id);
+        }
         let store = agent::thread_store_global();
         store.update(cx, |s, cx| s.archive_thread(&id, next, cx));
         let msg = if next {

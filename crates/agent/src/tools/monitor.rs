@@ -32,7 +32,10 @@ const MAX_TIMEOUT_MS: u64 = 3_600_000;
 #[derive(Deserialize, JsonSchema, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WsInput {
+    /// WebSocket URL (`ws://` or `wss://`). Must be ASCII, no userinfo, no whitespace.
     url: String,
+    /// Subprotocols to negotiate (e.g. `["v12.stomp"]`). Each must be a valid
+    /// HTTP token; no duplicates allowed.
     #[serde(default)]
     protocols: Option<Vec<String>>,
 }
@@ -40,13 +43,21 @@ pub(crate) struct WsInput {
 #[derive(Deserialize, JsonSchema, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MonitorInput {
+    /// One-line summary of what is being monitored, shown in the status card.
     description: String,
+    /// Shell command to run under `sh -c`. stdout lines become events; stderr is
+    /// captured for diagnostics only. Mutually exclusive with `ws`.
     #[serde(default)]
     command: Option<String>,
+    /// WebSocket connection to monitor. Text frames become events; binary frames
+    /// produce a size-placeholder event. Mutually exclusive with `command`.
     #[serde(default)]
     ws: Option<WsInput>,
+    /// Wall-clock limit in milliseconds before the monitor is killed. Default
+    /// 5 min; clamped to 1 hour. Ignored when `persistent` is true.
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// When true, the monitor runs indefinitely (no timeout). Default false.
     #[serde(default)]
     persistent: Option<bool>,
 }
@@ -191,7 +202,15 @@ impl AgentTool for MonitorTool {
                 .unwrap_or(DEFAULT_TIMEOUT_MS)
                 .min(MAX_TIMEOUT_MS)
         };
-        let timeout = Duration::from_millis(timeout_ms);
+        // The internal timeout is always positive: persistent monitors still
+        // need a connection-phase deadline and a runtime deadline of None
+        // (no expiry), but the return value reports timeoutMs=0 to the model.
+        let internal_timeout_ms = if persistent {
+            MAX_TIMEOUT_MS
+        } else {
+            timeout_ms
+        };
+        let timeout = Duration::from_millis(internal_timeout_ms);
         let thread_id = ctx.thread_id().to_string();
         let description = parsed.description.clone();
         let proxy_port = ctx.network_proxy_port();
@@ -321,8 +340,9 @@ async fn run_command_monitor(
     cancel: CancellationToken,
     task_id: TaskId,
     task: Arc<background_task::BackgroundTask>,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     sandbox: &crate::sandbox::SandboxPolicy,
-    proxy_port: Option<u16>,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] proxy_port: Option<u16>,
     plugin_root: Option<&std::path::Path>,
 ) -> Result<(), String> {
     use std::process::Stdio;

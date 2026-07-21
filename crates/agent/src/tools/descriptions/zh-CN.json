@@ -50,7 +50,6 @@
   "Monitor/properties/description": "一行关于被监控对象的摘要，显示在状态卡中以便用户区分并发的 monitor。",
   "Monitor/properties/command": "要在 `sh -c` 下运行的 shell 命令。stdout 行成为事件；stderr 仅用于诊断捕获。与 `ws` 互斥。",
   "Monitor/properties/ws": "要监控的 WebSocket 连接。文本帧成为事件；二进制帧生成大小占位事件。与 `command` 互斥。",
-  "Monitor/properties/ws/anyOf/0": "要监控的 WebSocket 连接。文本帧成为事件；二进制帧生成大小占位事件。与 `command` 互斥。",
   "Monitor/properties/ws/anyOf/0/properties/url": "WebSocket URL（`ws://` 或 `wss://`）。必须为纯 ASCII，不含 userinfo 和空白。",
   "Monitor/properties/ws/anyOf/0/properties/protocols": "要协商的子协议（如 `[\"v12.stomp\"]`）。每个必须是合法 HTTP token；不允许重复。",
   "Monitor/properties/timeout_ms": "杀死监控器前的挂钟时间上限（毫秒）。默认 5 min；钳制到 1 hour。`persistent` 为 true 时忽略。",

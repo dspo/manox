@@ -188,6 +188,17 @@ pub fn spawn(
         id
     };
 
+    // Also register in the unified background_task registry so TaskStop
+    // can find and stop background Bash by its shell id.
+    let bg_cancel = tokio_util::sync::CancellationToken::new();
+    let _bg_task = crate::background_task::register_with_id(
+        shell_id.clone(),
+        crate::background_task::TaskKind::BackgroundBash,
+        "background_shell".into(),
+        command.clone(),
+        bg_cancel,
+    );
+
     let state = {
         let reg = registry()
             .lock()

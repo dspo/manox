@@ -2213,29 +2213,10 @@ impl Thread {
         true
     }
     pub fn run_turn(&mut self, cx: &mut Context<Self>) {
-        // Spawn an event watcher so that background task events arriving while
-        // the thread is idle trigger a new turn. The watcher drains the shared
-        // event bus and re-calls `run_turn` when events arrive.
-        let thread_id = self.id.0.clone();
-        cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let (_, rx) = crate::background_task::ensure_thread_event_bus(&thread_id);
-            while let Ok(_event) = rx.recv().await {
-                let idle = this
-                    .update(cx, |this, _| this.running_turn.is_none())
-                    .unwrap_or(false);
-                if idle {
-                    this.update(cx, |this, cx| {
-                        this.run_turn(cx);
-                    })?;
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        })
-        .detach();
-
         if self.running_turn.is_some() {
             return;
         }
+
         let Some(model) = self.active_model() else {
             cx.emit(ThreadEvent::Error(anyhow::anyhow!("No model configured")));
             return;
@@ -2327,8 +2308,25 @@ impl Thread {
             if !turn_cancelled && !successor_running {
                 Self::maybe_continue_goal(&this, &model, cx).await;
             }
+            // Background task event auto-wake: after the turn finishes, check
+            // if events arrived on the shared event bus. If so, start a new
+            // turn to drain them. This is single-flight: only one turn runs
+            // at a time, and events that arrive during the new turn will be
+            // drained by `drain_background_events` at the top of the loop.
+            if !turn_cancelled {
+                let has_bg_events = this
+                    .update(cx, |this, _| {
+                        let (_, rx) = crate::background_task::ensure_thread_event_bus(&this.id.0);
+                        !rx.is_empty()
+                    })
+                    .unwrap_or(false);
+                if has_bg_events {
+                    let _ = this.update(cx, |this, cx| {
+                        this.run_turn(cx);
+                    });
+                }
+            }
         });
-
         self.running_turn = Some(task);
         cx.notify();
     }
@@ -3221,6 +3219,17 @@ impl Thread {
                         if steer_pending {
                             continue;
                         }
+                        // Check for background task events that arrived
+                        // during the final assistant stream. If any are
+                        // pending, continue the loop to inject them.
+                        let has_bg_events = this.update(cx, |this, _| {
+                            let (_, rx) =
+                                crate::background_task::ensure_thread_event_bus(&this.id.0);
+                            !rx.is_empty()
+                        })?;
+                        if has_bg_events {
+                            continue;
+                        }
                         break;
                     }
                     RecoveryAction::Abort => break,
@@ -3451,11 +3460,15 @@ impl Thread {
         let requires_user_input = tool.requires_user_input();
         let needs_approval = tool.requires_approval(&tu.input)
             && !this.read_with(cx, |this, _| {
+                // is_always_allowable gates the AlwaysAllow cache: tools
+                // that need per-call approval (e.g. WebSocket Monitor) must
+                // not be eligible for a name-keyed permission cache entry.
+                let always_allowable = tool.is_always_allowable(&tu.input);
                 (matches!(
                     this.approval_mode,
                     ApprovalMode::Yolo | ApprovalMode::AutoReview
                 ) && !requires_user_input)
-                    || this.permission.is_always_allowed(&name)
+                    || (always_allowable && this.permission.is_always_allowed(&name))
             })?;
         if needs_approval {
             this.update(cx, |_, cx| {

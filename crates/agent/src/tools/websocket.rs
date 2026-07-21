@@ -209,16 +209,13 @@ pub async fn connect_pinned(
     // Connect to the first pinned address that works.
     let mut last_err = None;
     for addr in pinned_addrs {
+        // The entire connect phase (TCP + TLS + WS handshake) shares one
+        // deadline derived from the task timeout, so no single phase can
+        // hang indefinitely.
         let connect_fut = async {
-            let stream = match timeout {
-                Some(t) => tokio::time::timeout(t, TcpStream::connect(*addr))
-                    .await
-                    .map_err(|_| "connection timeout".to_string())?
-                    .map_err(|e| format!("TCP connect failed: {e}"))?,
-                None => TcpStream::connect(*addr)
-                    .await
-                    .map_err(|e| format!("TCP connect failed: {e}"))?,
-            };
+            let stream = TcpStream::connect(*addr)
+                .await
+                .map_err(|e| format!("TCP connect failed: {e}"))?;
             let scheme = target.url.starts_with("wss://");
             let ws_stream = if scheme {
                 let (stream, _) = tokio_tungstenite::client_async_tls(req.clone(), stream)
@@ -235,21 +232,33 @@ pub async fn connect_pinned(
             Ok::<_, String>(ws_stream)
         };
 
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                return Err("WebSocket connection cancelled".into());
-            }
-            result = connect_fut => {
-                match result {
-                    Ok(stream) => return Ok(stream),
-                    Err(e) => {
-                        last_err = Some(e);
-                        continue;
+        match timeout {
+            Some(t) => tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err("WebSocket connection cancelled".into());
+                }
+                r = tokio::time::timeout(t, connect_fut) => {
+                    match r {
+                        Ok(Ok(stream)) => return Ok(stream),
+                        Ok(Err(e)) => { last_err = Some(e); continue; }
+                        Err(_) => { last_err = Some("connection timeout".into()); continue; }
                     }
                 }
-            }
-        }
+            },
+            None => tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err("WebSocket connection cancelled".into());
+                }
+                r = connect_fut => {
+                    match r {
+                        Ok(stream) => return Ok(stream),
+                        Err(e) => { last_err = Some(e); continue; }
+                    }
+                }
+            },
+        };
     }
+
     Err(last_err.unwrap_or_else(|| "no addresses to connect to".into()))
 }
 
@@ -278,6 +287,12 @@ pub async fn read_frame(
                 return Ok(WsFrame::Text(text));
             }
             Message::Binary(data) => {
+                if data.len() > MAX_FRAME_SIZE {
+                    return Err(format!(
+                        "binary frame exceeds 1 MiB limit ({len} bytes)",
+                        len = data.len()
+                    ));
+                }
                 return Ok(WsFrame::Binary { len: data.len() });
             }
             Message::Close(frame) => {
