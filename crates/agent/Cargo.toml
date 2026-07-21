@@ -38,6 +38,7 @@ xxhash-rust.workspace = true
 similar.workspace = true
 base64.workspace = true
 image.workspace = true
+http_proxy.workspace = true
 
 gpui.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
@@ -55,3 +56,4 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [lints.clippy]
 dbg_macro = "deny"
+

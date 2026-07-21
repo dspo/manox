@@ -272,7 +272,12 @@ impl AgentTool for BashTool {
         let head_lines = parsed.head_lines;
         let tail_lines = parsed.tail_lines;
         let run_in_background = parsed.run_in_background.unwrap_or(false);
-        // Background path: spawn and return immediately with a shell id.
+        // The thread's in-process network proxy port, when the sandbox
+        // network policy is `Restricted`. Injected into `wrap_command` so
+        // the seatbelt narrows outbound to `localhost:<port>` and proxy env
+        // vars point at the right address. `None` when the policy is
+        // `Blocked` or `Unrestricted` (no proxy running).
+        let proxy_port = ctx.network_proxy_port();
         // The model polls with BashOutput to collect incremental output.
         if run_in_background {
             let cwd_for_bg = cwd_override
@@ -297,6 +302,7 @@ impl AgentTool for BashTool {
                     timeout_bg,
                     plugin_root_bg.as_deref(),
                     &sandbox_bg,
+                    proxy_port,
                 )
                 .map(|shell_id| {
                     format!(
@@ -340,6 +346,7 @@ until the process exits."
                         &base_cwd,
                         cwd_override.as_deref(),
                         &sandbox,
+                        proxy_port,
                         timeout,
                         cancel,
                         sink,
@@ -903,6 +910,7 @@ async fn run_sandboxed_bash(
     base_cwd: &Path,
     cwd_override: Option<&str>,
     policy: &crate::sandbox::SandboxPolicy,
+    proxy_port: Option<u16>,
     timeout: Duration,
     cancel: CancellationToken,
     sink: ToolOutputSink,
@@ -912,11 +920,10 @@ async fn run_sandboxed_bash(
 ) -> Result<String, anyhow::Error> {
     use std::process::Stdio;
     use tokio::process::Child;
-
     let cwd = cwd_override
         .map(|c| super::resolve_path(c, base_cwd))
         .unwrap_or_else(|| base_cwd.to_path_buf());
-    let mut cmd = policy.wrap_command(command, &cwd);
+    let mut cmd = policy.wrap_command(command, &cwd, proxy_port);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
@@ -1094,6 +1101,7 @@ mod tests {
             &PathBuf::from("."),
             None,
             &policy(),
+            None,
             Duration::from_secs(10),
             CancellationToken::new(),
             null_sink(),

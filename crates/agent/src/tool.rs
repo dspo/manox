@@ -50,6 +50,12 @@ pub trait ToolContext {
     /// Whether the owning thread is in YOLO / AutoReview mode (bash uses this
     /// to force the unsandboxed branch without a per-call escalation flag).
     fn yolo(&self) -> bool;
+    /// The loopback port of the thread's in-process network proxy, when the
+    /// sandbox network policy is `Restricted`. The sandboxed bash command
+    /// is wrapped so the seatbelt only allows outbound to this port, and
+    /// `HTTP_PROXY`/`HTTPS_PROXY` env vars point here. `None` when the
+    /// policy is `Blocked` or `Unrestricted` (no proxy running).
+    fn network_proxy_port(&self) -> Option<u16>;
 }
 
 /// Owned snapshot of a `Thread`'s read-only fields, built per tool call. The
@@ -67,6 +73,7 @@ pub struct ToolContextSnapshot {
     agent_label: String,
     team: Option<Entity<crate::team::Team>>,
     yolo: bool,
+    network_proxy_port: Option<u16>,
 }
 
 impl ToolContextSnapshot {
@@ -84,6 +91,7 @@ impl ToolContextSnapshot {
             agent_label: t.agent_label().to_string(),
             team: t.team().cloned(),
             yolo: t.approval_mode() == crate::thread::ApprovalMode::Yolo,
+            network_proxy_port: t.network_proxy_port(),
         }
     }
 }
@@ -118,6 +126,9 @@ impl ToolContext for ToolContextSnapshot {
     }
     fn yolo(&self) -> bool {
         self.yolo
+    }
+    fn network_proxy_port(&self) -> Option<u16> {
+        self.network_proxy_port
     }
 }
 

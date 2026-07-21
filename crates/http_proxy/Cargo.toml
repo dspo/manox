@@ -1,0 +1,20 @@
+[package]
+name = "http_proxy"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints.clippy]
+dbg_macro = "deny"
+
+[dependencies]
+anyhow.workspace = true
+futures.workspace = true
+httparse.workspace = true
+idna.workspace = true
+log.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

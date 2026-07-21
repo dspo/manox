@@ -627,6 +627,13 @@ pub struct Thread {
     /// is observable rather than silently busting the provider's prefix cache.
     /// See [`crate::prefix_stability`].
     prefix_stability: StablePrefix,
+    /// In-process HTTP proxy for the restricted-network sandbox policy.
+    /// Spawned lazily on the first sandboxed bash call when the thread's
+    /// sandbox `NetworkPolicy` is `Restricted`; dropped when the policy
+    /// changes (worktree enter/exit) so the next call re-spawns against
+    /// the new allowlist. `None` when the policy is `Blocked` or
+    /// `Unrestricted` (no proxy needed).
+    proxy: Option<http_proxy::ProxyHandle>,
     /// Provider id of the current model, for per-provider stats in the sidebar.
     provider_id: Option<String>,
     /// Parent thread id for sub-agent lineage. `None` for main threads.
@@ -832,6 +839,7 @@ impl Thread {
                 goal_cancel: None,
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
+                proxy: None,
                 provider_id,
                 parent_id: None,
                 archived: false,
@@ -927,6 +935,7 @@ impl Thread {
                     title_last_eval_user_count,
                 ),
                 prefix_stability: StablePrefix::default(),
+                proxy: None,
                 provider_id,
                 parent_id: rec.parent_id,
                 archived: rec.archived,
@@ -1018,6 +1027,7 @@ impl Thread {
                 goal_cancel: None,
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
+                proxy: None,
                 provider_id: None,
                 parent_id: None,
                 archived: false,
@@ -1732,6 +1742,10 @@ impl Thread {
         let sandbox = self
             .sandbox_anchor(&project_root)
             .with_worktree(&path, &git_common_dir);
+        // The network policy changes (worktree = Unrestricted); drop the
+        // restricted-network proxy so the next bash call doesn't use a stale
+        // port. The next call re-spawns if the new policy needs it.
+        self.drop_network_proxy();
         self.cwd = path.clone();
         self.tools = Arc::new(tools::main_registry_with_policy(
             path.clone(),
@@ -1764,6 +1778,10 @@ impl Thread {
             return Err("Not in a worktree.".to_string());
         };
         let prior_cwd = wt.prior_cwd.clone();
+        // Exiting a worktree restores the project-level network policy
+        // (possibly Restricted); drop the worktree's Unrestricted proxy (if
+        // any) so the next bash call re-spawns under the new policy.
+        self.drop_network_proxy();
         self.cwd = prior_cwd.clone();
         let sandbox = self.sandbox_anchor(self.project.as_deref().unwrap_or(&prior_cwd));
         self.tools = Arc::new(tools::main_registry_with_policy(
@@ -1781,6 +1799,79 @@ impl Thread {
     /// `.with_worktree` and `exit_worktree` restores the plain policy.
     fn sandbox_anchor(&self, root: &Path) -> crate::sandbox::SandboxPolicy {
         crate::sandbox::SandboxPolicy::for_project(root)
+    }
+
+    /// The loopback port of the thread's in-process network proxy, if the
+    /// sandbox network policy is `Restricted` and the proxy has been spawned.
+    /// `None` when the policy is `Blocked` or `Unrestricted`, or when the
+    /// proxy hasn't been spawned yet (it's spawned lazily on the first
+    /// sandboxed bash call).
+    pub fn network_proxy_port(&self) -> Option<u16> {
+        self.proxy.as_ref().map(|p| p.port())
+    }
+
+    /// Ensure the thread's in-process HTTP proxy is running and return its
+    /// port. Spawns the proxy lazily when the sandbox network policy is
+    /// `Restricted`; returns `None` for `Blocked` or `Unrestricted` (no
+    /// proxy needed). If the proxy is already running, returns its port
+    /// without re-spawning.
+    pub fn ensure_network_proxy(&mut self) -> Option<u16> {
+        let sandbox = self.sandbox_for_bash();
+        match sandbox.network() {
+            crate::sandbox::NetworkPolicy::Restricted { allowlist } => {
+                if self.proxy.is_none() {
+                    let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+                    let config = http_proxy::ProxyConfig {
+                        allowlist: allowlist.clone(),
+                        events: events_tx,
+                    };
+                    match http_proxy::ProxyHandle::spawn(config) {
+                        Ok(handle) => {
+                            self.proxy = Some(handle);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to spawn sandbox network proxy; \
+                                 sandboxed bash will have no network access"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                self.proxy.as_ref().map(|p| p.port())
+            }
+            crate::sandbox::NetworkPolicy::Blocked => None,
+            crate::sandbox::NetworkPolicy::Unrestricted => None,
+        }
+    }
+
+    /// Drop the active network proxy, if any. Called when the sandbox policy
+    /// changes (worktree enter/exit) so the next bash call re-spawns against
+    /// the new policy. The proxy `Drop` joins a listener thread; to avoid
+    /// blocking the gpui main thread, the old handle is sent to a tokio task
+    /// for teardown.
+    fn drop_network_proxy(&mut self) {
+        if let Some(proxy) = self.proxy.take() {
+            crate::runtime::handle().spawn(async move {
+                drop(proxy);
+            });
+        }
+    }
+
+    /// The sandbox policy the bash tool should use. Derived from the active
+    /// worktree state (if any) or the project root. This mirrors what
+    /// `enter_worktree`/`exit_worktree` bake into the tool registry, so the
+    /// proxy lifecycle stays in sync with the registry's sandbox.
+    fn sandbox_for_bash(&self) -> crate::sandbox::SandboxPolicy {
+        if let Some(wt) = &self.worktree {
+            let project_root = self.project.clone().unwrap_or_else(|| self.cwd.clone());
+            crate::sandbox::SandboxPolicy::for_project(&project_root)
+                .with_worktree(&wt.path, &wt.git_common_dir)
+        } else {
+            let root = self.project.clone().unwrap_or_else(|| self.cwd.clone());
+            crate::sandbox::SandboxPolicy::for_project(&root)
+        }
     }
 
     /// Stamp an initial worktree state on a freshly-constructed sub-agent whose
