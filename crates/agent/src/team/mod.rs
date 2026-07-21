@@ -4,13 +4,13 @@
 //! registry like `agent_def` / `mcp`): long-lived members + a shared
 //! [`TaskList`] + peer messaging. The leader is the main thread itself; worker
 //! members are independent `Entity<Thread>`s that coordinate via
-//! `send_message` and the shared task list.
+//! `SendMessage` and the shared task list.
 //!
 //! Message routing: `deliver` pushes a [`PeerMessage`] onto the target's inbox
 //! and, if the target is idle, immediately flushes it (append a user-role
 //! message + emit [`ThreadEvent::PeerMessage`] + `run_turn`). A busy target
 //! keeps the message queued; the team's `Stop` subscription (wired at member
-//! spawn in `team_spawn`) calls `flush_inbox` on the target's turn end, after
+//! spawn in `TeamSpawn`) calls `flush_inbox` on the target's turn end, after
 //! `running_turn` has cleared — the `run_turn` guard prevents a double
 //! trigger, and `cx.defer` pushes the flush past the in-flight turn's
 //! teardown so the guard sees `running_turn == None`. This keeps peer
@@ -47,10 +47,10 @@ pub struct PeerMessage {
 /// as a `WeakEntity<Thread>` directly on [`Team`] (the leader `Thread` owns the
 /// `Entity<Team>`, so the team must not strongly hold the leader back); workers
 /// live in the `members` map, strongly owned by the team — their `Entity<Thread>`
-/// lifetime is the team's lifetime, and `team_disband` drops them. The
+/// lifetime is the team's lifetime, and `TeamDisband` drops them. The
 /// `member → team` edge (via `Thread.team`) is also strong, so team↔member is a
-/// strong cycle; `team_disband` breaks it by clearing `member.team` before
-/// dropping the roster, and `team_create` refuses a second team while one is
+/// strong cycle; `TeamDisband` breaks it by clearing `member.team` before
+/// dropping the roster, and `TeamCreate` refuses a second team while one is
 /// active so the cycle can't accumulate across recreations.
 pub struct Member {
     pub name: String,
@@ -60,7 +60,7 @@ pub struct Member {
 }
 
 impl Member {
-    /// Construct a member descriptor. `team_spawn` (see `team/tools.rs`) builds
+    /// Construct a member descriptor. `TeamSpawn` (see `team/tools.rs`) builds
     /// the underlying `Entity<Thread>` via `Thread::new_subagent` then wraps it
     /// here.
     pub fn new(name: String, role: String, thread: Entity<Thread>) -> Self {
@@ -102,7 +102,7 @@ pub struct Team {
     /// `members` does.
     member_subs: BTreeMap<String, gpui::Subscription>,
     /// The leader's own `Stop` subscription, flushing `leader_inbox` when the
-    /// leader's turn ends. `None` until `team_create` wires it.
+    /// leader's turn ends. `None` until `TeamCreate` wires it.
     leader_sub: Option<gpui::Subscription>,
     tasks: Entity<TaskList>,
 }
@@ -275,13 +275,13 @@ impl Team {
         thread.update(cx, |th, cx| th.deliver_peer_messages(msgs, cx));
     }
 
-    /// Store a member's auth/`Stop` subscription. Called by `team_spawn` after
+    /// Store a member's auth/`Stop` subscription. Called by `TeamSpawn` after
     /// `insert_member`; the subscription lives for the member's tenure.
     pub fn set_member_sub(&mut self, name: String, sub: gpui::Subscription) {
         self.member_subs.insert(name, sub);
     }
 
-    /// Store the leader's `Stop` subscription. Called once by `team_create`.
+    /// Store the leader's `Stop` subscription. Called once by `TeamCreate`.
     pub fn set_leader_sub(&mut self, sub: gpui::Subscription) {
         self.leader_sub = Some(sub);
     }
@@ -289,7 +289,7 @@ impl Team {
     /// Tear down the team: clear each member's `team` back-reference (breaking
     /// the team↔member strong cycle so the member `Entity<Thread>`s actually
     /// drop), release the leader/member subscriptions, and drain inboxes. The
-    /// leader's own `team` field is cleared separately by the `team_disband`
+    /// leader's own `team` field is cleared separately by the `TeamDisband`
     /// tool — the team entity holds the leader only weakly and cannot reach it.
     pub fn disband(&mut self, cx: &mut App) {
         for m in self.members.values() {

@@ -17,7 +17,7 @@ You may explore and execute **non-mutating** actions that improve the plan. You 
 Actions that gather truth, reduce ambiguity, or validate feasibility without changing repo-tracked state. Examples:
 
 * Reading or searching files, configs, schemas, types, manifests, and docs (`read_file`, `list_directory`, `grep`, `glob`, `web_fetch`)
-* Delegating broad exploration to the `explore` sub-agent via the `agent` tool so exploration stays in an isolated context
+* Delegating broad exploration to the `Explore` sub-agent via the `agent` tool so exploration stays in an isolated context
 * Dry-run style commands when they do not edit repo-tracked files
 * Tests, builds, or checks that may write to caches or build artifacts (for example, `target/`, `.cache/`, or snapshots) so long as they do not edit repo-tracked files
 

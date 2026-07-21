@@ -490,7 +490,7 @@ pub struct Thread {
     /// Sub-agent system prompt; `None` for the main thread (no system prompt injected).
     system: Option<String>,
     /// Whether the multi-level CLAUDE.md eager block is injected into this
-    /// thread's requests. Always on except for the built-in `explore`
+    /// thread's requests. Always on except for the built-in `Explore`
     /// sub-agent, which skips instruction files to stay fast and cheap
     /// (Claude Code's Explore/Plan carve-out).
     instructions_enabled: bool,
@@ -1304,7 +1304,7 @@ impl Thread {
         self.team.as_ref()
     }
 
-    /// Attach a team this thread leads. Called by `team_create`. Does not
+    /// Attach a team this thread leads. Called by `TeamCreate`. Does not
     /// touch the tool registry — team tools are advertised from the start and
     /// no-op until a team exists, so the request-tool prefix is unaffected.
     pub fn set_team(&mut self, team: Entity<crate::team::Team>, cx: &mut Context<Self>) {
@@ -1312,7 +1312,7 @@ impl Thread {
         cx.notify();
     }
 
-    /// Detach the team. `team_disband` calls this on the leader and on every
+    /// Detach the team. `TeamDisband` calls this on the leader and on every
     /// member to break the team↔member strong cycle before the roster drops.
     pub fn clear_team(&mut self, cx: &mut Context<Self>) {
         self.team = None;
@@ -1682,7 +1682,7 @@ impl Thread {
     }
 
     /// Toggle the multi-level CLAUDE.md eager block for this thread. Disabled
-    /// only for the built-in `explore` sub-agent (Claude Code's Explore/Plan
+    /// only for the built-in `Explore` sub-agent (Claude Code's Explore/Plan
     /// carve-out); every other thread keeps instructions on.
     pub fn set_instructions_enabled(&mut self, enabled: bool) {
         self.instructions_enabled = enabled;
@@ -4017,7 +4017,7 @@ impl Thread {
             // submits a plan by emitting a `<proposed_plan>` block, not by
             // calling a submit tool. The `agent` tool is read-only
             // (`SpawnAgentTool::is_read_only`), so it is included, letting the
-            // main thread delegate research to the `explore` sub-agent with
+            // main thread delegate research to the `Explore` sub-agent with
             // isolated context. Write tools and `bash` stay hidden;
             // `run_tool_inner` backstops any stray write call. Plan mode takes
             // precedence over `turn_tool_filter` — it is the stricter,
@@ -4652,7 +4652,7 @@ mod tests {
     /// the fixed slot right after the system head: present when instruction
     /// files exist under cwd, byte-stable across builds while the files are
     /// unchanged (prefix-cache contract), and omitted entirely when the
-    /// thread disables instructions (the built-in explore carve-out) or when
+    /// thread disables instructions (the built-in Explore carve-out) or when
     /// nothing loads.
     #[test]
     fn build_completion_request_injects_instructions_at_fixed_slot() {
@@ -4689,7 +4689,7 @@ mod tests {
         let req2 = cx.update(|cx| thread.read(cx).build_completion_request());
         assert_eq!(block, text_of_req(&req2.messages[1]));
 
-        // Disabled (built-in explore carve-out) → the slot vanishes.
+        // Disabled (built-in Explore carve-out) → the slot vanishes.
         cx.update(|cx| {
             thread.update(cx, |t, _cx| t.set_instructions_enabled(false));
         });
@@ -4707,7 +4707,7 @@ mod tests {
     /// A successful `read_file` appends newly-discovered nested CLAUDE.md
     /// files to its own tool result as a `<system-reminder>` — exactly once
     /// per directory (`lazy_instructions_injected` dedups), while error
-    /// results, other tools, selector-suffixed paths, and the explore
+    /// results, other tools, selector-suffixed paths, and the Explore
     /// carve-out stay untouched.
     #[test]
     fn read_file_tool_result_injects_nested_instructions_once() {
@@ -4802,7 +4802,7 @@ mod tests {
         });
         assert_eq!(out, "SHELL OUT");
 
-        // The explore carve-out (`instructions_enabled = false`) also gates
+        // The Explore carve-out (`instructions_enabled = false`) also gates
         // the lazy layer: a fresh thread with instructions disabled leaves
         // the result untouched and marks nothing injected.
         let thread2 = cx.update(|cx| {

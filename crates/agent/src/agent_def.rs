@@ -1,5 +1,5 @@
 //! Subagent definitions: a set of built-in definitions compiled into the
-//! binary (`explore`) plus user-authored files under
+//! binary (`Explore`) plus user-authored files under
 //! `~/.config/cx/manox/agents/*.md` and the `agents/` subdirectory of every
 //! installed plugin.
 //!
@@ -11,7 +11,7 @@
 //!
 //! Built-in definitions are loaded first; a user-authored or plugin file with
 //! the same `name` overrides the built-in (same-key-wins on insert order), so
-//! users can customize or replace the bundled `explore` agent.
+//! users can customize or replace the bundled `Explore` agent.
 //!
 //! Plugin-provided definitions are registered under a `plugin:name` namespace
 //! so they never collide with built-in or user-authored agents — the parent
@@ -94,7 +94,7 @@ pub struct AgentDefinitionFile {
     pub system_prompt: String,
     pub root: Option<PathBuf>,
     /// Compiled into the binary rather than loaded from disk. The built-in
-    /// `explore` agent is the one definition that skips CLAUDE.md instruction
+    /// `Explore` agent is the one definition that skips CLAUDE.md instruction
     /// injection (Claude Code's Explore/Plan carve-out); user-authored
     /// overrides with the same name are not built-in and keep instructions.
     pub builtin: bool,
@@ -109,7 +109,7 @@ pub struct AgentDefinitionRegistry {
 impl AgentDefinitionRegistry {
     /// Load the registry: built-in definitions first, then user-authored and
     /// plugin files. Same-`name` later loads override earlier ones, so users can
-    /// customize the bundled `explore` agent by dropping a same-named
+    /// customize the bundled `Explore` agent by dropping a same-named
     /// file in `~/.config/cx/manox/agents/`. Missing dirs or parse errors do not
     /// abort the load; the registry ends up partial. Plugin definitions are
     /// registered under `plugin:name` so they cannot shadow user-authored ones.
@@ -230,8 +230,8 @@ fn parse_definition(
 fn builtin_definitions() -> Vec<AgentDefinitionFile> {
     const EXPLORE: &str = include_str!("agents/explore.md");
     vec![
-        parse_definition(EXPLORE, "builtin:explore", None, true)
-            .expect("builtin explore agent must parse"),
+        parse_definition(EXPLORE, "builtin:Explore", None, true)
+            .expect("builtin Explore agent must parse"),
     ]
 }
 
@@ -323,8 +323,8 @@ mod tests {
         let builtins = builtin_definitions();
         let names: Vec<&str> = builtins.iter().map(|f| f.def.name.as_str()).collect();
         assert!(
-            names.contains(&"explore"),
-            "builtin explore must exist: {names:?}"
+            names.contains(&"Explore"),
+            "builtin Explore must exist: {names:?}"
         );
         for f in &builtins {
             // Read-only agents must disallow the write/spawn tools.
@@ -363,11 +363,11 @@ mod tests {
     fn entries_keys_match_lookup_names() {
         let mut defs = BTreeMap::new();
         defs.insert(
-            "explore".to_string(),
+            "Explore".to_string(),
             Arc::new(
                 parse_definition(
-                    "---\nname: explore\ndescription: d\n---\nbody",
-                    "builtin:explore",
+                    "---\nname: Explore\ndescription: d\n---\nbody",
+                    "builtin:Explore",
                     None,
                     true,
                 )
@@ -392,11 +392,11 @@ mod tests {
         // Built-in: key == bare name.
         let explore = entries
             .iter()
-            .find(|(k, _)| *k == "explore")
-            .expect("explore entry");
-        assert_eq!(explore.1.def.name, "explore");
+            .find(|(k, _)| *k == "Explore")
+            .expect("Explore entry");
+        assert_eq!(explore.1.def.name, "Explore");
         // The key is what the model would pass back; it must match `get`.
-        assert!(reg.get("explore").is_some());
+        assert!(reg.get("Explore").is_some());
 
         // Plugin: key has namespace prefix, bare name does not.
         let remora = entries

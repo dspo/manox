@@ -140,7 +140,7 @@ pub enum ConvItem {
         collapsed: bool,
         user_toggled: bool,
     },
-    /// A peer message from a team member (or the leader) — `send_message` /
+    /// A peer message from a team member (or the leader) — `SendMessage` /
     /// broadcast delivery routed through `ThreadEvent::PeerMessage`. The `from`
     /// is a member name (data); `content` is the peer's own message body
     /// (model-generated, left verbatim). Rendered as a distinct bubble so team

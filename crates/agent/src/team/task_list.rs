@@ -11,7 +11,7 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-/// Lifecycle of a task. Three states only: each is wired into the `task_update`
+/// Lifecycle of a task. Three states only: each is wired into the `TaskUpdate`
 /// tool and rendered on the board; adding a state without that wiring would be
 /// a half-built field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]

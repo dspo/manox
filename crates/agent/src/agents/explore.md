@@ -1,5 +1,5 @@
 ---
-name: explore
+name: Explore
 description: Read-only codebase search agent. Locates code by file pattern, symbol, or keyword across many files and returns the conclusion — not file dumps. Use for "where is X defined", "which files reference Y", or sweeping searches.
 tools:
   - Read

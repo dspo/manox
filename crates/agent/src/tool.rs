@@ -262,7 +262,7 @@ impl ToolRegistry {
     /// Plan-mode tool set: only tools whose `is_read_only()` returns true.
     /// Write/exec tools (`write_file`, `edit_file`, `bash`) are excluded; the
     /// `agent` tool is read-only (`SpawnAgentTool::is_read_only`), so it
-    /// survives — letting the main thread delegate research to the `explore`
+    /// survives — letting the main thread delegate research to the `Explore`
     /// sub-agent with isolated context.
     pub fn to_request_tools_read_only(&self) -> Vec<LanguageModelRequestTool> {
         self.tools
