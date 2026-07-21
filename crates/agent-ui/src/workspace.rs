@@ -2171,6 +2171,11 @@ impl Workspace {
     /// Archive the active thread and navigate to a fresh empty one. Shared
     /// by the `/exit` slash command and the `cmd-;` keybinding.
     pub(crate) fn archive_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // No-op while a turn is running: `attach_thread` would park the thread
+        // in the background and clear `pending_auths`, stranding tool approvals.
+        if self.thread.read(cx).is_running() {
+            return;
+        }
         let id = self.thread.read(cx).id.0.clone();
         self.thread.update(cx, |t, cx| t.set_archived(true, cx));
         let store = agent::thread_store_global();

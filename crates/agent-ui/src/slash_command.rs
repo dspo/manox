@@ -10,9 +10,12 @@
 //! ([`init`]). Each command is an erased `&'static dyn SlashCommand`. The
 //! `⁄` popover in the composer lists registered commands dynamically.
 //!
-//! Two built-in commands ship today: the live `/yolo` (toggle YOLO mode —
-//! bypass approvals + unsandboxed bash, see [`YoloCommand`]) and `/plan`
-//! (enter/exit plan mode, see [`PlanCommand`]). Markdown prompt-macros
+//! Built-in commands: `/yolo` (toggle YOLO mode — bypass approvals +
+//! unsandboxed bash, see [`YoloCommand`]), `/plan` (enter/exit plan mode,
+//! see [`PlanCommand`]), `/goal` (set a completion condition, see
+//! [`GoalCommand`]), `/compact` (manual context compaction, see
+//! [`CompactCommand`]), and `/exit` (archive the current thread and start
+//! a fresh one, see [`ExitCommand`]). Markdown prompt-macros
 //! (`/gitwork:deliver`, etc.) are mirrored in at runtime via the
 //! [`MarkdownSlashCommand`] adapter, and plugin/user skills via the
 //! [`SkillSlashCommand`] adapter — so `/<plugin>:<skill>` is slash-invocable
