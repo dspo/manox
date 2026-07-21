@@ -1902,7 +1902,10 @@ impl Workspace {
         // so its `run_turn_loop` task stays alive (the entity is otherwise only
         // held by `self.thread`; overwriting that field would drop it and
         // silently kill the turn via `WeakEntity::upgrade() -> None`).
-        if old_thread.read(cx).is_running() && old_id != new_id {
+        if (old_thread.read(cx).is_running()
+            || agent::background_task::thread_has_running_tasks(&old_id))
+            && old_id != new_id
+        {
             let sub = self.subscribe_background_thread(old_thread.clone(), cx);
             self.background_threads.push(BackgroundThread {
                 entity: old_thread,

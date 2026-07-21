@@ -731,7 +731,7 @@ impl Drop for Thread {
         // Cancel all background tasks owned by this thread so persistent
         // monitors and background bash are not orphaned.
         crate::background_task::cancel_all_for_thread(&self.id.0);
-        crate::background_task::remove_thread_event_rx(&self.id.0);
+        crate::background_task::remove_thread_event_bus(&self.id.0);
 
         let Some(wt) = self.worktree.take() else {
             return;
@@ -2137,17 +2137,11 @@ impl Thread {
     /// trained to treat these as informational, not as user authorization or
     /// instructions.
     fn drain_background_events(&mut self, cx: &mut Context<Self>) {
-        let Some(rx) = crate::background_task::take_thread_event_rx(&self.id.0) else {
-            return;
-        };
-        // Collect all ready events, then re-store the receiver so subsequent
-        // drains in the same turn can pick up more events.
+        let (_, rx) = crate::background_task::ensure_thread_event_bus(&self.id.0);
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
         }
-        // Re-store the receiver.
-        crate::background_task::store_thread_event_rx(self.id.0.clone(), rx);
 
         if events.is_empty() {
             return;
@@ -2219,6 +2213,26 @@ impl Thread {
         true
     }
     pub fn run_turn(&mut self, cx: &mut Context<Self>) {
+        // Spawn an event watcher so that background task events arriving while
+        // the thread is idle trigger a new turn. The watcher drains the shared
+        // event bus and re-calls `run_turn` when events arrive.
+        let thread_id = self.id.0.clone();
+        cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let (_, rx) = crate::background_task::ensure_thread_event_bus(&thread_id);
+            while let Ok(_event) = rx.recv().await {
+                let idle = this
+                    .update(cx, |this, _| this.running_turn.is_none())
+                    .unwrap_or(false);
+                if idle {
+                    this.update(cx, |this, cx| {
+                        this.run_turn(cx);
+                    })?;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .detach();
+
         if self.running_turn.is_some() {
             return;
         }

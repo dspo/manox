@@ -4,8 +4,8 @@
 //!
 //! The tool returns immediately with a task ID; the monitor runs in the
 //! background, pushing each event (stdout line / WS text frame) into the
-//! owning Thread's event channel. The Thread drains this channel at safe join
-//! points (idle → auto-wakeup, or running → steer queue).
+//! owning Thread's shared event channel. The Thread drains this channel at
+//! safe join points (idle → auto-wakeup, or running → steer queue).
 //!
 //! `command` and `ws` are mutually exclusive. Command Monitor runs through
 //! the same sandbox/supervisor path as Bash. WebSocket connections are
@@ -184,7 +184,7 @@ impl AgentTool for MonitorTool {
 
         let persistent = parsed.persistent.unwrap_or(false);
         let timeout_ms = if persistent {
-            MAX_TIMEOUT_MS
+            0
         } else {
             parsed
                 .timeout_ms
@@ -196,8 +196,9 @@ impl AgentTool for MonitorTool {
         let description = parsed.description.clone();
         let proxy_port = ctx.network_proxy_port();
 
-        let (event_tx, event_rx) = async_channel::bounded::<TaskEvent>(256);
-        crate::background_task::store_thread_event_rx(thread_id.clone(), event_rx);
+        // Get the shared event bus for this thread. All tasks owned by the
+        // same thread send into the same channel; the Thread drains it.
+        let (_event_tx, _) = crate::background_task::ensure_thread_event_bus(&thread_id);
 
         let runtime = crate::runtime::handle().clone();
 
@@ -209,7 +210,6 @@ impl AgentTool for MonitorTool {
                 thread_id,
                 description.clone(),
                 task_cancel.clone(),
-                event_tx,
             );
             task.set_command(command.clone());
 
@@ -266,7 +266,6 @@ impl AgentTool for MonitorTool {
                 thread_id,
                 description.clone(),
                 task_cancel.clone(),
-                event_tx,
             );
             task.set_ws_url(ws.url.clone());
 
@@ -392,6 +391,7 @@ async fn run_command_monitor(
         Some(tokio::time::Instant::now() + timeout)
     };
 
+    // Phase 1: stream stdout lines as events until EOF, cancel, or timeout.
     let exit_reason = loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -434,20 +434,46 @@ async fn run_command_monitor(
         }
     };
 
-    let status = child.wait().await;
+    // Phase 2: after stdout EOF, continue racing cancel/timeout against
+    // child.wait so a process that closes stdout but keeps running can still
+    // be stopped. Skip this if the child was already killed.
+    let (_final_status, exit_reason) = if matches!(exit_reason, "cancelled" | "timeout") {
+        (None::<()>, exit_reason)
+    } else {
+        let deadline2 = deadline;
+        let cancel2 = cancel.clone();
+        let reason = tokio::select! {
+            _ = cancel2.cancelled() => {
+                kill_process_group(&child);
+                "cancelled"
+            }
+            _ = async {
+                if let Some(dl) = deadline2 {
+                    tokio::time::sleep_until(dl).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                kill_process_group(&child);
+                "timeout"
+            }
+            status = child.wait() => {
+                match status {
+                    Ok(s) if s.success() => "eof",
+                    _ => "failed",
+                }
+            }
+        };
+        (None, reason)
+    };
+
     let stderr_text = stderr_task.await.unwrap_or_default();
 
     match exit_reason {
         "cancelled" => task.set_terminal(TaskStatus::Stopped),
         "timeout" => task.set_terminal(TaskStatus::TimedOut),
-        _ => {
-            let success = status.as_ref().is_ok_and(|s| s.success());
-            if success {
-                task.set_terminal(TaskStatus::Completed);
-            } else {
-                task.set_terminal(TaskStatus::Failed);
-            }
-        }
+        "eof" => task.set_terminal(TaskStatus::Completed),
+        _ => task.set_terminal(TaskStatus::Failed),
     }
 
     if !stderr_text.is_empty() {
@@ -488,7 +514,10 @@ async fn run_ws_monitor(
             return Err("URL has no host".into());
         }
     };
-    let port = uri.port_u16().unwrap_or(80);
+    let port = uri.port_u16().unwrap_or(match uri.scheme_str() {
+        Some("wss") => 443,
+        _ => 80,
+    });
 
     let pinned_addrs = match websocket::resolve_and_validate_addrs(&host, port) {
         Ok(a) => a,
@@ -503,11 +532,10 @@ async fn run_ws_monitor(
         protocols: ws_protocols.to_vec(),
     };
 
-    let connect_timeout = Duration::from_secs(30);
+    // Use the task's timeout as the overall deadline for the connection
+    // phase. DNS, TCP, TLS, and WS handshake all share this deadline.
     let mut stream =
-        match websocket::connect_pinned(&target, &pinned_addrs, Some(connect_timeout), &cancel)
-            .await
-        {
+        match websocket::connect_pinned(&target, &pinned_addrs, Some(timeout), &cancel).await {
             Ok(s) => s,
             Err(e) => {
                 task.set_terminal(TaskStatus::Failed);

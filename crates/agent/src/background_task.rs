@@ -7,11 +7,12 @@
 //! so a final poll or status card can observe the terminal state; a periodic GC
 //! sweep removes long-dead entries.
 //!
-//! Event injection: when a task produces an external event (stdout line, WS
-//! text frame), it pushes the event into a per-thread channel. The owning
-//! Thread drains this channel at safe join points (idle → auto-wakeup, or
-//! running → steer queue) and writes the event into the model's message
-//! history as an untrusted-external-data notice.
+//! Event injection: all tasks owned by a thread share one event channel.
+//! When a task produces an external event (stdout line, WS text frame), it
+//! pushes the event into that channel. The owning Thread drains the channel
+//! at safe join points (idle → auto-wakeup, or running → steer queue) and
+//! writes the event into the model's message history as an
+//! untrusted-external-data notice.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -44,11 +45,8 @@ impl std::fmt::Display for TaskId {
 /// What kind of background task this is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskKind {
-    /// A command Monitor spawned via the `Monitor` tool with `command`.
     MonitorCommand,
-    /// A WebSocket Monitor spawned via the `Monitor` tool with `ws`.
     MonitorWebSocket,
-    /// A background Bash spawned via `Bash` with `run_in_background: true`.
     BackgroundBash,
 }
 
@@ -57,13 +55,9 @@ pub enum TaskKind {
 pub enum TaskStatus {
     Running,
     Completed,
-    /// Non-zero exit, WS protocol error, spawn failure, etc.
     Failed,
-    /// Killed by timeout.
     TimedOut,
-    /// Stopped by `TaskStop`.
     Stopped,
-    /// The session (manox process) ended before the task finished.
     SessionEnded,
 }
 
@@ -72,7 +66,6 @@ pub enum TaskStatus {
 pub struct TaskEvent {
     pub task_id: TaskId,
     pub text: String,
-    /// Monotonic sequence number within the task, 1-indexed.
     pub seq: u64,
     pub at: Instant,
 }
@@ -100,7 +93,6 @@ struct TaskState {
     status: TaskStatus,
     cancel: CancellationToken,
     event_count: u64,
-    /// Bounded event buffer. Most recent events, total byte count tracked.
     events: Vec<TaskEvent>,
     events_byte_count: usize,
     total_bytes: u64,
@@ -110,6 +102,9 @@ struct TaskState {
     command: Option<String>,
     ws_url: Option<String>,
     driver_abort: Option<tokio::task::AbortHandle>,
+    /// The shared event bus sender for the owning thread. All tasks owned by
+    /// the same thread share this sender; the receiver lives in the thread's
+    /// event-injection map.
     event_tx: Option<async_channel::Sender<TaskEvent>>,
 }
 
@@ -210,12 +205,13 @@ impl BackgroundTask {
     /// Push an event into the task's buffer and forward it to the owning thread.
     /// The ring buffer evicts the oldest events when the byte cap is exceeded,
     /// tracking the byte count correctly so it doesn't clear everything.
+    /// When the shared event channel is full, the event is still recorded in
+    /// the task's own ring buffer so the thread can replay on drain.
     pub fn push_event(&self, event: TaskEvent) {
         let mut s = self.state.lock().expect("task state poisoned");
         let evt_len = event.text.len();
         s.events.push(event.clone());
         s.events_byte_count += evt_len;
-        // Evict oldest events if over the byte cap.
         while s.events_byte_count > MAX_BUFFER_BYTES && !s.events.is_empty() {
             let removed = s.events.remove(0);
             s.events_byte_count = s.events_byte_count.saturating_sub(removed.text.len());
@@ -282,7 +278,7 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
 }
 
 /// Allocate a unique id for the given kind.
-fn next_id(kind: &TaskKind) -> (TaskId, u64) {
+fn next_id(kind: &TaskKind) -> TaskId {
     let mut reg = registry().lock().expect("registry poisoned");
     let n = reg.next_id;
     reg.next_id += 1;
@@ -291,7 +287,56 @@ fn next_id(kind: &TaskKind) -> (TaskId, u64) {
         TaskKind::MonitorWebSocket => "ws",
         TaskKind::BackgroundBash => "bash",
     };
-    (TaskId::new(prefix, n), n)
+    TaskId::new(prefix, n)
+}
+
+/// Per-thread event bus: one shared channel per thread, created lazily.
+/// All tasks owned by the same thread send into this channel; the Thread
+/// drains it at safe join points.
+/// The shared event channel for a thread (sender, receiver).
+type ThreadEventChannel = (
+    async_channel::Sender<TaskEvent>,
+    async_channel::Receiver<TaskEvent>,
+);
+
+/// Per-thread event bus: one shared channel per thread, created lazily.
+static THREAD_EVENT_BUS: OnceLock<std::sync::Mutex<HashMap<String, ThreadEventChannel>>> =
+    OnceLock::new();
+
+fn thread_event_bus() -> &'static std::sync::Mutex<HashMap<String, ThreadEventChannel>> {
+    THREAD_EVENT_BUS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Get or create the shared event channel for a thread. All tasks owned by
+/// the same thread share this channel.
+pub fn ensure_thread_event_bus(
+    thread_id: &str,
+) -> (
+    async_channel::Sender<TaskEvent>,
+    async_channel::Receiver<TaskEvent>,
+) {
+    let mut map = thread_event_bus().lock().expect("event bus poisoned");
+    map.entry(thread_id.to_string())
+        .or_insert_with(|| async_channel::bounded(1024))
+        .clone()
+}
+
+/// Take the receiver for a thread's event bus. Returns None if the bus was
+/// never created.
+pub fn take_thread_event_rx(thread_id: &str) -> Option<async_channel::Receiver<TaskEvent>> {
+    thread_event_bus()
+        .lock()
+        .expect("event bus poisoned")
+        .remove(thread_id)
+        .map(|(_, rx)| rx)
+}
+
+/// Drop the event bus for a thread (called when the thread is dropped).
+pub fn remove_thread_event_bus(thread_id: &str) {
+    thread_event_bus()
+        .lock()
+        .expect("event bus poisoned")
+        .remove(thread_id);
 }
 
 /// Register a new background task and return its id and handle.
@@ -300,9 +345,9 @@ pub fn register(
     owner_thread_id: String,
     description: String,
     cancel: CancellationToken,
-    event_tx: async_channel::Sender<TaskEvent>,
 ) -> (TaskId, Arc<BackgroundTask>) {
-    let (id, _) = next_id(&kind);
+    let (event_tx, _) = ensure_thread_event_bus(&owner_thread_id);
+    let id = next_id(&kind);
     let task = Arc::new(BackgroundTask::new(
         kind,
         owner_thread_id,
@@ -363,48 +408,12 @@ fn list_stoppable_under_lock(reg: &Registry) -> String {
     }
 }
 
-/// Per-thread event receiver map, stored here so the Thread can drain events
-/// from background tasks that target it.
-static THREAD_EVENT_RX: OnceLock<
-    std::sync::Mutex<HashMap<String, async_channel::Receiver<TaskEvent>>>,
-> = OnceLock::new();
-
-/// Store the event receiver for a thread so it can drain background task events.
-pub fn store_thread_event_rx(thread_id: String, rx: async_channel::Receiver<TaskEvent>) {
-    let mut map = THREAD_EVENT_RX
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-        .lock()
-        .expect("thread event rx poisoned");
-    map.insert(thread_id, rx);
-}
-
-/// Take the event receiver for a thread, returning None if no tasks are registered.
-pub fn take_thread_event_rx(thread_id: &str) -> Option<async_channel::Receiver<TaskEvent>> {
-    THREAD_EVENT_RX.get().and_then(|m| {
-        m.lock()
-            .expect("thread event rx poisoned")
-            .remove(thread_id)
-    })
-}
-
-/// Drop the event receiver for a thread (called when the thread is dropped).
-pub fn remove_thread_event_rx(thread_id: &str) {
-    if let Some(map) = THREAD_EVENT_RX.get() {
-        let _ = map
-            .lock()
-            .expect("thread event rx poisoned")
-            .remove(thread_id);
-    }
-}
-
-/// Stop a task by id. Returns Ok(()) if the task was found and stopped (or
 /// Stop a task by id. Returns Ok(()) if the task was found and stopped (or
 /// was already terminal). Returns Err with a summary of available tasks if
 /// the id is unknown.
 pub fn stop(id: &str) -> Result<(), String> {
     let reg = registry().lock().expect("registry poisoned");
     let Some(task) = reg.tasks.get(id) else {
-        // Build the summary from the existing guard to avoid re-locking.
         let summary = list_stoppable_under_lock(&reg);
         return Err(format!("Unknown task id: {id}. {summary}"));
     };
@@ -477,6 +486,13 @@ pub fn shutdown_all() {
     }
 }
 
+/// Remove all tasks owned by a thread. Called when the thread is archived.
+pub fn remove_all_for_thread(thread_id: &str) {
+    let mut reg = registry().lock().expect("registry poisoned");
+    reg.tasks
+        .retain(|_, task| task.owner_thread_id() != thread_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,13 +500,11 @@ mod tests {
     #[test]
     fn register_and_get() {
         let cancel = CancellationToken::new();
-        let (tx, _rx) = async_channel::bounded::<TaskEvent>(8);
         let (id, task) = register(
             TaskKind::MonitorCommand,
             "thread-1".into(),
             "watch build".into(),
             cancel,
-            tx,
         );
         assert!(id.0.starts_with("monitor_"));
         assert_eq!(task.status(), TaskStatus::Running);
@@ -503,13 +517,11 @@ mod tests {
     #[test]
     fn stop_and_terminal() {
         let cancel = CancellationToken::new();
-        let (tx, _rx) = async_channel::bounded::<TaskEvent>(8);
         let (id, task) = register(
             TaskKind::MonitorCommand,
             "thread-1".into(),
             "test".into(),
             cancel,
-            tx,
         );
         assert_eq!(task.status(), TaskStatus::Running);
 
@@ -532,13 +544,11 @@ mod tests {
     #[test]
     fn push_event_updates_count() {
         let cancel = CancellationToken::new();
-        let (tx, _rx) = async_channel::bounded::<TaskEvent>(8);
         let (_id, task) = register(
             TaskKind::MonitorCommand,
             "thread-1".into(),
             "test".into(),
             cancel,
-            tx,
         );
         task.push_event(TaskEvent {
             task_id: TaskId::new("monitor", 1),
@@ -553,13 +563,11 @@ mod tests {
     #[test]
     fn set_terminal_is_idempotent() {
         let cancel = CancellationToken::new();
-        let (tx, _rx) = async_channel::bounded::<TaskEvent>(8);
         let (_id, task) = register(
             TaskKind::MonitorCommand,
             "thread-1".into(),
             "test".into(),
             cancel,
-            tx,
         );
         task.set_terminal(TaskStatus::Completed);
         assert_eq!(task.status(), TaskStatus::Completed);
@@ -570,16 +578,13 @@ mod tests {
     #[test]
     fn ring_buffer_evicts_oldest_not_all() {
         let cancel = CancellationToken::new();
-        let (tx, _rx) = async_channel::bounded::<TaskEvent>(8);
         let (_id, task) = register(
             TaskKind::MonitorCommand,
             "thread-1".into(),
             "test".into(),
             cancel,
-            tx,
         );
 
-        // Push events that total well over the cap.
         let big = "X".repeat(200 * 1024);
         task.push_event(TaskEvent {
             task_id: TaskId::new("monitor", 1),
@@ -601,13 +606,38 @@ mod tests {
         });
 
         let events = task.recent_events();
-        // The first event should have been evicted (200K > 256K cap with two 200K events).
-        // The last event ("last") should still be present.
         let texts: Vec<&str> = events.iter().map(|e| e.text.as_str()).collect();
         assert!(
             texts.contains(&"last"),
             "last event should survive, got: {:?}",
             texts
         );
+    }
+
+    #[test]
+    fn shared_event_bus_per_thread() {
+        // Two tasks on the same thread share the same event bus.
+        let (tx1, _rx1) = ensure_thread_event_bus("thread-a");
+        let (tx2, _rx2) = ensure_thread_event_bus("thread-a");
+        tx1.try_send(TaskEvent {
+            task_id: TaskId::new("monitor", 1),
+            text: "from tx1".into(),
+            seq: 1,
+            at: Instant::now(),
+        })
+        .expect("tx1 send");
+        tx2.try_send(TaskEvent {
+            task_id: TaskId::new("monitor", 2),
+            text: "from tx2".into(),
+            seq: 1,
+            at: Instant::now(),
+        })
+        .expect("tx2 send");
+        let (_, rx) = ensure_thread_event_bus("thread-a");
+        let e1 = rx.try_recv().expect("first event");
+        let e2 = rx.try_recv().expect("second event");
+        assert_eq!(e1.text, "from tx1");
+        assert_eq!(e2.text, "from tx2");
+        remove_thread_event_bus("thread-a");
     }
 }
