@@ -217,7 +217,7 @@ impl AgentTool for MonitorTool {
 
         // Get the shared event bus for this thread. All tasks owned by the
         // same thread send into the same channel; the Thread drains it.
-        let (_event_tx, _) = crate::background_task::ensure_thread_event_bus(&thread_id);
+        let (_event_tx, _, _) = crate::background_task::ensure_thread_event_bus(&thread_id);
 
         let runtime = crate::runtime::handle().clone();
 
@@ -241,8 +241,7 @@ impl AgentTool for MonitorTool {
             let sandbox = self.sandbox.clone();
             let plugin_root = self.plugin_root.clone();
             let base_cwd = self.cwd.clone();
-
-            runtime.spawn(async move {
+            let handle = runtime.spawn(async move {
                 let result = run_command_monitor(
                     &cmd_c,
                     &base_cwd,
@@ -261,6 +260,7 @@ impl AgentTool for MonitorTool {
                     tracing::warn!(target: "monitor", %tid_log, "monitor failed: {e}");
                 }
             });
+            task.set_driver_abort(handle.abort_handle());
 
             let result_json = serde_json::to_string(&MonitorResult {
                 task_id: tid_result.0,
@@ -288,14 +288,14 @@ impl AgentTool for MonitorTool {
             );
             task.set_ws_url(ws.url.clone());
 
-            let task_clone = task;
+            let task_clone = task.clone();
             let tid_run = task_id.clone();
             let tid_log = task_id.clone();
             let tid_result = task_id;
             let ws_url = ws.url;
             let ws_protocols = ws.protocols.unwrap_or_default();
 
-            runtime.spawn(async move {
+            let handle = runtime.spawn(async move {
                 let result = run_ws_monitor(
                     &ws_url,
                     &ws_protocols,
@@ -310,6 +310,7 @@ impl AgentTool for MonitorTool {
                     tracing::warn!(target: "monitor", %tid_log, "WS monitor failed: {e}");
                 }
             });
+            task.set_driver_abort(handle.abort_handle());
 
             let result_json = serde_json::to_string(&MonitorResult {
                 task_id: tid_result.0,
@@ -552,10 +553,15 @@ async fn run_ws_monitor(
         protocols: ws_protocols.to_vec(),
     };
 
-    // Use the task's timeout as the overall deadline for the connection
-    // phase. DNS, TCP, TLS, and WS handshake all share this deadline.
+    // Single wall-clock deadline shared across connection and runtime phases.
+    let deadline = if persistent {
+        None
+    } else {
+        Some(tokio::time::Instant::now() + timeout)
+    };
+
     let mut stream =
-        match websocket::connect_pinned(&target, &pinned_addrs, Some(timeout), &cancel).await {
+        match websocket::connect_pinned(&target, &pinned_addrs, deadline, &cancel).await {
             Ok(s) => s,
             Err(e) => {
                 task.set_terminal(TaskStatus::Failed);
@@ -564,11 +570,6 @@ async fn run_ws_monitor(
         };
 
     let mut event_seq: u64 = 0;
-    let deadline = if persistent {
-        None
-    } else {
-        Some(tokio::time::Instant::now() + timeout)
-    };
 
     let exit_reason = loop {
         tokio::select! {

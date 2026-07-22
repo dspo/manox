@@ -3,7 +3,6 @@
 //! as events.
 
 use std::net::ToSocketAddrs;
-use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -186,18 +185,14 @@ fn is_link_local_ip(ip: &std::net::IpAddr) -> bool {
 pub async fn connect_pinned(
     target: &WsTarget,
     pinned_addrs: &[std::net::SocketAddr],
-    timeout: Option<Duration>,
+    deadline: Option<tokio::time::Instant>,
     cancel: &CancellationToken,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, String> {
-    // Build a proper WebSocket request via `IntoClientRequest`, which adds
-    // Connection, Upgrade, Sec-WebSocket-Version, and Sec-WebSocket-Key.
     let mut req = target
         .url
         .as_str()
         .into_client_request()
         .map_err(|e| format!("failed to build WebSocket request: {e}"))?;
-
-    // Attach subprotocols if any.
     if !target.protocols.is_empty() {
         let val = target.protocols.join(", ");
         req.headers_mut().insert(
@@ -206,12 +201,21 @@ pub async fn connect_pinned(
         );
     }
 
-    // Connect to the first pinned address that works.
     let mut last_err = None;
     for addr in pinned_addrs {
-        // The entire connect phase (TCP + TLS + WS handshake) shares one
-        // deadline derived from the task timeout, so no single phase can
-        // hang indefinitely.
+        // Compute remaining budget from the single deadline so all
+        // addresses share one wall-clock budget.
+        let remaining = match deadline {
+            Some(dl) => {
+                let now = tokio::time::Instant::now();
+                if now >= dl {
+                    last_err = Some("connection deadline exceeded".into());
+                    break;
+                }
+                Some(dl - now)
+            }
+            None => None,
+        };
         let connect_fut = async {
             let stream = TcpStream::connect(*addr)
                 .await
@@ -232,31 +236,23 @@ pub async fn connect_pinned(
             Ok::<_, String>(ws_stream)
         };
 
-        match timeout {
+        match remaining {
             Some(t) => tokio::select! {
-                _ = cancel.cancelled() => {
-                    return Err("WebSocket connection cancelled".into());
-                }
-                r = tokio::time::timeout(t, connect_fut) => {
-                    match r {
-                        Ok(Ok(stream)) => return Ok(stream),
-                        Ok(Err(e)) => { last_err = Some(e); continue; }
-                        Err(_) => { last_err = Some("connection timeout".into()); continue; }
-                    }
+                _ = cancel.cancelled() => return Err("WebSocket connection cancelled".into()),
+                r = tokio::time::timeout(t, connect_fut) => match r {
+                    Ok(Ok(stream)) => return Ok(stream),
+                    Ok(Err(e)) => { last_err = Some(e); continue; }
+                    Err(_) => { last_err = Some("connection timeout".into()); continue; }
                 }
             },
             None => tokio::select! {
-                _ = cancel.cancelled() => {
-                    return Err("WebSocket connection cancelled".into());
-                }
-                r = connect_fut => {
-                    match r {
-                        Ok(stream) => return Ok(stream),
-                        Err(e) => { last_err = Some(e); continue; }
-                    }
+                _ = cancel.cancelled() => return Err("WebSocket connection cancelled".into()),
+                r = connect_fut => match r {
+                    Ok(stream) => return Ok(stream),
+                    Err(e) => { last_err = Some(e); continue; }
                 }
             },
-        };
+        }
     }
 
     Err(last_err.unwrap_or_else(|| "no addresses to connect to".into()))

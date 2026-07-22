@@ -7,12 +7,10 @@
 //! so a final poll or status card can observe the terminal state; a periodic GC
 //! sweep removes long-dead entries.
 //!
-//! Event injection: all tasks owned by a thread share one event channel.
-//! When a task produces an external event (stdout line, WS text frame), it
-//! pushes the event into that channel. The owning Thread drains the channel
-//! at safe join points (idle → auto-wakeup, or running → steer queue) and
-//! writes the event into the model's message history as an
-//! untrusted-external-data notice.
+//! Event injection: all tasks owned by a thread share one event channel +
+//! Notify. When a task produces an event, it pushes into the channel and
+//! notifies the watcher. The owning Thread drains the channel at safe join
+//! points (idle → auto-wakeup via Notify, or running → steer queue).
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -102,10 +100,12 @@ struct TaskState {
     command: Option<String>,
     ws_url: Option<String>,
     driver_abort: Option<tokio::task::AbortHandle>,
-    /// The shared event bus sender for the owning thread. All tasks owned by
-    /// the same thread share this sender; the receiver lives in the thread's
-    /// event-injection map.
     event_tx: Option<async_channel::Sender<TaskEvent>>,
+    /// Notify for the auto-wake watcher. Notified on every push_event.
+    event_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Last sequence number delivered to the channel. Used by drain to
+    /// replay undelivered events from the ring buffer.
+    last_delivered_seq: u64,
 }
 
 /// A registered background task.
@@ -120,6 +120,7 @@ impl BackgroundTask {
         description: String,
         cancel: CancellationToken,
         event_tx: async_channel::Sender<TaskEvent>,
+        event_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         Self {
             state: Arc::new(std::sync::Mutex::new(TaskState {
@@ -138,6 +139,8 @@ impl BackgroundTask {
                 ws_url: None,
                 driver_abort: None,
                 event_tx: Some(event_tx),
+                event_notify: Some(event_notify),
+                last_delivered_seq: 0,
             })),
         }
     }
@@ -202,11 +205,10 @@ impl BackgroundTask {
             .clone()
     }
 
-    /// Push an event into the task's buffer and forward it to the owning thread.
-    /// The ring buffer evicts the oldest events when the byte cap is exceeded,
-    /// tracking the byte count correctly so it doesn't clear everything.
-    /// When the shared event channel is full, the event is still recorded in
-    /// the task's own ring buffer so the thread can replay on drain.
+    /// Push an event into the task's ring buffer and forward it to the owning
+    /// thread's shared channel + Notify. When the channel is full, the event
+    /// is still recorded in the ring buffer; `drain_background_events` will
+    /// replay undelivered events from the buffer.
     pub fn push_event(&self, event: TaskEvent) {
         let mut s = self.state.lock().expect("task state poisoned");
         let evt_len = event.text.len();
@@ -218,9 +220,35 @@ impl BackgroundTask {
         }
         s.event_count += 1;
         s.total_bytes = s.total_bytes.saturating_add(evt_len as u64);
-        if let Some(tx) = &s.event_tx {
-            let _ = tx.try_send(event);
+        let notify = s.event_notify.clone();
+        if let Some(tx) = &s.event_tx
+            && tx.try_send(event).is_ok()
+        {
+            s.last_delivered_seq = s.event_count;
         }
+        drop(s);
+        // Notify the auto-wake watcher outside the lock.
+        if let Some(n) = notify {
+            n.notify_one();
+        }
+    }
+
+    /// Return events from the ring buffer whose seq > last_delivered_seq.
+    /// Used by drain_background_events to replay events that didn't fit in
+    /// the shared channel.
+    pub fn undelivered_events(&self) -> Vec<TaskEvent> {
+        let s = self.state.lock().expect("task state poisoned");
+        s.events
+            .iter()
+            .filter(|e| e.seq > s.last_delivered_seq)
+            .cloned()
+            .collect()
+    }
+
+    /// Mark events as delivered (after drain has consumed them).
+    pub fn mark_delivered(&self, up_to_seq: u64) {
+        let mut s = self.state.lock().expect("task state poisoned");
+        s.last_delivered_seq = s.last_delivered_seq.max(up_to_seq);
     }
 
     pub fn recent_events(&self) -> Vec<TaskEvent> {
@@ -235,8 +263,7 @@ impl BackgroundTask {
         self.state.lock().expect("task state poisoned").total_bytes
     }
 
-    /// Set the task to a terminal status. Idempotent: only the first call
-    /// takes effect.
+    /// Set the task to a terminal status. Idempotent.
     pub fn set_terminal(&self, status: TaskStatus) {
         let mut s = self.state.lock().expect("task state poisoned");
         if s.status != TaskStatus::Running {
@@ -245,6 +272,10 @@ impl BackgroundTask {
         s.status = status;
         s.exited_at = Some(Instant::now());
         s.event_tx = None;
+        // Notify so any waiting watcher wakes up.
+        if let Some(n) = &s.event_notify {
+            n.notify_one();
+        }
     }
 
     pub fn set_command(&self, cmd: String) {
@@ -258,6 +289,79 @@ impl BackgroundTask {
     pub fn set_driver_abort(&self, handle: tokio::task::AbortHandle) {
         self.state.lock().expect("task state poisoned").driver_abort = Some(handle);
     }
+}
+
+/// The shared event channel for a thread (sender, receiver, notify).
+type ThreadEventChannel = (
+    async_channel::Sender<TaskEvent>,
+    async_channel::Receiver<TaskEvent>,
+    Arc<tokio::sync::Notify>,
+);
+
+/// Per-thread event bus: one shared channel per thread, created lazily.
+static THREAD_EVENT_BUS: OnceLock<std::sync::Mutex<HashMap<String, ThreadEventChannel>>> =
+    OnceLock::new();
+
+fn thread_event_bus() -> &'static std::sync::Mutex<HashMap<String, ThreadEventChannel>> {
+    THREAD_EVENT_BUS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Get or create the shared event channel + Notify for a thread. All tasks
+/// owned by the same thread share this channel. The `Notify` is used by the
+/// auto-wake watcher to wait for new events without consuming them.
+pub fn ensure_thread_event_bus(
+    thread_id: &str,
+) -> (
+    async_channel::Sender<TaskEvent>,
+    async_channel::Receiver<TaskEvent>,
+    Arc<tokio::sync::Notify>,
+) {
+    let mut map = thread_event_bus().lock().expect("event bus poisoned");
+    map.entry(thread_id.to_string())
+        .or_insert_with(|| {
+            let (tx, rx) = async_channel::bounded(1024);
+            (tx, rx, Arc::new(tokio::sync::Notify::new()))
+        })
+        .clone()
+}
+
+/// Register a task with an externally-assigned id.
+pub fn register_with_id(
+    id: String,
+    kind: TaskKind,
+    owner_thread_id: String,
+    description: String,
+    cancel: CancellationToken,
+) -> Arc<BackgroundTask> {
+    let (event_tx, _, notify) = ensure_thread_event_bus(&owner_thread_id);
+    let task = Arc::new(BackgroundTask::new(
+        kind,
+        owner_thread_id,
+        description,
+        cancel,
+        event_tx,
+        notify,
+    ));
+    let mut reg = registry().lock().expect("registry poisoned");
+    reg.tasks.insert(id, task.clone());
+    task
+}
+
+/// Take the receiver for a thread's event bus.
+pub fn take_thread_event_rx(thread_id: &str) -> Option<async_channel::Receiver<TaskEvent>> {
+    thread_event_bus()
+        .lock()
+        .expect("event bus poisoned")
+        .remove(thread_id)
+        .map(|(_, rx, _)| rx)
+}
+
+/// Drop the event bus for a thread.
+pub fn remove_thread_event_bus(thread_id: &str) {
+    thread_event_bus()
+        .lock()
+        .expect("event bus poisoned")
+        .remove(thread_id);
 }
 
 /// The process-global background task registry.
@@ -290,78 +394,6 @@ fn next_id(kind: &TaskKind) -> TaskId {
     TaskId::new(prefix, n)
 }
 
-/// Per-thread event bus: one shared channel per thread, created lazily.
-/// All tasks owned by the same thread send into this channel; the Thread
-/// drains it at safe join points.
-/// The shared event channel for a thread (sender, receiver).
-type ThreadEventChannel = (
-    async_channel::Sender<TaskEvent>,
-    async_channel::Receiver<TaskEvent>,
-);
-
-/// Per-thread event bus: one shared channel per thread, created lazily.
-static THREAD_EVENT_BUS: OnceLock<std::sync::Mutex<HashMap<String, ThreadEventChannel>>> =
-    OnceLock::new();
-
-fn thread_event_bus() -> &'static std::sync::Mutex<HashMap<String, ThreadEventChannel>> {
-    THREAD_EVENT_BUS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-}
-
-/// Get or create the shared event channel for a thread. All tasks owned by
-/// the same thread share this channel.
-pub fn ensure_thread_event_bus(
-    thread_id: &str,
-) -> (
-    async_channel::Sender<TaskEvent>,
-    async_channel::Receiver<TaskEvent>,
-) {
-    let mut map = thread_event_bus().lock().expect("event bus poisoned");
-    map.entry(thread_id.to_string())
-        .or_insert_with(|| async_channel::bounded(1024))
-        .clone()
-}
-
-/// Register a task with an externally-assigned id (e.g. background Bash's
-/// `bash_N` from the old registry). The task is registered under the given
-/// id so TaskStop can find it.
-pub fn register_with_id(
-    id: String,
-    kind: TaskKind,
-    owner_thread_id: String,
-    description: String,
-    cancel: CancellationToken,
-) -> Arc<BackgroundTask> {
-    let (event_tx, _) = ensure_thread_event_bus(&owner_thread_id);
-    let task = Arc::new(BackgroundTask::new(
-        kind,
-        owner_thread_id,
-        description,
-        cancel,
-        event_tx,
-    ));
-    let mut reg = registry().lock().expect("registry poisoned");
-    reg.tasks.insert(id, task.clone());
-    task
-}
-
-/// Take the receiver for a thread's event bus. Returns None if the bus was
-/// never created.
-pub fn take_thread_event_rx(thread_id: &str) -> Option<async_channel::Receiver<TaskEvent>> {
-    thread_event_bus()
-        .lock()
-        .expect("event bus poisoned")
-        .remove(thread_id)
-        .map(|(_, rx)| rx)
-}
-
-/// Drop the event bus for a thread (called when the thread is dropped).
-pub fn remove_thread_event_bus(thread_id: &str) {
-    thread_event_bus()
-        .lock()
-        .expect("event bus poisoned")
-        .remove(thread_id);
-}
-
 /// Register a new background task and return its id and handle.
 pub fn register(
     kind: TaskKind,
@@ -369,7 +401,7 @@ pub fn register(
     description: String,
     cancel: CancellationToken,
 ) -> (TaskId, Arc<BackgroundTask>) {
-    let (event_tx, _) = ensure_thread_event_bus(&owner_thread_id);
+    let (event_tx, _, notify) = ensure_thread_event_bus(&owner_thread_id);
     let id = next_id(&kind);
     let task = Arc::new(BackgroundTask::new(
         kind,
@@ -377,6 +409,7 @@ pub fn register(
         description,
         cancel,
         event_tx,
+        notify,
     ));
     let mut reg = registry().lock().expect("registry poisoned");
     reg.tasks.insert(id.0.clone(), task.clone());
@@ -393,8 +426,17 @@ pub fn get(id: &TaskId) -> Option<Arc<BackgroundTask>> {
         .cloned()
 }
 
-/// Remove a task from the registry. Used when setup fails before the driver
-/// starts.
+/// Look up a task by string id.
+pub fn get_by_str(id: &str) -> Option<Arc<BackgroundTask>> {
+    registry()
+        .lock()
+        .expect("registry poisoned")
+        .tasks
+        .get(id)
+        .cloned()
+}
+
+/// Remove a task from the registry.
 pub fn remove(id: &TaskId) {
     registry()
         .lock()
@@ -431,9 +473,7 @@ fn list_stoppable_under_lock(reg: &Registry) -> String {
     }
 }
 
-/// Stop a task by id. Returns Ok(()) if the task was found and stopped (or
-/// was already terminal). Returns Err with a summary of available tasks if
-/// the id is unknown.
+/// Stop a task by id.
 pub fn stop(id: &str) -> Result<(), String> {
     let reg = registry().lock().expect("registry poisoned");
     let Some(task) = reg.tasks.get(id) else {
@@ -458,8 +498,7 @@ pub fn stop(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Run a garbage-collection pass: remove tasks whose process exited more than
-/// `GC_AFTER_EXIT` ago.
+/// Run a garbage-collection pass.
 pub fn gc() {
     let mut reg = registry().lock().expect("registry poisoned");
     let now = Instant::now();
@@ -472,8 +511,20 @@ pub fn gc() {
     });
 }
 
-/// Cancel all tasks owned by a thread. Called when the thread is archived or
-/// dropped.
+/// Get all tasks owned by a thread.
+pub fn tasks_for_thread(thread_id: &str) -> Vec<Arc<BackgroundTask>> {
+    let reg = registry().lock().expect("registry poisoned");
+    reg.tasks
+        .values()
+        .filter(|task| {
+            let s = task.state.lock().expect("task state poisoned");
+            s.owner_thread_id == thread_id
+        })
+        .cloned()
+        .collect()
+}
+
+/// Cancel all tasks owned by a thread.
 pub fn cancel_all_for_thread(thread_id: &str) {
     let reg = registry().lock().expect("registry poisoned");
     for task in reg.tasks.values() {
@@ -486,8 +537,7 @@ pub fn cancel_all_for_thread(thread_id: &str) {
     }
 }
 
-/// Whether a thread has any running tasks. The UI uses this to keep the
-/// thread alive during task switches.
+/// Whether a thread has any running tasks.
 pub fn thread_has_running_tasks(thread_id: &str) -> bool {
     let reg = registry().lock().expect("registry poisoned");
     reg.tasks.values().any(|task| {
@@ -496,7 +546,7 @@ pub fn thread_has_running_tasks(thread_id: &str) -> bool {
     })
 }
 
-/// Cancel all running tasks across all threads. Called at application exit.
+/// Cancel all running tasks across all threads.
 pub fn shutdown_all() {
     let reg = registry().lock().expect("registry poisoned");
     for task in reg.tasks.values() {
@@ -509,7 +559,7 @@ pub fn shutdown_all() {
     }
 }
 
-/// Remove all tasks owned by a thread. Called when the thread is archived.
+/// Remove all tasks owned by a thread.
 pub fn remove_all_for_thread(thread_id: &str) {
     let mut reg = registry().lock().expect("registry poisoned");
     reg.tasks
@@ -532,7 +582,6 @@ mod tests {
         assert!(id.0.starts_with("monitor_"));
         assert_eq!(task.status(), TaskStatus::Running);
         assert_eq!(task.event_count(), 0);
-
         let found = get(&id).expect("should find task");
         assert_eq!(found.status(), TaskStatus::Running);
     }
@@ -547,10 +596,8 @@ mod tests {
             cancel,
         );
         assert_eq!(task.status(), TaskStatus::Running);
-
         stop(&id.0).expect("stop should succeed");
         assert_eq!(task.status(), TaskStatus::Stopped);
-
         stop(&id.0).expect("stop should succeed");
         assert_eq!(task.status(), TaskStatus::Stopped);
     }
@@ -607,7 +654,6 @@ mod tests {
             "test".into(),
             cancel,
         );
-
         let big = "X".repeat(200 * 1024);
         task.push_event(TaskEvent {
             task_id: TaskId::new("monitor", 1),
@@ -627,7 +673,6 @@ mod tests {
             seq: 3,
             at: Instant::now(),
         });
-
         let events = task.recent_events();
         let texts: Vec<&str> = events.iter().map(|e| e.text.as_str()).collect();
         assert!(
@@ -639,9 +684,8 @@ mod tests {
 
     #[test]
     fn shared_event_bus_per_thread() {
-        // Two tasks on the same thread share the same event bus.
-        let (tx1, _rx1) = ensure_thread_event_bus("thread-a");
-        let (tx2, _rx2) = ensure_thread_event_bus("thread-a");
+        let (tx1, _rx1, _) = ensure_thread_event_bus("thread-a");
+        let (tx2, _rx2, _) = ensure_thread_event_bus("thread-a");
         tx1.try_send(TaskEvent {
             task_id: TaskId::new("monitor", 1),
             text: "from tx1".into(),
@@ -656,7 +700,7 @@ mod tests {
             at: Instant::now(),
         })
         .expect("tx2 send");
-        let (_, rx) = ensure_thread_event_bus("thread-a");
+        let (_, rx, _) = ensure_thread_event_bus("thread-a");
         let e1 = rx.try_recv().expect("first event");
         let e2 = rx.try_recv().expect("second event");
         assert_eq!(e1.text, "from tx1");

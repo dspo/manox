@@ -567,6 +567,10 @@ pub struct Thread {
     last_stop_reason: Option<StopReason>,
     /// The running turn task; dropping it aborts the turn.
     running_turn: Option<Task<()>>,
+    /// Persistent auto-wake watcher for background task events. Spawned once
+    /// per thread; uses `Notify::notified()` to wake without consuming
+    /// events, then triggers `run_turn` if the thread is idle.
+    bg_watcher: Option<Task<()>>,
     /// Cancellation token for the running turn. Cancelled by `cancel()` so the
     /// in-flight tool (e.g. `bash`) can reap its process group promptly instead
     /// of relying on task-drop, which does not reach the detached tokio child.
@@ -848,6 +852,7 @@ impl Thread {
                 overflow_recovery_attempted: false,
                 last_stop_reason: None,
                 running_turn: None,
+                bg_watcher: None,
                 turn_started_at: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
@@ -952,6 +957,7 @@ impl Thread {
                 overflow_recovery_attempted: false,
                 last_stop_reason: None,
                 running_turn: None,
+                bg_watcher: None,
                 turn_started_at: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
@@ -1050,6 +1056,7 @@ impl Thread {
                 overflow_recovery_attempted: false,
                 last_stop_reason: None,
                 running_turn: None,
+                bg_watcher: None,
                 turn_started_at: None,
                 turn_cancel: None,
                 turn_tool_filter: None,
@@ -1625,6 +1632,11 @@ impl Thread {
             return;
         }
         self.archived = archived;
+        if archived {
+            crate::background_task::cancel_all_for_thread(&self.id.0);
+            crate::background_task::remove_all_for_thread(&self.id.0);
+            crate::background_task::remove_thread_event_bus(&self.id.0);
+        }
         cx.notify();
     }
 
@@ -2137,20 +2149,51 @@ impl Thread {
     /// trained to treat these as informational, not as user authorization or
     /// instructions.
     fn drain_background_events(&mut self, cx: &mut Context<Self>) {
-        let (_, rx) = crate::background_task::ensure_thread_event_bus(&self.id.0);
+        let (_, rx, _) = crate::background_task::ensure_thread_event_bus(&self.id.0);
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
+        }
+        // Also replay undelivered events from task ring buffers. This
+        // covers the case where the shared channel was full and
+        // try_send failed; the events are still in the task's ring buffer.
+        // We check all tasks owned by this thread.
+        let thread_id = self.id.0.clone();
+        if let Some(undelivered) = crate::background_task::get_by_str("") {
+            // no-op: get_by_str("") returns None
+            let _ = undelivered;
+        }
+        // Collect undelivered events from all running tasks for this thread.
+        let tasks = crate::background_task::tasks_for_thread(&thread_id);
+        for task in &tasks {
+            for event in task.undelivered_events() {
+                // Only add events not already in the channel-drained set.
+                if !events
+                    .iter()
+                    .any(|e| e.seq == event.seq && e.task_id == event.task_id)
+                {
+                    events.push(event);
+                }
+            }
+        }
+        // Sort by sequence number to maintain order.
+        events.sort_by_key(|e| (e.task_id.0.clone(), e.seq));
+        // Mark all as delivered.
+        for task in &tasks {
+            let max_seq = events
+                .iter()
+                .filter(|e| e.task_id.0 == task.owner_thread_id())
+                .map(|e| e.seq)
+                .max()
+                .unwrap_or(0);
+            task.mark_delivered(max_seq);
         }
 
         if events.is_empty() {
             return;
         }
-        // Inject all events as a single user message. Each event is prefixed
-        // with the untrusted-external-data warning.
         let mut body = String::new();
         for event in &events {
-            // Infer the task kind from the task id prefix.
             let kind = if event.task_id.0.starts_with("ws_") {
                 crate::background_task::TaskKind::MonitorWebSocket
             } else if event.task_id.0.starts_with("monitor_") {
@@ -2213,6 +2256,46 @@ impl Thread {
         true
     }
     pub fn run_turn(&mut self, cx: &mut Context<Self>) {
+        // Ensure the background event auto-wake watcher is running. It's
+        // spawned once per thread and lives for the thread's lifetime.
+        // The watcher uses Notify::notified() to wake without consuming
+        // events; when woken, it checks if the thread is idle and if so
+        // triggers run_turn to drain the event bus.
+        if self.bg_watcher.is_none() {
+            let thread_id = self.id.0.clone();
+            let watcher = cx.spawn(async move |this, cx: &mut AsyncApp| {
+                let (_, _, notify) = crate::background_task::ensure_thread_event_bus(&thread_id);
+                loop {
+                    // Wait for a notification. This does not consume events
+                    // from the channel; it only signals that new events
+                    // may be available.
+                    notify.notified().await;
+                    // Check if the thread is idle and has pending events.
+                    let should_wake = this
+                        .update(cx, |this, _| {
+                            if this.running_turn.is_some() {
+                                return false;
+                            }
+                            let (_, rx, _) =
+                                crate::background_task::ensure_thread_event_bus(&this.id.0);
+                            !rx.is_empty()
+                        })
+                        .unwrap_or(false);
+                    if should_wake {
+                        let _ = this.update(cx, |this, cx| {
+                            this.run_turn(cx);
+                        });
+                    }
+                }
+                // Loop forever; the watcher lives for the thread's lifetime.
+                // The `#[allow(unreachable_code)]` suppresses the warning for
+                // the unreachable `Ok` after the infinite `loop`.
+                #[allow(unreachable_code)]
+                {}
+            });
+            self.bg_watcher = Some(watcher);
+        }
+
         if self.running_turn.is_some() {
             return;
         }
@@ -2316,7 +2399,8 @@ impl Thread {
             if !turn_cancelled {
                 let has_bg_events = this
                     .update(cx, |this, _| {
-                        let (_, rx) = crate::background_task::ensure_thread_event_bus(&this.id.0);
+                        let (_, rx, _) =
+                            crate::background_task::ensure_thread_event_bus(&this.id.0);
                         !rx.is_empty()
                     })
                     .unwrap_or(false);
@@ -3223,7 +3307,7 @@ impl Thread {
                         // during the final assistant stream. If any are
                         // pending, continue the loop to inject them.
                         let has_bg_events = this.update(cx, |this, _| {
-                            let (_, rx) =
+                            let (_, rx, _) =
                                 crate::background_task::ensure_thread_event_bus(&this.id.0);
                             !rx.is_empty()
                         })?;

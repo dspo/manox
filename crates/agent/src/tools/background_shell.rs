@@ -127,6 +127,7 @@ fn registry() -> &'static std::sync::Mutex<BackgroundShellRegistry> {
 /// `${CLAUDE_PLUGIN_ROOT}` just like foreground bash.
 pub fn spawn(
     command: String,
+    thread_id: &str,
     cwd: &std::path::Path,
     timeout: Option<Duration>,
     plugin_root: Option<&std::path::Path>,
@@ -189,14 +190,13 @@ pub fn spawn(
     };
 
     // Also register in the unified background_task registry so TaskStop
-    // can find and stop background Bash by its shell id.
     let bg_cancel = tokio_util::sync::CancellationToken::new();
-    let _bg_task = crate::background_task::register_with_id(
+    let bg_task = crate::background_task::register_with_id(
         shell_id.clone(),
         crate::background_task::TaskKind::BackgroundBash,
-        "background_shell".into(),
+        thread_id.into(),
         command.clone(),
-        bg_cancel,
+        bg_cancel.clone(),
     );
 
     let state = {
@@ -215,6 +215,8 @@ pub fn spawn(
     // #[tokio::test] contexts where the test provides its own runtime. Either
     // way, the task runs on a tokio reactor so tokio::process works.
     let state_clone = state.clone();
+    let bg_task_clone = bg_task.clone();
+    let bg_cancel_clone = bg_cancel.clone();
     let driver = async move {
         let stdout_task = tokio::spawn(drain_stream(stdout, state_clone.clone(), "stdout"));
         let stderr_task = tokio::spawn(drain_stream(stderr, state_clone.clone(), "stderr"));
@@ -226,29 +228,44 @@ pub fn spawn(
                 s.exited_at = Some(Instant::now());
             }
         };
-        if let Some(t) = timeout {
-            tokio::select! {
-                _ = wait => {}
-                _ = tokio::time::sleep(t) => {
-                    kill_process_group(&child);
-                    if let Ok(mut s) = state_clone.lock() {
-                        s.exit_code = Some(None);
-                        s.exited_at = Some(Instant::now());
-                    }
-                }
+        // Race: natural exit vs. timeout vs. TaskStop cancellation.
+        tokio::select! {
+            _ = wait => {
+                bg_task_clone.set_terminal(crate::background_task::TaskStatus::Completed);
             }
-        } else {
-            wait.await;
+            _ = bg_cancel_clone.cancelled() => {
+                kill_process_group(&child);
+                if let Ok(mut s) = state_clone.lock() {
+                    s.exit_code = Some(None);
+                    s.exited_at = Some(Instant::now());
+                }
+                bg_task_clone.set_terminal(crate::background_task::TaskStatus::Stopped);
+            }
+            _ = async {
+                if let Some(t) = timeout {
+                    tokio::time::sleep(t).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                kill_process_group(&child);
+                if let Ok(mut s) = state_clone.lock() {
+                    s.exit_code = Some(None);
+                    s.exited_at = Some(Instant::now());
+                }
+                bg_task_clone.set_terminal(crate::background_task::TaskStatus::TimedOut);
+            }
         }
 
         let _ = stdout_task.await;
         let _ = stderr_task.await;
     };
-    if let Some(h) = crate::runtime::try_handle() {
-        h.spawn(driver);
+    let driver_handle = if let Some(h) = crate::runtime::try_handle() {
+        h.spawn(driver)
     } else {
-        tokio::spawn(driver);
-    }
+        tokio::spawn(driver)
+    };
+    bg_task.set_driver_abort(driver_handle.abort_handle());
 
     // Opportunistic GC: sweep shells that exited long ago.
     gc();
@@ -390,6 +407,7 @@ mod tests {
         let cwd = std::path::PathBuf::from(".");
         let id = spawn(
             "echo hello; sleep 0.2; echo world".to_string(),
+            "test-thread",
             &cwd,
             None,
             None,
@@ -424,6 +442,7 @@ mod tests {
         let cwd = std::path::PathBuf::from(".");
         let id = spawn(
             "printf a; sleep 0.1; printf b; sleep 0.1; printf c".to_string(),
+            "test-thread",
             &cwd,
             None,
             None,
