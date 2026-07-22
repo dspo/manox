@@ -1788,6 +1788,7 @@ mod tests {
             .map(|ix| agent::background_task::TaskEvent {
                 task_id: agent::background_task::TaskId("monitor-test".into()),
                 kind: agent::background_task::TaskKind::MonitorCommand,
+                owner_goal_id: None,
                 event: agent::background_task::TaskEventKind::Output(format!("event-{ix}")),
                 thread_seq: ix,
                 task_seq: ix,

@@ -1567,10 +1567,15 @@ impl Thread {
     /// Switch collaboration mode. Plan temporarily gates Goal continuation and
     /// accounting without changing the durable Goal status.
     pub fn set_collaboration_mode(&mut self, mode: ModeKind, cx: &mut Context<Self>) {
+        let entering_plan = self.collaboration_mode != ModeKind::Plan && mode == ModeKind::Plan;
         let leaving_plan = self.collaboration_mode == ModeKind::Plan && mode != ModeKind::Plan;
+        if entering_plan && let Err(error) = self.flush_idle_goal_accounting(cx) {
+            cx.emit(ThreadEvent::Error(error));
+            return;
+        }
         self.collaboration_mode = mode;
         if leaving_plan {
-            self.try_start_goal_turn_if_idle(cx);
+            self.try_start_turn_if_idle(cx);
         }
         cx.notify();
     }
@@ -1667,6 +1672,60 @@ impl Thread {
         });
     }
 
+    fn cancel_goal_background_tasks(&self, goal_id: &str) {
+        let Some(runtime) = crate::runtime::try_handle() else {
+            tracing::warn!(
+                goal_id,
+                "Goal background task cancellation skipped because the runtime is unavailable"
+            );
+            return;
+        };
+        let thread_id = self.id.0.clone();
+        let goal_id = goal_id.to_string();
+        runtime.spawn(async move {
+            crate::background_task::cancel_all_for_goal(&thread_id, &goal_id).await;
+        });
+    }
+
+    /// Persist an Active Goal's idle waiting interval before a lifecycle gate
+    /// such as Plan or Pause stops its clock.
+    fn flush_idle_goal_accounting(&mut self, cx: &mut Context<Self>) -> Result<()> {
+        if self.running_turn.is_some() {
+            return Ok(());
+        }
+        let Some((goal_id, started_at, baseline)) = self.goal_turn_anchor.as_ref() else {
+            return Ok(());
+        };
+        let Some(_) = self.goal().filter(|goal| goal.goal_id == *goal_id) else {
+            self.goal_turn_anchor = None;
+            return Ok(());
+        };
+        let usage = self.cumulative_token_usage();
+        let delta = TokenUsage {
+            input_tokens: usage.input_tokens.saturating_sub(baseline.input_tokens),
+            output_tokens: usage.output_tokens.saturating_sub(baseline.output_tokens),
+            cache_creation_input_tokens: usage
+                .cache_creation_input_tokens
+                .saturating_sub(baseline.cache_creation_input_tokens),
+            cache_read_input_tokens: usage
+                .cache_read_input_tokens
+                .saturating_sub(baseline.cache_read_input_tokens),
+        };
+        let goal_id = goal_id.clone();
+        let db = crate::thread_store::global().read(cx).database();
+        let goal = db.account_goal(
+            &self.id.0,
+            &goal_id,
+            crate::goal::budget_tokens(delta),
+            started_at.elapsed().as_secs(),
+            self.last_user_message_id(),
+        )?;
+        self.goal_runtime.replace_snapshot(Some(goal));
+        self.goal_turn_anchor = None;
+        self.sync_goal_pin(cx);
+        Ok(())
+    }
+
     pub fn set_goal(&mut self, objective: String, cx: &mut Context<Self>) -> Result<()> {
         self.create_goal(objective, None, GoalActor::User, cx)
     }
@@ -1746,7 +1805,7 @@ impl Thread {
                 .push(Message::goal_objective_update(directive));
         }
         cx.emit(ThreadEvent::GoalChanged { active: true });
-        self.try_start_goal_turn_if_idle(cx);
+        self.try_start_turn_if_idle(cx);
         cx.notify();
         Ok(())
     }
@@ -1798,6 +1857,7 @@ impl Thread {
             time_delta,
             turn_id.as_deref(),
         )?;
+        self.cancel_goal_background_tasks(&current.goal_id);
         if let Some(cancel) = self.turn_cancel.as_ref() {
             cancel.cancel();
         }
@@ -1805,7 +1865,7 @@ impl Thread {
         self.goal_runtime.replace_snapshot(Some(replacement));
         self.sync_goal_pin(cx);
         cx.emit(ThreadEvent::GoalChanged { active: true });
-        self.try_start_goal_turn_if_idle(cx);
+        self.try_start_turn_if_idle(cx);
         cx.notify();
         Ok(())
     }
@@ -1817,6 +1877,9 @@ impl Thread {
         actor: GoalActor,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        if status != GoalStatus::Active {
+            self.flush_idle_goal_accounting(cx)?;
+        }
         let current = self
             .goal()
             .cloned()
@@ -1839,9 +1902,12 @@ impl Thread {
         db.update_goal(&current.goal_id, &updated, actor, None)?;
         self.goal_runtime.replace_snapshot(Some(updated));
         self.sync_goal_pin(cx);
+        if status != GoalStatus::Active {
+            self.cancel_goal_background_tasks(&current.goal_id);
+        }
         cx.emit(ThreadEvent::GoalChanged { active: true });
         if status == GoalStatus::Active {
-            self.try_start_goal_turn_if_idle(cx);
+            self.try_start_turn_if_idle(cx);
         } else if status == GoalStatus::Paused
             && matches!(actor, GoalActor::User)
             && let Some(cancel) = self.turn_cancel.as_ref()
@@ -1951,6 +2017,7 @@ impl Thread {
             time_delta,
             turn_id.as_deref(),
         )?;
+        self.cancel_goal_background_tasks(&goal.goal_id);
         if let Some(cancel) = self.turn_cancel.take() {
             cancel.cancel();
         }
@@ -1962,25 +2029,57 @@ impl Thread {
         Ok(())
     }
 
-    /// Start exactly one automatic Goal turn after all higher-priority thread
-    /// work has drained. The reservation is fenced by the current goal id.
-    pub fn try_start_goal_turn_if_idle(&mut self, cx: &mut Context<Self>) {
-        if self.depth != 0
-            || self.collaboration_mode == ModeKind::Plan
-            || self.running_turn.is_some()
-            || !self.pending_steer.is_empty()
+    /// Admit exactly one automatic turn after all higher-priority work has
+    /// drained. Background-task events are consumed before a plain Goal
+    /// continuation, and an Active Goal supplies the ownership reservation for
+    /// either path.
+    pub fn try_start_turn_if_idle(&mut self, cx: &mut Context<Self>) {
+        if self.archived || self.running_turn.is_some() {
+            return;
+        }
+        let has_background_work = if crate::background_task::thread_has_pending_events(&self.id.0) {
+            self.drain_background_events(cx)
+        } else {
+            false
+        };
+        if !self.pending_steer.is_empty()
             || !self.pending_authorizations.is_empty()
             || !self.pending_inbound.is_empty()
             || self.active_model().is_none()
         {
             return;
         }
-        let Some(goal) = self.goal().cloned() else {
+        let goal = self.goal().cloned().filter(|goal| {
+            self.depth == 0
+                && self.collaboration_mode != ModeKind::Plan
+                && goal.status == GoalStatus::Active
+        });
+        if has_background_work {
+            if let Some(goal) = goal {
+                self.start_goal_turn(goal, cx);
+            } else {
+                self.run_turn(cx);
+            }
+            return;
+        }
+        let Some(goal) = goal else {
             return;
         };
-        if goal.status != GoalStatus::Active
-            || !self.goal_runtime.reserve_continuation(&goal.goal_id)
-        {
+        if crate::background_task::goal_has_running_tasks(&self.id.0, &goal.goal_id) {
+            if self.goal_turn_anchor.is_none() {
+                self.goal_turn_anchor = Some((
+                    goal.goal_id.clone(),
+                    Instant::now(),
+                    self.cumulative_token_usage(),
+                ));
+            }
+            return;
+        }
+        self.start_goal_turn(goal, cx);
+    }
+
+    fn start_goal_turn(&mut self, goal: ThreadGoal, cx: &mut Context<Self>) {
+        if !self.goal_runtime.reserve_continuation(&goal.goal_id) {
             return;
         }
         let remaining = goal
@@ -2078,6 +2177,17 @@ impl Thread {
             }
         }
         self.goal_runtime.release_continuation(&goal_id);
+        if self.goal().is_some_and(|goal| {
+            goal.goal_id == goal_id
+                && goal.status == GoalStatus::Active
+                && crate::background_task::goal_has_running_tasks(&self.id.0, &goal_id)
+        }) {
+            self.goal_turn_anchor = Some((
+                goal_id.clone(),
+                Instant::now(),
+                self.cumulative_token_usage(),
+            ));
+        }
         cx.emit(ThreadEvent::GoalChanged {
             active: self.goal().is_some(),
         });
@@ -2830,18 +2940,37 @@ impl Thread {
     /// injected into the conversation as untrusted external data. The model is
     /// trained to treat these as informational, not as user authorization or
     /// instructions.
-    fn drain_background_events(&mut self, cx: &mut Context<Self>) {
+    fn drain_background_events(&mut self, cx: &mut Context<Self>) -> bool {
         let events = crate::background_task::drain_thread_events(&self.id.0);
         if events.is_empty() {
-            return;
+            return false;
         }
+        let current_goal = self.goal().map(|goal| (goal.goal_id.clone(), goal.status));
         // Events are already in thread-seq order from the mailbox.
         let mut body = String::new();
+        let mut should_wake = false;
         for event in &events {
+            let belongs_to_current_goal = event.owner_goal_id.as_deref().is_some_and(|goal_id| {
+                current_goal
+                    .as_ref()
+                    .is_some_and(|(current_id, _)| current_id == goal_id)
+            });
+            if event.owner_goal_id.is_some() && !belongs_to_current_goal {
+                continue;
+            }
             let rendered = crate::background_task::format_event_for_model(event);
             if !rendered.is_empty() {
                 body.push_str(&rendered);
                 body.push('\n');
+                should_wake |= match event.owner_goal_id.as_deref() {
+                    None => true,
+                    Some(_) => {
+                        self.collaboration_mode != ModeKind::Plan
+                            && current_goal
+                                .as_ref()
+                                .is_some_and(|(_, status)| *status == GoalStatus::Active)
+                    }
+                };
             }
         }
         if !body.is_empty() {
@@ -2876,6 +3005,7 @@ impl Thread {
             }
         }
         cx.notify();
+        should_wake
     }
 
     /// Resolve and run a slash command. The command body (with `$ARGUMENTS`
@@ -2946,15 +3076,13 @@ impl Thread {
                             {
                                 return false;
                             }
-                            let should_wake =
-                                crate::background_task::thread_has_pending_model_events(&this.id.0);
-                            this.drain_background_events(cx);
-                            should_wake
+                            let _ = cx;
+                            true
                         })
                         .unwrap_or(false);
                     if should_wake {
                         let _ = this.update(cx, |this, cx| {
-                            this.run_turn(cx);
+                            this.try_start_turn_if_idle(cx);
                         });
                     }
                 }
@@ -2986,6 +3114,10 @@ impl Thread {
         self.goal_budget_stop_injected = false;
         if self.collaboration_mode != ModeKind::Plan
             && let Some(goal) = self.goal().filter(|goal| goal.status == GoalStatus::Active)
+            && self
+                .goal_turn_anchor
+                .as_ref()
+                .is_none_or(|(goal_id, _, _)| goal_id != &goal.goal_id)
         {
             self.goal_turn_anchor = Some((
                 goal.goal_id.clone(),
@@ -3070,27 +3202,7 @@ impl Thread {
             if !successor_running {
                 let _ = this.update(cx, |thread, cx| {
                     thread.finish_goal_turn(turn_cancelled, turn_failed, cx);
-                    thread.try_start_goal_turn_if_idle(cx);
-                });
-            }
-            // Background task event auto-wake: after the turn finishes, check
-            // if events arrived on the shared event bus. If so, start a new
-            // turn to drain them. This is single-flight: only one turn runs
-            // at a time, and events that arrive during the new turn will be
-            // drained by `drain_background_events` at the top of the loop.
-            let has_bg_events = this
-                .update(cx, |this, cx| {
-                    let should_wake =
-                        crate::background_task::thread_has_pending_model_events(&this.id.0);
-                    if crate::background_task::thread_has_pending_events(&this.id.0) {
-                        this.drain_background_events(cx);
-                    }
-                    should_wake
-                })
-                .unwrap_or(false);
-            if has_bg_events {
-                let _ = this.update(cx, |this, cx| {
-                    this.run_turn(cx);
+                    thread.try_start_turn_if_idle(cx);
                 });
             }
         });
@@ -3980,12 +4092,11 @@ impl Thread {
                         // during the final assistant stream. If any are
                         // pending, continue the loop to inject them.
                         let has_bg_events = this.update(cx, |this, cx| {
-                            let should_continue =
-                                crate::background_task::thread_has_pending_model_events(&this.id.0);
                             if crate::background_task::thread_has_pending_events(&this.id.0) {
-                                this.drain_background_events(cx);
+                                this.drain_background_events(cx)
+                            } else {
+                                false
                             }
-                            should_continue
                         })?;
                         if has_bg_events {
                             continue;
@@ -5999,10 +6110,11 @@ pub(crate) fn truncate_summary(s: &str, max_chars: usize) -> String {
 
 /// Whether a message has any non-empty `Text` content block.
 pub(crate) fn message_has_text(m: &Message) -> bool {
-    if m.ui
-        .as_ref()
-        .and_then(|ui| ui.external_event)
-        .unwrap_or(false)
+    if m.is_hidden_from_ui()
+        || m.ui
+            .as_ref()
+            .and_then(|ui| ui.external_event)
+            .unwrap_or(false)
     {
         return false;
     }
@@ -7526,6 +7638,127 @@ mod tests {
     }
 
     #[test]
+    fn goal_waits_for_owned_background_event_before_continuing() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open memory database"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(GoalCompleteMockModel {
+            calls: calls.clone(),
+        });
+        let thread_id = "goal-background-wait";
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                thread_id,
+                "/tmp",
+                vec![Message::user("wait for the monitor".into())],
+            );
+            rec.title = Some("Goal background wait".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+        let (task_id, task) = cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .create_goal(
+                        "finish after monitor output".into(),
+                        Some(100),
+                        GoalActor::User,
+                        cx,
+                    )
+                    .unwrap();
+                let goal_id = thread.goal().unwrap().goal_id.clone();
+                let registered = crate::background_task::register_for_goal(
+                    crate::background_task::TaskKind::MonitorCommand,
+                    thread_id.into(),
+                    "goal monitor".into(),
+                    tokio_util::sync::CancellationToken::new(),
+                    Some(goal_id),
+                );
+                thread.try_start_turn_if_idle(cx);
+                assert!(!thread.is_running());
+                assert!(thread.goal_turn_anchor.is_some());
+                thread.goal_turn_anchor.as_mut().unwrap().1 =
+                    std::time::Instant::now() - std::time::Duration::from_secs(2);
+                thread.set_collaboration_mode(crate::ModeKind::Plan, cx);
+                assert_eq!(thread.goal().unwrap().status, GoalStatus::Active);
+                assert!(thread.goal().unwrap().time_used_seconds >= 2);
+                assert!(thread.goal_turn_anchor.is_none());
+                thread.set_collaboration_mode(crate::ModeKind::Default, cx);
+                assert!(thread.goal_turn_anchor.is_some());
+                assert!(!thread.is_running());
+                registered
+            })
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        task.push_event(&task_id, "monitor ready".into());
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| thread.try_start_turn_if_idle(cx));
+        });
+        cx.update(|cx| {
+            thread.read_with(cx, |thread, _| {
+                let external_ix = thread
+                    .messages
+                    .iter()
+                    .position(|message| {
+                        message
+                            .ui
+                            .as_ref()
+                            .and_then(|ui| ui.external_event)
+                            .unwrap_or(false)
+                    })
+                    .expect("background event message");
+                let continuation_ix = thread
+                    .messages
+                    .iter()
+                    .position(|message| {
+                        message.provenance == crate::MessageProvenance::GoalContinuation
+                    })
+                    .expect("Goal continuation message");
+                assert!(external_ix < continuation_ix);
+            });
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if cx.update(|cx| thread.read(cx).is_running()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "background-driven Goal turn did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            break;
+        }
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        cx.update(|cx| {
+            assert_eq!(thread.read(cx).goal().unwrap().status, GoalStatus::Complete);
+        });
+        crate::background_task::remove(&task_id);
+        crate::background_task::remove_thread_mailbox(thread_id);
+    }
+
+    #[test]
     fn model_blocked_requires_three_distinct_goal_turns() {
         let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
         crate::agent_def::init();
@@ -7696,12 +7929,19 @@ mod tests {
             rec.title = Some("Goal replacement".into());
             super::Thread::restore(rec, Some(model), cx)
         });
-        cx.update(|cx| {
+        let old_task_id = cx.update(|cx| {
             thread.update(cx, |thread, cx| {
                 thread
                     .create_goal("old objective".into(), None, GoalActor::User, cx)
                     .unwrap();
                 let old_id = thread.goal().unwrap().goal_id.clone();
+                let (old_task_id, old_task) = crate::background_task::register_for_goal(
+                    crate::background_task::TaskKind::MonitorCommand,
+                    thread.id.0.clone(),
+                    "old Goal monitor".into(),
+                    tokio_util::sync::CancellationToken::new(),
+                    Some(old_id.clone()),
+                );
                 assert!(thread.goal_runtime.reserve_continuation(&old_id));
                 thread.collaboration_mode = crate::ModeKind::Plan;
                 thread
@@ -7716,11 +7956,24 @@ mod tests {
                 thread.collaboration_mode = crate::ModeKind::Default;
                 thread.model = None;
                 let message_count = thread.messages.len();
-                thread.try_start_goal_turn_if_idle(cx);
+                old_task.push_event(&old_task_id, "late output from old Goal".into());
+                thread.try_start_turn_if_idle(cx);
                 assert_eq!(thread.messages.len(), message_count);
+                assert!(thread.messages.iter().all(|message| {
+                    message.content.iter().all(|content| {
+                        !matches!(
+                            content,
+                            MessageContent::Text(text) if text.contains("late output from old Goal")
+                        )
+                    })
+                }));
                 assert!(thread.goal_runtime.reserve_continuation(&new_id));
-            });
+                old_task_id
+            })
         });
+        cx.run_until_parked();
+        crate::background_task::remove(&old_task_id);
+        crate::background_task::remove_thread_mailbox("goal-replacement-fence");
     }
 
     /// A mock model whose only configurable surface is the two capability flags,

@@ -244,6 +244,14 @@ fn last_assistant_text(messages: &[Message]) -> Option<String> {
 
 /// Concatenate all `Text` blocks of a message into one trimmed string.
 fn message_text(m: &Message) -> Option<String> {
+    if m.is_hidden_from_ui()
+        || m.ui
+            .as_ref()
+            .and_then(|ui| ui.external_event)
+            .unwrap_or(false)
+    {
+        return None;
+    }
     let mut buf = String::new();
     for c in &m.content {
         if let MessageContent::Text(t) = c {
@@ -438,5 +446,30 @@ mod tests {
         assert!(instr.contains(UNCHANGED_SENTINEL));
         assert_eq!(req.temperature, Some(0.3));
         assert!(!req.thinking_allowed);
+    }
+
+    #[test]
+    fn title_sampling_ignores_internal_goal_and_external_event_messages() {
+        let mut external = Message::user("external monitor output".into());
+        external.ui = Some(crate::MessageUiMetadata {
+            external_event: Some(true),
+            ..Default::default()
+        });
+        let messages = vec![
+            Message::user("real objective".into()),
+            Message::goal_continuation("internal Goal snapshot".into()),
+            external,
+            Message::assistant(vec![MessageContent::Text("result".into())]),
+        ];
+        let req = build_topic_shift_request("current", &messages, crate::language::Language::En);
+        let sampled = req.messages[0]
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                MessageContent::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(sampled, "real objective");
     }
 }
