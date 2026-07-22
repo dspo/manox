@@ -3,12 +3,14 @@
 //! the same name.
 //!
 //! Unlike other tools, `run` is never reached in normal operation: the tool
-//! declares `requires_approval = true`, so `Thread::run_tool` routes it
-//! through `ToolCallAuthorization`. The UI renders a question card and sends
-//! back a `ToolAuthorizationResponse::AskUserQuestion` with the answers, which
-//! the thread short-circuits into a `ToolResult` without invoking `run`. The
-//! `run` body here is a defensive fallback for the case where the tool is
-//! ever approved without a question-card response.
+//! declares `requires_user_input = true`, so `Thread::run_tool_inner` routes
+//! it through a dedicated interactive path (never the approval pipeline —
+//! asking a question is read-only and must not be gated by approval modes,
+//! reviewer side calls, or the always-allow cache). The UI renders a question
+//! card and sends back a `ToolAuthorizationResponse::AskUserQuestion` with the
+//! answers, which the thread short-circuits into a `ToolResult` without
+//! invoking `run`. The `run` body here is a defensive fallback for the case
+//! where the tool is ever invoked outside that interactive path.
 
 use gpui::{App, AppContext as _, Task};
 use schemars::JsonSchema;
@@ -79,17 +81,19 @@ impl AgentTool for AskUserQuestionTool {
         super::schema::<AskUserQuestionInput>()
     }
 
-    fn requires_approval(&self, _input: &serde_json::Value) -> bool {
-        true
-    }
-
     fn is_read_only(&self) -> bool {
         true
     }
 
-    /// The authorization gate IS this tool's execution: the thread intercepts
+    /// Each call asks different questions; a name-keyed "always allow" grant
+    /// must never suppress the question card.
+    fn is_always_allowable(&self, _input: &serde_json::Value) -> bool {
+        false
+    }
+
+    /// The interactive path IS this tool's execution: the thread intercepts
     /// the `ToolAuthorizationResponse` and builds the result from the user's
-    /// answers, never reaching `run`. YOLO must not bypass it.
+    /// answers, never reaching `run`. Approval modes must not bypass it.
     fn requires_user_input(&self) -> bool {
         true
     }
@@ -155,6 +159,28 @@ mod tests {
 
         let recommended = find_property(&schema, "recommended").expect("recommended property");
         assert_eq!(recommended.get("type"), Some(&json!("boolean")));
+    }
+
+    #[test]
+    fn ask_user_question_never_enters_the_permission_pipeline() {
+        let tool = AskUserQuestionTool;
+        let input = serde_json::json!({
+            "questions": [{
+                "question": "Pick one?",
+                "header": "Pick",
+                "options": [
+                    {"label": "A", "description": ""},
+                    {"label": "B", "description": ""}
+                ],
+                "multiSelect": false
+            }]
+        });
+        // An approval gate, a reviewer side call, or a stale always-allow
+        // grant must never suppress the question card.
+        assert!(!tool.requires_approval(&input));
+        assert!(!tool.is_always_allowable(&input));
+        assert!(tool.requires_user_input());
+        assert!(tool.is_read_only());
     }
 
     #[test]

@@ -727,25 +727,29 @@ impl Workspace {
                     input,
                 } => {
                     if tool_name == agent::tools::ASK_USER_QUESTION {
+                        // The question card is the only surface for an
+                        // interactive tool — it never queues as a generic
+                        // approval entry.
                         this.pending_ask = parse_pending_ask(id.clone(), input.clone());
                         this.ask_step = 0;
                         this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
+                    } else {
+                        // The `AutoReview` approval agent attaches a one-line reason
+                        // to every tool it escalates back to the overlay; pull it
+                        // out here so the user can see *why* the reviewer did not
+                        // auto-approve. We snapshot-and-clear on the Thread side
+                        // because each reason is single-use — a stale reason on
+                        // the next tool call would mislead the user.
+                        let reason = this
+                            .thread
+                            .update(cx, |t, _cx| t.take_approval_ask_reason(id.as_str()));
+                        this.pending_auths.push(PendingAuth {
+                            id: id.clone(),
+                            tool_name: tool_name.clone(),
+                            summary: summary.clone(),
+                            reason,
+                        });
                     }
-                    // The `AutoReview` approval agent attaches a one-line reason
-                    // to every tool it escalates back to the overlay; pull it
-                    // out here so the user can see *why* the reviewer did not
-                    // auto-approve. We snapshot-and-clear on the Thread side
-                    // because each reason is single-use — a stale reason on
-                    // the next tool call would mislead the user.
-                    let reason = this
-                        .thread
-                        .update(cx, |t, _cx| t.take_approval_ask_reason(id.as_str()));
-                    this.pending_auths.push(PendingAuth {
-                        id: id.clone(),
-                        tool_name: tool_name.clone(),
-                        summary: summary.clone(),
-                        reason,
-                    });
                     this.context_rail.update(cx, |r, cx| {
                         r.cockpit_phase = CockpitPhase::AwaitingApproval;
                         cx.notify();
@@ -2145,14 +2149,30 @@ impl Workspace {
         // stored when the auth event was originally emitted. If the thread was
         // parked waiting for user approval while in the background, re-surface
         // the events so the overlay appears immediately upon switching back.
-        let entries: Vec<(String, String, String)> = self
+        let entries: Vec<(String, String, String, serde_json::Value)> = self
             .thread
             .read(cx)
             .pending_auth_entries()
             .into_iter()
-            .map(|(id, meta)| (id, meta.tool_name.clone(), meta.summary.clone()))
+            .map(|(id, meta)| {
+                (
+                    id,
+                    meta.tool_name.clone(),
+                    meta.summary.clone(),
+                    meta.input.clone(),
+                )
+            })
             .collect();
-        for (id, tool_name, summary) in entries {
+        for (id, tool_name, summary, input) in entries {
+            // AskUserQuestion needs its interactive card state rebuilt too —
+            // without `pending_ask` the generic approval overlay would surface
+            // for a tool that must only ever show the question card.
+            if tool_name == agent::tools::ASK_USER_QUESTION {
+                self.pending_ask = parse_pending_ask(id.clone(), input);
+                self.ask_step = 0;
+                self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
+                continue;
+            }
             let reason = self
                 .thread
                 .update(cx, |t, _cx| t.take_approval_ask_reason(&id));
@@ -2163,7 +2183,7 @@ impl Workspace {
                 reason,
             });
         }
-        if !self.pending_auths.is_empty() {
+        if !self.pending_auths.is_empty() || self.pending_ask.is_some() {
             cx.notify();
         }
     }
@@ -3622,9 +3642,6 @@ impl Workspace {
             answers.push((q.question.clone(), answer));
         }
         let id = ask.id.clone();
-        // Remove the matching entry from the pending-auth queue (it was pushed
-        // alongside the ask card) so it doesn't resurface after the ask resolves.
-        self.pending_auths.retain(|a| a.id != id);
         self.pending_ask = None;
         self.ask_step = 0;
         self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
@@ -3731,11 +3748,6 @@ impl Workspace {
     }
 
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // AskUserQuestion renders its own card; suppress the generic approval
-        // modal while a question card is open (both share the same id).
-        if self.pending_ask.is_some() {
-            return None;
-        }
         let auth = self.pending_auths.last()?;
         let summary = auth.summary.clone();
         let tool_name = auth.tool_name.clone();
@@ -6906,8 +6918,9 @@ fn thread_cwd(thread: &Entity<Thread>, cx: &App) -> Option<SharedString> {
 
 fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk> {
     let questions = input.get("questions")?.as_array()?;
-    // Out-of-range counts violate the tool contract; fall back to the generic
-    // approval path so the defensive tool runner can report a model-visible error.
+    // Out-of-range counts violate the tool contract. No card is shown for
+    // such input; the pending question resolves only when the turn is
+    // cancelled.
     if !(1..=3).contains(&questions.len()) {
         return None;
     }
