@@ -4807,8 +4807,9 @@ impl Thread {
         let needs_approval = tool.requires_approval(&tu.input)
             && !this.read_with(cx, |this, _| {
                 // is_always_allowable gates the AlwaysAllow cache: tools
-                // that need per-call approval (e.g. WebSocket Monitor) must
-                // not be eligible for a name-keyed permission cache entry.
+                // whose every call needs fresh user input (e.g.
+                // AskUserQuestion) must not be eligible for a name-keyed
+                // permission cache entry.
                 let always_allowable = tool.is_always_allowable(&tu.input);
                 (matches!(
                     this.approval_mode,
