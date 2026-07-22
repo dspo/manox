@@ -21,6 +21,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::conversation::{
+    ActivityEntry, AgentTaskItem, BackgroundTaskItem, ConvItem, ThinkingContainer, ToolCallItem,
+    UserImage, UserTurnMeta,
+};
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::thread::ApprovalMode;
 use agent::{Message, TokenUsage, ToolCallStatus, i18n};
@@ -46,10 +50,6 @@ use manox_components::turn_frame::TurnFrame;
 use std::path::{Path, PathBuf};
 
 use crate::Workspace;
-use crate::conversation::{
-    ActivityEntry, AgentTaskItem, ConvItem, ThinkingContainer, ToolCallItem, UserImage,
-    UserTurnMeta,
-};
 use crate::views::centered;
 use crate::workspace::AskCardSnapshot;
 
@@ -616,6 +616,7 @@ pub fn render_item(
             tool_ctx,
             cx,
         ),
+        ConvItem::BackgroundTask(bt) => render_background_task(bt, ix, theme, tool_ctx, cx),
     }
 }
 
@@ -2424,6 +2425,117 @@ pub fn render_agent_task(
                 .child(display_title),
         )
         .into_any_element()
+}
+
+/// Render a background task status card. Shows the task kind icon,
+/// description, task ID, status badge, event/byte counts, and a Stop
+/// button while running.
+fn render_background_task(
+    bt: &BackgroundTaskItem,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+    _cx: &mut App,
+) -> gpui::AnyElement {
+    use agent::background_task::{TaskKind, TaskStatus};
+
+    let is_running = matches!(bt.status, TaskStatus::Running | TaskStatus::Stopping);
+    let kind_str = match bt.kind {
+        TaskKind::MonitorCommand => i18n::t("background-task-kind-command"),
+        TaskKind::MonitorWebSocket => i18n::t("background-task-kind-websocket"),
+        TaskKind::BackgroundBash => i18n::t("background-task-kind-bash"),
+    };
+    let status_str = match bt.status {
+        TaskStatus::Running => i18n::t("background-task-status-running"),
+        TaskStatus::Stopping => i18n::t("background-task-status-stopping"),
+        TaskStatus::Completed => i18n::t("background-task-status-completed"),
+        TaskStatus::Failed => i18n::t("background-task-status-failed"),
+        TaskStatus::TimedOut => i18n::t("background-task-status-timed-out"),
+        TaskStatus::Stopped => i18n::t("background-task-status-stopped"),
+        TaskStatus::SessionEnded => i18n::t("background-task-status-session-ended"),
+    };
+    let (icon_name, icon_color) = match bt.status {
+        TaskStatus::Running | TaskStatus::Stopping => (IconName::LoaderCircle, theme.accent),
+        TaskStatus::Completed => (IconName::CircleCheck, theme.success),
+        TaskStatus::Failed | TaskStatus::TimedOut => (IconName::CircleX, theme.danger),
+        TaskStatus::Stopped | TaskStatus::SessionEnded => (IconName::Minus, theme.muted_foreground),
+    };
+    let title = format!("{kind_str} · {desc}", desc = bt.description);
+    let status_text = format!(
+        "{status_str} · {events} events · {bytes} bytes",
+        events = bt.event_count,
+        bytes = bt.total_bytes,
+    );
+    let _ = bt.exit_code;
+    let _ = tool_ctx;
+    let task_id_for_stop = bt.task_id.clone();
+
+    let row = h_flex()
+        .id(("bg-task", ix))
+        .w_full()
+        .min_w_0()
+        .px_2()
+        .py_1p5()
+        .gap_1p5()
+        .items_center()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .when(is_running, |s| {
+            s.child(
+                Spinner::new()
+                    .icon(icon_name.clone())
+                    .xsmall()
+                    .color(icon_color),
+            )
+        })
+        .when(!is_running, |s| {
+            s.child(Icon::new(icon_name).xsmall().text_color(icon_color))
+        })
+        .child(
+            v_flex()
+                .gap_0p5()
+                .child(
+                    gpui::div()
+                        .truncate()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.foreground)
+                        .child(title),
+                )
+                .child(
+                    gpui::div()
+                        .truncate()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(status_text),
+                ),
+        );
+
+    // Stop button while running.
+    if is_running {
+        row.child(
+            Button::new(("stop-bg-task", ix))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Close)
+                .label(i18n::t("background-task-stop"))
+                .on_click({
+                    let task_id = task_id_for_stop.clone();
+                    move |_, _window, cx: &mut App| {
+                        let task_id = task_id.clone();
+                        drop(cx.background_spawn(async move {
+                            let _ = agent::background_task::stop(&task_id);
+                        }));
+                    }
+                }),
+        )
+        .into_any_element()
+    } else {
+        row.into_any_element()
+    }
 }
 
 /// Map a tool call to its panel rendering kind and the body text the panel

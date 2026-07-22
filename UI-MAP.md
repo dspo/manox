@@ -35,7 +35,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### MessageItem 变体
 
-- [UserMessage](#usermessage) · [AssistantMessage](#assistantmessage) · [ReasoningBlock](#reasoningblock) · [ThinkingStatusRow](#thinkingstatusrow) · [ToolCallCard](#toolcallcard) · [AgentTaskCard](#agenttaskcard) · [ErrorMessage](#errormessage) · [NoticeMessage](#noticemessage) · [RecapCard](#recapcard) · [RetryBadge](#retrybadge)
+- [UserMessage](#usermessage) · [AssistantMessage](#assistantmessage) · [ReasoningBlock](#reasoningblock) · [ThinkingStatusRow](#thinkingstatusrow) · [ToolCallCard](#toolcallcard) · [AgentTaskCard](#agenttaskcard) · [BackgroundTaskCard](#backgroundtaskcard) · [ErrorMessage](#errormessage) · [NoticeMessage](#noticemessage) · [RecapCard](#recapcard) · [RetryBadge](#retrybadge)
 
 ### Footer / Composer
 
@@ -325,6 +325,12 @@ Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see
 #### AgentTaskCard
 
 Compact, single-line sub-agent row: `[status] type · short title`. Running and pending rows use an animated spinner; terminal rows use check, error, or minus icons. The title is always one line with truncation and a full-title tooltip. It deliberately renders no child text, nested messages, copy control, metrics, or expansion affordance. Clicking the row opens or focuses the corresponding read-only [SubagentPanel](#subagentpanel) in the right pane.
+
+> Source: `agent-ui/src/views/message.rs`
+
+#### BackgroundTaskCard
+
+Bordered card showing a background task's kind (Monitor command / Monitor WebSocket / Background Bash), description, status badge (Running / Stopping / Completed / Failed / Timed out / Stopped / Session ended), event count, and total bytes. Running tasks show a spinner icon and a Stop button that calls `background_task::stop`. Terminal tasks show a static status icon. Updated in-place by task ID via `ThreadEvent::BackgroundTaskUpdated` — the card is created when the first event snapshot arrives and never duplicated.
 
 > Source: `agent-ui/src/views/message.rs`
 

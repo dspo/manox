@@ -297,6 +297,13 @@ pub enum ThreadEvent {
         intent: String,
         payload: serde_json::Value,
     },
+    /// A background task's state changed (started, produced events, or
+    /// reached a terminal status). Carries a snapshot for the UI to update
+    /// the task's status card in-place. UI-only: never enters the model's
+    /// message history — the model sees events via the mailbox drain.
+    BackgroundTaskUpdated {
+        snapshot: crate::background_task::TaskSnapshot,
+    },
 }
 
 /// UI metadata for a pending tool-call authorization. Stored alongside the
@@ -2159,6 +2166,19 @@ impl Thread {
             body.push('\n');
         }
         self.insert_user_message(body, cx);
+        // Emit BackgroundTaskUpdated snapshots for tasks that produced
+        // events, so the UI can update status cards in-place.
+        let mut task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for event in &events {
+            task_ids.insert(event.task_id.0.clone());
+        }
+        for tid in &task_ids {
+            if let Some(task) = crate::background_task::get_by_str(tid) {
+                cx.emit(ThreadEvent::BackgroundTaskUpdated {
+                    snapshot: task.snapshot(&crate::background_task::TaskId(tid.clone())),
+                });
+            }
+        }
         cx.notify();
     }
 

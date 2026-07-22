@@ -578,3 +578,16 @@ plan-drawer-clear = Clear & Implement
 ### about.rs (About window)
 about-title = About Manox
 about-ok = OK
+
+# Background task status card
+background-task-kind-command = Monitor (command)
+background-task-kind-websocket = Monitor (WebSocket)
+background-task-kind-bash = Background Bash
+background-task-status-running = Running
+background-task-status-stopping = Stopping
+background-task-status-completed = Completed
+background-task-status-failed = Failed
+background-task-status-timed-out = Timed out
+background-task-status-stopped = Stopped
+background-task-status-session-ended = Session ended
+background-task-stop = Stop
