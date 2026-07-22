@@ -446,6 +446,7 @@ async fn run_command_monitor(
     let exit_reason = tokio::select! {
         _ = cancel.cancelled() => {
             process.close().await;
+            process.cleanup_process_group_after_exit().await;
             "cancelled"
         }
         _ = async {
@@ -456,10 +457,12 @@ async fn run_command_monitor(
             }
         } => {
             process.close().await;
+            process.cleanup_process_group_after_exit().await;
             "timeout"
         }
         code = &mut wait_for_exit => {
             task.set_exit_code(code);
+            process.cleanup_process_group_after_exit().await;
             if code == Some(0) { "eof" } else { "failed" }
         }
     };
@@ -564,9 +567,20 @@ async fn run_ws_monitor(
         {
             Ok(s) => s,
             Err(e) => {
-                task.set_failure_summary(e.clone());
-                task.push_terminal(&task_id, TaskStatus::Failed);
-                return Err(e);
+                let status = ws_connect_failure_status(
+                    cancel.is_cancelled(),
+                    tokio::time::Instant::now() >= connection_deadline,
+                    task.requested_stop_status(),
+                );
+                if status != TaskStatus::Stopped && status != TaskStatus::SessionEnded {
+                    task.set_failure_summary(e.clone());
+                }
+                task.push_terminal(&task_id, status);
+                return if status == TaskStatus::Failed {
+                    Err(e)
+                } else {
+                    Ok(())
+                };
             }
         };
 
@@ -616,6 +630,24 @@ async fn run_ws_monitor(
     task.push_terminal(&task_id, terminal_status);
 
     Ok(())
+}
+
+/// Preserve lifecycle intent when the TCP/TLS/WebSocket handshake loses its
+/// race with TaskStop/session shutdown or the shared connection deadline.
+/// Transport errors that occur before either boundary remain ordinary
+/// failures.
+fn ws_connect_failure_status(
+    cancelled: bool,
+    deadline_elapsed: bool,
+    requested_stop_status: TaskStatus,
+) -> TaskStatus {
+    if cancelled {
+        requested_stop_status
+    } else if deadline_elapsed {
+        TaskStatus::TimedOut
+    } else {
+        TaskStatus::Failed
+    }
 }
 
 #[cfg(test)]
@@ -683,5 +715,26 @@ mod tests {
         let m: MonitorInput = serde_json::from_value(v).unwrap();
         assert!(m.command.is_some());
         assert!(m.ws.is_some());
+    }
+
+    #[test]
+    fn classifies_ws_connect_cancellation_and_deadline() {
+        assert_eq!(
+            ws_connect_failure_status(true, false, TaskStatus::Stopped),
+            TaskStatus::Stopped
+        );
+        assert_eq!(
+            ws_connect_failure_status(true, true, TaskStatus::SessionEnded),
+            TaskStatus::SessionEnded,
+            "explicit lifecycle cancellation wins a simultaneous deadline"
+        );
+        assert_eq!(
+            ws_connect_failure_status(false, true, TaskStatus::Stopped),
+            TaskStatus::TimedOut
+        );
+        assert_eq!(
+            ws_connect_failure_status(false, false, TaskStatus::Stopped),
+            TaskStatus::Failed
+        );
     }
 }

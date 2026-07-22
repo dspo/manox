@@ -162,16 +162,52 @@ impl ManagedProcess {
         // SIGTERM the whole group. kill(-pgid, sig) targets every process in
         // process group `pgid`; the child leads its own group (pgid == pid).
         self.signal_group(libc::SIGTERM);
-        let notified = self.exited.notified();
-        if self.exited_flag.load(Ordering::SeqCst) {
-            return;
-        }
-        let timed_out = tokio::time::timeout(TERM_GRACE, notified).await.is_err();
-        if timed_out && !self.exited_flag.load(Ordering::SeqCst) {
+        if !self.wait_for_process_group_exit(TERM_GRACE).await {
             tracing::warn!(target: "supervisor", %kind, %name, "did not exit on SIGTERM, escalating to SIGKILL");
             self.signal_group(libc::SIGKILL);
-            let _ = tokio::time::timeout(KILL_GRACE, self.exited.notified()).await;
+            let _ = self.wait_for_process_group_exit(KILL_GRACE).await;
         }
+    }
+
+    /// A shell can exit successfully after starting a detached descendant in
+    /// its process group. The direct child has already been reaped in that
+    /// case, so `close` intentionally will not touch its potentially stale
+    /// pgid later. Background command drivers call this immediately after
+    /// observing the direct exit, while the pgid is still owned by that task,
+    /// to prevent the descendant from becoming an orphan.
+    pub async fn cleanup_process_group_after_exit(&self) {
+        if !self.process_group_exists() {
+            return;
+        }
+        self.signal_group(libc::SIGTERM);
+        if !self.wait_for_process_group_exit(TERM_GRACE).await {
+            self.signal_group(libc::SIGKILL);
+            let _ = self.wait_for_process_group_exit(KILL_GRACE).await;
+        }
+    }
+
+    async fn wait_for_process_group_exit(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if !self.process_group_exists() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn process_group_exists(&self) -> bool {
+        let Some(pgid) = self.pgid else {
+            return !self.exited_flag.load(Ordering::SeqCst);
+        };
+        let rc = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     /// Signal every process in this child's process group. `ESRCH` (already gone)

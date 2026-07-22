@@ -182,6 +182,27 @@ pub struct BackgroundTaskItem {
     pub recent_events: Vec<String>,
 }
 
+fn recent_background_task_output(task_id: &str) -> Vec<String> {
+    let Some(task) = agent::background_task::get_by_str(task_id) else {
+        return Vec::new();
+    };
+    latest_background_task_output(task.recent_events())
+}
+
+fn latest_background_task_output(events: Vec<agent::background_task::TaskEvent>) -> Vec<String> {
+    let mut output: Vec<String> = events
+        .into_iter()
+        .rev()
+        .filter_map(|event| match event.event {
+            agent::background_task::TaskEventKind::Output(text) => Some(text),
+            _ => None,
+        })
+        .take(20)
+        .collect();
+    output.reverse();
+    output
+}
+
 impl ConvItem {
     /// Whether this item is a `BackgroundTask` card with the given task ID.
     pub fn is_background_task_with_id(&self, task_id: &str) -> bool {
@@ -1442,41 +1463,12 @@ impl ConversationState {
                             bt.exit_code = snapshot.exit_code;
                             bt.failure_summary = snapshot.failure_summary.clone();
                             // Refresh recent events from the task's ring buffer.
-                            if let Some(task) =
-                                agent::background_task::get_by_str(&task_id)
-                            {
-                                bt.recent_events = task
-                                    .recent_events()
-                                    .iter()
-                                    .filter_map(|e| match &e.event {
-                                        agent::background_task::TaskEventKind::Output(t) => {
-                                            Some(t.clone())
-                                        }
-                                        _ => None,
-                                    })
-                                    .take(20)
-                                    .collect();
-                            }
+                            bt.recent_events = recent_background_task_output(&task_id);
                         }
                     });
                 } else {
                     // New task card.
-                    let recent_events = if let Some(task) =
-                        agent::background_task::get_by_str(&task_id)
-                    {
-                        task.recent_events()
-                            .iter()
-                            .filter_map(|e| match &e.event {
-                                agent::background_task::TaskEventKind::Output(t) => {
-                                    Some(t.clone())
-                                }
-                                _ => None,
-                            })
-                            .take(20)
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let recent_events = recent_background_task_output(&task_id);
                     let ix = self.items.len();
                     let entity = cx.new(|_| {
                         MessageItem::new(
@@ -1786,6 +1778,24 @@ mod tests {
         LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn background_task_card_keeps_latest_twenty_output_events() {
+        let events = (0..25)
+            .map(|ix| agent::background_task::TaskEvent {
+                task_id: agent::background_task::TaskId("monitor-test".into()),
+                kind: agent::background_task::TaskKind::MonitorCommand,
+                event: agent::background_task::TaskEventKind::Output(format!("event-{ix}")),
+                thread_seq: ix,
+                task_seq: ix,
+                timestamp_ms: ix,
+            })
+            .collect();
+        let output = latest_background_task_output(events);
+        assert_eq!(output.len(), 20);
+        assert_eq!(output.first().map(String::as_str), Some("event-5"));
+        assert_eq!(output.last().map(String::as_str), Some("event-24"));
+    }
 
     #[test]
     fn optimistic_steer_rolls_back_and_late_confirmation_heals_tombstone() {

@@ -404,9 +404,7 @@ impl BackgroundTask {
         // Ring buffer eviction
         s.events.push_back(event.clone());
         s.events_byte_count += evt_len;
-        while (s.events_byte_count > MAX_BUFFER_BYTES || s.events.len() > MAX_RING_EVENTS)
-            && s.events.len() > 1
-        {
+        while s.events_byte_count > MAX_BUFFER_BYTES || s.events.len() > MAX_RING_EVENTS {
             if let Some(removed) = s.events.pop_front()
                 && let TaskEventKind::Output(t) = &removed.event
             {
@@ -798,7 +796,8 @@ pub fn thread_has_pending_model_events(thread_id: &str) -> bool {
         .is_some_and(TaskMailbox::has_model_events)
 }
 
-/// Remove a thread's mailbox. Called when the thread is dropped or archived.
+/// Remove a thread's mailbox. Called when the thread is finally dropped;
+/// archiving deliberately retains it so unarchive can replay queued events.
 pub fn remove_thread_mailbox(thread_id: &str) {
     mailboxes()
         .lock()
@@ -1192,6 +1191,27 @@ mod tests {
         assert_eq!(task.total_bytes(), 5);
         remove(&id);
         remove_thread_mailbox("thread-1");
+    }
+
+    #[test]
+    fn oversized_single_event_does_not_break_task_ring_byte_cap() {
+        let cancel = CancellationToken::new();
+        let thread_id = "thread-oversized-task-ring";
+        let (id, task) = register(
+            TaskKind::MonitorCommand,
+            thread_id.into(),
+            "oversized event".into(),
+            cancel,
+        );
+        task.push_event(&id, "x".repeat(MAX_BUFFER_BYTES + 1));
+
+        let state = task.state.lock().expect("task state poisoned");
+        assert!(state.events_byte_count <= MAX_BUFFER_BYTES);
+        assert!(state.events.is_empty());
+        drop(state);
+
+        remove(&id);
+        remove_thread_mailbox(thread_id);
     }
 
     #[test]

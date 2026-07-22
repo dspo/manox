@@ -204,6 +204,7 @@ pub async fn spawn(
         // the final event and no tail output is lost.
         let (terminal_status, code) = tokio::select! {
             code = process.wait_for_exit() => {
+                process.cleanup_process_group_after_exit().await;
                 (
                     if code == Some(0) {
                         crate::background_task::TaskStatus::Completed
@@ -216,6 +217,7 @@ pub async fn spawn(
             _ = bg_cancel_clone.cancelled() => {
                 process.close().await;
                 let code = process.wait_for_exit().await;
+                process.cleanup_process_group_after_exit().await;
                 (
                     bg_task_clone.requested_stop_status(),
                     code,
@@ -230,6 +232,7 @@ pub async fn spawn(
             } => {
                 process.close().await;
                 let code = process.wait_for_exit().await;
+                process.cleanup_process_group_after_exit().await;
                 (
                     crate::background_task::TaskStatus::TimedOut,
                     code,

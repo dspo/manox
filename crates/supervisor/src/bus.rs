@@ -291,4 +291,36 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+
+    // A shell may exit successfully without waiting for a background child.
+    // The background-task driver observes that direct exit and must still
+    // terminate the remaining process group immediately.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_after_parent_exit_reaps_detached_descendant() {
+        let bus = ProcessBus::new();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 >/dev/null 2>&1 &");
+        let spawned = bus
+            .spawn("detached-descendant-test", cmd, ProcessKind::Bash)
+            .await
+            .expect("spawn detached descendant");
+        let pgid = spawned.proc.pgid().expect("pgid");
+
+        tokio::time::timeout(Duration::from_secs(2), spawned.proc.wait_for_exit())
+            .await
+            .expect("shell should exit without waiting for its child");
+        assert_eq!(
+            unsafe { libc::kill(-(pgid as libc::pid_t), 0) },
+            0,
+            "the detached descendant should still demonstrate the leak before cleanup"
+        );
+
+        spawned.proc.cleanup_process_group_after_exit().await;
+        assert_ne!(
+            unsafe { libc::kill(-(pgid as libc::pid_t), 0) },
+            0,
+            "cleanup must leave no process in group {pgid}"
+        );
+    }
 }

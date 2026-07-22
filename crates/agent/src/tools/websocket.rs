@@ -7,6 +7,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
     http::{HeaderValue, Uri},
+    protocol::WebSocketConfig,
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
@@ -142,6 +143,12 @@ pub async fn resolve_and_validate_addrs(
         if ip.is_unspecified() {
             return Err(format!("rejected: {ip} is an unspecified address"));
         }
+        if is_non_unicast_ip(&ip) {
+            return Err(format!("rejected: {ip} is not a public unicast address"));
+        }
+        if is_shared_ipv4(&ip) {
+            return Err(format!("rejected: {ip} is a shared CGNAT address"));
+        }
         if let std::net::IpAddr::V6(v6) = ip
             && v6.to_ipv4_mapped().is_some()
         {
@@ -149,6 +156,21 @@ pub async fn resolve_and_validate_addrs(
         }
     }
     Ok(addrs)
+}
+
+fn is_non_unicast_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_broadcast() || v4.is_multicast(),
+        std::net::IpAddr::V6(v6) => v6.is_multicast(),
+    }
+}
+
+fn is_shared_ipv4(ip: &std::net::IpAddr) -> bool {
+    let std::net::IpAddr::V4(v4) = ip else {
+        return false;
+    };
+    let octets = v4.octets();
+    octets[0] == 100 && (octets[1] & 0xc0) == 64
 }
 
 /// Check if an IP address is in a private range (RFC 1918, RFC 4193).
@@ -199,6 +221,11 @@ pub async fn connect_pinned(
     }
 
     let mut last_err = None;
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(MAX_FRAME_SIZE),
+        max_frame_size: Some(MAX_FRAME_SIZE),
+        ..WebSocketConfig::default()
+    };
     for addr in pinned_addrs {
         // Compute remaining budget from the single deadline so all
         // addresses share one wall-clock budget.
@@ -219,15 +246,24 @@ pub async fn connect_pinned(
                 .map_err(|e| format!("TCP connect failed: {e}"))?;
             let scheme = target.url.starts_with("wss://");
             let ws_stream = if scheme {
-                let (stream, _) = tokio_tungstenite::client_async_tls(req.clone(), stream)
-                    .await
-                    .map_err(|e| format!("TLS handshake failed: {e}"))?;
+                let (stream, _) = tokio_tungstenite::client_async_tls_with_config(
+                    req.clone(),
+                    stream,
+                    Some(ws_config),
+                    None,
+                )
+                .await
+                .map_err(|e| format!("TLS handshake failed: {e}"))?;
                 stream
             } else {
                 let plain = MaybeTlsStream::Plain(stream);
-                let (stream, _) = tokio_tungstenite::client_async(req.clone(), plain)
-                    .await
-                    .map_err(|e| format!("WebSocket handshake failed: {e}"))?;
+                let (stream, _) = tokio_tungstenite::client_async_with_config(
+                    req.clone(),
+                    plain,
+                    Some(ws_config),
+                )
+                .await
+                .map_err(|e| format!("WebSocket handshake failed: {e}"))?;
                 stream
             };
             Ok::<_, String>(ws_stream)
@@ -339,5 +375,18 @@ mod tests {
             .await
             .expect_err("loopback must be rejected");
         assert!(err.contains("loopback"));
+    }
+
+    #[tokio::test]
+    async fn async_resolution_rejects_shared_and_non_unicast_addresses() {
+        let cgnat = resolve_and_validate_addrs("100.64.0.1", 80)
+            .await
+            .expect_err("CGNAT space must be rejected");
+        assert!(cgnat.contains("CGNAT"));
+
+        let multicast = resolve_and_validate_addrs("224.0.0.1", 80)
+            .await
+            .expect_err("multicast space must be rejected");
+        assert!(multicast.contains("public unicast"));
     }
 }
