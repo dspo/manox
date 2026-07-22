@@ -2463,11 +2463,13 @@ fn render_background_task(
     // A background bash description is the full command, heredoc body
     // included — the title keeps only its first line; the complete text is
     // one hover away via the title's tooltip.
-    let title = format!(
-        "{kind_str} · {desc}",
-        desc = bt.description.lines().next().unwrap_or("").trim()
-    );
-    let title_tooltip = bt.description.clone();
+    let first_line = bt.description.lines().next().unwrap_or("").trim();
+    let title = if first_line.is_empty() {
+        kind_str.to_string()
+    } else {
+        format!("{kind_str} · {first_line}")
+    };
+    let title_tooltip = (!bt.description.trim().is_empty()).then(|| bt.description.clone());
     let mut status_text = format!(
         "{status_str} · {task_id} · {events} events · {bytes} bytes",
         task_id = bt.task_id,
@@ -2488,6 +2490,7 @@ fn render_background_task(
 
     let row = h_flex()
         .id(("bg-task", ix))
+        .debug_selector(move || format!("message-overflow-bg-task-row-{ix}"))
         .w_full()
         .min_w_0()
         .px_2()
@@ -2519,6 +2522,7 @@ fn render_background_task(
                 .child(
                     gpui::div()
                         .id(("bg-task-title", ix))
+                        .debug_selector(move || format!("message-overflow-bg-task-title-{ix}"))
                         .w_full()
                         .min_w_0()
                         .truncate()
@@ -2527,8 +2531,10 @@ fn render_background_task(
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.foreground)
                         .child(title)
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(title_tooltip.clone()).build(window, cx)
+                        .when_some(title_tooltip, |d, text| {
+                            d.tooltip(move |window, cx| {
+                                Tooltip::new(text.clone()).build(window, cx)
+                            })
                         }),
                 )
                 .child(
@@ -2547,6 +2553,7 @@ fn render_background_task(
                 .when_some(detail, |column, detail| {
                     column.child(
                         gpui::div()
+                            .debug_selector(move || format!("message-overflow-bg-task-detail-{ix}"))
                             .w_full()
                             .min_w_0()
                             .text_xs()
@@ -3240,6 +3247,27 @@ mod tests {
                 status: ToolCallStatus::Success,
                 is_error: false,
             });
+            // The description carries a heredoc body and the failure summary
+            // holds overlong single lines — the exact shape that used to paint
+            // past the card border.
+            let bg_task_item = ConvItem::BackgroundTask(BackgroundTaskItem {
+                task_id: "bash_overflow".into(),
+                kind: agent::background_task::TaskKind::BackgroundBash,
+                description: format!(
+                    "cd /some/project && run <<'EOF'\n{{\n  \"prompt\": \"{}\"\n}}\nEOF",
+                    "x".repeat(512)
+                ),
+                status: agent::background_task::TaskStatus::Failed,
+                event_count: 3,
+                total_bytes: 2048,
+                exit_code: Some(65),
+                failure_summary: Some(format!(
+                    "sandbox-exec: host must be * or localhost in network address {}",
+                    "y".repeat(512)
+                )),
+                created_at: None,
+                recent_events: Vec::new(),
+            });
             let theme = cx.theme().clone();
             gpui::div()
                 .id("message-overflow-probe")
@@ -3266,6 +3294,16 @@ mod tests {
                         .child(render_item(
                             &agent_item,
                             1,
+                            "test-model",
+                            &theme,
+                            None,
+                            None,
+                            None,
+                            cx,
+                        ))
+                        .child(render_item(
+                            &bg_task_item,
+                            2,
                             "test-model",
                             &theme,
                             None,
@@ -3310,6 +3348,9 @@ mod tests {
             "message-overflow-tool-output-2",
             "message-overflow-agent-row-1",
             "message-overflow-agent-title-1",
+            "message-overflow-bg-task-row-2",
+            "message-overflow-bg-task-title-2",
+            "message-overflow-bg-task-detail-2",
         ] {
             let bounds = cx
                 .debug_bounds(selector)
