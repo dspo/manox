@@ -309,6 +309,12 @@ async fn run_command_monitor(
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    // Cross-app automation (osascript / open -a) is exempt from the approval
+    // gate like any other monitor command, so leave an audit breadcrumb.
+    if crate::sandbox::is_cross_app_automation(command) {
+        tracing::warn!(target: "monitor", %task_id, "cross-app automation via monitor (no approval)");
+    }
+
     let mut c = tokio::process::Command::new("sh");
     c.arg("-c").arg(command);
     c.current_dir(cwd);
@@ -692,6 +698,12 @@ mod tests {
         assert!(!tool.requires_approval(&serde_json::json!({
             "description": "d",
             "ws": {"url": "wss://example.com/ws"},
+        })));
+        // Cross-app automation is also exempt: pin the intentional removal of
+        // the old approval gate so it cannot be reintroduced by accident.
+        assert!(!tool.requires_approval(&serde_json::json!({
+            "description": "d",
+            "command": "osascript -e 'tell application \"Finder\" to quit'",
         })));
     }
 }

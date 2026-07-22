@@ -209,9 +209,9 @@ pub trait AgentTool: Send + Sync + 'static {
         false
     }
     /// Whether this tool can be permanently allowed via the AlwaysAllow path.
-    /// The permission cache is keyed by tool name only; tools that need per-call
-    /// approval (e.g. WebSocket Monitor: each connection is a different target)
-    /// return false here to suppress the cache entry. Default true.
+    /// The permission cache is keyed by tool name only; a tool that needs
+    /// per-call approval returns false here to suppress the cache entry.
+    /// Default true.
     fn is_always_allowable(&self, _input: &serde_json::Value) -> bool {
         true
     }
