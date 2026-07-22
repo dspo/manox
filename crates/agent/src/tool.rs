@@ -51,6 +51,7 @@ pub trait ToolContext {
     /// Whether the owning thread is in YOLO / AutoReview mode (bash uses this
     /// to force the unsandboxed branch without a per-call escalation flag).
     fn yolo(&self) -> bool;
+    fn plan_mode(&self) -> bool;
     /// The loopback port of the thread's in-process network proxy, when the
     /// sandbox network policy is `Restricted`. The sandboxed bash command
     /// is wrapped so the seatbelt only allows outbound to this port, and
@@ -74,6 +75,7 @@ pub struct ToolContextSnapshot {
     agent_label: String,
     team: Option<Entity<crate::team::Team>>,
     yolo: bool,
+    plan_mode: bool,
     network_proxy_port: Option<u16>,
     anchor_message_id: Option<String>,
 }
@@ -93,6 +95,7 @@ impl ToolContextSnapshot {
             agent_label: t.agent_label().to_string(),
             team: t.team().cloned(),
             yolo: t.approval_mode() == crate::thread::ApprovalMode::Yolo,
+            plan_mode: t.collaboration_mode() == crate::collaboration_mode::ModeKind::Plan,
             network_proxy_port: t.network_proxy_port(),
             anchor_message_id: t.last_user_message_id().map(str::to_owned),
         }
@@ -132,6 +135,9 @@ impl ToolContext for ToolContextSnapshot {
     }
     fn yolo(&self) -> bool {
         self.yolo
+    }
+    fn plan_mode(&self) -> bool {
+        self.plan_mode
     }
     fn network_proxy_port(&self) -> Option<u16> {
         self.network_proxy_port
@@ -292,6 +298,34 @@ impl ToolRegistry {
         self.tools
             .values()
             .filter(|tool| allowed.iter().any(|a| a == tool.name()))
+            .map(|tool| LanguageModelRequestTool {
+                name: tool.name().to_string(),
+                description: crate::tools::descriptions::description_for(tool.name(), lang)
+                    .unwrap_or_else(|| tool.description())
+                    .to_string(),
+                input_schema: crate::tools::descriptions::override_schema(
+                    tool.input_schema(),
+                    tool.name(),
+                    lang,
+                ),
+                use_input_streaming: false,
+            })
+            .collect()
+    }
+
+    /// Build a filtered schema in the caller's stable order. Tool discovery
+    /// uses this to append newly activated schemas without reordering the
+    /// existing provider-cache prefix.
+    pub fn to_request_tools_in_order(
+        &self,
+        allowed: &[String],
+        lang: crate::language::Language,
+        read_only: bool,
+    ) -> Vec<LanguageModelRequestTool> {
+        allowed
+            .iter()
+            .filter_map(|name| self.tools.get(name))
+            .filter(|tool| !read_only || tool.is_read_only())
             .map(|tool| LanguageModelRequestTool {
                 name: tool.name().to_string(),
                 description: crate::tools::descriptions::description_for(tool.name(), lang)

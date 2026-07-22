@@ -186,12 +186,21 @@ pub struct ContextOptimizationSettings {
     #[serde(default)]
     pub compact_outputs: bool,
     /// Code-mode orchestration: `off` or `hybrid` (keep native tools + add
-    /// the `Code` tool with QuickJS isolate).
-    /// **Deferred** — the `Code` tool and QuickJS isolate are not yet
-    /// implemented; this field is a config placeholder so settings files
-    /// written against the current schema survive a future upgrade.
+    /// the restricted QuickJS `Code` tool).
     #[serde(default)]
     pub code_mode: CodeModeToggle,
+}
+
+impl ContextOptimizationSettings {
+    /// `compact_outputs` is the original boolean rollout knob; preserve it as
+    /// an `On` alias so existing configurations are not silently ignored.
+    pub fn effective_history_rewrite(self) -> Toggle {
+        if self.compact_outputs {
+            Toggle::On
+        } else {
+            self.history_rewrite
+        }
+    }
 }
 
 /// Three-state toggle for optimization features.
@@ -302,41 +311,91 @@ pub fn side_call_output_cap(policy: SideCallPolicy) -> Option<u32> {
 /// Preset defaults for each side-call purpose (used when the user hasn't
 /// configured a specific key).
 impl SideCallPolicy {
-    pub const fn title_default() -> Self {
+    pub fn title_default() -> Self {
         Self {
             model: String::new(),
-            reasoning_effort: None,
+            reasoning_effort: Some("low".into()),
             max_output_tokens: 128,
             enabled: true,
         }
     }
 
-    pub const fn goal_default() -> Self {
+    pub fn goal_default() -> Self {
         Self {
             model: String::new(),
-            reasoning_effort: None,
+            reasoning_effort: Some("low".into()),
             max_output_tokens: 256,
             enabled: true,
         }
     }
 
-    pub const fn approval_default() -> Self {
+    pub fn approval_default() -> Self {
         Self {
             model: String::new(),
-            reasoning_effort: None,
+            reasoning_effort: Some("low".into()),
             max_output_tokens: 2048,
             enabled: true,
         }
     }
 
-    pub const fn compaction_default() -> Self {
+    pub fn compaction_default() -> Self {
         Self {
             model: String::new(),
-            reasoning_effort: None,
+            reasoning_effort: Some("medium".into()),
             max_output_tokens: 4096,
             enabled: true,
         }
     }
+}
+
+/// Resolve the configured effort. Empty preset strings are translated to the
+/// purpose default here so serde-facing settings stay backwards-compatible.
+pub fn side_call_effort(
+    policy: &SideCallPolicy,
+    default: crate::language_model::ReasoningEffort,
+) -> Option<crate::language_model::ReasoningEffort> {
+    let raw = policy.reasoning_effort.as_deref().unwrap_or("").trim();
+    let effort = match raw {
+        "" => default,
+        "low" => crate::language_model::ReasoningEffort::Low,
+        "medium" => crate::language_model::ReasoningEffort::Medium,
+        "high" => crate::language_model::ReasoningEffort::High,
+        "xhigh" => crate::language_model::ReasoningEffort::XHigh,
+        other => {
+            tracing::warn!(
+                effort = other,
+                "unknown side-call reasoning effort; using default"
+            );
+            default
+        }
+    };
+    Some(effort)
+}
+
+/// Resolve a side-call model override, falling back to the current main model.
+/// An unavailable override warns once per model reference.
+pub fn side_call_model(
+    policy: &SideCallPolicy,
+    main: &crate::language_model::AnyLanguageModel,
+) -> crate::language_model::AnyLanguageModel {
+    if policy.model.trim().is_empty() {
+        return main.clone();
+    }
+    if let Some(model) = crate::model_alias::resolve_model_ref(policy.model.trim()) {
+        return model;
+    }
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let warned = WARNED.get_or_init(Default::default);
+    let mut warned = warned.lock().unwrap();
+    if warned.insert(policy.model.clone()) {
+        tracing::warn!(
+            model = policy.model,
+            fallback = main.id(),
+            "side-call model unavailable; falling back to main model"
+        );
+    }
+    main.clone()
 }
 
 /// Resolve a side-call policy: user-configured fields win; empty/zero fields

@@ -63,6 +63,44 @@ pub enum ToolCallStatus {
     Cancelled,
 }
 
+/// Per-request model-facing projection metrics. Token counts use the same
+/// deterministic bytes/4 estimator as local overflow/compaction decisions;
+/// provider-reported usage remains authoritative once the request completes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextOptimizationMetrics {
+    pub projected_tokens: u64,
+    pub estimated_baseline_tokens: u64,
+    pub saved_tokens: u64,
+    pub shadow_saved_tokens: u64,
+    pub system_tokens: u64,
+    pub mode_tokens: u64,
+    pub project_context_tokens: u64,
+    pub tool_schema_tokens: u64,
+    pub history_tokens: u64,
+    pub tool_result_tokens: u64,
+    pub rewrite_saved_tokens: u64,
+    pub pruning_saved_tokens: u64,
+    pub discovery_saved_tokens: u64,
+    pub image_saved_tokens: u64,
+    pub active_tool_schemas: usize,
+    pub total_tool_schemas: usize,
+    pub activated_tools: Vec<String>,
+    pub code_nested_calls: u64,
+    pub code_raw_tokens: u64,
+    pub code_projected_tokens: u64,
+    pub compactions_avoided: u64,
+    pub prefix_stability_pct: u16,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SideCallMetric {
+    pub purpose: String,
+    pub model: String,
+    pub calls: u64,
+    pub token_usage: TokenUsage,
+    pub latency_ms: u64,
+}
+
 /// User-facing approval policy for tool calls. Drives both the access chip in
 /// the composer and the free / approval branch in `run_turn_loop`. Persisted on
 /// the thread so switching threads restores the mode the user last picked.
@@ -131,7 +169,10 @@ pub enum ThreadEvent {
     /// Live output chunk from a streaming tool (e.g. `bash` stdout/stderr).
     /// Accumulated into the matching tool-call item's `output` until the
     /// final `ToolResult` overwrites it with the canonical (truncated) text.
-    ToolOutput { id: String, chunk: String },
+    ToolOutput {
+        id: String,
+        chunk: String,
+    },
     /// Emitted once when a sub-agent's child `Thread` is constructed and its
     /// first turn is about to start. Carries the parent-side `tool_use_id`,
     /// the sub-agent type + short description (from the model's `description`
@@ -168,7 +209,9 @@ pub enum ThreadEvent {
     },
     /// Approval mode changed. The UI refreshes its badge, access chip, and
     /// the popover's selected row.
-    ApprovalModeChanged { mode: ApprovalMode },
+    ApprovalModeChanged {
+        mode: ApprovalMode,
+    },
     /// A completion turn started. Signals the UI (via `ThreadStore`) that this
     /// thread is now running — covers the gap before the first `AgentText`/
     /// `AgentThinking` delta arrives (model warming up, network latency) so
@@ -202,17 +245,23 @@ pub enum ThreadEvent {
     /// UI-only: never enters the model's message history. The block content is
     /// stripped from the assistant message so the model never re-reads its own
     /// plan next turn.
-    PlanDelta { delta: String },
+    PlanDelta {
+        delta: String,
+    },
     /// A turn ended with a complete `<proposed_plan>` block. The UI shows the
     /// Plan Implementation overlay; the user's choice arrives via the
     /// workspace's plan-review handler. UI-only: never enters history.
-    PlanReady { plan_text: String },
+    PlanReady {
+        plan_text: String,
+    },
     /// The model published a structured task list via `UpdatePlan`. The Context
     /// Rail renders `snapshot` as an execution overview. This is a UI mirror of
     /// the tool call — the authoritative record is the `ToolUse`/`ToolResult`
     /// pair in history, from which `plan::rebuild_from_messages` recovers the
     /// snapshot on reload. An empty snapshot means the model cleared its plan.
-    PlanUpdated { snapshot: crate::plan::PlanSnapshot },
+    PlanUpdated {
+        snapshot: crate::plan::PlanSnapshot,
+    },
     /// The prefix-stability fingerprint for this turn vs. the previous one.
     /// Emitted every turn with the current stability ratio plus the drift
     /// flags so subscribers (e.g. future telemetry or debug views) can
@@ -224,23 +273,39 @@ pub enum ThreadEvent {
         system_changed: bool,
         tools_changed: bool,
     },
+    /// Actual and shadow savings for the just-built model request. This is a
+    /// projection-only diagnostic; canonical thread history is never sampled
+    /// through a destructive transform.
+    ContextOptimizationUpdated(ContextOptimizationMetrics),
+    /// Cumulative side-call breakdown, sorted by purpose for stable rendering.
+    SideCallMetricsUpdated(Vec<SideCallMetric>),
+    MainCallMetricsUpdated(SideCallMetric),
     /// Cumulative token usage changed (a `UsageUpdate` landed). The UI refreshes
     /// its token counter. Carries the thread-wide cumulative, not per-request.
     TokenUsageUpdated(TokenUsage),
     /// The user switched models mid-conversation. The store records a
     /// `model_change` event for the history timeline; emitted from `set_model`.
-    ModelChanged { from: Option<String>, to: String },
+    ModelChanged {
+        from: Option<String>,
+        to: String,
+    },
     /// Reasoning effort changed. The UI persists the new value to the thread record.
-    ReasoningEffortChanged { effort: ReasoningEffort },
+    ReasoningEffortChanged {
+        effort: ReasoningEffort,
+    },
     /// Goal mode toggled on/off. The UI shows or hides the `◎ /goal active`
     /// chip and, on activation, starts its elapsed-time ticker.
-    GoalChanged { active: bool },
+    GoalChanged {
+        active: bool,
+    },
     /// Auto-compaction summarization pass started: the side-LLM call in
     /// `stream_summary` is in flight. The cockpit flips to a "Summarizing
     /// context…" phase until the matching `Compaction` event lands. Carries
     /// the active-token total that crossed the trigger threshold, mirroring
     /// `Compaction::tokens_before`.
-    CompactionStarted { tokens_before: u64 },
+    CompactionStarted {
+        tokens_before: u64,
+    },
     /// A compaction pass landed: older history was replaced by a handoff
     /// summary message. `messages_compacted` is the count of messages folded
     /// into the summary; `tokens_before` is the active-token total that
@@ -265,14 +330,19 @@ pub enum ThreadEvent {
     /// Rendered as a `💬 from {name}` bubble, distinct from user/assistant
     /// turns. The thread also received a user-role message carrying the same
     /// content (so the model sees it); this event is the UI-side mirror.
-    PeerMessage { from: String, content: String },
+    PeerMessage {
+        from: String,
+        content: String,
+    },
     /// A queued steer follow-up was drained into `messages` at the next safe
     /// join point — the running turn has now absorbed it and will see it on
     /// its next round. The UI moves the matching queued card into the
     /// conversation at this moment so the bubble's stream position marks the
     /// turn that was actually steered. Carries the drained message's id so the
     /// UI can correlate it back to the parked queue item.
-    SteerInjected { message_id: String },
+    SteerInjected {
+        message_id: String,
+    },
     /// A page-state notification from a built-in browser tab routed to the
     /// owning thread. `EvalResult` and `UserHandback` are resolved in the host
     /// (against pending oneshots) and never reach here; this event carries the
@@ -682,6 +752,12 @@ pub struct Thread {
     /// Decoupled from the message list: the triggering user-message id is
     /// passed in by `Thread` on each `accumulate` / `finalize_request`.
     token_meter: TokenMeter,
+    /// Session-local title/goal/approval/compaction usage and latency. The
+    /// aggregate token meter remains the persisted billing source of truth.
+    side_call_metrics: HashMap<String, SideCallMetric>,
+    main_call_metric: SideCallMetric,
+    current_model_call_started: Option<std::time::Instant>,
+    avoided_compactions: AtomicU64,
     /// Monotonic counter stamped into every `snapshot()` so the db `upsert`
     /// can reject out-of-order writes. `save_thread` is fire-and-forget: an
     /// older snapshot (e.g. taken at submit, before the turn produced assistant
@@ -891,6 +967,13 @@ impl Thread {
                 created_at: now,
                 interacted_at: now,
                 token_meter: TokenMeter::default(),
+                side_call_metrics: HashMap::new(),
+                main_call_metric: SideCallMetric {
+                    purpose: "main".into(),
+                    ..Default::default()
+                },
+                current_model_call_started: None,
+                avoided_compactions: AtomicU64::new(0),
                 persist_revision: AtomicU64::new(0),
                 background_tasks: Vec::new(),
                 ui_notes: Vec::new(),
@@ -1011,6 +1094,13 @@ impl Thread {
                     rec.request_token_usage,
                     rec.per_model_token_usage,
                 ),
+                side_call_metrics: HashMap::new(),
+                main_call_metric: SideCallMetric {
+                    purpose: "main".into(),
+                    ..Default::default()
+                },
+                current_model_call_started: None,
+                avoided_compactions: AtomicU64::new(0),
                 persist_revision: AtomicU64::new(rec.revision),
                 background_tasks,
                 ui_notes: Vec::new(),
@@ -1103,6 +1193,13 @@ impl Thread {
                 created_at: chrono::Utc::now().timestamp(),
                 interacted_at: chrono::Utc::now().timestamp(),
                 token_meter: TokenMeter::default(),
+                side_call_metrics: HashMap::new(),
+                main_call_metric: SideCallMetric {
+                    purpose: "main".into(),
+                    ..Default::default()
+                },
+                current_model_call_started: None,
+                avoided_compactions: AtomicU64::new(0),
                 persist_revision: AtomicU64::new(0),
                 background_tasks: Vec::new(),
                 ui_notes: Vec::new(),
@@ -1776,6 +1873,96 @@ impl Thread {
     /// Per-model cumulative token usage, keyed by model display name.
     pub fn per_model_token_usage(&self) -> &HashMap<String, TokenUsage> {
         self.token_meter.per_model()
+    }
+
+    pub(crate) fn record_side_call(
+        &mut self,
+        purpose: &str,
+        model: &str,
+        usage: Option<TokenUsage>,
+        elapsed: std::time::Duration,
+        cx: &mut Context<Self>,
+    ) {
+        let metric = self
+            .side_call_metrics
+            .entry(purpose.to_string())
+            .or_insert_with(|| SideCallMetric {
+                purpose: purpose.to_string(),
+                model: model.to_string(),
+                ..Default::default()
+            });
+        metric.model = model.to_string();
+        metric.calls = metric.calls.saturating_add(1);
+        metric.latency_ms = metric
+            .latency_ms
+            .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64);
+        if let Some(usage) = usage {
+            metric.token_usage.input_tokens = metric
+                .token_usage
+                .input_tokens
+                .saturating_add(usage.input_tokens);
+            metric.token_usage.output_tokens = metric
+                .token_usage
+                .output_tokens
+                .saturating_add(usage.output_tokens);
+            metric.token_usage.cache_creation_input_tokens = metric
+                .token_usage
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens);
+            metric.token_usage.cache_read_input_tokens = metric
+                .token_usage
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens);
+            self.token_meter.accumulate_side_call_usage(usage, model);
+            cx.emit(ThreadEvent::TokenUsageUpdated(
+                self.cumulative_token_usage(),
+            ));
+        }
+        let mut metrics: Vec<_> = self.side_call_metrics.values().cloned().collect();
+        metrics.sort_by(|left, right| left.purpose.cmp(&right.purpose));
+        cx.emit(ThreadEvent::SideCallMetricsUpdated(metrics));
+    }
+
+    fn record_main_call(&mut self, cx: &mut Context<Self>) {
+        let Some(started) = self.current_model_call_started.take() else {
+            return;
+        };
+        self.main_call_metric.model = self
+            .model
+            .as_ref()
+            .map(|model| model.name())
+            .unwrap_or_default();
+        self.main_call_metric.calls = self.main_call_metric.calls.saturating_add(1);
+        self.main_call_metric.latency_ms = self
+            .main_call_metric
+            .latency_ms
+            .saturating_add(started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        let usage = self.token_meter.current_request();
+        self.main_call_metric.token_usage.input_tokens = self
+            .main_call_metric
+            .token_usage
+            .input_tokens
+            .saturating_add(usage.input_tokens);
+        self.main_call_metric.token_usage.output_tokens = self
+            .main_call_metric
+            .token_usage
+            .output_tokens
+            .saturating_add(usage.output_tokens);
+        self.main_call_metric
+            .token_usage
+            .cache_creation_input_tokens = self
+            .main_call_metric
+            .token_usage
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        self.main_call_metric.token_usage.cache_read_input_tokens = self
+            .main_call_metric
+            .token_usage
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
+        cx.emit(ThreadEvent::MainCallMetricsUpdated(
+            self.main_call_metric.clone(),
+        ));
     }
 
     /// Fold a streaming `UsageUpdate` into the meter. The caller emits the
@@ -2512,12 +2699,18 @@ impl Thread {
             .read_with(cx, |this, _| (this.messages.clone(), this.agent_language))
             .unwrap_or_default();
 
-        let verdict: GoalVerdict =
-            goal::evaluate(model, &condition, &messages, lang, cancel, cx).await;
+        let goal_policy = crate::settings::side_calls().goal_policy();
+        let goal_model = crate::settings::side_call_model(&goal_policy, model);
+        let goal_model_name = goal_model.name();
+        let started = std::time::Instant::now();
+        let evaluation = goal::evaluate(&goal_model, &condition, &messages, lang, cancel, cx).await;
+        let elapsed = started.elapsed();
+        let verdict: GoalVerdict = evaluation.verdict;
 
         // Write the verdict back and decide continue vs. clear vs. abort.
         let action = this
             .update(cx, |this, cx| {
+                this.record_side_call("goal", &goal_model_name, evaluation.usage, elapsed, cx);
                 this.goal_cancel = None;
                 // The goal was cleared while the evaluator was in flight (user
                 // hit `/goal clear` or cancel) — drop the result silently.
@@ -2600,7 +2793,7 @@ impl Thread {
     /// history — crosses `max_input * threshold_pct` (see
     /// `compact::effective_context_tokens`).
     fn auto_compaction_target(&self) -> Option<usize> {
-        if self.depth != 0 {
+        if self.depth != 0 || !crate::settings::side_calls().compaction_policy().enabled {
             return None;
         }
         let settings = crate::settings::load();
@@ -2618,14 +2811,32 @@ impl Thread {
             Some(window) => (window, crate::compact::CLAUDE_CODE_AUTO_COMPACT_THRESHOLD),
             None => (model.max_token_count(), settings.auto_compact.threshold),
         };
-        crate::compact::auto_compaction_target_ix(
+        let target = crate::compact::auto_compaction_target_ix(
             &self.messages,
             self.token_meter.per_request(),
             settings.auto_compact.enabled,
             max_input,
             threshold,
             self.agent_language,
-        )
+        )?;
+        if crate::settings::context_optimization().history_pruning == crate::settings::Toggle::On {
+            let prefix = &self.messages[..target.min(self.messages.len())];
+            if let Some(pruned) =
+                crate::retention::prune_for_compaction(prefix, self.cwd.as_ref(), &self.id.0)
+            {
+                let threshold_tokens = ((max_input as f64) * threshold).ceil() as u64;
+                if crate::compact::effective_context_tokens(
+                    &pruned,
+                    &std::collections::HashMap::new(),
+                    self.agent_language,
+                ) < threshold_tokens
+                {
+                    self.avoided_compactions.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+        Some(target)
     }
 
     /// Manually trigger a compaction (`/compact`). No-op when a turn is in
@@ -2633,7 +2844,8 @@ impl Thread {
     /// there is nothing to summarize. Runs the side LLM call in a spawned task
     /// so the call site returns immediately.
     pub fn compact(&mut self, cx: &mut Context<Self>) {
-        if self.running_turn.is_some() {
+        if self.running_turn.is_some() || !crate::settings::side_calls().compaction_policy().enabled
+        {
             return;
         }
         let Some(model) = self.model.clone() else {
@@ -2681,6 +2893,9 @@ impl Thread {
         cancel: &CancellationToken,
         cx: &mut AsyncApp,
     ) -> Result<bool> {
+        if !crate::settings::side_calls().compaction_policy().enabled {
+            return Ok(false);
+        }
         let insertion_ix = this.read_with(cx, |this, _| {
             crate::compact::forced_compaction_target_ix(&this.messages)
         })?;
@@ -2698,6 +2913,11 @@ impl Thread {
         cancel: &CancellationToken,
         cx: &mut AsyncApp,
     ) -> Result<String> {
+        let compaction_policy = crate::settings::side_calls().compaction_policy();
+        if !compaction_policy.enabled {
+            anyhow::bail!("compaction side call is disabled");
+        }
+        let compaction_model = crate::settings::side_call_model(&compaction_policy, model);
         let tokens_before = this
             .read_with(cx, |this, _| {
                 this.token_meter
@@ -2716,51 +2936,121 @@ impl Thread {
             cx.emit(ThreadEvent::CompactionStarted { tokens_before });
             cx.notify();
         })?;
-        let request = this.read_with(cx, |this, _| {
+        let mut request = this.read_with(cx, |this, _| {
+            let bound = insertion_ix.min(this.messages.len());
+            let source = &this.messages[..bound];
+            let projected = if crate::settings::context_optimization().history_pruning
+                == crate::settings::Toggle::On
+            {
+                crate::retention::prune_for_compaction(source, this.cwd.as_ref(), &this.id.0)
+                    .unwrap_or_else(|| source.to_vec())
+            } else {
+                source.to_vec()
+            };
             crate::compact::build_compaction_request(
-                &this.messages,
-                insertion_ix,
+                &projected,
+                projected.len(),
                 this.agent_language,
             )
         })?;
+        request.messages = crate::optimizer::apply_image_policy(
+            request.messages,
+            compaction_model.supports_images(),
+            Some(
+                compaction_model
+                    .max_token_count()
+                    .saturating_mul(4)
+                    .min(usize::MAX as u64) as usize,
+            ),
+        );
+        request.messages = crate::compact::coalesce_same_role(request.messages);
+        let side_call_started = std::time::Instant::now();
         let (summary, usage) =
-            crate::compact::stream_summary(model, request, cancel.clone(), cx).await?;
+            crate::compact::stream_summary(&compaction_model, request, cancel.clone(), cx).await?;
+        let side_call_elapsed = side_call_started.elapsed();
+
+        let capsule = this.read_with(cx, |this, _| {
+            let bound = insertion_ix.min(this.messages.len());
+            let plan_steps =
+                crate::plan::rebuild_from_messages(&this.messages[..bound]).map(|snapshot| {
+                    snapshot
+                        .steps
+                        .into_iter()
+                        .map(|step| crate::compact::PlanStepCapsule {
+                            title: step.step,
+                            status: serde_json::to_value(step.status)
+                                .ok()
+                                .and_then(|value| value.as_str().map(str::to_string))
+                                .unwrap_or_else(|| "unknown".into()),
+                        })
+                        .collect()
+                });
+            let active_tools = if crate::tools::tool_search::is_active() {
+                crate::tools::tool_search::schema_order(&this.id.0)
+            } else {
+                this.tools
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect()
+            };
+            (
+                this.cwd.clone(),
+                this.messages
+                    .get(bound.saturating_sub(1))
+                    .map(|message| message.id.clone()),
+                this.worktree
+                    .as_ref()
+                    .map(|worktree| worktree.branch.clone()),
+                this.worktree
+                    .as_ref()
+                    .map(|worktree| worktree.path.display().to_string()),
+                plan_steps,
+                this.goal.as_ref().map(|goal| goal.condition.clone()),
+                this.collaboration_mode.display_name().to_string(),
+                active_tools,
+                crate::compact::active_skills(&this.messages, bound),
+                crate::compact::artifact_references(&this.messages, bound),
+            )
+        })?;
+        let git_status = crate::compact::git_status_snapshot(capsule.0.clone()).await;
+        let git_branch = capsule.2.clone().or_else(|| {
+            git_status
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("## "))
+                .and_then(|line| line.split_once("...").map(|(branch, _)| branch))
+                .map(str::to_string)
+        });
+        let background_shells = this.read_with(cx, |thread, _| {
+            crate::tools::background_shell::snapshots(&thread.id.0)
+        })?;
+        let state =
+            crate::compact::collect_compaction_state(crate::compact::CompactionStateInput {
+                cwd: &capsule.0,
+                covered_message_id: capsule.1.as_deref(),
+                worktree_branch: capsule.2.as_deref(),
+                worktree_path: capsule.3.as_deref(),
+                git_branch: git_branch.as_deref(),
+                git_status: Some(git_status),
+                plan_steps: capsule.4,
+                goal: capsule.5.as_deref(),
+                collaboration_mode: Some(&capsule.6),
+                active_tools: capsule.7,
+                active_skills: capsule.8,
+                background_shells,
+                artifacts: capsule.9,
+            });
 
         let messages_compacted = this
             .read_with(cx, |this, _| insertion_ix.min(this.messages.len()))
             .unwrap_or(insertion_ix);
         this.update(cx, |this, cx| {
-            // Attribute the side call's tokens to the cumulative + per-model
-            // meter only — no per-user-message attribution, and never touch
-            // `current_request` (the call has no triggering user message, so
-            // stamping its tokens there would let the next `finalize_request`
-            // mis-attribute them to the following user message). Emitted so the
-            // UI counter reflects the spend.
-            if let Some(u) = usage {
-                if let Some(model) = this.model.as_ref() {
-                    this.token_meter
-                        .accumulate_side_call_usage(u, &model.name());
-                }
-                cx.emit(ThreadEvent::TokenUsageUpdated(
-                    this.cumulative_token_usage(),
-                ));
-            }
-            // Build the state capsule for the compaction envelope so the next
-            // summarizer pass can run incrementally (previous summary + delta).
-            let wt_path_str = this.worktree.as_ref().map(|w| w.path.display().to_string());
-            // The worktree branch IS the effective git branch when active;
-            // outside a worktree, the branch is not probed (a side effect
-            // that doesn't belong here). Plan steps live in message history
-            // and are reconstructed on restore — the capsule carries only
-            // lightweight hints.
-            let state = crate::compact::collect_compaction_state(
-                &this.cwd,
-                this.worktree.as_ref().map(|w| w.branch.as_str()),
-                wt_path_str.as_deref(),
-                this.worktree.as_ref().map(|w| w.branch.as_str()),
-                None, // plan steps recovered from message history
-                this.goal.as_ref().map(|g| g.condition.as_str()),
-                this.tools.iter().map(|t| t.name().to_string()).collect(),
+            this.record_side_call(
+                "compaction",
+                &compaction_model.name(),
+                usage,
+                side_call_elapsed,
+                cx,
             );
             let envelope = crate::compact::build_compaction_envelope(summary.clone(), state);
             let compaction_msg =
@@ -2847,6 +3137,7 @@ impl Thread {
             }
             // Attribute partial usage from the cancelled turn and reset the
             // per-request counter so the next turn's delta starts from zero.
+            self.record_main_call(cx);
             self.finalize_request_usage();
             cx.emit(ThreadEvent::Stop(StopReason::Cancelled));
             cx.notify();
@@ -2973,8 +3264,14 @@ impl Thread {
                     system_changed: change.is_some_and(|c| c.system_changed),
                     tools_changed: change.is_some_and(|c| c.tools_changed),
                 });
+                cx.emit(ThreadEvent::ContextOptimizationUpdated(
+                    this.context_optimization_metrics(&request),
+                ));
             })?;
 
+            this.update(cx, |this, _| {
+                this.current_model_call_started = Some(std::time::Instant::now());
+            })?;
             let mut stream = tokio::select! {
                 // A handshake failure (network drop after retries, auth error,
                 // etc.) does not end the turn dead: no event was ever produced,
@@ -2985,6 +3282,7 @@ impl Thread {
                 s = model.stream_completion(request, cx) => match s {
                     Ok(s) => s,
                     Err(e) => {
+                        let _ = this.update(cx, |this, cx| this.record_main_call(cx));
                         // A context-overflow rejection is deterministic: the
                         // identical request can never succeed, so skip the
                         // nudge-and-retry and spend the turn's single
@@ -3051,7 +3349,10 @@ impl Thread {
                         continue;
                     }
                 },
-                _ = cancel.cancelled() => break,
+                _ = cancel.cancelled() => {
+                    let _ = this.update(cx, |this, cx| this.record_main_call(cx));
+                    break;
+                },
             };
             let mut cancelled = false;
             loop {
@@ -3113,6 +3414,7 @@ impl Thread {
                     break;
                 }
             }
+            let _ = this.update(cx, |this, cx| this.record_main_call(cx));
             if cancelled {
                 break;
             }
@@ -3421,23 +3723,46 @@ impl Thread {
                         approval_tus.extend(auto_review_tus);
                     }
                     Some(model) => {
+                        let review_items: Vec<crate::approval::ReviewItem> = auto_review_tus
+                            .iter()
+                            .map(|tu| crate::approval::ReviewItem {
+                                id: tu.id.clone(),
+                                tool_name: tu.name.to_string(),
+                                tool_title: tool_title(&tu.name, &tu.input),
+                                tool_input: tu.input.clone(),
+                            })
+                            .collect();
+                        let started = std::time::Instant::now();
+                        let review = crate::approval::review_batch(
+                            model,
+                            &review_items,
+                            &cwd,
+                            lang,
+                            cancel_for_review.clone(),
+                            cx,
+                        )
+                        .await;
+                        let elapsed = started.elapsed();
+                        let _ = this.update(cx, |thread, cx| {
+                            thread.record_side_call(
+                                "approval",
+                                &review.model_name,
+                                review.usage,
+                                elapsed,
+                                cx,
+                            );
+                        });
+                        let verdicts = review.verdicts;
                         for tu in auto_review_tus {
                             if cancel_for_review.is_cancelled() {
                                 approval_tus.push(tu);
                                 continue;
                             }
-                            let title = tool_title(&tu.name, &tu.input);
-                            let verdict = crate::approval::review(
-                                model,
-                                &tu.name,
-                                &tu.input,
-                                &title,
-                                &cwd,
-                                lang,
-                                cancel_for_review.clone(),
-                                cx,
-                            )
-                            .await;
+                            let verdict = verdicts.get(&tu.id).cloned().unwrap_or(
+                                crate::approval::ReviewVerdict::Ask {
+                                    reason: "auto-review verdict missing; please confirm".into(),
+                                },
+                            );
                             match verdict {
                                 crate::approval::ReviewVerdict::Allow => free_tus.push(tu),
                                 crate::approval::ReviewVerdict::Ask { reason } => {
@@ -3570,6 +3895,342 @@ impl Thread {
         Ok(())
     }
 
+    async fn run_code_inner(
+        this: gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        cancel: CancellationToken,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let title = tool_title(crate::tools::CODE, &tu.input);
+        let script = serde_json::from_value::<crate::tools::code::CodeInput>(tu.input.clone())
+            .map(|input| input.script);
+        let Ok(script) = script else {
+            let output = "invalid Code input: expected only a string field `script`".to_string();
+            Self::emit_tool_result(&this, &id, crate::tools::CODE, &title, &output, true, cx)?;
+            Self::append_tool_result(&this, tu, output, true, cx)?;
+            return Ok(());
+        };
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: crate::tools::CODE.to_string(),
+                title: title.clone(),
+                status: ToolCallStatus::Running,
+                input: Some(tu.input.clone()),
+            });
+        })?;
+
+        let (request_tx, request_rx) = async_channel::bounded(crate::tools::code::MAX_CONCURRENCY);
+        let done = crate::tools::code::spawn_script(script, request_tx, cancel.clone());
+        let mut active = futures::stream::FuturesUnordered::new();
+        let approval_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let mut outcome: Option<Result<crate::tools::code::ScriptOutcome, String>> = None;
+        let mut audit = Vec::new();
+
+        loop {
+            while active.len() < crate::tools::code::MAX_CONCURRENCY {
+                let Ok(request) = request_rx.try_recv() else {
+                    break;
+                };
+                let nested_id = format!("{id}/{}", request.sequence + 1);
+                let audit_name = request.tool_name.clone();
+                let audit_input = request.input.clone();
+                let nested_cancel = cancel.clone();
+                let nested_approval_gate = approval_gate.clone();
+                let task = this.update(cx, |_, cx| {
+                    cx.spawn(async move |this, cx: &mut AsyncApp| {
+                        let response = Self::run_code_nested(
+                            this,
+                            nested_id,
+                            request.tool_name,
+                            request.input,
+                            nested_cancel,
+                            nested_approval_gate,
+                            cx,
+                        )
+                        .await;
+                        let _ = request.response.send(response.clone());
+                        crate::tools::code::AuditEntry {
+                            sequence: request.sequence,
+                            tool_name: audit_name,
+                            input: audit_input,
+                            ok: response.ok,
+                            output: response.output,
+                        }
+                    })
+                })?;
+                active.push(task);
+            }
+
+            if outcome.is_some() && active.is_empty() {
+                break;
+            }
+            tokio::select! {
+                result = done.recv(), if outcome.is_none() => {
+                    outcome = Some(result.unwrap_or_else(|_| Err("QuickJS worker stopped".into())));
+                }
+                Some(entry) = active.next(), if !active.is_empty() => {
+                    audit.push(entry);
+                }
+                request = request_rx.recv(), if outcome.is_none() && active.len() < crate::tools::code::MAX_CONCURRENCY => {
+                    if let Ok(request) = request {
+                        let nested_id = format!("{id}/{}", request.sequence + 1);
+                        let audit_name = request.tool_name.clone();
+                        let audit_input = request.input.clone();
+                        let nested_cancel = cancel.clone();
+                        let nested_approval_gate = approval_gate.clone();
+                        let task = this.update(cx, |_, cx| {
+                            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                                let response = Self::run_code_nested(
+                                    this,
+                                    nested_id,
+                                    request.tool_name,
+                                    request.input,
+                                    nested_cancel,
+                                    nested_approval_gate,
+                                    cx,
+                                ).await;
+                                let _ = request.response.send(response.clone());
+                                crate::tools::code::AuditEntry {
+                                    sequence: request.sequence,
+                                    tool_name: audit_name,
+                                    input: audit_input,
+                                    ok: response.ok,
+                                    output: response.output,
+                                }
+                            })
+                        })?;
+                        active.push(task);
+                    }
+                }
+            }
+        }
+
+        let outcome = outcome.unwrap_or_else(|| Err("Code cancelled".into()));
+        let is_error = outcome.is_err();
+        let output = crate::tools::code::envelope_json(outcome, audit);
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: crate::tools::CODE.to_string(),
+                title: title.clone(),
+                status: if is_error {
+                    ToolCallStatus::Error
+                } else {
+                    ToolCallStatus::Success
+                },
+                input: Some(tu.input.clone()),
+            });
+        })?;
+        Self::emit_tool_result(
+            &this,
+            &id,
+            crate::tools::CODE,
+            &title,
+            &crate::tools::code::model_text(&output),
+            is_error,
+            cx,
+        )?;
+        Self::append_tool_result(&this, tu, output, is_error, cx)?;
+        Ok(())
+    }
+
+    async fn run_code_nested(
+        this: gpui::WeakEntity<Self>,
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        cancel: CancellationToken,
+        approval_gate: Arc<tokio::sync::Mutex<()>>,
+        cx: &mut AsyncApp,
+    ) -> crate::tools::code::NestedResponse {
+        let fail = |output: String| crate::tools::code::NestedResponse { ok: false, output };
+        if cancel.is_cancelled() {
+            return fail("Code cancelled".into());
+        }
+        if !crate::tools::code::ALLOWED_TOOLS.contains(&name.as_str()) {
+            return fail(format!("tool not allowed in Code: {name}"));
+        }
+        let (tool, lang, in_plan, approval_mode, always_allowed, model) =
+            match this.read_with(cx, |thread, _| {
+                (
+                    thread.tools.get(&name).cloned(),
+                    thread.agent_language,
+                    thread.collaboration_mode == ModeKind::Plan,
+                    thread.approval_mode,
+                    thread.permission.is_always_allowed(&name),
+                    thread.model.clone(),
+                )
+            }) {
+                Ok(snapshot) => snapshot,
+                Err(error) => return fail(format!("thread unavailable: {error}")),
+            };
+        let Some(tool) = tool else {
+            return fail(format!("Unknown tool: {name}"));
+        };
+        if in_plan && !tool.is_read_only() {
+            return fail(format!("Plan mode does not permit calling {name}."));
+        }
+
+        let title = tool_title(&name, &input);
+        let mut needs_approval = tool.requires_approval(&input)
+            && approval_mode != ApprovalMode::Yolo
+            && !always_allowed;
+        if needs_approval
+            && approval_mode == ApprovalMode::AutoReview
+            && crate::settings::side_calls().approval_policy().enabled
+            && let Some(model) = model.as_ref()
+        {
+            let started = std::time::Instant::now();
+            let review = crate::approval::review(
+                model,
+                &name,
+                &input,
+                &title,
+                &this
+                    .read_with(cx, |thread, _| thread.cwd.clone())
+                    .unwrap_or_default(),
+                lang,
+                cancel.clone(),
+                cx,
+            )
+            .await;
+            let _ = this.update(cx, |thread, cx| {
+                thread.record_side_call(
+                    "approval",
+                    &review.model_name,
+                    review.usage,
+                    started.elapsed(),
+                    cx,
+                );
+            });
+            match review.verdict {
+                crate::approval::ReviewVerdict::Allow => needs_approval = false,
+                crate::approval::ReviewVerdict::Ask { reason } => {
+                    let _ = this.update(cx, |thread, _| {
+                        thread.approval_ask_reasons.insert(id.clone(), reason);
+                    });
+                }
+            }
+        }
+
+        if needs_approval {
+            // Promise.all may execute many safe reads concurrently, but the UI
+            // has a single authorization overlay. Serialize only the prompts,
+            // not the native tool executions themselves.
+            let _approval_guard = approval_gate.lock().await;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let registered = this.update(cx, |thread, cx| {
+                thread.pending_authorizations.insert(id.clone(), tx);
+                thread.pending_auth_meta.insert(
+                    id.clone(),
+                    PendingAuthMeta {
+                        tool_name: name.clone(),
+                        summary: title.clone(),
+                        input: input.clone(),
+                    },
+                );
+                cx.emit(ThreadEvent::ToolCallAuthorization {
+                    id: id.clone(),
+                    tool_name: name.clone(),
+                    summary: title.clone(),
+                    input: input.clone(),
+                });
+            });
+            if let Err(error) = registered {
+                return fail(format!("approval unavailable: {error}"));
+            }
+            let response = tokio::select! {
+                response = rx => response.unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
+                _ = cancel.cancelled() => ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
+            };
+            let _ = this.update(cx, |thread, _| {
+                thread.pending_authorizations.remove(&id);
+                thread.pending_auth_meta.remove(&id);
+            });
+            match response {
+                ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {
+                    return fail("User denied this nested tool call".into());
+                }
+                ToolAuthorizationResponse::Decision(PermissionDecision::AlwaysAllow) => {
+                    let _ =
+                        this.read_with(cx, |thread, _| thread.permission.set_always_allowed(&name));
+                }
+                ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {}
+                ToolAuthorizationResponse::AskUserQuestion { .. } => {
+                    return fail("interactive tools are not allowed inside Code".into());
+                }
+            }
+        }
+
+        let emitted = this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: ToolCallStatus::Running,
+                input: Some(input.clone()),
+            });
+        });
+        if let Err(error) = emitted {
+            return fail(format!("thread unavailable: {error}"));
+        }
+        if let Err(error) = this.update(cx, |thread, _| thread.ensure_network_proxy()) {
+            return fail(format!("network policy initialization failed: {error}"));
+        }
+        let context = match this.read_with(cx, |thread, _| {
+            crate::tool::ToolContextSnapshot::from_thread(thread)
+        }) {
+            Ok(context) => context,
+            Err(error) => return fail(format!("thread unavailable: {error}")),
+        };
+        let (sink, rx) = crate::tool::ToolOutputSink::channel(id.clone().into());
+        let id_for_drain = id.clone();
+        let task =
+            cx.update(|cx| tool.run_streaming(input.clone(), cancel.clone(), sink, &context, cx));
+        let _ = this.update(cx, |_, cx| {
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                while let Ok(chunk) = rx.recv().await {
+                    let _ = this.update(cx, |_, cx| {
+                        cx.emit(ThreadEvent::ToolOutput {
+                            id: id_for_drain.clone(),
+                            chunk,
+                        });
+                    });
+                }
+            })
+            .detach();
+        });
+        let (output, is_error) = match task.await {
+            Ok(output) => (output, false),
+            Err(error) => (error, true),
+        };
+        let output = crate::optimizer::compact_tool_output(
+            &name,
+            &output,
+            crate::optimizer::tool_budget(&name),
+        );
+        let _ = this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: if is_error {
+                    ToolCallStatus::Error
+                } else {
+                    ToolCallStatus::Success
+                },
+                input: Some(input.clone()),
+            });
+        });
+        let _ = Self::emit_tool_result(&this, &id, &name, &title, &output, is_error, cx);
+        crate::tools::code::NestedResponse {
+            ok: !is_error,
+            output,
+        }
+    }
+
     /// Run a single tool call: authorize (if needed) → run → append a ToolResult message → emit.
     /// Owned `WeakEntity`/`CancellationToken` so each parallel tool runs in its own spawned task.
     async fn run_tool_inner(
@@ -3603,6 +4264,10 @@ impl Thread {
             Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
             Self::append_tool_result(&this, tu, msg, true, cx)?;
             return Ok(());
+        }
+
+        if name == crate::tools::CODE {
+            return Self::run_code_inner(this, tu, cancel, cx).await;
         }
 
         // YOLO/AutoReview bypasses the permission gate: skip the authorization
@@ -3829,7 +4494,7 @@ impl Thread {
         // capped text. The `agent` envelope is exempt — it is bounded at
         // construction and the UI parses it as JSON, which truncation would
         // corrupt.
-        let output_str = if tu.name.as_ref() == crate::tools::AGENT {
+        let output_str = if matches!(tu.name.as_ref(), crate::tools::AGENT | crate::tools::CODE) {
             output_str
         } else {
             crate::tools::truncate::truncate_result(&output_str).into_owned()
@@ -3998,6 +4663,7 @@ impl Thread {
                 // user message, then reset the per-request counter so the next
                 // round (a tool-use loop iteration or a new user turn) starts
                 // from zero.
+                self.record_main_call(cx);
                 self.finalize_request_usage();
                 // Fire Stop hooks (e.g. a stop-gate reviewer) fail-open; the
                 // turn has already ended, so the handler runs detached.
@@ -4122,9 +4788,14 @@ impl Thread {
             // are always present and need no activation.
             if !is_error {
                 crate::tools::tool_search::activate_tools(&this.id.0, &[(*tu.name).to_string()]);
-                // BashOutput must be activated when Bash is used so the model
-                // can poll/reap background shells.
-                if tu.name.as_ref() == crate::tools::BASH {
+                // BashOutput is needed only for a background Bash invocation.
+                if tu.name.as_ref() == crate::tools::BASH
+                    && tu
+                        .input
+                        .get("run_in_background")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
                     crate::tools::tool_search::activate_tools(
                         &this.id.0,
                         &[crate::tools::BASH_OUTPUT.to_string()],
@@ -4502,7 +5173,11 @@ impl Thread {
             crate::settings::context_optimization().history_pruning == crate::settings::Toggle::On;
         let effective_messages: std::borrow::Cow<'_, [Message]> = if history_pruning_on {
             let cooldown_key = self.id.0.clone();
-            match crate::retention::prune_for_model(&self.messages, &cooldown_key) {
+            match crate::retention::prune_for_model(
+                &self.messages,
+                self.cwd.as_ref(),
+                &cooldown_key,
+            ) {
                 Some(pruned) => std::borrow::Cow::Owned(pruned),
                 None => std::borrow::Cow::Borrowed(&self.messages),
             }
@@ -4592,7 +5267,13 @@ impl Thread {
             // `run_tool_inner` backstops any stray write call. Plan mode takes
             // precedence over `turn_tool_filter` — it is the stricter,
             // user-visible safety contract.
-            self.tools.to_request_tools_read_only(self.agent_language)
+            if crate::tools::tool_search::is_active() {
+                let allowed = crate::tools::tool_search::schema_order(&self.id.0);
+                self.tools
+                    .to_request_tools_in_order(&allowed, self.agent_language, true)
+            } else {
+                self.tools.to_request_tools_read_only(self.agent_language)
+            }
         } else {
             // A slash command's `allowed-tools` whitelist is an intentional
             // narrowing of this turn's tool set. Respect it; the model enters
@@ -4607,14 +5288,9 @@ impl Thread {
                     // tools. The model uses ToolSearch to discover additional
                     // tools, which are activated and appear in subsequent turns.
                     if crate::tools::tool_search::is_active() {
-                        let mut allowed: Vec<String> = crate::tools::tool_search::CORE_TOOLS
-                            .iter()
-                            .map(|&s| s.to_string())
-                            .collect();
-                        let activated = crate::tools::tool_search::activated_for(&self.id.0);
-                        allowed.extend(activated);
+                        let allowed = crate::tools::tool_search::schema_order(&self.id.0);
                         self.tools
-                            .to_request_tools_filtered(&allowed, self.agent_language)
+                            .to_request_tools_in_order(&allowed, self.agent_language, false)
                     } else {
                         self.tools.to_request_tools(self.agent_language)
                     }
@@ -4629,6 +5305,13 @@ impl Thread {
         // the rest). Cache flags survive — coalesce keeps the trailing
         // segment's flag, so the prefix and trailing cache anchors persist.
         let messages = crate::compact::coalesce_same_role(messages);
+        let messages = crate::optimizer::apply_image_policy(
+            messages,
+            active_model
+                .as_ref()
+                .is_some_and(|model| model.supports_images()),
+            None,
+        );
         LanguageModelRequest {
             messages,
             tools,
@@ -4636,6 +5319,282 @@ impl Thread {
             ..Default::default()
         }
     }
+
+    fn context_optimization_metrics(
+        &self,
+        request: &LanguageModelRequest,
+    ) -> ContextOptimizationMetrics {
+        use crate::settings::Toggle;
+
+        let settings = crate::settings::context_optimization();
+        let message_bytes: usize = request.messages.iter().map(request_message_bytes).sum();
+        let system_bytes = request
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .map(request_message_bytes)
+            .sum::<usize>();
+        let mode_bytes = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                MessageContent::Text(text) if text.contains("<collaboration_mode>") => {
+                    Some(text.len())
+                }
+                _ => None,
+            })
+            .sum::<usize>();
+        let project_context_bytes = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                MessageContent::Text(text) if text.contains("<instructions scope=") => {
+                    Some(text.len())
+                }
+                _ => None,
+            })
+            .sum::<usize>();
+        let tool_result_bytes = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                MessageContent::ToolResult(result) => Some(result.content.len()),
+                _ => None,
+            })
+            .sum::<usize>();
+        let schema_bytes = serde_json::to_vec(&request.tools)
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+        let all_tools = self.tools.to_request_tools(self.agent_language);
+        let all_schema_bytes = serde_json::to_vec(&all_tools)
+            .map(|bytes| bytes.len())
+            .unwrap_or_default();
+
+        let rewrite_mode = settings.effective_history_rewrite();
+        let rewrite_bytes = if rewrite_mode == Toggle::Off {
+            0
+        } else {
+            self.messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|content| match content {
+                    MessageContent::ToolResult(result)
+                        if !matches!(
+                            result.tool_name.as_ref(),
+                            crate::tools::AGENT | crate::tools::CODE
+                        ) =>
+                    {
+                        let compact = crate::optimizer::compact_tool_output(
+                            &result.tool_name,
+                            &result.content,
+                            crate::optimizer::tool_budget(&result.tool_name),
+                        );
+                        Some(result.content.len().saturating_sub(compact.len()))
+                    }
+                    _ => None,
+                })
+                .sum()
+        };
+        let pruning_bytes = if settings.history_pruning == Toggle::Off {
+            0
+        } else {
+            crate::retention::preview(&self.messages, self.cwd.as_ref())
+                .map(|pruned| {
+                    let retained: HashSet<&str> = pruned
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .filter_map(|content| match content {
+                            MessageContent::ToolUse(tool_use) => Some(tool_use.id.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let dropped: HashSet<&str> = self
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .filter_map(|content| match content {
+                            MessageContent::ToolUse(tool_use)
+                                if !retained.contains(tool_use.id.as_str()) =>
+                            {
+                                Some(tool_use.id.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let projected: HashSet<&str> = request
+                        .messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .filter_map(|content| match content {
+                            MessageContent::ToolUse(tool_use) => Some(tool_use.id.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    self.messages
+                        .iter()
+                        .flat_map(|message| &message.content)
+                        .filter(|content| match content {
+                            MessageContent::ToolUse(tool_use) => {
+                                dropped.contains(tool_use.id.as_str())
+                                    && (settings.history_pruning == Toggle::Shadow
+                                        || !projected.contains(tool_use.id.as_str()))
+                            }
+                            MessageContent::ToolResult(result) => {
+                                dropped.contains(result.tool_use_id.as_str())
+                                    && (settings.history_pruning == Toggle::Shadow
+                                        || !projected.contains(result.tool_use_id.as_str()))
+                            }
+                            _ => false,
+                        })
+                        .map(content_bytes)
+                        .sum()
+                })
+                .unwrap_or_default()
+        };
+        let discovery_bytes = match settings.tool_discovery {
+            Toggle::Off => 0,
+            Toggle::On => all_schema_bytes.saturating_sub(schema_bytes),
+            Toggle::Shadow => {
+                let allowed = crate::tools::tool_search::schema_order(&self.id.0);
+                let candidate = self.tools.to_request_tools_in_order(
+                    &allowed,
+                    self.agent_language,
+                    self.collaboration_mode == ModeKind::Plan,
+                );
+                let candidate_bytes = serde_json::to_vec(&candidate)
+                    .map(|bytes| bytes.len())
+                    .unwrap_or_default();
+                all_schema_bytes.saturating_sub(candidate_bytes)
+            }
+        };
+        let image_bytes = if self
+            .active_model()
+            .as_ref()
+            .is_some_and(|model| model.supports_images())
+        {
+            0
+        } else {
+            self.messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|content| match content {
+                    MessageContent::Image { data, mime_type } => {
+                        let placeholder = format!(
+                            "[image omitted: active model has no vision support; mime={mime_type}, encoded_bytes={}]",
+                            data.len()
+                        );
+                        Some(
+                            data.len()
+                                .saturating_add(mime_type.len())
+                                .saturating_sub(placeholder.len()),
+                        )
+                    }
+                    _ => None,
+                })
+                .sum()
+        };
+        let mut code_nested_calls = 0u64;
+        let mut code_raw_bytes = 0usize;
+        let mut code_projected_bytes = 0usize;
+        for result in self
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                MessageContent::ToolResult(result)
+                    if result.tool_name.as_ref() == crate::tools::CODE =>
+                {
+                    Some(result)
+                }
+                _ => None,
+            })
+        {
+            code_raw_bytes = code_raw_bytes.saturating_add(result.content.len());
+            code_projected_bytes = code_projected_bytes
+                .saturating_add(crate::tools::code::model_text(&result.content).len());
+            if let Ok(envelope) =
+                serde_json::from_str::<crate::tools::code::CodeEnvelope>(&result.content)
+            {
+                code_nested_calls = code_nested_calls.saturating_add(envelope.calls as u64);
+            }
+        }
+
+        let (actual_bytes, shadow_bytes) = [
+            (rewrite_mode, rewrite_bytes),
+            (settings.history_pruning, pruning_bytes),
+            (settings.tool_discovery, discovery_bytes),
+        ]
+        .into_iter()
+        .fold(
+            (image_bytes, 0usize),
+            |(actual, shadow), (toggle, bytes)| match toggle {
+                Toggle::On => (actual.saturating_add(bytes), shadow),
+                Toggle::Shadow => (actual, shadow.saturating_add(bytes)),
+                Toggle::Off => (actual, shadow),
+            },
+        );
+        let projected_bytes = message_bytes.saturating_add(schema_bytes);
+        ContextOptimizationMetrics {
+            projected_tokens: approx_tokens(projected_bytes),
+            estimated_baseline_tokens: approx_tokens(
+                projected_bytes
+                    .saturating_add(actual_bytes)
+                    .saturating_add(shadow_bytes),
+            ),
+            saved_tokens: approx_tokens(actual_bytes),
+            shadow_saved_tokens: approx_tokens(shadow_bytes),
+            system_tokens: approx_tokens(system_bytes),
+            mode_tokens: approx_tokens(mode_bytes),
+            project_context_tokens: approx_tokens(project_context_bytes),
+            tool_schema_tokens: approx_tokens(schema_bytes),
+            history_tokens: approx_tokens(
+                message_bytes
+                    .saturating_sub(system_bytes)
+                    .saturating_sub(mode_bytes)
+                    .saturating_sub(project_context_bytes),
+            ),
+            tool_result_tokens: approx_tokens(tool_result_bytes),
+            rewrite_saved_tokens: approx_tokens(rewrite_bytes),
+            pruning_saved_tokens: approx_tokens(pruning_bytes),
+            discovery_saved_tokens: approx_tokens(discovery_bytes),
+            image_saved_tokens: approx_tokens(image_bytes),
+            active_tool_schemas: request.tools.len(),
+            total_tool_schemas: all_tools.len(),
+            activated_tools: request.tools.iter().map(|tool| tool.name.clone()).collect(),
+            code_nested_calls,
+            code_raw_tokens: approx_tokens(code_raw_bytes),
+            code_projected_tokens: approx_tokens(code_projected_bytes),
+            compactions_avoided: self.avoided_compactions.load(Ordering::Relaxed),
+            prefix_stability_pct: self.prefix_stability.stability_pct(),
+        }
+    }
+}
+
+fn approx_tokens(bytes: usize) -> u64 {
+    bytes.div_ceil(4) as u64
+}
+
+fn content_bytes(content: &MessageContent) -> usize {
+    match content {
+        MessageContent::Text(text) | MessageContent::Compaction(text) => text.len(),
+        MessageContent::Thinking { text, signature } => {
+            text.len() + signature.as_ref().map_or(0, String::len)
+        }
+        MessageContent::Image { data, mime_type } => data.len() + mime_type.len(),
+        MessageContent::ToolUse(tool_use) => {
+            tool_use.raw_input.len()
+                + serde_json::to_string(&tool_use.input).map_or(0, |value| value.len())
+                + tool_use.name.len()
+        }
+        MessageContent::ToolResult(result) => result.content.len() + result.tool_name.len(),
+    }
+}
+
+fn request_message_bytes(message: &LanguageModelRequestMessage) -> usize {
+    message.content.iter().map(content_bytes).sum()
 }
 
 /// Strip the `agent` tool's JSON envelope from a ToolResult so only its `final`
@@ -4661,11 +5620,19 @@ pub(crate) fn model_facing_content(
                 content: crate::tools::agent::agent_final_text(&tr.content),
             })
         }
+        MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == crate::tools::CODE => {
+            MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: tr.tool_use_id.clone(),
+                tool_name: tr.tool_name.clone(),
+                is_error: tr.is_error,
+                content: crate::tools::code::model_text(&tr.content),
+            })
+        }
         // Per-tool compact rewriting when context_optimization.history_rewrite
         // is On. Results exceeding the per-tool budget are truncated with
         // head+tail preservation. The canonical Thread::messages are untouched.
         MessageContent::ToolResult(tr)
-            if crate::settings::context_optimization().history_rewrite
+            if crate::settings::context_optimization().effective_history_rewrite()
                 == crate::settings::Toggle::On =>
         {
             let budget = crate::optimizer::tool_budget(&tr.tool_name);
@@ -4677,14 +5644,17 @@ pub(crate) fn model_facing_content(
             })
         }
         MessageContent::Compaction(raw) => {
-            // The compaction payload may be a JSON envelope (v1+) or legacy
-            // plain text (v0). Extract the summary text for the model. The
-            // state capsule (cwd, worktree, git branch, active tools, etc.)
-            // is for internal incremental compaction — the next summarizer
-            // pass reads the latest capsule so it can summarize only the
-            // delta. The model sees only the summary text wrapped in a
-            // preamble; exposing the state raw would waste tokens.
-            let (summary, _state) = crate::compact::parse_compaction(raw);
+            // Keep the deterministic capsule model-facing in compact JSON so
+            // resumed work retains operational state without asking the LLM
+            // to restate it in prose.
+            let (mut summary, state) = crate::compact::parse_compaction(raw);
+            if let Some(state) = state
+                && let Ok(json) = serde_json::to_string(&state)
+            {
+                summary.push_str("\n\n<runtime_state>");
+                summary.push_str(&json);
+                summary.push_str("</runtime_state>");
+            }
             MessageContent::Text(
                 crate::prompt::render(
                     crate::prompt::PromptTemplate::WrapperCompactionPreamble,

@@ -154,10 +154,8 @@ impl LanguageModel for AnthropicModel {
         let url = messages_url(&self.endpoint_url);
         let api_key = self.api_key.clone();
         let model = self.api_model_id.clone();
-        let max_tokens = match request.max_output_tokens {
-            Some(cap) => (cap as u64).min(self.max_output_tokens),
-            None => self.max_output_tokens,
-        };
+        let max_tokens =
+            super::request_output_cap(request.max_output_tokens, self.max_output_tokens);
         let policy = crate::provider::anthropic_cache::resolve_prompt_caching_policy(
             None,
             Some(&self.endpoint_url),

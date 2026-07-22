@@ -163,7 +163,7 @@ mod tests {
         let cwd = Path::new("/tmp/some-proj");
         let p = build_main_system_prompt(cwd, None, ApprovalMode::OnRequest, None, Language::En);
         assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
-        assert!(p.contains("manox agent"), "identity must appear: {p}");
+        assert!(p.contains("You are manox"), "identity must appear: {p}");
         assert!(p.contains("Today:"), "date row must appear: {p}");
         // Runtime versions are injected so the model does not guess (thread
         // 6cd3d096). The row is present regardless of whether the binary is
@@ -218,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_includes_context_economy() {
+    fn prompt_contains_manox_specific_tool_contracts() {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
@@ -226,14 +226,9 @@ mod tests {
             None,
             Language::En,
         );
-        assert!(
-            p.contains("Context economy"),
-            "context economy section: {p}"
-        );
-        assert!(
-            p.contains("byte-stable prefix"),
-            "cache-awareness guidance: {p}"
-        );
+        assert!(p.contains("Tool contracts"), "tool contracts section: {p}");
+        assert!(p.contains("don't re-Read"), "edit/read contract: {p}");
+        assert!(p.contains('⚠'), "truncation contract: {p}");
     }
 
     #[test]
@@ -246,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_contains_tool_use_section() {
+    fn prompt_omits_generic_model_tutoring() {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
@@ -254,14 +249,17 @@ mod tests {
             None,
             Language::En,
         );
-        assert!(p.contains("Tool use"), "tool use section: {p}");
         assert!(
-            p.contains("Pass arguments strictly"),
-            "tool args discipline: {p}"
+            !p.contains("Context economy"),
+            "generic context coaching must stay out of the static prompt: {p}"
         );
         assert!(
-            p.contains("independent tool calls in parallel"),
-            "parallel tool call guidance: {p}"
+            !p.contains("Pass arguments strictly"),
+            "generic tool coaching must stay out of the static prompt: {p}"
+        );
+        assert!(
+            !p.contains("independent tool calls in parallel"),
+            "generic parallelism coaching must stay out of the static prompt: {p}"
         );
     }
 
@@ -272,37 +270,6 @@ mod tests {
     // overall instruction tone + tool-sandbox boundary. No dedicated test
     // needed — the prompt's functional correctness is covered by the
     // verification-discipline and static-prompt-embedded tests.
-
-    #[test]
-    fn prompt_contains_context_economy() {
-        let p = build_main_system_prompt(
-            Path::new("/tmp"),
-            None,
-            ApprovalMode::OnRequest,
-            None,
-            Language::En,
-        );
-        assert!(
-            p.contains("Context economy"),
-            "context economy section: {p}"
-        );
-        assert!(p.contains("byte-stable prefix"), "prefix cache note: {p}");
-    }
-
-    #[test]
-    fn prompt_contains_validation_discipline() {
-        let p = build_main_system_prompt(
-            Path::new("/tmp"),
-            None,
-            ApprovalMode::OnRequest,
-            None,
-            Language::En,
-        );
-        assert!(
-            p.contains("Don't claim something passed without running it"),
-            "validation discipline: {p}"
-        );
-    }
 
     #[test]
     fn prompt_contains_sandbox_boundary() {
@@ -353,8 +320,8 @@ mod tests {
             None,
             Language::En,
         );
-        assert!(p.contains("Tool use"));
-        assert!(p.contains("in-process native agent workbench"));
+        assert!(p.contains("Tool contracts"));
+        assert!(p.contains("in-process native coding agent"));
     }
 
     #[test]
@@ -414,7 +381,7 @@ mod tests {
             None,
             Language::ZhCn,
         );
-        assert!(p.contains("工具使用"), "zh-CN static prose missing: {p}");
+        assert!(p.contains("工具契约"), "zh-CN static prose missing: {p}");
         assert!(p.contains("## 运行时身份"), "zh-CN identity heading: {p}");
         assert!(p.contains("今天："), "zh-CN today row: {p}");
         assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
@@ -444,10 +411,7 @@ mod tests {
             None,
             Language::En,
         );
-        assert!(
-            p.contains("Multi-agent delegation"),
-            "multi-agent section: {p}"
-        );
+        assert!(p.contains("Multi-agent work"), "multi-agent section: {p}");
         assert!(p.contains("`Agent`"), "agent tool mention: {p}");
         assert!(p.contains("TeamCreate"), "team-create mention: {p}");
     }
@@ -471,8 +435,8 @@ mod tests {
             "remote verification: {p}"
         );
         assert!(
-            p.contains("Don't report success without verifying"),
-            "no-success-without-verify: {p}"
+            p.contains("After pushing, verify"),
+            "push verification: {p}"
         );
         assert!(
             p.contains("git branch --show-current"),

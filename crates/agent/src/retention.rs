@@ -1,312 +1,379 @@
-//! History retention: classify and prune low-value tool results from the
-//! model-facing projection to save context tokens.
+//! Cache-aware pruning for the model-facing conversation projection.
 //!
-//! Every tool result is classified as Keep / Useless / Supersede(key). The
-//! most recent ~40K tokens (the "hot prefix") are always preserved intact so
-//! the provider prefix cache stays warm. Older useless and superseded results
-//! are dropped from the projection, but only when ≥20K tokens would be saved
-//! and ≥90 minutes have passed since the last prune *for this thread*.
-//!
-//! The canonical [`Thread::messages`] is never modified — this layer only
-//! affects the projection built by [`build_completion_request`].
-//!
-//! **Block-level pruning.** Individual ToolResult blocks are pruned from
-//! messages. When every ToolResult in a User-role message is pruned, the
-//! message itself is removed *together with its preceding Assistant message*
-//! to preserve ToolUse/ToolResult pairing. A User message that still has at
-//! least one kept ToolResult block is retained with only the remaining blocks
-//! — no orphaned ToolUses are created because the Anthropic wire pairs
-//! User↔Assistant at the message level, not per-block.
+//! Pruning is deliberately pair-aware: a `ToolUse` and its matching
+//! `ToolResult` are either both retained or both removed. Canonical thread
+//! history is never mutated.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::language_model::LanguageModelToolResult;
-use crate::language_model::MessageContent;
+use crate::language_model::{LanguageModelToolResult, LanguageModelToolUse, MessageContent};
 use crate::message::Message;
 
-/// Minimum cooldown between two pruning decisions for the same thread. Avoids
-/// thrashing the provider-side KV cache (each prune busts the prefix cache).
 const PRUNE_COOLDOWN: Duration = Duration::from_secs(90 * 60);
-
-/// Hot prefix protection: the most recent ~40K tokens (≈160 KiB at 4 bytes per
-/// token) are never touched. The provider's prompt cache uses a sliding window
-/// from the end, so preserving the tail is what matters for cache stability.
 const HOT_PREFIX_BYTES: usize = 160 * 1024;
-
-/// Only apply pruning when at least this many bytes would be removed from the
-/// projection. Below this threshold the cache-bust cost outweighs the savings.
 const MIN_SAVINGS_BYTES: usize = 80 * 1024;
 
-/// Per-thread cooldown timers keyed by an opaque thread-level token. A prune
-/// in thread A does not suppress pruning in thread B.
 static COOLDOWNS: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
 
-// ─── classification ────────────────────────────────────────────────────────
-
-/// Retention classification for a single tool-result block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Hint {
-    /// Keep — carries lasting information.
     Keep,
-    /// Useless — pure acknowledgment, no information (e.g. "File written.").
     Useless,
-    /// Superseded — a newer result with `key` replaces this one.
-    Supersede(String),
+    Supersede(SupersedeKey),
 }
 
-/// Classify a tool result.
-fn classify(tr: &LanguageModelToolResult) -> Hint {
-    if is_useless(tr) {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupersedeKey {
+    key: String,
+    /// File affected by a Read. Used to enforce the Edit/Write refresh barrier.
+    read_path: Option<String>,
+}
+
+#[derive(Clone)]
+struct ToolPair {
+    use_msg: usize,
+    use_block: usize,
+    result_msg: usize,
+    result_block: usize,
+    tool_use: LanguageModelToolUse,
+    result: LanguageModelToolResult,
+}
+
+impl ToolPair {
+    fn projected_bytes(&self) -> usize {
+        self.result.content.len()
+            + self.tool_use.raw_input.len()
+            + serde_json::to_string(&self.tool_use.input)
+                .map(|s| s.len())
+                .unwrap_or_default()
+    }
+}
+
+fn classify(pair: &ToolPair, cwd: &Path) -> Hint {
+    if pair.result.is_error {
+        return Hint::Keep;
+    }
+    if is_useless_poll(&pair.result) {
         return Hint::Useless;
     }
-    if let Some(key) = supersede_key(tr) {
-        return Hint::Supersede(key);
-    }
-    Hint::Keep
+    supersede_key(&pair.tool_use, cwd)
+        .map(Hint::Supersede)
+        .unwrap_or(Hint::Keep)
 }
 
-/// A tool result is useless when it is a short, data-free confirmation.
-fn is_useless(tr: &LanguageModelToolResult) -> bool {
-    if tr.is_error {
+/// A running BashOutput poll with no incremental body carries no durable state.
+/// Its matching ToolUse is removed with it, so provider pairing stays valid.
+fn is_useless_poll(result: &LanguageModelToolResult) -> bool {
+    if result.tool_name.as_ref() != crate::tools::BASH_OUTPUT {
         return false;
     }
-    let t = tr.content.trim();
-    if t.is_empty() {
-        return true;
-    }
-    // Short ack-only results: "File written successfully." / "Done." / "OK."
-    if t.len() <= 120 && t.lines().count() <= 2 {
-        let lower = t.to_lowercase();
-        let has_ack = lower.contains("success")
-            || lower.contains("written")
-            || lower.contains("created")
-            || lower.contains("deleted")
-            || lower.contains("ok")
-            || lower.contains("done");
-        let has_data = lower.contains(": ")
-            || lower.contains("line")
-            || lower.contains("error")
-            || lower.contains("result")
-            || t.lines().any(|l| l.len() > 80);
-        if has_ack && !has_data {
-            return true;
-        }
-    }
-    false
+    let Some((header, body)) = result.content.split_once("\n\n") else {
+        return false;
+    };
+    header.starts_with("Shell status: running") && body.trim().is_empty()
 }
 
-/// Compute a supersede key. A later result with the same key replaces an
-/// earlier one — e.g. a second `Read` of the same file (with the same
-/// selector range) makes the first read stale.
-///
-/// The key is derived from the ToolResult content only (not the paired
-/// ToolUse input, which is not available in this layer). As a result:
-/// - `Read` uses the full hashline header `[path#selector]` as key, so
-///   reads with different selectors (e.g. `#L1-L100` vs `#L500-L600`)
-///   do not falsely supersede each other.
-/// - `Write`/`Edit` keys are tool-specific and do NOT supersede `Read`
-///   results — stale read invalidation after writes requires
-///   ToolUse-input-side tracking and is deferred.
-/// - `Grep`/`Glob`/`List` key from the first three lines, which is
-///   stable for same-query, same-path re-invocations but won't match
-///   when the output changes.
-fn supersede_key(tr: &LanguageModelToolResult) -> Option<String> {
-    match &*tr.tool_name {
-        "Read" => {
-            // First line is `[path#selector]`. Keep the full header so
-            // different selectors produce different keys.
-            let header = tr.content.lines().next()?;
-            Some(format!("Read:{}", header))
+fn supersede_key(tool_use: &LanguageModelToolUse, cwd: &Path) -> Option<SupersedeKey> {
+    let input = &tool_use.input;
+    match tool_use.name.as_ref() {
+        crate::tools::READ => {
+            let raw = input.get("path")?.as_str()?;
+            let (path, selector) = crate::tools::path_selector::split_path_and_sel(raw);
+            let path = normalize_path(cwd, path);
+            let selector = selector
+                .map(|s| format!("{s:?}"))
+                .unwrap_or_else(|| "Full".to_string());
+            Some(SupersedeKey {
+                key: format!("Read:{path}:{selector}"),
+                read_path: Some(path),
+            })
         }
-        "Write" | "Edit" => {
-            // The result text is an ack or diff; first line is not a
-            // stable path. Derive a best-effort key from the content
-            // fingerprint — two writes to the same file with identical
-            // output are extremely unlikely outside tests.
-            let head = &tr.content[..tr.content.len().min(128)];
-            let h = hash_str(head);
-            Some(format!("{}:{h:x}", tr.tool_name))
-        }
-        "Grep" | "Glob" | "List" => {
-            let head: String = tr.content.lines().take(3).collect::<Vec<_>>().join("\n");
-            let h = hash_str(&head);
-            Some(format!("{}:{h:x}", tr.tool_name))
-        }
+        crate::tools::GREP => Some(SupersedeKey {
+            key: format!(
+                "Grep:{}:{}:{}:{}:{}",
+                json_string(input, "pattern"),
+                input_path(input, cwd),
+                json_string(input, "glob"),
+                json_string(input, "limit"),
+                json_string(input, "offset")
+            ),
+            read_path: None,
+        }),
+        crate::tools::GLOB => Some(SupersedeKey {
+            key: format!(
+                "Glob:{}:{}:{}:{}:{}:{}",
+                json_string(input, "pattern"),
+                input_path(input, cwd),
+                json_string(input, "no_ignore"),
+                json_string(input, "include_hidden"),
+                json_string(input, "include_dirs"),
+                json_string(input, "limit")
+            ),
+            read_path: None,
+        }),
+        crate::tools::LIST => Some(SupersedeKey {
+            key: format!("List:{}", input_path(input, cwd)),
+            read_path: None,
+        }),
+        crate::tools::BASH_OUTPUT => Some(SupersedeKey {
+            key: format!("BashOutput:{}", json_string(input, "shell_id")),
+            read_path: None,
+        }),
+        crate::tools::TOOL_SEARCH => Some(SupersedeKey {
+            key: format!("ToolSearch:{}", json_string(input, "query")),
+            read_path: None,
+        }),
         _ => None,
     }
 }
 
-fn hash_str(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+fn json_string(input: &serde_json::Value, key: &str) -> String {
+    input
+        .get(key)
+        .map(serde_json::Value::to_string)
+        .unwrap_or_else(|| "null".to_string())
 }
 
-// ─── pruning ────────────────────────────────────────────────────────────────
+fn input_path(input: &serde_json::Value, cwd: &Path) -> String {
+    input
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(|p| normalize_path(cwd, p))
+        .unwrap_or_else(|| normalize_path(cwd, "."))
+}
 
-/// Build a pruned message list for the model-facing projection.
-///
-/// `cooldown_key` scopes the prune cooldown to a single thread.
-///
-/// Returns `None` when pruning is suppressed (cooldown active, savings
-/// below threshold, or no blocks classified for removal).
-pub(crate) fn prune_for_model(messages: &[Message], cooldown_key: &str) -> Option<Vec<Message>> {
-    // ── per-thread cooldown ──────────────────────────────────────────────
-    {
+fn normalize_path(cwd: &Path, raw: &str) -> String {
+    let path = Path::new(raw);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized.to_string_lossy().into_owned()
+}
+
+fn mutation_paths(pair: &ToolPair, cwd: &Path) -> Vec<String> {
+    if pair.result.is_error {
+        return Vec::new();
+    }
+    match pair.tool_use.name.as_ref() {
+        crate::tools::WRITE => pair
+            .tool_use
+            .input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|p| vec![normalize_path(cwd, p)])
+            .unwrap_or_default(),
+        crate::tools::EDIT => pair
+            .tool_use
+            .input
+            .get("patch")
+            .and_then(serde_json::Value::as_str)
+            .map(|patch| edit_paths(patch, cwd))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn edit_paths(patch: &str, cwd: &Path) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            let header = line.strip_prefix('[')?.strip_suffix(']')?;
+            let (path, _tag) = header.rsplit_once('#')?;
+            Some(normalize_path(cwd, path))
+        })
+        .collect()
+}
+
+fn collect_pairs(messages: &[Message]) -> Vec<ToolPair> {
+    let mut uses: HashMap<String, (usize, usize, LanguageModelToolUse)> = HashMap::new();
+    for (msg_idx, message) in messages.iter().enumerate() {
+        for (block_idx, content) in message.content.iter().enumerate() {
+            if let MessageContent::ToolUse(tool_use) = content {
+                uses.insert(tool_use.id.clone(), (msg_idx, block_idx, tool_use.clone()));
+            }
+        }
+    }
+
+    let mut pairs = Vec::new();
+    for (msg_idx, message) in messages.iter().enumerate() {
+        for (block_idx, content) in message.content.iter().enumerate() {
+            if let MessageContent::ToolResult(result) = content
+                && let Some((use_msg, use_block, tool_use)) = uses.get(&result.tool_use_id)
+            {
+                pairs.push(ToolPair {
+                    use_msg: *use_msg,
+                    use_block: *use_block,
+                    result_msg: msg_idx,
+                    result_block: block_idx,
+                    tool_use: tool_use.clone(),
+                    result: result.clone(),
+                });
+            }
+        }
+    }
+    pairs
+}
+
+pub(crate) fn prune_for_model(
+    messages: &[Message],
+    cwd: &Path,
+    cooldown_key: &str,
+) -> Option<Vec<Message>> {
+    prune_impl(messages, cwd, cooldown_key, true)
+}
+
+/// Compaction is an explicit cache boundary, so it may flush eligible cold
+/// pairs without waiting for the ordinary 90-minute cooldown.
+pub(crate) fn prune_for_compaction(
+    messages: &[Message],
+    cwd: &Path,
+    cooldown_key: &str,
+) -> Option<Vec<Message>> {
+    let pruned = prune_impl(messages, cwd, cooldown_key, false);
+    clear_cooldown(cooldown_key);
+    pruned
+}
+
+/// Side-effect-free projection used by shadow metrics and the offline replay
+/// harness. It applies the same hot-prefix and savings thresholds without
+/// consuming or mutating the per-thread cooldown.
+pub(crate) fn preview(messages: &[Message], cwd: &Path) -> Option<Vec<Message>> {
+    prune_impl(messages, cwd, "preview", false)
+}
+
+pub(crate) fn clear_cooldown(cooldown_key: &str) {
+    if let Some(map) = COOLDOWNS.lock().unwrap().as_mut() {
+        map.remove(cooldown_key);
+    }
+}
+
+fn prune_impl(
+    messages: &[Message],
+    cwd: &Path,
+    cooldown_key: &str,
+    honor_cooldown: bool,
+) -> Option<Vec<Message>> {
+    if honor_cooldown {
         let mut guard = COOLDOWNS.lock().unwrap();
         let map = guard.get_or_insert_with(HashMap::new);
-        if let Some(t) = map.get(cooldown_key)
-            && t.elapsed() < PRUNE_COOLDOWN
+        if map
+            .get(cooldown_key)
+            .is_some_and(|time| time.elapsed() < PRUNE_COOLDOWN)
         {
             return None;
         }
     }
 
-    // ── classify every tool-result block ───────────────────────────────
-    struct BlockInfo {
-        block_ord: usize, // sequential across all blocks
-        msg_idx: usize,
-        block_idx: usize, // index within the message's content vec
-        hint: Hint,
-        byte_len: usize,
-    }
-    let mut blocks: Vec<BlockInfo> = Vec::new();
-    for (mi, msg) in messages.iter().enumerate() {
-        for (bi, block) in msg.content.iter().enumerate() {
-            if let MessageContent::ToolResult(tr) = block {
-                let hint = classify(tr);
-                let byte_len = tr.content.len();
-                blocks.push(BlockInfo {
-                    block_ord: blocks.len(),
-                    msg_idx: mi,
-                    block_idx: bi,
-                    hint,
-                    byte_len,
-                });
-            }
-        }
-    }
-
-    // ── walk backward to find the hot prefix boundary ─────────────────
-    let total_bytes: usize = blocks.iter().map(|b| b.byte_len).sum();
+    let pairs = collect_pairs(messages);
+    let total_bytes: usize = pairs.iter().map(ToolPair::projected_bytes).sum();
     if total_bytes <= HOT_PREFIX_BYTES {
         return None;
     }
 
     let mut hot_bytes = 0usize;
-    let mut hot_cutoff: Option<usize> = None; // first block_ord inside hot prefix
-    for b in blocks.iter().rev() {
-        hot_bytes += b.byte_len;
+    let mut hot_cutoff = pairs.len();
+    for (idx, pair) in pairs.iter().enumerate().rev() {
+        hot_bytes += pair.projected_bytes();
+        hot_cutoff = idx;
         if hot_bytes >= HOT_PREFIX_BYTES {
-            hot_cutoff = Some(b.block_ord);
             break;
         }
     }
 
-    let hot_cutoff = hot_cutoff?;
-
-    // ── classify: walk in reverse to keep the latest per-key ──────────
-    let mut last_seen: HashMap<String, usize> = HashMap::new();
-    // (msg_idx, block_idx) of blocks to drop
-    let mut drop_blocks: HashSet<(usize, usize)> = HashSet::new();
-    // Tracks how many ToolResult blocks each User message has in total,
-    // and how many are being pruned.
-    let mut user_msg_tr_count: HashMap<usize, usize> = HashMap::new();
-    let mut user_msg_pruned: HashMap<usize, usize> = HashMap::new();
-
-    // First pass: count total ToolResult blocks per User message.
-    for b in &blocks {
-        if messages[b.msg_idx].role == crate::language_model::Role::User {
-            *user_msg_tr_count.entry(b.msg_idx).or_default() += 1;
+    let hints: Vec<Hint> = pairs.iter().map(|pair| classify(pair, cwd)).collect();
+    let mut latest_by_key: HashMap<String, usize> = HashMap::new();
+    let mut latest_mutation_by_path: HashMap<String, usize> = HashMap::new();
+    for (idx, (pair, hint)) in pairs.iter().zip(&hints).enumerate() {
+        if let Hint::Supersede(key) = hint {
+            latest_by_key.insert(key.key.clone(), idx);
+        }
+        for path in mutation_paths(pair, cwd) {
+            latest_mutation_by_path.insert(path, idx);
         }
     }
 
-    let mut savings: usize = 0;
-
-    for b in blocks.iter().rev() {
-        if b.block_ord >= hot_cutoff {
-            if let Hint::Supersede(ref key) = b.hint {
-                last_seen.entry(key.clone()).or_insert(b.block_ord);
-            }
+    let mut drop_blocks: HashSet<(usize, usize)> = HashSet::new();
+    let mut savings = 0usize;
+    for (idx, (pair, hint)) in pairs.iter().zip(&hints).enumerate() {
+        if idx >= hot_cutoff {
             continue;
         }
-        match &b.hint {
-            Hint::Keep => {}
-            Hint::Useless => {
-                drop_blocks.insert((b.msg_idx, b.block_idx));
-                *user_msg_pruned.entry(b.msg_idx).or_default() += 1;
-                savings += b.byte_len;
-            }
+        let drop_pair = match hint {
+            Hint::Keep => false,
+            Hint::Useless => true,
             Hint::Supersede(key) => {
-                if last_seen.contains_key(key) {
-                    drop_blocks.insert((b.msg_idx, b.block_idx));
-                    *user_msg_pruned.entry(b.msg_idx).or_default() += 1;
-                    savings += b.byte_len;
+                let Some(&latest) = latest_by_key.get(&key.key) else {
+                    continue;
+                };
+                if latest <= idx {
+                    false
+                } else if let Some(path) = &key.read_path {
+                    latest_mutation_by_path
+                        .get(path)
+                        .is_none_or(|mutation| latest > *mutation)
                 } else {
-                    last_seen.insert(key.clone(), b.block_ord);
+                    true
                 }
             }
+        };
+        if drop_pair {
+            drop_blocks.insert((pair.use_msg, pair.use_block));
+            drop_blocks.insert((pair.result_msg, pair.result_block));
+            savings += pair.projected_bytes();
         }
     }
 
-    if savings < MIN_SAVINGS_BYTES {
+    if savings < MIN_SAVINGS_BYTES || drop_blocks.is_empty() {
         return None;
     }
 
-    // ── stamp the per-thread cooldown timer ────────────────────────────
-    {
-        let mut guard = COOLDOWNS.lock().unwrap();
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(cooldown_key.to_string(), Instant::now());
-    }
-
-    // ── identify fully-pruned User messages → drop paired Assistant ───
-    // When EVERY ToolResult in a User message is pruned, the message
-    // itself is dropped, and the preceding Assistant message (carrying
-    // the paired ToolUse blocks) must also be dropped so the wire format
-    // stays valid.
-    let mut drop_msg: HashSet<usize> = HashSet::new();
-    for (&msg_idx, &pruned) in &user_msg_pruned {
-        let total = user_msg_tr_count.get(&msg_idx).copied().unwrap_or(0);
-        if pruned >= total {
-            drop_msg.insert(msg_idx);
-            if msg_idx > 0 && messages[msg_idx - 1].role == crate::language_model::Role::Assistant {
-                drop_msg.insert(msg_idx - 1);
-            }
-        }
-    }
-
-    // ── rebuild: drop fully-pruned messages, partially prune blocks ────
     let pruned: Vec<Message> = messages
         .iter()
         .enumerate()
-        .filter(|(mi, _)| !drop_msg.contains(mi))
-        .map(|(mi, msg)| {
-            let new_content: Vec<MessageContent> = msg
+        .filter_map(|(msg_idx, message)| {
+            let content: Vec<MessageContent> = message
                 .content
                 .iter()
                 .enumerate()
-                .filter(|(bi, _)| !drop_blocks.contains(&(mi, *bi)))
-                .map(|(_, c)| c.clone())
+                .filter(|(block_idx, _)| !drop_blocks.contains(&(msg_idx, *block_idx)))
+                .map(|(_, content)| content.clone())
                 .collect();
-            Message {
-                id: msg.id.clone(),
-                timestamp: msg.timestamp,
-                parent_id: msg.parent_id.clone(),
-                role: msg.role,
-                content: new_content,
-                ui: msg.ui.clone(),
+            if content.is_empty() {
+                return None;
             }
+            Some(Message {
+                id: message.id.clone(),
+                timestamp: message.timestamp,
+                parent_id: message.parent_id.clone(),
+                role: message.role,
+                content,
+                ui: message.ui.clone(),
+            })
         })
         .collect();
 
-    if pruned.len() >= messages.len() {
-        return None;
+    if honor_cooldown {
+        COOLDOWNS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(cooldown_key.to_string(), Instant::now());
     }
-
     Some(pruned)
 }
 
@@ -315,228 +382,212 @@ mod tests {
     use super::*;
     use crate::language_model::Role;
 
-    fn tr(name: &str, content: &str) -> MessageContent {
-        MessageContent::ToolResult(LanguageModelToolResult {
-            tool_use_id: "tu_1".into(),
-            tool_name: name.into(),
-            is_error: false,
-            content: content.into(),
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> MessageContent {
+        MessageContent::ToolUse(LanguageModelToolUse {
+            id: id.into(),
+            name: name.into(),
+            raw_input: input.to_string(),
+            input,
+            is_input_complete: true,
+            thought_signature: None,
         })
     }
 
-    fn make_msg(role: Role, blocks: Vec<MessageContent>) -> Message {
+    fn tool_result(id: &str, name: &str, content: String) -> MessageContent {
+        MessageContent::ToolResult(LanguageModelToolResult {
+            tool_use_id: id.into(),
+            tool_name: name.into(),
+            is_error: false,
+            content,
+        })
+    }
+
+    fn message(role: Role, content: Vec<MessageContent>) -> Message {
         Message {
-            id: format!("m_{}", rand_id()),
+            id: uuid::Uuid::new_v4().to_string(),
             timestamp: 0,
             parent_id: None,
             role,
-            content: blocks,
-            ui: Default::default(),
+            content,
+            ui: None,
         }
     }
 
-    fn rand_id() -> u64 {
-        use std::sync::atomic::AtomicU64;
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    fn pair(id: &str, name: &str, input: serde_json::Value, output: String) -> [Message; 2] {
+        [
+            message(Role::Assistant, vec![tool_use(id, name, input)]),
+            message(Role::User, vec![tool_result(id, name, output)]),
+        ]
     }
 
-    // ── classification tests ──────────────────────────────────────────
+    fn assert_protocol_pairs(messages: &[Message]) {
+        let uses: HashSet<String> = messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                MessageContent::ToolUse(t) => Some(t.id.clone()),
+                _ => None,
+            })
+            .collect();
+        let results: HashSet<String> = messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                MessageContent::ToolResult(t) => Some(t.tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses, results, "tool protocol must remain paired");
+    }
 
     #[test]
-    fn empty_result_is_useless() {
-        let r = LanguageModelToolResult {
-            tool_use_id: "tu_1".into(),
-            tool_name: "Bash".into(),
-            is_error: false,
-            content: String::new(),
+    fn read_key_comes_from_input_selector_not_hashline_tag() {
+        let cwd = Path::new("/repo");
+        let a = LanguageModelToolUse {
+            id: "a".into(),
+            name: crate::tools::READ.into(),
+            raw_input: String::new(),
+            input: serde_json::json!({"path":"src/lib.rs:1-20"}),
+            is_input_complete: true,
+            thought_signature: None,
         };
-        assert!(is_useless(&r));
+        let mut b = a.clone();
+        b.input = serde_json::json!({"path":"src/lib.rs:21-40"});
+        assert_ne!(supersede_key(&a, cwd), supersede_key(&b, cwd));
+        b.input = a.input.clone();
+        assert_eq!(supersede_key(&a, cwd), supersede_key(&b, cwd));
     }
 
     #[test]
-    fn ack_only_is_useless() {
-        let r = LanguageModelToolResult {
-            tool_use_id: "tu_1".into(),
-            tool_name: "Write".into(),
-            is_error: false,
-            content: "File written successfully.".into(),
-        };
-        assert!(is_useless(&r));
-    }
-
-    #[test]
-    fn error_is_not_useless() {
-        let r = LanguageModelToolResult {
-            tool_use_id: "tu_1".into(),
-            tool_name: "Bash".into(),
-            is_error: true,
-            content: "command not found: foo".into(),
-        };
-        assert!(!is_useless(&r));
-    }
-
-    #[test]
-    fn data_rich_result_is_not_useless() {
-        let r = LanguageModelToolResult {
-            tool_use_id: "tu_1".into(),
-            tool_name: "Bash".into(),
-            is_error: false,
-            content: "test result: 42 tests passed, 0 failed\ncover: 85%".into(),
-        };
-        assert!(!is_useless(&r));
-    }
-
-    #[test]
-    fn read_supersede_key_includes_selector() {
-        // Two reads of the same file with different selectors produce
-        // different keys, so they do not falsely supersede each other.
-        let r1 = LanguageModelToolResult {
-            tool_use_id: "tu_1".into(),
-            tool_name: "Read".into(),
-            is_error: false,
-            content: "[src/main.rs#L1-L100]\n1:fn main() {\n…\n100:}\n".into(),
-        };
-        let r2 = LanguageModelToolResult {
-            tool_use_id: "tu_2".into(),
-            tool_name: "Read".into(),
-            is_error: false,
-            content: "[src/main.rs#L500-L600]\n500:fn other() {\n…\n600:}\n".into(),
-        };
-        let k1 = supersede_key(&r1).unwrap();
-        let k2 = supersede_key(&r2).unwrap();
-        assert_ne!(k1, k2, "different selectors → different keys");
-    }
-
-    #[test]
-    fn read_same_selector_same_key() {
-        let r1 = LanguageModelToolResult {
-            tool_use_id: "tu_1".into(),
-            tool_name: "Read".into(),
-            is_error: false,
-            content: "[src/lib.rs#L42]\n42:old\n".into(),
-        };
-        let r2 = LanguageModelToolResult {
-            tool_use_id: "tu_2".into(),
-            tool_name: "Read".into(),
-            is_error: false,
-            content: "[src/lib.rs#L42]\n42:new\n".into(),
-        };
-        assert_eq!(supersede_key(&r1), supersede_key(&r2));
-    }
-
-    #[test]
-    fn write_key_is_tool_specific() {
-        // Write/Edit keys are scoped per tool type — they don't collide
-        // with Read keys. Cross-tool read-after-write invalidation
-        // requires ToolUse-input-side tracking and is deferred.
-        let w = LanguageModelToolResult {
-            tool_use_id: "tu_1".into(),
-            tool_name: "Write".into(),
-            is_error: false,
-            content: "File written successfully.\n".into(),
-        };
-        let k = supersede_key(&w).unwrap();
-        assert!(k.starts_with("Write:"), "key is tool-scoped: {k}");
-    }
-
-    #[test]
-    fn bash_does_not_supersede() {
-        let r = LanguageModelToolResult {
-            tool_use_id: "tu_1".into(),
-            tool_name: "Bash".into(),
-            is_error: false,
-            content: "cargo build succeeded".into(),
-        };
-        assert!(supersede_key(&r).is_none());
-    }
-
-    // ── pruning tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn empty_messages_yield_none() {
-        assert!(prune_for_model(&[], "test").is_none());
-    }
-
-    #[test]
-    fn hot_prefix_is_untouched() {
-        let msg = make_msg(Role::User, vec![tr("Bash", "ok")]);
-        assert!(prune_for_model(&[msg], "test").is_none());
-    }
-
-    #[test]
-    fn mixed_message_keep_block_survives_partial_prune() {
-        // A User message with one useful result and many useless results:
-        // only the useless blocks are pruned; the Keep block is retained.
-        // This is the reviewer counterexample: 900 useless + 1 keep.
-        let big_data = "x".repeat(HOT_PREFIX_BYTES + 10_000);
-        let useful = tr("Bash", "test result: 42 passed, 0 failed\ncoverage: 85%");
-        let useless = tr("Write", "File written successfully.");
-        // Put a big read first so the hot prefix boundary can be
-        // established and the useless blocks are above it.
-        let big_read = tr("Read", &big_data);
-
-        let msgs = vec![
-            make_msg(Role::User, vec![big_read]),
-            make_msg(Role::Assistant, vec![]),
-            // This message has 900 useless + 1 useful — partial prune test.
-            {
-                let mut content = Vec::new();
-                for _ in 0..900 {
-                    content.push(useless.clone());
-                }
-                content.push(useful.clone());
-                make_msg(Role::User, content)
-            },
+    fn partial_prune_removes_matching_use_and_result_only() {
+        let cwd = Path::new("/repo");
+        let old = "old\n".repeat(24_000);
+        let new = "new\n".repeat(24_000);
+        let hot = "hot\n".repeat(45_000);
+        let mut messages = vec![
+            message(
+                Role::Assistant,
+                vec![
+                    tool_use(
+                        "read-old",
+                        crate::tools::READ,
+                        serde_json::json!({"path":"a.rs"}),
+                    ),
+                    tool_use(
+                        "keep",
+                        crate::tools::BASH,
+                        serde_json::json!({"command":"cargo test"}),
+                    ),
+                ],
+            ),
+            message(
+                Role::User,
+                vec![
+                    tool_result("read-old", crate::tools::READ, old),
+                    tool_result("keep", crate::tools::BASH, "42 tests passed".into()),
+                ],
+            ),
         ];
+        messages.extend(pair(
+            "read-new",
+            crate::tools::READ,
+            serde_json::json!({"path":"a.rs"}),
+            new,
+        ));
+        messages.extend(pair(
+            "hot",
+            crate::tools::BASH,
+            serde_json::json!({"command":"long"}),
+            hot,
+        ));
 
-        let result = prune_for_model(&msgs, "test_mixed");
-        // Pruning should either return None (hot prefix too small, or
-        // savings below threshold) or return a Vec where the useful
-        // Bash result survived while useless Write results were pruned.
-        if let Some(pruned) = result {
-            // The mixed message (index 2) should still exist if the
-            // useful Bash result was kept. Its content should contain
-            // the Bash result.
-            let mixed = &pruned[pruned.len() - 1];
-            assert_eq!(mixed.role, Role::User);
-            let kept_bash = mixed.content.iter().any(
-                |c| matches!(c, MessageContent::ToolResult(tr) if tr.tool_name.as_ref() == "Bash"),
-            );
-            assert!(kept_bash, "useful Bash result must survive partial prune");
-        }
-        // If result is None (below threshold / within hot prefix), that's
-        // also valid — the key invariant is that when pruning DOES occur,
-        // Keep blocks survive.
+        let pruned = prune_impl(&messages, cwd, "partial", false).expect("must prune");
+        assert_protocol_pairs(&pruned);
+        let ids: HashSet<String> = pruned
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                MessageContent::ToolUse(t) => Some(t.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!ids.contains("read-old"));
+        assert!(ids.contains("keep"));
+        assert!(ids.contains("read-new"));
     }
 
     #[test]
-    fn fully_pruned_user_drops_paired_assistant() {
-        // When ALL ToolResult blocks in a User message are pruned, both
-        // the User message and its preceding Assistant message must be
-        // removed to maintain ToolUse/ToolResult pairing.
-        let big_data = "x".repeat(HOT_PREFIX_BYTES + 10_000);
-        let msgs = vec![
-            make_msg(Role::User, vec![tr("Read", &big_data)]),
-            make_msg(Role::Assistant, vec![]),
-            make_msg(Role::User, vec![tr("Write", "File written successfully.")]),
-        ];
+    fn edit_requires_a_successful_refresh_before_old_read_is_removed() {
+        let cwd = Path::new("/repo");
+        let old = "old\n".repeat(24_000);
+        let hot = "hot\n".repeat(45_000);
+        let mut messages = Vec::new();
+        messages.extend(pair(
+            "read-old",
+            crate::tools::READ,
+            serde_json::json!({"path":"a.rs"}),
+            old.clone(),
+        ));
+        messages.extend(pair(
+            "edit",
+            crate::tools::EDIT,
+            serde_json::json!({"patch":"[/repo/a.rs#ABCD]\nSWAP 1.=1:\n+new"}),
+            "Applied patch".into(),
+        ));
+        messages.extend(pair(
+            "hot",
+            crate::tools::BASH,
+            serde_json::json!({"command":"long"}),
+            hot.clone(),
+        ));
+        assert!(prune_impl(&messages, cwd, "barrier-no-refresh", false).is_none());
 
-        let result = prune_for_model(&msgs, "test_full_prune");
-        if let Some(pruned) = result {
-            // Only the first Read message should survive; the Assistant
-            // at index 1 and the useless Write at index 2 should both be
-            // gone.
-            assert_eq!(pruned.len(), 1, "only first Read survives: {pruned:?}");
-            assert_eq!(pruned[0].role, Role::User);
-        }
+        messages.splice(
+            4..4,
+            pair(
+                "read-new",
+                crate::tools::READ,
+                serde_json::json!({"path":"a.rs"}),
+                old,
+            ),
+        );
+        let pruned = prune_impl(&messages, cwd, "barrier-refresh", false).expect("refresh prunes");
+        assert_protocol_pairs(&pruned);
+        assert!(
+            !pruned
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|c| matches!(c, MessageContent::ToolUse(t) if t.id == "read-old"))
+        );
     }
 
     #[test]
-    fn different_cooldown_keys_are_independent() {
-        let msgs = vec![make_msg(Role::User, vec![tr("Bash", "ok")])];
-        let _ = prune_for_model(&msgs, "thread_A");
-        let _ = prune_for_model(&msgs, "thread_B");
-        // No panic — different keys used independent cooldown slots.
+    fn failed_results_are_never_pruned() {
+        let cwd = Path::new("/repo");
+        let mut messages = Vec::new();
+        messages.extend(pair(
+            "old",
+            crate::tools::READ,
+            serde_json::json!({"path":"a.rs"}),
+            "old\n".repeat(24_000),
+        ));
+        let [use_message, mut result_message] = pair(
+            "failed",
+            crate::tools::READ,
+            serde_json::json!({"path":"a.rs"}),
+            "permission denied".into(),
+        );
+        if let MessageContent::ToolResult(result) = &mut result_message.content[0] {
+            result.is_error = true;
+        }
+        messages.push(use_message);
+        messages.push(result_message);
+        messages.extend(pair(
+            "hot",
+            crate::tools::BASH,
+            serde_json::json!({"command":"long"}),
+            "hot\n".repeat(45_000),
+        ));
+        assert!(prune_impl(&messages, cwd, "failed", false).is_none());
     }
 }

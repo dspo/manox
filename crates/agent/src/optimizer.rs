@@ -13,7 +13,7 @@
 //! `read_file`) is **not** stripped — it is the protocol the model uses to
 //! produce Edit tool patches, and removing it would break Edit.
 
-use crate::language_model::MessageContent;
+use crate::language_model::{LanguageModelRequestMessage, MessageContent};
 use crate::message::Message;
 
 /// Per-tool output budgets in bytes. Roughly ordered by expected verbosity:
@@ -68,6 +68,92 @@ pub fn optimize(messages: &[Message]) -> Vec<Message> {
         .collect()
 }
 
+/// Project inline images for the selected model. Vision-capable models retain
+/// images. Text-only models receive a compact placeholder. During compaction,
+/// `max_bytes` may remove the oldest image-only messages first while retaining
+/// the newest visual turn.
+pub fn apply_image_policy(
+    mut messages: Vec<LanguageModelRequestMessage>,
+    supports_images: bool,
+    max_bytes: Option<usize>,
+) -> Vec<LanguageModelRequestMessage> {
+    if !supports_images {
+        for message in &mut messages {
+            message.content = message
+                .content
+                .iter()
+                .map(|content| match content {
+                    MessageContent::Image { data, mime_type } => MessageContent::Text(format!(
+                        "[image omitted: active model has no vision support; mime={mime_type}, encoded_bytes={}]",
+                        data.len()
+                    )),
+                    other => other.clone(),
+                })
+                .collect();
+        }
+        return messages;
+    }
+
+    let Some(max_bytes) = max_bytes else {
+        return messages;
+    };
+    let mut total = request_content_bytes(&messages);
+    if total <= max_bytes {
+        return messages;
+    }
+    let image_only: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| {
+            !message.content.is_empty()
+                && message
+                    .content
+                    .iter()
+                    .all(|content| matches!(content, MessageContent::Image { .. }))
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    let newest = image_only.last().copied();
+    let mut remove = std::collections::HashSet::new();
+    for idx in image_only {
+        if Some(idx) == newest || total <= max_bytes {
+            continue;
+        }
+        total = total.saturating_sub(message_content_bytes(&messages[idx]));
+        remove.insert(idx);
+    }
+    messages
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| !remove.contains(idx))
+        .map(|(_, message)| message)
+        .collect()
+}
+
+fn request_content_bytes(messages: &[LanguageModelRequestMessage]) -> usize {
+    messages.iter().map(message_content_bytes).sum()
+}
+
+fn message_content_bytes(message: &LanguageModelRequestMessage) -> usize {
+    message
+        .content
+        .iter()
+        .map(|content| match content {
+            MessageContent::Text(text)
+            | MessageContent::Compaction(text)
+            | MessageContent::Thinking { text, .. } => text.len(),
+            MessageContent::Image { data, mime_type } => data.len() + mime_type.len(),
+            MessageContent::ToolUse(tool_use) => {
+                tool_use.raw_input.len()
+                    + serde_json::to_string(&tool_use.input)
+                        .map(|text| text.len())
+                        .unwrap_or_default()
+            }
+            MessageContent::ToolResult(result) => result.content.len(),
+        })
+        .sum()
+}
+
 /// The per-tool output budget in bytes.
 pub(crate) fn tool_budget(tool_name: &str) -> usize {
     match tool_name {
@@ -99,29 +185,34 @@ fn truncate_with_budget(text: &str, budget: usize) -> String {
     if text.len() <= budget {
         return text.to_string();
     }
-    let head_bytes = (budget as f64 * HEAD_FRAC) as usize;
-    let tail_bytes = (budget as f64 * TAIL_FRAC) as usize;
-    let total_kept = head_bytes + tail_bytes;
-    if total_kept >= text.len() {
-        return text.to_string();
+    if budget < 128 {
+        return truncate_str_to_bytes(text, budget).to_string();
     }
-    let elided = text.len() - total_kept;
-
-    // Find valid UTF-8 boundaries closest to the budget fractions.
-    let head = truncate_str_to_bytes(text, head_bytes);
-    // For the tail, walk backward from the end by tail_bytes, then snap
-    // forward to the next char boundary.
-    let tail_start = text.len().saturating_sub(tail_bytes);
-    let tail_start = snap_to_char_boundary(text, tail_start);
-    let tail = &text[tail_start..];
-
-    format!(
-        "{head}\n⚠ Output truncated ({total} bytes, keeping head {head_b}B + tail {tail_b}B; {skipped} bytes elided)\n{tail}",
-        total = text.len(),
-        head_b = head.len(),
-        tail_b = tail.len(),
-        skipped = elided,
-    )
+    let mut head_bytes = (budget as f64 * HEAD_FRAC) as usize;
+    let mut tail_bytes = (budget as f64 * TAIL_FRAC) as usize;
+    loop {
+        let head = truncate_str_to_bytes(text, head_bytes);
+        let tail_start = snap_to_char_boundary(text, text.len().saturating_sub(tail_bytes));
+        let tail = &text[tail_start..];
+        let skipped = text.len().saturating_sub(head.len() + tail.len());
+        let rendered = format!(
+            "{head}\n⚠ Output truncated ({total} bytes, keeping head {head_b}B + tail {tail_b}B; {skipped} bytes elided)\n{tail}",
+            total = text.len(),
+            head_b = head.len(),
+            tail_b = tail.len(),
+        );
+        if rendered.len() <= budget {
+            return rendered;
+        }
+        let overflow = rendered.len() - budget;
+        if tail_bytes > overflow + 4 {
+            tail_bytes -= overflow + 4;
+        } else if head_bytes > overflow + 4 {
+            head_bytes -= overflow + 4;
+        } else {
+            return truncate_str_to_bytes(text, budget).to_string();
+        }
+    }
 }
 
 /// Return the longest prefix of `s` whose byte length is ≤ `max_bytes` and
@@ -188,7 +279,7 @@ mod tests {
         let out = truncate_with_budget(&big, 1000);
         assert!(out.starts_with('A'));
         assert!(out.contains("truncated"));
-        assert!(out.len() <= 1200); // budget + marker overhead
+        assert!(out.len() <= 1000); // marker is included in the budget
     }
 
     #[test]
@@ -208,7 +299,7 @@ mod tests {
         let text = "中".repeat(25000); // 75000 bytes
         let out = truncate_with_budget(&text, 24 * 1024); // 24576 bytes
         assert!(
-            out.len() <= 24 * 1024 + 200, // budget + ~200 bytes marker overhead
+            out.len() <= 24 * 1024,
             "24 KiB budget: output {} bytes (budget 24576)",
             out.len()
         );
@@ -219,6 +310,50 @@ mod tests {
         let _ = BUDGET_READ;
         let _ = BUDGET_GREP;
         let _ = BUDGET_DEFAULT;
+    }
+
+    fn image_message(id: &str, bytes: usize) -> LanguageModelRequestMessage {
+        LanguageModelRequestMessage {
+            role: crate::language_model::Role::User,
+            content: vec![MessageContent::Image {
+                data: id.repeat(bytes),
+                mime_type: "image/png".into(),
+            }],
+            cache: false,
+        }
+    }
+
+    #[test]
+    fn nonvision_projection_replaces_images_without_mutating_input() {
+        let input = vec![image_message("A", 1024)];
+        let projected = apply_image_policy(input.clone(), false, None);
+        assert!(matches!(input[0].content[0], MessageContent::Image { .. }));
+        assert!(
+            matches!(projected[0].content[0], MessageContent::Text(ref text) if text.contains("image omitted"))
+        );
+    }
+
+    #[test]
+    fn vision_projection_keeps_images_without_compaction_budget() {
+        let input = vec![image_message("A", 1024)];
+        assert!(matches!(
+            apply_image_policy(input, true, None)[0].content[0],
+            MessageContent::Image { .. }
+        ));
+    }
+
+    #[test]
+    fn compaction_drops_oldest_image_only_messages_but_keeps_newest() {
+        let projected = apply_image_policy(
+            vec![image_message("A", 1000), image_message("B", 1000)],
+            true,
+            Some(1200),
+        );
+        assert_eq!(projected.len(), 1);
+        assert!(matches!(
+            &projected[0].content[0],
+            MessageContent::Image { data, .. } if data.starts_with('B')
+        ));
     }
 
     const _: () = {

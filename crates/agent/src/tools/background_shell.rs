@@ -327,6 +327,26 @@ pub fn poll(shell_id: &str) -> Result<PollResult, String> {
     })
 }
 
+/// Compact deterministic state for compaction capsules. The registry is
+/// thread-scoped unified task registry remains the lifecycle source of truth;
+/// completed entries stay available until its normal expiry.
+pub fn snapshots(thread_id: &str) -> Vec<String> {
+    let mut snapshots = crate::background_task::snapshots_for_thread(thread_id)
+        .into_iter()
+        .filter(|snapshot| snapshot.kind == crate::background_task::TaskKind::BackgroundBash)
+        .map(|snapshot| {
+            format!(
+                "{}:{}:{}B",
+                snapshot.task_id,
+                snapshot.status.as_str(),
+                snapshot.total_bytes
+            )
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort();
+    snapshots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "recorded_model_latency_ms": 1200.0,
+  "scenarios": [
+    {
+      "name": "repeated full-file reads",
+      "calls": [
+        {"id":"r1","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000},
+        {"id":"r2","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000},
+        {"id":"r3","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000},
+        {"id":"r4","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000},
+        {"id":"r5","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000}
+      ],
+      "schema_baseline_bytes": 140000,
+      "schema_projected_bytes": 36000,
+      "baseline_model_calls": 6,
+      "optimized_model_calls": 6
+    },
+    {
+      "name": "grep refinement loop",
+      "calls": [
+        {"id":"g1","tool":"Grep","input":{"pattern":"ThreadEvent","path":"crates"},"output_seed":"crates/agent/src/thread.rs:100:ThreadEvent\n","repeat":5000},
+        {"id":"g2","tool":"Grep","input":{"pattern":"ThreadEvent","path":"crates"},"output_seed":"crates/agent/src/thread.rs:100:ThreadEvent\n","repeat":5000},
+        {"id":"g3","tool":"Grep","input":{"pattern":"ThreadEvent","path":"crates"},"output_seed":"crates/agent/src/thread.rs:100:ThreadEvent\n","repeat":5000},
+        {"id":"g4","tool":"Grep","input":{"pattern":"ThreadEvent","path":"crates"},"output_seed":"crates/agent/src/thread.rs:100:ThreadEvent\n","repeat":5000}
+      ],
+      "schema_baseline_bytes": 140000,
+      "schema_projected_bytes": 32000,
+      "baseline_model_calls": 5,
+      "optimized_model_calls": 5
+    },
+    {
+      "name": "noisy build diagnostics",
+      "calls": [
+        {"id":"b1","tool":"Bash","input":{"command":"cargo test --workspace"},"output_seed":"warning: generated diagnostic line for replay\n","repeat":6500},
+        {"id":"b2","tool":"Bash","input":{"command":"cargo test --workspace"},"output_seed":"warning: generated diagnostic line for replay\n","repeat":6500},
+        {"id":"b3","tool":"Bash","input":{"command":"cargo test --workspace"},"output_seed":"warning: generated diagnostic line for replay\n","repeat":6500}
+      ],
+      "schema_baseline_bytes": 140000,
+      "schema_projected_bytes": 36000,
+      "baseline_model_calls": 4,
+      "optimized_model_calls": 4
+    },
+    {
+      "name": "edit refresh barrier",
+      "calls": [
+        {"id":"e1","tool":"Read","input":{"path":"src/state.rs"},"output_seed":"1:pub struct State;\n","repeat":9000},
+        {"id":"e2","tool":"Edit","input":{"patch":"[/replay/src/state.rs#ABCD]\nSWAP 1.=1:\n+pub struct State(u8);"},"output_seed":"Applied patch\n","repeat":1},
+        {"id":"e3","tool":"Read","input":{"path":"src/state.rs"},"output_seed":"1:pub struct State(u8);\n","repeat":9000},
+        {"id":"e4","tool":"Bash","input":{"command":"cargo check"},"output_seed":"Checking replay dependency graph\n","repeat":7000}
+      ],
+      "schema_baseline_bytes": 140000,
+      "schema_projected_bytes": 36000,
+      "baseline_model_calls": 5,
+      "optimized_model_calls": 5
+    },
+    {
+      "name": "non-vision image history and code batching",
+      "calls": [
+        {"id":"i1","tool":"Read","input":{"path":"assets/index.json"},"output_seed":"{\"asset\":\"sample\"}\n","repeat":6000}
+      ],
+      "images": [
+        {"mime_type":"image/png","encoded_seed":"QUJDREVGR0hJSktMTU5PUA==","repeat":18000},
+        {"mime_type":"image/png","encoded_seed":"UVJTVFVWV1hZWjAxMjM0NQ==","repeat":18000}
+      ],
+      "schema_baseline_bytes": 140000,
+      "schema_projected_bytes": 36000,
+      "baseline_model_calls": 6,
+      "optimized_model_calls": 3
+    }
+  ]
+}

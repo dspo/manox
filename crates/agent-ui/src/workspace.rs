@@ -798,6 +798,24 @@ impl Workspace {
                 ThreadEvent::TokenUsageUpdated(_) => {
                     cx.notify();
                 }
+                ThreadEvent::ContextOptimizationUpdated(metrics) => {
+                    this.context_rail.update(cx, |rail, cx| {
+                        rail.optimization = Some(metrics.clone());
+                        cx.notify();
+                    });
+                }
+                ThreadEvent::SideCallMetricsUpdated(metrics) => {
+                    this.context_rail.update(cx, |rail, cx| {
+                        rail.side_calls = metrics.clone();
+                        cx.notify();
+                    });
+                }
+                ThreadEvent::MainCallMetricsUpdated(metric) => {
+                    this.context_rail.update(cx, |rail, cx| {
+                        rail.main_call = Some(metric.clone());
+                        cx.notify();
+                    });
+                }
                 ThreadEvent::TurnStarted => {
                     // Light up the sidebar running indicator immediately —
                     // before the first streaming delta arrives (model warm-up,

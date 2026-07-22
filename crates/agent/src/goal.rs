@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
-    LanguageModelRequestMessage, MessageContent, Role,
+    LanguageModelRequestMessage, MessageContent, Role, TokenUsage,
 };
 use crate::message::Message;
 use crate::thread::truncate_summary;
@@ -47,6 +47,12 @@ const MESSAGE_SAMPLE_CHARS: usize = 800;
 pub struct GoalVerdict {
     pub satisfied: bool,
     pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GoalEvaluation {
+    pub verdict: GoalVerdict,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,7 +77,7 @@ pub async fn evaluate(
     lang: crate::language::Language,
     cancel: CancellationToken,
     cx: &AsyncApp,
-) -> GoalVerdict {
+) -> GoalEvaluation {
     let last_user = last_text(messages, Role::User)
         .map(|t| truncate_summary(&t, MESSAGE_SAMPLE_CHARS))
         .unwrap_or_default();
@@ -112,7 +118,10 @@ pub async fn evaluate(
         tool_choice: None,
         temperature: Some(0.0),
         thinking_allowed: false,
-        reasoning_effort: None,
+        reasoning_effort: crate::settings::side_call_effort(
+            &crate::settings::side_calls().goal_policy(),
+            crate::language_model::ReasoningEffort::Low,
+        ),
         max_output_tokens: crate::settings::side_call_output_cap(
             crate::settings::side_calls().goal_policy(),
         ),
@@ -126,15 +135,17 @@ pub async fn evaluate(
         };
         futures::pin_mut!(stream);
         let mut text = String::new();
+        let mut usage = None;
         while let Some(event) = stream.next().await {
             let Ok(event) = event else { return None };
             match event {
                 LanguageModelCompletionEvent::Text(delta) => text.push_str(&delta),
+                LanguageModelCompletionEvent::UsageUpdate(value) => usage = Some(value),
                 LanguageModelCompletionEvent::Stop(_) => break,
                 _ => {}
             }
         }
-        Some(text)
+        Some((text, usage))
     };
 
     // Race the evaluator call against a hard deadline and cancellation.
@@ -148,17 +159,23 @@ pub async fn evaluate(
         _ = cx.background_executor().timer(EVAL_TIMEOUT) => None,
         _ = cancel.cancelled() => None,
     };
-    let Some(text) = outcome else {
-        return GoalVerdict {
-            satisfied: false,
-            reason: "evaluator unavailable; continuing".to_string(),
+    let Some((text, usage)) = outcome else {
+        return GoalEvaluation {
+            verdict: GoalVerdict {
+                satisfied: false,
+                reason: "evaluator unavailable; continuing".to_string(),
+            },
+            usage: None,
         };
     };
 
-    parse_verdict(&text).unwrap_or(GoalVerdict {
-        satisfied: false,
-        reason: "evaluator response unparseable; continuing".to_string(),
-    })
+    GoalEvaluation {
+        verdict: parse_verdict(&text).unwrap_or(GoalVerdict {
+            satisfied: false,
+            reason: "evaluator response unparseable; continuing".to_string(),
+        }),
+        usage,
+    }
 }
 
 /// The trimmed concatenated `Text` blocks of the most recent message with the

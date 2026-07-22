@@ -34,6 +34,7 @@ pub mod prompt;
 pub mod proposed_plan;
 pub mod provider;
 pub mod read_policy;
+pub mod replay;
 pub mod retention;
 pub mod runtime;
 pub mod sandbox;
@@ -61,7 +62,10 @@ pub use language_model::{ReasoningEffort, TokenUsage};
 pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};
 pub use message::{Message, MessageUiMetadata};
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
-pub use thread::{PendingAuthMeta, Thread, ThreadEvent, ThreadId, ToolCallStatus};
+pub use thread::{
+    ContextOptimizationMetrics, PendingAuthMeta, SideCallMetric, Thread, ThreadEvent, ThreadId,
+    ToolCallStatus,
+};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
 pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
 pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};

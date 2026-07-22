@@ -92,12 +92,14 @@ impl TitleState {
         }
         // Respect the side-call policy — disabled title generation skips all
         // LLM calls and keeps the mechanical fallback.
-        if !crate::settings::side_calls().title_policy().enabled {
+        let policy = crate::settings::side_calls().title_policy();
+        if !policy.enabled {
             return;
         }
-        let Some(model) = model.cloned() else {
+        let Some(main_model) = model.cloned() else {
             return;
         };
+        let model = crate::settings::side_call_model(&policy, &main_model);
         if !messages
             .iter()
             .any(|m| m.role == Role::Assistant && message_has_text(m))
@@ -127,31 +129,36 @@ impl TitleState {
         self.in_flight = true;
         self.last_eval_user_count = Some(user_count);
         let entity = cx.entity();
+        let model_name = model.name();
         cx.spawn(async move |this, cx: &mut AsyncApp| {
+            let started = std::time::Instant::now();
             let result = crate::title::stream_thread_title(&model, request, cx).await;
+            let elapsed = started.elapsed();
             // Surface every title-generation outcome. A failure here used to be
             // swallowed by the `if let Ok` below, so an empty title (the symptom:
             // the Bot row falls back to the mechanical summary) left no trace.
             // `warn` on error / empty-text so the default log level shows it;
             // `debug` for the benign unchanged / success paths.
             match &result {
-                Ok(title) if title.is_empty() => {
+                Ok((title, _)) if title.is_empty() => {
                     tracing::warn!("title generation produced no usable text")
                 }
-                Ok(title) if crate::title::is_unchanged(title) => {
+                Ok((title, _)) if crate::title::is_unchanged(title) => {
                     tracing::debug!("title unchanged by model");
                 }
-                Ok(title) => {
+                Ok((title, _)) => {
                     tracing::debug!(title = %title, "title updated");
                 }
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:?}"), "title generation stream failed")
                 }
             }
+            let usage = result.as_ref().ok().and_then(|(_, usage)| *usage);
             let mut changed = false;
             this.update(cx, |t, cx| {
                 t.title_state.in_flight = false;
-                if let Ok(title) = result
+                t.record_side_call("title", &model_name, usage, elapsed, cx);
+                if let Ok((title, _)) = result
                     && !title.is_empty()
                     && !crate::title::is_unchanged(&title)
                 {
