@@ -1,6 +1,6 @@
 //! Agent cockpit view-model logic: run-phase enum and context-budget
 //! estimation. Pure functions over [`agent`] types — no GPUI, no rendering
-//! (the workspace reads these and lays them into the "Conversation info" card).
+//! (the workspace reads these and lays them into the "Conversation Info" card).
 //!
 //! The execution plan overview is no longer inferred here — the model publishes
 //! it explicitly through the `UpdatePlan` tool, and the rail consumes the

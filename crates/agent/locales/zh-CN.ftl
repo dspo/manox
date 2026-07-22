@@ -472,9 +472,9 @@ workspace-env-no-sources = 暂无来源
 workspace-env-git-unavailable = git 不可用
 workspace-env-git-not-a-repo = 非 git 仓库
 workspace-env-git-detached = 分离头指针
-workspace-env-git-copy-branch = 复制分支名
-workspace-env-git-copy-path = 复制工作区路径
-workspace-env-git-exit-worktree = 退出工作区
+workspace-env-git-copied-branch = 已复制分支名到剪贴板。
+workspace-env-git-copied-worktree-name = 已复制工作区名到剪贴板。
+workspace-env-git-copied-worktree-path = 已复制工作区路径到剪贴板。
 
 # ── 上下文栏（右侧边栏）────────────────────────────────────────────────
 context-rail-title = 对话信息
