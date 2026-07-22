@@ -68,6 +68,7 @@ impl AgentTool for ReadTool {
         };
         let (path_str, selector) = split_path_and_sel(&parsed.path);
         let path = resolve_path(path_str, &self.cwd);
+        let cwd = self.cwd.clone();
         let read_policy = self.read_policy.clone();
         cx.background_spawn(async move {
             // Enforce the read deny-list before touching the file: SSH keys,
@@ -84,6 +85,11 @@ impl AgentTool for ReadTool {
                 .lock()
                 .expect("hashline store poisoned")
                 .record(&path, &text);
+
+            // A successful source read is the earliest reliable signal that a
+            // coding task may need semantic navigation. Warm in the background
+            // so later definition/reference calls do not pay startup latency.
+            crate::lsp::warm_path(&path, &cwd);
 
             match selector {
                 None => Ok(format_full_read(

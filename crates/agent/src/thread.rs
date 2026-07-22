@@ -38,6 +38,7 @@ use crate::prefix_stability::StablePrefix;
 use crate::proposed_plan::{ProposedPlanParser, ProposedPlanSegment};
 use crate::title_state::TitleState;
 use crate::token_meter::TokenMeter;
+use crate::tool::ToolContext as _;
 use crate::tool::{PermissionCache, PermissionDecision, ToolAuthorizationResponse, ToolRegistry};
 use crate::tools;
 
@@ -3540,10 +3541,55 @@ impl Thread {
             .detach();
         })?;
         let output = result_task.await;
-        let (output_str, is_error) = match output {
+        let (mut output_str, is_error) = match output {
             Ok(o) => (o, false),
             Err(e) => (e, true),
         };
+
+        if crate::lsp::is_semantic_tool(&name) {
+            tracing::info!(
+                target: "manox::lsp_metrics",
+                event = "semantic_tool_result",
+                tool = %name,
+                success = !is_error,
+                thread_id = %ctx.thread_id()
+            );
+        }
+
+        // Successful source edits get a bounded, file-synchronized LSP check
+        // before the result returns to the model. This closes the fast feedback
+        // loop even when the model forgets to call Diagnostics explicitly.
+        if !is_error {
+            let changed_paths = crate::lsp::changed_source_paths(&name, &tu.input, ctx.cwd());
+            if !changed_paths.is_empty() {
+                let cwd = ctx.cwd().to_path_buf();
+                let path_count = changed_paths.len();
+                let diagnostics_task =
+                    cx.update(|cx| crate::lsp::post_edit_diagnostics(changed_paths, cwd, cx));
+                match diagnostics_task.await {
+                    Ok(feedback) if !feedback.is_empty() => {
+                        output_str.push_str("\n\n");
+                        output_str.push_str(&feedback);
+                        tracing::info!(
+                            target: "manox::lsp_metrics",
+                            event = "post_edit_diagnostics",
+                            files = path_count,
+                            success = true,
+                            thread_id = %ctx.thread_id()
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        target: "manox::lsp_metrics",
+                        event = "post_edit_diagnostics",
+                        files = path_count,
+                        success = false,
+                        %error,
+                        thread_id = %ctx.thread_id()
+                    ),
+                }
+            }
+        }
         // Every tool result enters the conversation bounded: the UI event, the
         // persisted messages, and the PostToolUse hook all share this one
         // capped text. The `agent` envelope is exempt — it is bounded at

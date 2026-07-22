@@ -16,6 +16,6 @@ pub mod proto;
 pub mod registry;
 pub mod spec;
 
-pub use client::{LspClient, ServerStatus};
+pub use client::{DiagnosticsReport, LspClient, ServerStatus};
 pub use registry::{LspRegistry, global, init, try_global};
 pub use spec::{LspServerSpec, SPECS, spec_for_extension, spec_for_id};

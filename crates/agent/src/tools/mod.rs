@@ -389,14 +389,13 @@ pub(crate) fn base_tools_with_policy(
         Arc::new(web_fetch::WebFetchTool) as AnyAgentTool,
     ];
 
-    // LSP code-intel is a read-only axis shared with sub-agents (unlike MCP,
-    // which stays main-agent-only). Same one-time-fingerprint discipline as the
-    // main registry.
-    if let Some(lsp_reg) = crate::lsp::try_global()
-        && !lsp_reg.available_specs().is_empty()
-    {
-        for tool in crate::lsp::tools() {
-            tools.push(tool);
+    // Status is always available so a broken shim or missing installation is
+    // actionable. The remaining code-intel tools are advertised only when at
+    // least one server passed its viability probe.
+    if let Some(lsp_reg) = crate::lsp::try_global() {
+        tools.push(crate::lsp::status_tool());
+        if !lsp_reg.available_specs().is_empty() {
+            tools.extend(crate::lsp::code_intel_tools());
         }
     }
 
@@ -480,18 +479,8 @@ pub fn main_registry_with_policy(
             reg.register(tool.clone());
         }
     }
-    // LSP code-intel tools — all read-only. Registered only when at least one
-    // server is on PATH, so an environment without language servers doesn't
-    // pollute the tool list. Unlike MCP, LSP is a read-only axis shared with
-    // sub-agents (see `base_tools_with_policy`); the registration is one-time,
-    // so the provider prefix cache fingerprint settles once across turns.
-    if let Some(lsp_reg) = crate::lsp::try_global()
-        && !lsp_reg.available_specs().is_empty()
-    {
-        for tool in crate::lsp::tools() {
-            reg.register(tool);
-        }
-    }
+    // LSP tools already arrive through `base_tools_with_policy`, including for
+    // the main agent. Do not register a duplicate set here.
     reg
 }
 
@@ -500,9 +489,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_tools_has_twelve_tools() {
+    fn base_tools_has_core_tools() {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
-        assert_eq!(tools.len(), 12);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"Write"));

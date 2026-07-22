@@ -2,9 +2,10 @@
 //! spawn/readiness model; six code-intel tools route a file path to the right
 //! server client by extension and return `path:line:col` or text summaries.
 //!
-//! Position input is `(path, line, symbol)`: the model picks the symbol text
-//! off a line (as `read_file` showed it) and the client resolves the exact
-//! column, freeing the model from counting UTF-16 offsets. Code-intel calls
+//! Position input is `(path, line, symbol, column?)`: the model normally picks
+//! the symbol text off a line and the client resolves the exact column. When a
+//! symbol occurs twice on one line, the optional 1-indexed column disambiguates
+//! it. Code-intel calls
 //! go through `LspRegistry::client_for`, which ensures + bounded-waits
 //! (≤5s) and returns an "indexing, retry" error instead of blocking forever.
 
@@ -57,7 +58,7 @@ pub struct LspStatusTool;
 #[derive(Deserialize, JsonSchema)]
 struct LspStatusInput {
     /// Optional language id (`rust`, `go`, `python`, `typescript`) or server
-    /// spec id (`rust-analyzer`). When omitted, reports every detected server.
+    /// spec id (`rust-analyzer`). When omitted, reports every supported server.
     #[serde(default)]
     language: Option<String>,
 }
@@ -68,7 +69,7 @@ impl AgentTool for LspStatusTool {
     }
     fn description(&self) -> &str {
         "Report the status of language servers (rust-analyzer/gopls/pyright/typescript-language-server) for the current project. \
-         Returns `not_started` (installed, not spawned yet — the default), `starting`, `ready`, `failed`, or `not_installed` per server. \
+         Returns `not_started` (installed, not spawned yet — the default), `starting`, `ready`, `failed`, or an actionable missing/broken probe detail per server. \
          Cheap: does not spawn a server. Optional `language` filters to one. \
          Use this before code-intel tools to decide whether to call LspEnsure/LspWaitReady."
     }
@@ -98,14 +99,17 @@ impl AgentTool for LspStatusTool {
                 let Some(want) = resolve_language(&lang) else {
                     return Ok(format!("unknown language `{lang}`"));
                 };
-                all.retain(|(id, _)| *id == want);
+                all.retain(|report| report.id == want);
             }
             if all.is_empty() {
-                return Ok("No LSP servers detected on PATH (install rust-analyzer/gopls/pyright/typescript-language-server to enable code-intel)".to_string());
+                return Ok("No matching LSP server is configured".to_string());
             }
             let body = all
                 .into_iter()
-                .map(|(id, s)| format!("{id}: {s:?}"))
+                .map(|report| match report.detail {
+                    Some(detail) => format!("{}: {:?} ({detail})", report.id, report.status),
+                    None => format!("{}: {:?}", report.id, report.status),
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             Ok(body)
@@ -154,8 +158,14 @@ impl AgentTool for LspEnsureTool {
             let Some(spec_id) = resolve_language(&parsed.language) else {
                 return Ok(format!("unknown language `{}`", parsed.language));
             };
-            if !reg.is_available(spec_id) {
-                return Ok(format!("{spec_id}: not_installed"));
+            match reg.availability(spec_id) {
+                Some(lsp::registry::ServerAvailability::Available) => {}
+                Some(lsp::registry::ServerAvailability::Broken(reason)) => {
+                    return Ok(format!("{spec_id}: broken ({reason})"));
+                }
+                Some(lsp::registry::ServerAvailability::NotInstalled) | None => {
+                    return Ok(format!("{spec_id}: not_installed"));
+                }
             }
             let status = reg.ensure(spec_id, cwd).await?;
             Ok(format!("{spec_id}: {status:?}"))
@@ -212,6 +222,15 @@ impl AgentTool for LspWaitReadyTool {
             let Some(spec_id) = resolve_language(&parsed.language) else {
                 return Ok(format!("unknown language `{}`", parsed.language));
             };
+            match reg.availability(spec_id) {
+                Some(lsp::registry::ServerAvailability::Available) => {}
+                Some(lsp::registry::ServerAvailability::Broken(reason)) => {
+                    return Ok(format!("{spec_id}: broken ({reason})"));
+                }
+                Some(lsp::registry::ServerAvailability::NotInstalled) | None => {
+                    return Ok(format!("{spec_id}: not_installed"));
+                }
+            }
             let status = reg
                 .wait_ready(
                     spec_id,
@@ -234,16 +253,7 @@ async fn client_for_path(path: &str, cwd: &Path) -> anyhow::Result<(Arc<lsp::Lsp
         return Err(anyhow::anyhow!("LSP not initialized"));
     };
     let abs = resolve_path(path, cwd);
-    let Some(spec) = reg.spec_for_path(&abs) else {
-        let ext = abs
-            .extension()
-            .map(|e| e.to_string_lossy())
-            .unwrap_or_default();
-        return Err(anyhow::anyhow!(
-            "no LSP server handles `.{ext}` — not a routed language (rust/go/python/typescript), or its server isn't on PATH"
-        ));
-    };
-    let client = reg.client_for(spec.id, cwd.to_path_buf()).await?;
+    let client = reg.client_for_path(&abs, cwd).await?;
     Ok((client, abs))
 }
 
@@ -276,6 +286,10 @@ struct PositionInput {
     /// The symbol text on that line whose definition to jump to. Picked off
     /// the line as read_file showed it; the client resolves the exact column.
     symbol: String,
+    /// Optional 1-indexed character column. Required only when the symbol text
+    /// occurs more than once on the selected line.
+    #[serde(default)]
+    column: Option<u32>,
 }
 
 impl AgentTool for GoToDefinitionTool {
@@ -283,7 +297,7 @@ impl AgentTool for GoToDefinitionTool {
         GO_TO_DEFINITION
     }
     fn description(&self) -> &str {
-        "Find where a symbol is defined (LSP textDocument/definition). Input: path + 1-indexed line + the symbol text on that line. \
+        "Find where a symbol is defined (LSP textDocument/definition). Input: path + 1-indexed line + the symbol text on that line; pass optional 1-indexed column only when the symbol occurs twice on the line. \
          Returns `path:line:col` triples (feed straight to read_file). Routes by file extension: .rs→rust-analyzer, .go→gopls, .py→pyright, .ts/.tsx/...→typescript-language-server. \
          The server must be installed and warmed (LspEnsure/LspWaitReady); returns an 'indexing, retry' note if not ready yet."
     }
@@ -307,7 +321,7 @@ impl AgentTool for GoToDefinitionTool {
         bridge_tokio(cx, async move {
             let (client, abs) = client_for_path(&parsed.path, &cwd).await?;
             let locs = client
-                .go_to_definition(&abs, parsed.line, &parsed.symbol)
+                .go_to_definition(&abs, parsed.line, &parsed.symbol, parsed.column)
                 .await?;
             Ok(render_locs(
                 locs,
@@ -325,6 +339,8 @@ struct ReferencesInput {
     path: String,
     line: u32,
     symbol: String,
+    #[serde(default)]
+    column: Option<u32>,
     /// Include the declaration site among references. Default true.
     #[serde(default = "default_true")]
     include_declaration: bool,
@@ -340,7 +356,7 @@ impl AgentTool for FindReferencesTool {
     }
     fn description(&self) -> &str {
         "Find all references to a symbol (LSP textDocument/references). Semantically accurate — unlike grep, won't be swamped by same-name identifiers in other scopes. \
-         Input: path + 1-indexed line + symbol text. Returns `path:line:col` triples. include_declaration defaults true. Same routing/ready rules as GoToDefinition."
+         Input: path + 1-indexed line + symbol text, plus optional column for same-line ambiguity. Returns `path:line:col` triples. include_declaration defaults true. Same routing/ready rules as GoToDefinition."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<ReferencesInput>()
@@ -366,6 +382,7 @@ impl AgentTool for FindReferencesTool {
                     &abs,
                     parsed.line,
                     &parsed.symbol,
+                    parsed.column,
                     parsed.include_declaration,
                 )
                 .await?;
@@ -386,7 +403,7 @@ impl AgentTool for HoverTool {
     }
     fn description(&self) -> &str {
         "Get hover info for a symbol (LSP textDocument/hover): type signature, doc comments. \
-         Input: path + 1-indexed line + symbol text. Returns markdown/plaintext, or 'no hover' if the server has nothing. Same routing/ready rules as GoToDefinition."
+         Input: path + 1-indexed line + symbol text, plus optional column for same-line ambiguity. Returns markdown/plaintext, or 'no hover' if the server has nothing. Same routing/ready rules as GoToDefinition."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<PositionInput>()
@@ -407,7 +424,10 @@ impl AgentTool for HoverTool {
         let cwd = ctx.cwd().to_path_buf();
         bridge_tokio(cx, async move {
             let (client, abs) = client_for_path(&parsed.path, &cwd).await?;
-            match client.hover(&abs, parsed.line, &parsed.symbol).await? {
+            match client
+                .hover(&abs, parsed.line, &parsed.symbol, parsed.column)
+                .await?
+            {
                 Some(text) => Ok(truncate_output(&text, OUTPUT_CAP).render("narrow the symbol")),
                 None => Ok("No hover information available".to_string()),
             }
@@ -553,9 +573,8 @@ impl AgentTool for DiagnosticsTool {
         DIAGNOSTICS
     }
     fn description(&self) -> &str {
-        "Report LSP diagnostics (errors/warnings) for a file or the whole project. These are what the language server pushes as it indexes; \
-         an empty result may mean no problems OR none pushed yet (check LspStatus). Input: optional path. \
-         NOTE: diagnostics reflect on-disk state (the server watches files); they may be stale during initial indexing. Re-run after edits settle."
+        "Report LSP diagnostics (errors/warnings) for a file or the whole project. A file-scoped call synchronizes the current on-disk content and waits briefly for a fresh publication. \
+         It explicitly reports `diagnostics unknown` on timeout and never presents missing data as a clean file. Input: optional path; omit it only to inspect the cached project-wide snapshot."
     }
     fn input_schema(&self) -> serde_json::Value {
         schema::<DiagnosticsInput>()
@@ -577,8 +596,10 @@ impl AgentTool for DiagnosticsTool {
         bridge_tokio(cx, async move {
             if let Some(path) = parsed.path {
                 let (client, abs) = client_for_path(&path, &cwd).await?;
-                let diags = client.cached_diagnostics(&abs);
-                return Ok(render_diagnostics(&abs, &diags));
+                let report = client
+                    .diagnostics_for(&abs, std::time::Duration::from_secs(2))
+                    .await?;
+                return Ok(render_diagnostics_report(&abs, report));
             }
             // No path: dump cached diagnostics across every warmed server.
             let Some(reg) = lsp::registry::try_global() else {
@@ -634,4 +655,61 @@ fn render_diagnostics(path: &Path, diags: &[lsp_types::Diagnostic]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     truncate_output(&body, OUTPUT_CAP).render("scope to a single file via the `path` argument")
+}
+
+fn render_diagnostics_report(path: &Path, report: lsp::DiagnosticsReport) -> String {
+    if !report.fresh {
+        return format!(
+            "{}: diagnostics unknown (no fresh publication for the current file content)",
+            path.display()
+        );
+    }
+    render_diagnostics(path, &report.diagnostics)
+}
+
+/// Fast post-edit feedback used by the harness after successful `Edit`/`Write`
+/// calls. Unsupported files are ignored; supported-but-unavailable servers are
+/// reported so the model can fall back to compiler/test verification.
+pub(crate) async fn diagnostics_for_paths(
+    paths: Vec<PathBuf>,
+    cwd: PathBuf,
+) -> anyhow::Result<Option<String>> {
+    let Some(reg) = lsp::registry::try_global() else {
+        return Ok(None);
+    };
+    const POST_EDIT_FILE_CAP: usize = 4;
+    let paths: Vec<_> = paths
+        .into_iter()
+        .filter(|path| reg.routed_spec_for_path(path).is_some())
+        .collect();
+    let total = paths.len();
+    let mut bodies = Vec::new();
+    for path in paths.into_iter().take(POST_EDIT_FILE_CAP) {
+        match reg.client_for_path(&path, &cwd).await {
+            Ok(client) => {
+                let report = client
+                    .diagnostics_for(&path, std::time::Duration::from_secs(1))
+                    .await?;
+                bodies.push(render_diagnostics_report(&path, report));
+            }
+            Err(error) => bodies.push(format!(
+                "{}: diagnostics unavailable ({error})",
+                path.display()
+            )),
+        }
+    }
+    if total > POST_EDIT_FILE_CAP {
+        bodies.push(format!(
+            "{} additional changed files were not checked automatically; call Diagnostics with each path or run the project checker",
+            total - POST_EDIT_FILE_CAP
+        ));
+    }
+    if bodies.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "LSP post-edit diagnostics:\n{}",
+            bodies.join("\n")
+        )))
+    }
 }

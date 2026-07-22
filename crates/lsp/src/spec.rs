@@ -5,7 +5,9 @@
 /// A language server manox can drive. Every field is static data; no behavior.
 ///
 /// - `detect`: command whose exit status tells whether the server binary is on
-///   `PATH`. Run at startup (cheap); a server not on `PATH` is never spawned.
+///   `PATH`.
+/// - `probe`: command that proves the resolved executable can actually run.
+///   This catches shims such as a rustup proxy whose component is not installed.
 /// - `spawn`: argv for the stdio server (pyright / ts-language-server need
 ///   `--stdio` to enter LSP mode; rust-analyzer / gopls are stdio by default).
 /// - `extensions`: file extensions routed to this server. `GoToDefinition`
@@ -15,7 +17,9 @@
 pub struct LspServerSpec {
     pub id: &'static str,
     pub detect: &'static [&'static str],
+    pub probe: &'static [&'static str],
     pub spawn: &'static [&'static str],
+    pub language_id: &'static str,
     pub extensions: &'static [&'static str],
     pub root_hints: &'static [&'static str],
 }
@@ -39,22 +43,28 @@ pub const SPECS: &[LspServerSpec] = &[
     LspServerSpec {
         id: "rust-analyzer",
         detect: &["which", "rust-analyzer"],
+        probe: &["rust-analyzer", "--version"],
         spawn: &["rust-analyzer"],
+        language_id: "rust",
         extensions: &["rs"],
         root_hints: &["Cargo.toml"],
     },
     LspServerSpec {
         id: "gopls",
         detect: &["which", "gopls"],
+        probe: &["gopls", "version"],
         spawn: &["gopls"],
+        language_id: "go",
         extensions: &["go"],
         root_hints: &["go.mod"],
     },
     LspServerSpec {
         id: "pyright",
         detect: &["which", "pyright-langserver"],
+        probe: &["pyright-langserver", "--version"],
         // pyright's LSP entry is `pyright-langserver`, not the `pyright` CLI.
         spawn: &["pyright-langserver", "--stdio"],
+        language_id: "python",
         extensions: &["py"],
         root_hints: &[
             "pyproject.toml",
@@ -66,7 +76,9 @@ pub const SPECS: &[LspServerSpec] = &[
     LspServerSpec {
         id: "typescript-language-server",
         detect: &["which", "typescript-language-server"],
+        probe: &["typescript-language-server", "--version"],
         spawn: &["typescript-language-server", "--stdio"],
+        language_id: "typescript",
         extensions: &["ts", "tsx", "js", "jsx", "mjs", "cjs"],
         root_hints: &["tsconfig.json", "package.json", "jsconfig.json"],
     },

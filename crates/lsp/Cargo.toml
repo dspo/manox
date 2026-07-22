@@ -16,5 +16,8 @@ serde_json.workspace = true
 lsp-types.workspace = true
 supervisor.workspace = true
 
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
 [lints.clippy]
 dbg_macro = "deny"
