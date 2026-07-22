@@ -449,10 +449,8 @@ mod tests {
             ("auto", ReasoningEffort::High),
             ("garbage", ReasoningEffort::High),
         ] {
-            let v: ReasoningEffort =
-                serde_json::from_str(&format!("\"{input}\"")).unwrap_or_else(|e| {
-                    panic!("deserialize \"{input}\" must succeed, got: {e}")
-                });
+            let v: ReasoningEffort = serde_json::from_str(&format!("\"{input}\""))
+                .unwrap_or_else(|e| panic!("deserialize \"{input}\" must succeed, got: {e}"));
             assert_eq!(
                 v, expected,
                 "\"{input}\" must resolve to {:?}, got {:?}",
