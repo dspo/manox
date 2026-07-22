@@ -1673,6 +1673,10 @@ impl Thread {
         }
         self.archived = archived;
         if archived {
+            // Archiving stops live work but deliberately retains the mailbox:
+            // events queued while the thread is archived must still be
+            // available if it is later unarchived. `Drop` owns final mailbox
+            // removal once the Thread can no longer be resumed.
             let thread_id = self.id.0.clone();
             if let Some(handle) = crate::runtime::try_handle() {
                 handle.spawn(async move {
@@ -2247,9 +2251,6 @@ impl Thread {
     /// of the run. Returns `false` when no command named `name` is registered,
     /// leaving the thread untouched so the UI can surface an error. `name` may
     /// be `plugin:command` or a bare `command`.
-    /// of the run. Returns `false` when no command named `name` is registered,
-    /// leaving the thread untouched so the UI can surface an error. `name` may
-    /// be `plugin:command` or a bare `command`.
     pub fn submit_command(&mut self, name: &str, args: &str, cx: &mut Context<Self>) -> bool {
         let Some(cmd) = crate::command::global().get(name).cloned() else {
             return false;
@@ -2324,6 +2325,8 @@ impl Thread {
                         });
                     }
                 }
+                // The watcher intentionally lives for the Thread's lifetime;
+                // this expression only supplies the async block's return type.
                 #[allow(unreachable_code)]
                 {}
             });
