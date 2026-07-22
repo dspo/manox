@@ -2480,6 +2480,11 @@ impl Thread {
             if this.depth != 0 {
                 return None;
             }
+            // Respect the side-call policy — disabled goal evaluation skips
+            // the LLM call and keeps the last-known verdict.
+            if !crate::settings::side_calls().goal_policy().enabled {
+                return None;
+            }
             // Plan turns do not advance a goal: codex gates `account_tokens` on
             // `!Plan`, and a Plan turn is read-only research with no execution
             // to evaluate progress against. Goal and Plan are also mutually
@@ -3403,12 +3408,16 @@ impl Thread {
             // AutoReview: ask the security-reviewer agent for each pending call.
             // Allow verdicts flow into `free_tus`; Ask verdicts flow into
             // `approval_tus` with a one-line reason surfaced in the overlay.
+            // When the side-call policy disables the reviewer, all
+            // auto-review calls fall through to user approval.
             if !auto_review_tus.is_empty() {
+                let review_enabled = crate::settings::side_calls().approval_policy().enabled;
                 match model.as_ref() {
                     None => {
-                        // No model loaded — defer everything to the overlay so
-                        // the user is never silently auto-approved without a
-                        // model in the loop.
+                        approval_tus.extend(auto_review_tus);
+                    }
+                    Some(_) if !review_enabled => {
+                        // Reviewer disabled — fall through to user approval.
                         approval_tus.extend(auto_review_tus);
                     }
                     Some(model) => {
@@ -4113,6 +4122,14 @@ impl Thread {
             // are always present and need no activation.
             if !is_error {
                 crate::tools::tool_search::activate_tools(&this.id.0, &[(*tu.name).to_string()]);
+                // BashOutput must be activated when Bash is used so the model
+                // can poll/reap background shells.
+                if tu.name.as_ref() == crate::tools::BASH {
+                    crate::tools::tool_search::activate_tools(
+                        &this.id.0,
+                        &[crate::tools::BASH_OUTPUT.to_string()],
+                    );
+                }
             }
             this.push_tool_result(result, cx);
         })?;

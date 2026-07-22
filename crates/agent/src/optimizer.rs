@@ -92,37 +92,57 @@ pub(crate) fn compact_tool_output(_tool_name: &str, raw: &str, budget: usize) ->
 
 /// Truncate `text` to `budget` bytes, preserving the head (HEAD_FRAC of
 /// budget) and tail (TAIL_FRAC of budget). The middle is replaced by a
-/// one-line elision marker. Truncation operates on chars (not bytes) to
-/// avoid splitting multi-byte UTF-8 sequences mid-character.
+/// one-line elision marker. Truncation operates at byte positions on valid
+/// UTF-8 character boundaries so multi-byte sequences are never split.
+/// The truncation marker itself counts toward the budget.
 fn truncate_with_budget(text: &str, budget: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= budget {
+    if text.len() <= budget {
         return text.to_string();
     }
-    let head_chars = (budget as f64 * HEAD_FRAC) as usize;
-    let tail_chars = (budget as f64 * TAIL_FRAC) as usize;
-    let total_kept = head_chars + tail_chars;
-    if total_kept >= char_count {
-        // Budget covers everything after rounding — no truncation needed.
+    let head_bytes = (budget as f64 * HEAD_FRAC) as usize;
+    let tail_bytes = (budget as f64 * TAIL_FRAC) as usize;
+    let total_kept = head_bytes + tail_bytes;
+    if total_kept >= text.len() {
         return text.to_string();
     }
-    let elided = char_count - total_kept;
-    let head: String = text.chars().take(head_chars).collect();
-    let tail: String = text
-        .chars()
-        .rev()
-        .take(tail_chars)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let elided = text.len() - total_kept;
+
+    // Find valid UTF-8 boundaries closest to the budget fractions.
+    let head = truncate_str_to_bytes(text, head_bytes);
+    // For the tail, walk backward from the end by tail_bytes, then snap
+    // forward to the next char boundary.
+    let tail_start = text.len().saturating_sub(tail_bytes);
+    let tail_start = snap_to_char_boundary(text, tail_start);
+    let tail = &text[tail_start..];
+
     format!(
-        "{head}\n⚠ Output truncated ({total} chars, showing first {head_c} and last {tail_c}; {skipped} chars elided)\n{tail}",
-        total = char_count,
-        head_c = head_chars,
-        tail_c = tail_chars,
+        "{head}\n⚠ Output truncated ({total} bytes, keeping head {head_b}B + tail {tail_b}B; {skipped} bytes elided)\n{tail}",
+        total = text.len(),
+        head_b = head.len(),
+        tail_b = tail.len(),
         skipped = elided,
     )
+}
+
+/// Return the longest prefix of `s` whose byte length is ≤ `max_bytes` and
+/// ends at a valid UTF-8 character boundary.
+fn truncate_str_to_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let end = snap_to_char_boundary(s, max_bytes);
+    &s[..end]
+}
+
+/// Find the nearest valid UTF-8 character boundary at or before `pos`.
+fn snap_to_char_boundary(s: &str, mut pos: usize) -> usize {
+    if pos >= s.len() {
+        return s.len();
+    }
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
 }
 
 #[cfg(test)]
@@ -172,14 +192,26 @@ mod tests {
     }
 
     #[test]
-    fn multi_byte_chars_handled_correctly() {
-        // Each emoji is 4 bytes in UTF-8. chars().take() preserves whole chars.
+    fn multi_byte_chars_preserved_at_boundaries() {
+        // Emoji are 4 bytes each. Truncation must not split them.
         let text = "🚀".repeat(500) + "hello" + &"🌟".repeat(500);
         let out = truncate_with_budget(&text, 600);
-        assert!(out.starts_with('🚀'), "starts with rocket: {out}");
+        assert!(out.starts_with('🚀'), "starts with rocket");
         assert!(out.ends_with('🌟'), "ends with star");
-        // Must not contain split multi-byte sequences (would cause UTF-8 errors).
         assert!(std::str::from_utf8(out.as_bytes()).is_ok(), "valid UTF-8");
+    }
+
+    #[test]
+    fn budget_is_bytes_not_chars() {
+        // "中" is 3 bytes in UTF-8. 24 KiB budget should allow at most 8192
+        // of them (= 24576 bytes), NOT 24576 chars (= 73728 bytes).
+        let text = "中".repeat(25000); // 75000 bytes
+        let out = truncate_with_budget(&text, 24 * 1024); // 24576 bytes
+        assert!(
+            out.len() <= 24 * 1024 + 200, // budget + ~200 bytes marker overhead
+            "24 KiB budget: output {} bytes (budget 24576)",
+            out.len()
+        );
     }
 
     #[test]

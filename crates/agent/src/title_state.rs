@@ -90,6 +90,11 @@ impl TitleState {
         if depth != 0 || self.in_flight {
             return;
         }
+        // Respect the side-call policy — disabled title generation skips all
+        // LLM calls and keeps the mechanical fallback.
+        if !crate::settings::side_calls().title_policy().enabled {
+            return;
+        }
         let Some(model) = model.cloned() else {
             return;
         };

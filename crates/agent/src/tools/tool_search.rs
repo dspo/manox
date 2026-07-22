@@ -91,12 +91,14 @@ pub fn drop_activations(thread_id: &str) {
     }
 }
 
-/// Whether tool discovery is active for the current process. True when the
-/// settings toggle is not Off.
+/// Whether tool discovery is actively filtering the schema. True only when
+/// the settings toggle is `On`. `Shadow` collects metrics (future) but does
+/// not alter the model-facing tool set, preserving the rollout safety
+/// contract.
 pub fn is_active() -> bool {
-    !matches!(
+    matches!(
         crate::settings::context_optimization().tool_discovery,
-        crate::settings::Toggle::Off
+        crate::settings::Toggle::On
     )
 }
 
