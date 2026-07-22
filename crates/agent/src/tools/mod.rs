@@ -19,6 +19,7 @@ pub mod descriptions;
 pub mod edit_file;
 pub mod file_lock;
 pub mod glob;
+pub mod goal;
 pub mod grep;
 pub mod list_directory;
 pub mod monitor;
@@ -62,6 +63,8 @@ pub const CODE: &str = "Code";
 pub const EDIT: &str = "Edit";
 pub const GLOB: &str = "Glob";
 pub const GREP: &str = "Grep";
+pub const GET_GOAL: &str = "GetGoal";
+pub const CREATE_GOAL: &str = "CreateGoal";
 pub const LIST: &str = "List";
 pub const MONITOR: &str = "Monitor";
 pub const READ: &str = "Read";
@@ -69,6 +72,7 @@ pub const SELF_INFO: &str = "SelfInfo";
 pub const SKILL: &str = "Skill";
 pub const TOOL_SEARCH: &str = "ToolSearch";
 pub const UPDATE_PLAN: &str = "UpdatePlan";
+pub const UPDATE_GOAL: &str = "UpdateGoal";
 pub const WEB_FETCH: &str = "WebFetch";
 pub const ENTER_WORKTREE: &str = "EnterWorktree";
 pub const EXIT_WORKTREE: &str = "ExitWorktree";
@@ -464,6 +468,11 @@ pub fn main_registry_with_policy(
     // drive the rail. Not read-only, so plan mode's filter hides it and the
     // backstop rejects a hallucinated call there.
     reg.register(Arc::new(update_plan::UpdatePlanTool) as AnyAgentTool);
+    // Goal tools are registered once for every main thread. Their stable
+    // presence keeps the provider tool prefix identical across Goal states.
+    reg.register(Arc::new(goal::GetGoalTool::new(parent.clone())) as AnyAgentTool);
+    reg.register(Arc::new(goal::CreateGoalTool::new(parent.clone())) as AnyAgentTool);
+    reg.register(Arc::new(goal::UpdateGoalTool::new(parent.clone())) as AnyAgentTool);
     // Worktree harness tools: main-thread-only, they mutate the owning
     // Thread's cwd and rebuild its tool registry on enter/exit.
     reg.register(Arc::new(worktree::EnterWorktreeTool::new(parent.clone())) as AnyAgentTool);
@@ -756,5 +765,47 @@ mod tests {
             full_names.iter().any(|n| n == UPDATE_PLAN),
             "UpdatePlan missing from the Default-mode tool set"
         );
+    }
+
+    #[test]
+    fn goal_tools_are_main_only_stable_and_hidden_in_plan_mode() {
+        crate::agent_def::init();
+        let base = base_tools(Arc::new(PathBuf::from(".")));
+        for name in [GET_GOAL, CREATE_GOAL, UPDATE_GOAL] {
+            assert!(!base.iter().any(|tool| tool.name() == name));
+        }
+
+        let registry = main_registry(
+            PathBuf::from("."),
+            WeakEntity::new_invalid(),
+            crate::language::Language::En,
+        );
+        let default_names: Vec<String> = registry
+            .to_request_tools(crate::language::Language::En)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let plan_names: Vec<String> = registry
+            .to_request_tools_read_only(crate::language::Language::En)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let discovery_names: Vec<String> = registry
+            .to_request_tools_in_order(
+                &tool_search::schema_order("goal-tools-stable"),
+                crate::language::Language::En,
+                false,
+            )
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for name in [GET_GOAL, CREATE_GOAL, UPDATE_GOAL] {
+            assert!(default_names.iter().any(|registered| registered == name));
+            assert!(
+                discovery_names.iter().any(|registered| registered == name),
+                "{name} must remain stable when tool discovery is enabled"
+            );
+            assert!(!plan_names.iter().any(|registered| registered == name));
+        }
     }
 }

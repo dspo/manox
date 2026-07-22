@@ -17,5 +17,4 @@
 - 你可以处理图片附件。
 {% else -%}
 - 你无法处理图片。如果有图片附件，如实说明并请用户提供文字描述，不要声称能看到它。
-{% endif %}{% if goal %}
-{% include "mode/goal.tera.md" %}{% endif %}
+{% endif %}

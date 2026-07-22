@@ -60,6 +60,7 @@ pub fn optimize(messages: &[Message]) -> Vec<Message> {
                 id: msg.id.clone(),
                 timestamp: msg.timestamp,
                 parent_id: msg.parent_id.clone(),
+                provenance: msg.provenance,
                 role: msg.role,
                 content,
                 ui: msg.ui.clone(),
@@ -239,6 +240,15 @@ fn snap_to_char_boundary(s: &str, mut pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::MessageProvenance;
+
+    #[test]
+    fn projection_preserves_internal_goal_provenance() {
+        let input = vec![Message::goal_continuation("continue".into())];
+        let projected = optimize(&input);
+        assert_eq!(projected[0].provenance, MessageProvenance::GoalContinuation);
+        assert!(projected[0].is_hidden_from_ui());
+    }
 
     #[test]
     fn small_output_passes_through() {

@@ -360,6 +360,7 @@ fn prune_impl(
                 id: message.id.clone(),
                 timestamp: message.timestamp,
                 parent_id: message.parent_id.clone(),
+                provenance: message.provenance,
                 role: message.role,
                 content,
                 ui: message.ui.clone(),
@@ -403,13 +404,10 @@ mod tests {
     }
 
     fn message(role: Role, content: Vec<MessageContent>) -> Message {
-        Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            timestamp: 0,
-            parent_id: None,
-            role,
-            content,
-            ui: None,
+        match role {
+            Role::User => Message::user_with_content(content),
+            Role::Assistant => Message::assistant(content),
+            Role::System => unreachable!("retention fixtures never store system-role messages"),
         }
     }
 
@@ -612,6 +610,22 @@ mod tests {
             "hot\n".repeat(45_000),
         ));
         messages
+    }
+
+    #[test]
+    fn pruning_preserves_internal_goal_messages_and_provenance() {
+        let mut messages = eligible_history();
+        messages.insert(0, Message::goal_continuation("authoritative Goal".into()));
+        let pruned =
+            prune_impl(&messages, Path::new("/repo"), "goal-provenance", false).expect("prunes");
+        let goal = pruned
+            .iter()
+            .find(|message| message.is_hidden_from_ui())
+            .expect("Goal continuation survives projection pruning");
+        assert_eq!(
+            goal.provenance,
+            crate::message::MessageProvenance::GoalContinuation
+        );
     }
 
     #[test]

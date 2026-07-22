@@ -60,7 +60,7 @@ pub use collaboration_mode::{
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
 pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};
-pub use message::{Message, MessageUiMetadata};
+pub use message::{Message, MessageProvenance, MessageUiMetadata};
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
 pub use thread::{
     ContextOptimizationMetrics, PendingAuthMeta, SideCallMetric, Thread, ThreadEvent, ThreadId,

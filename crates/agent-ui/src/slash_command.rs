@@ -379,15 +379,8 @@ impl SlashCommand for PlanCommand {
     }
 }
 
-/// `/goal` — set a completion condition the agent works toward until met.
-///
-/// - Bare `/goal`: open the goal status popover (condition / elapsed /
-///   evaluations / last reason / Clear). Does not send a turn.
-/// - `/goal <condition>`: enter goal mode and immediately run `condition` as
-///   the first user turn. `set_goal` runs before `InjectUserTurn` returns, so
-///   the turn's `build_completion_request` already carries the goal addendum.
-/// - `/goal clear` (aliases `stop`/`off`/`reset`/`none`/`cancel`): clear the
-///   active goal and abort any in-flight evaluator.
+/// `/goal` manages the durable Goal lifecycle. Replacing an unfinished Goal
+/// requires the explicit `/goal replace <objective>` confirmation command.
 struct GoalCommand;
 
 impl SlashCommand for GoalCommand {
@@ -401,23 +394,134 @@ impl SlashCommand for GoalCommand {
         &self,
         args: &str,
         workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> SlashResult {
         let thread = workspace.thread.clone();
         let trimmed = args.trim();
+        if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
+            thread.update(cx, |t, cx| {
+                if let Err(error) =
+                    t.replace_goal(objective.to_string(), None, agent::db::GoalActor::User, cx)
+                {
+                    cx.emit(agent::ThreadEvent::Error(error));
+                }
+            });
+            return SlashResult::Handled;
+        }
+        if let Some(objective) = trimmed.strip_prefix("edit ").map(str::trim) {
+            thread.update(cx, |t, cx| {
+                let budget = t.goal().and_then(|goal| goal.token_budget);
+                if let Err(error) = t.edit_goal(
+                    objective.to_string(),
+                    budget,
+                    agent::db::GoalActor::User,
+                    cx,
+                ) {
+                    cx.emit(agent::ThreadEvent::Error(error));
+                }
+            });
+            return SlashResult::Handled;
+        }
+        if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
+            thread.update(cx, |t, cx| {
+                let Some(goal) = t.goal().cloned() else {
+                    cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
+                        "thread has no Goal"
+                    )));
+                    return;
+                };
+                let budget = if matches!(value, "none" | "unlimited") {
+                    None
+                } else {
+                    match value.parse::<u64>() {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            cx.emit(agent::ThreadEvent::Error(error.into()));
+                            return;
+                        }
+                    }
+                };
+                if let Err(error) =
+                    t.edit_goal(goal.objective, budget, agent::db::GoalActor::User, cx)
+                {
+                    cx.emit(agent::ThreadEvent::Error(error));
+                }
+            });
+            return SlashResult::Handled;
+        }
         match trimmed.to_lowercase().as_str() {
             "" => {
-                workspace.open_goal_popover(cx);
+                if thread.read(cx).goal().is_some() {
+                    workspace.open_goal_popover(cx);
+                } else {
+                    workspace.begin_goal_new(window, cx);
+                }
                 SlashResult::Handled
             }
-            "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
-                thread.update(cx, |t, cx| t.clear_goal(cx));
+            "clear" => {
+                thread.update(cx, |t, cx| {
+                    if let Err(error) = t.clear_goal(agent::db::GoalActor::User, cx) {
+                        cx.emit(agent::ThreadEvent::Error(error));
+                    }
+                });
                 cx.notify();
                 SlashResult::Handled
             }
+            "pause" | "stop" => {
+                thread.update(cx, |t, cx| {
+                    if let Err(error) = t.set_goal_status(
+                        agent::goal::GoalStatus::Paused,
+                        Some("paused by user".into()),
+                        agent::db::GoalActor::User,
+                        cx,
+                    ) {
+                        cx.emit(agent::ThreadEvent::Error(error));
+                    }
+                });
+                SlashResult::Handled
+            }
+            "resume" => {
+                thread.update(cx, |t, cx| {
+                    if let Err(error) = t.set_goal_status(
+                        agent::goal::GoalStatus::Active,
+                        None,
+                        agent::db::GoalActor::User,
+                        cx,
+                    ) {
+                        cx.emit(agent::ThreadEvent::Error(error));
+                    }
+                });
+                SlashResult::Handled
+            }
+            "edit" => {
+                workspace.begin_goal_edit(window, cx);
+                SlashResult::Handled
+            }
+            "replace" => {
+                workspace.begin_goal_replace(window, cx);
+                SlashResult::Handled
+            }
             _ => {
-                thread.update(cx, |t, cx| t.set_goal(trimmed.to_string(), cx));
+                let needs_confirmation = thread
+                    .read(cx)
+                    .goal()
+                    .is_some_and(|goal| goal.status != agent::goal::GoalStatus::Complete);
+                if needs_confirmation {
+                    workspace.begin_goal_replace_with_objective(trimmed, window, cx);
+                    return SlashResult::Handled;
+                }
+                let created =
+                    thread.update(cx, |t, cx| match t.set_goal(trimmed.to_string(), cx) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            cx.emit(agent::ThreadEvent::Error(error));
+                            false
+                        }
+                    });
+                if !created {
+                    return SlashResult::Handled;
+                }
                 cx.notify();
                 SlashResult::InjectUserTurn(trimmed.to_string())
             }

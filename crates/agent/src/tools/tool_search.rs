@@ -36,6 +36,9 @@ pub const CORE_TOOLS: &[&str] = &[
     crate::tools::GLOB,
     crate::tools::ASK_USER_QUESTION,
     crate::tools::UPDATE_PLAN,
+    crate::tools::GET_GOAL,
+    crate::tools::CREATE_GOAL,
+    crate::tools::UPDATE_GOAL,
     NAME,
 ];
 
@@ -81,7 +84,8 @@ pub fn activate_tools(thread_id: &str, tool_names: &[String]) {
 }
 
 fn conditional_core(name: &str) -> bool {
-    (name == crate::tools::SKILL && !crate::skill::global().list().is_empty())
+    (name == crate::tools::SKILL
+        && crate::skill::try_global().is_some_and(|skills| !skills.list().is_empty()))
         || (name == crate::tools::CODE
             && matches!(
                 crate::settings::context_optimization().code_mode,
@@ -99,7 +103,7 @@ pub fn schema_order(thread_id: &str) -> Vec<String> {
     ) {
         order.push(crate::tools::CODE.to_string());
     }
-    if !crate::skill::global().list().is_empty() {
+    if crate::skill::try_global().is_some_and(|skills| !skills.list().is_empty()) {
         order.push(crate::tools::SKILL.to_string());
     }
     for name in activated_for(thread_id) {
