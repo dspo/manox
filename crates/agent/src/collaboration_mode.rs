@@ -138,16 +138,16 @@ impl ModeSettingsMap {
     }
 }
 
-/// Built-in preset for a mode, in `lang`. Plan sets `reasoning_effort = Medium`
-/// and the plan-mode developer instructions; Default carries the default-mode
-/// instructions. Both are overlaid by any user `[modes.*]` override. The
-/// instructions are selected by the thread's agent language so a Chinese
-/// thread gets Chinese plan/default prose.
+/// Built-in preset for a mode, in `lang`. Plan sets no reasoning_effort
+/// override (inherits the thread's selected effort) and the plan-mode developer
+/// instructions; Default carries the default-mode instructions. Both are
+/// overlaid by any user `[modes.*]` override. The instructions are selected by
+/// the thread's agent language so a Chinese thread gets Chinese plan/default prose.
 pub fn preset_for(mode: ModeKind, lang: Language) -> ModeSettings {
     match mode {
         ModeKind::Plan => ModeSettings {
             model: None,
-            reasoning_effort: Some(ReasoningEffort::Medium),
+            reasoning_effort: None,
             developer_instructions: Some(plan_instructions(lang).to_string()),
         },
         ModeKind::Default => ModeSettings {
@@ -220,17 +220,17 @@ mod tests {
     fn resolved_overlay_takes_override_when_present() {
         let base = ModeSettings {
             model: Some("base-model".into()),
-            reasoning_effort: Some(ReasoningEffort::Low),
+            reasoning_effort: Some(ReasoningEffort::High),
             developer_instructions: Some("base".into()),
         };
         let ovr = ModeSettings {
             model: Some("ovr-model".into()),
-            reasoning_effort: Some(ReasoningEffort::High),
+            reasoning_effort: Some(ReasoningEffort::Max),
             developer_instructions: Some("ovr".into()),
         };
         let r = base.resolved(&ovr);
         assert_eq!(r.model.as_deref(), Some("ovr-model"));
-        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::Max));
         assert_eq!(r.developer_instructions.as_deref(), Some("ovr"));
     }
 
@@ -238,7 +238,7 @@ mod tests {
     fn resolved_preserves_base_when_override_absent() {
         let base = ModeSettings {
             model: Some("base-model".into()),
-            reasoning_effort: Some(ReasoningEffort::Low),
+            reasoning_effort: Some(ReasoningEffort::High),
             developer_instructions: Some("base".into()),
         };
         // Empty override: every base field preserved.
@@ -252,14 +252,14 @@ mod tests {
         };
         let r = base.resolved(&partial);
         assert_eq!(r.model.as_deref(), Some("ovr-model"));
-        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(r.developer_instructions.as_deref(), Some("base"));
     }
 
     #[test]
-    fn preset_for_plan_sets_medium_effort_and_plan_instructions() {
+    fn preset_for_plan_has_no_effort_override() {
         let p = preset_for(ModeKind::Plan, Language::En);
-        assert_eq!(p.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(p.reasoning_effort, None);
         assert!(p.developer_instructions.is_some());
         assert!(p.model.is_none());
     }
@@ -276,7 +276,7 @@ mod tests {
     fn resolve_returns_preset_when_no_user_override() {
         let user = ModeSettingsMap::default();
         let plan = resolve(ModeKind::Plan, &user, Language::En);
-        assert_eq!(plan.reasoning_effort, Some(ReasoningEffort::Medium));
+        assert_eq!(plan.reasoning_effort, None);
 
         let default = resolve(ModeKind::Default, &user, Language::En);
         assert_eq!(default.reasoning_effort, None);
@@ -287,14 +287,14 @@ mod tests {
         let user = ModeSettingsMap {
             plan: Some(ModeSettings {
                 model: Some("custom-plan-model".into()),
-                reasoning_effort: Some(ReasoningEffort::High),
+                reasoning_effort: Some(ReasoningEffort::Max),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let r = resolve(ModeKind::Plan, &user, Language::En);
         assert_eq!(r.model.as_deref(), Some("custom-plan-model"));
-        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(r.reasoning_effort, Some(ReasoningEffort::Max));
         // Preset's developer_instructions survives (override didn't set it).
         assert!(r.developer_instructions.is_some());
     }

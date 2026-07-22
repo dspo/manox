@@ -72,7 +72,7 @@ pub struct MainSystemPromptData {
 /// `base` is the pre-rendered base prompt: for the main thread, the rendered
 /// [`MainSystemPromptData`]; for a sub-agent, its `agents/*.md` system body.
 /// `language` is `Some` only for sub-agents (the main base already bakes the
-/// directive in). Mode addendums are toggled by the booleans; the prose lives
+/// directive in). Mode addendums are toggled by the boolean; the prose lives
 /// in the `mode/*.tera.md` templates included by the assembly template.
 #[derive(Debug, Clone, Serialize)]
 pub struct SystemPromptAssembly {
@@ -80,7 +80,6 @@ pub struct SystemPromptAssembly {
     pub language: Option<LanguagePromptData>,
     pub worktree_subagent: Option<WorktreePromptData>,
     pub goal: bool,
-    pub ultracode: bool,
     /// Operator-declared model capability ground truth (provider-config
     /// `supports_tools` / `supports_images`), so the model does not
     /// self-report — and hallucinate — its own capabilities (thread 480b2469:

@@ -797,9 +797,9 @@ mod tests {
     }
 
     #[test]
-    fn build_request_body_clamps_reasoning_effort_for_official_openai() {
+    fn build_request_body_clamps_max_effort_for_official_openai() {
         let mut req = req_with_tool();
-        req.reasoning_effort = Some(ReasoningEffort::Ultracode);
+        req.reasoning_effort = Some(ReasoningEffort::Max);
         let body = build_request_body("m", 64, &req, "test-key", true);
         assert_eq!(body["reasoning_effort"], "high");
     }

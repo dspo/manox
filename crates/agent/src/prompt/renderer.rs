@@ -38,8 +38,6 @@ const TPL_SYSTEM_ASSEMBLY_EN: &str = include_str!("templates/en/system/assembly.
 const TPL_SYSTEM_ASSEMBLY_ZH_CN: &str = include_str!("templates/zh-CN/system/assembly.tera.md");
 const TPL_MODE_GOAL_EN: &str = include_str!("templates/en/mode/goal.tera.md");
 const TPL_MODE_GOAL_ZH_CN: &str = include_str!("templates/zh-CN/mode/goal.tera.md");
-const TPL_MODE_ULTRACODE_EN: &str = include_str!("templates/en/mode/ultracode.tera.md");
-const TPL_MODE_ULTRACODE_ZH_CN: &str = include_str!("templates/zh-CN/mode/ultracode.tera.md");
 const TPL_WRAPPER_MAX_TURNS_SUMMARY_EN: &str =
     include_str!("templates/en/wrapper/max_turns_summary.tera.md");
 const TPL_WRAPPER_MAX_TURNS_SUMMARY_ZH_CN: &str =
@@ -120,10 +118,9 @@ const TPL_AGENT_TOOL_ZH_CN: &str = include_str!("templates/zh-CN/tools/agent_too
 
 /// `(PromptTemplate, English source, 简体中文 source)` for every built-in
 /// template. The single source of truth for what gets parsed into each
-/// language's Tera. Order matters: `mode/goal.tera.md` and
-/// `mode/ultracode.tera.md` must be registered before `system/assembly.tera.md`
-/// (which `{% include %}`s them), because Tera resolves includes at
-/// `add_raw_template` time.
+/// language's Tera. Order matters: `mode/goal.tera.md` must be registered
+/// before `system/assembly.tera.md` (which `{% include %}`s it), because Tera
+/// resolves includes at `add_raw_template` time.
 const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
     (
         PromptTemplate::SystemMain,
@@ -134,11 +131,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::ModeGoalAddendum,
         TPL_MODE_GOAL_EN,
         TPL_MODE_GOAL_ZH_CN,
-    ),
-    (
-        PromptTemplate::ModeUltracodeGrant,
-        TPL_MODE_ULTRACODE_EN,
-        TPL_MODE_ULTRACODE_ZH_CN,
     ),
     (
         PromptTemplate::SystemAssembly,
@@ -452,7 +444,6 @@ mod tests {
         // Run against both languages so a parse failure in one is caught.
         let static_templates = [
             PromptTemplate::ModeGoalAddendum,
-            PromptTemplate::ModeUltracodeGrant,
             PromptTemplate::WrapperMaxTokensDirective,
             PromptTemplate::WrapperUnfulfilledToolIntentNudge,
             PromptTemplate::WrapperToolDenied,
@@ -487,8 +478,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 26);
-        assert_eq!(REGISTRATIONS.len(), 26);
+        assert_eq!(template::ALL.len(), 25);
+        assert_eq!(REGISTRATIONS.len(), 25);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -577,7 +568,6 @@ mod tests {
                     path: "/w".to_string(),
                 }),
                 goal: true,
-                ultracode: true,
             };
             assert_clean(
                 &render(PromptTemplate::SystemAssembly, lang, &assembly).unwrap(),

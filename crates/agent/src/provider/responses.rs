@@ -777,9 +777,9 @@ mod tests {
     #[test]
     fn build_request_body_includes_reasoning_effort() {
         let mut req = req_with_tool();
-        req.reasoning_effort = Some(ReasoningEffort::XHigh);
+        req.reasoning_effort = Some(ReasoningEffort::Max);
         let body = build_request_body("m", 64, &req, "test-key", false);
-        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["reasoning"]["effort"], "max");
     }
 
     #[test]
@@ -788,14 +788,6 @@ mod tests {
         req.reasoning_effort = Some(ReasoningEffort::Max);
         let body = build_request_body("m", 64, &req, "test-key", true);
         assert_eq!(body["reasoning"]["effort"], "high");
-    }
-
-    #[test]
-    fn build_request_body_includes_ultracode_effort() {
-        let mut req = req_with_tool();
-        req.reasoning_effort = Some(ReasoningEffort::Ultracode);
-        let body = build_request_body("m", 64, &req, "test-key", false);
-        assert_eq!(body["reasoning"]["effort"], "ultracode");
     }
 
     #[test]
