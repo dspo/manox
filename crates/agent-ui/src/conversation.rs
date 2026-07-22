@@ -1489,7 +1489,7 @@ impl ConversationState {
                                 total_bytes: snapshot.total_bytes,
                                 exit_code: snapshot.exit_code,
                                 failure_summary: snapshot.failure_summary.clone(),
-                                created_at: None,
+                                created_at: Some(Instant::now()),
                                 recent_events,
                             }),
                             role.to_string(),
@@ -1574,6 +1574,40 @@ impl ConversationState {
             turn_started_at: Instant::now(),
         }
     }
+
+    /// Rehydrate persisted background-task cards after rebuilding canonical
+    /// messages. Running/Stopping snapshots have already been normalized to
+    /// SessionEnded by `Thread::restore`.
+    pub fn restore_background_tasks(
+        &mut self,
+        snapshots: &[agent::background_task::TaskSnapshot],
+        role: &str,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) {
+        for snapshot in snapshots {
+            let id = self.items.len();
+            self.items.push(cx.new(|_| {
+                MessageItem::new(
+                    ConvItem::BackgroundTask(BackgroundTaskItem {
+                        task_id: snapshot.task_id.clone(),
+                        kind: snapshot.kind,
+                        description: snapshot.description.clone(),
+                        status: snapshot.status,
+                        event_count: snapshot.event_count,
+                        total_bytes: snapshot.total_bytes,
+                        exit_code: snapshot.exit_code,
+                        failure_summary: snapshot.failure_summary.clone(),
+                        created_at: None,
+                        recent_events: Vec::new(),
+                    }),
+                    role.to_string(),
+                    id,
+                    weak.clone(),
+                )
+            }));
+        }
+    }
 }
 
 /// Splice persisted UI notes back into the rebuilt canonical item list.
@@ -1608,6 +1642,13 @@ fn merge_ui_notes(
         .iter()
         .filter(|m| {
             if m.role != Role::User {
+                return false;
+            }
+            if m.ui
+                .as_ref()
+                .and_then(|ui| ui.external_event)
+                .unwrap_or(false)
+            {
                 return false;
             }
             let has_text = m.content.iter().any(|c| match c {

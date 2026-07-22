@@ -689,6 +689,9 @@ pub struct Thread {
     /// them. The revision lets `upsert` refuse the stale write instead of
     /// clobbering the newer state — see `ThreadsDatabase::upsert`.
     persist_revision: AtomicU64,
+    /// Persisted task snapshots, including terminal tasks from prior sessions.
+    /// Live registry snapshots override entries with the same id.
+    background_tasks: Vec<crate::background_task::TaskSnapshot>,
     /// Persisted UI annotations (`Error` / `Notice` cards) loaded from the
     /// `thread_ui_notes` table. A UI-only cache: it is never part of the
     /// canonical `messages`, never read by `build_completion_request`, and
@@ -740,8 +743,13 @@ impl Drop for Thread {
     fn drop(&mut self) {
         // Cancel all background tasks owned by this thread so persistent
         // monitors and background bash are not orphaned.
-        crate::background_task::cancel_all_for_thread(&self.id.0);
-        crate::background_task::remove_thread_mailbox(&self.id.0);
+        if let Some(handle) = crate::runtime::try_handle() {
+            let thread_id = self.id.0.clone();
+            handle.spawn(async move {
+                crate::background_task::cancel_all_for_thread(&thread_id).await;
+                crate::background_task::remove_thread_mailbox(&thread_id);
+            });
+        }
 
         let Some(wt) = self.worktree.take() else {
             return;
@@ -881,6 +889,7 @@ impl Thread {
                 interacted_at: now,
                 token_meter: TokenMeter::default(),
                 persist_revision: AtomicU64::new(0),
+                background_tasks: Vec::new(),
                 ui_notes: Vec::new(),
             }
         })
@@ -929,6 +938,12 @@ impl Thread {
                     );
                     crate::language::Language::En
                 });
+            let background_tasks = rec
+                .background_tasks
+                .iter()
+                .cloned()
+                .map(crate::background_task::TaskSnapshot::normalize_after_restore)
+                .collect();
             Self {
                 id: ThreadId(rec.id),
                 messages: rec.messages,
@@ -994,6 +1009,7 @@ impl Thread {
                     rec.per_model_token_usage,
                 ),
                 persist_revision: AtomicU64::new(rec.revision),
+                background_tasks,
                 ui_notes: Vec::new(),
             }
         })
@@ -1085,6 +1101,7 @@ impl Thread {
                 interacted_at: chrono::Utc::now().timestamp(),
                 token_meter: TokenMeter::default(),
                 persist_revision: AtomicU64::new(0),
+                background_tasks: Vec::new(),
                 ui_notes: Vec::new(),
             }
         })
@@ -1127,7 +1144,24 @@ impl Thread {
             messages: self.messages.clone(),
             request_token_usage: self.token_meter.per_request().clone(),
             per_model_token_usage: self.token_meter.per_model().clone(),
+            background_tasks: self.background_task_snapshots(),
         })
+    }
+
+    /// Merge persisted and live task state for persistence and historical UI.
+    pub fn background_task_snapshots(&self) -> Vec<crate::background_task::TaskSnapshot> {
+        let mut by_id: HashMap<String, crate::background_task::TaskSnapshot> = self
+            .background_tasks
+            .iter()
+            .cloned()
+            .map(|snapshot| (snapshot.task_id.clone(), snapshot))
+            .collect();
+        for snapshot in crate::background_task::snapshots_for_thread(&self.id.0) {
+            by_id.insert(snapshot.task_id.clone(), snapshot);
+        }
+        let mut snapshots: Vec<_> = by_id.into_values().collect();
+        snapshots.sort_by_key(|snapshot| snapshot.created_at_ms);
+        snapshots
     }
 
     /// Display title: the LLM-generated title if present, else the mechanical
@@ -1639,9 +1673,14 @@ impl Thread {
         }
         self.archived = archived;
         if archived {
-            crate::background_task::cancel_all_for_thread(&self.id.0);
-            crate::background_task::remove_all_for_thread(&self.id.0);
-            crate::background_task::remove_thread_mailbox(&self.id.0);
+            let thread_id = self.id.0.clone();
+            if let Some(handle) = crate::runtime::try_handle() {
+                handle.spawn(async move {
+                    crate::background_task::cancel_all_for_thread(&thread_id).await;
+                });
+            }
+        } else if crate::background_task::thread_has_pending_events(&self.id.0) {
+            crate::background_task::ensure_thread_mailbox(&self.id.0).notify_one();
         }
         cx.notify();
     }
@@ -2162,10 +2201,22 @@ impl Thread {
         // Events are already in thread-seq order from the mailbox.
         let mut body = String::new();
         for event in &events {
-            body.push_str(&crate::background_task::format_event_for_model(event));
-            body.push('\n');
+            let rendered = crate::background_task::format_event_for_model(event);
+            if !rendered.is_empty() {
+                body.push_str(&rendered);
+                body.push('\n');
+            }
         }
-        self.insert_user_message(body, cx);
+        if !body.is_empty() {
+            self.insert_user_message_with_ui_metadata(
+                body,
+                Some(crate::MessageUiMetadata {
+                    external_event: Some(true),
+                    ..Default::default()
+                }),
+                cx,
+            );
+        }
         // Emit BackgroundTaskUpdated snapshots for tasks that produced
         // events, so the UI can update status cards in-place.
         let mut task_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2174,9 +2225,17 @@ impl Thread {
         }
         for tid in &task_ids {
             if let Some(task) = crate::background_task::get_by_str(tid) {
-                cx.emit(ThreadEvent::BackgroundTaskUpdated {
-                    snapshot: task.snapshot(&crate::background_task::TaskId(tid.clone())),
-                });
+                let snapshot = task.snapshot(&crate::background_task::TaskId(tid.clone()));
+                if let Some(existing) = self
+                    .background_tasks
+                    .iter_mut()
+                    .find(|existing| existing.task_id == *tid)
+                {
+                    *existing = snapshot.clone();
+                } else {
+                    self.background_tasks.push(snapshot.clone());
+                }
+                cx.emit(ThreadEvent::BackgroundTaskUpdated { snapshot });
             }
         }
         cx.notify();
@@ -2242,11 +2301,21 @@ impl Thread {
                     // Wait for a notification. This does not consume events;
                     // it only signals that new events may be available.
                     notify.notified().await;
-                    // Check if the thread is idle and has pending events.
+                    // An idle watcher drains every event so UI state advances,
+                    // but starts a model turn only for model-facing output,
+                    // Gap or Terminal events. StateChanged alone is UI-only.
                     let should_wake = this
-                        .update(cx, |this, _| {
-                            this.running_turn.is_none()
-                                && crate::background_task::thread_has_pending_events(&this.id.0)
+                        .update(cx, |this, cx| {
+                            if this.archived
+                                || this.running_turn.is_some()
+                                || !crate::background_task::thread_has_pending_events(&this.id.0)
+                            {
+                                return false;
+                            }
+                            let should_wake =
+                                crate::background_task::thread_has_pending_model_events(&this.id.0);
+                            this.drain_background_events(cx);
+                            should_wake
                         })
                         .unwrap_or(false);
                     if should_wake {
@@ -2361,17 +2430,20 @@ impl Thread {
             // turn to drain them. This is single-flight: only one turn runs
             // at a time, and events that arrive during the new turn will be
             // drained by `drain_background_events` at the top of the loop.
-            if !turn_cancelled {
-                let has_bg_events = this
-                    .update(cx, |this, _| {
-                        crate::background_task::thread_has_pending_events(&this.id.0)
-                    })
-                    .unwrap_or(false);
-                if has_bg_events {
-                    let _ = this.update(cx, |this, cx| {
-                        this.run_turn(cx);
-                    });
-                }
+            let has_bg_events = this
+                .update(cx, |this, cx| {
+                    let should_wake =
+                        crate::background_task::thread_has_pending_model_events(&this.id.0);
+                    if crate::background_task::thread_has_pending_events(&this.id.0) {
+                        this.drain_background_events(cx);
+                    }
+                    should_wake
+                })
+                .unwrap_or(false);
+            if has_bg_events {
+                let _ = this.update(cx, |this, cx| {
+                    this.run_turn(cx);
+                });
             }
         });
         self.running_turn = Some(task);
@@ -3269,8 +3341,13 @@ impl Thread {
                         // Check for background task events that arrived
                         // during the final assistant stream. If any are
                         // pending, continue the loop to inject them.
-                        let has_bg_events = this.update(cx, |this, _| {
-                            crate::background_task::thread_has_pending_events(&this.id.0)
+                        let has_bg_events = this.update(cx, |this, cx| {
+                            let should_continue =
+                                crate::background_task::thread_has_pending_model_events(&this.id.0);
+                            if crate::background_task::thread_has_pending_events(&this.id.0) {
+                                this.drain_background_events(cx);
+                            }
+                            should_continue
                         })?;
                         if has_bg_events {
                             continue;
@@ -4529,6 +4606,13 @@ pub(crate) fn truncate_summary(s: &str, max_chars: usize) -> String {
 
 /// Whether a message has any non-empty `Text` content block.
 pub(crate) fn message_has_text(m: &Message) -> bool {
+    if m.ui
+        .as_ref()
+        .and_then(|ui| ui.external_event)
+        .unwrap_or(false)
+    {
+        return false;
+    }
     m.content
         .iter()
         .any(|c| matches!(c, MessageContent::Text(t) if !t.trim().is_empty()))

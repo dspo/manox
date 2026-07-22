@@ -342,16 +342,19 @@ impl AgentTool for BashTool {
             // back to the gpui executor via async_channel, mirroring monitor.
             let (tx, rx) = async_channel::bounded::<Result<String, String>>(1);
             let thread_id_bg = ctx.thread_id().to_string();
+            let anchor_message_id = ctx.anchor_message_id().map(str::to_owned);
             crate::runtime::handle().spawn(async move {
                 let result = super::background_shell::spawn(
                     command,
                     &thread_id_bg,
+                    anchor_message_id,
                     &cwd_for_bg,
                     timeout_bg,
                     plugin_root_bg.as_deref(),
                     &sandbox_bg,
                     proxy_port,
                 )
+                .await
                 .map(|shell_id| {
                     format!(
                         "Background shell started. shell_id: {shell_id}\n\

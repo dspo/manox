@@ -1085,6 +1085,11 @@ impl Workspace {
                         s.set_unread(&id, true, cx);
                     });
                 }
+                ThreadEvent::BackgroundTaskUpdated { .. } => {
+                    save_thread(parked_thread.clone(), false, cx);
+                    let store = agent::thread_store_global();
+                    store.update(cx, |s, cx| s.set_unread(&id, true, cx));
+                }
                 _ => {}
             },
         )
@@ -1929,20 +1934,26 @@ impl Workspace {
         let subagent_snapshots = snapshots_from_messages(&messages);
         let usage = self.thread.read(cx).request_token_usage().clone();
         let notes = self.thread.read(cx).ui_notes().to_vec();
+        let background_tasks = self.thread.read(cx).background_task_snapshots();
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
         let running = self.thread.read(cx).is_running();
         let cwd = thread_cwd(&self.thread, cx);
         let new_conv = cx.new(|cx| {
-            ConversationState::rebuild_from_messages(
+            let mut conversation = ConversationState::rebuild_from_messages(
                 &messages,
                 &usage,
                 &role,
                 running,
                 &notes,
-                crate::conversation::ApplyCtx { weak, cwd },
+                crate::conversation::ApplyCtx {
+                    weak: weak.clone(),
+                    cwd,
+                },
                 cx,
-            )
+            );
+            conversation.restore_background_tasks(&background_tasks, &role, weak.clone(), cx);
+            conversation
         });
         self.conversation = new_conv;
         // Restore the incoming thread's saved draft, or clear the input if it
@@ -3295,6 +3306,7 @@ impl Workspace {
             model_id: (!meta.model_id.is_empty()).then(|| meta.model_id.clone()),
             approval_mode: meta.approval_mode.map(|mode| mode.as_i64()),
             steered: meta.steered.then_some(true),
+            external_event: None,
         }
     }
 

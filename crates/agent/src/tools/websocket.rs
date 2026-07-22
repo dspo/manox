@@ -2,8 +2,6 @@
 //! rejects private/loopback addresses, connects, and streams text frames
 //! as events.
 
-use std::net::ToSocketAddrs;
-
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{
@@ -119,13 +117,12 @@ fn is_valid_http_token(s: &str) -> bool {
 /// Resolve a host:port pair and reject private/loopback/link-local/unspecified
 /// addresses. Returns the resolved addresses so the caller can pin them and
 /// avoid DNS rebinding.
-pub fn resolve_and_validate_addrs(
+pub async fn resolve_and_validate_addrs(
     host: &str,
     port: u16,
 ) -> Result<Vec<std::net::SocketAddr>, String> {
-    let addr_str = format!("{host}:{port}");
-    let addrs: Vec<std::net::SocketAddr> = addr_str
-        .to_socket_addrs()
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
         .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
         .collect();
     if addrs.is_empty() {
@@ -334,5 +331,13 @@ mod tests {
         assert!(is_valid_http_token("soap"));
         assert!(!is_valid_http_token("bad token"));
         assert!(!is_valid_http_token(""));
+    }
+
+    #[tokio::test]
+    async fn async_resolution_rejects_loopback() {
+        let err = resolve_and_validate_addrs("127.0.0.1", 80)
+            .await
+            .expect_err("loopback must be rejected");
+        assert!(err.contains("loopback"));
     }
 }

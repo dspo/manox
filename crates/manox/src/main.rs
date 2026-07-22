@@ -416,8 +416,8 @@ fn main() {
     match agent::runtime::try_handle() {
         Some(handle) => {
             handle.block_on(async {
+                agent::background_task::shutdown_all().await;
                 supervisor::global().shutdown_all().await;
-                agent::background_task::shutdown_all();
             });
         }
         None => {

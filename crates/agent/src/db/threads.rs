@@ -108,6 +108,7 @@ pub struct ThreadRecord {
     /// `TokenMeter::per_model` so the env card shows per-model totals for a
     /// thread the moment it opens, without waiting for a fresh stream.
     pub per_model_token_usage: std::collections::HashMap<String, TokenUsage>,
+    pub background_tasks: Vec<crate::background_task::TaskSnapshot>,
 }
 
 /// Decompressed payload of the `thread_data` BLOB.
@@ -116,6 +117,8 @@ struct ThreadData {
     messages: Vec<Message>,
     request_token_usage: std::collections::HashMap<String, TokenUsage>,
     per_model_token_usage: std::collections::HashMap<String, TokenUsage>,
+    #[serde(default)]
+    background_tasks: Vec<crate::background_task::TaskSnapshot>,
 }
 
 const COMPRESSION_LEVEL: i32 = 3;
@@ -174,6 +177,7 @@ impl ThreadsDatabase {
             messages: rec.messages.clone(),
             request_token_usage: rec.request_token_usage.clone(),
             per_model_token_usage: rec.per_model_token_usage.clone(),
+            background_tasks: rec.background_tasks.clone(),
         };
         let json = serde_json::to_vec(&data).context("serialize thread data")?;
         let compressed =
@@ -347,6 +351,7 @@ impl ThreadsDatabase {
                     messages: Vec::new(),
                     request_token_usage: std::collections::HashMap::new(),
                     per_model_token_usage: std::collections::HashMap::new(),
+                    background_tasks: Vec::new(),
                 })
             },
         );
@@ -374,6 +379,7 @@ impl ThreadsDatabase {
         rec.messages = data.messages;
         rec.request_token_usage = data.request_token_usage;
         rec.per_model_token_usage = data.per_model_token_usage;
+        rec.background_tasks = data.background_tasks;
         Ok(Some(rec))
     }
 
@@ -526,6 +532,7 @@ impl ThreadRecord {
             messages,
             request_token_usage: std::collections::HashMap::new(),
             per_model_token_usage: std::collections::HashMap::new(),
+            background_tasks: Vec::new(),
         }
     }
 }

@@ -19,7 +19,7 @@
 mod bus;
 mod proc;
 
-pub use bus::{Condition, ProcessBus, SpawnedProcess};
+pub use bus::{CapturedSpawnedProcess, Condition, ProcessBus, SpawnedProcess};
 pub use proc::{ManagedProcess, ProcessKind};
 
 use std::sync::OnceLock;

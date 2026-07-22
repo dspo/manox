@@ -206,17 +206,18 @@ impl AgentTool for MonitorTool {
         // need a connection-phase deadline and a runtime deadline of None
         // (no expiry), but the return value reports timeoutMs=0 to the model.
         let internal_timeout_ms = if persistent {
-            MAX_TIMEOUT_MS
+            DEFAULT_TIMEOUT_MS
         } else {
             timeout_ms
         };
         let timeout = Duration::from_millis(internal_timeout_ms);
         let thread_id = ctx.thread_id().to_string();
+        let anchor_message_id = ctx.anchor_message_id().map(str::to_owned);
         let description = parsed.description.clone();
         let proxy_port = ctx.network_proxy_port();
 
         // Ensure the mailbox exists for this thread.
-        let _ = crate::background_task::thread_notify(&thread_id);
+        let _ = crate::background_task::ensure_thread_mailbox(&thread_id);
 
         let runtime = crate::runtime::handle().clone();
 
@@ -230,6 +231,9 @@ impl AgentTool for MonitorTool {
                 task_cancel.clone(),
             );
             task.set_command(command.clone());
+            if let Some(anchor) = anchor_message_id.clone() {
+                task.set_anchor_message_id(anchor);
+            }
 
             let task_clone = task.clone();
             let tid_run = task_id.clone();
@@ -259,7 +263,7 @@ impl AgentTool for MonitorTool {
                     tracing::warn!(target: "monitor", %tid_log, "monitor failed: {e}");
                 }
             });
-            task.set_driver_abort(handle.abort_handle());
+            task.set_driver(handle);
 
             let result_json = serde_json::to_string(&MonitorResult {
                 task_id: tid_result.0,
@@ -286,6 +290,9 @@ impl AgentTool for MonitorTool {
                 task_cancel.clone(),
             );
             task.set_ws_url(ws.url.clone());
+            if let Some(anchor) = anchor_message_id {
+                task.set_anchor_message_id(anchor);
+            }
 
             let task_clone = task.clone();
             let tid_run = task_id.clone();
@@ -309,7 +316,7 @@ impl AgentTool for MonitorTool {
                     tracing::warn!(target: "monitor", %tid_log, "WS monitor failed: {e}");
                 }
             });
-            task.set_driver_abort(handle.abort_handle());
+            task.set_driver(handle);
 
             let result_json = serde_json::to_string(&MonitorResult {
                 task_id: tid_result.0,
@@ -365,24 +372,31 @@ async fn run_command_monitor(
         c
     };
 
-    c.stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    c.process_group(0);
+    c.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(root) = plugin_root {
         c.env("CLAUDE_PLUGIN_ROOT", root);
     }
 
-    let mut child = match c.spawn() {
-        Ok(c) => c,
+    let spawned = match supervisor::global()
+        .spawn_captured(
+            &format!("background-{}", task_id.0),
+            c,
+            supervisor::ProcessKind::Bash,
+        )
+        .await
+    {
+        Ok(spawned) => spawned,
         Err(e) => {
+            task.set_failure_summary(e.to_string());
             task.push_terminal(&task_id, TaskStatus::Failed);
             return Err(format!("failed to spawn monitor command: {e}"));
         }
     };
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
+    let process = spawned.proc.clone();
+    task.set_managed_proc(process.clone());
+    drop(spawned.stdin);
+    let stdout = spawned.stdout;
+    let stderr = spawned.stderr;
 
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
@@ -403,84 +417,57 @@ async fn run_command_monitor(
         stderr_buf
     });
 
-    let mut reader = BufReader::new(stdout).lines();
+    let stdout_task_id = task_id.clone();
+    let stdout_task_handle = task.clone();
+    let stdout_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => stdout_task_handle.push_event(&stdout_task_id, line),
+                Ok(None) => break,
+                Err(e) => {
+                    stdout_task_handle.push_event(&stdout_task_id, format!("read error: {e}"));
+                    break;
+                }
+            }
+        }
+    });
     let deadline = if persistent {
         None
     } else {
         Some(tokio::time::Instant::now() + timeout)
     };
 
-    // Phase 1: stream stdout lines as events until EOF, cancel, or timeout.
-    let exit_reason = loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                kill_process_group(&child);
-                break "cancelled";
+    let wait_for_exit = process.wait_for_exit();
+    tokio::pin!(wait_for_exit);
+    // Race the managed reaper, cancellation and the shared deadline while the
+    // dedicated pipe tasks drain output. Cancellation is complete only after
+    // `close` has reaped the process group.
+    let exit_reason = tokio::select! {
+        _ = cancel.cancelled() => {
+            process.close().await;
+            "cancelled"
+        }
+        _ = async {
+            if let Some(dl) = deadline {
+                tokio::time::sleep_until(dl).await;
+            } else {
+                std::future::pending::<()>().await;
             }
-            _ = async {
-                if let Some(dl) = deadline {
-                    tokio::time::sleep_until(dl).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                kill_process_group(&child);
-                break "timeout";
-            }
-            line = reader.next_line() => {
-                match line {
-                    Ok(Some(l)) => {
-                        task.push_event(&task_id, l);
-                    }
-                    Ok(None) => break "eof",
-                    Err(e) => {
-                        task.push_event(&task_id, format!("read error: {e}"));
-                        break "read-error";
-                    }
-                }
-            }
+        } => {
+            process.close().await;
+            "timeout"
+        }
+        code = &mut wait_for_exit => {
+            task.set_exit_code(code);
+            if code == Some(0) { "eof" } else { "failed" }
         }
     };
 
-    // Phase 2: after stdout EOF, continue racing cancel/timeout against
-    // child.wait so a process that closes stdout but keeps running can still
-    // be stopped.
-    let exit_reason = if matches!(exit_reason, "cancelled" | "timeout") {
-        exit_reason
-    } else {
-        let deadline2 = deadline;
-        let cancel2 = cancel.clone();
-        tokio::select! {
-            _ = cancel2.cancelled() => {
-                kill_process_group(&child);
-                "cancelled"
-            }
-            _ = async {
-                if let Some(dl) = deadline2 {
-                    tokio::time::sleep_until(dl).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
-                kill_process_group(&child);
-                "timeout"
-            }
-            status = child.wait() => {
-                match status {
-                    Ok(s) if s.success() => {
-                        task.set_exit_code(s.code());
-                        "eof"
-                    }
-                    Ok(s) => {
-                        task.set_exit_code(s.code());
-                        "failed"
-                    }
-                    Err(_) => "failed",
-                }
-            }
-        }
-    };
-
+    if matches!(exit_reason, "cancelled" | "timeout") {
+        task.set_exit_code(process.wait_for_exit().await);
+    }
+    let _ = stdout_task.await;
     let stderr_text = stderr_task.await.unwrap_or_default();
     if !stderr_text.is_empty() {
         task.set_failure_summary(stderr_text.clone());
@@ -488,7 +475,7 @@ async fn run_command_monitor(
     }
 
     let terminal_status = match exit_reason {
-        "cancelled" => TaskStatus::Stopped,
+        "cancelled" => task.requested_stop_status(),
         "timeout" => TaskStatus::TimedOut,
         "eof" => TaskStatus::Completed,
         _ => TaskStatus::Failed,
@@ -535,28 +522,46 @@ async fn run_ws_monitor(
         _ => 80,
     });
 
-    let pinned_addrs = match websocket::resolve_and_validate_addrs(&host, port) {
-        Ok(a) => a,
-        Err(e) => {
-            task.push_terminal(&task_id, TaskStatus::Failed);
-            return Err(e);
-        }
-    };
-
     let target = websocket::WsTarget {
         url: ws_url.to_string(),
         protocols: ws_protocols.to_vec(),
     };
 
-    // Single wall-clock deadline shared across connection and runtime phases.
+    // DNS and connection always share a bounded connection deadline. A
+    // non-persistent monitor keeps that same deadline for its runtime phase.
+    let connection_deadline = tokio::time::Instant::now() + timeout;
     let deadline = if persistent {
         None
     } else {
-        Some(tokio::time::Instant::now() + timeout)
+        Some(connection_deadline)
+    };
+
+    let pinned_addrs = tokio::select! {
+        _ = cancel.cancelled() => {
+            task.push_terminal(&task_id, task.requested_stop_status());
+            return Ok(());
+        }
+        result = tokio::time::timeout_at(
+            connection_deadline,
+            websocket::resolve_and_validate_addrs(&host, port),
+        ) => match result {
+            Ok(Ok(addrs)) => addrs,
+            Ok(Err(e)) => {
+                task.set_failure_summary(e.clone());
+                task.push_terminal(&task_id, TaskStatus::Failed);
+                return Err(e);
+            }
+            Err(_) => {
+                task.push_terminal(&task_id, TaskStatus::TimedOut);
+                return Ok(());
+            }
+        }
     };
 
     let mut stream =
-        match websocket::connect_pinned(&target, &pinned_addrs, deadline, &cancel).await {
+        match websocket::connect_pinned(&target, &pinned_addrs, Some(connection_deadline), &cancel)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 task.set_failure_summary(e.clone());
@@ -603,7 +608,7 @@ async fn run_ws_monitor(
     };
 
     let terminal_status = match exit_reason {
-        "cancelled" => TaskStatus::Stopped,
+        "cancelled" => task.requested_stop_status(),
         "timeout" => TaskStatus::TimedOut,
         "close" => TaskStatus::Completed,
         _ => TaskStatus::Failed,
@@ -612,18 +617,6 @@ async fn run_ws_monitor(
 
     Ok(())
 }
-
-#[cfg(unix)]
-fn kill_process_group(child: &tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        unsafe {
-            libc::killpg(pid as i32, libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_child: &tokio::process::Child) {}
 
 #[cfg(test)]
 mod tests {

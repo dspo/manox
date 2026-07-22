@@ -32,6 +32,7 @@ pub use permission::{PermissionCache, PermissionDecision, ToolAuthorizationRespo
 /// `&dyn ToolContext` never crosses an await boundary.
 pub trait ToolContext {
     fn thread_id(&self) -> &str;
+    fn anchor_message_id(&self) -> Option<&str>;
     fn cwd(&self) -> &Path;
     fn project(&self) -> Option<&PathBuf>;
     fn model(&self) -> Option<&AnyLanguageModel>;
@@ -74,6 +75,7 @@ pub struct ToolContextSnapshot {
     team: Option<Entity<crate::team::Team>>,
     yolo: bool,
     network_proxy_port: Option<u16>,
+    anchor_message_id: Option<String>,
 }
 
 impl ToolContextSnapshot {
@@ -92,6 +94,7 @@ impl ToolContextSnapshot {
             team: t.team().cloned(),
             yolo: t.approval_mode() == crate::thread::ApprovalMode::Yolo,
             network_proxy_port: t.network_proxy_port(),
+            anchor_message_id: t.last_user_message_id().map(str::to_owned),
         }
     }
 }
@@ -99,6 +102,9 @@ impl ToolContextSnapshot {
 impl ToolContext for ToolContextSnapshot {
     fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+    fn anchor_message_id(&self) -> Option<&str> {
+        self.anchor_message_id.as_deref()
     }
     fn cwd(&self) -> &Path {
         &self.cwd

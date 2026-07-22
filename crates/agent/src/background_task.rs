@@ -89,6 +89,9 @@ impl TaskStatus {
 /// What kind of event a `TaskEvent` represents.
 #[derive(Debug, Clone)]
 pub enum TaskEventKind {
+    /// Lifecycle-only notification used to create/update the UI card. It is
+    /// deliberately not injected into the model as a user message.
+    StateChanged,
     /// A line of stdout (command) or a text frame (WebSocket).
     Output(String),
     /// The task reached a terminal state.
@@ -136,6 +139,7 @@ pub fn format_event_for_model(event: &TaskEvent) -> String {
         TaskKind::BackgroundBash => "Background Bash",
     };
     let body = match &event.event {
+        TaskEventKind::StateChanged => return String::new(),
         TaskEventKind::Output(text) => text.clone(),
         TaskEventKind::Terminal {
             status,
@@ -187,9 +191,11 @@ struct TaskState {
     total_bytes: u64,
     event_count: u64,
     created_at: Instant,
+    created_at_ms: u64,
     exited_at: Option<Instant>,
-    /// The driver task's abort handle, set after spawn.
-    driver_abort: Option<tokio::task::AbortHandle>,
+    exited_at_ms: Option<u64>,
+    /// The driver task, retained so stop/shutdown can join it.
+    driver: Option<tokio::task::JoinHandle<()>>,
     /// The supervisor `ManagedProcess` for command/Bash tasks (for graceful close).
     managed_proc: Option<Arc<supervisor::ManagedProcess>>,
     /// Exit code (for command/Bash tasks).
@@ -199,6 +205,10 @@ struct TaskState {
     /// Anchor message id: the user message that preceded the tool call that
     /// started this task (for UI card placement).
     anchor_message_id: Option<String>,
+    /// Terminal status requested by the lifecycle owner. Drivers read this in
+    /// their cancellation branch so archive/shutdown become SessionEnded while
+    /// an explicit TaskStop becomes Stopped.
+    requested_stop_status: TaskStatus,
 }
 
 impl TaskState {
@@ -222,12 +232,15 @@ impl TaskState {
             total_bytes: 0,
             event_count: 0,
             created_at: Instant::now(),
+            created_at_ms: TaskEvent::now_ts(),
             exited_at: None,
-            driver_abort: None,
+            exited_at_ms: None,
+            driver: None,
             managed_proc: None,
             exit_code: None,
             failure_summary: None,
             anchor_message_id: None,
+            requested_stop_status: TaskStatus::Stopped,
         }
     }
 }
@@ -235,6 +248,7 @@ impl TaskState {
 /// A registered background task.
 pub struct BackgroundTask {
     state: Arc<std::sync::Mutex<TaskState>>,
+    completion: Arc<Notify>,
 }
 
 impl BackgroundTask {
@@ -251,6 +265,7 @@ impl BackgroundTask {
                 description,
                 cancel,
             ))),
+            completion: Arc::new(Notify::new()),
         }
     }
 
@@ -345,8 +360,8 @@ impl BackgroundTask {
         self.state.lock().expect("task state poisoned").ws_url = Some(url);
     }
 
-    pub fn set_driver_abort(&self, handle: tokio::task::AbortHandle) {
-        self.state.lock().expect("task state poisoned").driver_abort = Some(handle);
+    pub fn set_driver(&self, handle: tokio::task::JoinHandle<()>) {
+        self.state.lock().expect("task state poisoned").driver = Some(handle);
     }
 
     pub fn set_managed_proc(&self, proc: Arc<supervisor::ManagedProcess>) {
@@ -407,6 +422,24 @@ impl BackgroundTask {
         push_to_mailbox(&thread_id, event);
     }
 
+    /// Notify the thread that a card should be created/refreshed without
+    /// manufacturing a model-facing user message.
+    fn push_state_changed(&self, task_id: &TaskId) {
+        let mut s = self.state.lock().expect("task state poisoned");
+        s.task_seq += 1;
+        let event = TaskEvent {
+            task_id: task_id.clone(),
+            kind: s.kind,
+            event: TaskEventKind::StateChanged,
+            thread_seq: 0,
+            task_seq: s.task_seq,
+            timestamp_ms: TaskEvent::now_ts(),
+        };
+        let thread_id = s.owner_thread_id.clone();
+        drop(s);
+        push_to_mailbox(&thread_id, event);
+    }
+
     /// Push a terminal event. Idempotent: only Running/Stopping can transition.
     pub fn push_terminal(&self, task_id: &TaskId, status: TaskStatus) {
         let mut s = self.state.lock().expect("task state poisoned");
@@ -415,6 +448,7 @@ impl BackgroundTask {
         }
         s.status = status;
         s.exited_at = Some(Instant::now());
+        s.exited_at_ms = Some(TaskEvent::now_ts());
         let task_seq = {
             s.task_seq += 1;
             s.task_seq
@@ -438,6 +472,7 @@ impl BackgroundTask {
             timestamp_ms: TaskEvent::now_ts(),
         };
         push_to_mailbox(&thread_id, event);
+        self.completion.notify_waiters();
     }
 
     /// Set the exit code (for command/Bash tasks).
@@ -448,7 +483,8 @@ impl BackgroundTask {
     /// Set a truncated failure summary (stderr or error message).
     pub fn set_failure_summary(&self, summary: String) {
         let truncated = if summary.len() > 2048 {
-            format!("{}…", &summary[..2048])
+            let boundary = summary.floor_char_boundary(2048);
+            format!("{}…", &summary[..boundary])
         } else {
             summary
         };
@@ -467,13 +503,37 @@ impl BackgroundTask {
         }
         s.status = status;
         s.exited_at = Some(Instant::now());
+        s.exited_at_ms = Some(TaskEvent::now_ts());
+        drop(s);
+        self.completion.notify_waiters();
     }
 
-    /// Transition to Stopping (for graceful stop path).
-    pub fn set_stopping(&self) {
+    /// Atomically become the lifecycle owner for a stop. Concurrent callers
+    /// wait for this owner instead of returning before process reap.
+    fn begin_stopping(&self, terminal: TaskStatus) -> bool {
         let mut s = self.state.lock().expect("task state poisoned");
-        if !s.status.is_terminal() {
-            s.status = TaskStatus::Stopping;
+        match s.status {
+            TaskStatus::Running => {
+                s.status = TaskStatus::Stopping;
+                s.requested_stop_status = terminal;
+                true
+            }
+            TaskStatus::Stopping
+            | TaskStatus::Completed
+            | TaskStatus::Failed
+            | TaskStatus::TimedOut
+            | TaskStatus::Stopped
+            | TaskStatus::SessionEnded => false,
+        }
+    }
+
+    async fn wait_until_terminal(&self) {
+        loop {
+            let notified = self.completion.notified();
+            if self.status().is_terminal() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -492,13 +552,19 @@ impl BackgroundTask {
         self.state.lock().expect("task state poisoned").total_bytes
     }
 
-    /// The driver abort handle, for forced cleanup.
-    pub fn driver_abort(&self) -> Option<tokio::task::AbortHandle> {
+    fn take_driver(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.state
             .lock()
             .expect("task state poisoned")
-            .driver_abort
-            .clone()
+            .driver
+            .take()
+    }
+
+    pub fn requested_stop_status(&self) -> TaskStatus {
+        self.state
+            .lock()
+            .expect("task state poisoned")
+            .requested_stop_status
     }
 
     /// The managed process, for supervisor-coordinated close.
@@ -519,8 +585,8 @@ impl BackgroundTask {
             owner_thread_id: s.owner_thread_id.clone(),
             description: s.description.clone(),
             status: s.status,
-            created_at_ms: instant_to_ms(s.created_at),
-            ended_at_ms: s.exited_at.map(instant_to_ms),
+            created_at_ms: s.created_at_ms,
+            ended_at_ms: s.exited_at_ms,
             event_count: s.event_count,
             total_bytes: s.total_bytes,
             exit_code: s.exit_code,
@@ -528,16 +594,6 @@ impl BackgroundTask {
             anchor_message_id: s.anchor_message_id.clone(),
         }
     }
-}
-
-fn instant_to_ms(_t: Instant) -> u64 {
-    // Approximate: convert to epoch millis using the process start as reference.
-    // For persistence we store a best-effort wall-clock timestamp.
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// A serializable snapshot of a background task's state.
@@ -558,6 +614,22 @@ pub struct TaskSnapshot {
     pub failure_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_message_id: Option<String>,
+}
+
+impl TaskSnapshot {
+    /// A persisted Running/Stopping task cannot still be attached to a process
+    /// after a new app session starts. Preserve the record, but make the stale
+    /// lifecycle boundary explicit instead of showing a forever-running card.
+    pub fn normalize_after_restore(mut self) -> Self {
+        if matches!(self.status, TaskStatus::Running | TaskStatus::Stopping) {
+            self.status = TaskStatus::SessionEnded;
+            self.ended_at_ms = Some(TaskEvent::now_ts());
+            if self.failure_summary.is_none() {
+                self.failure_summary = Some("The previous manox session ended.".into());
+            }
+        }
+        self
+    }
 }
 
 // ─── TaskMailbox ────────────────────────────────────────────────────────────
@@ -588,6 +660,7 @@ impl TaskMailbox {
         self.next_thread_seq += 1;
 
         let event_len = match &event.event {
+            TaskEventKind::StateChanged => 0,
             TaskEventKind::Output(t) => t.len(),
             TaskEventKind::Terminal { .. } => 0,
             TaskEventKind::Gap { .. } => 0,
@@ -596,15 +669,53 @@ impl TaskMailbox {
         self.events.push_back(event);
         self.total_bytes += event_len;
 
-        // Evict oldest events when over cap, but keep at least the newest.
-        while (self.total_bytes > MAX_BUFFER_BYTES || self.events.len() > MAX_RING_EVENTS)
-            && self.events.len() > 1
+        // Evict the oldest droppable events and replace the entire lost range
+        // with one explicit Gap. Terminal/state events are never discarded.
+        let mut dropped_events = 0_u64;
+        let mut dropped_bytes = 0_u64;
+        let mut gap_seed: Option<TaskEvent> = None;
+        while self.total_bytes > MAX_BUFFER_BYTES
+            || self.events.len() > MAX_RING_EVENTS.saturating_sub(1)
         {
-            if let Some(removed) = self.events.pop_front()
-                && let TaskEventKind::Output(t) = &removed.event
-            {
-                self.total_bytes = self.total_bytes.saturating_sub(t.len());
+            let Some(ix) = self.events.iter().position(|e| {
+                matches!(
+                    e.event,
+                    TaskEventKind::Output(_) | TaskEventKind::Gap { .. }
+                )
+            }) else {
+                break;
+            };
+            let removed = self.events.remove(ix).expect("event index exists");
+            if gap_seed.is_none() {
+                gap_seed = Some(removed.clone());
             }
+            match removed.event {
+                TaskEventKind::Output(t) => {
+                    dropped_events += 1;
+                    dropped_bytes += t.len() as u64;
+                    self.total_bytes = self.total_bytes.saturating_sub(t.len());
+                }
+                TaskEventKind::Gap {
+                    dropped_events: n,
+                    dropped_bytes: b,
+                } => {
+                    dropped_events += n;
+                    dropped_bytes += b;
+                }
+                _ => unreachable!("only droppable events are selected"),
+            }
+        }
+        if let Some(mut gap) = gap_seed {
+            gap.event = TaskEventKind::Gap {
+                dropped_events,
+                dropped_bytes,
+            };
+            let insert_at = self
+                .events
+                .iter()
+                .position(|event| event.thread_seq > gap.thread_seq)
+                .unwrap_or(self.events.len());
+            self.events.insert(insert_at, gap);
         }
 
         self.notify.notify_one();
@@ -618,6 +729,12 @@ impl TaskMailbox {
 
     fn is_empty(&self) -> bool {
         self.events.is_empty()
+    }
+
+    fn has_model_events(&self) -> bool {
+        self.events
+            .iter()
+            .any(|event| !matches!(event.event, TaskEventKind::StateChanged))
     }
 }
 
@@ -670,6 +787,15 @@ pub fn drain_thread_events(thread_id: &str) -> Vec<TaskEvent> {
 pub fn thread_has_pending_events(thread_id: &str) -> bool {
     let map = mailboxes().lock().expect("mailboxes poisoned");
     map.get(thread_id).is_some_and(|m| !m.is_empty())
+}
+
+/// Whether pending events contain data that must be delivered to the model.
+/// StateChanged alone updates UI/persistence and must not manufacture a model
+/// turn with no new model-facing message.
+pub fn thread_has_pending_model_events(thread_id: &str) -> bool {
+    let map = mailboxes().lock().expect("mailboxes poisoned");
+    map.get(thread_id)
+        .is_some_and(TaskMailbox::has_model_events)
 }
 
 /// Remove a thread's mailbox. Called when the thread is dropped or archived.
@@ -732,27 +858,9 @@ pub fn register(
     ));
     let mut reg = registry().lock().expect("registry poisoned");
     reg.tasks.insert(id.0.clone(), task.clone());
+    drop(reg);
+    task.push_state_changed(&id);
     (id, task)
-}
-
-/// Register a task with an externally-assigned id (used by background Bash,
-/// which assigns `bash_N` ids via its own counter for BashOutput compat).
-pub fn register_with_id(
-    id: String,
-    kind: TaskKind,
-    owner_thread_id: String,
-    description: String,
-    cancel: CancellationToken,
-) -> Arc<BackgroundTask> {
-    let task = Arc::new(BackgroundTask::new(
-        kind,
-        owner_thread_id,
-        description,
-        cancel,
-    ));
-    let mut reg = registry().lock().expect("registry poisoned");
-    reg.tasks.insert(id, task.clone());
-    task
 }
 
 pub(crate) fn register_bash_shell(
@@ -800,10 +908,13 @@ pub fn remove(id: &TaskId) {
         .remove(&id.0);
 }
 
-/// Stop a task by id. Returns immediately after signaling (cancel + abort).
-/// The actual process reap happens asynchronously via supervisor or
-/// `kill_on_drop`.
-pub fn stop(id: &str) -> Result<(), String> {
+/// Stop a task by id and return only after its driver and managed process have
+/// terminated. This is the semantic boundary used by TaskStop and shutdown.
+pub async fn stop(id: &str) -> Result<(), String> {
+    stop_with_status(id, TaskStatus::Stopped).await
+}
+
+async fn stop_with_status(id: &str, terminal: TaskStatus) -> Result<(), String> {
     // Get the task without holding the registry lock during stop operations.
     let task = {
         let reg = registry().lock().expect("registry poisoned");
@@ -818,27 +929,29 @@ pub fn stop(id: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    task.set_stopping();
+    if !task.begin_stopping(terminal) {
+        task.wait_until_terminal().await;
+        return Ok(());
+    }
+    task.push_state_changed(&TaskId(id.to_string()));
     task.cancel();
 
-    // For command/Bash tasks with a managed process, use supervisor close
-    // (graceful → SIGTERM → SIGKILL) on the tokio runtime.
-    if let Some(proc) = task.managed_proc()
-        && let Some(handle) = crate::runtime::try_handle()
+    if let Some(proc) = task.managed_proc() {
+        proc.close().await;
+    }
+
+    if let Some(mut driver) = task.take_driver()
+        && tokio::time::timeout(Duration::from_secs(8), &mut driver)
+            .await
+            .is_err()
     {
-        handle.spawn(async move {
-            proc.close().await;
-        });
+        driver.abort();
+        let _ = driver.await;
     }
 
-    // Abort the driver task.
-    if let Some(abort) = task.driver_abort() {
-        abort.abort();
-    }
-
-    // Mark as Stopped. The driver may have already set a terminal status; if so,
-    // `set_terminal_status` is a no-op.
-    task.set_terminal_status(TaskStatus::Stopped);
+    // WebSocket and process drivers normally publish this themselves. The
+    // fallback covers spawn failures or a driver forced past the join budget.
+    task.push_terminal(&TaskId(id.to_string()), terminal);
 
     Ok(())
 }
@@ -915,16 +1028,20 @@ pub fn snapshots_for_thread(thread_id: &str) -> Vec<TaskSnapshot> {
 }
 
 /// Cancel all tasks owned by a thread and mark them as SessionEnded.
-pub fn cancel_all_for_thread(thread_id: &str) {
-    let reg = registry().lock().expect("registry poisoned");
-    for task in reg.tasks.values() {
-        let s = task.state.lock().expect("task state poisoned");
-        if s.owner_thread_id == thread_id && !s.status.is_terminal() {
-            drop(s);
-            task.cancel();
-            task.set_terminal_status(TaskStatus::SessionEnded);
-        }
-    }
+pub async fn cancel_all_for_thread(thread_id: &str) {
+    let ids: Vec<String> = {
+        let reg = registry().lock().expect("registry poisoned");
+        reg.tasks
+            .iter()
+            .filter(|(_, task)| task.owner_thread_id() == thread_id && !task.status().is_terminal())
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    futures::future::join_all(
+        ids.iter()
+            .map(|id| stop_with_status(id, TaskStatus::SessionEnded)),
+    )
+    .await;
 }
 
 /// Whether a thread has any running (non-terminal) tasks.
@@ -937,16 +1054,20 @@ pub fn thread_has_running_tasks(thread_id: &str) -> bool {
 }
 
 /// Shutdown all running tasks across all threads. Called at app exit.
-pub fn shutdown_all() {
-    let reg = registry().lock().expect("registry poisoned");
-    for task in reg.tasks.values() {
-        let s = task.state.lock().expect("task state poisoned");
-        if !s.status.is_terminal() {
-            drop(s);
-            task.cancel();
-            task.set_terminal_status(TaskStatus::SessionEnded);
-        }
-    }
+pub async fn shutdown_all() {
+    let ids: Vec<String> = {
+        let reg = registry().lock().expect("registry poisoned");
+        reg.tasks
+            .iter()
+            .filter(|(_, task)| !task.status().is_terminal())
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    futures::future::join_all(
+        ids.iter()
+            .map(|id| stop_with_status(id, TaskStatus::SessionEnded)),
+    )
+    .await;
 }
 
 /// Remove all tasks and bash shells owned by a thread.
@@ -969,7 +1090,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let (id, task) = register(
             TaskKind::MonitorCommand,
-            "thread-1".into(),
+            "thread-register".into(),
             "watch build".into(),
             cancel,
         );
@@ -978,11 +1099,18 @@ mod tests {
         assert_eq!(task.event_count(), 0);
         let found = get(&id).expect("should find task");
         assert_eq!(found.status(), TaskStatus::Running);
+        assert!(thread_has_pending_events("thread-register"));
+        assert!(
+            !thread_has_pending_model_events("thread-register"),
+            "initial card update must not create an empty model turn"
+        );
+        let _ = drain_thread_events("thread-register");
         remove(&id);
+        remove_thread_mailbox("thread-register");
     }
 
-    #[test]
-    fn stop_and_terminal() {
+    #[tokio::test]
+    async fn stop_and_terminal() {
         let cancel = CancellationToken::new();
         let (id, task) = register(
             TaskKind::MonitorCommand,
@@ -991,19 +1119,63 @@ mod tests {
             cancel,
         );
         assert_eq!(task.status(), TaskStatus::Running);
-        stop(&id.0).expect("stop should succeed");
+        stop(&id.0).await.expect("stop should succeed");
         assert!(task.status().is_terminal());
-        stop(&id.0).expect("double stop should succeed");
+        stop(&id.0).await.expect("double stop should succeed");
         remove(&id);
     }
 
-    #[test]
-    fn stop_unknown_task_returns_error_with_list() {
-        let result = stop("nonexistent_id");
+    #[tokio::test]
+    async fn stop_unknown_task_returns_error_with_list() {
+        let result = stop("nonexistent_id").await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("Unknown task id"));
         assert!(err.contains("background tasks") || err.contains("No background"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_waits_for_managed_process_reap() {
+        let cancel = CancellationToken::new();
+        let (id, task) = register(
+            TaskKind::MonitorCommand,
+            "thread-reap".into(),
+            "sleeping process".into(),
+            cancel.clone(),
+        );
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & wait"]);
+        let spawned = supervisor::global()
+            .spawn_captured("background-stop-test", cmd, supervisor::ProcessKind::Bash)
+            .await
+            .expect("spawn managed process");
+        let process = spawned.proc.clone();
+        let pgid = process.pgid().expect("process group id");
+        drop(spawned.stdout);
+        drop(spawned.stderr);
+        drop(spawned.stdin);
+        task.set_managed_proc(process.clone());
+
+        let task_for_driver = task.clone();
+        let id_for_driver = id.clone();
+        let driver = tokio::spawn(async move {
+            cancel.cancelled().await;
+            process.close().await;
+            task_for_driver.push_terminal(&id_for_driver, task_for_driver.requested_stop_status());
+        });
+        task.set_driver(driver);
+
+        let (first, concurrent) = tokio::join!(stop(&id.0), stop(&id.0));
+        first.expect("first stop should reap process");
+        concurrent.expect("concurrent stop should await the same reap");
+        assert_eq!(task.status(), TaskStatus::Stopped);
+        assert!(task.managed_proc().expect("managed process").is_exited());
+        let group_exists = unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == 0;
+        assert!(!group_exists, "process group {pgid} survived TaskStop");
+
+        remove(&id);
+        remove_thread_mailbox("thread-reap");
     }
 
     #[test]
@@ -1086,7 +1258,6 @@ mod tests {
         task1.push_event(&id1, "third".into());
 
         let events = drain_thread_events("thread-ordered");
-        assert_eq!(events.len(), 3);
         let texts: Vec<String> = events
             .iter()
             .filter_map(|e| match &e.event {
@@ -1137,16 +1308,42 @@ mod tests {
         for i in 0..10 {
             task.push_event(&id, format!("{big}_{i}"));
         }
-        // The mailbox should have evicted some events.
+        // The mailbox should explicitly describe the evicted range.
         let events = drain_thread_events("thread-gap");
-        // Not all 10 should survive — some were evicted.
-        assert!(
-            events.len() < 10,
-            "expected evictions, got {} events",
-            events.len()
-        );
+        let gap = events.iter().find_map(|event| match event.event {
+            TaskEventKind::Gap {
+                dropped_events,
+                dropped_bytes,
+            } => Some((dropped_events, dropped_bytes)),
+            _ => None,
+        });
+        let (dropped_events, dropped_bytes) = gap.expect("overflow must emit a Gap event");
+        assert!(dropped_events > 0);
+        assert!(dropped_bytes > 0);
 
         remove(&id);
         remove_thread_mailbox("thread-gap");
+    }
+
+    #[test]
+    fn restore_normalizes_live_snapshot_to_session_ended() {
+        let snapshot = TaskSnapshot {
+            task_id: "monitor_old".into(),
+            kind: TaskKind::MonitorCommand,
+            owner_thread_id: "thread-old".into(),
+            description: "old task".into(),
+            status: TaskStatus::Running,
+            created_at_ms: 1,
+            ended_at_ms: None,
+            event_count: 0,
+            total_bytes: 0,
+            exit_code: None,
+            failure_summary: None,
+            anchor_message_id: None,
+        }
+        .normalize_after_restore();
+        assert_eq!(snapshot.status, TaskStatus::SessionEnded);
+        assert!(snapshot.ended_at_ms.is_some());
+        assert!(snapshot.failure_summary.is_some());
     }
 }

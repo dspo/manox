@@ -45,6 +45,12 @@ impl ProcessKind {
 /// `close` bounds it with `GRACEFUL_TIMEOUT` and falls back to signals.
 pub type GracefulShutdown = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
+pub(super) struct ReaperHandles {
+    pub exited: Arc<Notify>,
+    pub exited_flag: Arc<AtomicBool>,
+    pub exit_code: Arc<Mutex<Option<Option<i32>>>>,
+}
+
 /// One spawned third-party process.
 ///
 /// The `tokio::process::Child` is NOT held here — it moves into a detached
@@ -59,6 +65,7 @@ pub struct ManagedProcess {
     graceful: Mutex<Option<GracefulShutdown>>,
     exited: Arc<Notify>,
     exited_flag: Arc<AtomicBool>,
+    exit_code: Arc<Mutex<Option<Option<i32>>>>,
     closed: AtomicBool,
 }
 
@@ -71,14 +78,19 @@ impl ManagedProcess {
             graceful: Mutex::new(None),
             exited: Arc::new(Notify::new()),
             exited_flag: Arc::new(AtomicBool::new(false)),
+            exit_code: Arc::new(Mutex::new(None)),
             closed: AtomicBool::new(false),
         }
     }
 
     /// The handles the reaper task needs to signal completion. Cloned into the
     /// detached `child.wait()` task at spawn time.
-    pub(super) fn reaper_handles(&self) -> (Arc<Notify>, Arc<AtomicBool>) {
-        (self.exited.clone(), self.exited_flag.clone())
+    pub(super) fn reaper_handles(&self) -> ReaperHandles {
+        ReaperHandles {
+            exited: self.exited.clone(),
+            exited_flag: self.exited_flag.clone(),
+            exit_code: self.exit_code.clone(),
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -96,6 +108,22 @@ impl ManagedProcess {
     /// Whether the underlying process has already been reported as exited.
     pub fn is_exited(&self) -> bool {
         self.exited_flag.load(Ordering::SeqCst)
+    }
+
+    /// Wait until the detached reaper has observed the child exit and return
+    /// its numeric exit code. `None` means signal/unknown status.
+    pub async fn wait_for_exit(&self) -> Option<i32> {
+        loop {
+            let notified = self.exited.notified();
+            if self.exited_flag.load(Ordering::SeqCst) {
+                return self
+                    .exit_code
+                    .lock()
+                    .expect("exit-code mutex poisoned")
+                    .unwrap_or(None);
+            }
+            notified.await;
+        }
     }
 
     /// Attach a graceful shutdown hook. The client (which owns the protocol

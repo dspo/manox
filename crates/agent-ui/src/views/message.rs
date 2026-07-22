@@ -2461,12 +2461,21 @@ fn render_background_task(
         TaskStatus::Stopped | TaskStatus::SessionEnded => (IconName::Minus, theme.muted_foreground),
     };
     let title = format!("{kind_str} · {desc}", desc = bt.description);
-    let status_text = format!(
-        "{status_str} · {events} events · {bytes} bytes",
+    let mut status_text = format!(
+        "{status_str} · {task_id} · {events} events · {bytes} bytes",
+        task_id = bt.task_id,
         events = bt.event_count,
         bytes = bt.total_bytes,
     );
-    let _ = bt.exit_code;
+    if let Some(code) = bt.exit_code {
+        status_text.push_str(&format!(" · exit {code}"));
+    }
+    let detail = bt.failure_summary.clone().or_else(|| {
+        bt.recent_events
+            .last()
+            .map(|event| event.trim().to_string())
+            .filter(|event| !event.is_empty())
+    });
     let _ = tool_ctx;
     let task_id_for_stop = bt.task_id.clone();
 
@@ -2511,7 +2520,17 @@ fn render_background_task(
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(status_text),
-                ),
+                )
+                .when_some(detail, |column, detail| {
+                    column.child(
+                        gpui::div()
+                            .truncate()
+                            .whitespace_nowrap()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(detail),
+                    )
+                }),
         );
 
     // Stop button while running.
@@ -2524,11 +2543,11 @@ fn render_background_task(
                 .label(i18n::t("background-task-stop"))
                 .on_click({
                     let task_id = task_id_for_stop.clone();
-                    move |_, _window, cx: &mut App| {
+                    move |_, _window, _cx: &mut App| {
                         let task_id = task_id.clone();
-                        drop(cx.background_spawn(async move {
-                            let _ = agent::background_task::stop(&task_id);
-                        }));
+                        agent::runtime::handle().spawn(async move {
+                            let _ = agent::background_task::stop(&task_id).await;
+                        });
                     }
                 }),
         )
@@ -2719,15 +2738,20 @@ pub fn build_items(
     for m in messages {
         match m.role {
             Role::User => {
-                let has_prompt_text = m.content.iter().any(|c| match c {
-                    MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
-                        !t.is_empty()
-                    }
-                    _ => false,
-                }) || m
-                    .content
-                    .iter()
-                    .any(|c| matches!(c, MessageContent::Image { .. }));
+                let external_event =
+                    m.ui.as_ref()
+                        .and_then(|ui| ui.external_event)
+                        .unwrap_or(false);
+                let has_prompt_text = !external_event
+                    && m.content.iter().any(|c| match c {
+                        MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
+                            !t.is_empty()
+                        }
+                        _ => false,
+                    })
+                    || m.content
+                        .iter()
+                        .any(|c| matches!(c, MessageContent::Image { .. }));
                 if has_prompt_text {
                     // A new user prompt closes the current turn's activity
                     // segment so the next turn opens a fresh one. A pure-
@@ -2736,7 +2760,9 @@ pub fn build_items(
                     close_segment(&mut items, active_segment_ix);
                     active_segment_ix = None;
                 }
-                last_user_id = Some(m.id.as_str());
+                if !external_event {
+                    last_user_id = Some(m.id.as_str());
+                }
                 // Text becomes a user bubble; ToolResult blocks pair back to the
                 // ToolCall item emitted from the preceding assistant ToolUse.
                 // ToolResults live in user messages per the Anthropic wire contract.
@@ -2765,7 +2791,7 @@ pub fn build_items(
                         _ => None,
                     })
                     .collect();
-                if !text.is_empty() || !images.is_empty() {
+                if !external_event && (!text.is_empty() || !images.is_empty()) {
                     items.push(ConvItem::User {
                         text,
                         images,
@@ -3898,6 +3924,28 @@ mod tests {
                 .count(),
             1,
             "one assistant text between the two segments"
+        );
+    }
+
+    #[test]
+    fn build_items_does_not_render_external_event_as_user_bubble() {
+        let mut external = Message::user("CI pipeline completed".into());
+        external.ui = Some(agent::MessageUiMetadata {
+            external_event: Some(true),
+            ..Default::default()
+        });
+        let items = build_items(
+            &[Message::user("wait for CI".into()), external],
+            &HashMap::new(),
+            false,
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, ConvItem::User { .. }))
+                .count(),
+            1,
+            "machine-generated events must not be attributed to the user"
         );
     }
 }

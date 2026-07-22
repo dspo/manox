@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::background_task;
 use crate::tool::AgentTool;
-use crate::tools::schema;
+use crate::tools::{bridge_tokio, schema};
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -56,11 +56,11 @@ impl AgentTool for TaskStopTool {
         };
 
         let task_id = parsed.task_id;
-        cx.background_spawn(async move {
-            match background_task::stop(&task_id) {
-                Ok(()) => Ok(format!("Task {task_id} stopped.")),
-                Err(e) => Err(e),
-            }
+        bridge_tokio(cx, async move {
+            background_task::stop(&task_id)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            Ok(format!("Task {task_id} stopped."))
         })
     }
 }
