@@ -36,8 +36,6 @@ const TPL_SYSTEM_MAIN_EN: &str = include_str!("templates/en/system/main.tera.md"
 const TPL_SYSTEM_MAIN_ZH_CN: &str = include_str!("templates/zh-CN/system/main.tera.md");
 const TPL_SYSTEM_ASSEMBLY_EN: &str = include_str!("templates/en/system/assembly.tera.md");
 const TPL_SYSTEM_ASSEMBLY_ZH_CN: &str = include_str!("templates/zh-CN/system/assembly.tera.md");
-const TPL_MODE_GOAL_EN: &str = include_str!("templates/en/mode/goal.tera.md");
-const TPL_MODE_GOAL_ZH_CN: &str = include_str!("templates/zh-CN/mode/goal.tera.md");
 const TPL_WRAPPER_MAX_TURNS_SUMMARY_EN: &str =
     include_str!("templates/en/wrapper/max_turns_summary.tera.md");
 const TPL_WRAPPER_MAX_TURNS_SUMMARY_ZH_CN: &str =
@@ -68,10 +66,6 @@ const TPL_WRAPPER_ASK_USER_QUESTIONS_ZH_CN: &str =
 const TPL_WRAPPER_TOOL_DENIED_EN: &str = include_str!("templates/en/wrapper/tool_denied.tera.md");
 const TPL_WRAPPER_TOOL_DENIED_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/tool_denied.tera.md");
-const TPL_WRAPPER_GOAL_CONTINUATION_EN: &str =
-    include_str!("templates/en/wrapper/goal_continuation.tera.md");
-const TPL_WRAPPER_GOAL_CONTINUATION_ZH_CN: &str =
-    include_str!("templates/zh-CN/wrapper/goal_continuation.tera.md");
 const TPL_WRAPPER_COMPACTION_PREAMBLE_EN: &str =
     include_str!("templates/en/wrapper/compaction_preamble.tera.md");
 const TPL_WRAPPER_COMPACTION_PREAMBLE_ZH_CN: &str =
@@ -92,13 +86,6 @@ const TPL_SIDECALL_APPROVAL_USER_EN: &str =
     include_str!("templates/en/side_call/approval_user.tera.md");
 const TPL_SIDECALL_APPROVAL_USER_ZH_CN: &str =
     include_str!("templates/zh-CN/side_call/approval_user.tera.md");
-const TPL_SIDECALL_GOAL_SYSTEM_EN: &str =
-    include_str!("templates/en/side_call/goal_system.tera.md");
-const TPL_SIDECALL_GOAL_SYSTEM_ZH_CN: &str =
-    include_str!("templates/zh-CN/side_call/goal_system.tera.md");
-const TPL_SIDECALL_GOAL_USER_EN: &str = include_str!("templates/en/side_call/goal_user.tera.md");
-const TPL_SIDECALL_GOAL_USER_ZH_CN: &str =
-    include_str!("templates/zh-CN/side_call/goal_user.tera.md");
 const TPL_SIDECALL_COMPACT_SYSTEM_EN: &str =
     include_str!("templates/en/side_call/compact_system.tera.md");
 const TPL_SIDECALL_COMPACT_SYSTEM_ZH_CN: &str =
@@ -118,19 +105,12 @@ const TPL_AGENT_TOOL_ZH_CN: &str = include_str!("templates/zh-CN/tools/agent_too
 
 /// `(PromptTemplate, English source, 简体中文 source)` for every built-in
 /// template. The single source of truth for what gets parsed into each
-/// language's Tera. Order matters: `mode/goal.tera.md` must be registered
-/// before `system/assembly.tera.md` (which `{% include %}`s it), because Tera
-/// resolves includes at `add_raw_template` time.
+/// language's Tera registry.
 const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
     (
         PromptTemplate::SystemMain,
         TPL_SYSTEM_MAIN_EN,
         TPL_SYSTEM_MAIN_ZH_CN,
-    ),
-    (
-        PromptTemplate::ModeGoalAddendum,
-        TPL_MODE_GOAL_EN,
-        TPL_MODE_GOAL_ZH_CN,
     ),
     (
         PromptTemplate::SystemAssembly,
@@ -178,11 +158,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         TPL_WRAPPER_TOOL_DENIED_ZH_CN,
     ),
     (
-        PromptTemplate::WrapperGoalContinuation,
-        TPL_WRAPPER_GOAL_CONTINUATION_EN,
-        TPL_WRAPPER_GOAL_CONTINUATION_ZH_CN,
-    ),
-    (
         PromptTemplate::WrapperCompactionPreamble,
         TPL_WRAPPER_COMPACTION_PREAMBLE_EN,
         TPL_WRAPPER_COMPACTION_PREAMBLE_ZH_CN,
@@ -206,16 +181,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::SideCallApprovalUser,
         TPL_SIDECALL_APPROVAL_USER_EN,
         TPL_SIDECALL_APPROVAL_USER_ZH_CN,
-    ),
-    (
-        PromptTemplate::SideCallGoalSystem,
-        TPL_SIDECALL_GOAL_SYSTEM_EN,
-        TPL_SIDECALL_GOAL_SYSTEM_ZH_CN,
-    ),
-    (
-        PromptTemplate::SideCallGoalUser,
-        TPL_SIDECALL_GOAL_USER_EN,
-        TPL_SIDECALL_GOAL_USER_ZH_CN,
     ),
     (
         PromptTemplate::SideCallCompactSystem,
@@ -443,12 +408,10 @@ mod tests {
         // their own module tests; this loop only guards the static ones.
         // Run against both languages so a parse failure in one is caught.
         let static_templates = [
-            PromptTemplate::ModeGoalAddendum,
             PromptTemplate::WrapperMaxTokensDirective,
             PromptTemplate::WrapperUnfulfilledToolIntentNudge,
             PromptTemplate::WrapperToolDenied,
             PromptTemplate::SideCallApprovalSystem,
-            PromptTemplate::SideCallGoalSystem,
             PromptTemplate::SideCallCompactSystem,
             PromptTemplate::SideCallCompactFinalInstruction,
             PromptTemplate::TitleFirstInstruction,
@@ -469,8 +432,8 @@ mod tests {
     #[test]
     fn every_variant_resolves_to_a_registered_template_in_both_languages() {
         // Touch both globals so `assert_all_registered` runs at init for each.
-        let _ = render_static(PromptTemplate::ModeGoalAddendum, Language::En).unwrap();
-        let _ = render_static(PromptTemplate::ModeGoalAddendum, Language::ZhCn).unwrap();
+        let _ = render_static(PromptTemplate::WrapperMaxTokensDirective, Language::En).unwrap();
+        let _ = render_static(PromptTemplate::WrapperMaxTokensDirective, Language::ZhCn).unwrap();
         // `assert_all_registered` ties `ALL` to `REGISTRATIONS` (length +
         // per-variant parse) and `name()` is a compile-exhaustive match, so
         // the only thing left to guard is `ALL` itself staying exhaustive
@@ -478,8 +441,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 25);
-        assert_eq!(REGISTRATIONS.len(), 25);
+        assert_eq!(template::ALL.len(), 21);
+        assert_eq!(REGISTRATIONS.len(), 21);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -567,7 +530,6 @@ mod tests {
                     branch: "b".to_string(),
                     path: "/w".to_string(),
                 }),
-                goal: true,
             };
             assert_clean(
                 &render(PromptTemplate::SystemAssembly, lang, &assembly).unwrap(),
@@ -681,18 +643,6 @@ mod tests {
             );
             assert_clean(
                 &render(
-                    PromptTemplate::WrapperGoalContinuation,
-                    lang,
-                    &crate::prompt::GoalContinuationData {
-                        condition: "c".to_string(),
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::WrapperGoalContinuation,
-                lang,
-            );
-            assert_clean(
-                &render(
                     PromptTemplate::WrapperCompactionPreamble,
                     lang,
                     &crate::prompt::CompactionPreambleData {
@@ -720,21 +670,6 @@ mod tests {
                 PromptTemplate::SideCallApprovalUser,
                 lang,
             );
-            assert_clean(
-                &render(
-                    PromptTemplate::SideCallGoalUser,
-                    lang,
-                    &crate::prompt::GoalEvalPromptData {
-                        condition: "c".to_string(),
-                        last_user: "u".to_string(),
-                        last_assistant: "a".to_string(),
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::SideCallGoalUser,
-                lang,
-            );
-
             // Title topic-shift (uses a sentinel literal in data).
             assert_clean(
                 &render(

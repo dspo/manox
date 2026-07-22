@@ -8,6 +8,18 @@
 use crate::language_model::{MessageContent, Role};
 use serde::{Deserialize, Serialize};
 
+/// Stable origin of a persisted message. Internal Goal directives are model
+/// visible but hidden from every user-facing reconstruction path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageProvenance {
+    User,
+    Assistant,
+    Tool,
+    GoalContinuation,
+    GoalObjectiveUpdate,
+}
+
 /// UI-only metadata captured when a user message is submitted.
 ///
 /// The model request path ignores this data; it is persisted with the message
@@ -45,6 +57,7 @@ pub struct Message {
     /// Parent message id for branch/fork linking. Reserved: not yet wired to any
     /// branch-switch UI; linear conversations leave it `None`.
     pub parent_id: Option<String>,
+    pub provenance: MessageProvenance,
     pub role: Role,
     pub content: Vec<MessageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,22 +66,58 @@ pub struct Message {
 
 impl Message {
     pub fn user(text: String) -> Self {
-        Self::new(Role::User, vec![MessageContent::Text(text)])
+        Self::new(
+            Role::User,
+            MessageProvenance::User,
+            vec![MessageContent::Text(text)],
+        )
     }
 
     pub fn user_with_content(content: Vec<MessageContent>) -> Self {
-        Self::new(Role::User, content)
+        let provenance = if content
+            .iter()
+            .any(|part| matches!(part, MessageContent::ToolResult(_)))
+        {
+            MessageProvenance::Tool
+        } else {
+            MessageProvenance::User
+        };
+        Self::new(Role::User, provenance, content)
     }
 
     pub fn assistant(content: Vec<MessageContent>) -> Self {
-        Self::new(Role::Assistant, content)
+        Self::new(Role::Assistant, MessageProvenance::Assistant, content)
     }
 
-    fn new(role: Role, content: Vec<MessageContent>) -> Self {
+    pub fn goal_continuation(text: String) -> Self {
+        Self::new(
+            Role::User,
+            MessageProvenance::GoalContinuation,
+            vec![MessageContent::Text(text)],
+        )
+    }
+
+    pub fn goal_objective_update(text: String) -> Self {
+        Self::new(
+            Role::User,
+            MessageProvenance::GoalObjectiveUpdate,
+            vec![MessageContent::Text(text)],
+        )
+    }
+
+    pub fn is_hidden_from_ui(&self) -> bool {
+        matches!(
+            self.provenance,
+            MessageProvenance::GoalContinuation | MessageProvenance::GoalObjectiveUpdate
+        )
+    }
+
+    fn new(role: Role, provenance: MessageProvenance, content: Vec<MessageContent>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: chrono::Utc::now().timestamp(),
             parent_id: None,
+            provenance,
             role,
             content,
             ui: None,
@@ -82,5 +131,33 @@ impl Message {
 
     pub fn push_content(&mut self, content: MessageContent) {
         self.content.push(content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provenance_is_required_in_persisted_messages() {
+        let value = serde_json::json!({
+            "id": "m1",
+            "timestamp": 0,
+            "parent_id": null,
+            "role": "user",
+            "content": [],
+        });
+        assert!(serde_json::from_value::<Message>(value).is_err());
+    }
+
+    #[test]
+    fn goal_messages_are_model_visible_but_ui_hidden() {
+        let message = Message::goal_continuation("continue".into());
+        assert!(message.is_hidden_from_ui());
+        assert_eq!(message.role, Role::User);
+        assert_eq!(
+            message.content,
+            vec![MessageContent::Text("continue".into())]
+        );
     }
 }

@@ -1,5 +1,5 @@
 //! `thread_events` table: an append-only event stream per thread. Event types
-//! (model_change / compaction / branch_summary / custom) map to queryable rows.
+//! Lifecycle, Goal, and custom events map to queryable rows.
 
 use anyhow::{Context as _, Result};
 use rusqlite::{Connection, params};
@@ -15,6 +15,10 @@ pub enum ThreadEventType {
     ModelChange,
     Compaction,
     BranchSummary,
+    GoalCreated,
+    GoalUpdated,
+    GoalAccounted,
+    GoalCleared,
     Custom,
 }
 
@@ -24,6 +28,10 @@ impl ThreadEventType {
             ThreadEventType::ModelChange => "model_change",
             ThreadEventType::Compaction => "compaction",
             ThreadEventType::BranchSummary => "branch_summary",
+            ThreadEventType::GoalCreated => "goal_created",
+            ThreadEventType::GoalUpdated => "goal_updated",
+            ThreadEventType::GoalAccounted => "goal_accounted",
+            ThreadEventType::GoalCleared => "goal_cleared",
             ThreadEventType::Custom => "custom",
         }
     }

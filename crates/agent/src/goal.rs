@@ -1,346 +1,291 @@
-//! Goal-mode evaluator.
+//! Persistent Goal domain model and lifecycle runtime.
 //!
-//! When a thread has an active goal, [`evaluate`] runs after each natural
-//! turn end. It makes a single-shot LLM call (no tools, no streaming beyond
-//! draining the response) and returns whether the user-defined completion
-//! condition is met plus a one-line reason shown in the goal status popover.
-//!
-//! Failures (LLM unavailable, timeout, malformed response) **all** return
-//! `satisfied: false` with a machine reason — the evaluator is fail-open to
-//! continuation rather than fail-closed, because falsely declaring a goal
-//! complete is worse than an extra round. A separate evaluation cap in
-//! `Thread` bounds the loop either way.
-//!
-//! The evaluator prompt lives in the `side_call/goal_system.tera.md` template
-//! and is rendered at the request-build boundary. It is model-facing text; it
-//! is bilingual via the thread's `agent_language` (en / zh-CN mirrors) and is
-//! never routed through the `i18n` bundle (which only carries UI chrome).
+//! A Goal is the durable autonomy contract for one main thread. Completion is
+//! reported explicitly through the Goal tools; there is deliberately no
+//! per-turn evaluator or provider-specific cost accounting in this module.
 
-use std::sync::Arc;
-use std::time::Duration;
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 
-use futures::StreamExt as _;
-use gpui::AsyncApp;
-use serde::Deserialize;
-use tokio_util::sync::CancellationToken;
+/// Maximum number of Unicode scalar values accepted for a Goal objective.
+pub const MAX_OBJECTIVE_CHARS: usize = 4_000;
 
-use crate::language_model::{
-    AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
-    LanguageModelRequestMessage, MessageContent, Role, TokenUsage,
-};
-use crate::message::Message;
-use crate::thread::truncate_summary;
-
-/// Per-call hard timeout. The evaluator judges a whole turn's outcome, so it
-/// is allowed a little longer than a streaming chunk — but it runs on the
-/// user's critical path between turns, so it must stay bounded.
-const EVAL_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Cap on each sampled message snippet forwarded to the evaluator. The
-/// evaluator needs the gist of the latest user/assistant exchange, not the
-/// full transcript — a sliver keeps its own provider-side prompt cache hot
-/// and the call cheap.
-const MESSAGE_SAMPLE_CHARS: usize = 800;
-
-/// The evaluator's verdict for one turn.
-#[derive(Debug, Clone)]
-pub struct GoalVerdict {
-    pub satisfied: bool,
-    pub reason: String,
+/// Durable lifecycle state of a Goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    BudgetLimited,
+    Complete,
 }
 
-#[derive(Debug, Clone)]
-pub struct GoalEvaluation {
-    pub verdict: GoalVerdict,
-    pub usage: Option<TokenUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VerdictPayload {
-    satisfied: bool,
-    #[serde(default)]
-    reason: Option<String>,
-}
-
-/// Vet whether `condition` is met given the conversation so far. Blocks until
-/// the evaluator responds, the per-call timeout elapses, or `cancel` fires —
-/// every non-success path returns `satisfied: false`.
-///
-/// `model` is the same `AnyLanguageModel` the owning thread uses for its main
-/// loop. Only the latest user and assistant messages are sampled (truncated),
-/// mirroring the title-turn's context window: the evaluator judges "what did
-/// this turn accomplish", not the full history.
-pub async fn evaluate(
-    model: &AnyLanguageModel,
-    condition: &str,
-    messages: &[Message],
-    lang: crate::language::Language,
-    cancel: CancellationToken,
-    cx: &AsyncApp,
-) -> GoalEvaluation {
-    let last_user = last_text(messages, Role::User)
-        .map(|t| truncate_summary(&t, MESSAGE_SAMPLE_CHARS))
-        .unwrap_or_default();
-    let last_assistant = last_text(messages, Role::Assistant)
-        .map(|t| truncate_summary(&t, MESSAGE_SAMPLE_CHARS))
-        .unwrap_or_default();
-    let user_prompt = crate::prompt::render(
-        crate::prompt::PromptTemplate::SideCallGoalUser,
-        lang,
-        &crate::prompt::GoalEvalPromptData {
-            condition: condition.to_string(),
-            last_user,
-            last_assistant,
-        },
-    )
-    .expect("goal user prompt render");
-
-    let request = LanguageModelRequest {
-        messages: vec![
-            LanguageModelRequestMessage {
-                role: Role::System,
-                content: vec![MessageContent::Text(
-                    crate::prompt::render_static(
-                        crate::prompt::PromptTemplate::SideCallGoalSystem,
-                        lang,
-                    )
-                    .expect("goal system prompt render"),
-                )],
-                cache: true,
-            },
-            LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![MessageContent::Text(user_prompt)],
-                cache: false,
-            },
-        ],
-        tools: Vec::new(),
-        tool_choice: None,
-        temperature: Some(0.0),
-        thinking_allowed: false,
-        reasoning_effort: crate::settings::side_call_effort(
-            &crate::settings::side_calls().goal_policy(),
-            crate::language_model::RequestReasoningEffort::Low,
-        ),
-        max_output_tokens: crate::settings::side_call_output_cap(
-            crate::settings::side_calls().goal_policy(),
-        ),
-    };
-
-    let model = Arc::clone(model);
-    let call = async move {
-        let stream = match model.stream_completion(request, cx).await {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-        futures::pin_mut!(stream);
-        let mut text = String::new();
-        let mut usage = None;
-        while let Some(event) = stream.next().await {
-            let Ok(event) = event else { return None };
-            match event {
-                LanguageModelCompletionEvent::Text(delta) => text.push_str(&delta),
-                LanguageModelCompletionEvent::UsageUpdate(value) => usage = Some(value),
-                LanguageModelCompletionEvent::Stop(_) => break,
-                _ => {}
-            }
+impl GoalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Blocked => "blocked",
+            Self::BudgetLimited => "budget_limited",
+            Self::Complete => "complete",
         }
-        Some((text, usage))
-    };
+    }
 
-    // Race the evaluator call against a hard deadline and cancellation.
-    // `evaluate` runs inline on the gpui foreground executor — there is no
-    // tokio runtime context here, so `tokio::time::timeout` would panic at
-    // `Handle::current` and abort the process. The timer comes from the gpui
-    // executor instead; `call` is safe on the foreground executor because
-    // `stream_completion` bridges its HTTP work onto the global tokio runtime.
-    let outcome = tokio::select! {
-        result = call => result,
-        _ = cx.background_executor().timer(EVAL_TIMEOUT) => None,
-        _ = cancel.cancelled() => None,
-    };
-    let Some((text, usage)) = outcome else {
-        return GoalEvaluation {
-            verdict: GoalVerdict {
-                satisfied: false,
-                reason: "evaluator unavailable; continuing".to_string(),
-            },
-            usage: None,
-        };
-    };
+    pub fn parse(value: &str) -> Result<Self> {
+        Ok(match value {
+            "active" => Self::Active,
+            "paused" => Self::Paused,
+            "blocked" => Self::Blocked,
+            "budget_limited" => Self::BudgetLimited,
+            "complete" => Self::Complete,
+            _ => bail!("unknown Goal status: {value}"),
+        })
+    }
 
-    GoalEvaluation {
-        verdict: parse_verdict(&text).unwrap_or(GoalVerdict {
-            satisfied: false,
-            reason: "evaluator response unparseable; continuing".to_string(),
-        }),
-        usage,
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Blocked | Self::BudgetLimited | Self::Complete)
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        self == next
+            || matches!(
+                (self, next),
+                (
+                    Self::Active,
+                    Self::Paused | Self::Blocked | Self::BudgetLimited | Self::Complete
+                ) | (
+                    Self::Paused | Self::Blocked | Self::BudgetLimited,
+                    Self::Active
+                ) | (Self::BudgetLimited, Self::Blocked | Self::Complete)
+            )
     }
 }
 
-/// The trimmed concatenated `Text` blocks of the most recent message with the
-/// given role. `User` skips tool-result user messages (which carry no `Text`).
-fn last_text(messages: &[Message], role: Role) -> Option<String> {
-    let mut buf = String::new();
-    for m in messages.iter().rev() {
-        if m.role != role {
-            continue;
-        }
-        for c in &m.content {
-            if let MessageContent::Text(t) = c {
-                buf.push_str(t);
-            }
-        }
-        let trimmed = buf.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-        buf.clear();
-    }
-    None
+/// The one current Goal owned by a main thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadGoal {
+    pub thread_id: String,
+    pub goal_id: String,
+    pub objective: String,
+    pub status: GoalStatus,
+    pub token_budget: Option<u64>,
+    pub tokens_used: u64,
+    pub time_used_seconds: u64,
+    pub status_reason: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
-fn parse_verdict(text: &str) -> Option<GoalVerdict> {
-    let trimmed = text.trim();
-    if let Some(v) = try_parse_payload(trimmed) {
-        return Some(verdict_from(v));
+impl ThreadGoal {
+    pub fn new(thread_id: String, objective: String, token_budget: Option<u64>) -> Result<Self> {
+        let objective = validate_objective(objective)?;
+        validate_budget(token_budget)?;
+        let now = chrono::Utc::now().timestamp();
+        Ok(Self {
+            thread_id,
+            goal_id: uuid::Uuid::new_v4().to_string(),
+            objective,
+            status: GoalStatus::Active,
+            token_budget,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            status_reason: None,
+            created_at: now,
+            updated_at: now,
+        })
     }
-    // Prose-wrapped JSON. The prompt forbids extra text, but models
-    // occasionally add a preamble or a fenced example. Take the most-recently
-    // emitted balanced `{...}` block so a trailing example doesn't swallow
-    // the actual answer.
-    let bytes = trimmed.as_bytes();
-    let mut i = bytes.len();
-    while i > 0 {
-        i -= 1;
-        if bytes[i] != b'{' {
-            continue;
-        }
-        if let Some(end) = find_matching_close(bytes, i)
-            && let Some(payload) = try_parse_payload(&trimmed[i..=end])
+
+    pub fn remaining_tokens(&self) -> Option<u64> {
+        self.token_budget
+            .map(|budget| budget.saturating_sub(self.tokens_used))
+    }
+
+    pub fn can_resume(&self) -> Result<()> {
+        if let Some(budget) = self.token_budget
+            && self.tokens_used >= budget
         {
-            return Some(verdict_from(payload));
+            bail!("Goal token budget is exhausted");
+        }
+        if self.status == GoalStatus::Complete {
+            bail!("a completed Goal cannot be resumed");
+        }
+        Ok(())
+    }
+}
+
+/// In-memory coordinator for one persisted Goal.
+///
+/// `continuation_reserved` is the fencing bit for the idle gate: there can be
+/// at most one automatic turn reservation for the current `goal_id`.
+#[derive(Debug, Default)]
+pub struct GoalRuntime {
+    current: Option<ThreadGoal>,
+    continuation_reserved: bool,
+    blocker_reason: Option<String>,
+    blocker_turns: u8,
+    blocker_last_turn_id: Option<String>,
+}
+
+impl GoalRuntime {
+    pub fn restore(goal: Option<ThreadGoal>) -> Self {
+        Self {
+            current: goal,
+            continuation_reserved: false,
+            blocker_reason: None,
+            blocker_turns: 0,
+            blocker_last_turn_id: None,
         }
     }
-    None
-}
 
-fn find_matching_close(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut j = start;
-    while j < bytes.len() {
-        let c = bytes[j];
-        if escape {
-            escape = false;
-        } else if c == b'\\' {
-            escape = true;
-        } else if c == b'"' {
-            in_string = !in_string;
-        } else if !in_string {
-            match c {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(j);
-                    }
-                }
-                _ => {}
-            }
-        }
-        j += 1;
+    pub fn current(&self) -> Option<&ThreadGoal> {
+        self.current.as_ref()
     }
-    None
-}
 
-fn try_parse_payload(s: &str) -> Option<VerdictPayload> {
-    serde_json::from_str(s).ok()
-}
+    pub fn replace_snapshot(&mut self, goal: Option<ThreadGoal>) {
+        let same_goal = self.current.as_ref().map(|goal| &goal.goal_id)
+            == goal.as_ref().map(|goal| &goal.goal_id);
+        self.current = goal;
+        if !same_goal {
+            self.continuation_reserved = false;
+            self.clear_blocker();
+        }
+    }
 
-fn verdict_from(payload: VerdictPayload) -> GoalVerdict {
-    let reason = payload
-        .reason
-        .map(|r| r.trim().to_string())
-        .filter(|r| !r.is_empty())
-        .unwrap_or_else(|| {
-            if payload.satisfied {
-                "condition met"
-            } else {
-                "not yet met"
-            }
-            .to_string()
+    pub fn expected_goal_id(&self) -> Option<&str> {
+        self.current.as_ref().map(|goal| goal.goal_id.as_str())
+    }
+
+    pub fn reserve_continuation(&mut self, expected_goal_id: &str) -> bool {
+        let active = self.current.as_ref().is_some_and(|goal| {
+            goal.goal_id == expected_goal_id && goal.status == GoalStatus::Active
         });
-    GoalVerdict {
-        satisfied: payload.satisfied,
-        reason,
+        if !active || self.continuation_reserved {
+            return false;
+        }
+        self.continuation_reserved = true;
+        true
     }
+
+    pub fn release_continuation(&mut self, expected_goal_id: &str) {
+        if self.expected_goal_id() == Some(expected_goal_id) {
+            self.continuation_reserved = false;
+        }
+    }
+
+    /// Record at most one blocker report per Goal turn. A changed reason
+    /// resets the consecutive-turn streak.
+    pub fn record_blocker(&mut self, reason: &str, turn_id: &str) -> u8 {
+        if self.blocker_last_turn_id.as_deref() == Some(turn_id) {
+            return self.blocker_turns;
+        }
+        if self.blocker_reason.as_deref() == Some(reason) {
+            self.blocker_turns = self.blocker_turns.saturating_add(1);
+        } else {
+            self.blocker_reason = Some(reason.to_string());
+            self.blocker_turns = 1;
+        }
+        self.blocker_last_turn_id = Some(turn_id.to_string());
+        self.blocker_turns
+    }
+
+    /// A Goal turn without a blocker report breaks the consecutive streak.
+    pub fn finish_blocker_turn(&mut self, turn_id: &str) {
+        if self.blocker_last_turn_id.as_deref() != Some(turn_id) {
+            self.clear_blocker();
+        }
+    }
+
+    pub fn clear_blocker(&mut self) {
+        self.blocker_reason = None;
+        self.blocker_turns = 0;
+        self.blocker_last_turn_id = None;
+    }
+}
+
+pub fn validate_objective(objective: String) -> Result<String> {
+    let objective = objective.trim().to_string();
+    if objective.is_empty() {
+        bail!("Goal objective must not be empty");
+    }
+    if objective.chars().count() > MAX_OBJECTIVE_CHARS {
+        bail!("Goal objective must be at most {MAX_OBJECTIVE_CHARS} characters");
+    }
+    Ok(objective)
+}
+
+pub fn validate_budget(token_budget: Option<u64>) -> Result<()> {
+    if token_budget == Some(0) {
+        bail!("Goal token budget must be a positive integer");
+    }
+    Ok(())
+}
+
+/// Goal-budget tokens exclude provider cache reads by definition.
+pub fn budget_tokens(usage: crate::language_model::TokenUsage) -> u64 {
+    usage.input_tokens + usage.cache_creation_input_tokens + usage.output_tokens
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::language_model::TokenUsage;
 
     #[test]
-    fn parses_satisfied_with_reason() {
-        let v = parse_verdict(r#"{"satisfied":true,"reason":"test passes"}"#).unwrap();
-        assert!(v.satisfied);
-        assert_eq!(v.reason, "test passes");
+    fn validates_objective_and_budget() {
+        assert!(validate_objective("   ".into()).is_err());
+        assert!(validate_objective("x".repeat(MAX_OBJECTIVE_CHARS + 1)).is_err());
+        assert_eq!(validate_objective("  ship it  ".into()).unwrap(), "ship it");
+        assert!(validate_budget(Some(0)).is_err());
+        assert!(validate_budget(Some(1)).is_ok());
+        assert!(validate_budget(None).is_ok());
     }
 
     #[test]
-    fn parses_unsatisfied_without_reason() {
-        let v = parse_verdict(r#"{"satisfied":false}"#).unwrap();
-        assert!(!v.satisfied);
-        assert_eq!(v.reason, "not yet met");
+    fn budget_excludes_cache_reads() {
+        assert_eq!(
+            budget_tokens(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 4,
+                cache_creation_input_tokens: 3,
+                cache_read_input_tokens: 100,
+            }),
+            17
+        );
     }
 
     #[test]
-    fn parses_satisfied_without_reason() {
-        let v = parse_verdict(r#"{"satisfied":true}"#).unwrap();
-        assert!(v.satisfied);
-        assert_eq!(v.reason, "condition met");
+    fn continuation_reservation_is_fenced_by_goal_id() {
+        let goal = ThreadGoal::new("thread".into(), "finish".into(), None).unwrap();
+        let id = goal.goal_id.clone();
+        let mut runtime = GoalRuntime::restore(Some(goal));
+        assert!(runtime.reserve_continuation(&id));
+        assert!(!runtime.reserve_continuation(&id));
+        runtime.release_continuation("stale");
+        assert!(!runtime.reserve_continuation(&id));
+        runtime.release_continuation(&id);
+        assert!(runtime.reserve_continuation(&id));
     }
 
     #[test]
-    fn tolerates_surrounding_prose_and_fences() {
-        let v = parse_verdict(
-            "Here is my judgment:\n```json\n{\"satisfied\":true,\"reason\":\"done\"}\n```\n",
-        )
-        .unwrap();
-        assert!(v.satisfied);
-        assert_eq!(v.reason, "done");
+    fn blocker_requires_three_distinct_consecutive_turns() {
+        let goal = ThreadGoal::new("thread".into(), "finish".into(), None).unwrap();
+        let mut runtime = GoalRuntime::restore(Some(goal));
+        assert_eq!(runtime.record_blocker("waiting", "turn-1"), 1);
+        assert_eq!(runtime.record_blocker("waiting", "turn-1"), 1);
+        assert_eq!(runtime.record_blocker("waiting", "turn-2"), 2);
+        assert_eq!(runtime.record_blocker("other", "turn-3"), 1);
+        runtime.finish_blocker_turn("turn-4");
+        assert_eq!(runtime.record_blocker("other", "turn-5"), 1);
+        assert_eq!(runtime.record_blocker("other", "turn-6"), 2);
+        assert_eq!(runtime.record_blocker("other", "turn-7"), 3);
     }
 
     #[test]
-    fn falls_through_on_garbage() {
-        assert!(parse_verdict("not json at all").is_none());
-    }
-
-    #[test]
-    fn picks_latest_object_when_format_example_precedes() {
-        let v = parse_verdict(
-            r#"Format: {"satisfied":true} and my answer: {"satisfied":false,"reason":"still working"}"#,
-        )
-        .unwrap();
-        assert!(!v.satisfied);
-        assert_eq!(v.reason, "still working");
-    }
-
-    #[test]
-    fn last_text_skips_empty_user_tool_result() {
-        use crate::language_model::MessageContent;
-        // A tool result is role User with no Text block; the sampler must
-        // skip it and return the prior real user text.
-        let msgs = vec![
-            Message::user_with_content(vec![MessageContent::Text("real question".into())]),
-            Message::user_with_content(vec![]),
-            Message::assistant(vec![MessageContent::Text("answer".into())]),
-        ];
-        let u = last_text(&msgs, Role::User).unwrap();
-        assert_eq!(u, "real question");
-        let a = last_text(&msgs, Role::Assistant).unwrap();
-        assert_eq!(a, "answer");
+    fn status_machine_rejects_terminal_rewrites() {
+        assert!(GoalStatus::Active.can_transition_to(GoalStatus::Complete));
+        assert!(GoalStatus::Paused.can_transition_to(GoalStatus::Active));
+        assert!(!GoalStatus::Complete.can_transition_to(GoalStatus::Active));
+        assert!(!GoalStatus::Blocked.can_transition_to(GoalStatus::Complete));
     }
 }

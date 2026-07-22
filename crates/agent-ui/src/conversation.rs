@@ -896,7 +896,7 @@ impl ConversationState {
             ThreadEvent::TurnFinished { .. } => {}
             // Goal lifecycle is surfaced by the composer chip + status popover,
             // not as a conversation item.
-            ThreadEvent::GoalChanged { .. } | ThreadEvent::GoalEvaluated { .. } => {}
+            ThreadEvent::GoalChanged { .. } => {}
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
@@ -1636,7 +1636,7 @@ fn merge_ui_notes(
     let segment_ids: Vec<&str> = messages
         .iter()
         .filter(|m| {
-            if m.role != Role::User {
+            if m.role != Role::User || m.is_hidden_from_ui() {
                 return false;
             }
             if m.ui
@@ -1665,7 +1665,7 @@ fn merge_ui_notes(
     let user_msg_index: HashMap<&str, usize> = messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == Role::User)
+        .filter(|(_, m)| m.role == Role::User && !m.is_hidden_from_ui())
         .map(|(i, m)| (m.id.as_str(), i))
         .collect();
     let segment_msg_ix: Vec<usize> = segment_ids.iter().map(|id| user_msg_index[id]).collect();
@@ -1847,6 +1847,11 @@ mod tests {
             id: id.to_string(),
             timestamp: 0,
             parent_id: None,
+            provenance: if role == Role::User {
+                agent::MessageProvenance::User
+            } else {
+                agent::MessageProvenance::Assistant
+            },
             role,
             content: vec![MessageContent::Text(text.to_string())],
             ui: None,

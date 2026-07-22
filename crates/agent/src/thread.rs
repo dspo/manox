@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::collaboration_mode::{ModeKind, ModeSettings};
-use crate::db::ThreadRecord;
-use crate::goal::{self, GoalVerdict};
+use crate::db::{GoalActor, ThreadRecord};
+use crate::goal::{GoalRuntime, GoalStatus, ThreadGoal};
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
     LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUse, MessageContent,
@@ -320,16 +320,6 @@ pub enum ThreadEvent {
         messages_compacted: usize,
         tokens_before: u64,
     },
-    /// A goal evaluator run completed. Carries the verdict + reason + the
-    /// evaluation count so the UI can refresh the status popover without
-    /// re-reading thread state. Emitted on both satisfied and unsatisfied
-    /// outcomes; a satisfied outcome is immediately followed by
-    /// `GoalChanged { active: false }` from `clear_goal`.
-    GoalEvaluated {
-        satisfied: bool,
-        reason: String,
-        evaluations: u32,
-    },
     /// A peer message was delivered to this thread from another team member.
     /// Rendered as a `💬 from {name}` bubble, distinct from user/assistant
     /// turns. The thread also received a user-role message carrying the same
@@ -389,33 +379,6 @@ pub struct PendingAuthMeta {
     pub input: serde_json::Value,
 }
 
-/// Goal-mode state. The deterministic compaction capsule persists the
-/// condition; reload resets monotonic timing/evaluation counters because
-/// `Instant` is intentionally not serialized.
-pub struct GoalState {
-    /// The completion condition the agent works toward, in the user's words.
-    pub condition: String,
-    /// Wall-clock start instant for the elapsed-time chip. Monotonic so the
-    /// chip is unaffected by system-clock changes.
-    pub started_at: Instant,
-    /// Monotonic evaluation counter, incremented before each evaluator call.
-    pub evaluations: u32,
-    /// The last evaluator reason (satisfied or not), shown in the status
-    /// popover so the user can see why the loop is or is not continuing.
-    pub last_reason: String,
-}
-
-/// Outcome of a goal evaluation, deciding what `maybe_continue_goal` does next.
-enum GoalAction {
-    /// Condition not yet met — inject the condition and start another turn.
-    Continue,
-    /// Condition met — clear the goal and exit goal mode.
-    Satisfied,
-    /// Goal cleared mid-evaluation (cancel / `/goal clear`) or the evaluation
-    /// cap was hit — drop the result and clear without continuing.
-    Abort,
-}
-
 /// Per-turn cap on recovery continuations (tool-use JSON parse error +
 /// max-tokens truncation). Guards the main thread — which has no `max_turns` —
 /// against a model that loops on unparseable JSON or keeps hitting the output
@@ -423,6 +386,15 @@ enum GoalAction {
 /// this emits `ThreadEvent::Error` and ends the turn rather than spinning
 /// forever.
 const MAX_RECOVERY_ATTEMPTS: u32 = 2;
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
 
 /// Whether the assistant's visible text announces a tool action the model then
 /// failed to perform (no `tool_use` emitted). Catches the narrate-without-acting
@@ -704,18 +676,16 @@ pub struct Thread {
     /// `respond_inbound` with an allow/deny decision; orthogonal to
     /// `approval_mode` (a page's write request is never auto-allowed).
     pending_inbound: HashMap<String, tokio::sync::oneshot::Sender<bool>>,
-    /// Active goal state. `None` unless the user set a completion condition via
-    /// `/goal <condition>`. While `Some`, after each natural turn end the
-    /// thread runs a lightweight evaluator; an unsatisfied goal auto-continues
-    /// the turn (condition as directive), a satisfied goal clears itself and
-    /// exits goal mode. Session-scoped — never persisted. Main-thread only —
-    /// sub-agents never carry a goal (`set_goal` no-ops at depth > 0).
-    goal: Option<GoalState>,
-    /// Cancellation token for an in-flight goal evaluator. `None` when no
-    /// evaluation is running. Cancelled by `cancel()`, `clear_goal`, and on
-    /// satisfaction so a stray late evaluator result does not trigger a
-    /// continuation. Mirrors `turn_cancel`'s role for the main turn.
-    goal_cancel: Option<CancellationToken>,
+    /// Durable main-thread Goal state and continuation fencing. The snapshot is
+    /// updated only after its SQLite transaction commits; sub-agents never own
+    /// a Goal and completion is reported explicitly through `UpdateGoal`.
+    goal_runtime: GoalRuntime,
+    /// Accounting anchor for a Goal-owned Default-mode turn. The tuple carries
+    /// the goal-id fence, active-time start, and thread usage baseline.
+    goal_turn_anchor: Option<(String, Instant, TokenUsage)>,
+    /// One-shot guard for the safe-stop directive injected when streaming
+    /// usage reaches the explicit Goal budget during a live turn.
+    goal_budget_stop_injected: bool,
     /// LLM title + re-eval cadence + user rename. The spawn that drives a
     /// title turn lives in [`TitleState::maybe_generate`]; `Thread` passes in
     /// depth / model / messages each call. `pub(crate)` so the spawn callback
@@ -958,8 +928,9 @@ impl Thread {
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
                 reasoning_effort: ReasoningEffort::default(),
-                goal: None,
-                goal_cancel: None,
+                goal_runtime: GoalRuntime::default(),
+                goal_turn_anchor: None,
+                goal_budget_stop_injected: false,
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
                 proxy: None,
@@ -988,6 +959,16 @@ impl Thread {
     pub fn restore(
         rec: ThreadRecord,
         model: Option<AnyLanguageModel>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::restore_with_goal(rec, model, None, cx)
+    }
+
+    /// Restore a thread together with its already fail-safe-restored Goal.
+    pub fn restore_with_goal(
+        rec: ThreadRecord,
+        model: Option<AnyLanguageModel>,
+        goal: Option<ThreadGoal>,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
@@ -1043,16 +1024,6 @@ impl Thread {
                     _ => None,
                 })
                 .unwrap_or_default();
-            let restored_goal = restored_state
-                .as_ref()
-                .and_then(|state| state.goal.clone())
-                .filter(|_| restored_mode != ModeKind::Plan)
-                .map(|condition| GoalState {
-                    condition,
-                    started_at: Instant::now(),
-                    evaluations: 0,
-                    last_reason: "restored from compaction capsule".into(),
-                });
             if let Some(state) = restored_state.as_ref() {
                 crate::tools::tool_search::activate_tools(&rec.id, &state.active_tools);
             }
@@ -1100,8 +1071,9 @@ impl Thread {
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
                 reasoning_effort: ReasoningEffort::from_i64(rec.reasoning_effort),
-                goal: restored_goal,
-                goal_cancel: None,
+                goal_runtime: GoalRuntime::restore(goal),
+                goal_turn_anchor: None,
+                goal_budget_stop_injected: false,
                 title_state: TitleState::restore(
                     rec.title,
                     rec.title_override,
@@ -1207,8 +1179,9 @@ impl Thread {
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
                 reasoning_effort,
-                goal: None,
-                goal_cancel: None,
+                goal_runtime: GoalRuntime::default(),
+                goal_turn_anchor: None,
+                goal_budget_stop_injected: false,
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
                 proxy: None,
@@ -1591,18 +1564,14 @@ impl Thread {
         self.collaboration_mode
     }
 
-    /// Switch collaboration mode. Called by the UI (slash `/plan`, the `+` menu
-    /// row, or shift-tab cycling). Only sets the mode; the next
-    /// `build_completion_request` resolves the per-mode tool set, model,
-    /// reasoning effort, and `developer_instructions` injection. Does not start
-    /// a turn. Goal mode and Plan mode are mutually exclusive — entering Plan
-    /// clears an active goal so the next turn advertises write tools rather
-    /// than the read-only plan set.
+    /// Switch collaboration mode. Plan temporarily gates Goal continuation and
+    /// accounting without changing the durable Goal status.
     pub fn set_collaboration_mode(&mut self, mode: ModeKind, cx: &mut Context<Self>) {
-        if mode == ModeKind::Plan && self.goal.is_some() {
-            self.clear_goal(cx);
-        }
+        let leaving_plan = self.collaboration_mode == ModeKind::Plan && mode != ModeKind::Plan;
         self.collaboration_mode = mode;
+        if leaving_plan {
+            self.try_start_goal_turn_if_idle(cx);
+        }
         cx.notify();
     }
 
@@ -1673,47 +1642,469 @@ impl Thread {
         mode.reasoning_effort.unwrap_or(self.reasoning_effort)
     }
 
-    /// Active goal state, if any. Drives the composer's `◎ /goal active` chip.
-    pub fn goal(&self) -> Option<&GoalState> {
-        self.goal.as_ref()
+    pub fn goal(&self) -> Option<&ThreadGoal> {
+        self.goal_runtime.current()
     }
 
-    /// Set a completion condition and enter goal mode. Main-thread only — a
-    /// sub-agent (depth > 0) no-ops. Exits Plan mode (the two are mutually
-    /// exclusive) so the next turn advertises write tools. Does NOT start a
-    /// turn — the caller owns turn initiation, exactly like
-    /// `set_collaboration_mode`.
-    pub fn set_goal(&mut self, condition: String, cx: &mut Context<Self>) {
-        if self.depth != 0 {
-            return;
-        }
-        if self.collaboration_mode == ModeKind::Plan {
-            self.collaboration_mode = ModeKind::Default;
-        }
-        self.goal = Some(GoalState {
-            condition,
-            started_at: Instant::now(),
-            evaluations: 0,
-            last_reason: String::new(),
+    pub fn goal_elapsed_seconds(&self) -> Option<u64> {
+        let goal = self.goal()?;
+        let live = self
+            .goal_turn_anchor
+            .as_ref()
+            .filter(|(goal_id, _, _)| goal_id == &goal.goal_id)
+            .map(|(_, started_at, _)| started_at.elapsed().as_secs())
+            .unwrap_or(0);
+        Some(goal.time_used_seconds.saturating_add(live))
+    }
+
+    fn sync_goal_pin(&self, cx: &mut Context<Self>) {
+        let active = self
+            .goal()
+            .is_some_and(|goal| goal.status == GoalStatus::Active);
+        let thread = cx.entity().clone();
+        crate::thread_store::global().update(cx, |store, _| {
+            store.sync_goal_pin(&self.id.0, thread, active);
         });
+    }
+
+    pub fn set_goal(&mut self, objective: String, cx: &mut Context<Self>) -> Result<()> {
+        self.create_goal(objective, None, GoalActor::User, cx)
+    }
+
+    pub fn create_goal(
+        &mut self,
+        objective: String,
+        token_budget: Option<u64>,
+        actor: GoalActor,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        if self.depth != 0 {
+            anyhow::bail!("sub-agents cannot own a Goal");
+        }
+        if self
+            .goal()
+            .is_some_and(|goal| goal.status != GoalStatus::Complete)
+        {
+            anyhow::bail!("thread already has an unfinished Goal");
+        }
+        if self.goal().is_some() {
+            self.clear_goal(GoalActor::System, cx)?;
+        }
+        let goal = ThreadGoal::new(self.id.0.clone(), objective, token_budget)?;
+        let db = crate::thread_store::global().read(cx).database();
+        let record = self
+            .snapshot()
+            .ok_or_else(|| anyhow::anyhow!("Goal requires a configured model"))?;
+        db.upsert(&record, true)?;
+        db.create_goal(&goal, actor)?;
+        let goal_id = goal.goal_id.clone();
+        self.goal_runtime.replace_snapshot(Some(goal));
+        self.sync_goal_pin(cx);
+        if self.running_turn.is_some() && self.collaboration_mode != ModeKind::Plan {
+            self.goal_turn_anchor = Some((goal_id, Instant::now(), self.cumulative_token_usage()));
+        }
         cx.emit(ThreadEvent::GoalChanged { active: true });
         cx.notify();
+        Ok(())
     }
 
-    /// Clear the active goal and abort any in-flight evaluator. Called by
-    /// `/goal clear`, on satisfaction, from `set_collaboration_mode` (mutual
-    /// exclusion), and as a backstop from `cancel()`. Emits `GoalChanged {
-    /// active: false }` when a goal was actually active so the chip disappears.
-    pub fn clear_goal(&mut self, cx: &mut Context<Self>) {
-        let was_active = self.goal.is_some();
-        if let Some(c) = self.goal_cancel.take() {
-            c.cancel();
+    pub fn edit_goal(
+        &mut self,
+        objective: String,
+        token_budget: Option<u64>,
+        actor: GoalActor,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let current = self
+            .goal()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("thread has no Goal"))?;
+        let mut updated = current.clone();
+        updated.objective = crate::goal::validate_objective(objective)?;
+        crate::goal::validate_budget(token_budget)?;
+        updated.token_budget = token_budget;
+        if updated.status == GoalStatus::Active
+            && token_budget.is_some_and(|budget| updated.tokens_used >= budget)
+        {
+            updated.status = GoalStatus::BudgetLimited;
+            updated.status_reason = Some("token budget exhausted".into());
         }
-        self.goal = None;
-        if was_active {
-            cx.emit(ThreadEvent::GoalChanged { active: false });
-            cx.notify();
+        updated.updated_at = chrono::Utc::now().timestamp();
+        let db = crate::thread_store::global().read(cx).database();
+        db.update_goal(&current.goal_id, &updated, actor, None)?;
+        self.goal_runtime.replace_snapshot(Some(updated.clone()));
+        self.sync_goal_pin(cx);
+        if current.objective != updated.objective {
+            let directive = format!(
+                "<goal_objective_update goal_id=\"{}\">\n{}\n</goal_objective_update>",
+                updated.goal_id,
+                escape_xml(&updated.objective)
+            );
+            self.messages
+                .push(Message::goal_objective_update(directive));
         }
+        cx.emit(ThreadEvent::GoalChanged { active: true });
+        self.try_start_goal_turn_if_idle(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    /// Replace the current Goal only after the caller explicitly supplies the
+    /// current id through the persisted CAS path. Replacement resets all
+    /// accounting and fences every callback from the old Goal.
+    pub fn replace_goal(
+        &mut self,
+        objective: String,
+        token_budget: Option<u64>,
+        actor: GoalActor,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let current = self
+            .goal()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("thread has no Goal to replace"))?;
+        let replacement = ThreadGoal::new(self.id.0.clone(), objective, token_budget)?;
+        let (token_delta, time_delta, turn_id) = self
+            .goal_turn_anchor
+            .as_ref()
+            .filter(|(goal_id, _, _)| goal_id == &current.goal_id)
+            .map(|(_, started_at, baseline)| {
+                let usage = self.cumulative_token_usage();
+                let delta = TokenUsage {
+                    input_tokens: usage.input_tokens.saturating_sub(baseline.input_tokens),
+                    output_tokens: usage.output_tokens.saturating_sub(baseline.output_tokens),
+                    cache_creation_input_tokens: usage
+                        .cache_creation_input_tokens
+                        .saturating_sub(baseline.cache_creation_input_tokens),
+                    cache_read_input_tokens: usage
+                        .cache_read_input_tokens
+                        .saturating_sub(baseline.cache_read_input_tokens),
+                };
+                (
+                    crate::goal::budget_tokens(delta),
+                    started_at.elapsed().as_secs(),
+                    self.last_user_message_id().map(str::to_owned),
+                )
+            })
+            .unwrap_or((0, 0, None));
+        let db = crate::thread_store::global().read(cx).database();
+        db.replace_goal(
+            &current.goal_id,
+            &replacement,
+            actor,
+            token_delta,
+            time_delta,
+            turn_id.as_deref(),
+        )?;
+        if let Some(cancel) = self.turn_cancel.as_ref() {
+            cancel.cancel();
+        }
+        self.goal_turn_anchor = None;
+        self.goal_runtime.replace_snapshot(Some(replacement));
+        self.sync_goal_pin(cx);
+        cx.emit(ThreadEvent::GoalChanged { active: true });
+        self.try_start_goal_turn_if_idle(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    pub fn set_goal_status(
+        &mut self,
+        status: GoalStatus,
+        reason: Option<String>,
+        actor: GoalActor,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let current = self
+            .goal()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("thread has no Goal"))?;
+        if !current.status.can_transition_to(status) {
+            anyhow::bail!(
+                "invalid Goal transition: {} -> {}",
+                current.status.as_str(),
+                status.as_str()
+            );
+        }
+        if status == GoalStatus::Active {
+            current.can_resume()?;
+        }
+        let mut updated = current.clone();
+        updated.status = status;
+        updated.status_reason = reason;
+        updated.updated_at = chrono::Utc::now().timestamp();
+        let db = crate::thread_store::global().read(cx).database();
+        db.update_goal(&current.goal_id, &updated, actor, None)?;
+        self.goal_runtime.replace_snapshot(Some(updated));
+        self.sync_goal_pin(cx);
+        cx.emit(ThreadEvent::GoalChanged { active: true });
+        if status == GoalStatus::Active {
+            self.try_start_goal_turn_if_idle(cx);
+        } else if status == GoalStatus::Paused
+            && matches!(actor, GoalActor::User)
+            && let Some(cancel) = self.turn_cancel.as_ref()
+        {
+            cancel.cancel();
+        }
+        cx.notify();
+        Ok(())
+    }
+
+    /// Apply a model terminal report only to the Goal that owns the current
+    /// turn. This turn-bound fence prevents a late tool callback from changing
+    /// a replacement Goal.
+    pub fn update_goal_from_model(
+        &mut self,
+        status: GoalStatus,
+        reason: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let expected_goal_id = self
+            .goal_turn_anchor
+            .as_ref()
+            .map(|(goal_id, _, _)| goal_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("model Goal update is not bound to a Goal turn"))?;
+        let current = self
+            .goal()
+            .cloned()
+            .filter(|goal| goal.goal_id == expected_goal_id)
+            .ok_or_else(|| anyhow::anyhow!("stale model Goal update"))?;
+        match status {
+            GoalStatus::Complete => {
+                self.goal_runtime.clear_blocker();
+                self.set_goal_status(status, reason, GoalActor::Model, cx)
+            }
+            GoalStatus::Blocked => {
+                let reason = reason
+                    .map(|reason| reason.trim().to_string())
+                    .filter(|reason| !reason.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Blocked requires a concrete reason"))?;
+                let turn_id = self
+                    .last_user_message_id()
+                    .ok_or_else(|| anyhow::anyhow!("Goal turn has no stable id"))?
+                    .to_string();
+                let count = self.goal_runtime.record_blocker(&reason, &turn_id);
+                if count >= 3 {
+                    return self.set_goal_status(
+                        GoalStatus::Blocked,
+                        Some(reason),
+                        GoalActor::Model,
+                        cx,
+                    );
+                }
+                let mut updated = current;
+                updated.status_reason = Some(format!("blocked report {count}/3: {reason}"));
+                updated.updated_at = chrono::Utc::now().timestamp();
+                let db = crate::thread_store::global().read(cx).database();
+                db.update_goal(
+                    &expected_goal_id,
+                    &updated,
+                    GoalActor::Model,
+                    Some(&turn_id),
+                )?;
+                self.goal_runtime.replace_snapshot(Some(updated));
+                cx.emit(ThreadEvent::GoalChanged { active: true });
+                cx.notify();
+                Ok(())
+            }
+            GoalStatus::Active | GoalStatus::Paused | GoalStatus::BudgetLimited => {
+                anyhow::bail!("model may only report Complete or Blocked")
+            }
+        }
+    }
+
+    pub fn clear_goal(&mut self, actor: GoalActor, cx: &mut Context<Self>) -> Result<()> {
+        let Some(goal) = self.goal().cloned() else {
+            return Ok(());
+        };
+        let db = crate::thread_store::global().read(cx).database();
+        let (token_delta, time_delta, turn_id) = self
+            .goal_turn_anchor
+            .as_ref()
+            .filter(|(goal_id, _, _)| goal_id == &goal.goal_id)
+            .map(|(_, started_at, baseline)| {
+                let usage = self.cumulative_token_usage();
+                let delta = TokenUsage {
+                    input_tokens: usage.input_tokens.saturating_sub(baseline.input_tokens),
+                    output_tokens: usage.output_tokens.saturating_sub(baseline.output_tokens),
+                    cache_creation_input_tokens: usage
+                        .cache_creation_input_tokens
+                        .saturating_sub(baseline.cache_creation_input_tokens),
+                    cache_read_input_tokens: usage
+                        .cache_read_input_tokens
+                        .saturating_sub(baseline.cache_read_input_tokens),
+                };
+                (
+                    crate::goal::budget_tokens(delta),
+                    started_at.elapsed().as_secs(),
+                    self.last_user_message_id().map(str::to_owned),
+                )
+            })
+            .unwrap_or((0, 0, None));
+        db.clear_goal(
+            &self.id.0,
+            &goal.goal_id,
+            actor,
+            token_delta,
+            time_delta,
+            turn_id.as_deref(),
+        )?;
+        if let Some(cancel) = self.turn_cancel.take() {
+            cancel.cancel();
+        }
+        self.goal_runtime.replace_snapshot(None);
+        self.goal_turn_anchor = None;
+        self.sync_goal_pin(cx);
+        cx.emit(ThreadEvent::GoalChanged { active: false });
+        cx.notify();
+        Ok(())
+    }
+
+    /// Start exactly one automatic Goal turn after all higher-priority thread
+    /// work has drained. The reservation is fenced by the current goal id.
+    pub fn try_start_goal_turn_if_idle(&mut self, cx: &mut Context<Self>) {
+        if self.depth != 0
+            || self.collaboration_mode == ModeKind::Plan
+            || self.running_turn.is_some()
+            || !self.pending_steer.is_empty()
+            || !self.pending_authorizations.is_empty()
+            || !self.pending_inbound.is_empty()
+        {
+            return;
+        }
+        let Some(goal) = self.goal().cloned() else {
+            return;
+        };
+        if goal.status != GoalStatus::Active
+            || !self.goal_runtime.reserve_continuation(&goal.goal_id)
+        {
+            return;
+        }
+        let remaining = goal
+            .remaining_tokens()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unlimited".into());
+        let directive = format!(
+            "<goal_continuation goal_id=\"{}\" status=\"{}\">\n<objective>{}</objective>\n<tokens used=\"{}\" remaining=\"{}\"/>\nContinue working autonomously. Before finishing, verify the objective against current tool evidence and call UpdateGoal with complete or blocked.\n</goal_continuation>",
+            goal.goal_id,
+            goal.status.as_str(),
+            escape_xml(&goal.objective),
+            goal.tokens_used,
+            remaining,
+        );
+        self.messages.push(Message::goal_continuation(directive));
+        self.run_turn(cx);
+    }
+
+    fn finish_goal_turn(&mut self, cancelled: bool, failed: bool, cx: &mut Context<Self>) {
+        let Some((goal_id, started_at, baseline)) = self.goal_turn_anchor.take() else {
+            return;
+        };
+        let Some(_) = self.goal().filter(|goal| goal.goal_id == goal_id) else {
+            return;
+        };
+        let turn_id = self.last_user_message_id().map(str::to_owned);
+        if let Some(turn_id) = turn_id.as_deref() {
+            self.goal_runtime.finish_blocker_turn(turn_id);
+        }
+        let usage = self.cumulative_token_usage();
+        let delta = TokenUsage {
+            input_tokens: usage.input_tokens.saturating_sub(baseline.input_tokens),
+            output_tokens: usage.output_tokens.saturating_sub(baseline.output_tokens),
+            cache_creation_input_tokens: usage
+                .cache_creation_input_tokens
+                .saturating_sub(baseline.cache_creation_input_tokens),
+            cache_read_input_tokens: usage
+                .cache_read_input_tokens
+                .saturating_sub(baseline.cache_read_input_tokens),
+        };
+        let db = crate::thread_store::global().read(cx).database();
+        let token_delta = crate::goal::budget_tokens(delta);
+        match db.account_goal(
+            &self.id.0,
+            &goal_id,
+            token_delta,
+            started_at.elapsed().as_secs(),
+            turn_id.as_deref(),
+        ) {
+            Ok(goal) => {
+                self.goal_runtime.replace_snapshot(Some(goal));
+                self.sync_goal_pin(cx);
+            }
+            Err(error) => {
+                tracing::error!(%error, goal_id, "Goal accounting failed; automatic work stopped");
+                cx.emit(ThreadEvent::Error(anyhow::anyhow!(
+                    "Goal accounting failed; automatic work stopped: {error}"
+                )));
+                return;
+            }
+        }
+        let terminal = if cancelled {
+            Some((GoalStatus::Paused, "paused by user"))
+        } else if failed {
+            Some((GoalStatus::Blocked, "provider turn failed"))
+        } else if self.goal().is_some_and(|goal| goal.token_budget.is_some()) && token_delta == 0 {
+            Some((GoalStatus::Blocked, "provider did not report token usage"))
+        } else {
+            None
+        };
+        if let Some((status, reason)) = terminal {
+            let _ = self.set_goal_status(status, Some(reason.into()), GoalActor::System, cx);
+        }
+        self.goal_runtime.release_continuation(&goal_id);
+        cx.emit(ThreadEvent::GoalChanged {
+            active: self.goal().is_some(),
+        });
+    }
+
+    fn enforce_goal_budget_during_turn(&mut self, cx: &mut Context<Self>) {
+        if self.goal_budget_stop_injected || self.collaboration_mode == ModeKind::Plan {
+            return;
+        }
+        let Some((goal_id, _, baseline)) = self.goal_turn_anchor.as_ref() else {
+            return;
+        };
+        let Some(goal) = self
+            .goal()
+            .cloned()
+            .filter(|goal| goal.goal_id == *goal_id && goal.status == GoalStatus::Active)
+        else {
+            return;
+        };
+        let Some(budget) = goal.token_budget else {
+            return;
+        };
+        let usage = self.cumulative_token_usage();
+        let delta = TokenUsage {
+            input_tokens: usage.input_tokens.saturating_sub(baseline.input_tokens),
+            output_tokens: usage.output_tokens.saturating_sub(baseline.output_tokens),
+            cache_creation_input_tokens: usage
+                .cache_creation_input_tokens
+                .saturating_sub(baseline.cache_creation_input_tokens),
+            cache_read_input_tokens: usage
+                .cache_read_input_tokens
+                .saturating_sub(baseline.cache_read_input_tokens),
+        };
+        if goal
+            .tokens_used
+            .saturating_add(crate::goal::budget_tokens(delta))
+            < budget
+        {
+            return;
+        }
+        self.goal_budget_stop_injected = true;
+        if let Err(error) = self.set_goal_status(
+            GoalStatus::BudgetLimited,
+            Some("token budget exhausted".into()),
+            GoalActor::System,
+            cx,
+        ) {
+            cx.emit(ThreadEvent::Error(error));
+            return;
+        }
+        self.messages.push(Message::goal_continuation(
+            "<goal_budget_stop>Token budget reached. Do not start new external work; safely finish any in-flight side effect and summarize the current state.</goal_budget_stop>".into(),
+        ));
     }
 
     pub fn reasoning_effort(&self) -> ReasoningEffort {
@@ -2563,6 +2954,16 @@ impl Thread {
         // lights up during the warm-up gap. `ThreadStore::set_running` (called
         // by the workspace on this event) is the bridge to the sidebar.
         self.turn_started_at = Some(Instant::now());
+        self.goal_budget_stop_injected = false;
+        if self.collaboration_mode != ModeKind::Plan
+            && let Some(goal) = self.goal().filter(|goal| goal.status == GoalStatus::Active)
+        {
+            self.goal_turn_anchor = Some((
+                goal.goal_id.clone(),
+                Instant::now(),
+                self.cumulative_token_usage(),
+            ));
+        }
         cx.emit(ThreadEvent::TurnStarted);
 
         let cancel = CancellationToken::new();
@@ -2637,12 +3038,11 @@ impl Thread {
                 // update. Treat it like a successor so both paths are skipped.
                 true
             };
-            // Goal auto-continuation: on a natural (non-cancelled) turn end
-            // with an active goal, run the evaluator and either continue or
-            // clear. A cancelled turn (user stop / `/goal clear` during a turn)
-            // skips this so cancel is terminal. Sub-agents never carry a goal.
-            if !turn_cancelled && !successor_running {
-                Self::maybe_continue_goal(&this, &model, cx).await;
+            if !successor_running {
+                let _ = this.update(cx, |thread, cx| {
+                    thread.finish_goal_turn(turn_cancelled, turn_failed, cx);
+                    thread.try_start_goal_turn_if_idle(cx);
+                });
             }
             // Background task event auto-wake: after the turn finishes, check
             // if events arrived on the shared event bus. If so, start a new
@@ -2667,144 +3067,6 @@ impl Thread {
         });
         self.running_turn = Some(task);
         cx.notify();
-    }
-
-    /// Hard cap on goal evaluations. Bounds the auto-continue loop when a
-    /// condition is genuinely unmeetable or the evaluator keeps failing. 50
-    /// evaluations ≈ a long but bounded work session; the user can re-issue
-    /// `/goal <condition>` to restart with a fresh count.
-    const GOAL_MAX_EVALUATIONS: u32 = 50;
-
-    /// After a natural turn end, if a goal is active, run the evaluator. On
-    /// "satisfied" → clear the goal (exits mode). On "unsatisfied" → inject
-    /// the condition as a directive and start a new turn. No-op when no goal
-    /// is active, on a sub-agent, or when an evaluator is somehow already in
-    /// flight. The continuation runs in a separate spawned task so it does
-    /// not hold `this`'s write lease across the call to `run_turn` (re-entrancy
-    /// safety — `run_turn`'s `running_turn.is_some()` guard is the backstop).
-    async fn maybe_continue_goal(
-        this: &WeakEntity<Self>,
-        model: &AnyLanguageModel,
-        cx: &mut AsyncApp,
-    ) {
-        // Claim the evaluator slot and capture the condition. Bails when there
-        // is no goal, this is a sub-agent, or an evaluator is already running.
-        let claimed = this.update(cx, |this, cx| {
-            if this.depth != 0 {
-                return None;
-            }
-            // Respect the side-call policy — disabled goal evaluation skips
-            // the LLM call and keeps the last-known verdict.
-            if !crate::settings::side_calls().goal_policy().enabled {
-                return None;
-            }
-            // Plan turns do not advance a goal: codex gates `account_tokens` on
-            // `!Plan`, and a Plan turn is read-only research with no execution
-            // to evaluate progress against. Goal and Plan are also mutually
-            // exclusive at entry, so this is a backstop for any stale path.
-            if this.collaboration_mode == ModeKind::Plan {
-                return None;
-            }
-            let g = this.goal.as_mut()?;
-            if this.goal_cancel.is_some() {
-                return None;
-            }
-            let cancel = CancellationToken::new();
-            this.goal_cancel = Some(cancel.clone());
-            g.evaluations += 1;
-            let n = g.evaluations;
-            cx.notify();
-            Some((g.condition.clone(), n, cancel))
-        });
-        let Ok(Some((condition, eval_count, cancel))) = claimed else {
-            return;
-        };
-
-        // Snapshot the message list for the evaluator under a short lease.
-        let (messages, lang) = this
-            .read_with(cx, |this, _| (this.messages.clone(), this.agent_language))
-            .unwrap_or_default();
-
-        let goal_policy = crate::settings::side_calls().goal_policy();
-        let goal_model = crate::settings::side_call_model(&goal_policy, model);
-        let goal_model_name = goal_model.name();
-        let started = std::time::Instant::now();
-        let evaluation = goal::evaluate(&goal_model, &condition, &messages, lang, cancel, cx).await;
-        let elapsed = started.elapsed();
-        let verdict: GoalVerdict = evaluation.verdict;
-
-        // Write the verdict back and decide continue vs. clear vs. abort.
-        let action = this
-            .update(cx, |this, cx| {
-                this.record_side_call("goal", &goal_model_name, evaluation.usage, elapsed, cx);
-                this.goal_cancel = None;
-                // The goal was cleared while the evaluator was in flight (user
-                // hit `/goal clear` or cancel) — drop the result silently.
-                let Some(g) = this.goal.as_mut() else {
-                    return GoalAction::Abort;
-                };
-                g.last_reason = verdict.reason.clone();
-                cx.emit(ThreadEvent::GoalEvaluated {
-                    satisfied: verdict.satisfied,
-                    reason: verdict.reason,
-                    evaluations: eval_count,
-                });
-                // Cap: too many evaluations without satisfaction → clear and
-                // surface the abort in the last reason, rather than looping
-                // forever.
-                if eval_count >= Self::GOAL_MAX_EVALUATIONS {
-                    g.last_reason = format!(
-                        "goal aborted after {} evaluations: {}",
-                        eval_count, g.last_reason
-                    );
-                    return GoalAction::Abort;
-                }
-                if verdict.satisfied {
-                    GoalAction::Satisfied
-                } else {
-                    GoalAction::Continue
-                }
-            })
-            .ok();
-        let Some(action) = action else {
-            return;
-        };
-
-        match action {
-            GoalAction::Abort | GoalAction::Satisfied => {
-                // Satisfied → clear goal (exits mode, emits GoalChanged{false}).
-                // Abort (cap hit or goal cleared mid-eval) → clear too; if the
-                // goal was already cleared this is a no-op.
-                let _ = this.update(cx, |this, cx| this.clear_goal(cx));
-            }
-            GoalAction::Continue => {
-                // Inject the condition as the next turn's directive and start
-                // the turn in a separate task so we do not re-enter `run_turn`
-                // while still inside this callback's `this.update` callers. The
-                // goal may have been cleared in the window between the verdict
-                // decision and this spawned task running — re-check so a late
-                // `/goal clear` does not kick off a spurious continuation turn.
-                let this = this.clone();
-                cx.spawn(async move |cx: &mut AsyncApp| {
-                    let _ = this.update(cx, |this, cx| {
-                        if this.goal.is_none() {
-                            return;
-                        }
-                        let directive = crate::prompt::render(
-                            crate::prompt::PromptTemplate::WrapperGoalContinuation,
-                            this.agent_language,
-                            &crate::prompt::GoalContinuationData {
-                                condition: condition.clone(),
-                            },
-                        )
-                        .expect("goal continuation template render");
-                        this.insert_user_message(directive, cx);
-                        this.run_turn(cx);
-                    });
-                })
-                .detach();
-            }
-        }
     }
 
     /// The index at which a compaction should be inserted right now under
@@ -3031,7 +3293,7 @@ impl Thread {
                     .as_ref()
                     .map(|worktree| worktree.path.display().to_string()),
                 plan_steps,
-                this.goal.as_ref().map(|goal| goal.condition.clone()),
+                this.goal().map(|goal| goal.objective.clone()),
                 this.collaboration_mode.display_name().to_string(),
                 active_tools,
                 crate::compact::active_skills(&this.messages, bound),
@@ -3151,16 +3413,6 @@ impl Thread {
             // response no-ops at the parent instead of traversing to a child
             // whose own pending map is already empty.
             self.pending_child_auth.clear();
-            // Abort any in-flight goal evaluator so a late verdict does not
-            // trigger an auto-continuation after the user cancelled. The goal
-            // itself is left in place — cancel stops the current turn, it does
-            // not discard the condition (the user can `/goal` to inspect or
-            // re-submit). `maybe_continue_goal` is gated on
-            // `cancel.is_cancelled()`, so a cancelled turn never reaches the
-            // evaluator entry point either.
-            if let Some(c) = self.goal_cancel.take() {
-                c.cancel();
-            }
             // Attribute partial usage from the cancelled turn and reset the
             // per-request counter so the next turn's delta starts from zero.
             self.record_main_call(cx);
@@ -4658,6 +4910,7 @@ impl Thread {
             }
             Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) => {
                 self.accumulate_token_usage(usage);
+                self.enforce_goal_budget_during_turn(cx);
                 cx.emit(ThreadEvent::TokenUsageUpdated(
                     self.cumulative_token_usage(),
                 ));
@@ -5120,7 +5373,6 @@ impl Thread {
                 } else {
                     None
                 },
-                goal: self.goal.is_some(),
                 capabilities,
             },
         )
@@ -5840,10 +6092,12 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{model_facing_content, tool_title};
+    use crate::db::GoalActor;
+    use crate::goal::GoalStatus;
     use crate::ModeKind;
     use crate::language_model::{
         AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
-        LanguageModelToolResult, MessageContent,
+        LanguageModelToolResult, LanguageModelToolUse, MessageContent, StopReason, TokenUsage,
     };
     use crate::message::Message;
     use serde_json::json;
@@ -6198,9 +6452,9 @@ mod tests {
         cx.update(|cx| {
             let thread = thread.read(cx);
             assert_eq!(thread.collaboration_mode, ModeKind::Default);
-            assert_eq!(
-                thread.goal.as_ref().map(|goal| goal.condition.as_str()),
-                Some("all checks pass")
+            assert!(
+                thread.goal().is_none(),
+                "the database, not a compaction capsule, is authoritative for Goal restore"
             );
         });
         assert_eq!(
@@ -7091,6 +7345,155 @@ mod tests {
                 Ok(futures::stream::iter(events).boxed())
             })
         }
+    }
+
+    /// Two-round Goal provider: the first response explicitly completes the
+    /// Goal through `UpdateGoal`, and the second emits the final answer. This
+    /// exercises the real tool loop and final-turn accounting without an
+    /// evaluator request.
+    struct GoalCompleteMockModel {
+        calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl crate::language_model::LanguageModel for GoalCompleteMockModel {
+        fn id(&self) -> String {
+            "test/goal-complete".into()
+        }
+        fn name(&self) -> String {
+            self.id()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            use std::sync::atomic::Ordering;
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                use futures::StreamExt as _;
+                let events = if call == 0 {
+                    vec![
+                        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                            id: "goal-complete-1".into(),
+                            name: Arc::from(crate::tools::UPDATE_GOAL),
+                            raw_input: r#"{"status":"complete"}"#.into(),
+                            input: serde_json::json!({"status": "complete"}),
+                            is_input_complete: true,
+                            thought_signature: None,
+                        }),
+                        LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                            input_tokens: 10,
+                            output_tokens: 2,
+                            cache_creation_input_tokens: 3,
+                            cache_read_input_tokens: 100,
+                        }),
+                        LanguageModelCompletionEvent::Stop(StopReason::ToolUse),
+                    ]
+                } else {
+                    vec![
+                        LanguageModelCompletionEvent::Text("Goal complete.".into()),
+                        LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                            input_tokens: 4,
+                            output_tokens: 1,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 50,
+                        }),
+                        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+                    ]
+                };
+                Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+            })
+        }
+    }
+
+    #[test]
+    fn goal_runs_through_explicit_complete_and_accounts_final_response() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open memory database"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(GoalCompleteMockModel {
+            calls: calls.clone(),
+        });
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                "goal-complete-e2e",
+                "/tmp",
+                vec![Message::user("finish the objective".into())],
+            );
+            rec.title = Some("Goal e2e".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .create_goal(
+                        "finish the objective".into(),
+                        Some(100),
+                        GoalActor::User,
+                        cx,
+                    )
+                    .unwrap();
+                thread.run_turn(cx);
+            });
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if cx.update(|cx| thread.read(cx).is_running()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "Goal turn did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            break;
+        }
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let goal = thread.read(cx).goal().cloned().unwrap();
+            assert_eq!(goal.status, GoalStatus::Complete);
+            assert_eq!(goal.tokens_used, 20);
+            assert_eq!(goal.remaining_tokens(), Some(80));
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     /// A mock model whose only configurable surface is the two capability flags,
