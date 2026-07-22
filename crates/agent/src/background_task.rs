@@ -113,6 +113,9 @@ pub enum TaskEventKind {
 pub struct TaskEvent {
     pub task_id: TaskId,
     pub kind: TaskKind,
+    /// Goal that owned the tool call which created this task. Used to fence
+    /// late output from a replaced or cleared Goal.
+    pub owner_goal_id: Option<String>,
     pub event: TaskEventKind,
     /// Monotonic per-thread sequence number, assigned by the mailbox.
     pub thread_seq: u64,
@@ -178,6 +181,7 @@ pub fn format_event_for_model(event: &TaskEvent) -> String {
 struct TaskState {
     kind: TaskKind,
     owner_thread_id: String,
+    owner_goal_id: Option<String>,
     description: String,
     command: Option<String>,
     ws_url: Option<String>,
@@ -215,12 +219,14 @@ impl TaskState {
     fn new(
         kind: TaskKind,
         owner_thread_id: String,
+        owner_goal_id: Option<String>,
         description: String,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             kind,
             owner_thread_id,
+            owner_goal_id,
             description,
             command: None,
             ws_url: None,
@@ -255,6 +261,7 @@ impl BackgroundTask {
     fn new(
         kind: TaskKind,
         owner_thread_id: String,
+        owner_goal_id: Option<String>,
         description: String,
         cancel: CancellationToken,
     ) -> Self {
@@ -262,6 +269,7 @@ impl BackgroundTask {
             state: Arc::new(std::sync::Mutex::new(TaskState::new(
                 kind,
                 owner_thread_id,
+                owner_goal_id,
                 description,
                 cancel,
             ))),
@@ -340,6 +348,14 @@ impl BackgroundTask {
             .clone()
     }
 
+    pub fn owner_goal_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .expect("task state poisoned")
+            .owner_goal_id
+            .clone()
+    }
+
     pub fn exit_code(&self) -> Option<i32> {
         self.state.lock().expect("task state poisoned").exit_code
     }
@@ -395,6 +411,7 @@ impl BackgroundTask {
         let event = TaskEvent {
             task_id: task_id.clone(),
             kind,
+            owner_goal_id: s.owner_goal_id.clone(),
             event: TaskEventKind::Output(text),
             thread_seq: 0, // assigned by mailbox
             task_seq,
@@ -428,6 +445,7 @@ impl BackgroundTask {
         let event = TaskEvent {
             task_id: task_id.clone(),
             kind: s.kind,
+            owner_goal_id: s.owner_goal_id.clone(),
             event: TaskEventKind::StateChanged,
             thread_seq: 0,
             task_seq: s.task_seq,
@@ -454,12 +472,14 @@ impl BackgroundTask {
         let kind = s.kind;
         let exit_code = s.exit_code;
         let failure_summary = s.failure_summary.clone();
+        let owner_goal_id = s.owner_goal_id.clone();
         let thread_id = s.owner_thread_id.clone();
         drop(s);
 
         let event = TaskEvent {
             task_id: task_id.clone(),
             kind,
+            owner_goal_id,
             event: TaskEventKind::Terminal {
                 status,
                 exit_code,
@@ -848,10 +868,22 @@ pub fn register(
     description: String,
     cancel: CancellationToken,
 ) -> (TaskId, Arc<BackgroundTask>) {
+    register_for_goal(kind, owner_thread_id, description, cancel, None)
+}
+
+/// Register a background task with an optional Goal ownership fence.
+pub fn register_for_goal(
+    kind: TaskKind,
+    owner_thread_id: String,
+    description: String,
+    cancel: CancellationToken,
+    owner_goal_id: Option<String>,
+) -> (TaskId, Arc<BackgroundTask>) {
     let id = next_id(&kind);
     let task = Arc::new(BackgroundTask::new(
         kind,
         owner_thread_id,
+        owner_goal_id,
         description,
         cancel,
     ));
@@ -1052,6 +1084,39 @@ pub fn thread_has_running_tasks(thread_id: &str) -> bool {
     })
 }
 
+/// Whether a Goal currently owns at least one non-terminal background task.
+pub fn goal_has_running_tasks(thread_id: &str, goal_id: &str) -> bool {
+    let reg = registry().lock().expect("registry poisoned");
+    reg.tasks.values().any(|task| {
+        let s = task.state.lock().expect("task state poisoned");
+        s.owner_thread_id == thread_id
+            && s.owner_goal_id.as_deref() == Some(goal_id)
+            && !s.status.is_terminal()
+    })
+}
+
+/// Stop all non-terminal background tasks owned by a specific Goal.
+pub async fn cancel_all_for_goal(thread_id: &str, goal_id: &str) {
+    let ids: Vec<String> = {
+        let reg = registry().lock().expect("registry poisoned");
+        reg.tasks
+            .iter()
+            .filter(|(_, task)| {
+                let s = task.state.lock().expect("task state poisoned");
+                s.owner_thread_id == thread_id
+                    && s.owner_goal_id.as_deref() == Some(goal_id)
+                    && !s.status.is_terminal()
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    futures::future::join_all(
+        ids.iter()
+            .map(|id| stop_with_status(id, TaskStatus::Stopped)),
+    )
+    .await;
+}
+
 /// Shutdown all running tasks across all threads. Called at app exit.
 pub async fn shutdown_all() {
     let ids: Vec<String> = {
@@ -1122,6 +1187,39 @@ mod tests {
         assert!(task.status().is_terminal());
         stop(&id.0).await.expect("double stop should succeed");
         remove(&id);
+    }
+
+    #[tokio::test]
+    async fn goal_owned_tasks_are_fenced_and_cancelled_by_goal() {
+        let thread_id = "thread-goal-owned";
+        let (old_id, old_task) = register_for_goal(
+            TaskKind::MonitorCommand,
+            thread_id.into(),
+            "old goal task".into(),
+            CancellationToken::new(),
+            Some("goal-old".into()),
+        );
+        let (new_id, new_task) = register_for_goal(
+            TaskKind::MonitorCommand,
+            thread_id.into(),
+            "new goal task".into(),
+            CancellationToken::new(),
+            Some("goal-new".into()),
+        );
+
+        let events = drain_thread_events(thread_id);
+        assert!(events.iter().any(|event| {
+            event.task_id == old_id && event.owner_goal_id.as_deref() == Some("goal-old")
+        }));
+        assert!(goal_has_running_tasks(thread_id, "goal-old"));
+        cancel_all_for_goal(thread_id, "goal-old").await;
+        assert_eq!(old_task.status(), TaskStatus::Stopped);
+        assert!(new_task.is_running());
+
+        stop(&new_id.0).await.unwrap();
+        remove(&old_id);
+        remove(&new_id);
+        remove_thread_mailbox(thread_id);
     }
 
     #[tokio::test]

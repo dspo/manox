@@ -334,14 +334,14 @@ fn build_messages(trace: &ReplayTrace) -> Vec<Message> {
 }
 
 fn message(role: Role, content: Vec<MessageContent>) -> Message {
-    Message {
-        id: format!("replay-{}", uuid::Uuid::new_v4()),
-        timestamp: 0,
-        parent_id: None,
-        role,
-        content,
-        ui: None,
-    }
+    let mut message = match role {
+        Role::User => Message::user_with_content(content),
+        Role::Assistant => Message::assistant(content),
+        Role::System => unreachable!("replay history never stores system-role messages"),
+    };
+    message.id = format!("replay-{}", uuid::Uuid::new_v4());
+    message.timestamp = 0;
+    message
 }
 
 fn content_bytes(content: &MessageContent) -> usize {

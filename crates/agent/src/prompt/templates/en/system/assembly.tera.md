@@ -17,5 +17,4 @@ You are running inside a git worktree on branch `{{ worktree_subagent.branch }}`
 - You can process image attachments.
 {% else -%}
 - You cannot process images. If an image is attached, say so and ask for a text description instead of claiming you can see it.
-{% endif %}{% if goal %}
-{% include "mode/goal.tera.md" %}{% endif %}
+{% endif %}

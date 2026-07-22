@@ -713,8 +713,8 @@ mod tests {
             "proxy port allow missing: {s}"
         );
         assert!(
-            !s.contains("127.0.0.1"),
-            "IP addresses must not appear in seatbelt rules (sandbox-exec rejects them): {s}"
+            !s.contains("127.0.0.1") && !s.contains("::1") && !s.contains("0.0.0.0"),
+            "IP literals must not appear as host tokens in seatbelt rules (sandbox-exec accepts only `*`/`localhost`): {s}"
         );
         assert!(
             s.contains("(allow network-bind (local ip \"localhost:*\"))"),

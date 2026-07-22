@@ -32,6 +32,9 @@ pub use permission::{PermissionCache, PermissionDecision, ToolAuthorizationRespo
 /// `&dyn ToolContext` never crosses an await boundary.
 pub trait ToolContext {
     fn thread_id(&self) -> &str;
+    /// Active Goal that owns this tool call. Absent for Plan turns,
+    /// sub-agents, and ordinary turns outside an Active Goal.
+    fn goal_id(&self) -> Option<&str>;
     fn anchor_message_id(&self) -> Option<&str>;
     fn cwd(&self) -> &Path;
     fn project(&self) -> Option<&PathBuf>;
@@ -66,6 +69,7 @@ pub trait ToolContext {
 /// `Task`.
 pub struct ToolContextSnapshot {
     thread_id: String,
+    goal_id: Option<String>,
     cwd: PathBuf,
     project: Option<PathBuf>,
     model: Option<AnyLanguageModel>,
@@ -86,6 +90,14 @@ impl ToolContextSnapshot {
     pub fn from_thread(t: &crate::thread::Thread) -> Self {
         Self {
             thread_id: t.id.0.clone(),
+            goal_id: t
+                .goal()
+                .filter(|goal| {
+                    goal.status == crate::goal::GoalStatus::Active
+                        && t.collaboration_mode() != crate::ModeKind::Plan
+                        && t.depth() == 0
+                })
+                .map(|goal| goal.goal_id.clone()),
             cwd: t.cwd().to_path_buf(),
             project: t.project().cloned(),
             model: t.model().cloned(),
@@ -105,6 +117,9 @@ impl ToolContextSnapshot {
 impl ToolContext for ToolContextSnapshot {
     fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+    fn goal_id(&self) -> Option<&str> {
+        self.goal_id.as_deref()
     }
     fn anchor_message_id(&self) -> Option<&str> {
         self.anchor_message_id.as_deref()

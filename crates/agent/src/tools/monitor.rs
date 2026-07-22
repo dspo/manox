@@ -212,6 +212,7 @@ impl AgentTool for MonitorTool {
         };
         let timeout = Duration::from_millis(internal_timeout_ms);
         let thread_id = ctx.thread_id().to_string();
+        let goal_id = ctx.goal_id().map(str::to_owned);
         let anchor_message_id = ctx.anchor_message_id().map(str::to_owned);
         let description = parsed.description.clone();
         let proxy_port = ctx.network_proxy_port();
@@ -224,11 +225,12 @@ impl AgentTool for MonitorTool {
         if has_command {
             let command = parsed.command.expect("has_command");
             let task_cancel = CancellationToken::new();
-            let (task_id, task) = background_task::register(
+            let (task_id, task) = background_task::register_for_goal(
                 TaskKind::MonitorCommand,
                 thread_id,
                 description.clone(),
                 task_cancel.clone(),
+                goal_id.clone(),
             );
             task.set_command(command.clone());
             if let Some(anchor) = anchor_message_id.clone() {
@@ -283,11 +285,12 @@ impl AgentTool for MonitorTool {
         if has_ws {
             let ws = parsed.ws.expect("has_ws");
             let task_cancel = CancellationToken::new();
-            let (task_id, task) = background_task::register(
+            let (task_id, task) = background_task::register_for_goal(
                 TaskKind::MonitorWebSocket,
                 thread_id,
                 description.clone(),
                 task_cancel.clone(),
+                goal_id,
             );
             task.set_ws_url(ws.url.clone());
             if let Some(anchor) = anchor_message_id {

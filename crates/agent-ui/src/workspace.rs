@@ -937,11 +937,6 @@ impl Workspace {
                     }
                     cx.notify();
                 }
-                ThreadEvent::GoalEvaluated { .. } => {
-                    // Refresh the status popover's last-reason / evaluations
-                    // rows; no conversation item is produced.
-                    cx.notify();
-                }
                 ThreadEvent::SteerInjected { message_id } => {
                     // The running turn drained the steer. Confirm the bubble
                     // that was inserted optimistically when the user clicked;
@@ -4730,9 +4725,20 @@ impl Workspace {
         let accent = theme.accent;
         let muted = theme.muted_foreground;
         let fg = theme.foreground;
-        let elapsed = format_elapsed(g.started_at.elapsed());
-        let label: SharedString =
-            format!("◎ {} · {}", i18n::t("workspace-chip-goal-active"), elapsed).into();
+        let status_key = match g.status {
+            agent::goal::GoalStatus::Active => "goal-status-active",
+            agent::goal::GoalStatus::Paused => "goal-status-paused",
+            agent::goal::GoalStatus::Blocked => "goal-status-blocked",
+            agent::goal::GoalStatus::BudgetLimited => "goal-status-budget-limited",
+            agent::goal::GoalStatus::Complete => "goal-status-complete",
+        };
+        let elapsed = format_elapsed(std::time::Duration::from_secs(
+            self.thread
+                .read(cx)
+                .goal_elapsed_seconds()
+                .unwrap_or_default(),
+        ));
+        let label: SharedString = format!("◎ {} · {}", i18n::t(status_key), elapsed).into();
         let open = self.goal_popover_open;
 
         let trigger = h_flex()
@@ -4765,16 +4771,33 @@ impl Workspace {
             return Some(trigger.into_any_element());
         }
 
-        // Status popover: condition / elapsed / evaluations / last reason /
-        // Clear. Mirrors the access chip's `popover_style` dropdown pattern.
-        let condition = g.condition.clone();
-        let evaluations = g.evaluations;
-        let last_reason = g.last_reason.clone();
-        let condition_label = i18n::t("goal-popover-condition");
+        let objective = g.objective.clone();
+        let status = i18n::t(status_key);
+        let reason = g.status_reason.clone().unwrap_or_else(|| "—".into());
+        let tokens = g.tokens_used.to_string();
+        let budget = g
+            .token_budget
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "∞".into());
+        let remaining = g
+            .remaining_tokens()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "∞".into());
+        let goal_status = g.status;
+        let objective_label = i18n::t("goal-popover-objective");
+        let status_label = i18n::t("goal-popover-status");
         let elapsed_label = i18n::t("goal-popover-elapsed");
-        let evals_label = i18n::t("goal-popover-evaluations");
-        let reason_label = i18n::t("goal-popover-last-reason");
+        let reason_label = i18n::t("goal-popover-reason");
+        let tokens_label = i18n::t("goal-popover-tokens");
+        let budget_label = i18n::t("goal-popover-budget");
+        let remaining_label = i18n::t("goal-popover-remaining");
         let clear_label = i18n::t("goal-popover-clear");
+        let pause_label = i18n::t("goal-popover-pause");
+        let resume_label = i18n::t("goal-popover-resume");
+        let edit_label = i18n::t("goal-popover-edit");
+        let edit_budget_label = i18n::t("goal-popover-edit-budget");
+        let replace_label = i18n::t("goal-popover-replace");
+        let new_label = i18n::t("goal-popover-new");
         let title_label = i18n::t("goal-popover-title");
         let popover = v_flex()
             .w_full()
@@ -4786,35 +4809,130 @@ impl Workspace {
                     .text_color(accent)
                     .child(format!("◎ {title_label}")),
             )
-            .child(goal_popover_row(&condition_label, &condition, fg, muted))
+            .child(goal_popover_row(&objective_label, &objective, fg, muted))
+            .child(goal_popover_row(&status_label, &status, fg, muted))
             .child(goal_popover_row(&elapsed_label, &elapsed, fg, muted))
-            .child(goal_popover_row(
-                &evals_label,
-                &evaluations.to_string(),
-                fg,
-                muted,
-            ))
-            .child(goal_popover_row(
-                &reason_label,
-                if last_reason.is_empty() {
-                    "—"
-                } else {
-                    &last_reason
-                },
-                fg,
-                muted,
-            ))
+            .child(goal_popover_row(&reason_label, &reason, fg, muted))
+            .child(goal_popover_row(&tokens_label, &tokens, fg, muted))
+            .child(goal_popover_row(&budget_label, &budget, fg, muted))
+            .child(goal_popover_row(&remaining_label, &remaining, fg, muted))
             .child(
-                h_flex().justify_end().child(
-                    Button::new("goal-clear")
-                        .small()
-                        .label(clear_label)
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.thread.update(cx, |t, cx| t.clear_goal(cx));
-                            this.goal_popover_open = false;
-                            cx.notify();
-                        })),
-                ),
+                h_flex()
+                    .justify_end()
+                    .gap_1()
+                    .when(goal_status == agent::goal::GoalStatus::Active, |row| {
+                        row.child(
+                            Button::new("goal-pause")
+                                .small()
+                                .label(pause_label)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    let _ = this.thread.update(cx, |t, cx| {
+                                        t.set_goal_status(
+                                            agent::goal::GoalStatus::Paused,
+                                            Some("paused by user".into()),
+                                            agent::db::GoalActor::User,
+                                            cx,
+                                        )
+                                    });
+                                })),
+                        )
+                    })
+                    .when(
+                        matches!(
+                            goal_status,
+                            agent::goal::GoalStatus::Paused | agent::goal::GoalStatus::Blocked
+                        ),
+                        |row| {
+                            row.child(
+                                Button::new("goal-resume")
+                                    .small()
+                                    .label(resume_label)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        let _ = this.thread.update(cx, |t, cx| {
+                                            t.set_goal_status(
+                                                agent::goal::GoalStatus::Active,
+                                                None,
+                                                agent::db::GoalActor::User,
+                                                cx,
+                                            )
+                                        });
+                                    })),
+                            )
+                        },
+                    )
+                    .when(
+                        matches!(
+                            goal_status,
+                            agent::goal::GoalStatus::Active
+                                | agent::goal::GoalStatus::Paused
+                                | agent::goal::GoalStatus::Blocked
+                        ),
+                        |row| {
+                            row.child(Button::new("goal-edit").small().label(edit_label).on_click(
+                                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.goal_popover_open = false;
+                                    this.begin_goal_edit(window, cx);
+                                }),
+                            ))
+                        },
+                    )
+                    .when(
+                        goal_status == agent::goal::GoalStatus::BudgetLimited,
+                        |row| {
+                            row.child(
+                                Button::new("goal-edit-budget")
+                                    .small()
+                                    .label(edit_budget_label)
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.goal_popover_open = false;
+                                            this.begin_goal_budget_edit(window, cx);
+                                        },
+                                    )),
+                            )
+                        },
+                    )
+                    .when(
+                        matches!(
+                            goal_status,
+                            agent::goal::GoalStatus::Paused
+                                | agent::goal::GoalStatus::Blocked
+                                | agent::goal::GoalStatus::BudgetLimited
+                        ),
+                        |row| {
+                            row.child(
+                                Button::new("goal-replace")
+                                    .small()
+                                    .label(replace_label)
+                                    .on_click(cx.listener(
+                                        move |this, _: &ClickEvent, window, cx| {
+                                            this.goal_popover_open = false;
+                                            this.begin_goal_replace(window, cx);
+                                        },
+                                    )),
+                            )
+                        },
+                    )
+                    .when(goal_status == agent::goal::GoalStatus::Complete, |row| {
+                        row.child(Button::new("goal-new").small().label(new_label).on_click(
+                            cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.goal_popover_open = false;
+                                this.begin_goal_new(window, cx);
+                            }),
+                        ))
+                    })
+                    .child(
+                        Button::new("goal-clear")
+                            .small()
+                            .label(clear_label)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                let _ = this.thread.update(cx, |t, cx| {
+                                    t.clear_goal(agent::db::GoalActor::User, cx)
+                                });
+                                this.goal_popover_open = false;
+                                cx.notify();
+                            })),
+                    ),
             );
 
         Some(
@@ -4846,6 +4964,64 @@ impl Workspace {
     /// Open the goal status popover (from the bare `/goal` command).
     pub fn open_goal_popover(&mut self, cx: &mut Context<Self>) {
         self.goal_popover_open = true;
+        cx.notify();
+    }
+
+    /// Prefill the composer with the durable objective so `/goal edit` is an
+    /// explicit, inspectable update rather than an ephemeral popover field.
+    pub fn begin_goal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(objective) = self
+            .thread
+            .read(cx)
+            .goal()
+            .map(|goal| goal.objective.clone())
+        else {
+            self.goal_popover_open = true;
+            cx.notify();
+            return;
+        };
+        self.input_state.update(cx, |state, cx| {
+            state.set_value(format!("/goal edit {objective}"), window, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn begin_goal_budget_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self
+            .thread
+            .read(cx)
+            .goal()
+            .and_then(|goal| goal.token_budget)
+            .map(|budget| budget.to_string())
+            .unwrap_or_else(|| "none".into());
+        self.input_state.update(cx, |state, cx| {
+            state.set_value(format!("/goal budget {value}"), window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Selecting Replace only prepares an explicit confirmation command; the
+    /// persisted CAS replacement happens when the user submits it.
+    pub fn begin_goal_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_goal_replace_with_objective("", window, cx);
+    }
+
+    pub fn begin_goal_replace_with_objective(
+        &mut self,
+        objective: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input_state.update(cx, |state, cx| {
+            state.set_value(format!("/goal replace {objective}"), window, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn begin_goal_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input_state.update(cx, |state, cx| {
+            state.set_value("/goal ".to_string(), window, cx);
+        });
         cx.notify();
     }
 

@@ -5,11 +5,11 @@
 //! refresh its list. `save_thread` persists asynchronously on turn end or user
 //! message submit and then refreshes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, WeakEntity};
 
 use crate::db::{ThreadSummary, ThreadsDatabase, default_db_path};
 use crate::language_model::AnyLanguageModel;
@@ -38,6 +38,12 @@ pub struct ThreadStore {
     /// Thread ids currently running a turn. Multiple threads can run concurrently;
     /// the sidebar shows a running indicator on every row whose id is in this set.
     running: HashSet<String>,
+    /// Canonical entity lookup without retaining idle threads indefinitely.
+    live_threads: HashMap<String, WeakEntity<Thread>>,
+    /// Strong ownership for Active Goal threads. Every transition away from
+    /// Active removes the pin, which is the lifecycle invariant that permits
+    /// background work without leaking all opened threads.
+    goal_pins: HashMap<String, Entity<Thread>>,
 }
 
 impl EventEmitter<ThreadStoreEvent> for ThreadStore {}
@@ -84,6 +90,8 @@ pub fn init(cx: &mut App) {
         summaries,
         known_projects,
         running: HashSet::new(),
+        live_threads: HashMap::new(),
+        goal_pins: HashMap::new(),
     });
     let _ = GLOBAL.set(entity);
 }
@@ -101,6 +109,20 @@ pub fn global() -> Entity<ThreadStore> {
 }
 
 impl ThreadStore {
+    pub(crate) fn database(&self) -> Arc<ThreadsDatabase> {
+        self.db.clone()
+    }
+
+    /// Keep exactly the Active Goal threads alive while still canonicalizing
+    /// every live thread through a weak lookup.
+    pub(crate) fn sync_goal_pin(&mut self, id: &str, thread: Entity<Thread>, active: bool) {
+        self.live_threads.insert(id.to_string(), thread.downgrade());
+        if active {
+            self.goal_pins.insert(id.to_string(), thread);
+        } else {
+            self.goal_pins.remove(id);
+        }
+    }
     pub fn summaries(&self) -> &[ThreadSummary] {
         &self.summaries
     }
@@ -296,7 +318,10 @@ impl ThreadStore {
     }
 
     /// Load and restore a `Thread` by id (model resolved from the registry by id; `None` if not found).
-    pub fn load_thread(&self, id: &str, cx: &mut App) -> Option<Entity<Thread>> {
+    pub fn load_thread(&mut self, id: &str, cx: &mut App) -> Option<Entity<Thread>> {
+        if let Some(entity) = self.live_threads.get(id).and_then(WeakEntity::upgrade) {
+            return Some(entity);
+        }
         let rec = match self.db.load(id) {
             Ok(Some(r)) => r,
             Ok(None) => {
@@ -309,7 +334,14 @@ impl ThreadStore {
             }
         };
         let model: Option<AnyLanguageModel> = registry::global().get_model(&rec.model_id);
-        let entity = Thread::restore(rec, model, cx);
+        let goal = match self.db.restore_goal(id) {
+            Ok(goal) => goal,
+            Err(error) => {
+                tracing::warn!(thread_id = id, error = ?error, "load_thread: Goal restore failed");
+                return None;
+            }
+        };
+        let entity = Thread::restore_with_goal(rec, model, goal, cx);
         // Backfill the UI-note cache from its own append-only table. Best-effort:
         // a read failure leaves the thread without historical Error/Notice
         // cards but otherwise intact. This is the only place `ui_notes` is
@@ -320,12 +352,16 @@ impl ThreadStore {
                 tracing::warn!(thread_id = id, error = ?e, "load_thread: ui_notes load failed")
             }
         }
+        self.live_threads.insert(id.to_string(), entity.downgrade());
         Some(entity)
     }
 
     /// Create a fresh empty `Thread` (used by the sidebar "new conversation" button).
-    pub fn new_thread(&self, cwd: PathBuf, cx: &mut App) -> Entity<Thread> {
-        Thread::new(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx)
+    pub fn new_thread(&mut self, cwd: PathBuf, cx: &mut App) -> Entity<Thread> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let entity = Thread::new(ThreadId(id.clone()), cwd, cx);
+        self.live_threads.insert(id, entity.downgrade());
+        entity
     }
 
     /// Archive (or unarchive) a thread. Refreshes so it leaves/enters the active list.
@@ -498,6 +534,8 @@ pub fn init_for_test(db: Arc<ThreadsDatabase>, cx: &mut App) {
         db,
         summaries: Vec::new(),
         known_projects: Vec::new(),
+        live_threads: HashMap::new(),
+        goal_pins: HashMap::new(),
         running: HashSet::new(),
     });
     *TEST_OVERRIDE.lock().unwrap() = Some(entity);

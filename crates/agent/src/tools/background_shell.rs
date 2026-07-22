@@ -96,6 +96,7 @@ impl PollResult {
 pub async fn spawn(
     command: String,
     thread_id: &str,
+    goal_id: Option<String>,
     anchor_message_id: Option<String>,
     cwd: &std::path::Path,
     timeout: Option<Duration>,
@@ -129,11 +130,12 @@ pub async fn spawn(
     }
 
     let bg_cancel = tokio_util::sync::CancellationToken::new();
-    let (task_id, bg_task) = crate::background_task::register(
+    let (task_id, bg_task) = crate::background_task::register_for_goal(
         crate::background_task::TaskKind::BackgroundBash,
         thread_id.into(),
         command.clone(),
         bg_cancel.clone(),
+        goal_id,
     );
     if let Some(anchor) = anchor_message_id {
         bg_task.set_anchor_message_id(anchor);
@@ -360,6 +362,7 @@ mod tests {
             "echo hello; sleep 0.2; echo world".to_string(),
             "test-thread",
             None,
+            None,
             &cwd,
             None,
             None,
@@ -397,6 +400,7 @@ mod tests {
             "printf a; sleep 0.1; printf b; sleep 0.1; printf c".to_string(),
             "test-thread",
             None,
+            None,
             &cwd,
             None,
             None,
@@ -428,6 +432,7 @@ mod tests {
         let id = spawn(
             "printf tail; exit 7".to_string(),
             "test-thread-failed",
+            None,
             None,
             &cwd,
             None,
@@ -462,6 +467,7 @@ mod tests {
         let id = spawn(
             "sleep 30".to_string(),
             "test-thread-stop-shell",
+            None,
             None,
             &cwd,
             None,

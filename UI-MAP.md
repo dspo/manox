@@ -240,7 +240,7 @@ Thread title text, clickable → opens [TitleMenu](#titlemenu).
 
 #### TitleBarGoalChip
 
-Goal status chip (visible when thread has a goal), click → [GoalPopover](#goalpopover).
+Persistent Goal status chip (visible for Active, Paused, Blocked, BudgetLimited, and Complete), click → [GoalPopover](#goalpopover). The elapsed label uses active Goal time and therefore does not advance in Plan or terminal states.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -548,7 +548,7 @@ Trigger: [TitleBarMenuButton](#titlebarmenubutton). Pin, archive, copy, schedule
 
 #### GoalPopover
 
-Trigger: [TitleBarGoalChip](#titlebargoalchip). Goal status, elapsed time ticker, evaluation details.
+Trigger: [TitleBarGoalChip](#titlebargoalchip) or bare `/goal`. Shows the authoritative objective, lifecycle status/reason, active elapsed time, tokens used, optional budget, and remaining tokens. Actions follow the persisted state: Active can Pause/Edit/Clear; Paused and Blocked can Resume/Edit/Replace/Clear; BudgetLimited can Edit budget/Replace/Clear and resumes only after budget is raised or removed; Complete can start a New Goal or Clear. Objective edit prefills `/goal edit <objective>`, budget edit prefills `/goal budget <tokens|none>`, and Replace prefills the explicit confirmation command `/goal replace <objective>` in [InputField](#inputfield). Edit keeps the Goal id and accounting; Replace creates a fresh id and resets accounting. Internal Goal continuation/objective-update messages remain model-visible and persisted but never produce [UserMessage](#usermessage) bubbles.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -1086,5 +1086,3 @@ Values selectable in [EffortMenu](#effortmenu).
 
 #### High
 #### Max
-
-
