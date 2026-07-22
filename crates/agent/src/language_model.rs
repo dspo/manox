@@ -220,6 +220,48 @@ impl ReasoningEffort {
     }
 }
 
+/// Per-request effort sent on the provider wire. Main-agent settings expose
+/// only [`ReasoningEffort::High`] and [`ReasoningEffort::Max`], while bounded
+/// side calls intentionally use the cheaper `low`/`medium` levels from #299.
+/// Keeping this wire type separate prevents side-call routing from widening
+/// the user-facing effort selector again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestReasoningEffort {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl RequestReasoningEffort {
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn openai_wire_value(self, official_openai: bool) -> &'static str {
+        if official_openai && matches!(self, Self::Max) {
+            "high"
+        } else {
+            self.wire_value()
+        }
+    }
+}
+
+impl From<ReasoningEffort> for RequestReasoningEffort {
+    fn from(value: ReasoningEffort) -> Self {
+        match value {
+            ReasoningEffort::High => Self::High,
+            ReasoningEffort::Max => Self::Max,
+        }
+    }
+}
+
 /// A single completion request.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LanguageModelRequest {
@@ -242,7 +284,13 @@ pub struct LanguageModelRequest {
     #[serde(default)]
     pub thinking_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub reasoning_effort: Option<RequestReasoningEffort>,
+    /// Per-request output token cap. `None` means use the model's configured
+    /// default. When set, the provider takes `min(request, model_max)`. Side
+    /// calls (title, goal, approval, compaction) use this to bound their
+    /// responses; the main turn loop leaves it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 /// A streaming completion event.

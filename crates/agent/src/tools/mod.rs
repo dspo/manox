@@ -14,6 +14,7 @@ pub mod ask_user;
 pub mod background_shell;
 pub mod bash;
 pub mod bash_output;
+pub mod code;
 pub mod descriptions;
 pub mod edit_file;
 pub mod file_lock;
@@ -26,6 +27,7 @@ pub mod read_file;
 pub mod self_info;
 pub mod skill;
 pub mod task_stop;
+pub mod tool_search;
 pub mod truncate;
 pub mod update_plan;
 pub mod web_explore;
@@ -56,6 +58,7 @@ pub const AGENT: &str = "Agent";
 pub const ASK_USER_QUESTION: &str = "AskUserQuestion";
 pub const BASH: &str = "Bash";
 pub const BASH_OUTPUT: &str = "BashOutput";
+pub const CODE: &str = "Code";
 pub const EDIT: &str = "Edit";
 pub const GLOB: &str = "Glob";
 pub const GREP: &str = "Grep";
@@ -64,6 +67,7 @@ pub const MONITOR: &str = "Monitor";
 pub const READ: &str = "Read";
 pub const SELF_INFO: &str = "SelfInfo";
 pub const SKILL: &str = "Skill";
+pub const TOOL_SEARCH: &str = "ToolSearch";
 pub const UPDATE_PLAN: &str = "UpdatePlan";
 pub const WEB_FETCH: &str = "WebFetch";
 pub const ENTER_WORKTREE: &str = "EnterWorktree";
@@ -399,6 +403,13 @@ pub(crate) fn base_tools_with_policy(
         Arc::new(task_stop::TaskStopTool) as AnyAgentTool,
     ];
 
+    if matches!(
+        crate::settings::context_optimization().code_mode,
+        crate::settings::CodeModeToggle::Hybrid
+    ) {
+        tools.push(Arc::new(code::CodeTool) as AnyAgentTool);
+    }
+
     // Status is always available so a broken shim or missing installation is
     // actionable. The remaining code-intel tools are advertised only when at
     // least one server passed its viability probe.
@@ -491,6 +502,15 @@ pub fn main_registry_with_policy(
     }
     // LSP tools already arrive through `base_tools_with_policy`, including for
     // the main agent. Do not register a duplicate set here.
+    // Shadow must not alter the model-visible schema. Register ToolSearch only
+    // when discovery is On; the tool snapshots this exact registry as its
+    // bilingual search catalog.
+    if matches!(
+        crate::settings::context_optimization().tool_discovery,
+        crate::settings::Toggle::On
+    ) {
+        tool_search::register(&mut reg);
+    }
     reg
 }
 

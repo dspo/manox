@@ -109,6 +109,11 @@ pub(crate) struct ContextRail {
     /// cells whose model disappeared (e.g. thread reset) are pruned, keeping
     /// the map bounded by the number of live models.
     pub(crate) env_counter_state: HashMap<String, (u64, u64)>,
+    /// Last request's model-facing projection breakdown and optimization
+    /// savings, including estimates collected by shadow-mode features.
+    pub(crate) optimization: Option<agent::ContextOptimizationMetrics>,
+    pub(crate) side_calls: Vec<agent::SideCallMetric>,
+    pub(crate) main_call: Option<agent::SideCallMetric>,
     /// Latest git change stats for the thread's cwd. Refreshed (debounced) by
     /// `Workspace` on thread attach, terminal stop, and enter/exit worktree.
     pub(crate) git_change_stats: Option<GitChangeStats>,
@@ -138,6 +143,9 @@ impl ContextRail {
             weak_workspace,
             agents: Vec::new(),
             env_counter_state: HashMap::new(),
+            optimization: None,
+            side_calls: Vec::new(),
+            main_call: None,
             git_change_stats: None,
             git_branch_display: None,
         }
@@ -161,6 +169,9 @@ impl ContextRail {
     /// placeholders until its own refresh lands.
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.env_counter_state.clear();
+        self.optimization = None;
+        self.side_calls.clear();
+        self.main_call = None;
         self.agents.clear();
         let new_phase = if running {
             CockpitPhase::Streaming
@@ -296,6 +307,9 @@ impl ContextRail {
             .child(self.render_agents_section(theme, cx))
             .child(self.render_branch_block(&project, theme, cx))
             .child(self.render_usage_section(theme, cx, per_model))
+            .child(self.render_optimization_section(theme))
+            .child(self.render_main_call_section(theme))
+            .child(self.render_side_calls_section(theme))
             .child(self.render_cockpit_context_budget(theme, cx))
             .child(self.render_plan_section(theme, cx))
             .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
@@ -470,6 +484,201 @@ impl ContextRail {
                         .child(output_row)
                         .into_any_element()
                 },
+            ))
+            .into_any_element()
+    }
+
+    fn render_optimization_section(&self, theme: &Theme) -> AnyElement {
+        let Some(metrics) = self.optimization.as_ref() else {
+            return gpui::div().into_any_element();
+        };
+        let tokens = |value| crate::cockpit::format_tokens(value);
+        let mut savings = tokens(metrics.saved_tokens);
+        if metrics.shadow_saved_tokens > 0 {
+            savings.push_str(" + ");
+            savings.push_str(&tokens(metrics.shadow_saved_tokens));
+            savings.push_str(" shadow");
+        }
+        let muted = theme.muted_foreground;
+        v_flex()
+            .w_full()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(IconName::ChartPie).xsmall().text_color(muted))
+                    .child(
+                        gpui::div()
+                            .flex_1()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(i18n::t("context-optimization-title")),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(theme.success)
+                            .child(savings),
+                    ),
+            )
+            .child(
+                gpui::div()
+                    .pl(px(12.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(i18n::t_str(
+                        "context-optimization-projection",
+                        &[
+                            ("projected", &tokens(metrics.projected_tokens)),
+                            ("baseline", &tokens(metrics.estimated_baseline_tokens)),
+                        ],
+                    )),
+            )
+            .child(
+                gpui::div()
+                    .pl(px(12.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(i18n::t_str(
+                        "context-optimization-breakdown",
+                        &[
+                            ("system", &tokens(metrics.system_tokens)),
+                            ("mode", &tokens(metrics.mode_tokens)),
+                            ("project", &tokens(metrics.project_context_tokens)),
+                            ("schemas", &tokens(metrics.tool_schema_tokens)),
+                            ("history", &tokens(metrics.history_tokens)),
+                            ("results", &tokens(metrics.tool_result_tokens)),
+                        ],
+                    )),
+            )
+            .child(
+                gpui::div()
+                    .pl(px(12.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(i18n::t_str(
+                        "context-optimization-tools",
+                        &[
+                            ("active", &metrics.active_tool_schemas.to_string()),
+                            ("total", &metrics.total_tool_schemas.to_string()),
+                            ("rewrite", &tokens(metrics.rewrite_saved_tokens)),
+                            ("pruning", &tokens(metrics.pruning_saved_tokens)),
+                            ("discovery", &tokens(metrics.discovery_saved_tokens)),
+                        ],
+                    )),
+            )
+            .child(
+                gpui::div()
+                    .pl(px(12.))
+                    .truncate()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(i18n::t_str(
+                        "context-optimization-runtime",
+                        &[
+                            ("prefix", &metrics.prefix_stability_pct.to_string()),
+                            ("avoided", &metrics.compactions_avoided.to_string()),
+                            ("nested", &metrics.code_nested_calls.to_string()),
+                            (
+                                "roundtrips",
+                                &metrics.code_model_round_trips_avoided.to_string(),
+                            ),
+                            ("raw", &tokens(metrics.code_raw_tokens)),
+                            ("projected", &tokens(metrics.code_projected_tokens)),
+                            ("tools", &metrics.activated_tools.join(", ")),
+                            ("queries", &metrics.tool_search_queries.to_string()),
+                            ("hits", &metrics.tool_search_hits.to_string()),
+                            ("last_hits", &metrics.tool_search_last_hits.join(", ")),
+                        ],
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_side_calls_section(&self, theme: &Theme) -> AnyElement {
+        if self.side_calls.is_empty() {
+            return gpui::div().into_any_element();
+        }
+        let muted = theme.muted_foreground;
+        v_flex()
+            .w_full()
+            .gap_0p5()
+            .child(
+                gpui::div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(i18n::t("context-side-calls-title")),
+            )
+            .children(self.side_calls.iter().map(|metric| {
+                let average_ms = metric.latency_ms / metric.calls.max(1);
+                let cache_rate = cache_read_ratio(metric.token_usage)
+                    .map(|ratio| format!("{:.0}%", ratio * 100.0))
+                    .unwrap_or_else(|| "--".into());
+                gpui::div()
+                    .pl(px(12.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(i18n::t_str(
+                        "context-side-calls-row",
+                        &[
+                            ("purpose", &metric.purpose),
+                            ("model", &metric.model),
+                            ("calls", &metric.calls.to_string()),
+                            (
+                                "input",
+                                &crate::cockpit::format_tokens(metric.token_usage.input_tokens),
+                            ),
+                            (
+                                "output",
+                                &crate::cockpit::format_tokens(metric.token_usage.output_tokens),
+                            ),
+                            (
+                                "cache",
+                                &crate::cockpit::format_tokens(
+                                    metric.token_usage.cache_read_input_tokens,
+                                ),
+                            ),
+                            ("cache_rate", &cache_rate),
+                            ("latency", &average_ms.to_string()),
+                        ],
+                    ))
+                    .into_any_element()
+            }))
+            .into_any_element()
+    }
+
+    fn render_main_call_section(&self, theme: &Theme) -> AnyElement {
+        let Some(metric) = self.main_call.as_ref() else {
+            return gpui::div().into_any_element();
+        };
+        let average_ms = metric.latency_ms / metric.calls.max(1);
+        let cache_rate = cache_read_ratio(metric.token_usage)
+            .map(|ratio| format!("{:.0}%", ratio * 100.0))
+            .unwrap_or_else(|| "--".into());
+        gpui::div()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(i18n::t_str(
+                "context-main-calls-row",
+                &[
+                    ("model", &metric.model),
+                    ("calls", &metric.calls.to_string()),
+                    (
+                        "input",
+                        &crate::cockpit::format_tokens(metric.token_usage.input_tokens),
+                    ),
+                    (
+                        "output",
+                        &crate::cockpit::format_tokens(metric.token_usage.output_tokens),
+                    ),
+                    (
+                        "cache",
+                        &crate::cockpit::format_tokens(metric.token_usage.cache_read_input_tokens),
+                    ),
+                    ("cache_rate", &cache_rate),
+                    ("latency", &average_ms.to_string()),
+                ],
             ))
             .into_any_element()
     }

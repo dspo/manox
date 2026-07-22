@@ -24,6 +24,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod message;
 pub mod model_alias;
+pub mod optimizer;
 pub mod path_env;
 pub mod paths;
 pub mod plan;
@@ -33,6 +34,8 @@ pub mod prompt;
 pub mod proposed_plan;
 pub mod provider;
 pub mod read_policy;
+pub mod replay;
+pub mod retention;
 pub mod runtime;
 pub mod sandbox;
 pub mod settings;
@@ -59,7 +62,10 @@ pub use language_model::{ReasoningEffort, TokenUsage};
 pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};
 pub use message::{Message, MessageUiMetadata};
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
-pub use thread::{PendingAuthMeta, Thread, ThreadEvent, ThreadId, ToolCallStatus};
+pub use thread::{
+    ContextOptimizationMetrics, PendingAuthMeta, SideCallMetric, Thread, ThreadEvent, ThreadId,
+    ToolCallStatus,
+};
 pub use thread_store::{ThreadStore, ThreadStoreEvent, global as thread_store_global, save_thread};
 pub use tool::permission::{PermissionCache, PermissionDecision, ToolAuthorizationResponse};
 pub use tool::{AgentTool, AnyAgentTool, ToolOutputSink, ToolRegistry};
@@ -73,6 +79,7 @@ pub fn init(cx: &mut App) {
     // user's locale is settled before the first frame / first turn.
     i18n::init();
     settings::init_modes();
+    settings::init_optimization();
     provider::registry::init(cx);
     mcp::registry::init(cx);
     // LSP PATH detection (no spawn — servers start lazily on first code-intel

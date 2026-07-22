@@ -25,6 +25,10 @@ pub fn clamp_prompt_cache_key(key: &str) -> String {
     key.chars().take(64).collect()
 }
 
+pub(crate) fn request_output_cap(request_cap: Option<u32>, model_cap: u64) -> u64 {
+    request_cap.map_or(model_cap, |cap| (cap as u64).min(model_cap))
+}
+
 /// Whether an OpenAI-compatible endpoint is the official `api.openai.com`
 /// host (and thus eligible for `prompt_cache_retention:"24h"` and other
 /// first-party-only features). Third-party OpenAI-compatible servers are
@@ -77,7 +81,14 @@ pub fn is_deepseek(endpoint_url: &str, model_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::anthropic_supports_effort;
+    use super::{anthropic_supports_effort, request_output_cap};
+
+    #[test]
+    fn request_output_cap_never_exceeds_model_or_request_limit() {
+        assert_eq!(request_output_cap(None, 8192), 8192);
+        assert_eq!(request_output_cap(Some(128), 8192), 128);
+        assert_eq!(request_output_cap(Some(16_384), 8192), 8192);
+    }
 
     #[test]
     fn anthropic_supports_effort_for_capable_claude_families() {

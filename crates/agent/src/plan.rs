@@ -208,7 +208,23 @@ pub fn rebuild_from_messages(messages: &[Message]) -> Option<PlanSnapshot> {
             }
         }
     }
-    None
+    let state = crate::compact::latest_compaction_state(messages)?;
+    let steps = state.plan_steps?;
+    let snapshot = PlanSnapshot {
+        explanation: None,
+        steps: steps
+            .into_iter()
+            .map(|step| {
+                let status = serde_json::from_value(serde_json::Value::String(step.status))
+                    .unwrap_or(PlanStepStatus::Pending);
+                PlanStep {
+                    step: step.title,
+                    status,
+                }
+            })
+            .collect(),
+    };
+    (!snapshot.is_empty()).then_some(snapshot)
 }
 
 #[cfg(test)]
@@ -431,6 +447,46 @@ mod tests {
             tool_result("2", false),
         ];
         assert!(rebuild_from_messages(&messages).is_none());
+    }
+
+    #[test]
+    fn rebuild_recovers_plan_from_latest_compaction_capsule() {
+        let state =
+            crate::compact::collect_compaction_state(crate::compact::CompactionStateInput {
+                cwd: std::path::Path::new("/tmp"),
+                covered_message_id: Some("covered"),
+                worktree_branch: None,
+                worktree_path: None,
+                git_branch: None,
+                git_status: None,
+                plan_steps: Some(vec![
+                    crate::compact::PlanStepCapsule {
+                        title: "Recovered".into(),
+                        status: "in_progress".into(),
+                    },
+                    crate::compact::PlanStepCapsule {
+                        title: "Then verify".into(),
+                        status: "pending".into(),
+                    },
+                ]),
+                goal: None,
+                collaboration_mode: Some("Plan"),
+                active_tools: Vec::new(),
+                active_skills: Vec::new(),
+                background_shells: Vec::new(),
+                artifacts: Vec::new(),
+            });
+        let messages = vec![Message::user_with_content(vec![
+            MessageContent::Compaction(crate::compact::build_compaction_envelope(
+                "handoff".into(),
+                state,
+            )),
+        ])];
+
+        let snapshot = rebuild_from_messages(&messages).unwrap();
+        assert_eq!(snapshot.steps[0].step, "Recovered");
+        assert_eq!(snapshot.steps[0].status, PlanStepStatus::InProgress);
+        assert_eq!(snapshot.steps[1].step, "Then verify");
     }
 
     #[test]

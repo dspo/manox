@@ -1,0 +1,76 @@
+{
+  "version": 2,
+  "recorded_model_latency_ms": 1200.0,
+  "context_window_tokens": 65536,
+  "scenarios": [
+    {
+      "name": "repeated full-file reads",
+      "baseline": {
+        "calls": [
+          {"id":"r1","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000},
+          {"id":"r2","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000},
+          {"id":"r3","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000},
+          {"id":"r4","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000},
+          {"id":"r5","tool":"Read","input":{"path":"src/lib.rs"},"output_seed":"1:fn replay_line() {}\n","repeat":7000}
+        ]
+      }
+    },
+    {
+      "name": "grep refinement loop",
+      "baseline": {
+        "calls": [
+          {"id":"g1","tool":"Grep","input":{"pattern":"ThreadEvent","path":"crates"},"output_seed":"crates/agent/src/thread.rs:100:ThreadEvent\n","repeat":5000},
+          {"id":"g2","tool":"Grep","input":{"pattern":"ThreadEvent","path":"crates"},"output_seed":"crates/agent/src/thread.rs:100:ThreadEvent\n","repeat":5000},
+          {"id":"g3","tool":"Grep","input":{"pattern":"ThreadEvent","path":"crates"},"output_seed":"crates/agent/src/thread.rs:100:ThreadEvent\n","repeat":5000},
+          {"id":"g4","tool":"Grep","input":{"pattern":"ThreadEvent","path":"crates"},"output_seed":"crates/agent/src/thread.rs:100:ThreadEvent\n","repeat":5000}
+        ]
+      }
+    },
+    {
+      "name": "noisy build diagnostics",
+      "baseline": {
+        "calls": [
+          {"id":"b1","tool":"Bash","input":{"command":"cargo test --workspace"},"output_seed":"warning: generated diagnostic line for replay\n","repeat":6500},
+          {"id":"b2","tool":"Bash","input":{"command":"cargo test --workspace"},"output_seed":"warning: generated diagnostic line for replay\n","repeat":6500},
+          {"id":"b3","tool":"Bash","input":{"command":"cargo test --workspace"},"output_seed":"warning: generated diagnostic line for replay\n","repeat":6500}
+        ]
+      }
+    },
+    {
+      "name": "edit refresh barrier",
+      "baseline": {
+        "calls": [
+          {"id":"e1","tool":"Read","input":{"path":"src/state.rs"},"output_seed":"1:pub struct State;\n","repeat":9000},
+          {"id":"e2","tool":"Edit","input":{"patch":"[/replay/src/state.rs#ABCD]\nSWAP 1.=1:\n+pub struct State(u8);"},"output_seed":"Applied patch\n","repeat":1},
+          {"id":"e3","tool":"Read","input":{"path":"src/state.rs"},"output_seed":"1:pub struct State(u8);\n","repeat":9000},
+          {"id":"e4","tool":"Bash","input":{"command":"cargo check"},"output_seed":"Checking replay dependency graph\n","repeat":7000}
+        ]
+      }
+    },
+    {
+      "name": "non-vision image history and code batching",
+      "baseline": {
+        "images": [
+          {"mime_type":"image/png","encoded_seed":"QUJDREVGR0hJSktMTU5PUA==","repeat":18000},
+          {"mime_type":"image/png","encoded_seed":"UVJTVFVWV1hZWjAxMjM0NQ==","repeat":18000}
+        ],
+        "calls": [
+          {"id":"i1","tool":"Read","input":{"path":"assets/index.json"},"output_seed":"{\"asset\":\"sample\"}\n","repeat":6000},
+          {"id":"i2","tool":"Grep","input":{"pattern":"asset","path":"assets"},"output_seed":"assets/index.json:1:asset\n","repeat":4000},
+          {"id":"i3","tool":"Read","input":{"path":"assets/a.json"},"output_seed":"{\"id\":1}\n","repeat":5000},
+          {"id":"i4","tool":"Read","input":{"path":"assets/b.json"},"output_seed":"{\"id\":2}\n","repeat":5000},
+          {"id":"i5","tool":"Bash","input":{"command":"printf done"},"output_seed":"done\n","repeat":1}
+        ]
+      },
+      "optimized": {
+        "images": [
+          {"mime_type":"image/png","encoded_seed":"QUJDREVGR0hJSktMTU5PUA==","repeat":18000},
+          {"mime_type":"image/png","encoded_seed":"UVJTVFVWV1hZWjAxMjM0NQ==","repeat":18000}
+        ],
+        "calls": [
+          {"id":"code1","tool":"Code","input":{"script":"const [a,b] = await Promise.all([tools.Read({path:'assets/a.json'}), tools.Read({path:'assets/b.json'})]); return a.length + b.length;"},"output_seed":"{\"version\":1,\"selected\":[],\"returned\":\"42\",\"error\":null,\"calls\":5,\"audit\":[]}","repeat":1}
+        ]
+      }
+    }
+  ]
+}

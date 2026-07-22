@@ -101,6 +101,8 @@ image = "0.25"
 # single-binary deliverable; the ExtrasAssetSource overlays custom agent icons
 # (claude/codex/copilot) on top of gpui-component-assets.
 rust-embed = "8"
+# Restricted JavaScript isolate for the optional hybrid Code orchestration tool.
+rquickjs = { version = "0.12.1", features = ["futures", "macro"] }
 
 tokio-tungstenite = { version = "0.24", features = ["connect", "native-tls"] }
 

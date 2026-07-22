@@ -58,6 +58,10 @@ impl TokenMeter {
         &self.per_model
     }
 
+    pub fn current_request(&self) -> TokenUsage {
+        self.current_request
+    }
+
     /// Token usage attributed to the last user message, if the provider
     /// reported any for this turn. `user_id` is the owning `Thread`'s last
     /// user-message id (the caller knows the message list, this struct does not).

@@ -19,7 +19,7 @@ use gpui::AsyncApp;
 
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
-    LanguageModelRequestMessage, MessageContent, Role,
+    LanguageModelRequestMessage, MessageContent, Role, TokenUsage,
 };
 use crate::message::Message;
 use crate::thread::truncate_summary;
@@ -80,7 +80,13 @@ pub fn build_title_request(
         tool_choice: None,
         temperature: Some(0.3),
         thinking_allowed: false,
-        reasoning_effort: None,
+        reasoning_effort: crate::settings::side_call_effort(
+            &crate::settings::side_calls().title_policy(),
+            crate::language_model::RequestReasoningEffort::Low,
+        ),
+        max_output_tokens: crate::settings::side_call_output_cap(
+            crate::settings::side_calls().title_policy(),
+        ),
     }
 }
 
@@ -160,7 +166,13 @@ pub fn build_topic_shift_request(
         tool_choice: None,
         temperature: Some(0.3),
         thinking_allowed: false,
-        reasoning_effort: None,
+        reasoning_effort: crate::settings::side_call_effort(
+            &crate::settings::side_calls().title_policy(),
+            crate::language_model::RequestReasoningEffort::Low,
+        ),
+        max_output_tokens: crate::settings::side_call_output_cap(
+            crate::settings::side_calls().title_policy(),
+        ),
     }
 }
 
@@ -171,23 +183,30 @@ pub async fn stream_thread_title(
     model: &AnyLanguageModel,
     request: LanguageModelRequest,
     cx: &AsyncApp,
-) -> Result<String> {
+) -> Result<(String, Option<TokenUsage>)> {
     let mut events = model.stream_completion(request, cx).await?;
     let mut raw = String::new();
+    let mut usage = None;
+    let mut title_complete = false;
     while let Some(ev) = events.next().await {
-        let Ok(LanguageModelCompletionEvent::Text(text)) = ev else {
-            continue;
-        };
-        if let Some(nl) = text.find(['\n', '\r']) {
-            raw.push_str(&text[..nl]);
-            break;
+        match ev? {
+            LanguageModelCompletionEvent::Text(text) if !title_complete => {
+                if let Some(nl) = text.find(['\n', '\r']) {
+                    raw.push_str(&text[..nl]);
+                    title_complete = true;
+                } else {
+                    raw.push_str(&text);
+                }
+            }
+            LanguageModelCompletionEvent::UsageUpdate(value) => usage = Some(value),
+            LanguageModelCompletionEvent::Stop(_) => break,
+            _ => {}
         }
-        raw.push_str(&text);
         if raw.chars().count() > MAX_RAW_CHARS {
-            break;
+            title_complete = true;
         }
     }
-    Ok(sanitize_title(&raw))
+    Ok((sanitize_title(&raw), usage))
 }
 
 /// Trim, strip wrapping quotes and a leading `Title:`/`标题：` prefix, collapse

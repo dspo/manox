@@ -20,6 +20,7 @@
 //! mirrors) and is never routed through the `i18n` bundle (which only carries
 //! UI chrome).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::language_model::{
     AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
-    LanguageModelRequestMessage, MessageContent, Role,
+    LanguageModelRequestMessage, MessageContent, Role, TokenUsage,
 };
 
 /// Per-call hard timeout for the reviewer. The reviewer is allowed to take
@@ -55,6 +56,199 @@ struct VerdictPayload {
     verdict: String,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewItem {
+    pub id: String,
+    pub tool_name: String,
+    pub tool_title: String,
+    pub tool_input: serde_json::Value,
+}
+
+pub struct ReviewBatchOutcome {
+    pub verdicts: HashMap<String, ReviewVerdict>,
+    pub usage: Option<TokenUsage>,
+    pub model_name: String,
+}
+
+pub struct ReviewOutcome {
+    pub verdict: ReviewVerdict,
+    pub usage: Option<TokenUsage>,
+    pub model_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchVerdictPayload {
+    id: String,
+    verdict: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Vet every AutoReview tool call from one assistant response in one side
+/// request. Missing or malformed per-id verdicts fail closed independently.
+pub async fn review_batch(
+    model: &AnyLanguageModel,
+    items: &[ReviewItem],
+    cwd: &Path,
+    lang: crate::language::Language,
+    cancel: CancellationToken,
+    cx: &AsyncApp,
+) -> ReviewBatchOutcome {
+    review_batch_with_timeout(model, items, cwd, lang, cancel, REVIEW_TIMEOUT, cx).await
+}
+
+async fn review_batch_with_timeout(
+    model: &AnyLanguageModel,
+    items: &[ReviewItem],
+    cwd: &Path,
+    lang: crate::language::Language,
+    cancel: CancellationToken,
+    timeout: Duration,
+    cx: &AsyncApp,
+) -> ReviewBatchOutcome {
+    if items.is_empty() {
+        return ReviewBatchOutcome {
+            verdicts: HashMap::new(),
+            usage: None,
+            model_name: model.name(),
+        };
+    }
+    let fallback = || ReviewVerdict::Ask {
+        reason: "auto-review unavailable; please confirm".to_string(),
+    };
+    let fail_closed = || {
+        items
+            .iter()
+            .map(|item| (item.id.clone(), fallback()))
+            .collect::<HashMap<_, _>>()
+    };
+
+    let policy = crate::settings::side_calls().approval_policy();
+    let model = crate::settings::side_call_model(&policy, model);
+    let model_name = model.name();
+    let calls: Vec<serde_json::Value> = items
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "id": item.id,
+                "tool_name": item.tool_name,
+                "tool_title": item.tool_title,
+                "tool_input": truncate_tool_input(&item.tool_input),
+            })
+        })
+        .collect();
+    let batch_override = match lang {
+        crate::language::Language::En => {
+            "\n\n## Batch override\nThe user message contains an array of calls. Review every call and return only a JSON array with one object per id: [{\"id\":\"...\",\"verdict\":\"ALLOW|ASK\",\"reason\":\"<=200 chars\"}]. This replaces the single-object output format above for this request."
+        }
+        crate::language::Language::ZhCn => {
+            "\n\n## 批量覆盖规则\n用户消息包含一组调用。逐项审核，只返回 JSON 数组，每个 id 一个对象：[{\"id\":\"...\",\"verdict\":\"ALLOW|ASK\",\"reason\":\"不超过200字\"}]。本规则替代上面的单对象输出格式。"
+        }
+    };
+    let system = format!(
+        "{}{}",
+        crate::prompt::render_static(crate::prompt::PromptTemplate::SideCallApprovalSystem, lang,)
+            .expect("approval system prompt render"),
+        batch_override
+    );
+    let user = serde_json::json!({
+        "cwd": cwd.display().to_string(),
+        "calls": calls,
+    })
+    .to_string();
+    let request = LanguageModelRequest {
+        messages: vec![
+            LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text(system)],
+                cache: true,
+            },
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text(user)],
+                cache: false,
+            },
+        ],
+        tools: Vec::new(),
+        tool_choice: None,
+        temperature: Some(0.0),
+        thinking_allowed: false,
+        reasoning_effort: crate::settings::side_call_effort(
+            &policy,
+            crate::language_model::RequestReasoningEffort::Low,
+        ),
+        max_output_tokens: crate::settings::side_call_output_cap(policy),
+    };
+
+    let call = async move {
+        let stream = model.stream_completion(request, cx).await.ok()?;
+        futures::pin_mut!(stream);
+        let mut text = String::new();
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            match event.ok()? {
+                LanguageModelCompletionEvent::Text(delta) => text.push_str(&delta),
+                LanguageModelCompletionEvent::UsageUpdate(value) => usage = Some(value),
+                LanguageModelCompletionEvent::Stop(_) => break,
+                _ => {}
+            }
+        }
+        Some((text, usage))
+    };
+    let outcome = tokio::select! {
+        result = call => result,
+        _ = cx.background_executor().timer(timeout) => None,
+        _ = cancel.cancelled() => None,
+    };
+    let Some((text, usage)) = outcome else {
+        return ReviewBatchOutcome {
+            verdicts: fail_closed(),
+            usage: None,
+            model_name,
+        };
+    };
+    ReviewBatchOutcome {
+        verdicts: parse_batch_verdicts(&text, items),
+        usage,
+        model_name,
+    }
+}
+
+fn parse_batch_verdicts(text: &str, items: &[ReviewItem]) -> HashMap<String, ReviewVerdict> {
+    let trimmed = text.trim();
+    let json = serde_json::from_str::<Vec<BatchVerdictPayload>>(trimmed)
+        .ok()
+        .or_else(|| {
+            let start = trimmed.find('[')?;
+            let end = trimmed.rfind(']')?;
+            serde_json::from_str(&trimmed[start..=end]).ok()
+        });
+    let mut parsed = HashMap::new();
+    if let Some(payloads) = json {
+        let expected: std::collections::HashSet<&str> =
+            items.iter().map(|item| item.id.as_str()).collect();
+        for payload in payloads {
+            if !expected.contains(payload.id.as_str()) || parsed.contains_key(&payload.id) {
+                continue;
+            }
+            if let Some(verdict) = verdict_from(VerdictPayload {
+                verdict: payload.verdict,
+                reason: payload.reason,
+            }) {
+                parsed.insert(payload.id, verdict);
+            }
+        }
+    }
+    for item in items {
+        parsed
+            .entry(item.id.clone())
+            .or_insert_with(|| ReviewVerdict::Ask {
+                reason: "auto-review verdict missing or malformed; please confirm".to_string(),
+            });
+    }
+    parsed
 }
 
 /// Vet a single tool call under `AutoReview`. Blocks until the reviewer
@@ -121,7 +315,10 @@ pub async fn review(
     lang: crate::language::Language,
     cancel: CancellationToken,
     cx: &AsyncApp,
-) -> ReviewVerdict {
+) -> ReviewOutcome {
+    let policy = crate::settings::side_calls().approval_policy();
+    let model = crate::settings::side_call_model(&policy, model);
+    let model_name = model.name();
     let user_prompt = crate::prompt::render(
         crate::prompt::PromptTemplate::SideCallApprovalUser,
         lang,
@@ -158,10 +355,16 @@ pub async fn review(
         tool_choice: None,
         temperature: Some(0.0),
         thinking_allowed: false,
-        reasoning_effort: None,
+        reasoning_effort: crate::settings::side_call_effort(
+            &crate::settings::side_calls().approval_policy(),
+            crate::language_model::RequestReasoningEffort::Low,
+        ),
+        max_output_tokens: crate::settings::side_call_output_cap(
+            crate::settings::side_calls().approval_policy(),
+        ),
     };
 
-    let model = Arc::clone(model);
+    let model = Arc::clone(&model);
     let call = async move {
         let stream = match model.stream_completion(request, cx).await {
             Ok(s) => s,
@@ -169,15 +372,17 @@ pub async fn review(
         };
         futures::pin_mut!(stream);
         let mut text = String::new();
+        let mut usage = None;
         while let Some(event) = stream.next().await {
             let Ok(event) = event else { return None };
             match event {
                 LanguageModelCompletionEvent::Text(delta) => text.push_str(&delta),
+                LanguageModelCompletionEvent::UsageUpdate(value) => usage = Some(value),
                 LanguageModelCompletionEvent::Stop(_) => break,
                 _ => {}
             }
         }
-        Some(text)
+        Some((text, usage))
     };
 
     // Race the reviewer call against a hard deadline and cancellation. `review`
@@ -192,15 +397,23 @@ pub async fn review(
         _ = cx.background_executor().timer(REVIEW_TIMEOUT) => None,
         _ = cancel.cancelled() => None,
     };
-    let Some(text) = outcome else {
-        return ReviewVerdict::Ask {
-            reason: "auto-review unavailable; please confirm".to_string(),
+    let Some((text, usage)) = outcome else {
+        return ReviewOutcome {
+            verdict: ReviewVerdict::Ask {
+                reason: "auto-review unavailable; please confirm".to_string(),
+            },
+            usage: None,
+            model_name,
         };
     };
 
-    parse_verdict(&text).unwrap_or(ReviewVerdict::Ask {
-        reason: "auto-review response unparseable; please confirm".to_string(),
-    })
+    ReviewOutcome {
+        verdict: parse_verdict(&text).unwrap_or(ReviewVerdict::Ask {
+            reason: "auto-review response unparseable; please confirm".to_string(),
+        }),
+        usage,
+        model_name,
+    }
 }
 
 fn parse_verdict(text: &str) -> Option<ReviewVerdict> {
@@ -280,6 +493,41 @@ fn verdict_from(payload: VerdictPayload) -> Option<ReviewVerdict> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PendingReviewModel;
+
+    impl crate::language_model::LanguageModel for PendingReviewModel {
+        fn id(&self) -> String {
+            "test/pending-review".into()
+        }
+        fn name(&self) -> String {
+            "pending-review".into()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            Box::pin(futures::future::pending())
+        }
+    }
 
     #[test]
     fn parses_allow_without_reason() {
@@ -370,5 +618,89 @@ mod tests {
         let head_end = content.find('…').unwrap();
         assert!(head_end <= REVIEWER_FIELD_CAP);
         assert!(content.is_char_boundary(head_end));
+    }
+
+    #[test]
+    fn batch_parser_fails_closed_per_missing_or_malformed_id() {
+        let items = vec![
+            ReviewItem {
+                id: "a".into(),
+                tool_name: "Read".into(),
+                tool_title: "read".into(),
+                tool_input: serde_json::json!({}),
+            },
+            ReviewItem {
+                id: "b".into(),
+                tool_name: "Bash".into(),
+                tool_title: "bash".into(),
+                tool_input: serde_json::json!({}),
+            },
+            ReviewItem {
+                id: "c".into(),
+                tool_name: "Write".into(),
+                tool_title: "write".into(),
+                tool_input: serde_json::json!({}),
+            },
+        ];
+        let parsed = parse_batch_verdicts(
+            r#"[{"id":"a","verdict":"ALLOW"},{"id":"b","verdict":"MAYBE"}]"#,
+            &items,
+        );
+        assert_eq!(parsed["a"], ReviewVerdict::Allow);
+        assert!(matches!(parsed["b"], ReviewVerdict::Ask { .. }));
+        assert!(matches!(parsed["c"], ReviewVerdict::Ask { .. }));
+    }
+
+    #[test]
+    fn batch_timeout_fails_closed_for_every_id() {
+        use std::sync::{Arc, Mutex};
+
+        let items = vec![
+            ReviewItem {
+                id: "a".into(),
+                tool_name: "Bash".into(),
+                tool_title: "bash".into(),
+                tool_input: serde_json::json!({"command":"echo a"}),
+            },
+            ReviewItem {
+                id: "b".into(),
+                tool_name: "Write".into(),
+                tool_title: "write".into(),
+                tool_input: serde_json::json!({"path":"b"}),
+            },
+        ];
+        let model: AnyLanguageModel = Arc::new(PendingReviewModel);
+        let result = Arc::new(Mutex::new(None));
+        let captured = result.clone();
+        let cx = gpui::TestAppContext::single();
+        cx.spawn(|cx| {
+            let cx = cx.clone();
+            async move {
+                let outcome = review_batch_with_timeout(
+                    &model,
+                    &items,
+                    Path::new("/tmp"),
+                    crate::language::Language::En,
+                    CancellationToken::new(),
+                    Duration::from_millis(5),
+                    &cx,
+                )
+                .await;
+                *captured.lock().unwrap() = Some(outcome);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+        let outcome = result.lock().unwrap().take().expect("review timeout");
+        assert_eq!(outcome.verdicts.len(), 2);
+        assert!(
+            outcome
+                .verdicts
+                .values()
+                .all(|verdict| matches!(verdict, ReviewVerdict::Ask { .. }))
+        );
+        assert!(outcome.usage.is_none());
     }
 }

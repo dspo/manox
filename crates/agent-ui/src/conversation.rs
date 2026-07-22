@@ -870,6 +870,9 @@ impl ConversationState {
             // Token usage + model/effort changes are surfaced elsewhere (sidebar /
             // model-history overlay). No conversation item.
             ThreadEvent::TokenUsageUpdated(_)
+            | ThreadEvent::ContextOptimizationUpdated(_)
+            | ThreadEvent::SideCallMetricsUpdated(_)
+            | ThreadEvent::MainCallMetricsUpdated(_)
             | ThreadEvent::ModelChanged { .. }
             | ThreadEvent::ReasoningEffortChanged { .. }
             // `CompactionStarted` is a cockpit-only phase signal (the side-LLM

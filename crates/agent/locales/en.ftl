@@ -534,6 +534,14 @@ workspace-env-git-copied-worktree-path = Worktree path copied to clipboard.
 
 # ── Context rail (right sidecar) ────────────────────────────────────────
 context-rail-title = Conversation Info
+context-optimization-title = Context projection saved
+context-optimization-projection = {$projected} sent / {$baseline} baseline
+context-optimization-breakdown = system {$system} · mode {$mode} · project {$project} · schemas {$schemas} · history {$history} · results {$results}
+context-optimization-tools = schemas {$active}/{$total} · rewrite {$rewrite} · prune {$pruning} · discovery {$discovery}
+context-optimization-runtime = prefix {$prefix}% · avoided compact {$avoided} · Code {$nested} calls / {$roundtrips} trips saved {$raw}→{$projected} · ToolSearch {$queries} queries / {$hits} hits (last: {$last_hits}) · activated {$tools}
+context-side-calls-title = Side calls
+context-side-calls-row = {$purpose} · {$model} · {$calls} calls · in {$input} out {$output} cache {$cache} ({$cache_rate}) · avg {$latency}ms
+context-main-calls-row = Main · {$model} · {$calls} calls · in {$input} out {$output} cache {$cache} ({$cache_rate}) · avg {$latency}ms
 
 # ── Cockpit (run status / milestones / context budget) ──────────────────
 # Phase labels for the run-status row (three-tag pill: generating / reasoning /
