@@ -122,6 +122,7 @@ impl ThreadGoal {
 pub struct GoalRuntime {
     current: Option<ThreadGoal>,
     continuation_reserved: bool,
+    continuation_failed: bool,
     blocker_reason: Option<String>,
     blocker_turns: u8,
     blocker_last_turn_id: Option<String>,
@@ -132,6 +133,7 @@ impl GoalRuntime {
         Self {
             current: goal,
             continuation_reserved: false,
+            continuation_failed: false,
             blocker_reason: None,
             blocker_turns: 0,
             blocker_last_turn_id: None,
@@ -146,6 +148,10 @@ impl GoalRuntime {
         let same_goal = self.current.as_ref().map(|goal| &goal.goal_id)
             == goal.as_ref().map(|goal| &goal.goal_id);
         self.current = goal;
+        // A successfully persisted snapshot is the recovery fence after a
+        // previous accounting failure. Explicit pause/edit/resume can thereby
+        // re-enable automatic work without allowing an immediate blind retry.
+        self.continuation_failed = false;
         if !same_goal {
             self.continuation_reserved = false;
             self.clear_blocker();
@@ -160,7 +166,7 @@ impl GoalRuntime {
         let active = self.current.as_ref().is_some_and(|goal| {
             goal.goal_id == expected_goal_id && goal.status == GoalStatus::Active
         });
-        if !active || self.continuation_reserved {
+        if !active || self.continuation_reserved || self.continuation_failed {
             return false;
         }
         self.continuation_reserved = true;
@@ -170,6 +176,15 @@ impl GoalRuntime {
     pub fn release_continuation(&mut self, expected_goal_id: &str) {
         if self.expected_goal_id() == Some(expected_goal_id) {
             self.continuation_reserved = false;
+        }
+    }
+
+    /// Fail closed after a persistence error while still releasing the active
+    /// reservation. The next successfully persisted snapshot clears the latch.
+    pub fn fail_continuation(&mut self, expected_goal_id: &str) {
+        if self.expected_goal_id() == Some(expected_goal_id) {
+            self.continuation_reserved = false;
+            self.continuation_failed = true;
         }
     }
 
@@ -264,6 +279,19 @@ mod tests {
         runtime.release_continuation("stale");
         assert!(!runtime.reserve_continuation(&id));
         runtime.release_continuation(&id);
+        assert!(runtime.reserve_continuation(&id));
+    }
+
+    #[test]
+    fn persistence_failure_stops_until_a_successful_mutation() {
+        let goal = ThreadGoal::new("thread".into(), "finish".into(), None).unwrap();
+        let id = goal.goal_id.clone();
+        let mut runtime = GoalRuntime::restore(Some(goal.clone()));
+        assert!(runtime.reserve_continuation(&id));
+        runtime.fail_continuation(&id);
+        assert!(!runtime.reserve_continuation(&id));
+
+        runtime.replace_snapshot(Some(goal));
         assert!(runtime.reserve_continuation(&id));
     }
 

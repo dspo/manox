@@ -1688,7 +1688,9 @@ impl Thread {
             anyhow::bail!("thread already has an unfinished Goal");
         }
         if self.goal().is_some() {
-            self.clear_goal(GoalActor::System, cx)?;
+            // A completed Goal is replaced atomically so a failed creation
+            // cannot leave the thread without either the old or new Goal.
+            return self.replace_goal(objective, token_budget, actor, cx);
         }
         let goal = ThreadGoal::new(self.id.0.clone(), objective, token_budget)?;
         let db = crate::thread_store::global().read(cx).database();
@@ -1969,6 +1971,7 @@ impl Thread {
             || !self.pending_steer.is_empty()
             || !self.pending_authorizations.is_empty()
             || !self.pending_inbound.is_empty()
+            || self.active_model().is_none()
         {
             return;
         }
@@ -2032,6 +2035,9 @@ impl Thread {
                 self.sync_goal_pin(cx);
             }
             Err(error) => {
+                // Release the reservation but keep a fail-closed latch until a
+                // later successful persisted Goal mutation explicitly recovers.
+                self.goal_runtime.fail_continuation(&goal_id);
                 tracing::error!(%error, goal_id, "Goal accounting failed; automatic work stopped");
                 cx.emit(ThreadEvent::Error(anyhow::anyhow!(
                     "Goal accounting failed; automatic work stopped: {error}"
@@ -2049,7 +2055,27 @@ impl Thread {
             None
         };
         if let Some((status, reason)) = terminal {
-            let _ = self.set_goal_status(status, Some(reason.into()), GoalActor::System, cx);
+            let transition = self
+                .goal()
+                .map(|goal| (goal.status, goal.status.can_transition_to(status)));
+            match transition {
+                Some((_, true)) => {
+                    if let Err(error) =
+                        self.set_goal_status(status, Some(reason.into()), GoalActor::System, cx)
+                    {
+                        cx.emit(ThreadEvent::Error(error));
+                    }
+                }
+                Some((current, false)) => {
+                    tracing::warn!(
+                        goal_id,
+                        current = current.as_str(),
+                        requested = status.as_str(),
+                        "Goal terminal event arrived after a conflicting terminal transition"
+                    );
+                }
+                None => {}
+            }
         }
         self.goal_runtime.release_continuation(&goal_id);
         cx.emit(ThreadEvent::GoalChanged {
@@ -2945,6 +2971,9 @@ impl Thread {
         }
 
         let Some(model) = self.active_model() else {
+            if let Some(goal_id) = self.goal_runtime.expected_goal_id().map(str::to_owned) {
+                self.goal_runtime.release_continuation(&goal_id);
+            }
             cx.emit(ThreadEvent::Error(anyhow::anyhow!("No model configured")));
             return;
         };
@@ -7494,6 +7523,204 @@ mod tests {
             assert_eq!(goal.remaining_tokens(), Some(80));
         });
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn model_blocked_requires_three_distinct_goal_turns() {
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open memory database"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let model: AnyLanguageModel = Arc::new(GoalCompleteMockModel {
+            calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                "goal-blocked-three-turns",
+                "/tmp",
+                vec![Message::user("start".into())],
+            );
+            rec.title = Some("Goal blocker".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .create_goal("wait for external state".into(), None, GoalActor::User, cx)
+                    .unwrap();
+            });
+        });
+
+        for turn in 1..=3 {
+            cx.update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.messages.push(Message::goal_continuation(format!(
+                        "<goal_continuation>turn {turn}</goal_continuation>"
+                    )));
+                    let goal_id = thread.goal().unwrap().goal_id.clone();
+                    thread.goal_turn_anchor = Some((
+                        goal_id,
+                        std::time::Instant::now(),
+                        thread.cumulative_token_usage(),
+                    ));
+                    thread
+                        .update_goal_from_model(
+                            GoalStatus::Blocked,
+                            Some("waiting for deployment".into()),
+                            cx,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        thread.goal().unwrap().status,
+                        if turn == 3 {
+                            GoalStatus::Blocked
+                        } else {
+                            GoalStatus::Active
+                        }
+                    );
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn live_budget_exhaustion_injects_one_safe_stop_directive() {
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open memory database"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let model: AnyLanguageModel = Arc::new(GoalCompleteMockModel {
+            calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                "goal-live-budget",
+                "/tmp",
+                vec![Message::user("start".into())],
+            );
+            rec.title = Some("Goal budget".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .create_goal("stay within budget".into(), Some(10), GoalActor::User, cx)
+                    .unwrap();
+                let goal_id = thread.goal().unwrap().goal_id.clone();
+                thread.goal_turn_anchor = Some((
+                    goal_id,
+                    std::time::Instant::now(),
+                    thread.cumulative_token_usage(),
+                ));
+                thread.accumulate_token_usage(TokenUsage {
+                    input_tokens: 7,
+                    output_tokens: 2,
+                    cache_creation_input_tokens: 1,
+                    cache_read_input_tokens: 100,
+                });
+                thread.enforce_goal_budget_during_turn(cx);
+                thread.enforce_goal_budget_during_turn(cx);
+
+                assert_eq!(thread.goal().unwrap().status, GoalStatus::BudgetLimited);
+                let stop_directives = thread
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.content.iter().any(|content| {
+                            matches!(content, MessageContent::Text(text) if text.contains("<goal_budget_stop>"))
+                        })
+                    })
+                    .count();
+                assert_eq!(stop_directives, 1);
+            });
+        });
+    }
+
+    #[test]
+    fn replacement_fences_old_reservation_and_no_model_does_not_reserve() {
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open memory database"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let model: AnyLanguageModel = Arc::new(GoalCompleteMockModel {
+            calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                "goal-replacement-fence",
+                "/tmp",
+                vec![Message::user("start".into())],
+            );
+            rec.title = Some("Goal replacement".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .create_goal("old objective".into(), None, GoalActor::User, cx)
+                    .unwrap();
+                let old_id = thread.goal().unwrap().goal_id.clone();
+                assert!(thread.goal_runtime.reserve_continuation(&old_id));
+                thread.collaboration_mode = crate::ModeKind::Plan;
+                thread
+                    .replace_goal("new objective".into(), None, GoalActor::User, cx)
+                    .unwrap();
+                let new_id = thread.goal().unwrap().goal_id.clone();
+                assert_ne!(old_id, new_id);
+                thread.goal_runtime.release_continuation(&old_id);
+                assert!(thread.goal_runtime.reserve_continuation(&new_id));
+                thread.goal_runtime.release_continuation(&new_id);
+
+                thread.collaboration_mode = crate::ModeKind::Default;
+                thread.model = None;
+                let message_count = thread.messages.len();
+                thread.try_start_goal_turn_if_idle(cx);
+                assert_eq!(thread.messages.len(), message_count);
+                assert!(thread.goal_runtime.reserve_continuation(&new_id));
+            });
+        });
     }
 
     /// A mock model whose only configurable surface is the two capability flags,
