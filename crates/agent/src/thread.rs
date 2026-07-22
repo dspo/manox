@@ -630,8 +630,8 @@ pub struct Thread {
     /// Wall-clock anchor for the in-flight turn, set the instant `TurnStarted`
     /// is emitted and cleared when the turn ends (`Stop`/`Error`/cancel). The
     /// cockpit reads `elapsed()` for its run-status timer; `None` ⇒ idle.
-    /// Mirrors `GoalState::started_at` — a core-side anchor that travels with
-    /// the entity across thread swaps, so the UI does not re-wire on switch.
+    /// Travels with the entity across thread swaps, so the UI does not re-wire
+    /// the elapsed-time display on switch.
     turn_started_at: Option<Instant>,
     /// Optional tool whitelist for the current turn, set by a slash command's
     /// `allowed-tools` frontmatter. `None` or empty = inherit all tools. The
@@ -6233,9 +6233,9 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{model_facing_content, tool_title};
+    use crate::ModeKind;
     use crate::db::GoalActor;
     use crate::goal::GoalStatus;
-    use crate::ModeKind;
     use crate::language_model::{
         AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
         LanguageModelToolResult, LanguageModelToolUse, MessageContent, StopReason, TokenUsage,
@@ -6560,7 +6560,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_rehydrates_goal_mode_and_tool_activations_from_capsule() {
+    fn restore_ignores_capsule_goal_and_rehydrates_tool_activations() {
         crate::agent_def::init();
         let cx = gpui::TestAppContext::single();
         let state =

@@ -790,8 +790,21 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect();
+        let discovery_names: Vec<String> = registry
+            .to_request_tools_in_order(
+                &tool_search::schema_order("goal-tools-stable"),
+                crate::language::Language::En,
+                false,
+            )
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
         for name in [GET_GOAL, CREATE_GOAL, UPDATE_GOAL] {
             assert!(default_names.iter().any(|registered| registered == name));
+            assert!(
+                discovery_names.iter().any(|registered| registered == name),
+                "{name} must remain stable when tool discovery is enabled"
+            );
             assert!(!plan_names.iter().any(|registered| registered == name));
         }
     }

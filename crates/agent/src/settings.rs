@@ -137,8 +137,8 @@ pub struct Settings {
     #[serde(default)]
     pub context_optimization: ContextOptimizationSettings,
 
-    /// Per-purpose side-call policies: title, goal evaluation, approval
-    /// review, and compaction summarization.
+    /// Per-purpose side-call policies: title, approval review, and compaction
+    /// summarization.
     #[serde(default)]
     pub side_calls: SideCallsSettings,
 }
@@ -267,8 +267,6 @@ pub struct SideCallsSettings {
     #[serde(default)]
     pub title: SideCallPolicy,
     #[serde(default)]
-    pub goal: SideCallPolicy,
-    #[serde(default)]
     pub approval: SideCallPolicy,
     #[serde(default)]
     pub compaction: SideCallPolicy,
@@ -303,10 +301,6 @@ impl SideCallsSettings {
     /// Resolved title policy: user config overlaid on the title preset.
     pub fn title_policy(&self) -> SideCallPolicy {
         resolve_side_call_policy(&self.title, SideCallPolicy::title_default())
-    }
-    /// Resolved goal-evaluation policy.
-    pub fn goal_policy(&self) -> SideCallPolicy {
-        resolve_side_call_policy(&self.goal, SideCallPolicy::goal_default())
     }
     /// Resolved approval-review policy.
     pub fn approval_policy(&self) -> SideCallPolicy {
@@ -348,15 +342,6 @@ impl SideCallPolicy {
             model: String::new(),
             reasoning_effort: Some("low".into()),
             max_output_tokens: 128,
-            enabled: true,
-        }
-    }
-
-    pub fn goal_default() -> Self {
-        Self {
-            model: String::new(),
-            reasoning_effort: Some("low".into()),
-            max_output_tokens: 256,
             enabled: true,
         }
     }
@@ -714,7 +699,6 @@ follow_up_behavior = "Steer"
     #[test]
     fn side_call_presets() {
         assert_eq!(SideCallPolicy::title_default().max_output_tokens, 128);
-        assert_eq!(SideCallPolicy::goal_default().max_output_tokens, 256);
         assert_eq!(SideCallPolicy::approval_default().max_output_tokens, 2048);
         assert_eq!(SideCallPolicy::compaction_default().max_output_tokens, 4096);
     }
