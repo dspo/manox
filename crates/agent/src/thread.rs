@@ -4966,9 +4966,7 @@ mod tests {
 
         // Max → Max on the wire.
         let req = cx.update(|cx| {
-            thread.update(cx, |t, cx| {
-                t.set_reasoning_effort(ReasoningEffort::Max, cx)
-            });
+            thread.update(cx, |t, cx| t.set_reasoning_effort(ReasoningEffort::Max, cx));
             thread.read(cx).build_completion_request()
         });
         assert_eq!(req.reasoning_effort, Some(ReasoningEffort::Max));

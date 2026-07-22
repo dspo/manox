@@ -392,15 +392,9 @@ mod tests {
 
     #[test]
     fn openai_wire_value_clamps_max_on_official_openai() {
-        assert_eq!(
-            ReasoningEffort::Max.openai_wire_value(true),
-            "high"
-        );
+        assert_eq!(ReasoningEffort::Max.openai_wire_value(true), "high");
         // Compatible endpoints pass max through.
-        assert_eq!(
-            ReasoningEffort::Max.openai_wire_value(false),
-            "max"
-        );
+        assert_eq!(ReasoningEffort::Max.openai_wire_value(false), "max");
     }
 
     #[test]
