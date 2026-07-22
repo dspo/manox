@@ -92,7 +92,18 @@ pub(crate) fn changed_source_paths(
         crate::tools::EDIT => input
             .get("patch")
             .and_then(|value| value.as_str())
-            .and_then(|patch| crate::hashline::parse_patch(patch).ok())
+            .and_then(|patch| match crate::hashline::parse_patch(patch) {
+                Ok(patches) => Some(patches),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "manox::lsp_metrics",
+                        event = "post_edit_patch_parse_failed",
+                        %error,
+                        "skipping automatic LSP diagnostics"
+                    );
+                    None
+                }
+            })
             .map(|patches| {
                 patches
                     .into_iter()

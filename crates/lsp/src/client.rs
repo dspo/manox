@@ -754,6 +754,9 @@ fn respond_to_server_request(inner: &Arc<Inner>, id: Value, method: &str, params
                 "name": inner.root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
             }]
         }),
+        // Acknowledge dynamic registration so servers do not block waiting for
+        // a response. Registrations are not persisted yet; Manox currently
+        // implements only the capabilities advertised during initialization.
         "client/registerCapability"
         | "client/unregisterCapability"
         | "window/workDoneProgress/create" => {

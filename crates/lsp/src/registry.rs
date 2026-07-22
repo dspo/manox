@@ -377,14 +377,28 @@ impl LspRegistry {
     }
 }
 
-/// Probe `PATH` for every spec's server binary. Cheap (a few `which`
-/// subprocesses); safe to run on the gpui main thread at startup. Never spawns
-/// a server.
+/// Probe `PATH` and viability for every supported server without starting a
+/// long-running language server. Probes run in parallel, so startup is bounded
+/// by one probe timeout (currently two seconds), not the sum across servers.
 pub fn init() {
+    let probed = std::thread::scope(|scope| {
+        let handles = SPECS
+            .iter()
+            .map(|spec| (spec, scope.spawn(move || probe_server(spec))))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(spec, handle)| {
+                let state = handle.join().unwrap_or_else(|_| {
+                    ServerAvailability::Broken("viability probe panicked".into())
+                });
+                (spec, state)
+            })
+            .collect::<Vec<_>>()
+    });
     let mut available = Vec::new();
     let mut availability = HashMap::new();
-    for spec in SPECS {
-        let state = probe_server(spec);
+    for (spec, state) in probed {
         if state == ServerAvailability::Available {
             available.push(spec);
         }
