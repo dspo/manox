@@ -66,12 +66,12 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             resolved.provider_name
         )
     })?)?;
-    let max_tokens = resolve_context_window(resolved);
-    let max_output_tokens = resolve_max_output_tokens(resolved, max_tokens);
+    let context = resolve_context_window(resolved);
+    let max_output_tokens = resolve_max_output_tokens(resolved, context);
     let supports_tools = resolved.supports_tools;
     let supports_images = resolved.supports_images;
     let auto_compact_window =
-        resolve_auto_compact_window(resolved.wire_api, &resolved.env, max_tokens);
+        resolve_auto_compact_window(resolved.wire_api, &resolved.env, context);
 
     let model: AnyLanguageModel = match resolved.wire_api {
         WireApi::Anthropic => Arc::new(AnthropicModel::new(AnthropicModelConfig {
@@ -81,7 +81,7 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             api_model_id: resolved.api_model_id(),
             endpoint_url: resolved.endpoint_url.clone(),
             api_key,
-            max_token_count: max_tokens,
+            max_token_count: context,
             max_output_tokens,
             supports_tools,
             supports_images,
@@ -95,7 +95,7 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             api_model_id: resolved.api_model_id(),
             endpoint_url: resolved.endpoint_url.clone(),
             api_key,
-            max_token_count: max_tokens,
+            max_token_count: context,
             max_output_tokens,
             supports_tools,
             supports_images,
@@ -108,7 +108,7 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             api_model_id: resolved.api_model_id(),
             endpoint_url: resolved.endpoint_url.clone(),
             api_key,
-            max_token_count: max_tokens,
+            max_token_count: context,
             max_output_tokens,
             supports_tools,
             supports_images,
@@ -134,24 +134,28 @@ pub(crate) fn default_max_output_tokens(max_token_count: u64) -> u64 {
     max_token_count.clamp(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS_CAP)
 }
 
-/// Resolve a model's context-window size in tokens. `max_tokens` is always
+/// Resolve a model's context-window size in tokens. `context` is always
 /// populated by `ResolvedModel::from_config()` with a default of 1M when
 /// neither the config nor the remote models API provides one; the fallback
-/// to 8192 only covers manually constructed `ResolvedModel` values in tests.
+/// to [`ResolvedModel::DEFAULT_CONTEXT`] only covers manually constructed
+/// `ResolvedModel` values in tests.
 fn resolve_context_window(resolved: &ResolvedModel) -> u64 {
-    resolved.max_tokens.unwrap_or(8192)
+    resolved.context.unwrap_or(ResolvedModel::DEFAULT_CONTEXT)
 }
 
-/// Resolve a model's `max_output_tokens` request field. The operator-declared
-/// `max_output_tokens` config field wins when present (capped at the context
+/// Resolve a model's `max_tokens` request field. The operator-declared
+/// `max_tokens` config field wins when present (capped at the context
 /// window so a misconfigured budget cannot exceed the model's input capacity);
 /// otherwise the heuristic [`default_max_output_tokens`] clamp applies. The
-/// explicit field is operator intent — a value that floors/ceil the heuristic
-/// bounds is honored as-is (only the context cap is enforced), so a model with
-/// a genuinely large output budget is not silently shrunk to the 32k cap.
+/// heuristic also guards cx-providers' 384K fallback
+/// (`ResolvedModel::DEFAULT_MAX_TOKENS`), which overstates what most
+/// providers accept per response — DashScope rejects >128K with a 400.
+/// An explicit config value that floors/ceil the heuristic bounds is honored
+/// as-is (only the context cap is enforced), so a model with a genuinely large
+/// output budget is not silently shrunk to the 32k cap.
 fn resolve_max_output_tokens(resolved: &ResolvedModel, max_tokens: u64) -> u64 {
-    match resolved.max_output_tokens {
-        Some(n) => n.min(max_tokens),
+    match resolved.max_tokens {
+        Some(n) => n.min(max_tokens).min(MAX_OUTPUT_TOKENS_CAP),
         None => default_max_output_tokens(max_tokens),
     }
 }
@@ -277,7 +281,7 @@ pub fn global() -> Arc<ProviderRegistry> {
 mod tests {
     use super::*;
 
-    fn model(id: &str, max_tokens: Option<u64>) -> ResolvedModel {
+    fn model(id: &str, context_val: Option<u64>) -> ResolvedModel {
         ResolvedModel {
             id: id.to_string(),
             desc: String::new(),
@@ -289,8 +293,8 @@ mod tests {
             copilot_auth: cx_providers::CopilotAuth::ApiKey,
             env: std::collections::BTreeMap::new(),
             apikey_source: None,
-            max_output_tokens: None,
-            max_tokens,
+            max_tokens: None,
+            context: context_val,
             supports_tools: true,
             supports_images: false,
         }
@@ -298,28 +302,38 @@ mod tests {
 
     #[test]
     fn resolve_context_window_cases() {
-        // max_tokens populated from config.
+        // context populated from config.
         assert_eq!(
             resolve_context_window(&model("m", Some(1_000_000))),
             1_000_000
         );
         assert_eq!(resolve_context_window(&model("m", Some(131_072))), 131_072);
-        // max_tokens absent → fallback 8192 (only in tests).
-        assert_eq!(resolve_context_window(&model("m", None)), 8192);
+        // context absent → fallback DEFAULT_CONTEXT (only in tests).
+        assert_eq!(
+            resolve_context_window(&model("m", None)),
+            ResolvedModel::DEFAULT_CONTEXT
+        );
     }
 
     #[test]
     fn resolve_max_output_tokens_honors_config_then_heuristic() {
-        // Explicit `max_output_tokens` is used verbatim, capped only at the
-        // context window (a misconfigured output budget cannot exceed input).
+        // Explicit `max_tokens` within bounds is used verbatim.
         let mut m = model("m", Some(131_072));
-        m.max_output_tokens = Some(131_072);
-        assert_eq!(resolve_max_output_tokens(&m, 131_072), 131_072);
+        m.max_tokens = Some(16_384);
+        assert_eq!(resolve_max_output_tokens(&m, 131_072), 16_384);
         // Capped at the context window when the declared output exceeds it.
         let mut over = model("m", Some(8_192));
-        over.max_output_tokens = Some(65_536);
-        assert_eq!(resolve_max_output_tokens(&over, 8_192), 8_192);
-        // Absent `max_output_tokens` falls back to the heuristic clamp.
+        over.max_tokens = Some(4_096);
+        assert_eq!(resolve_max_output_tokens(&over, 8_192), 4_096);
+        // Above-cap values shrink to the cap: cx-providers' 384K fallback
+        // exceeds what providers like DashScope accept per response (>128K → 400).
+        let mut fallback = model("m", Some(1_000_000));
+        fallback.max_tokens = Some(384_000);
+        assert_eq!(
+            resolve_max_output_tokens(&fallback, 1_000_000),
+            MAX_OUTPUT_TOKENS_CAP
+        );
+        // Absent `max_tokens` falls back to the heuristic clamp.
         assert_eq!(
             resolve_max_output_tokens(&model("m", None), 4_096),
             MIN_OUTPUT_TOKENS

@@ -397,13 +397,13 @@ impl SandboxPolicy {
                 // localhost so TCP connect() (which implicitly binds an
                 // ephemeral port) and tools that listen on localhost (e.g.
                 // dev servers) work inside the sandbox.
+                // macOS seatbelt only accepts `*` or `localhost` as the
+                // remote host in `network-outbound` rules — IP addresses like
+                // `127.0.0.1` are rejected (sandbox-exec exits 65).
                 let port = proxy_port.unwrap_or(0);
                 s.push_str("(deny network*)\n");
                 s.push_str(&format!(
                     "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
-                ));
-                s.push_str(&format!(
-                    "(allow network-outbound (remote tcp \"127.0.0.1:{port}\"))\n"
                 ));
                 s.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
             }
@@ -713,8 +713,8 @@ mod tests {
             "proxy port allow missing: {s}"
         );
         assert!(
-            s.contains("(allow network-outbound (remote tcp \"127.0.0.1:54321\"))"),
-            "127.0.0.1 proxy port allow missing: {s}"
+            !s.contains("127.0.0.1"),
+            "IP addresses must not appear in seatbelt rules (sandbox-exec rejects them): {s}"
         );
         assert!(
             s.contains("(allow network-bind (local ip \"localhost:*\"))"),
