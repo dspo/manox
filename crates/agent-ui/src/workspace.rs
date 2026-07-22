@@ -3642,9 +3642,6 @@ impl Workspace {
             answers.push((q.question.clone(), answer));
         }
         let id = ask.id.clone();
-        // Remove the matching entry from the pending-auth queue (it was pushed
-        // alongside the ask card) so it doesn't resurface after the ask resolves.
-        self.pending_auths.retain(|a| a.id != id);
         self.pending_ask = None;
         self.ask_step = 0;
         self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
@@ -6921,8 +6918,9 @@ fn thread_cwd(thread: &Entity<Thread>, cx: &App) -> Option<SharedString> {
 
 fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk> {
     let questions = input.get("questions")?.as_array()?;
-    // Out-of-range counts violate the tool contract; fall back to the generic
-    // approval path so the defensive tool runner can report a model-visible error.
+    // Out-of-range counts violate the tool contract. No card is shown for
+    // such input; the pending question resolves only when the turn is
+    // cancelled.
     if !(1..=3).contains(&questions.len()) {
         return None;
     }
