@@ -113,6 +113,9 @@ pub async fn evaluate(
         temperature: Some(0.0),
         thinking_allowed: false,
         reasoning_effort: None,
+        max_output_tokens: crate::settings::side_call_output_cap(
+            crate::settings::side_calls().goal_policy(),
+        ),
     };
 
     let model = Arc::clone(model);

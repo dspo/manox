@@ -2737,8 +2737,21 @@ impl Thread {
                     this.cumulative_token_usage(),
                 ));
             }
+            // Build the state capsule for the compaction envelope so the next
+            // summarizer pass can run incrementally (previous summary + delta).
+            let wt_path_str = this.worktree.as_ref().map(|w| w.path.display().to_string());
+            let state = crate::compact::collect_compaction_state(
+                &this.cwd,
+                this.worktree.as_ref().map(|w| w.branch.as_str()),
+                wt_path_str.as_deref(),
+                None, // git branch not readily available
+                None, // plan steps deferred
+                this.goal.as_ref().map(|g| g.condition.as_str()),
+                this.tools.iter().map(|t| t.name().to_string()).collect(),
+            );
+            let envelope = crate::compact::build_compaction_envelope(summary.clone(), state);
             let compaction_msg =
-                Message::user_with_content(vec![MessageContent::Compaction(summary.clone())]);
+                Message::user_with_content(vec![MessageContent::Compaction(envelope)]);
             this.messages.insert(insertion_ix, compaction_msg);
             // The summary may absorb the lazy instruction reminders injected
             // into earlier tool results; clearing the injected set lets a
@@ -4435,6 +4448,12 @@ impl Thread {
         // tool call, tool result, and reasoning block leaks into the parent's
         // context, defeating the point of spawning an isolated sub-agent.
         //
+        // History retention pruning is applied on the cold (old) prefix before
+        // mapping: useless acknowledgments and superseded tool results are
+        // dropped from the model-facing projection when enough tokens are saved
+        // and the cooldown allows it. The canonical `self.messages` is never
+        // modified — the pruned list is only used for this request.
+        //
         // When a compaction message sits in the history, the request is
         // assembled as `[retained recent user messages][compaction summary]
         // [everything after the compaction]` instead of the full transcript —
@@ -4448,29 +4467,37 @@ impl Thread {
         // consecutive same-role messages, accepts the request. A no-op for
         // the normal alternation, so the cached prefix is byte-stable across
         // turns; the coalesced run is itself stable once it's in history.
+        let effective_messages: std::borrow::Cow<'_, [Message]> =
+            match crate::retention::prune_for_model(&self.messages) {
+                Some(pruned) => std::borrow::Cow::Owned(pruned),
+                None => std::borrow::Cow::Borrowed(&self.messages),
+            };
         let mapped: Vec<LanguageModelRequestMessage> = crate::compact::coalesce_same_role(
-            match crate::compact::latest_compaction_ix(&self.messages, self.messages.len()) {
+            match crate::compact::latest_compaction_ix(
+                &effective_messages,
+                effective_messages.len(),
+            ) {
                 Some(c_ix) => {
                     let mut rebuilt = crate::compact::retained_user_messages_before(
-                        &self.messages,
+                        &effective_messages,
                         c_ix,
                         self.agent_language,
                     );
                     // The compaction message itself (mapped to its preamble-wrapped
                     // text form). Always included — it is the boundary marker.
-                    let compaction_content: Vec<MessageContent> = self.messages[c_ix]
+                    let compaction_content: Vec<MessageContent> = effective_messages[c_ix]
                         .content
                         .iter()
                         .map(|c| model_facing_content(c, self.agent_language))
                         .collect();
                     rebuilt.push(LanguageModelRequestMessage {
-                        role: self.messages[c_ix].role,
+                        role: effective_messages[c_ix].role,
                         content: compaction_content,
                         cache: false,
                     });
                     // Everything after the compaction verbatim (mapped), including
                     // the active tool-result turn.
-                    rebuilt.extend(self.messages[c_ix + 1..].iter().map(|m| {
+                    rebuilt.extend(effective_messages[c_ix + 1..].iter().map(|m| {
                         LanguageModelRequestMessage {
                             role: m.role,
                             content: m
@@ -4483,8 +4510,7 @@ impl Thread {
                     }));
                     rebuilt
                 }
-                None => self
-                    .messages
+                None => effective_messages
                     .iter()
                     .map(|m| LanguageModelRequestMessage {
                         role: m.role,
@@ -4582,16 +4608,34 @@ pub(crate) fn model_facing_content(
                 content: crate::tools::agent::agent_final_text(&tr.content),
             })
         }
-        MessageContent::Compaction(summary) => MessageContent::Text(
-            crate::prompt::render(
-                crate::prompt::PromptTemplate::WrapperCompactionPreamble,
-                lang,
-                &crate::prompt::CompactionPreambleData {
-                    summary: summary.clone(),
-                },
+        // Per-tool compact rewriting when context_optimization.history_rewrite
+        // is On. Results exceeding the per-tool budget are truncated with
+        // head+tail preservation. The canonical Thread::messages are untouched.
+        MessageContent::ToolResult(tr)
+            if crate::settings::context_optimization().history_rewrite
+                == crate::settings::Toggle::On =>
+        {
+            let budget = crate::optimizer::tool_budget(&tr.tool_name);
+            MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: tr.tool_use_id.clone(),
+                tool_name: tr.tool_name.clone(),
+                is_error: tr.is_error,
+                content: crate::optimizer::compact_tool_output(&tr.tool_name, &tr.content, budget),
+            })
+        }
+        MessageContent::Compaction(raw) => {
+            // The compaction payload may be a JSON envelope (v1+) or legacy
+            // plain text (v0). Extract the summary text for the model.
+            let (summary, _state) = crate::compact::parse_compaction(raw);
+            MessageContent::Text(
+                crate::prompt::render(
+                    crate::prompt::PromptTemplate::WrapperCompactionPreamble,
+                    lang,
+                    &crate::prompt::CompactionPreambleData { summary },
+                )
+                .expect("compaction preamble render"),
             )
-            .expect("compaction preamble render"),
-        ),
+        }
         other => other.clone(),
     }
 }

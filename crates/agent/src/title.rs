@@ -81,6 +81,9 @@ pub fn build_title_request(
         temperature: Some(0.3),
         thinking_allowed: false,
         reasoning_effort: None,
+        max_output_tokens: crate::settings::side_call_output_cap(
+            crate::settings::side_calls().title_policy(),
+        ),
     }
 }
 
@@ -161,6 +164,9 @@ pub fn build_topic_shift_request(
         temperature: Some(0.3),
         thinking_allowed: false,
         reasoning_effort: None,
+        max_output_tokens: crate::settings::side_call_output_cap(
+            crate::settings::side_calls().title_policy(),
+        ),
     }
 }
 

@@ -243,6 +243,12 @@ pub struct LanguageModelRequest {
     pub thinking_allowed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Per-request output token cap. `None` means use the model's configured
+    /// default. When set, the provider takes `min(request, model_max)`. Side
+    /// calls (title, goal, approval, compaction) use this to bound their
+    /// responses; the main turn loop leaves it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 /// A streaming completion event.

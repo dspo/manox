@@ -26,6 +26,7 @@ pub mod read_file;
 pub mod self_info;
 pub mod skill;
 pub mod task_stop;
+pub mod tool_search;
 pub mod truncate;
 pub mod update_plan;
 pub mod web_explore;
@@ -64,6 +65,7 @@ pub const MONITOR: &str = "Monitor";
 pub const READ: &str = "Read";
 pub const SELF_INFO: &str = "SelfInfo";
 pub const SKILL: &str = "Skill";
+pub const TOOL_SEARCH: &str = "ToolSearch";
 pub const UPDATE_PLAN: &str = "UpdatePlan";
 pub const WEB_FETCH: &str = "WebFetch";
 pub const ENTER_WORKTREE: &str = "EnterWorktree";
@@ -491,6 +493,16 @@ pub fn main_registry_with_policy(
     }
     // LSP tools already arrive through `base_tools_with_policy`, including for
     // the main agent. Do not register a duplicate set here.
+    // ToolSearch: lazy tool discovery via BM25 scoring. Only registered when
+    // tool_discovery is not Off (Shadow or On). The catalog is seeded once
+    // from the fully-assembled registry.
+    if !matches!(
+        crate::settings::context_optimization().tool_discovery,
+        crate::settings::Toggle::Off
+    ) {
+        tool_search::register(&mut reg);
+    }
+    tool_search::seed_catalog_from_registry(&reg);
     reg
 }
 

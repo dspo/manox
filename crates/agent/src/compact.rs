@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use futures::StreamExt as _;
 use gpui::AsyncApp;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::language_model::{
@@ -34,6 +35,102 @@ use crate::language_model::{
 };
 use crate::message::Message;
 use crate::thread::model_facing_content;
+
+// ─── compaction state capsule ──────────────────────────────────────────────
+
+/// Schema version for the compaction envelope. Increment when the shape of
+/// [`CompactionState`] changes in a way that would confuse a reader.
+const CAPSULE_VERSION: u32 = 1;
+
+/// Runtime state snapshot embedded in every compaction message. The next
+/// summarizer pass reads the most recent capsule + messages since then, so
+/// it never re-processes the full history — only the delta.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionState {
+    pub version: u32,
+    /// Absolute working directory at compaction time.
+    pub cwd: String,
+    /// Active worktree branch + path, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    /// Current git branch name at compaction time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// Active plan snapshot (simplified: just step titles + statuses).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_steps: Option<Vec<PlanStepCapsule>>,
+    /// The active goal, if one is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    /// Tool names currently in the registry. Helps the next instance know what
+    /// capabilities are available without re-discovering them.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub active_tools: Vec<String>,
+}
+
+/// A single plan step, slimmed for the capsule (no timestamps or metadata).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStepCapsule {
+    pub title: String,
+    pub status: String,
+}
+
+/// The on-wire format stored in [`MessageContent::Compaction`]. Legacy
+/// compactions (plain text without a JSON envelope) are treated as version 0
+/// with `summary` set to the raw text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactionEnvelope {
+    #[serde(default)]
+    version: u32,
+    summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state: Option<CompactionState>,
+}
+
+/// Parse a [`MessageContent::Compaction`] block into its envelope form.
+/// Returns `(summary_text, state)` — `state` is `None` for legacy compactions.
+pub fn parse_compaction(content: &str) -> (String, Option<CompactionState>) {
+    match serde_json::from_str::<CompactionEnvelope>(content) {
+        Ok(env) => (env.summary, env.state),
+        Err(_) => (content.to_string(), None),
+    }
+}
+
+/// Build the JSON envelope for a new compaction. The caller provides the
+/// summary text and the current runtime state.
+pub fn build_compaction_envelope(summary: String, state: CompactionState) -> String {
+    let envelope = CompactionEnvelope {
+        version: CAPSULE_VERSION,
+        summary,
+        state: Some(state),
+    };
+    serde_json::to_string(&envelope).unwrap_or_else(|_| envelope.summary.clone())
+}
+
+/// Collect runtime state for the compaction capsule from the thread's live
+/// fields. Callers pass what they have; `None` for unavailable fields.
+pub fn collect_compaction_state(
+    cwd: &std::path::Path,
+    worktree_branch: Option<&str>,
+    worktree_path: Option<&str>,
+    git_branch: Option<&str>,
+    plan_steps: Option<Vec<PlanStepCapsule>>,
+    goal: Option<&str>,
+    active_tools: Vec<String>,
+) -> CompactionState {
+    CompactionState {
+        version: CAPSULE_VERSION,
+        cwd: cwd.display().to_string(),
+        worktree_branch: worktree_branch.map(|s| s.to_string()),
+        worktree_path: worktree_path.map(|s| s.to_string()),
+        git_branch: git_branch.map(|s| s.to_string()),
+        plan_steps,
+        goal: goal.map(|s| s.to_string()),
+        active_tools,
+    }
+}
 
 /// Auto-compaction is only available for models whose context window is at
 /// least this large. Below it there is not enough headroom for a compaction
@@ -339,19 +436,25 @@ fn take_byte_prefix(text: &str, budget: usize) -> (String, usize) {
     (prefix.to_string(), cut)
 }
 
-/// Build the side-LLM request that produces a compaction summary. The request
-/// is the conversation region before `insertion_ix` (mapped to model-facing
-/// form so `agent`-tool envelopes and prior `Compaction` blocks become text),
-/// prefixed by the handoff summarization prompt as a system message and tailed
-/// by a user turn requesting the summary. Sub-agent nesting is collapsed: the
-/// summarizer is a one-shot task, not the agent in agent-mode.
+/// Build the side-LLM request that produces a compaction summary.
+///
+/// When a prior compaction exists before `insertion_ix`, the summarizer runs in
+/// **incremental mode**: it receives the previous summary (as a user-role
+/// preamble) plus only the new messages after that compaction — it never
+/// re-processes the full history. Without a prior compaction, the summarizer
+/// sees the full transcript before `insertion_ix` (current behavior).
+///
+/// Sub-agent nesting is collapsed: the summarizer is a one-shot task, not the
+/// agent in agent-mode.
 pub fn build_compaction_request(
     messages: &[Message],
     insertion_ix: usize,
     lang: crate::language::Language,
 ) -> LanguageModelRequest {
     let bound = insertion_ix.min(messages.len());
-    let mut request_messages: Vec<LanguageModelRequestMessage> = Vec::with_capacity(bound + 2);
+    let mut request_messages: Vec<LanguageModelRequestMessage> = Vec::new();
+
+    // ── system prompt ──────────────────────────────────────────────────
     request_messages.push(LanguageModelRequestMessage {
         role: Role::System,
         content: vec![MessageContent::Text(
@@ -363,17 +466,65 @@ pub fn build_compaction_request(
         )],
         cache: false,
     });
-    for m in &messages[..bound] {
+
+    // ── incremental or full history ────────────────────────────────────
+    // Find the most recent compaction before the insertion point.
+    let prev_compaction = latest_compaction_ix(messages, bound);
+
+    if let Some(prev_ix) = prev_compaction {
+        // Incremental mode: summarizer sees the previous summary as context
+        // plus only the new messages since that compaction.
+        let prev_content: String = messages[prev_ix]
+            .content
+            .iter()
+            .filter_map(|c| {
+                if let MessageContent::Compaction(text) = c {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (prev_summary, _prev_state) = parse_compaction(&prev_content);
+
+        // Inject the previous summary as a user-role context block.
         request_messages.push(LanguageModelRequestMessage {
-            role: m.role,
-            content: m
-                .content
-                .iter()
-                .map(|c| model_facing_content(c, lang))
-                .collect(),
+            role: Role::User,
+            content: vec![MessageContent::Text(format!(
+                "Previous compaction summary (use this as context; summarize ONLY the new messages below):\n\n{prev_summary}"
+            ))],
             cache: false,
         });
+
+        // Feed only the new messages after the previous compaction.
+        for m in &messages[prev_ix + 1..bound] {
+            request_messages.push(LanguageModelRequestMessage {
+                role: m.role,
+                content: m
+                    .content
+                    .iter()
+                    .map(|c| model_facing_content(c, lang))
+                    .collect(),
+                cache: false,
+            });
+        }
+    } else {
+        // Full mode: no prior compaction — summarize the entire history.
+        for m in &messages[..bound] {
+            request_messages.push(LanguageModelRequestMessage {
+                role: m.role,
+                content: m
+                    .content
+                    .iter()
+                    .map(|c| model_facing_content(c, lang))
+                    .collect(),
+                cache: false,
+            });
+        }
     }
+
+    // ── final instruction ──────────────────────────────────────────────
     request_messages.push(LanguageModelRequestMessage {
         role: Role::User,
         content: vec![MessageContent::Text(
@@ -393,6 +544,9 @@ pub fn build_compaction_request(
         temperature: Some(0.0),
         thinking_allowed: false,
         reasoning_effort: None,
+        max_output_tokens: crate::settings::side_call_output_cap(
+            crate::settings::side_calls().compaction_policy(),
+        ),
     }
 }
 

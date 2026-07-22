@@ -249,6 +249,10 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &AnyAgentTool> {
+        self.tools.values()
+    }
+
     /// Build the `LanguageModelRequestTool` list sent to the model, with tool
     /// descriptions and schema field descriptions rendered in `lang`. Tools
     /// whose prose is bilingualized are sourced from the descriptions asset;

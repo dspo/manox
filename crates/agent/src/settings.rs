@@ -37,6 +37,28 @@ pub fn modes() -> ModeSettingsMap {
     MODES.get().cloned().unwrap_or_default()
 }
 
+// ── context optimization & side-call caches ──────────────────────────
+
+static CONTEXT_OPT: OnceLock<ContextOptimizationSettings> = OnceLock::new();
+static SIDE_CALLS: OnceLock<SideCallsSettings> = OnceLock::new();
+
+/// Cache the optimization and side-call tables at startup.
+pub fn init_optimization() {
+    let s = load();
+    let _ = CONTEXT_OPT.set(s.context_optimization);
+    let _ = SIDE_CALLS.set(s.side_calls);
+}
+
+/// Cached context-optimization settings. Defaults when not yet initialized.
+pub fn context_optimization() -> ContextOptimizationSettings {
+    CONTEXT_OPT.get().copied().unwrap_or_default()
+}
+
+/// Cached side-call settings. Defaults when not yet initialized.
+pub fn side_calls() -> SideCallsSettings {
+    SIDE_CALLS.get().cloned().unwrap_or_default()
+}
+
 /// Build the [`crate::claude_md::LoadContext`] for instruction loading.
 ///
 /// Production reads the real home dir, the platform managed-policy path, and
@@ -108,6 +130,17 @@ pub struct Settings {
     /// `sandbox::NetworkPolicy::for_project` at registry-build time.
     #[serde(default, skip_serializing_if = "NetworkSettings::is_empty")]
     pub network: NetworkSettings,
+
+    /// Context optimization: tool discovery, history rewrite, pruning, and
+    /// compact output knobs. Shadow mode collects metrics without affecting
+    /// model-facing content.
+    #[serde(default)]
+    pub context_optimization: ContextOptimizationSettings,
+
+    /// Per-purpose side-call policies: title, goal evaluation, approval
+    /// review, and compaction summarization.
+    #[serde(default)]
+    pub side_calls: SideCallsSettings,
 }
 
 /// Network allowlist settings for the sandbox. Read once at startup by
@@ -127,6 +160,202 @@ impl NetworkSettings {
     /// Whether the allowlist is empty (no network plumbing needed).
     fn is_empty(&self) -> bool {
         self.allowlist.is_empty()
+    }
+}
+
+// ── context optimization settings ────────────────────────────────────
+
+/// Feature flags for context optimization. Each dimension is independently
+/// toggleable: `off`, `shadow` (collect metrics only, don't alter model-facing
+/// content), or `on` (apply the optimization).
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ContextOptimizationSettings {
+    /// Tool discovery via BM25 `ToolSearch`. When `shadow`, the tool schema
+    /// is sent but activations are logged, not applied.
+    #[serde(default)]
+    pub tool_discovery: Toggle,
+    /// Per-turn tool-result compact rewriting.
+    #[serde(default)]
+    pub history_rewrite: Toggle,
+    /// Superseded-read / useless-result pruning with hot-prefix protection.
+    #[serde(default)]
+    pub history_pruning: Toggle,
+    /// Whether tool results use per-tool output budgets (default 50 KiB cap
+    /// remains when false).
+    #[serde(default)]
+    pub compact_outputs: bool,
+    /// Code-mode orchestration: `off` or `hybrid` (keep native tools + add
+    /// the `Code` tool with QuickJS isolate).
+    #[serde(default)]
+    pub code_mode: CodeModeToggle,
+}
+
+/// Three-state toggle for optimization features.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Toggle {
+    #[default]
+    Off,
+    /// Collect metrics but don't alter model-facing content.
+    Shadow,
+    /// Apply the optimization.
+    On,
+}
+
+/// Code-mode toggle: `off` (no `Code` tool) or `hybrid` (add `Code` tool
+/// alongside native tools; the model can use either).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeModeToggle {
+    #[default]
+    Off,
+    Hybrid,
+}
+
+// ── side-call policy settings ────────────────────────────────────────
+
+/// Per-purpose side-call policies. Each key maps to a [`SideCallPolicy`];
+/// absent keys use the defaults below.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SideCallsSettings {
+    #[serde(default)]
+    pub title: SideCallPolicy,
+    #[serde(default)]
+    pub goal: SideCallPolicy,
+    #[serde(default)]
+    pub approval: SideCallPolicy,
+    #[serde(default)]
+    pub compaction: SideCallPolicy,
+}
+
+/// A side-call policy: which model, reasoning effort, output cap, and
+/// whether the call is enabled at all. An empty `model` reuses the main
+/// threadʼs active model. `max_output_tokens = 0` means uncapped.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SideCallPolicy {
+    /// Model id override. Empty → inherit the main model.
+    #[serde(default)]
+    pub model: String,
+    /// Reasoning effort: `low`, `medium`, `high`, or `xhigh` (ultracode).
+    /// `None` → no thinking (deterministic, fast).
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Output token cap. `0` → no per-request override.
+    #[serde(default)]
+    pub max_output_tokens: u32,
+    /// Whether this side call runs at all.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+impl SideCallsSettings {
+    /// Resolved title policy: user config overlaid on the title preset.
+    pub fn title_policy(&self) -> SideCallPolicy {
+        resolve_side_call_policy(&self.title, SideCallPolicy::title_default())
+    }
+    /// Resolved goal-evaluation policy.
+    pub fn goal_policy(&self) -> SideCallPolicy {
+        resolve_side_call_policy(&self.goal, SideCallPolicy::goal_default())
+    }
+    /// Resolved approval-review policy.
+    pub fn approval_policy(&self) -> SideCallPolicy {
+        resolve_side_call_policy(&self.approval, SideCallPolicy::approval_default())
+    }
+    /// Resolved compaction-summarization policy.
+    pub fn compaction_policy(&self) -> SideCallPolicy {
+        resolve_side_call_policy(&self.compaction, SideCallPolicy::compaction_default())
+    }
+}
+
+impl Default for SideCallPolicy {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            reasoning_effort: None,
+            max_output_tokens: 0,
+            enabled: true,
+        }
+    }
+}
+
+/// Convert a resolved [`SideCallPolicy`]'s `max_output_tokens` into the
+/// `Option<u32>` that [`LanguageModelRequest::max_output_tokens`] expects.
+/// `0` (the default "no override" sentinel) maps to `None`.
+pub fn side_call_output_cap(policy: SideCallPolicy) -> Option<u32> {
+    if policy.max_output_tokens > 0 && policy.enabled {
+        Some(policy.max_output_tokens)
+    } else {
+        None
+    }
+}
+
+/// Preset defaults for each side-call purpose (used when the user hasn't
+/// configured a specific key).
+impl SideCallPolicy {
+    pub const fn title_default() -> Self {
+        Self {
+            model: String::new(),
+            reasoning_effort: None,
+            max_output_tokens: 128,
+            enabled: true,
+        }
+    }
+
+    pub const fn goal_default() -> Self {
+        Self {
+            model: String::new(),
+            reasoning_effort: None,
+            max_output_tokens: 256,
+            enabled: true,
+        }
+    }
+
+    pub const fn approval_default() -> Self {
+        Self {
+            model: String::new(),
+            reasoning_effort: None,
+            max_output_tokens: 2048,
+            enabled: true,
+        }
+    }
+
+    pub const fn compaction_default() -> Self {
+        Self {
+            model: String::new(),
+            reasoning_effort: None,
+            max_output_tokens: 4096,
+            enabled: true,
+        }
+    }
+}
+
+/// Resolve a side-call policy: user-configured fields win; empty/zero fields
+/// fall back to the per-purpose preset.
+pub fn resolve_side_call_policy(user: &SideCallPolicy, preset: SideCallPolicy) -> SideCallPolicy {
+    let model = if user.model.is_empty() {
+        preset.model
+    } else {
+        user.model.clone()
+    };
+    let reasoning_effort = user.reasoning_effort.clone().or(preset.reasoning_effort);
+    let max_output_tokens = if user.max_output_tokens == 0 {
+        preset.max_output_tokens
+    } else {
+        user.max_output_tokens
+    };
+    let enabled = user.enabled;
+    SideCallPolicy {
+        model,
+        reasoning_effort,
+        max_output_tokens,
+        enabled,
     }
 }
 
@@ -319,5 +548,113 @@ follow_up_behavior = "Steer"
         let r = settings.resolve();
         assert_eq!(r.ui, Language::En);
         assert_eq!(r.agent, Language::En);
+    }
+
+    // ── context optimization / side-call tests ──────────────────────
+
+    #[test]
+    fn context_optimization_defaults_all_off() {
+        let s = ContextOptimizationSettings::default();
+        assert_eq!(s.tool_discovery, Toggle::Off);
+        assert_eq!(s.history_rewrite, Toggle::Off);
+        assert_eq!(s.history_pruning, Toggle::Off);
+        assert!(!s.compact_outputs);
+        assert_eq!(s.code_mode, CodeModeToggle::Off);
+    }
+
+    #[test]
+    fn toggle_serde_round_trips() {
+        for (val, json) in [
+            (Toggle::Off, "\"off\""),
+            (Toggle::Shadow, "\"shadow\""),
+            (Toggle::On, "\"on\""),
+        ] {
+            assert_eq!(serde_json::to_string(&val).unwrap(), json);
+            let back: Toggle = serde_json::from_str(json).unwrap();
+            assert_eq!(back, val);
+        }
+    }
+
+    #[test]
+    fn code_mode_toggle_serde_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&CodeModeToggle::Off).unwrap(),
+            "\"off\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CodeModeToggle::Hybrid).unwrap(),
+            "\"hybrid\""
+        );
+        let back: CodeModeToggle = serde_json::from_str("\"hybrid\"").unwrap();
+        assert_eq!(back, CodeModeToggle::Hybrid);
+    }
+
+    #[test]
+    fn side_call_policy_defaults() {
+        let p = SideCallPolicy::default();
+        assert!(p.model.is_empty());
+        assert!(p.reasoning_effort.is_none());
+        assert_eq!(p.max_output_tokens, 0);
+        assert!(p.enabled);
+    }
+
+    #[test]
+    fn side_call_presets() {
+        assert_eq!(SideCallPolicy::title_default().max_output_tokens, 128);
+        assert_eq!(SideCallPolicy::goal_default().max_output_tokens, 256);
+        assert_eq!(SideCallPolicy::approval_default().max_output_tokens, 2048);
+        assert_eq!(SideCallPolicy::compaction_default().max_output_tokens, 4096);
+    }
+
+    #[test]
+    fn resolve_side_call_policy_user_wins() {
+        let user = SideCallPolicy {
+            model: "custom".into(),
+            reasoning_effort: Some("high".into()),
+            max_output_tokens: 500,
+            enabled: false,
+        };
+        let r = resolve_side_call_policy(&user, SideCallPolicy::title_default());
+        assert_eq!(r.model, "custom");
+        assert_eq!(r.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(r.max_output_tokens, 500);
+        assert!(!r.enabled);
+    }
+
+    #[test]
+    fn resolve_side_call_policy_falls_back() {
+        let user = SideCallPolicy::default(); // all empty/zero
+        let r = resolve_side_call_policy(&user, SideCallPolicy::title_default());
+        assert_eq!(r.max_output_tokens, 128);
+        assert!(r.enabled);
+        assert!(r.model.is_empty()); // preset's model is also empty
+    }
+
+    #[test]
+    fn settings_deser_with_context_optimization() {
+        let raw = r#"
+ui_language = "en"
+
+[context_optimization]
+tool_discovery = "shadow"
+history_rewrite = "shadow"
+history_pruning = "shadow"
+compact_outputs = false
+code_mode = "off"
+
+[side_calls.title]
+max_output_tokens = 128
+
+[side_calls.compaction]
+reasoning_effort = "medium"
+max_output_tokens = 4096
+"#;
+        let s: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(s.context_optimization.tool_discovery, Toggle::Shadow);
+        assert_eq!(s.side_calls.title.max_output_tokens, 128);
+        assert_eq!(
+            s.side_calls.compaction.reasoning_effort.as_deref(),
+            Some("medium")
+        );
     }
 }

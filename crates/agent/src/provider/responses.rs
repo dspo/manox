@@ -135,7 +135,10 @@ impl LanguageModel for ResponsesModel {
         let url = responses_url(&self.endpoint_url);
         let api_key = self.api_key.clone();
         let model = self.api_model_id.clone();
-        let max_tokens = self.max_output_tokens;
+        let max_tokens = match request.max_output_tokens {
+            Some(cap) => (cap as u64).min(self.max_output_tokens),
+            None => self.max_output_tokens,
+        };
         let prompt_cache_key = self.id.clone();
         let long_ttl = self.long_ttl;
 

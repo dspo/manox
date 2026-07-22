@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_contains_engineering_stance() {
+    fn prompt_contains_tool_use_section() {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
@@ -254,34 +254,27 @@ mod tests {
             None,
             Language::En,
         );
+        assert!(p.contains("Tool use"), "tool use section: {p}");
         assert!(
-            p.contains("Engineering stance"),
-            "engineering stance section: {p}"
+            p.contains("Pass arguments strictly"),
+            "tool args discipline: {p}"
         );
         assert!(
-            p.contains("Own the end state"),
-            "end-state responsibility: {p}"
-        );
-        assert!(p.contains("root cause"), "root-cause discipline: {p}");
-    }
-
-    #[test]
-    fn prompt_contains_no_fabrication() {
-        let p = build_main_system_prompt(
-            Path::new("/tmp"),
-            None,
-            ApprovalMode::OnRequest,
-            None,
-            Language::En,
-        );
-        assert!(
-            p.contains("don't fabricate"),
-            "no-fabrication discipline: {p}"
+            p.contains("independent tool calls in parallel"),
+            "parallel tool call guidance: {p}"
         );
     }
 
+    // The "don't fabricate" / "no fabrication" discipline was carried by the
+    // "Engineering stance" section of the old (verbose) system prompt. The
+    // trimmed prompt removes generic best-practice prose that strong models
+    // already know; the guard against fabrication is now implicit in the
+    // overall instruction tone + tool-sandbox boundary. No dedicated test
+    // needed — the prompt's functional correctness is covered by the
+    // verification-discipline and static-prompt-embedded tests.
+
     #[test]
-    fn prompt_contains_task_completion() {
+    fn prompt_contains_context_economy() {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
@@ -290,9 +283,10 @@ mod tests {
             Language::En,
         );
         assert!(
-            p.contains("fully solved"),
-            "task completion discipline: {p}"
+            p.contains("Context economy"),
+            "context economy section: {p}"
         );
+        assert!(p.contains("byte-stable prefix"), "prefix cache note: {p}");
     }
 
     #[test]
@@ -323,10 +317,7 @@ mod tests {
             p.contains("Tool sandbox boundary"),
             "sandbox boundary section: {p}"
         );
-        assert!(
-            p.contains("`.git` directory is read-only"),
-            ".git protected: {p}"
-        );
+        assert!(p.contains("`.git` is read-only"), ".git protected: {p}");
         assert!(
             p.contains("unsandboxed"),
             "unsandboxed knob documented: {p}"
@@ -362,7 +353,7 @@ mod tests {
             None,
             Language::En,
         );
-        assert!(p.contains("Engineering stance"));
+        assert!(p.contains("Tool use"));
         assert!(p.contains("in-process native agent workbench"));
     }
 
@@ -423,7 +414,7 @@ mod tests {
             None,
             Language::ZhCn,
         );
-        assert!(p.contains("工程立场"), "zh-CN static prose missing: {p}");
+        assert!(p.contains("工具使用"), "zh-CN static prose missing: {p}");
         assert!(p.contains("## 运行时身份"), "zh-CN identity heading: {p}");
         assert!(p.contains("今天："), "zh-CN today row: {p}");
         assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
@@ -442,11 +433,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_distinguishes_discussion_from_implementation() {
-        // "How do I X" is a discussion request, not an implementation request —
-        // the agent must answer first and ask before touching code (thread
-        // bfb39601: agent started implementing on a "how do I add a
-        // marketplace" question).
+    fn prompt_contains_multi_agent_delegation() {
+        // The trimmed prompt condenses the old verbose sections into concise
+        // tool-usage rules. "Multi-agent delegation" carries the key contract:
+        // Agent, TeamCreate, and write-safety across members.
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
@@ -455,22 +445,11 @@ mod tests {
             Language::En,
         );
         assert!(
-            p.contains("Discussion vs implementation"),
-            "discussion section: {p}"
+            p.contains("Multi-agent delegation"),
+            "multi-agent section: {p}"
         );
-        assert!(p.contains("discussion or Q&A"), "discussion framing: {p}");
-        assert!(
-            p.contains("shall I implement this now?"),
-            "ask-before-implementing: {p}"
-        );
-        assert!(
-            p.contains("Don't modify code without an explicit request"),
-            "no-unsolicited-code-changes: {p}"
-        );
-        assert!(
-            p.contains("the user's actual request"),
-            "task-execution scoped to actual request: {p}"
-        );
+        assert!(p.contains("`Agent`"), "agent tool mention: {p}");
+        assert!(p.contains("TeamCreate"), "team-create mention: {p}");
     }
 
     #[test]
