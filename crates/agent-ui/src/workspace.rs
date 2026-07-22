@@ -727,25 +727,29 @@ impl Workspace {
                     input,
                 } => {
                     if tool_name == agent::tools::ASK_USER_QUESTION {
+                        // The question card is the only surface for an
+                        // interactive tool — it never queues as a generic
+                        // approval entry.
                         this.pending_ask = parse_pending_ask(id.clone(), input.clone());
                         this.ask_step = 0;
                         this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
+                    } else {
+                        // The `AutoReview` approval agent attaches a one-line reason
+                        // to every tool it escalates back to the overlay; pull it
+                        // out here so the user can see *why* the reviewer did not
+                        // auto-approve. We snapshot-and-clear on the Thread side
+                        // because each reason is single-use — a stale reason on
+                        // the next tool call would mislead the user.
+                        let reason = this
+                            .thread
+                            .update(cx, |t, _cx| t.take_approval_ask_reason(id.as_str()));
+                        this.pending_auths.push(PendingAuth {
+                            id: id.clone(),
+                            tool_name: tool_name.clone(),
+                            summary: summary.clone(),
+                            reason,
+                        });
                     }
-                    // The `AutoReview` approval agent attaches a one-line reason
-                    // to every tool it escalates back to the overlay; pull it
-                    // out here so the user can see *why* the reviewer did not
-                    // auto-approve. We snapshot-and-clear on the Thread side
-                    // because each reason is single-use — a stale reason on
-                    // the next tool call would mislead the user.
-                    let reason = this
-                        .thread
-                        .update(cx, |t, _cx| t.take_approval_ask_reason(id.as_str()));
-                    this.pending_auths.push(PendingAuth {
-                        id: id.clone(),
-                        tool_name: tool_name.clone(),
-                        summary: summary.clone(),
-                        reason,
-                    });
                     this.context_rail.update(cx, |r, cx| {
                         r.cockpit_phase = CockpitPhase::AwaitingApproval;
                         cx.notify();
@@ -2167,6 +2171,7 @@ impl Workspace {
                 self.pending_ask = parse_pending_ask(id.clone(), input);
                 self.ask_step = 0;
                 self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
+                continue;
             }
             let reason = self
                 .thread
@@ -2178,7 +2183,7 @@ impl Workspace {
                 reason,
             });
         }
-        if !self.pending_auths.is_empty() {
+        if !self.pending_auths.is_empty() || self.pending_ask.is_some() {
             cx.notify();
         }
     }

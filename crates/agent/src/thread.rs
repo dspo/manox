@@ -3886,7 +3886,7 @@ impl Thread {
                         ApprovalMode::Yolo | ApprovalMode::AutoReview
                     ) && !requires_user_input;
 
-                    if !requires_approval || always_allowed {
+                    if (!requires_approval || always_allowed) && !requires_user_input {
                         free.push(tu.clone());
                     } else if bypassed && this.approval_mode == ApprovalMode::Yolo {
                         // Yolo short-circuits; AutoReview must consult the
