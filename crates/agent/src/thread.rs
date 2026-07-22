@@ -730,12 +730,11 @@ impl Drop for Thread {
     /// runtime — `Drop` cannot await, and the runtime may already be gone at
     /// process teardown, so a missing handle is a quiet no-op. User-entered
     /// worktrees (`subagent_created == false`) are never auto-removed here;
-    /// they live until `exit_worktree` with `action=remove`.
     fn drop(&mut self) {
         // Cancel all background tasks owned by this thread so persistent
         // monitors and background bash are not orphaned.
         crate::background_task::cancel_all_for_thread(&self.id.0);
-        crate::background_task::remove_thread_event_bus(&self.id.0);
+        crate::background_task::remove_thread_mailbox(&self.id.0);
 
         let Some(wt) = self.worktree.take() else {
             return;
@@ -1635,7 +1634,7 @@ impl Thread {
         if archived {
             crate::background_task::cancel_all_for_thread(&self.id.0);
             crate::background_task::remove_all_for_thread(&self.id.0);
-            crate::background_task::remove_thread_event_bus(&self.id.0);
+            crate::background_task::remove_thread_mailbox(&self.id.0);
         }
         cx.notify();
     }
@@ -2149,61 +2148,14 @@ impl Thread {
     /// trained to treat these as informational, not as user authorization or
     /// instructions.
     fn drain_background_events(&mut self, cx: &mut Context<Self>) {
-        let (_, rx, _) = crate::background_task::ensure_thread_event_bus(&self.id.0);
-        let mut events = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            events.push(event);
-        }
-        // Also replay undelivered events from task ring buffers. This
-        // covers the case where the shared channel was full and
-        // try_send failed; the events are still in the task's ring buffer.
-        // We check all tasks owned by this thread.
-        let thread_id = self.id.0.clone();
-        if let Some(undelivered) = crate::background_task::get_by_str("") {
-            // no-op: get_by_str("") returns None
-            let _ = undelivered;
-        }
-        // Collect undelivered events from all running tasks for this thread.
-        let tasks = crate::background_task::tasks_for_thread(&thread_id);
-        for task in &tasks {
-            for event in task.undelivered_events() {
-                // Only add events not already in the channel-drained set.
-                if !events
-                    .iter()
-                    .any(|e| e.seq == event.seq && e.task_id == event.task_id)
-                {
-                    events.push(event);
-                }
-            }
-        }
-        // Sort by sequence number to maintain order.
-        events.sort_by_key(|e| (e.task_id.0.clone(), e.seq));
-        // Mark all as delivered.
-        for task in &tasks {
-            let max_seq = events
-                .iter()
-                .filter(|e| e.task_id.0 == task.owner_thread_id())
-                .map(|e| e.seq)
-                .max()
-                .unwrap_or(0);
-            task.mark_delivered(max_seq);
-        }
-
+        let events = crate::background_task::drain_thread_events(&self.id.0);
         if events.is_empty() {
             return;
         }
+        // Events are already in thread-seq order from the mailbox.
         let mut body = String::new();
         for event in &events {
-            let kind = if event.task_id.0.starts_with("ws_") {
-                crate::background_task::TaskKind::MonitorWebSocket
-            } else if event.task_id.0.starts_with("monitor_") {
-                crate::background_task::TaskKind::MonitorCommand
-            } else {
-                crate::background_task::TaskKind::BackgroundBash
-            };
-            body.push_str(&crate::background_task::format_event_for_model(
-                event, &kind,
-            ));
+            body.push_str(&crate::background_task::format_event_for_model(event));
             body.push('\n');
         }
         self.insert_user_message(body, cx);
@@ -2258,27 +2210,23 @@ impl Thread {
     pub fn run_turn(&mut self, cx: &mut Context<Self>) {
         // Ensure the background event auto-wake watcher is running. It's
         // spawned once per thread and lives for the thread's lifetime.
-        // The watcher uses Notify::notified() to wake without consuming
-        // events; when woken, it checks if the thread is idle and if so
-        // triggers run_turn to drain the event bus.
+        // The watcher waits on a `Notify` (created eagerly so no polling is
+        // needed); when woken, it checks if the thread is idle and if so
+        // triggers `run_turn` to drain the mailbox.
         if self.bg_watcher.is_none() {
             let thread_id = self.id.0.clone();
+            // Eagerly create the mailbox so the Notify always exists.
+            let notify = crate::background_task::ensure_thread_mailbox(&thread_id);
             let watcher = cx.spawn(async move |this, cx: &mut AsyncApp| {
-                let (_, _, notify) = crate::background_task::ensure_thread_event_bus(&thread_id);
                 loop {
-                    // Wait for a notification. This does not consume events
-                    // from the channel; it only signals that new events
-                    // may be available.
+                    // Wait for a notification. This does not consume events;
+                    // it only signals that new events may be available.
                     notify.notified().await;
                     // Check if the thread is idle and has pending events.
                     let should_wake = this
                         .update(cx, |this, _| {
-                            if this.running_turn.is_some() {
-                                return false;
-                            }
-                            let (_, rx, _) =
-                                crate::background_task::ensure_thread_event_bus(&this.id.0);
-                            !rx.is_empty()
+                            this.running_turn.is_none()
+                                && crate::background_task::thread_has_pending_events(&this.id.0)
                         })
                         .unwrap_or(false);
                     if should_wake {
@@ -2287,9 +2235,6 @@ impl Thread {
                         });
                     }
                 }
-                // Loop forever; the watcher lives for the thread's lifetime.
-                // The `#[allow(unreachable_code)]` suppresses the warning for
-                // the unreachable `Ok` after the infinite `loop`.
                 #[allow(unreachable_code)]
                 {}
             });
@@ -2399,9 +2344,7 @@ impl Thread {
             if !turn_cancelled {
                 let has_bg_events = this
                     .update(cx, |this, _| {
-                        let (_, rx, _) =
-                            crate::background_task::ensure_thread_event_bus(&this.id.0);
-                        !rx.is_empty()
+                        crate::background_task::thread_has_pending_events(&this.id.0)
                     })
                     .unwrap_or(false);
                 if has_bg_events {
@@ -3307,9 +3250,7 @@ impl Thread {
                         // during the final assistant stream. If any are
                         // pending, continue the loop to inject them.
                         let has_bg_events = this.update(cx, |this, _| {
-                            let (_, rx, _) =
-                                crate::background_task::ensure_thread_event_bus(&this.id.0);
-                            !rx.is_empty()
+                            crate::background_task::thread_has_pending_events(&this.id.0)
                         })?;
                         if has_bg_events {
                             continue;

@@ -20,7 +20,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::background_task::{self, TaskEvent, TaskId, TaskKind, TaskStatus};
+use crate::background_task::{self, TaskId, TaskKind, TaskStatus};
 use crate::tool::{AgentTool, ToolOutputSink};
 use crate::tools::schema;
 
@@ -215,9 +215,8 @@ impl AgentTool for MonitorTool {
         let description = parsed.description.clone();
         let proxy_port = ctx.network_proxy_port();
 
-        // Get the shared event bus for this thread. All tasks owned by the
-        // same thread send into the same channel; the Thread drains it.
-        let (_event_tx, _, _) = crate::background_task::ensure_thread_event_bus(&thread_id);
+        // Ensure the mailbox exists for this thread.
+        let _ = crate::background_task::thread_notify(&thread_id);
 
         let runtime = crate::runtime::handle().clone();
 
@@ -378,7 +377,7 @@ async fn run_command_monitor(
     let mut child = match c.spawn() {
         Ok(c) => c,
         Err(e) => {
-            task.set_terminal(TaskStatus::Failed);
+            task.push_terminal(&task_id, TaskStatus::Failed);
             return Err(format!("failed to spawn monitor command: {e}"));
         }
     };
@@ -405,7 +404,6 @@ async fn run_command_monitor(
     });
 
     let mut reader = BufReader::new(stdout).lines();
-    let mut event_seq: u64 = 0;
     let deadline = if persistent {
         None
     } else {
@@ -432,22 +430,11 @@ async fn run_command_monitor(
             line = reader.next_line() => {
                 match line {
                     Ok(Some(l)) => {
-                        event_seq += 1;
-                        task.push_event(TaskEvent {
-                            task_id: task_id.clone(),
-                            text: l,
-                            seq: event_seq,
-                            at: std::time::Instant::now(),
-                        });
+                        task.push_event(&task_id, l);
                     }
                     Ok(None) => break "eof",
                     Err(e) => {
-                        task.push_event(TaskEvent {
-                            task_id: task_id.clone(),
-                            text: format!("read error: {e}"),
-                            seq: event_seq + 1,
-                            at: std::time::Instant::now(),
-                        });
+                        task.push_event(&task_id, format!("read error: {e}"));
                         break "read-error";
                     }
                 }
@@ -457,13 +444,13 @@ async fn run_command_monitor(
 
     // Phase 2: after stdout EOF, continue racing cancel/timeout against
     // child.wait so a process that closes stdout but keeps running can still
-    // be stopped. Skip this if the child was already killed.
-    let (_final_status, exit_reason) = if matches!(exit_reason, "cancelled" | "timeout") {
-        (None::<()>, exit_reason)
+    // be stopped.
+    let exit_reason = if matches!(exit_reason, "cancelled" | "timeout") {
+        exit_reason
     } else {
         let deadline2 = deadline;
         let cancel2 = cancel.clone();
-        let reason = tokio::select! {
+        tokio::select! {
             _ = cancel2.cancelled() => {
                 kill_process_group(&child);
                 "cancelled"
@@ -480,26 +467,34 @@ async fn run_command_monitor(
             }
             status = child.wait() => {
                 match status {
-                    Ok(s) if s.success() => "eof",
-                    _ => "failed",
+                    Ok(s) if s.success() => {
+                        task.set_exit_code(s.code());
+                        "eof"
+                    }
+                    Ok(s) => {
+                        task.set_exit_code(s.code());
+                        "failed"
+                    }
+                    Err(_) => "failed",
                 }
             }
-        };
-        (None, reason)
+        }
     };
 
     let stderr_text = stderr_task.await.unwrap_or_default();
-
-    match exit_reason {
-        "cancelled" => task.set_terminal(TaskStatus::Stopped),
-        "timeout" => task.set_terminal(TaskStatus::TimedOut),
-        "eof" => task.set_terminal(TaskStatus::Completed),
-        _ => task.set_terminal(TaskStatus::Failed),
-    }
-
     if !stderr_text.is_empty() {
+        task.set_failure_summary(stderr_text.clone());
         tracing::info!(target: "monitor", %task_id, "monitor stderr:\n{stderr_text}");
     }
+
+    let terminal_status = match exit_reason {
+        "cancelled" => TaskStatus::Stopped,
+        "timeout" => TaskStatus::TimedOut,
+        "eof" => TaskStatus::Completed,
+        _ => TaskStatus::Failed,
+    };
+    task.push_terminal(&task_id, terminal_status);
+
     Ok(())
 }
 
@@ -513,25 +508,25 @@ async fn run_ws_monitor(
     task: Arc<background_task::BackgroundTask>,
 ) -> Result<(), String> {
     if let Err(e) = websocket::validate_ws_url(ws_url) {
-        task.set_terminal(TaskStatus::Failed);
+        task.push_terminal(&task_id, TaskStatus::Failed);
         return Err(e);
     }
     if let Err(e) = websocket::validate_protocols(ws_protocols) {
-        task.set_terminal(TaskStatus::Failed);
+        task.push_terminal(&task_id, TaskStatus::Failed);
         return Err(e);
     }
 
     let uri: tokio_tungstenite::tungstenite::http::Uri = match ws_url.parse() {
         Ok(u) => u,
         Err(e) => {
-            task.set_terminal(TaskStatus::Failed);
+            task.push_terminal(&task_id, TaskStatus::Failed);
             return Err(format!("invalid URL: {e}"));
         }
     };
     let host = match uri.host() {
         Some(h) => h.to_string(),
         None => {
-            task.set_terminal(TaskStatus::Failed);
+            task.push_terminal(&task_id, TaskStatus::Failed);
             return Err("URL has no host".into());
         }
     };
@@ -543,7 +538,7 @@ async fn run_ws_monitor(
     let pinned_addrs = match websocket::resolve_and_validate_addrs(&host, port) {
         Ok(a) => a,
         Err(e) => {
-            task.set_terminal(TaskStatus::Failed);
+            task.push_terminal(&task_id, TaskStatus::Failed);
             return Err(e);
         }
     };
@@ -564,12 +559,11 @@ async fn run_ws_monitor(
         match websocket::connect_pinned(&target, &pinned_addrs, deadline, &cancel).await {
             Ok(s) => s,
             Err(e) => {
-                task.set_terminal(TaskStatus::Failed);
+                task.set_failure_summary(e.clone());
+                task.push_terminal(&task_id, TaskStatus::Failed);
                 return Err(e);
             }
         };
-
-    let mut event_seq: u64 = 0;
 
     let exit_reason = loop {
         tokio::select! {
@@ -584,22 +578,10 @@ async fn run_ws_monitor(
             frame = websocket::read_frame(&mut stream) => {
                 match frame {
                     Ok(websocket::WsFrame::Text(text)) => {
-                        event_seq += 1;
-                        task.push_event(TaskEvent {
-                            task_id: task_id.clone(),
-                            text,
-                            seq: event_seq,
-                            at: std::time::Instant::now(),
-                        });
+                        task.push_event(&task_id, text);
                     }
                     Ok(websocket::WsFrame::Binary { len }) => {
-                        event_seq += 1;
-                        task.push_event(TaskEvent {
-                            task_id: task_id.clone(),
-                            text: format!("[binary frame: {len} bytes]"),
-                            seq: event_seq,
-                            at: std::time::Instant::now(),
-                        });
+                        task.push_event(&task_id, format!("[binary frame: {len} bytes]"));
                     }
                     Ok(websocket::WsFrame::Close { code, reason }) => {
                         let reason_str = reason.unwrap_or_default();
@@ -607,21 +589,12 @@ async fn run_ws_monitor(
                         let msg = format!(
                             "WebSocket closed by server (code={code_str}, reason={reason_str})"
                         );
-                        task.push_event(TaskEvent {
-                            task_id: task_id.clone(),
-                            text: msg,
-                            seq: event_seq + 1,
-                            at: std::time::Instant::now(),
-                        });
+                        task.push_event(&task_id, msg);
                         break "close";
                     }
                     Err(e) => {
-                        task.push_event(TaskEvent {
-                            task_id: task_id.clone(),
-                            text: format!("WebSocket error: {e}"),
-                            seq: event_seq + 1,
-                            at: std::time::Instant::now(),
-                        });
+                        task.set_failure_summary(e.clone());
+                        task.push_event(&task_id, format!("WebSocket error: {e}"));
                         break "error";
                     }
                 }
@@ -629,12 +602,13 @@ async fn run_ws_monitor(
         }
     };
 
-    match exit_reason {
-        "cancelled" => task.set_terminal(TaskStatus::Stopped),
-        "timeout" => task.set_terminal(TaskStatus::TimedOut),
-        "close" => task.set_terminal(TaskStatus::Completed),
-        _ => task.set_terminal(TaskStatus::Failed),
-    }
+    let terminal_status = match exit_reason {
+        "cancelled" => TaskStatus::Stopped,
+        "timeout" => TaskStatus::TimedOut,
+        "close" => TaskStatus::Completed,
+        _ => TaskStatus::Failed,
+    };
+    task.push_terminal(&task_id, terminal_status);
 
     Ok(())
 }
