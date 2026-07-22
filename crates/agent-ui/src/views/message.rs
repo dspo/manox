@@ -2460,7 +2460,14 @@ fn render_background_task(
         TaskStatus::Failed | TaskStatus::TimedOut => (IconName::CircleX, theme.danger),
         TaskStatus::Stopped | TaskStatus::SessionEnded => (IconName::Minus, theme.muted_foreground),
     };
-    let title = format!("{kind_str} · {desc}", desc = bt.description);
+    // A background bash description is the full command, heredoc body
+    // included — the title keeps only its first line; the complete text is
+    // one hover away via the title's tooltip.
+    let title = format!(
+        "{kind_str} · {desc}",
+        desc = bt.description.lines().next().unwrap_or("").trim()
+    );
+    let title_tooltip = bt.description.clone();
     let mut status_text = format!(
         "{status_str} · {task_id} · {events} events · {bytes} bytes",
         task_id = bt.task_id,
@@ -2502,30 +2509,46 @@ fn render_background_task(
             s.child(Icon::new(icon_name).xsmall().text_color(icon_color))
         })
         .child(
+            // flex_1 + min_w_0 give the text divs a definite width so
+            // text_ellipsis actually truncates; without them a nowrap line
+            // sizes to its content and paints past the card border.
             v_flex()
+                .flex_1()
+                .min_w_0()
                 .gap_0p5()
                 .child(
                     gpui::div()
+                        .id(("bg-task-title", ix))
+                        .w_full()
+                        .min_w_0()
                         .truncate()
                         .whitespace_nowrap()
                         .text_xs()
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.foreground)
-                        .child(title),
+                        .child(title)
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(title_tooltip.clone()).build(window, cx)
+                        }),
                 )
                 .child(
                     gpui::div()
+                        .w_full()
+                        .min_w_0()
                         .truncate()
                         .whitespace_nowrap()
                         .text_xs()
                         .text_color(theme.muted_foreground)
                         .child(status_text),
                 )
+                // The failure summary is the only UI surface for a task's
+                // error text, so the detail wraps in full (bounded to 2048
+                // chars at the source) instead of truncating to one line.
                 .when_some(detail, |column, detail| {
                     column.child(
                         gpui::div()
-                            .truncate()
-                            .whitespace_nowrap()
+                            .w_full()
+                            .min_w_0()
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(detail),

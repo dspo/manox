@@ -330,7 +330,7 @@ Compact, single-line sub-agent row: `[status] type · short title`. Running and 
 
 #### BackgroundTaskCard
 
-Bordered card showing a background task's kind (Monitor command / Monitor WebSocket / Background Bash), description, status badge (Running / Stopping / Completed / Failed / Timed out / Stopped / Session ended), event count, and total bytes. Running tasks show a spinner icon and a Stop button that calls `background_task::stop`. Terminal tasks show a static status icon. Updated in-place by task ID via `ThreadEvent::BackgroundTaskUpdated` — the card is created when the first event snapshot arrives and never duplicated.
+Bordered card showing a background task's kind (Monitor command / Monitor WebSocket / Background Bash), description, status badge (Running / Stopping / Completed / Failed / Timed out / Stopped / Session ended), event count, and total bytes. The title row keeps only the description's first line (a background bash description is the full command, heredoc body included) with single-line ellipsis; the complete text is shown in a hover tooltip. The detail row (failure summary or latest event) wraps in full — it is the only UI surface for a task's error text. Running tasks show a spinner icon and a Stop button that calls `background_task::stop`. Terminal tasks show a static status icon. Updated in-place by task ID via `ThreadEvent::BackgroundTaskUpdated` — the card is created when the first event snapshot arrives and never duplicated.
 
 > Source: `agent-ui/src/views/message.rs`
 
