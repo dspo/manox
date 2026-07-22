@@ -77,11 +77,12 @@ pub fn init(cx: &mut App) {
     // call). Runs after MCP so the registry is settled before the first
     // `main_registry` build picks up LSP tools.
     lsp::init();
-    // The store opens the real `threads.db` into an un-clearable `OnceLock`,
-    // which leaks the entity in the first test to call init. Tests use
-    // `thread_store::init_for_test` (a clearable `TEST_OVERRIDE`) instead, so
-    // skip the production init in test-support builds.
-    #[cfg(not(feature = "test-support"))]
+    // Always initialize the global ThreadStore. In test-support builds the
+    // real db is also opened, but `global()` checks `TEST_OVERRIDE` first —
+    // tests that call `init_for_test` after `init` still get the in-memory
+    // store over the real one. Skipping this call (the prior `#[cfg(not(…))]`
+    // guard) caused a launch-time panic in `Sidebar::new` → `thread_store_global`
+    // whenever the binary was built with `test-support` enabled.
     thread_store::init(cx);
     hashline::init();
     agent_def::init();
