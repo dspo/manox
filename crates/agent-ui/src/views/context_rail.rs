@@ -25,11 +25,14 @@ use std::time::Duration;
 
 use agent::{Thread, ThreadEvent, i18n};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, Entity, Render,
-    SharedString, WeakEntity, Window, deferred, ease_out_quint, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardItem, Context, Entity,
+    MouseButton, MouseUpEvent, Render, SharedString, WeakEntity, Window, ease_out_quint,
+    prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, h_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
+    h_flex,
+    notification::Notification,
     tooltip::Tooltip, v_flex,
 };
 
@@ -44,7 +47,7 @@ use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_disp
 
 /// Floating card width. Wide enough for the per-model usage block: model id
 /// (plus trailing cache-hit badge) on the top line, `├── 穿透` (input /
-/// output) and `└── 缓存` (cache create / cache read) tree rows underneath,
+/// (input / output) and `└── 缓存` (cache read) tree rows underneath,
 /// each with `↑↓` animated counters.
 pub(crate) const ENV_CARD_WIDTH: f32 = 260.;
 /// Right inset the conversation body reserves for the floating card: the
@@ -115,10 +118,6 @@ pub(crate) struct ContextRail {
     /// first refresh completes; the changes/branch rows render placeholders
     /// until then.
     pub(crate) git_branch_display: Option<GitBranchDisplay>,
-    /// Open branch-row context menu entity + its dismiss subscription. Created
-    /// on open, dropped on close — mirrors the title-menu pattern.
-    pub(crate) branch_menu: Option<Entity<gpui_component::menu::PopupMenu>>,
-    branch_menu_sub: Option<gpui::Subscription>,
 }
 
 impl ContextRail {
@@ -143,8 +142,6 @@ impl ContextRail {
             env_counter_state: HashMap::new(),
             git_change_stats: None,
             git_branch_display: None,
-            branch_menu: None,
-            branch_menu_sub: None,
         }
     }
 
@@ -181,7 +178,6 @@ impl ContextRail {
         self.plan_seen = false;
         self.git_change_stats = None;
         self.git_branch_display = None;
-        self.close_branch_menu();
         cx.notify();
     }
 
@@ -196,12 +192,6 @@ impl ContextRail {
         self.git_change_stats = stats;
         self.git_branch_display = display;
         cx.notify();
-    }
-
-    /// Drop the open branch-row context menu entity + subscription.
-    pub(crate) fn close_branch_menu(&mut self) {
-        self.branch_menu = None;
-        self.branch_menu_sub = None;
     }
 
     /// Update `cockpit_phase` for the streaming/tool variants that flow through
@@ -522,13 +512,11 @@ impl ContextRail {
             .into_any_element()
     }
 
-    /// Branch block: (1) the worktree directory basename in foreground, shown
-    /// only while the thread is inside a worktree; (2) the branch row —
-    /// resolved branch or detached sha (+ "(detached)") as the label with the
-    /// changes counts as its right-aligned trailing. The branch line is the
-    /// clickable affordance for the copy / exit-worktree context menu — it
-    /// never exits directly, so a stray click cannot destroy the isolation
-    /// context.
+    /// Branch block: (1) the worktree directory basename, shown only while the
+    /// thread is inside a worktree — click copies the name, double-click copies
+    /// the absolute path; (2) the branch row — resolved branch or detached sha
+    /// (+ "(detached)") as the label with the changes counts as its right-aligned
+    /// trailing. Both rows copy on click with a notification for feedback.
     fn render_branch_block(
         &mut self,
         project: &Option<PathBuf>,
@@ -538,8 +526,7 @@ impl ContextRail {
         let display = self.git_branch_display.clone();
         let worktree_path = self.thread.read(cx).worktree().map(|w| w.path.clone());
 
-        // Branch label (line 2): branch / detached sha + (detached). No
-        // worktree suffix — that lives on its own line above when present.
+        // Branch label: branch / detached sha + (detached).
         let branch_label: SharedString = match &display {
             Some(d) if d.is_no_repo() => i18n::t("workspace-env-git-not-a-repo"),
             Some(d) => {
@@ -569,96 +556,25 @@ impl ContextRail {
 
         let changes_line = self.render_changes_trailing(project, theme);
 
-        let menu_open = self.branch_menu.is_some();
-        let trigger = env_row_clickable(
+        // Branch row: click copies the branch name with notification feedback.
+        let branch_for_copy = display
+            .as_ref()
+            .and_then(|d| d.branch.clone());
+        let branch_feedback = i18n::t("workspace-env-git-copied-branch");
+        let branch_row = env_row_clickable(
             "icons/git-branch.svg".into(),
             branch_label,
             Some(changes_line),
             theme,
-            menu_open,
-            cx.listener(move |this, _: &ClickEvent, window, cx| {
-                if this.branch_menu.is_some() {
-                    this.close_branch_menu();
-                    cx.notify();
-                    return;
+            move |_ev: &ClickEvent, window, cx| {
+                if let Some(ref name) = branch_for_copy {
+                    cx.write_to_clipboard(ClipboardItem::new_string(name.clone()));
+                    window.push_notification(
+                        Notification::success(branch_feedback.clone()),
+                        cx,
+                    );
                 }
-                let rail = cx.entity().downgrade();
-                let branch = this
-                    .git_branch_display
-                    .as_ref()
-                    .and_then(|d| d.branch.clone());
-                let worktree_path = this.thread.read(cx).worktree().map(|w| w.path.clone());
-                let in_worktree = this.thread.read(cx).worktree().is_some();
-                let thread = this.thread.clone();
-                let menu =
-                    gpui_component::menu::PopupMenu::build(window, cx, move |menu, _w, _cx| {
-                        let mut menu = menu.label(i18n::t("workspace-env-changes"));
-                        if let Some(b) = &branch {
-                            let b = b.clone();
-                            let r = rail.clone();
-                            menu = menu.item(
-                                gpui_component::menu::PopupMenuItem::new(i18n::t(
-                                    "workspace-env-git-copy-branch",
-                                ))
-                                .on_click(move |_, _, cx| {
-                                    let _ = r.update(cx, |this, cx| {
-                                        this.copy_to_clipboard(b.clone(), cx);
-                                        this.close_branch_menu();
-                                        cx.notify();
-                                    });
-                                }),
-                            );
-                        }
-                        if let Some(p) = &worktree_path {
-                            let p = p.clone();
-                            let r = rail.clone();
-                            menu = menu.item(
-                                gpui_component::menu::PopupMenuItem::new(i18n::t(
-                                    "workspace-env-git-copy-path",
-                                ))
-                                .on_click(move |_, _, cx| {
-                                    let _ = r.update(cx, |this, cx| {
-                                        this.copy_to_clipboard(p.display().to_string(), cx);
-                                        this.close_branch_menu();
-                                        cx.notify();
-                                    });
-                                }),
-                            );
-                        }
-                        if in_worktree {
-                            let t = thread.clone();
-                            let r = rail.clone();
-                            menu = menu.separator().item(
-                                gpui_component::menu::PopupMenuItem::new(i18n::t(
-                                    "workspace-env-git-exit-worktree",
-                                ))
-                                .on_click(move |_, _, cx| {
-                                    let _ = r.update(cx, |this, cx| {
-                                        this.close_branch_menu();
-                                        t.update(cx, |thread, cx| {
-                                            let _ = thread.exit_worktree(cx);
-                                        });
-                                        cx.notify();
-                                    });
-                                }),
-                            );
-                        }
-                        menu
-                    });
-                let sub = cx.subscribe(
-                    &menu,
-                    |this: &mut ContextRail,
-                     _menu: Entity<gpui_component::menu::PopupMenu>,
-                     _: &gpui::DismissEvent,
-                     cx: &mut Context<ContextRail>| {
-                        this.close_branch_menu();
-                        cx.notify();
-                    },
-                );
-                this.branch_menu = Some(menu);
-                this.branch_menu_sub = Some(sub);
-                cx.notify();
-            }),
+            },
         );
 
         let mut block = v_flex().w_full().gap_0p5();
@@ -667,11 +583,39 @@ impl ContextRail {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let basename_clone = basename.clone();
+            let name_feedback = i18n::t("workspace-env-git-copied-worktree-name");
+            let path_feedback = i18n::t("workspace-env-git-copied-worktree-path");
+            let path_for_copy = path.display().to_string();
             block = block.child(
                 h_flex()
                     .w_full()
                     .items_center()
                     .gap_2()
+                    .cursor_pointer()
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |_this, e: &MouseUpEvent, window, cx| {
+                            if e.click_count >= 2 {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    path_for_copy.clone(),
+                                ));
+                                window.push_notification(
+                                    Notification::success(path_feedback.clone()),
+                                    cx,
+                                );
+                            } else {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    basename_clone.clone(),
+                                ));
+                                window.push_notification(
+                                    Notification::success(name_feedback.clone()),
+                                    cx,
+                                );
+                            }
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(
                         Icon::new(Icon::default().path("icons/workflow.svg"))
                             .xsmall()
@@ -688,40 +632,9 @@ impl ContextRail {
                     ),
             );
         }
-        block = block.child(trigger);
+        block = block.child(branch_row);
 
-        if !menu_open {
-            return block.into_any_element();
-        }
-        let menu = self
-            .branch_menu
-            .clone()
-            .expect("branch_menu exists when open");
-        // `deferred` + `with_priority(1)` paints the dropdown after the whole
-        // rail panel tree, so it floats above the usage/budget/plan rows
-        // that follow the branch block instead of being overpainted by them.
-        gpui::div()
-            .relative()
-            .child(block)
-            .child(
-                deferred(
-                    gpui::div()
-                        .id("branch-dropdown")
-                        .absolute()
-                        .top_full()
-                        .left_0()
-                        .occlude()
-                        .child(menu),
-                )
-                .with_priority(1),
-            )
-            .into_any_element()
-    }
-
-    /// Copy a string to the clipboard. Silent success — clipboard writes need
-    /// no separate UI feedback; the branch menu closes on click.
-    fn copy_to_clipboard(&self, value: String, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(value));
+        block.into_any_element()
     }
 
     fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -1080,9 +993,13 @@ impl ContextRail {
         }
 
         // Expanded: every step, in a bounded scroll region so a long plan does
-        // not push the rest of the rail off-screen.
+        // not push the rest of the rail off-screen. Incomplete steps (Pending,
+        // InProgress) sort before completed ones; within each group the
+        // original chronological order is preserved.
         let mut list = v_flex().w_full().gap_1();
-        for step in &plan.steps {
+        let mut steps: Vec<&agent::PlanStep> = plan.steps.iter().collect();
+        steps.sort_by_key(|s| s.status == PlanStepStatus::Completed);
+        for step in steps {
             list = list.child(self.render_plan_row(step, theme));
         }
         v_flex()
@@ -1182,10 +1099,9 @@ fn cockpit_status_block(icon: IconName, phase: AnyElement, theme: &Theme) -> Any
         .into_any_element()
 }
 
-/// A clickable variant of [`env_row`]: the whole row is a pointer cursor with
-/// an `on_click` handler, and tints the icon foreground when `open` so the
-/// affordance matches an open dropdown below it. Used by the branch row to
-/// open its context menu.
+/// A clickable row with an icon, label, and optional trailing element. The
+/// whole row is a pointer cursor with an `on_click` handler. Used by the
+/// branch row to copy the branch name.
 ///
 /// `icon_path` is a `icons/…` asset path resolved through `ExtrasAssetSource`,
 /// not an `IconName` — the rail's branch / worktree glyphs (lucide
@@ -1196,14 +1112,8 @@ fn env_row_clickable(
     label: SharedString,
     trailing: Option<AnyElement>,
     theme: &Theme,
-    open: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let icon_color = if open {
-        theme.accent
-    } else {
-        theme.muted_foreground
-    };
     h_flex()
         .id("env-row-clickable")
         .w_full()
@@ -1214,7 +1124,7 @@ fn env_row_clickable(
         .child(
             Icon::new(Icon::default().path(icon_path))
                 .xsmall()
-                .text_color(icon_color),
+                .text_color(theme.muted_foreground),
         )
         .child(
             gpui::div()

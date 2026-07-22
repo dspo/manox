@@ -181,7 +181,7 @@ fn main() {
             #[cfg(not(target_os = "macos"))]
             gpui::KeyBinding::new("ctrl-alt-/", agent_ui::UndoLastQueued, None),
             // Cockpit milestone panel: cmd/ctrl-shift-m collapses or expands
-            // the plan-steps section in the "Conversation info" card. The
+            // the plan-steps section in the "Conversation Info" card. The
             // header is also clickable; this is the keyboard affordance.
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-shift-m", agent_ui::ToggleCockpitTasks, None),

@@ -518,7 +518,7 @@ titlebar-not-implemented = Not implemented yet.
 workspace-env-changes = Changes
 workspace-env-no-project = No project
 workspace-env-usage = Usage
-workspace-env-throughput = Throughput
+workspace-env-throughput = Input
 workspace-env-cache = Cache
 workspace-env-output = Output
 workspace-env-cache-hit-rate = cache {$pct}%
@@ -527,21 +527,21 @@ workspace-env-no-sources = No sources yet
 workspace-env-git-unavailable = git unavailable
 workspace-env-git-not-a-repo = Not a git repo
 workspace-env-git-detached = detached
-workspace-env-git-copy-branch = Copy branch name
-workspace-env-git-copy-path = Copy worktree path
-workspace-env-git-exit-worktree = Exit worktree
+workspace-env-git-copied-branch = Branch name copied to clipboard.
+workspace-env-git-copied-worktree-name = Worktree name copied to clipboard.
+workspace-env-git-copied-worktree-path = Worktree path copied to clipboard.
 
 # ── Context rail (right sidecar) ────────────────────────────────────────
-context-rail-title = Conversation info
+context-rail-title = Conversation Info
 
 # ── Cockpit (run status / milestones / context budget) ──────────────────
-# Phase labels for the run-status row (three-tag pill: streaming / thinking /
-# awaiting input).
-cockpit-status-thinking = Thinking
-cockpit-status-streaming = Streaming
-# The "awaiting input" tag label (collapsed state of idle/stopped/failed/
+# Phase labels for the run-status row (three-tag pill: generating / reasoning /
+# user-turn).
+cockpit-status-thinking = Reasoning
+cockpit-status-streaming = Generating
+# The "user-turn" tag label (collapsed state of idle/stopped/failed/
 # awaiting-approval).
-cockpit-status-awaiting-input = Awaiting input
+cockpit-status-awaiting-input = UserTurn
 # Plan section header.
 cockpit-milestones-header = Plan
 # Plan progress count shown at the right of the header. {$done}/{$total} are
