@@ -391,12 +391,11 @@ pub(crate) fn base_tools_with_policy(
         Arc::new(skill::SkillTool { lang }),
         // BashOutput: poll a background shell started by Bash with run_in_background.
         Arc::new(bash_output::BashOutputTool) as AnyAgentTool,
-        // Monitor: runs background commands through the sandbox policy and
-        // WebSocket connections through validated addresses. Shared with
-        // sub-agents.
+        // Monitor: runs background commands directly under `sh -c` (no
+        // sandbox) and WebSocket connections through validated addresses.
+        // Shared with sub-agents.
         Arc::new(monitor::MonitorTool::new(
             cwd.as_ref().clone(),
-            sandbox.clone(),
             plugin_root.clone(),
         )) as AnyAgentTool,
         // Lightweight HTTP GET for public docs. Read-only and shared with

@@ -7,9 +7,12 @@
 //! owning Thread's shared event channel. The Thread drains this channel at
 //! safe join points (idle → auto-wakeup, or running → steer queue).
 //!
-//! `command` and `ws` are mutually exclusive. Command Monitor runs through
-//! the same sandbox/supervisor path as Bash. WebSocket connections are
-//! validated (URL, DNS, private-address rejection) and never auto-reconnect.
+//! `command` and `ws` are mutually exclusive. Command Monitor runs the command
+//! directly under `sh -c`, without the seatbelt sandbox — mirroring Claude
+//! Code. An observability tool needs network access, which the sandbox's
+//! write-isolation and network-blocking design would defeat; it shares only
+//! the supervisor process bus with Bash. WebSocket connections are validated
+//! (URL, DNS, private-address rejection) and never auto-reconnect.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,21 +76,12 @@ struct MonitorResult {
 
 pub struct MonitorTool {
     cwd: PathBuf,
-    sandbox: crate::sandbox::SandboxPolicy,
     plugin_root: Option<PathBuf>,
 }
 
 impl MonitorTool {
-    pub fn new(
-        cwd: PathBuf,
-        sandbox: crate::sandbox::SandboxPolicy,
-        plugin_root: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            cwd,
-            sandbox,
-            plugin_root,
-        }
+    pub fn new(cwd: PathBuf, plugin_root: Option<PathBuf>) -> Self {
+        Self { cwd, plugin_root }
     }
 }
 
@@ -109,42 +103,6 @@ impl AgentTool for MonitorTool {
 
     fn input_schema(&self) -> serde_json::Value {
         schema::<MonitorInput>()
-    }
-
-    fn requires_approval(&self, input: &serde_json::Value) -> bool {
-        if input.get("ws").is_some() {
-            return true;
-        }
-        let has_command = input.get("command").and_then(|v| v.as_str()).is_some();
-        if has_command {
-            let unsandboxed = input
-                .get("unsandboxed")
-                .and_then(|v| match v {
-                    serde_json::Value::Bool(b) => Some(*b),
-                    serde_json::Value::String(s) => {
-                        Some(s.eq_ignore_ascii_case("true") || s == "1")
-                    }
-                    _ => None,
-                })
-                .unwrap_or(false);
-            if unsandboxed {
-                return true;
-            }
-            if let Some(cmd) = input.get("command").and_then(serde_json::Value::as_str)
-                && crate::sandbox::is_cross_app_automation(cmd)
-            {
-                return true;
-            }
-            return !crate::sandbox::is_available();
-        }
-        false
-    }
-
-    fn is_always_allowable(&self, input: &serde_json::Value) -> bool {
-        if input.get("ws").is_some() {
-            return false;
-        }
-        true
     }
 
     fn run(
@@ -215,7 +173,6 @@ impl AgentTool for MonitorTool {
         let goal_id = ctx.goal_id().map(str::to_owned);
         let anchor_message_id = ctx.anchor_message_id().map(str::to_owned);
         let description = parsed.description.clone();
-        let proxy_port = ctx.network_proxy_port();
 
         // Ensure the mailbox exists for this thread.
         let _ = crate::background_task::ensure_thread_mailbox(&thread_id);
@@ -243,7 +200,6 @@ impl AgentTool for MonitorTool {
             let tid_result = task_id;
             let cmd_c = command;
             let desc_c = description;
-            let sandbox = self.sandbox.clone();
             let plugin_root = self.plugin_root.clone();
             let base_cwd = self.cwd.clone();
             let handle = runtime.spawn(async move {
@@ -256,8 +212,6 @@ impl AgentTool for MonitorTool {
                     task_cancel,
                     tid_run,
                     task_clone,
-                    &sandbox,
-                    proxy_port,
                     plugin_root.as_deref(),
                 )
                 .await;
@@ -350,30 +304,14 @@ async fn run_command_monitor(
     cancel: CancellationToken,
     task_id: TaskId,
     task: Arc<background_task::BackgroundTask>,
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-    sandbox: &crate::sandbox::SandboxPolicy,
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] proxy_port: Option<u16>,
     plugin_root: Option<&std::path::Path>,
 ) -> Result<(), String> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    #[cfg(target_os = "macos")]
-    let mut c = if crate::sandbox::is_available() {
-        sandbox.wrap_command(command, cwd, proxy_port)
-    } else {
-        let mut c = tokio::process::Command::new("sh");
-        c.arg("-c").arg(command);
-        c.current_dir(cwd);
-        c
-    };
-    #[cfg(not(target_os = "macos"))]
-    let mut c = {
-        let mut c = tokio::process::Command::new("sh");
-        c.arg("-c").arg(command);
-        c.current_dir(cwd);
-        c
-    };
+    let mut c = tokio::process::Command::new("sh");
+    c.arg("-c").arg(command);
+    c.current_dir(cwd);
 
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(root) = plugin_root {
@@ -739,5 +677,21 @@ mod tests {
             ws_connect_failure_status(false, false, TaskStatus::Stopped),
             TaskStatus::Failed
         );
+    }
+
+    #[test]
+    fn monitor_runs_without_approval() {
+        // Monitor is an observability tool exempt from the approval gate
+        // (mirroring Claude Code): neither command nor ws input requires
+        // approval, so it falls through to the trait default.
+        let tool = MonitorTool::new(PathBuf::from("/tmp"), None);
+        assert!(!tool.requires_approval(&serde_json::json!({
+            "description": "d",
+            "command": "tail -f /var/log/system.log",
+        })));
+        assert!(!tool.requires_approval(&serde_json::json!({
+            "description": "d",
+            "ws": {"url": "wss://example.com/ws"},
+        })));
     }
 }
