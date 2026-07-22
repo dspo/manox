@@ -342,7 +342,7 @@ pub struct Workspace {
     plus_menu_sub: Option<Subscription>,
     /// Access-chip dropdown (Normal / YOLO mode). Mirrors the model selector pattern.
     access_open: bool,
-    /// Reasoning-effort dropdown (Low / Medium / High / XHigh / Max / Ultracode / Auto).
+    /// Reasoning-effort dropdown (High / Max).
     effort_open: bool,
     effort_menu: Option<Entity<PopupMenu>>,
     effort_menu_sub: Option<Subscription>,
@@ -3952,8 +3952,8 @@ impl Workspace {
         let open = self.effort_open;
         let selected = self.thread.read(cx).reasoning_effort();
         let workspace = cx.entity().downgrade();
-        // Effort enum values are provider wire literals (low/medium/high/...),
-        // not UI chrome — they are not localized.
+        // Effort enum values are provider wire literals (high/max), not UI
+        // chrome — they are not localized.
         let label = selected.wire_value();
 
         let trigger = h_flex()

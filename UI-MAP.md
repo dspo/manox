@@ -524,7 +524,7 @@ Trigger: [AccessChip](#accesschip). [ApprovalMode](#approval-modes) selector: On
 
 #### EffortMenu
 
-Trigger: [EffortChip](#effortchip). [ReasoningEffort](#reasoning-effort-levels): Low / Medium / High / XHigh / Max / Ultracode / Auto.
+Trigger: [EffortChip](#effortchip). [ReasoningEffort](#reasoning-effort-levels): High / Max.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -1044,7 +1044,7 @@ Execution mode. Full tool set. No mode-specific developer instructions injected 
 
 #### Plan
 
-Read-only research-and-plan mode. Tool set filtered to read-only (no write/bash/submit tools). Per-mode overrides apply (`reasoning_effort = Medium`, plan-mode developer instructions injected as a fixed-position `<collaboration_mode>` User message at request-build time — never persisted into history, never woven into the system prompt, so the provider prefix cache stays warm across mode-stable turns). The model submits a plan by emitting a single `<proposed_plan>…</proposed_plan>` block; block content surfaces as a [PlanReviewCard](#planreviewcard) drawer card in the message list (verdict buttons in the card). Goal accounting is suspended in Plan mode.
+Read-only research-and-plan mode. Tool set filtered to read-only (no write/bash/submit tools). Plan inherits the thread's reasoning effort (no override) and injects plan-mode developer instructions as a fixed-position `<collaboration_mode>` User message at request-build time — never persisted into history, never woven into the system prompt, so the provider prefix cache stays warm across mode-stable turns. The model submits a plan by emitting a single `<proposed_plan>…</proposed_plan>` block; block content surfaces as a [PlanReviewCard](#planreviewcard) drawer card in the message list (verdict buttons in the card). Goal accounting is suspended in Plan mode.
 
 ---
 
@@ -1078,12 +1078,7 @@ Greyed out, "denied" label.
 
 Values selectable in [EffortMenu](#effortmenu).
 
-#### Low
-#### Medium
 #### High
-#### XHigh
 #### Max
-#### Ultracode
-#### Auto
 
 

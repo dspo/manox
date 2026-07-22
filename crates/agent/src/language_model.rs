@@ -8,6 +8,7 @@ use std::sync::Arc;
 use futures::{future::BoxFuture, stream::BoxStream};
 use gpui::AsyncApp;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     *value == T::default()
@@ -150,12 +151,32 @@ pub enum LanguageModelToolChoice {
 
 /// User-facing reasoning effort knob for providers that expose an effort
 /// parameter (Anthropic `output_config.effort`, OpenAI `reasoning.effort`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     #[default]
     High,
     Max,
+}
+
+impl<'de> Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "high" => Self::High,
+            "max" => Self::Max,
+            other => {
+                warn!(
+                    effort = other,
+                    "unknown reasoning_effort in config; falling back to High"
+                );
+                Self::High
+            }
+        })
+    }
 }
 
 impl ReasoningEffort {
@@ -411,6 +432,32 @@ mod tests {
     fn as_i64_round_trips() {
         for effort in ReasoningEffort::ALL {
             assert_eq!(ReasoningEffort::from_i64(effort.as_i64()), effort);
+        }
+    }
+
+    #[test]
+    fn deserialize_unknown_variant_falls_back_to_high() {
+        // Old settings.toml values must not break the entire config parse.
+        for (input, expected) in [
+            ("high", ReasoningEffort::High),
+            ("max", ReasoningEffort::Max),
+            // Removed variants: each must fall back to High.
+            ("low", ReasoningEffort::High),
+            ("medium", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::High),
+            ("ultracode", ReasoningEffort::High),
+            ("auto", ReasoningEffort::High),
+            ("garbage", ReasoningEffort::High),
+        ] {
+            let v: ReasoningEffort =
+                serde_json::from_str(&format!("\"{input}\"")).unwrap_or_else(|e| {
+                    panic!("deserialize \"{input}\" must succeed, got: {e}")
+                });
+            assert_eq!(
+                v, expected,
+                "\"{input}\" must resolve to {:?}, got {:?}",
+                expected, v
+            );
         }
     }
 }
