@@ -366,9 +366,9 @@ fn build_request_body(
     }
     // `output_config.effort` is a top-level field (not part of the cached
     // message prefix, so toggling it does not break prefix caching). The value
-    // is already resolved to a concrete level by `build_completion_request` —
-    // `Auto` / `Ultracode` never reach here. Gated on `supports_effort` so
-    // older Claude and non-Claude Anthropic-wire models do not 400.
+    // is always a concrete wire level (High or Max) when it reaches here.
+    // Gated on `supports_effort` so older Claude and non-Claude Anthropic-wire
+    // models do not 400.
     if supports_effort && let Some(effort) = request.reasoning_effort {
         body["output_config"] = json!({ "effort": effort.wire_value() });
     }

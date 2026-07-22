@@ -80,7 +80,7 @@ pub struct ThreadRecord {
     /// Three-state approval mode (0 = OnRequest, 1 = AutoReview, 2 = Yolo).
     /// Persisted as INTEGER for schema-stability across enum reorderings.
     pub approval_mode: i64,
-    /// Reasoning effort (0 = Low, 1 = Medium, …, 6 = Auto).
+    /// Reasoning effort (2 = High, 4 = Max).
     /// Persisted as INTEGER matching `ReasoningEffort::as_i64`.
     pub reasoning_effort: i64,
     pub depth: i32,
@@ -133,7 +133,7 @@ pub fn create_table(conn: &Connection) -> Result<()> {
             project TEXT,
             agent_language TEXT NOT NULL DEFAULT 'en',
             approval_mode INTEGER NOT NULL DEFAULT 1,
-            reasoning_effort INTEGER NOT NULL DEFAULT 1,
+            reasoning_effort INTEGER NOT NULL DEFAULT 2,
             depth INTEGER NOT NULL DEFAULT 0,
             parent_id TEXT,
             archived INTEGER NOT NULL DEFAULT 0,
@@ -512,7 +512,7 @@ impl ThreadRecord {
             project: String::new(),
             agent_language: "en".into(),
             approval_mode: 0,
-            reasoning_effort: 1,
+            reasoning_effort: 2,
             depth: 0,
             parent_id: None,
             archived: false,

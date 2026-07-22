@@ -18,5 +18,4 @@
 {% else -%}
 - 你无法处理图片。如果有图片附件，如实说明并请用户提供文字描述，不要声称能看到它。
 {% endif %}{% if goal %}
-{% include "mode/goal.tera.md" %}{% endif %}{% if ultracode %}
-{% include "mode/ultracode.tera.md" %}{% endif %}
+{% include "mode/goal.tera.md" %}{% endif %}

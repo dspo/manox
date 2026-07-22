@@ -22,13 +22,12 @@ pub enum PromptTemplate {
     /// plain-markdown file.
     SystemMain,
     /// Final system message assembly: a pre-rendered base plus optional mode
-    /// addendums (goal / ultracode / sub-agent worktree). Rendered once at the
+    /// addendums (goal / sub-agent worktree). Rendered once at the
     /// `build_completion_request` boundary so no `push_str` lands in flow code.
     SystemAssembly,
 
     // --- mode addendums (static prose, no variables) ---
     ModeGoalAddendum,
-    ModeUltracodeGrant,
 
     // --- conversation wrappers (inserted into history as user/tool messages) ---
     WrapperMaxTurnsSummary,
@@ -75,7 +74,6 @@ impl PromptTemplate {
             Self::SystemMain => "system/main.tera.md",
             Self::SystemAssembly => "system/assembly.tera.md",
             Self::ModeGoalAddendum => "mode/goal.tera.md",
-            Self::ModeUltracodeGrant => "mode/ultracode.tera.md",
             Self::WrapperMaxTurnsSummary => "wrapper/max_turns_summary.tera.md",
             Self::WrapperMaxTokensDirective => "wrapper/max_tokens_directive.tera.md",
             Self::WrapperRecoveryFailure => "wrapper/recovery_failure.tera.md",
@@ -108,11 +106,10 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 26] = [
+pub const ALL: [PromptTemplate; 25] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::ModeGoalAddendum,
-    PromptTemplate::ModeUltracodeGrant,
     PromptTemplate::WrapperMaxTurnsSummary,
     PromptTemplate::WrapperMaxTokensDirective,
     PromptTemplate::WrapperRecoveryFailure,

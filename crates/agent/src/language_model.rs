@@ -8,6 +8,7 @@ use std::sync::Arc;
 use futures::{future::BoxFuture, stream::BoxStream};
 use gpui::AsyncApp;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 fn is_default<T: Default + PartialEq>(value: &T) -> bool {
     *value == T::default()
@@ -150,101 +151,71 @@ pub enum LanguageModelToolChoice {
 
 /// User-facing reasoning effort knob for providers that expose an effort
 /// parameter (Anthropic `output_config.effort`, OpenAI `reasoning.effort`).
-/// `Auto` and `Ultracode` are not API values — `resolve_for_wire` folds them
-/// into a concrete level before the request reaches any provider.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
-    Low,
-    Medium,
     #[default]
     High,
-    XHigh,
     Max,
-    Ultracode,
-    Auto,
+}
+
+impl<'de> Deserialize<'de> for ReasoningEffort {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "high" => Self::High,
+            "max" => Self::Max,
+            other => {
+                warn!(
+                    effort = other,
+                    "unknown reasoning_effort in config; falling back to High"
+                );
+                Self::High
+            }
+        })
+    }
 }
 
 impl ReasoningEffort {
-    pub const ALL: [Self; 7] = [
-        Self::Low,
-        Self::Medium,
-        Self::High,
-        Self::XHigh,
-        Self::Max,
-        Self::Ultracode,
-        Self::Auto,
-    ];
+    pub const ALL: [Self; 2] = [Self::High, Self::Max];
 
     /// Wire value for Anthropic-style and generic providers.
     pub fn wire_value(self) -> &'static str {
         match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
             Self::High => "high",
-            Self::XHigh => "xhigh",
             Self::Max => "max",
-            Self::Ultracode => "ultracode",
-            Self::Auto => "auto",
-        }
-    }
-
-    /// Resolve `Auto` / `Ultracode` into a concrete level the wire accepts.
-    /// Providers only ever receive the resolved value: `Auto` picks the
-    /// per-context default (main thread, depth 0 → `High`; sub-agent →
-    /// `Medium`, floored so it never drops below `Medium`), and `Ultracode`
-    /// resolves to `XHigh` for the wire while its multi-agent grant is a
-    /// separate system-message side effect handled in `build_completion_request`.
-    pub fn resolve_for_wire(self, depth: u32) -> Self {
-        match self {
-            Self::Auto => {
-                if depth == 0 {
-                    Self::High
-                } else {
-                    Self::Medium
-                }
-            }
-            Self::Ultracode => Self::XHigh,
-            other => other,
         }
     }
 
     /// Wire value for official OpenAI endpoints, which only accept
-    /// `low` / `medium` / `high`. Everything above `high` is clamped. `Auto`
-    /// never reaches a provider — `resolve_for_wire` folds it away first —
-    /// so it is absent from the non-clamp set and would clamp to `high` if
-    /// it ever did reach this call.
+    /// `low` / `medium` / `high`. `Max` is clamped to `high` on official
+    /// OpenAI; compatible endpoints pass `max` through.
     pub fn openai_wire_value(self, official_openai: bool) -> &'static str {
-        if official_openai && !matches!(self, Self::Low | Self::Medium | Self::High) {
+        if official_openai && matches!(self, Self::Max) {
             "high"
         } else {
             self.wire_value()
         }
     }
 
-    /// Integer encoding for SQLite persistence. Mirrors `ApprovalMode::as_i64`.
+    /// Integer encoding for SQLite persistence. Keeps the original code points
+    /// (`High` = 2, `Max` = 4) for backward compatibility with existing DB
+    /// records; unknown values fall back to `High`.
     pub fn from_i64(v: i64) -> Self {
         match v {
-            0 => Self::Low,
-            1 => Self::Medium,
             2 => Self::High,
-            3 => Self::XHigh,
             4 => Self::Max,
-            5 => Self::Ultracode,
-            6 => Self::Auto,
             _ => Self::High,
         }
     }
 
     pub fn as_i64(self) -> i64 {
         match self {
-            Self::Low => 0,
-            Self::Medium => 1,
             Self::High => 2,
-            Self::XHigh => 3,
             Self::Max => 4,
-            Self::Ultracode => 5,
-            Self::Auto => 6,
         }
     }
 }
@@ -435,53 +406,56 @@ mod tests {
     use super::ReasoningEffort;
 
     #[test]
-    fn resolve_for_wire_auto_uses_high_for_main_thread() {
-        // Main thread (depth 0) → High; the floor is Medium, but the main
-        // agent default is High.
-        assert_eq!(
-            ReasoningEffort::Auto.resolve_for_wire(0),
-            ReasoningEffort::High
-        );
+    fn wire_values_match_provider_expectations() {
+        assert_eq!(ReasoningEffort::High.wire_value(), "high");
+        assert_eq!(ReasoningEffort::Max.wire_value(), "max");
     }
 
     #[test]
-    fn resolve_for_wire_auto_uses_medium_for_subagent() {
-        // Sub-agents step down to Medium and never drop below it.
-        assert_eq!(
-            ReasoningEffort::Auto.resolve_for_wire(1),
-            ReasoningEffort::Medium
-        );
-        assert_eq!(
-            ReasoningEffort::Auto.resolve_for_wire(5),
-            ReasoningEffort::Medium
-        );
+    fn openai_wire_value_clamps_max_on_official_openai() {
+        assert_eq!(ReasoningEffort::Max.openai_wire_value(true), "high");
+        // Compatible endpoints pass max through.
+        assert_eq!(ReasoningEffort::Max.openai_wire_value(false), "max");
     }
 
     #[test]
-    fn resolve_for_wire_ultracode_folds_to_xhigh() {
-        // Ultracode's wire value is xhigh; the multi-agent grant is a separate
-        // system-message side effect, not a wire value.
-        assert_eq!(
-            ReasoningEffort::Ultracode.resolve_for_wire(0),
-            ReasoningEffort::XHigh
-        );
-        assert_eq!(
-            ReasoningEffort::Ultracode.resolve_for_wire(3),
-            ReasoningEffort::XHigh
-        );
+    fn from_i64_is_backward_compatible_and_falls_back_to_high() {
+        // Known code points.
+        assert_eq!(ReasoningEffort::from_i64(2), ReasoningEffort::High);
+        assert_eq!(ReasoningEffort::from_i64(4), ReasoningEffort::Max);
+        // Unknown values fall back to High.
+        assert_eq!(ReasoningEffort::from_i64(0), ReasoningEffort::High);
+        assert_eq!(ReasoningEffort::from_i64(99), ReasoningEffort::High);
     }
 
     #[test]
-    fn resolve_for_wire_passes_concrete_levels_through() {
-        for level in [
-            ReasoningEffort::Low,
-            ReasoningEffort::Medium,
-            ReasoningEffort::High,
-            ReasoningEffort::XHigh,
-            ReasoningEffort::Max,
+    fn as_i64_round_trips() {
+        for effort in ReasoningEffort::ALL {
+            assert_eq!(ReasoningEffort::from_i64(effort.as_i64()), effort);
+        }
+    }
+
+    #[test]
+    fn deserialize_unknown_variant_falls_back_to_high() {
+        // Old settings.toml values must not break the entire config parse.
+        for (input, expected) in [
+            ("high", ReasoningEffort::High),
+            ("max", ReasoningEffort::Max),
+            // Removed variants: each must fall back to High.
+            ("low", ReasoningEffort::High),
+            ("medium", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::High),
+            ("ultracode", ReasoningEffort::High),
+            ("auto", ReasoningEffort::High),
+            ("garbage", ReasoningEffort::High),
         ] {
-            assert_eq!(level.resolve_for_wire(0), level);
-            assert_eq!(level.resolve_for_wire(2), level);
+            let v: ReasoningEffort = serde_json::from_str(&format!("\"{input}\""))
+                .unwrap_or_else(|e| panic!("deserialize \"{input}\" must succeed, got: {e}"));
+            assert_eq!(
+                v, expected,
+                "\"{input}\" must resolve to {:?}, got {:?}",
+                expected, v
+            );
         }
     }
 }
