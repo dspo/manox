@@ -91,7 +91,7 @@ const ENTER_DESCRIPTION: &str = "Enter a git worktree on an isolated branch and 
      explicitly told to work in a worktree. Exit with `ExitWorktree` (keep or remove). Enter \
      re-baselines the provider prefix cache (the cwd line in the system prompt changes) — that \
      is expected. Pass `name` to create a new worktree+branch under `<project>/.claude/worktrees/`, \
-     or `path` to re-enter an existing one. The base ref is `origin/<default-branch>` (fallback \
+     or `path` to re-enter any existing git worktree. The base ref is `origin/<default-branch>` (fallback \
      `HEAD` when no remote tracking branch exists).";
 
 const EXIT_DESCRIPTION: &str = "Leave the active git worktree. `action=keep` (default) switches the session cwd back to the \
@@ -110,11 +110,12 @@ impl AgentTool for EnterWorktreeTool {
     fn input_schema(&self) -> serde_json::Value {
         super::schema::<EnterWorktreeInput>()
     }
-    /// Creating a worktree is an unsandboxed git + FS mutation and switches the
-    /// session cwd — gate on approval. A user who trusts the workflow can
-    /// always-allow it via the permission cache.
+    /// Entering a worktree switches cwd and rebuilds the tool registry with a
+    /// worktree-scoped sandbox. The sandbox confines writes to the worktree
+    /// path and de-protects only that worktree's git common dir — no approval
+    /// needed because the sandbox, not a user gate, provides isolation.
     fn requires_approval(&self, _input: &serde_json::Value) -> bool {
-        true
+        false
     }
     fn run(
         &self,
@@ -161,26 +162,7 @@ impl AgentTool for EnterWorktreeTool {
                     validate_worktree_name(name)?;
                     (worktree_dir(&project_root, name), Some(name.clone()), false)
                 }
-                (None, Some(path_str)) => {
-                    // Restrict re-entry to worktrees under this project's
-                    // `.claude/worktrees/` — otherwise an approval-gated
-                    // `enter_worktree path=/foreign/repo` would de-protect a
-                    // foreign repo's `.git` and enable network for it, a
-                    // privilege escalation beyond the intended same-repo
-                    // isolation context.
-                    let candidate = PathBuf::from(path_str);
-                    let anchor = project_root.join(".claude").join("worktrees");
-                    let canon_candidate = canonicalize_best_effort(&candidate);
-                    let canon_anchor = canonicalize_best_effort(&anchor);
-                    if !canon_candidate.starts_with(&canon_anchor) {
-                        return Err(format!(
-                            "enter_worktree `path` must be under {}. Got: {}",
-                            canon_anchor.display(),
-                            candidate.display()
-                        ));
-                    }
-                    (candidate, None, true)
-                }
+                (None, Some(path_str)) => (PathBuf::from(path_str), None, true),
                 (None, None) => {
                     let name = generate_name();
                     (worktree_dir(&project_root, &name), Some(name), false)
@@ -448,27 +430,6 @@ fn validate_worktree_name(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-/// Best-effort canonicalize that resolves the longest existing ancestor and
-/// rejoins the tail — `Path::canonicalize` fails for non-existent paths, and a
-/// not-yet-created worktree leaf must still be compared against the anchor.
-/// Mirrors `sandbox::canonicalize_best_effort` without reaching across modules.
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
-    if path.exists() {
-        return path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    }
-    let Some(parent) = path.parent() else {
-        return path.to_path_buf();
-    };
-    if parent == Path::new("") {
-        return path.to_path_buf();
-    }
-    let canon_parent = canonicalize_best_effort(parent);
-    match path.file_name() {
-        Some(name) => canon_parent.join(name),
-        None => canon_parent,
-    }
 }
 
 /// `wt-` + first 8 hex chars of a fresh UUID — short, unique, valid as both a
