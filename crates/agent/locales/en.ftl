@@ -600,6 +600,7 @@ plan-drawer-clear = Clear & Implement
 ### about.rs (About window)
 about-title = About Manox
 about-ok = OK
+about-copy = Copy
 
 # Background task status card
 background-task-kind-command = Monitor (command)
