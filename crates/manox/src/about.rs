@@ -65,12 +65,7 @@ impl Render for AboutWindow {
                     .gap_3()
                     .items_center()
                     .child(gpui::img(self.app_icon.clone()).size(px(48.)).flex_none())
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::BOLD)
-                            .child("Manox"),
-                    )
+                    .child(div().text_lg().font_weight(FontWeight::BOLD).child("Manox"))
                     .child(
                         div()
                             .text_sm()
