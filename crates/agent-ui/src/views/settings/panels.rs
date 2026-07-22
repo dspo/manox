@@ -912,9 +912,12 @@ pub fn render_config(view: &mut SettingsView, cx: &mut Context<SettingsView>) ->
             row_with_control(
                 i18n::t("settings-row-config-version"),
                 None,
-                // The version is a build identifier (e.g. "26.630.12135"), not
-                // user-facing copy. Not routed through i18n.
-                muted_text("26.630.12135".into(), muted),
+                // Build identifier captured at compile time — commit SHA and
+                // build type. Not routed through i18n.
+                muted_text(
+                    SharedString::from(agent::version::full_version_string()),
+                    muted,
+                ),
             ),
             hairline(theme.border.opacity(0.6)),
             row_with_control(

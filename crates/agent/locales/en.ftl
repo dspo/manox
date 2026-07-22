@@ -478,6 +478,7 @@ menu-file = File
 menu-terminal = Terminal
 menu-new-terminal = New Terminal Tab
 menu-close-terminal = Close Terminal Tab
+menu-about = About Manox
 
 ### terminal-ui (overlay status / search)
 terminal-placeholder = Terminal running… type to interact
@@ -573,3 +574,7 @@ plan-card-sidebar = Open in side panel
 # Plan review card verdict buttons
 plan-drawer-implement = Implement
 plan-drawer-clear = Clear & Implement
+
+### about.rs (About window)
+about-title = About Manox
+about-ok = OK

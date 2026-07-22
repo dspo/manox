@@ -426,6 +426,7 @@ menu-file = File
 menu-terminal = 终端
 menu-new-terminal = 新建终端标签页
 menu-close-terminal = 关闭终端标签页
+menu-about = 关于 Manox
 
 ### terminal-ui (overlay status / search)
 terminal-placeholder = 终端运行中… 输入以交互
@@ -513,3 +514,7 @@ plan-card-sidebar = 在侧边栏打开
 # Plan review card verdict buttons
 plan-drawer-implement = 执行
 plan-drawer-clear = 清空并执行
+
+### about.rs (About window)
+about-title = 关于 Manox
+about-ok = 确定

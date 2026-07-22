@@ -45,6 +45,7 @@ pub mod title_state;
 pub mod token_meter;
 pub mod tool;
 pub mod tools;
+pub mod version;
 pub mod webview_host;
 
 use gpui::App;

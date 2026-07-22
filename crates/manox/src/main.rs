@@ -8,7 +8,9 @@ use gpui::{WindowBounds, WindowOptions};
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 use std::borrow::Cow;
 
-actions!(manox, [Quit, ToggleFullscreen]);
+mod about;
+
+actions!(manox, [Quit, ToggleFullscreen, OpenAbout]);
 
 /// Minimum window width budget, left to right:
 /// sidebar (260) + sidebar divider (6) + a readable conversation column
@@ -242,6 +244,9 @@ fn main() {
                 let _ = handle.update(cx, |_, window, _| window.toggle_fullscreen());
             }
         });
+        cx.on_action(|_: &OpenAbout, cx: &mut App| {
+            about::open_about_window(cx);
+        });
         // macOS system menu items are evaluated against App-level on_action
         // handlers, not the view tree's local on_action listeners. Registering
         // the dispatch here keeps Settings… enabled when the Workspace is the
@@ -422,6 +427,7 @@ fn build_app_menus() -> Vec<Menu> {
     {
         vec![
             Menu::new("manox").items([
+                MenuItem::action(agent::i18n::t("menu-about"), OpenAbout),
                 MenuItem::separator(),
                 MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
                 MenuItem::separator(),
@@ -442,6 +448,8 @@ fn build_app_menus() -> Vec<Menu> {
     #[cfg(not(target_os = "macos"))]
     {
         vec![Menu::new(agent::i18n::t("menu-file")).items([
+            MenuItem::action(agent::i18n::t("menu-about"), OpenAbout),
+            MenuItem::separator(),
             MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
             MenuItem::separator(),
             MenuItem::action(
