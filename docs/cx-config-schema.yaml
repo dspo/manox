@@ -28,8 +28,8 @@ providers:
         agents: ["string (optional override filter)"]
         env:
           VAR_NAME: "string (optional; 启动时注入的环境变量，仅用于配置值，不要存放密钥——密钥请用 apikey_source 或专用 env 文件)"
-        max_tokens: "integer (optional; model context window size in tokens, e.g. 1000000)"
-        max_output_tokens: "integer (optional; max tokens per response; defaults to a heuristic from max_tokens)"
+        max_tokens: "integer (optional; max tokens per response; defaults to a heuristic from context)"
+        context: "integer (optional; model context window size in tokens, e.g. 1000000)"
         supports_tools: "bool (optional; default true)"
         supports_images: "bool (optional; default false)"
 

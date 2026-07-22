@@ -204,14 +204,14 @@ pub struct ModelConfig {
     pub agents: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Maximum tokens a single response may emit. When unset, the consumer
-    /// derives a heuristic from the context window.
-    #[serde(default)]
-    pub max_output_tokens: Option<u64>,
-    /// Model context window size in tokens. Numeric counterpart to the display
-    /// `context` string; takes precedence for request sizing when present.
+    /// Maximum output tokens a single response may emit. When unset, the
+    /// consumer derives a heuristic from the context window.
     #[serde(default)]
     pub max_tokens: Option<u64>,
+    /// Model context window size in tokens. Takes precedence for request
+    /// sizing when present.
+    #[serde(default)]
+    pub context: Option<u64>,
     /// Whether the model accepts tool definitions. Defaults to `true` at
     /// resolution time so existing reasoning/chat models keep tool access.
     #[serde(default)]
@@ -233,9 +233,9 @@ pub struct ProviderModelConfig {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
-    pub max_output_tokens: Option<u64>,
-    #[serde(default)]
     pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub context: Option<u64>,
     #[serde(default)]
     pub supports_tools: Option<bool>,
     #[serde(default)]
@@ -435,8 +435,8 @@ impl ProviderConfig {
                         wire_apis: model.wire_apis.clone(),
                         agents: model.agents.clone(),
                         env: model.env.clone(),
-                        max_output_tokens: model.max_output_tokens,
                         max_tokens: model.max_tokens,
+                        context: model.context,
                         supports_tools: model.supports_tools,
                         supports_images: model.supports_images,
                     })
@@ -505,12 +505,12 @@ pub struct ResolvedModel {
     pub env: BTreeMap<String, String>,
     /// apikey resolution source from the provider (`keychain:SERVICE` / `env:VAR` / `literal:` / `$(shell ...)`).
     pub apikey_source: Option<String>,
-    /// Maximum tokens a single response may emit. Defaults to 384K when not
-    /// specified in config or by the remote models API.
-    pub max_output_tokens: Option<u64>,
-    /// Model context window size in tokens. Defaults to 1M when not specified
-    /// in config or by the remote models API.
+    /// Maximum output tokens a single response may emit. Defaults to 384K
+    /// when not specified in config or by the remote models API.
     pub max_tokens: Option<u64>,
+    /// Model context window size in tokens. Defaults to 1M when not
+    /// specified in config or by the remote models API.
+    pub context: Option<u64>,
     /// Whether the model accepts tool definitions. `true` when the model did
     /// not opt out, so existing models keep tool access by default.
     pub supports_tools: bool,
@@ -521,9 +521,9 @@ pub struct ResolvedModel {
 
 impl ResolvedModel {
     /// Fallback context window when neither config nor remote API provides it: 1M tokens.
-    pub const DEFAULT_MAX_TOKENS: u64 = 1_000_000;
+    pub const DEFAULT_CONTEXT: u64 = 1_000_000;
     /// Fallback max output tokens: 384K.
-    pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 384_000;
+    pub const DEFAULT_MAX_TOKENS: u64 = 384_000;
 
     /// Build a resolved model with shared semantics: `visible_agents` is the
     /// effective set for this model (wire_api-compatible agents, filtered by the
@@ -561,10 +561,10 @@ impl ResolvedModel {
             endpoint_url: endpoint.url.clone(),
             visible_agents: effective_agents_for_model(config, provider, endpoint, model),
             copilot_auth: CopilotAuth::from_endpoint(endpoint),
-            env: merged_env,
             apikey_source: provider.apikey_source.clone(),
-            max_output_tokens: Some(model.max_output_tokens.unwrap_or(Self::DEFAULT_MAX_OUTPUT_TOKENS)),
+            env: merged_env,
             max_tokens: Some(model.max_tokens.unwrap_or(Self::DEFAULT_MAX_TOKENS)),
+            context: Some(model.context.unwrap_or(Self::DEFAULT_CONTEXT)),
             supports_tools: model.supports_tools.unwrap_or(true),
             supports_images: model.supports_images.unwrap_or(false),
         }
@@ -1372,8 +1372,8 @@ providers:
   models:
     m1:
       wire_apis: [anthropic]
-      max_output_tokens: 8192
-      max_tokens: 200000
+      max_tokens: 8192
+      context: 200000
       supports_tools: false
       supports_images: true
   endpoints:
@@ -1383,8 +1383,8 @@ providers:
         let config: CxConfig = yaml.parse().expect("parse");
         let resolved = config.resolve_all_models();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].max_output_tokens, Some(8192));
-        assert_eq!(resolved[0].max_tokens, Some(200_000));
+        assert_eq!(resolved[0].max_tokens, Some(8192));
+        assert_eq!(resolved[0].context, Some(200_000));
         assert!(!resolved[0].supports_tools);
         assert!(resolved[0].supports_images);
     }
@@ -1408,12 +1408,12 @@ providers:
         let resolved = config.resolve_all_models();
         assert_eq!(resolved.len(), 1);
         assert_eq!(
-            resolved[0].max_output_tokens,
-            Some(ResolvedModel::DEFAULT_MAX_OUTPUT_TOKENS)
-        );
-        assert_eq!(
             resolved[0].max_tokens,
             Some(ResolvedModel::DEFAULT_MAX_TOKENS)
+        );
+        assert_eq!(
+            resolved[0].context,
+            Some(ResolvedModel::DEFAULT_CONTEXT)
         );
         assert!(resolved[0].supports_tools, "tools default on");
         assert!(!resolved[0].supports_images, "images default off");
@@ -1464,7 +1464,7 @@ name: test
 models:
   m1:
     wire_apis: [anthropic]
-    max_tokens: 200000
+    context: 200000
     supports_tools: false
 endpoints: {}
 "#;
@@ -1472,7 +1472,7 @@ endpoints: {}
         let map = provider.models_map().expect("inline models");
         let m1 = &map["m1"];
         assert_eq!(m1.wire_apis, vec!["anthropic".to_string()]);
-        assert_eq!(m1.max_tokens, Some(200_000));
+        assert_eq!(m1.context, Some(200_000));
         assert_eq!(m1.supports_tools, Some(false));
     }
 }

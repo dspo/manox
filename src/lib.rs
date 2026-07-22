@@ -3938,8 +3938,8 @@ mod tests {
             copilot_auth: CopilotAuth::ApiKey,
             env: BTreeMap::new(),
             apikey_source: None,
-            max_output_tokens: None,
             max_tokens: None,
+            context: None,
             supports_tools: true,
             supports_images: false,
         }
@@ -4284,8 +4284,8 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: BTreeMap::new(),
                 apikey_source: None,
-                max_output_tokens: None,
                 max_tokens: None,
+                context: None,
                 supports_tools: true,
                 supports_images: false,
             }),
@@ -4355,8 +4355,8 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: BTreeMap::new(),
                 apikey_source: None,
-                max_output_tokens: None,
                 max_tokens: None,
+                context: None,
                 supports_tools: true,
                 supports_images: false,
             }),
@@ -4399,8 +4399,8 @@ mod tests {
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
                 apikey_source: None,
-                max_output_tokens: None,
                 max_tokens: None,
+                context: None,
                 supports_tools: true,
                 supports_images: false,
             }),
@@ -4452,8 +4452,8 @@ mod tests {
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
                 apikey_source: None,
-                max_output_tokens: None,
                 max_tokens: None,
+                context: None,
                 supports_tools: true,
                 supports_images: false,
             }),
@@ -4497,8 +4497,8 @@ mod tests {
                 copilot_auth: CopilotAuth::BearerToken,
                 env: BTreeMap::new(),
                 apikey_source: None,
-                max_output_tokens: None,
                 max_tokens: None,
+                context: None,
                 supports_tools: true,
                 supports_images: false,
             }),
@@ -4597,8 +4597,8 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: model_env,
                 apikey_source: None,
-                max_output_tokens: None,
                 max_tokens: None,
+                context: None,
                 supports_tools: true,
                 supports_images: false,
             }),
@@ -4646,8 +4646,8 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: model_env,
                 apikey_source: None,
-                max_output_tokens: None,
                 max_tokens: None,
+                context: None,
                 supports_tools: true,
                 supports_images: false,
             }),
@@ -4732,8 +4732,8 @@ mod tests {
                 copilot_auth: CopilotAuth::ApiKey,
                 env: merged_env,
                 apikey_source: None,
-                max_output_tokens: None,
                 max_tokens: None,
+                context: None,
                 supports_tools: true,
                 supports_images: false,
             }),
@@ -5896,8 +5896,7 @@ trust_level = "trusted"
     }
 
     /// 向前兼容测试：旧配置文件中含已移除的 lcb_pro 字段时，
-    /// serde 应静默忽略该未知键，不报错。
-    /// Removed fields (`swe_pro`, `hle`, `context`, `lcb_pro`) in old YAML are
+    /// Removed fields (`swe_pro`, `hle`, `context_window`, `lcb_pro`) in old YAML are
     /// silently ignored by serde (no `deny_unknown_fields`).
     #[test]
     fn deserialization_ignores_removed_benchmark_fields() {
@@ -5910,7 +5909,7 @@ providers:
         swe_pro: "56.6%"
         lcb_pro: "1226"
         hle: "28.8%"
-        context: "1M"
+        context_window: "1M"
         desc: "test"
         wire_apis: [responses]
 agents:

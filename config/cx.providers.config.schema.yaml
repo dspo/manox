@@ -20,8 +20,8 @@ providers:
         agents: ["string (optional override filter)"]
         env:
           VAR_NAME: "string (optional)"
-        max_tokens: "integer (optional; context window size in tokens)"
-        max_output_tokens: "integer (optional; max tokens per response)"
+        max_tokens: "integer (optional; max tokens per response)"
+        context: "integer (optional; context window size in tokens)"
         supports_tools: "bool (optional; default true)"
         supports_images: "bool (optional; default false)"
 

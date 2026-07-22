@@ -321,8 +321,8 @@ mod tests {
             copilot_auth: CopilotAuth::ApiKey,
             env: BTreeMap::new(),
             apikey_source: None,
-            max_output_tokens: None,
             max_tokens: None,
+            context: None,
             supports_tools: true,
             supports_images: false,
         }
