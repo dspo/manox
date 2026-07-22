@@ -75,6 +75,7 @@ pub fn init(cx: &mut App) {
     // user's locale is settled before the first frame / first turn.
     i18n::init();
     settings::init_modes();
+    settings::init_optimization();
     provider::registry::init(cx);
     mcp::registry::init(cx);
     // LSP PATH detection (no spawn — servers start lazily on first code-intel

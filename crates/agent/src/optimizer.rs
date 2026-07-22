@@ -4,10 +4,14 @@
 //! before it reaches the model. The original messages are never modified — this
 //! layer only affects the projection built by [`build_completion_request`].
 //!
-//! Each tool type has a compact renderer with a per-tool output budget. Results
-//! exceeding the budget are truncated with head+tail preservation and a summary
-//! of what was elided. The goal is to keep relevant information while removing
-//! verbose logs, repeated metadata, and UI-only envelope content.
+//! Each tool type has a per-tool output budget. Results exceeding the budget are
+//! truncated with head+tail preservation and a summary of what was elided. The
+//! goal is to keep relevant information while removing verbose logs, repeated
+//! metadata, and UI-only envelope content.
+//!
+//! Hashline numbering (`[path#TAG]` header and `N:` line-number prefix from
+//! `read_file`) is **not** stripped — it is the protocol the model uses to
+//! produce Edit tool patches, and removing it would break Edit.
 
 use crate::language_model::MessageContent;
 use crate::message::Message;
@@ -79,72 +83,45 @@ pub(crate) fn tool_budget(tool_name: &str) -> usize {
     }
 }
 
-/// Compact a single tool output: strip hashline numbering (the `N:`
-/// prefix on each line from `read_file`), then apply the per-tool budget
-/// with head+tail preservation.
-pub(crate) fn compact_tool_output(tool_name: &str, raw: &str, budget: usize) -> String {
-    let cleaned = strip_hashline_numbering(tool_name, raw);
-    truncate_with_budget(&cleaned, budget)
-}
-
-/// Strip the `[path#TAG]\n` header and the `N:` line-number prefix added by
-/// `read_file`. Preserve the tag marker for reference.
-fn strip_hashline_numbering(tool_name: &str, raw: &str) -> String {
-    if tool_name != "Read" {
-        return raw.to_string();
-    }
-    // Remove the hashline header line (first line starting with `[` and ending
-    // with `#<tag>]`), but keep everything else.
-    let body = match raw.find('\n') {
-        Some(nl) => &raw[nl + 1..],
-        None => raw,
-    };
-    // Strip `N:` prefix from each line.
-    body.lines()
-        .map(|line| {
-            if let Some(rest) = line.strip_prefix(|c: char| c.is_ascii_digit())
-                && rest.starts_with(':')
-            {
-                &rest[1..]
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+/// Compact a single tool output: apply the per-tool budget with head+tail
+/// preservation. Hashline numbering is preserved — the model needs the
+/// `[path#TAG]` header and `N:` line-number prefix to generate Edit patches.
+pub(crate) fn compact_tool_output(_tool_name: &str, raw: &str, budget: usize) -> String {
+    truncate_with_budget(raw, budget)
 }
 
 /// Truncate `text` to `budget` bytes, preserving the head (HEAD_FRAC of
 /// budget) and tail (TAIL_FRAC of budget). The middle is replaced by a
-/// one-line elision marker.
+/// one-line elision marker. Truncation operates on chars (not bytes) to
+/// avoid splitting multi-byte UTF-8 sequences mid-character.
 fn truncate_with_budget(text: &str, budget: usize) -> String {
-    if text.len() <= budget {
+    let char_count = text.chars().count();
+    if char_count <= budget {
         return text.to_string();
     }
-    let head_bytes = (budget as f64 * HEAD_FRAC) as usize;
-    let tail_bytes = (budget as f64 * TAIL_FRAC) as usize;
-    let elided = text.len() - head_bytes - tail_bytes;
-    if elided == 0 {
-        // Budget too small — just take the head.
-        let mut out = text.chars().take(budget).collect::<String>();
-        out.push('…');
-        return out;
+    let head_chars = (budget as f64 * HEAD_FRAC) as usize;
+    let tail_chars = (budget as f64 * TAIL_FRAC) as usize;
+    let total_kept = head_chars + tail_chars;
+    if total_kept >= char_count {
+        // Budget covers everything after rounding — no truncation needed.
+        return text.to_string();
     }
-    let head: String = text.chars().take(head_bytes).collect();
+    let elided = char_count - total_kept;
+    let head: String = text.chars().take(head_chars).collect();
     let tail: String = text
         .chars()
         .rev()
-        .take(tail_bytes)
+        .take(tail_chars)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect();
     format!(
-        "{head}\n⚠ Output truncated ({total} bytes, showing first {head_b} and last {tail_b}; {elided_b} bytes elided)\n{tail}",
-        total = text.len(),
-        head_b = head_bytes,
-        tail_b = tail_bytes,
-        elided_b = elided,
+        "{head}\n⚠ Output truncated ({total} chars, showing first {head_c} and last {tail_c}; {skipped} chars elided)\n{tail}",
+        total = char_count,
+        head_c = head_chars,
+        tail_c = tail_chars,
+        skipped = elided,
     )
 }
 
@@ -159,19 +136,30 @@ mod tests {
     }
 
     #[test]
-    fn hashline_stripping_removes_line_numbers() {
+    fn hashline_is_preserved_for_edit_tool() {
+        // The model needs [path#TAG] and N: line numbers to generate Edit patches.
         let raw = "[src/main.rs#L1]\n1:fn main() {\n2:    println!(\"hi\");\n3:}\n";
-        let out = strip_hashline_numbering("Read", raw);
-        assert!(!out.contains("[src/main.rs#L1]"), "header removed");
-        assert!(!out.contains("1:fn"), "line numbers stripped: {out}");
-        assert!(out.contains("fn main()"), "code preserved: {out}");
+        let out = compact_tool_output("Read", raw, 1024);
+        assert!(out.contains("[src/main.rs#L1]"), "header preserved: {out}");
+        assert!(out.contains("1:fn"), "line numbers preserved: {out}");
     }
 
     #[test]
-    fn bash_output_not_hashline_stripped() {
+    fn multi_digit_line_numbers_preserved() {
+        let raw = "[src/lib.rs#L100]\n99:fn foo() {\n100:    bar();\n101:}\n";
+        let out = compact_tool_output("Read", raw, 1024);
+        assert!(out.contains("99:fn"), "multi-digit line preserved: {out}");
+        assert!(
+            out.contains("100:    bar()"),
+            "3-digit line preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn bash_output_passes_through() {
         let raw = "1:error: something failed\n2:  at line 42\n";
-        let out = strip_hashline_numbering("Bash", raw);
-        assert_eq!(out, raw); // Bash output preserved verbatim before budget truncation
+        let out = compact_tool_output("Bash", raw, 1024);
+        assert_eq!(out, raw); // No hashline stripping on non-Read tools
     }
 
     #[test]
@@ -184,9 +172,18 @@ mod tests {
     }
 
     #[test]
+    fn multi_byte_chars_handled_correctly() {
+        // Each emoji is 4 bytes in UTF-8. chars().take() preserves whole chars.
+        let text = "🚀".repeat(500) + "hello" + &"🌟".repeat(500);
+        let out = truncate_with_budget(&text, 600);
+        assert!(out.starts_with('🚀'), "starts with rocket: {out}");
+        assert!(out.ends_with('🌟'), "ends with star");
+        // Must not contain split multi-byte sequences (would cause UTF-8 errors).
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok(), "valid UTF-8");
+    }
+
+    #[test]
     fn budgets_are_reasonable() {
-        // Runtime guard: the constants are compile-time but the test documents the
-        // invariant for human readers.
         let _ = BUDGET_READ;
         let _ = BUDGET_GREP;
         let _ = BUDGET_DEFAULT;

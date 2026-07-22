@@ -751,6 +751,9 @@ impl Drop for Thread {
             });
         }
 
+        // Clean up tool-discovery activation state so stale entries never
+        // accumulate and unbalance the per-thread cooldown ledger.
+        crate::tools::tool_search::drop_activations(&self.id.0);
         let Some(wt) = self.worktree.take() else {
             return;
         };
@@ -2740,12 +2743,17 @@ impl Thread {
             // Build the state capsule for the compaction envelope so the next
             // summarizer pass can run incrementally (previous summary + delta).
             let wt_path_str = this.worktree.as_ref().map(|w| w.path.display().to_string());
+            // The worktree branch IS the effective git branch when active;
+            // outside a worktree, the branch is not probed (a side effect
+            // that doesn't belong here). Plan steps live in message history
+            // and are reconstructed on restore — the capsule carries only
+            // lightweight hints.
             let state = crate::compact::collect_compaction_state(
                 &this.cwd,
                 this.worktree.as_ref().map(|w| w.branch.as_str()),
                 wt_path_str.as_deref(),
-                None, // git branch not readily available
-                None, // plan steps deferred
+                this.worktree.as_ref().map(|w| w.branch.as_str()),
+                None, // plan steps recovered from message history
                 this.goal.as_ref().map(|g| g.condition.as_str()),
                 this.tools.iter().map(|t| t.name().to_string()).collect(),
             );
@@ -4100,6 +4108,12 @@ impl Thread {
                 is_error,
                 content: output,
             };
+            // Implicit activation: when a non-core tool is successfully used,
+            // make it available in the schema for subsequent turns. Core tools
+            // are always present and need no activation.
+            if !is_error {
+                crate::tools::tool_search::activate_tools(&this.id.0, &[(*tu.name).to_string()]);
+            }
             this.push_tool_result(result, cx);
         })?;
         Ok(())
@@ -4467,11 +4481,17 @@ impl Thread {
         // consecutive same-role messages, accepts the request. A no-op for
         // the normal alternation, so the cached prefix is byte-stable across
         // turns; the coalesced run is itself stable once it's in history.
-        let effective_messages: std::borrow::Cow<'_, [Message]> =
-            match crate::retention::prune_for_model(&self.messages) {
+        let history_pruning_on =
+            crate::settings::context_optimization().history_pruning == crate::settings::Toggle::On;
+        let effective_messages: std::borrow::Cow<'_, [Message]> = if history_pruning_on {
+            let cooldown_key = self.id.0.clone();
+            match crate::retention::prune_for_model(&self.messages, &cooldown_key) {
                 Some(pruned) => std::borrow::Cow::Owned(pruned),
                 None => std::borrow::Cow::Borrowed(&self.messages),
-            };
+            }
+        } else {
+            std::borrow::Cow::Borrowed(&self.messages)
+        };
         let mapped: Vec<LanguageModelRequestMessage> = crate::compact::coalesce_same_role(
             match crate::compact::latest_compaction_ix(
                 &effective_messages,
@@ -4565,7 +4585,23 @@ impl Thread {
                 Some(f) if !f.is_empty() => {
                     self.tools.to_request_tools_filtered(f, self.agent_language)
                 }
-                _ => self.tools.to_request_tools(self.agent_language),
+                _ => {
+                    // Tool discovery: when On, the first turn sends only core
+                    // tools. The model uses ToolSearch to discover additional
+                    // tools, which are activated and appear in subsequent turns.
+                    if crate::tools::tool_search::is_active() {
+                        let mut allowed: Vec<String> = crate::tools::tool_search::CORE_TOOLS
+                            .iter()
+                            .map(|&s| s.to_string())
+                            .collect();
+                        let activated = crate::tools::tool_search::activated_for(&self.id.0);
+                        allowed.extend(activated);
+                        self.tools
+                            .to_request_tools_filtered(&allowed, self.agent_language)
+                    } else {
+                        self.tools.to_request_tools(self.agent_language)
+                    }
+                }
             }
         };
         // Coalesce the fully assembled list so the fixed-position
@@ -4625,7 +4661,12 @@ pub(crate) fn model_facing_content(
         }
         MessageContent::Compaction(raw) => {
             // The compaction payload may be a JSON envelope (v1+) or legacy
-            // plain text (v0). Extract the summary text for the model.
+            // plain text (v0). Extract the summary text for the model. The
+            // state capsule (cwd, worktree, git branch, active tools, etc.)
+            // is for internal incremental compaction — the next summarizer
+            // pass reads the latest capsule so it can summarize only the
+            // delta. The model sees only the summary text wrapped in a
+            // preamble; exposing the state raw would waste tokens.
             let (summary, _state) = crate::compact::parse_compaction(raw);
             MessageContent::Text(
                 crate::prompt::render(

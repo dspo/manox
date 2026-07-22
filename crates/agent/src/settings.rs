@@ -187,6 +187,9 @@ pub struct ContextOptimizationSettings {
     pub compact_outputs: bool,
     /// Code-mode orchestration: `off` or `hybrid` (keep native tools + add
     /// the `Code` tool with QuickJS isolate).
+    /// **Deferred** — the `Code` tool and QuickJS isolate are not yet
+    /// implemented; this field is a config placeholder so settings files
+    /// written against the current schema survive a future upgrade.
     #[serde(default)]
     pub code_mode: CodeModeToggle,
 }
