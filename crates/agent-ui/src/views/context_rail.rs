@@ -31,9 +31,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
-    h_flex,
-    notification::Notification,
-    tooltip::Tooltip, v_flex,
+    h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
 
 use crate::Workspace;
@@ -557,9 +555,7 @@ impl ContextRail {
         let changes_line = self.render_changes_trailing(project, theme);
 
         // Branch row: click copies the branch name with notification feedback.
-        let branch_for_copy = display
-            .as_ref()
-            .and_then(|d| d.branch.clone());
+        let branch_for_copy = display.as_ref().and_then(|d| d.branch.clone());
         let branch_feedback = i18n::t("workspace-env-git-copied-branch");
         let branch_row = env_row_clickable(
             "icons/git-branch.svg".into(),
@@ -569,10 +565,7 @@ impl ContextRail {
             move |_ev: &ClickEvent, window, cx| {
                 if let Some(ref name) = branch_for_copy {
                     cx.write_to_clipboard(ClipboardItem::new_string(name.clone()));
-                    window.push_notification(
-                        Notification::success(branch_feedback.clone()),
-                        cx,
-                    );
+                    window.push_notification(Notification::success(branch_feedback.clone()), cx);
                 }
             },
         );

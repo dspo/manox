@@ -10,6 +10,7 @@
 //! `SIGTERM`→`SIGKILL` escalation.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,9 +50,32 @@ struct Inner {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, Value>>>>,
     ready_notify: Arc<Notify>,
     status: Mutex<ServerStatus>,
-    diagnostics: Mutex<HashMap<PathBuf, Vec<lsp_types::Diagnostic>>>,
+    diagnostics: Mutex<HashMap<PathBuf, DiagnosticSnapshot>>,
+    diagnostic_generation: AtomicU64,
+    diagnostics_notify: Notify,
+    open_documents: Mutex<HashMap<PathBuf, OpenDocument>>,
     spec_id: &'static str,
+    language_id: &'static str,
     root: PathBuf,
+}
+
+#[derive(Clone)]
+struct DiagnosticSnapshot {
+    diagnostics: Vec<lsp_types::Diagnostic>,
+    generation: u64,
+}
+
+struct OpenDocument {
+    content_hash: u64,
+    version: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiagnosticsReport {
+    pub diagnostics: Vec<lsp_types::Diagnostic>,
+    /// True only when the server has published diagnostics for the current
+    /// on-disk content. `false` must never be rendered as a clean result.
+    pub fresh: bool,
 }
 
 /// A connected language server. Clone freely — the underlying state is shared
@@ -114,7 +138,11 @@ impl LspClient {
             ready_notify: Arc::new(Notify::new()),
             status: Mutex::new(ServerStatus::Starting),
             diagnostics: Mutex::new(HashMap::new()),
+            diagnostic_generation: AtomicU64::new(0),
+            diagnostics_notify: Notify::new(),
+            open_documents: Mutex::new(HashMap::new()),
             spec_id: spec.id,
+            language_id: spec.language_id,
             root,
         });
 
@@ -156,6 +184,16 @@ impl LspClient {
     /// Send a request and await its `result` (or `error`). The reader task
     /// fulfils the `oneshot` when the matching id's response arrives.
     async fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> anyhow::Result<Value> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         // Guard removes the pending entry on every exit path — including a
@@ -181,7 +219,7 @@ impl LspClient {
         if let Err(e) = res {
             return Err(anyhow!("writing `{method}` request: {e}"));
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(err))) => Err(anyhow!("`{method}` server error: {err}")),
             Ok(Err(_)) => {
@@ -192,9 +230,7 @@ impl LspClient {
                     "`{method}` response channel closed (server likely exited)"
                 ))
             }
-            Err(_) => Err(anyhow!(
-                "`{method}` request timed out after {REQUEST_TIMEOUT:?}"
-            )),
+            Err(_) => Err(anyhow!("`{method}` request timed out after {timeout:?}")),
         }
     }
 
@@ -210,9 +246,9 @@ impl LspClient {
         *self.inner.status.lock().expect("status mutex poisoned") = ServerStatus::Failed;
     }
 
-    /// The `initialize` / `initialized` handshake. Declares client capabilities
-    /// for the methods we use and lets the server watch files itself
-    /// (`didChangeWatchedFiles`) — manox never sends did_open/did_change.
+    /// The `initialize` / `initialized` handshake. Declares full document
+    /// synchronization because manox sends `didOpen` / `didChange` after reads
+    /// and edits instead of relying on file-watcher timing.
     ///
     /// Separate from [`start`](Self::start) so the registry can spawn the
     /// process without blocking on the handshake.
@@ -226,14 +262,22 @@ impl LspClient {
                 "workspace": {
                     "didChangeConfiguration": { "dynamicRegistration": false },
                     "didChangeWatchedFiles": { "dynamicRegistration": false },
+                    "configuration": true,
+                    "workspaceFolders": true,
                     "symbol": { "dynamicRegistration": false },
                 },
                 "textDocument": {
-                    "synchronization": { "dynamicRegistration": false },
+                    "synchronization": {
+                        "dynamicRegistration": false,
+                        "didSave": true,
+                        "willSave": false,
+                        "willSaveWaitUntil": false
+                    },
                     "definition": { "linkSupport": false },
                     "references": {},
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
                     "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+                    "diagnostic": { "dynamicRegistration": false, "relatedDocumentSupport": false },
                     "publishDiagnostics": { "relatedInformation": true }
                 }
             },
@@ -274,13 +318,14 @@ impl LspClient {
     // Position resolution: the caller gives a 1-indexed line and the symbol text.
     // The client reads just that line from disk and locates the symbol to compute
     // the 0-indexed LSP position. LSP `character` is a UTF-16 code-unit offset;
-    // we approximate with a Unicode-scalar count (identical for ASCII code,
-    // the only case where the difference matters in practice).
+    // Count UTF-16 code units exactly; Unicode scalar counts are wrong when a
+    // non-BMP character precedes the symbol.
 
     fn resolve_position(
         path: &Path,
         line_1: u32,
         symbol: &str,
+        column_1: Option<u32>,
     ) -> anyhow::Result<lsp_types::Position> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading {} for position resolution", path.display()))?;
@@ -288,11 +333,37 @@ impl LspClient {
             .lines()
             .nth(line_1 as usize - 1)
             .ok_or_else(|| anyhow!("line {line_1} not in {}", path.display()))?;
-        let col = line
-            .find(symbol)
-            .ok_or_else(|| anyhow!("symbol `{symbol}` not found on line {line_1}"))?;
-        // char count up to the column ≈ LSP character offset for code.
-        let character = line[..col].chars().count() as u32;
+        let col = if let Some(column_1) = column_1 {
+            if column_1 == 0 {
+                return Err(anyhow!("column must be 1-indexed"));
+            }
+            let character_index = (column_1 - 1) as usize;
+            let byte_index = line
+                .char_indices()
+                .nth(character_index)
+                .map(|(index, _)| index)
+                .unwrap_or(line.len());
+            if !line[byte_index..].starts_with(symbol) {
+                return Err(anyhow!(
+                    "symbol `{symbol}` does not start at column {column_1} on line {line_1}"
+                ));
+            }
+            byte_index
+        } else {
+            let mut matches = line.match_indices(symbol);
+            let first = matches
+                .next()
+                .map(|(index, _)| index)
+                .ok_or_else(|| anyhow!("symbol `{symbol}` not found on line {line_1}"))?;
+            if matches.next().is_some() {
+                return Err(anyhow!(
+                    "symbol `{symbol}` occurs more than once on line {line_1}; pass its 1-indexed `column`"
+                ));
+            }
+            first
+        };
+        // LSP character offsets are UTF-16 code units.
+        let character = line[..col].encode_utf16().count() as u32;
         Ok(lsp_types::Position {
             line: line_1 - 1,
             character,
@@ -304,12 +375,78 @@ impl LspClient {
         path: &Path,
         line_1: u32,
         symbol: &str,
+        column_1: Option<u32>,
     ) -> anyhow::Result<Value> {
-        let pos = Self::resolve_position(path, line_1, symbol)?;
+        let pos = Self::resolve_position(path, line_1, symbol, column_1)?;
         Ok(json!({
             "textDocument": { "uri": file_uri(path) },
             "position": pos,
         }))
+    }
+
+    /// Synchronize a file's current on-disk content with the server. Returns
+    /// whether a notification was sent (first open or changed content).
+    async fn sync_document(&self, path: &Path) -> anyhow::Result<bool> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {} for LSP synchronization", path.display()))?;
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        let content_hash = hasher.finish();
+        let (method, version) = {
+            let mut documents = self
+                .inner
+                .open_documents
+                .lock()
+                .expect("open documents mutex poisoned");
+            match documents.get_mut(path) {
+                Some(open) if open.content_hash == content_hash => return Ok(false),
+                Some(open) => {
+                    open.content_hash = content_hash;
+                    open.version += 1;
+                    ("textDocument/didChange", open.version)
+                }
+                None => {
+                    documents.insert(
+                        path.to_path_buf(),
+                        OpenDocument {
+                            content_hash,
+                            version: 1,
+                        },
+                    );
+                    ("textDocument/didOpen", 1)
+                }
+            }
+        };
+        let uri = file_uri(path);
+        if method == "textDocument/didOpen" {
+            self.notify(
+                method,
+                json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": self.inner.language_id,
+                        "version": version,
+                        "text": text
+                    }
+                }),
+            )
+            .await;
+        } else {
+            self.notify(
+                method,
+                json!({
+                    "textDocument": { "uri": uri, "version": version },
+                    "contentChanges": [{ "text": text }]
+                }),
+            )
+            .await;
+            self.notify(
+                "textDocument/didSave",
+                json!({ "textDocument": { "uri": uri } }),
+            )
+            .await;
+        }
+        Ok(true)
     }
 
     pub async fn go_to_definition(
@@ -317,8 +454,10 @@ impl LspClient {
         path: &Path,
         line_1: u32,
         symbol: &str,
+        column_1: Option<u32>,
     ) -> anyhow::Result<Vec<(PathBuf, u32, u32)>> {
-        let params = self.text_document_position(path, line_1, symbol)?;
+        self.sync_document(path).await?;
+        let params = self.text_document_position(path, line_1, symbol, column_1)?;
         let result = self.request("textDocument/definition", params).await?;
         Ok(parse_locations(result))
     }
@@ -328,9 +467,11 @@ impl LspClient {
         path: &Path,
         line_1: u32,
         symbol: &str,
+        column_1: Option<u32>,
         include_declaration: bool,
     ) -> anyhow::Result<Vec<(PathBuf, u32, u32)>> {
-        let mut params = self.text_document_position(path, line_1, symbol)?;
+        self.sync_document(path).await?;
+        let mut params = self.text_document_position(path, line_1, symbol, column_1)?;
         params["context"] = json!({ "includeDeclaration": include_declaration });
         let result = self.request("textDocument/references", params).await?;
         Ok(parse_locations(result))
@@ -341,8 +482,10 @@ impl LspClient {
         path: &Path,
         line_1: u32,
         symbol: &str,
+        column_1: Option<u32>,
     ) -> anyhow::Result<Option<String>> {
-        let params = self.text_document_position(path, line_1, symbol)?;
+        self.sync_document(path).await?;
+        let params = self.text_document_position(path, line_1, symbol, column_1)?;
         let result = self.request("textDocument/hover", params).await?;
         Ok(parse_hover(result))
     }
@@ -351,6 +494,7 @@ impl LspClient {
         &self,
         path: &Path,
     ) -> anyhow::Result<Vec<(String, String, u32)>> {
+        self.sync_document(path).await?;
         let params = json!({ "textDocument": { "uri": file_uri(path) } });
         let result = self.request("textDocument/documentSymbol", params).await?;
         Ok(parse_document_symbols(result))
@@ -365,17 +509,104 @@ impl LspClient {
         Ok(parse_workspace_symbols(result))
     }
 
-    /// Cached `publishDiagnostics` for a file, if any have been pushed. The
-    /// server pushes these asynchronously as it indexes; an empty vec means
-    /// either no diagnostics or none pushed yet (the distinction is surfaced
-    /// to the caller as a staleness note, not here).
+    /// Synchronize `path`, then wait briefly for a diagnostics publication that
+    /// corresponds to the new content. A timeout returns `fresh = false` so the
+    /// caller cannot mistake missing data for a clean file.
+    pub async fn diagnostics_for(
+        &self,
+        path: &Path,
+        timeout: Duration,
+    ) -> anyhow::Result<DiagnosticsReport> {
+        let before = self
+            .inner
+            .diagnostics
+            .lock()
+            .expect("diagnostics mutex poisoned")
+            .get(path)
+            .map(|snapshot| snapshot.generation)
+            .unwrap_or(0);
+        let changed = self.sync_document(path).await?;
+        // LSP 3.17 pull diagnostics are deterministic and version-aligned.
+        // Servers that only implement publishDiagnostics reject this request;
+        // in that case the bounded push-notification path below remains the
+        // compatibility fallback.
+        let pull = self
+            .request_with_timeout(
+                "textDocument/diagnostic",
+                json!({ "textDocument": { "uri": file_uri(path) } }),
+                timeout.min(Duration::from_secs(2)),
+            )
+            .await;
+        if let Ok(value) = pull
+            && let Some(items) = value.get("items").cloned()
+            && let Ok(diagnostics) = serde_json::from_value::<Vec<lsp_types::Diagnostic>>(items)
+        {
+            let generation = self
+                .inner
+                .diagnostic_generation
+                .fetch_add(1, Ordering::Relaxed)
+                + 1;
+            self.inner
+                .diagnostics
+                .lock()
+                .expect("diagnostics mutex poisoned")
+                .insert(
+                    path.to_path_buf(),
+                    DiagnosticSnapshot {
+                        diagnostics: diagnostics.clone(),
+                        generation,
+                    },
+                );
+            return Ok(DiagnosticsReport {
+                diagnostics,
+                fresh: true,
+            });
+        }
+        if changed || before == 0 {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let notified = self.inner.diagnostics_notify.notified();
+                let current = self
+                    .inner
+                    .diagnostics
+                    .lock()
+                    .expect("diagnostics mutex poisoned")
+                    .get(path)
+                    .map(|snapshot| snapshot.generation)
+                    .unwrap_or(0);
+                if current > before {
+                    break;
+                }
+                if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                    break;
+                }
+            }
+        }
+        let snapshot = self
+            .inner
+            .diagnostics
+            .lock()
+            .expect("diagnostics mutex poisoned")
+            .get(path)
+            .cloned();
+        Ok(DiagnosticsReport {
+            fresh: snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !changed || snapshot.generation > before),
+            diagnostics: snapshot
+                .map(|snapshot| snapshot.diagnostics)
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Cached `publishDiagnostics` for a file, if any have been pushed.
     pub fn cached_diagnostics(&self, path: &Path) -> Vec<lsp_types::Diagnostic> {
         self.inner
             .diagnostics
             .lock()
             .expect("diagnostics mutex poisoned")
             .get(path)
-            .cloned()
+            .map(|snapshot| snapshot.diagnostics.clone())
             .unwrap_or_default()
     }
 
@@ -422,6 +653,14 @@ async fn read_loop(inner: Arc<Inner>, stdout: ChildStdout) {
 /// notification updates cache/state.
 fn dispatch(inner: &Arc<Inner>, msg: Value) {
     if let Some(id) = msg.get("id").cloned() {
+        // A message with both `id` and `method` is a server-to-client request,
+        // not a response to one of our pending calls. rust-analyzer requests
+        // workspace configuration during startup and will defer diagnostics if
+        // the client never answers.
+        if let Some(method) = msg.get("method").and_then(|method| method.as_str()) {
+            respond_to_server_request(inner, id, method, msg.get("params"));
+            return;
+        }
         // Response (request or error) — match by id.
         let id = match id {
             Value::Number(n) => n.as_u64(),
@@ -462,11 +701,19 @@ fn dispatch(inner: &Arc<Inner>, msg: Value) {
                 }
             };
             if let Some(path) = uri_to_path(&parsed.uri) {
+                let generation = inner.diagnostic_generation.fetch_add(1, Ordering::Relaxed) + 1;
                 inner
                     .diagnostics
                     .lock()
                     .expect("diagnostics mutex poisoned")
-                    .insert(path, parsed.diagnostics);
+                    .insert(
+                        path,
+                        DiagnosticSnapshot {
+                            diagnostics: parsed.diagnostics,
+                            generation,
+                        },
+                    );
+                inner.diagnostics_notify.notify_waiters();
             }
         }
         "window/logMessage" => {
@@ -487,6 +734,50 @@ fn dispatch(inner: &Arc<Inner>, msg: Value) {
             debug!(spec = inner.spec_id, "unhandled notification {method}");
         }
     }
+}
+
+fn respond_to_server_request(inner: &Arc<Inner>, id: Value, method: &str, params: Option<&Value>) {
+    let response = match method {
+        "workspace/configuration" => {
+            let count = params
+                .and_then(|params| params.get("items"))
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            json!({ "jsonrpc": "2.0", "id": id, "result": vec![Value::Null; count] })
+        }
+        "workspace/workspaceFolders" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": [{
+                "uri": file_uri(&inner.root),
+                "name": inner.root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default()
+            }]
+        }),
+        // Acknowledge dynamic registration so servers do not block waiting for
+        // a response. Registrations are not persisted yet; Manox currently
+        // implements only the capabilities advertised during initialization.
+        "client/registerCapability"
+        | "client/unregisterCapability"
+        | "window/workDoneProgress/create" => {
+            json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
+        }
+        _ => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": format!("unsupported client method `{method}`") }
+        }),
+    };
+    let inner = inner.clone();
+    tokio::spawn(async move {
+        let mut writer = inner.writer.lock().await;
+        if let Err(error) = write_message(&mut *writer, &response).await {
+            warn!(
+                spec = inner.spec_id,
+                "server request response failed: {error}"
+            );
+        }
+    });
 }
 
 #[derive(Deserialize)]
@@ -706,12 +997,28 @@ fn truncate_debug(v: &Value) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn resolve_position_uses_utf16_and_rejects_ambiguous_symbols() {
+        let path =
+            std::env::temp_dir().join(format!("manox-lsp-position-{}.rs", std::process::id()));
+        std::fs::write(&path, "😀foo(); foo();\n").unwrap();
+
+        let ambiguous = LspClient::resolve_position(&path, 1, "foo", None).unwrap_err();
+        assert!(ambiguous.to_string().contains("more than once"));
+
+        let position = LspClient::resolve_position(&path, 1, "foo", Some(2)).unwrap();
+        assert_eq!(position.line, 0);
+        assert_eq!(position.character, 2, "emoji occupies two UTF-16 units");
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Throwaway live handshake check: spawn → initialize → Ready → graceful
     /// close. Uses gopls (a real binary, not a rustup proxy). Gated off by
     /// default. Run with `MANOX_RUN_LIVE=1 cargo test -p lsp live_handshake
-    /// -- --nocapture`.
+    /// -- --ignored --nocapture`.
     #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "requires MANOX_RUN_LIVE=1 and installed gopls"]
     async fn live_handshake_gopls() {
         if std::env::var("MANOX_RUN_LIVE").is_err() {
             return;
@@ -735,6 +1042,7 @@ mod tests {
     /// Gated off by default.
     #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "requires MANOX_RUN_LIVE=1 and installed gopls"]
     async fn live_document_symbols_gopls() {
         if std::env::var("MANOX_RUN_LIVE").is_err() {
             return;
@@ -771,6 +1079,60 @@ mod tests {
         client.inner.proc.close().await;
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(got_greet, "gopls should report the `Greet` symbol");
+    }
+
+    /// Full Rust round-trip: initialize, synchronize an opened document, query
+    /// symbols, then change the file and require fresh diagnostics for the new
+    /// version. Gated because it spawns a real rust-analyzer process.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires MANOX_RUN_LIVE=1 and installed rust-analyzer"]
+    async fn live_sync_and_diagnostics_rust_analyzer() {
+        if std::env::var("MANOX_RUN_LIVE").is_err() {
+            return;
+        }
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .try_init();
+        let tmp = std::env::temp_dir().join(format!("manox-lsp-live-rust-{}", std::process::id()));
+        let src = tmp.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            tmp.join("Cargo.toml"),
+            "[package]\nname = \"manox_lsp_live\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let file = src.join("lib.rs");
+        std::fs::write(&file, "pub fn greet() -> &'static str { \"hi\" }\n").unwrap();
+
+        let spec = crate::spec::spec_for_id("rust-analyzer").expect("spec");
+        let client = LspClient::start(spec, tmp.clone()).await.expect("start");
+        client.initialize().await.expect("initialize");
+        let symbols = client.document_symbols(&file).await.expect("symbols");
+        assert!(symbols.iter().any(|(name, _, _)| name == "greet"));
+
+        std::fs::write(&file, "pub fn greet( {\n").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut got_fresh_error = false;
+        while tokio::time::Instant::now() < deadline {
+            let report = client
+                .diagnostics_for(&file, Duration::from_secs(2))
+                .await
+                .expect("diagnostics");
+            if report.fresh && !report.diagnostics.is_empty() {
+                got_fresh_error = true;
+                break;
+            }
+        }
+        client.inner.proc.close().await;
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            got_fresh_error,
+            "rust-analyzer should publish diagnostics for changed content"
+        );
     }
 
     #[test]

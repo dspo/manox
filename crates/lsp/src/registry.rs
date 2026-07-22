@@ -1,8 +1,9 @@
 //! Process-global LSP registry: PATH detection at startup, lazy per-`(spec,
 //! root)` client lifecycle.
 //!
-//! Mirrors `agent::mcp::registry`'s `OnceLock` shape. `init()` only probes
-//! `PATH` — it never spawns. Per-`(spec_id, root)` slot, `ensure` kicks off a
+//! Mirrors `agent::mcp::registry`'s `OnceLock` shape. `init()` probes each
+//! executable with a bounded version command, but never spawns a long-running
+//! server. Per-`(spec_id, root)` slot, `ensure` kicks off a
 //! detached spawn+initialize (non-blocking — returns `Starting` immediately),
 //! `wait_ready` blocks on a `Notify` with a caller-chosen timeout, and
 //! `client_for` is the convenience path code-intel tools use (ensure +
@@ -13,7 +14,9 @@
 //! `lsp`; `lsp` must not depend on `agent`).
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Duration;
@@ -23,7 +26,7 @@ use tokio::sync::{Mutex, Notify};
 use tracing::warn;
 
 use crate::client::{LspClient, ServerStatus};
-use crate::spec::{LspServerSpec, SPECS, spec_for_id};
+use crate::spec::{LspServerSpec, SPECS, spec_for_extension, spec_for_id};
 
 static REGISTRY: OnceLock<LspRegistry> = OnceLock::new();
 
@@ -51,10 +54,24 @@ enum SlotState {
 type SlotMap = StdMutex<HashMap<(String, PathBuf), Arc<ClientSlot>>>;
 
 pub struct LspRegistry {
-    /// Specs whose server binary was found on `PATH` at `init` time. Only these
-    /// are ever spawned; the rest degrade silently to grep/glob.
+    /// Specs whose executable passed both PATH detection and a viability probe.
     available: Vec<&'static LspServerSpec>,
+    availability: HashMap<&'static str, ServerAvailability>,
     cells: SlotMap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerAvailability {
+    Available,
+    NotInstalled,
+    Broken(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerReport {
+    pub id: &'static str,
+    pub status: ServerStatus,
+    pub detail: Option<String>,
 }
 
 impl LspRegistry {
@@ -66,6 +83,10 @@ impl LspRegistry {
         self.available.iter().any(|s| s.id == spec_id)
     }
 
+    pub fn availability(&self, spec_id: &str) -> Option<&ServerAvailability> {
+        self.availability.get(spec_id)
+    }
+
     /// Look up the spec for a file path's extension, among available servers.
     pub fn spec_for_path(&self, path: &Path) -> Option<&'static LspServerSpec> {
         let ext = path.extension()?.to_str()?;
@@ -73,6 +94,82 @@ impl LspRegistry {
             .iter()
             .copied()
             .find(|s| s.extensions.contains(&ext))
+    }
+
+    /// Route by extension even when the corresponding executable is missing or
+    /// broken, so callers can return the real installation/probe failure rather
+    /// than the misleading "unsupported language" fallback.
+    pub fn routed_spec_for_path(&self, path: &Path) -> Option<&'static LspServerSpec> {
+        let ext = path.extension()?.to_str()?;
+        spec_for_extension(ext)
+    }
+
+    pub fn workspace_root_for(
+        &self,
+        spec: &LspServerSpec,
+        path: &Path,
+        fallback: &Path,
+    ) -> PathBuf {
+        let start = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        for ancestor in start.ancestors() {
+            if spec
+                .root_hints
+                .iter()
+                .any(|hint| ancestor.join(hint).exists())
+            {
+                return ancestor.to_path_buf();
+            }
+        }
+        fallback.to_path_buf()
+    }
+
+    pub async fn client_for_path(
+        &self,
+        path: &Path,
+        fallback_root: &Path,
+    ) -> anyhow::Result<Arc<LspClient>> {
+        let Some(spec) = self.routed_spec_for_path(path) else {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            return Err(anyhow!("no LSP server handles `.{ext}`"));
+        };
+        match self.availability(spec.id) {
+            Some(ServerAvailability::Available) => {}
+            Some(ServerAvailability::NotInstalled) | None => {
+                return Err(anyhow!(
+                    "LSP server `{}` is not installed; install it to enable code intelligence",
+                    spec.id
+                ));
+            }
+            Some(ServerAvailability::Broken(reason)) => {
+                return Err(anyhow!(
+                    "LSP server `{}` is installed but unusable: {reason}",
+                    spec.id
+                ));
+            }
+        }
+        let root = self.workspace_root_for(spec, path, fallback_root);
+        self.client_for(spec.id, root).await
+    }
+
+    /// Fire-and-forget callers use this to warm the correctly rooted server
+    /// after the first source read without spending a model tool call.
+    pub async fn ensure_for_path(
+        &self,
+        path: &Path,
+        fallback_root: &Path,
+    ) -> anyhow::Result<ServerStatus> {
+        let Some(spec) = self.routed_spec_for_path(path) else {
+            return Ok(ServerStatus::NotStarted);
+        };
+        if !self.is_available(spec.id) {
+            return Ok(ServerStatus::NotStarted);
+        }
+        let root = self.workspace_root_for(spec, path, fallback_root);
+        self.ensure(spec.id, root).await
     }
 
     /// Get-or-create the slot for `(spec_id, root)`.
@@ -188,34 +285,38 @@ impl LspRegistry {
             .wait_ready(spec_id, root.clone(), CODE_INTEL_WAIT)
             .await?;
         let slot = self.slot_for(spec_id, root.clone());
-        let client = {
+        let (client, failure) = {
             let st = slot.state.lock().await;
             match &*st {
-                SlotState::Ready(c) => Some(c.clone()),
-                _ => None,
+                SlotState::Ready(c) => (Some(c.clone()), None),
+                SlotState::Failed(reason) => (None, Some(reason.clone())),
+                SlotState::Idle | SlotState::Starting => (None, None),
             }
         };
-        match (status, client) {
-            (ServerStatus::Ready, Some(c)) if c.is_ready() => Ok(c),
+        match (status, client, failure) {
+            (ServerStatus::Ready, Some(c), _) if c.is_ready() => Ok(c),
             // Cached client but the server died after Ready — reset and tell
             // the caller to retry, so the next call re-spawns.
-            (ServerStatus::Ready, Some(_)) => {
+            (ServerStatus::Ready, Some(_), _) => {
                 let mut st = slot.state.lock().await;
                 *st = SlotState::Idle;
                 Err(anyhow!(
                     "LSP server `{spec_id}` exited unexpectedly; retry the call to re-spawn"
                 ))
             }
-            (ServerStatus::NotStarted, _) => Err(anyhow!(
+            (ServerStatus::NotStarted, _, _) => Err(anyhow!(
                 "LSP server `{spec_id}` is not on PATH; install it to enable code-intel"
             )),
-            (ServerStatus::Starting, _) => Err(anyhow!(
+            (ServerStatus::Starting, _, _) => Err(anyhow!(
                 "LSP server `{spec_id}` still indexing; call LspWaitReady or retry shortly"
             )),
-            (ServerStatus::Failed, _) => Err(anyhow!(
-                "LSP server `{spec_id}` failed to start; see logs (reinstall or check PATH)"
-            )),
-            (ServerStatus::Ready, None) => Err(anyhow!(
+            (ServerStatus::Failed, _, Some(reason)) => {
+                Err(anyhow!("LSP server `{spec_id}` failed to start: {reason}"))
+            }
+            (ServerStatus::Failed, _, None) => {
+                Err(anyhow!("LSP server `{spec_id}` failed to start"))
+            }
+            (ServerStatus::Ready, None, _) => Err(anyhow!(
                 "LSP server `{spec_id}` not in a usable state; retry the call"
             )),
         }
@@ -223,9 +324,28 @@ impl LspRegistry {
 
     /// Snapshot every available server's status for a given root, for
     /// `LspStatus`. `Idle` (never spawned) surfaces as `NotStarted`.
-    pub async fn statuses_for(&self, root: &Path) -> Vec<(&'static str, ServerStatus)> {
-        let mut out = Vec::with_capacity(self.available.len());
-        for spec in &self.available {
+    pub async fn statuses_for(&self, root: &Path) -> Vec<ServerReport> {
+        let mut out = Vec::with_capacity(SPECS.len());
+        for spec in SPECS {
+            match self.availability(spec.id) {
+                Some(ServerAvailability::NotInstalled) | None => {
+                    out.push(ServerReport {
+                        id: spec.id,
+                        status: ServerStatus::NotStarted,
+                        detail: Some("not installed".to_string()),
+                    });
+                    continue;
+                }
+                Some(ServerAvailability::Broken(reason)) => {
+                    out.push(ServerReport {
+                        id: spec.id,
+                        status: ServerStatus::Failed,
+                        detail: Some(reason.clone()),
+                    });
+                    continue;
+                }
+                Some(ServerAvailability::Available) => {}
+            }
             let key = (spec.id.to_string(), root.to_path_buf());
             // Take the slot clone out of the cells lock before awaiting the
             // per-slot state lock — the std `Mutex` guard is not await-safe.
@@ -235,32 +355,55 @@ impl LspRegistry {
                 .expect("cells mutex poisoned")
                 .get(&key)
                 .cloned();
-            let status = match slot {
-                None => ServerStatus::NotStarted,
+            let (status, detail) = match slot {
+                None => (ServerStatus::NotStarted, None),
                 Some(slot) => {
                     let st = slot.state.lock().await;
                     match &*st {
-                        SlotState::Idle => ServerStatus::NotStarted,
-                        SlotState::Starting => ServerStatus::Starting,
-                        SlotState::Ready(_) => ServerStatus::Ready,
-                        SlotState::Failed(_) => ServerStatus::Failed,
+                        SlotState::Idle => (ServerStatus::NotStarted, None),
+                        SlotState::Starting => (ServerStatus::Starting, None),
+                        SlotState::Ready(_) => (ServerStatus::Ready, None),
+                        SlotState::Failed(reason) => (ServerStatus::Failed, Some(reason.clone())),
                     }
                 }
             };
-            out.push((spec.id, status));
+            out.push(ServerReport {
+                id: spec.id,
+                status,
+                detail,
+            });
         }
         out
     }
 }
 
-/// Probe `PATH` for every spec's server binary. Cheap (a few `which`
-/// subprocesses); safe to run on the gpui main thread at startup. Never spawns
-/// a server.
+/// Probe `PATH` and viability for every supported server without starting a
+/// long-running language server. Probes run in parallel, so startup is bounded
+/// by one probe timeout (currently two seconds), not the sum across servers.
 pub fn init() {
-    let available = SPECS
-        .iter()
-        .filter(|s| binary_on_path(s))
-        .collect::<Vec<_>>();
+    let probed = std::thread::scope(|scope| {
+        let handles = SPECS
+            .iter()
+            .map(|spec| (spec, scope.spawn(move || probe_server(spec))))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(spec, handle)| {
+                let state = handle.join().unwrap_or_else(|_| {
+                    ServerAvailability::Broken("viability probe panicked".into())
+                });
+                (spec, state)
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut available = Vec::new();
+    let mut availability = HashMap::new();
+    for (spec, state) in probed {
+        if state == ServerAvailability::Available {
+            available.push(spec);
+        }
+        availability.insert(spec.id, state);
+    }
     let names: Vec<&str> = available.iter().map(|s| s.id).collect();
     if names.is_empty() {
         tracing::info!("LSP registry empty (no language servers on PATH)");
@@ -269,6 +412,7 @@ pub fn init() {
     }
     let registry = LspRegistry {
         available,
+        availability,
         cells: SlotMap::default(),
     };
     if let Err(rejected) = REGISTRY.set(registry) {
@@ -293,6 +437,57 @@ fn binary_on_path(spec: &LspServerSpec) -> bool {
     out.status.success() && !out.stdout.is_empty()
 }
 
+fn probe_server(spec: &LspServerSpec) -> ServerAvailability {
+    if !binary_on_path(spec) {
+        return ServerAvailability::NotInstalled;
+    }
+    let mut child = match std::process::Command::new(spec.probe[0])
+        .args(&spec.probe[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return ServerAvailability::Broken(error.to_string()),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ServerAvailability::Broken("viability probe timed out after 2s".into());
+            }
+            Err(error) => return ServerAvailability::Broken(error.to_string()),
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    if status.success() {
+        return ServerAvailability::Available;
+    }
+    let stderr = stderr.trim().to_string();
+    let stdout = stdout.trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("probe exited with {status}")
+    };
+    ServerAvailability::Broken(detail.chars().take(500).collect())
+}
+
 pub fn global() -> &'static LspRegistry {
     REGISTRY
         .get()
@@ -307,10 +502,18 @@ pub fn try_global() -> Option<&'static LspRegistry> {
 mod tests {
     use super::*;
 
+    fn all_available() -> HashMap<&'static str, ServerAvailability> {
+        SPECS
+            .iter()
+            .map(|spec| (spec.id, ServerAvailability::Available))
+            .collect()
+    }
+
     #[test]
     fn spec_for_path_matches_extension() {
         let reg = LspRegistry {
             available: SPECS.iter().collect(),
+            availability: all_available(),
             cells: SlotMap::default(),
         };
         assert_eq!(
@@ -328,9 +531,28 @@ mod tests {
     fn is_available_respects_detected_set() {
         let reg = LspRegistry {
             available: vec![&SPECS[0]],
+            availability: all_available(),
             cells: SlotMap::default(),
         };
         assert!(reg.is_available("rust-analyzer"));
         assert!(!reg.is_available("gopls"));
+    }
+
+    #[test]
+    fn probe_rejects_a_resolvable_but_broken_executable() {
+        static BROKEN: LspServerSpec = LspServerSpec {
+            id: "broken-test",
+            detect: &["which", "sh"],
+            probe: &["sh", "-c", "echo probe-broken >&2; exit 7"],
+            spawn: &["sh"],
+            language_id: "test",
+            extensions: &["test"],
+            root_hints: &["test.root"],
+        };
+        let availability = probe_server(&BROKEN);
+        assert!(
+            matches!(availability, ServerAvailability::Broken(ref detail) if detail.contains("probe-broken")),
+            "availability: {availability:?}"
+        );
     }
 }

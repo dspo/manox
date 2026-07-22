@@ -303,15 +303,9 @@ mod tests {
             resolve_context_window(&model("m", Some(1_000_000))),
             1_000_000
         );
-        assert_eq!(
-            resolve_context_window(&model("m", Some(131_072))),
-            131_072
-        );
+        assert_eq!(resolve_context_window(&model("m", Some(131_072))), 131_072);
         // max_tokens absent → fallback 8192 (only in tests).
-        assert_eq!(
-            resolve_context_window(&model("m", None)),
-            8192
-        );
+        assert_eq!(resolve_context_window(&model("m", None)), 8192);
     }
 
     #[test]

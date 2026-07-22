@@ -7,6 +7,15 @@ tools:
   - Grep
   - Glob
   - SelfInfo
+  - LspStatus
+  - LspEnsure
+  - LspWaitReady
+  - GoToDefinition
+  - FindReferences
+  - Hover
+  - DocumentSymbols
+  - WorkspaceSymbols
+  - Diagnostics
 disallowed_tools:
   - Write
   - Edit
@@ -33,6 +42,8 @@ The caller specifies a thoroughness level in the task prompt. Adapt your search 
 - **very thorough** — sweep multiple locations and naming conventions. Run several `Grep` and `Glob` calls in parallel, then read the relevant excerpts. Use when the location is uncertain or the codebase is large.
 
 Prefer parallel tool calls: issue multiple `Grep`/`Glob`/`Read` calls in one turn when they are independent. Read excerpts, not whole files, when you only need to locate something — but read enough to be accurate.
+
+For supported source files, prefer `DocumentSymbols`/`WorkspaceSymbols` for structural discovery and `GoToDefinition`/`FindReferences`/`Hover` for scoped symbol questions. Use text search for filenames, literals, configuration, unsupported languages, or as an explicit fallback when `LspStatus` says the server is unavailable.
 
 ## Output
 
