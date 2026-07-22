@@ -58,7 +58,7 @@
   "TaskStop": "通过 task id 停止后台任务（Monitor 或后台 Bash）。无需审批。若 task id 未知，返回所有当前可停止任务的摘要。",
   "TaskStop/properties/task_id": "要停止的 task id（如 `monitor_1`、`ws_1`、`bash_1`）。",
 
-  "EnterWorktree": "进入一个位于隔离分支上的 git worktree，并将会话工作目录切到该处。之后所有工具（Read、Write、Edit、Bash、……）自动在 worktree 内操作——无需手动 `cd`。在 worktree 内时，git 操作（commit、rebase、push、fetch）无需审批：绑定仓库的 `.git` 可写且网络启用，故 `git push` 顺畅无阻。当为隔离工作切出分支，或被显式要求在 worktree 中工作时使用此工具。用 `ExitWorktree` 退出（保留或移除）。Enter 会重定 provider 前缀缓存基线（system prompt 中的 cwd 行变化）——这是预期行为。传入 `name` 在 `<project>/.claude/worktrees/` 下创建新 worktree+分支，或传 `path` 重新进入已存在的 worktree。基准 ref 为 `origin/<default-branch>`（无远端跟踪分支时回退到 `HEAD`）。",
+  "EnterWorktree": "进入一个位于隔离分支上的 git worktree，并将会话工作目录切到该处。之后所有工具（Read、Write、Edit、Bash、……）自动在 worktree 内操作——无需手动 `cd`。在 worktree 内时，git 操作（commit、rebase、push、fetch）无需审批：绑定仓库的 `.git` 可写且网络启用，故 `git push` 顺畅无阻。当为隔离工作切出分支，或被显式要求在 worktree 中工作时使用此工具。用 `ExitWorktree` 退出（保留或移除）。Enter 会重定 provider 前缀缓存基线（system prompt 中的 cwd 行变化）——这是预期行为。传入 `name` 在 `<project>/.claude/worktrees/` 下创建新 worktree+分支，或传 `path` 重新进入任意已存在的 git worktree。基准 ref 为 `origin/<default-branch>`（无远端跟踪分支时回退到 `HEAD`）。",
   "EnterWorktree/properties/name": "新 worktree（及其分支）的名字。缺省时自动生成为 `wt-<short>`。与 `path` 互斥。",
   "EnterWorktree/properties/path": "要重新进入的已存在 worktree 的路径（如先前一次 `action=keep` 的 `exit_worktree` 留下的）。与 `name` 互斥。",
 
