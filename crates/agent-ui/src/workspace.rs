@@ -2145,14 +2145,29 @@ impl Workspace {
         // stored when the auth event was originally emitted. If the thread was
         // parked waiting for user approval while in the background, re-surface
         // the events so the overlay appears immediately upon switching back.
-        let entries: Vec<(String, String, String)> = self
+        let entries: Vec<(String, String, String, serde_json::Value)> = self
             .thread
             .read(cx)
             .pending_auth_entries()
             .into_iter()
-            .map(|(id, meta)| (id, meta.tool_name.clone(), meta.summary.clone()))
+            .map(|(id, meta)| {
+                (
+                    id,
+                    meta.tool_name.clone(),
+                    meta.summary.clone(),
+                    meta.input.clone(),
+                )
+            })
             .collect();
-        for (id, tool_name, summary) in entries {
+        for (id, tool_name, summary, input) in entries {
+            // AskUserQuestion needs its interactive card state rebuilt too —
+            // without `pending_ask` the generic approval overlay would surface
+            // for a tool that must only ever show the question card.
+            if tool_name == agent::tools::ASK_USER_QUESTION {
+                self.pending_ask = parse_pending_ask(id.clone(), input);
+                self.ask_step = 0;
+                self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
+            }
             let reason = self
                 .thread
                 .update(cx, |t, _cx| t.take_approval_ask_reason(&id));
@@ -3731,11 +3746,6 @@ impl Workspace {
     }
 
     fn render_auth_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // AskUserQuestion renders its own card; suppress the generic approval
-        // modal while a question card is open (both share the same id).
-        if self.pending_ask.is_some() {
-            return None;
-        }
         let auth = self.pending_auths.last()?;
         let summary = auth.summary.clone();
         let tool_name = auth.tool_name.clone();

@@ -4653,6 +4653,104 @@ impl Thread {
         }
     }
 
+    /// Interactive tools (`requires_user_input`, today only `AskUserQuestion`)
+    /// produce their result from the user's response instead of `run`. They
+    /// are read-only by contract and bypass the entire permission pipeline —
+    /// approval modes, the AutoReview side call, and the always-allow cache
+    /// must never gate or swallow a question to the user. Emits the same
+    /// `ToolCallAuthorization` event the UI's question card listens for, then
+    /// parks on the response oneshot. Serialized by the caller (interactive
+    /// calls are routed to the approval queue) so two cards never race for
+    /// the single-slot overlay.
+    async fn run_interactive_tool_inner(
+        this: gpui::WeakEntity<Self>,
+        tu: LanguageModelToolUse,
+        cancel: CancellationToken,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let name = tu.name.to_string();
+        let title = tool_title(&name, &tu.input);
+        let lang = this.read_with(cx, |this, _| this.agent_language)?;
+
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.clone(),
+                status: ToolCallStatus::PendingApproval,
+                input: Some(tu.input.clone()),
+            });
+        })?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        this.update(cx, |this, _cx| {
+            this.pending_authorizations.insert(id.clone(), tx);
+            this.pending_auth_meta.insert(
+                id.clone(),
+                PendingAuthMeta {
+                    tool_name: name.clone(),
+                    summary: title.clone(),
+                    input: tu.input.clone(),
+                },
+            );
+        })?;
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCallAuthorization {
+                id: id.clone(),
+                tool_name: name.clone(),
+                summary: title.clone(),
+                input: tu.input.clone(),
+            });
+        })?;
+
+        let response = tokio::select! {
+            r = rx => r.unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
+            _ = cancel.cancelled() => ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
+        };
+        // The pending responder is spent whether the UI answered or cancel
+        // fired; remove it so a late `respond_authorization` cannot revive a
+        // cancelled turn.
+        this.update(cx, |this, _cx| {
+            this.pending_authorizations.remove(&id);
+            this.pending_auth_meta.remove(&id);
+        })?;
+
+        let (output, is_error) = match response {
+            ToolAuthorizationResponse::AskUserQuestion { answers, response } => (
+                crate::prompt::render(
+                    crate::prompt::PromptTemplate::WrapperAskUserQuestions,
+                    lang,
+                    &crate::prompt::AskUserQuestionsData {
+                        answers: answers
+                            .into_iter()
+                            .map(|(q, a)| crate::prompt::AskUserQa {
+                                question: q,
+                                answer: a,
+                            })
+                            .collect(),
+                        response,
+                    },
+                )
+                .expect("ask user questions render"),
+                false,
+            ),
+            // Any bare decision means the question never reached the user:
+            // Deny (cancel, timeout, or a rejected prompt) is surfaced as-is.
+            _ => (
+                crate::prompt::render_static(
+                    crate::prompt::PromptTemplate::WrapperToolDenied,
+                    lang,
+                )
+                .expect("tool denied render"),
+                true,
+            ),
+        };
+        Self::emit_tool_result(&this, &id, &name, &title, &output, is_error, cx)?;
+        Self::append_tool_result(&this, tu, output, is_error, cx)?;
+        Ok(())
+    }
+
     /// Run a single tool call: authorize (if needed) → run → append a ToolResult message → emit.
     /// Owned `WeakEntity`/`CancellationToken` so each parallel tool runs in its own spawned task.
     async fn run_tool_inner(
@@ -4690,6 +4788,12 @@ impl Thread {
 
         if name == crate::tools::CODE {
             return Self::run_code_inner(this, tu, cancel, cx).await;
+        }
+
+        // Interactive tools resolve through their own path before any
+        // approval-mode / reviewer / always-allow logic can touch them.
+        if tool.requires_user_input() {
+            return Self::run_interactive_tool_inner(this, tu, cancel, cx).await;
         }
 
         // YOLO/AutoReview bypasses the permission gate: skip the authorization
@@ -4770,26 +4874,10 @@ impl Thread {
                     this.read_with(cx, |this, _| this.permission.set_always_allowed(&name))?;
                 }
                 ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {}
-                ToolAuthorizationResponse::AskUserQuestion { answers, response } => {
-                    let output = crate::prompt::render(
-                        crate::prompt::PromptTemplate::WrapperAskUserQuestions,
-                        lang,
-                        &crate::prompt::AskUserQuestionsData {
-                            answers: answers
-                                .into_iter()
-                                .map(|(q, a)| crate::prompt::AskUserQa {
-                                    question: q,
-                                    answer: a,
-                                })
-                                .collect(),
-                            response,
-                        },
-                    )
-                    .expect("ask user questions render");
-                    Self::emit_tool_result(&this, &id, &name, &title, &output, false, cx)?;
-                    Self::append_tool_result(&this, tu, output, false, cx)?;
-                    return Ok(());
-                }
+                // Interactive tools never reach this path (dispatched to
+                // `run_interactive_tool_inner` above), and no regular tool's
+                // response carries answers — the variant is unmatchable here.
+                ToolAuthorizationResponse::AskUserQuestion { .. } => {}
             }
         }
 
@@ -6699,6 +6787,116 @@ mod tests {
         let response = result.lock().unwrap().take().expect("nested response");
         assert!(!response.ok);
         assert!(response.output.contains("User denied"));
+    }
+
+    /// Interactive tools (`requires_user_input`) resolve through their own
+    /// path: no approval-mode gate, no reviewer side call, no always-allow
+    /// cache lookup — a poisoned cache entry must not suppress the question
+    /// card. Regression test for issue #296.
+    #[test]
+    fn interactive_tool_bypasses_permission_cache_and_renders_answers() {
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("ask-interactive", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        // Simulate the pre-fix poisoned state: a leftover always-allow grant
+        // and YOLO mode. Neither may skip the question card.
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.permission
+                    .set_always_allowed(crate::tools::ASK_USER_QUESTION);
+                t.set_approval_mode(super::ApprovalMode::Yolo, cx);
+            });
+        });
+
+        let auths: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = auths.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&thread, move |_, event: &super::ThreadEvent, _| {
+                if let super::ThreadEvent::ToolCallAuthorization { id, tool_name, .. } = event {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((id.clone(), tool_name.clone()));
+                }
+            })
+        });
+
+        let tu = crate::language_model::LanguageModelToolUse {
+            id: "ask1".into(),
+            name: crate::tools::ASK_USER_QUESTION.into(),
+            raw_input: String::new(),
+            input: serde_json::json!({
+                "questions": [{
+                    "question": "Pick one?",
+                    "header": "Pick",
+                    "options": [
+                        {"label": "A", "description": ""},
+                        {"label": "B", "description": ""}
+                    ],
+                    "multiSelect": false
+                }]
+            }),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let weak = thread.downgrade();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                let _ = super::Thread::run_tool_inner(weak, tu, CancellationToken::new(), &mut cx)
+                    .await;
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+
+        // The authorization event fired even with a poisoned cache + YOLO.
+        assert_eq!(
+            auths.lock().unwrap().as_slice(),
+            &[(
+                "ask1".to_string(),
+                crate::tools::ASK_USER_QUESTION.to_string()
+            )]
+        );
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                assert!(thread.pending_authorizations.contains_key("ask1"));
+                thread.respond_authorization(
+                    "ask1",
+                    super::ToolAuthorizationResponse::AskUserQuestion {
+                        answers: vec![("Pick one?".to_string(), "A".to_string())],
+                        response: None,
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let thread = thread.read(cx);
+            let result = thread
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .find_map(|c| match c {
+                    MessageContent::ToolResult(tr) => Some(tr),
+                    _ => None,
+                })
+                .expect("tool result appended");
+            assert_eq!(result.tool_use_id, "ask1");
+            assert!(!result.is_error, "answers must not render as an error");
+            assert!(result.content.contains("A"), "{}", result.content);
+        });
     }
 
     #[test]
