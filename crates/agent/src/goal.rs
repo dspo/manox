@@ -120,7 +120,7 @@ pub async fn evaluate(
         thinking_allowed: false,
         reasoning_effort: crate::settings::side_call_effort(
             &crate::settings::side_calls().goal_policy(),
-            crate::language_model::ReasoningEffort::Low,
+            crate::language_model::RequestReasoningEffort::Low,
         ),
         max_output_tokens: crate::settings::side_call_output_cap(
             crate::settings::side_calls().goal_policy(),

@@ -98,7 +98,22 @@ pub struct NestedRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NestedResponse {
     pub ok: bool,
+    /// Complete native output delivered into the private isolate. It is not
+    /// itself copied into the parent model request; only the script's selected
+    /// `text()` / return value is rendered there under Code's output budget.
     pub output: String,
+    /// Canonical/UI audit payload retained outside the serialized host-call
+    /// response. Native dispatch normally sets this to the same complete
+    /// output, making the audit contract explicit and independent of future
+    /// isolate wire changes.
+    #[serde(skip)]
+    pub raw_output: Option<String>,
+}
+
+impl NestedResponse {
+    pub fn into_audit_output(self) -> String {
+        self.raw_output.unwrap_or(self.output)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -225,21 +240,25 @@ async fn run_script(
     let context = AsyncContext::full(&runtime).await.map_err(js_error)?;
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_for_call = counter.clone();
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENCY));
 
     let result = context
         .async_with(async |ctx| {
             let requests = requests.clone();
             let cancel = cancel.clone();
+            let permits = permits.clone();
             let host_call = move |name: String, input: String| {
                 let requests = requests.clone();
                 let cancel = cancel.clone();
                 let counter = counter_for_call.clone();
+                let permits = permits.clone();
                 async move {
                     let sequence = counter.fetch_add(1, Ordering::AcqRel);
                     if sequence >= MAX_NESTED_CALLS {
                         return serde_json::to_string(&NestedResponse {
                             ok: false,
                             output: format!("nested call limit exceeded ({MAX_NESTED_CALLS})"),
+                            raw_output: None,
                         })
                         .unwrap();
                     }
@@ -247,6 +266,7 @@ async fn run_script(
                         return serde_json::to_string(&NestedResponse {
                             ok: false,
                             output: format!("tool not allowed in Code: {name}"),
+                            raw_output: None,
                         })
                         .unwrap();
                     }
@@ -256,9 +276,30 @@ async fn run_script(
                             return serde_json::to_string(&NestedResponse {
                                 ok: false,
                                 output: format!("invalid tool input: {error}"),
+                                raw_output: None,
                             })
                             .unwrap();
                         }
+                    };
+                    // Enforce the isolate contract independently of the
+                    // foreground dispatcher. A stalled dispatcher therefore
+                    // cannot accumulate more than eight in-flight native
+                    // calls, and cancellation wakes callers waiting for a
+                    // permit.
+                    let permit = tokio::select! {
+                        permit = permits.acquire_owned() => match permit {
+                            Ok(permit) => permit,
+                            Err(_) => return serde_json::to_string(&NestedResponse {
+                                ok: false,
+                                output: "Code dispatcher stopped".into(),
+                                raw_output: None,
+                            }).unwrap(),
+                        },
+                        _ = cancel.cancelled() => return serde_json::to_string(&NestedResponse {
+                            ok: false,
+                            output: "Code cancelled".into(),
+                            raw_output: None,
+                        }).unwrap(),
                     };
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let request = NestedRequest {
@@ -270,13 +311,17 @@ async fn run_script(
                     let response = tokio::select! {
                         sent = requests.send(request) => {
                             if sent.is_err() {
-                                NestedResponse { ok: false, output: "Code dispatcher stopped".into() }
+                                NestedResponse { ok: false, output: "Code dispatcher stopped".into(), raw_output: None }
                             } else {
-                                rx.await.unwrap_or(NestedResponse { ok: false, output: "nested tool cancelled".into() })
+                                tokio::select! {
+                                    response = rx => response.unwrap_or(NestedResponse { ok: false, output: "nested tool cancelled".into(), raw_output: None }),
+                                    _ = cancel.cancelled() => NestedResponse { ok: false, output: "Code cancelled".into(), raw_output: None },
+                                }
                             }
                         }
-                        _ = cancel.cancelled() => NestedResponse { ok: false, output: "Code cancelled".into() },
+                        _ = cancel.cancelled() => NestedResponse { ok: false, output: "Code cancelled".into(), raw_output: None },
                     };
+                    drop(permit);
                     serde_json::to_string(&response).unwrap()
                 }
             };
@@ -289,7 +334,7 @@ async fn run_script(
                 .iter()
                 .map(|name| {
                     format!(
-                        "{name}: async (input) => {{ const r = JSON.parse(await __hostCall({quoted}, JSON.stringify(input ?? {{}}))); if (!r.ok) throw new Error(r.output); return r.output; }}",
+                        "{name}: async (input) => {{ const r = JSON.parse(await __hostCall({quoted}, JSON.stringify(input ?? {{}}))); if (!r.ok) throw new Error({quoted} + ': ' + r.output); return r.output; }}",
                         quoted = serde_json::to_string(name).unwrap()
                     )
                 })
@@ -297,16 +342,19 @@ async fn run_script(
                 .join(",\n");
             let source = format!(
                 r#"
-                const AsyncFunction = (async () => {{}}).constructor;
-                const GeneratorFunction = (function* () {{}}).constructor;
-                const AsyncGeneratorFunction = (async function* () {{}}).constructor;
-                for (const constructor of [
-                    Function, AsyncFunction, GeneratorFunction, AsyncGeneratorFunction
-                ]) {{
-                    Object.defineProperty(constructor.prototype, "constructor", {{
-                        value: undefined, writable: false, configurable: false
-                    }});
-                }}
+                (() => {{
+                    const constructors = [
+                        Function,
+                        (async () => {{}}).constructor,
+                        (function* () {{}}).constructor,
+                        (async function* () {{}}).constructor
+                    ];
+                    for (const constructor of constructors) {{
+                        Object.defineProperty(constructor.prototype, "constructor", {{
+                            value: undefined, writable: false, configurable: false
+                        }});
+                    }}
+                }})();
                 globalThis.process = undefined;
                 globalThis.require = undefined;
                 globalThis.fetch = undefined;
@@ -314,6 +362,9 @@ async fn run_script(
                 globalThis.WebSocket = undefined;
                 globalThis.eval = undefined;
                 globalThis.Function = undefined;
+                globalThis.AsyncFunction = undefined;
+                globalThis.GeneratorFunction = undefined;
+                globalThis.AsyncGeneratorFunction = undefined;
                 const tools = Object.freeze({{ {tool_bindings} }});
                 (async () => {{
                     const selected = [];
@@ -378,7 +429,7 @@ mod tests {
                         return done.recv().await.expect("isolate result");
                     };
                     let output = format!("{}:{}", request.tool_name, request.input);
-                    request.response.send(NestedResponse { ok: true, output }).expect("response");
+                    request.response.send(NestedResponse { ok: true, output, raw_output: None }).expect("response");
                 }
             }
         }
@@ -407,6 +458,8 @@ mod tests {
             text([
                 typeof process, typeof require, typeof fetch,
                 typeof eval, typeof Function,
+                typeof AsyncFunction, typeof GeneratorFunction,
+                typeof AsyncGeneratorFunction,
                 typeof (() => {}).constructor,
                 typeof (async () => {}).constructor,
                 typeof (function* () {}).constructor,
@@ -419,7 +472,7 @@ mod tests {
         assert_eq!(
             outcome.selected,
             [
-                "undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined"
+                "undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined"
             ]
         );
     }
@@ -476,6 +529,7 @@ mod tests {
             .send(NestedResponse {
                 ok: true,
                 output: "A".into(),
+                raw_output: None,
             })
             .unwrap();
         second
@@ -483,11 +537,110 @@ mod tests {
             .send(NestedResponse {
                 ok: true,
                 output: "B".into(),
+                raw_output: None,
             })
             .unwrap();
         let outcome = done.recv().await.unwrap().unwrap();
         assert_eq!(outcome.calls, 2);
         assert_eq!(outcome.returned.as_deref(), Some("A,B"));
+    }
+
+    #[tokio::test]
+    async fn promise_all_never_dispatches_more_than_eight_active_calls() {
+        let (request_tx, request_rx) = async_channel::bounded(MAX_NESTED_CALLS);
+        let calls = (0..MAX_CONCURRENCY + 1)
+            .map(|i| format!(r#"tools.Read({{path: "{i}"}})"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let done = spawn_script(
+            format!("await Promise.all([{calls}]); return 'done';"),
+            request_tx,
+            CancellationToken::new(),
+        );
+        let mut active = Vec::new();
+        for _ in 0..MAX_CONCURRENCY {
+            active.push(
+                tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+                    .await
+                    .expect("active request timeout")
+                    .expect("active request"),
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), request_rx.recv())
+                .await
+                .is_err(),
+            "a ninth request crossed the eight-call concurrency boundary"
+        );
+        active
+            .pop()
+            .unwrap()
+            .response
+            .send(NestedResponse {
+                ok: true,
+                output: "released".into(),
+                raw_output: None,
+            })
+            .unwrap();
+        let ninth = tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+            .await
+            .expect("ninth request was not released")
+            .expect("ninth request");
+        for request in active.into_iter().chain(std::iter::once(ninth)) {
+            request
+                .response
+                .send(NestedResponse {
+                    ok: true,
+                    output: "ok".into(),
+                    raw_output: None,
+                })
+                .unwrap();
+        }
+        let outcome = done.recv().await.unwrap().unwrap();
+        assert_eq!(outcome.calls, MAX_CONCURRENCY + 1);
+        assert_eq!(outcome.returned.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_propagates_to_pending_nested_call() {
+        let (request_tx, request_rx) = async_channel::bounded(MAX_CONCURRENCY);
+        let cancel = CancellationToken::new();
+        let done = spawn_script(
+            "await tools.Read({path: 'slow'});".into(),
+            request_tx,
+            cancel.clone(),
+        );
+        let _pending = request_rx.recv().await.expect("nested request");
+        cancel.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), done.recv())
+            .await
+            .expect("cancelled isolate timeout")
+            .expect("isolate result")
+            .unwrap_err();
+        assert!(error.contains("Read: Code cancelled"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn uncaught_nested_error_names_the_failing_tool() {
+        let (request_tx, request_rx) = async_channel::bounded(MAX_CONCURRENCY);
+        let done = spawn_script(
+            "await tools.Read({path: 'denied'});".into(),
+            request_tx,
+            CancellationToken::new(),
+        );
+        request_rx
+            .recv()
+            .await
+            .expect("nested request")
+            .response
+            .send(NestedResponse {
+                ok: false,
+                output: "permission denied".into(),
+                raw_output: None,
+            })
+            .unwrap();
+        let error = done.recv().await.unwrap().unwrap_err();
+        assert!(error.contains("Read: permission denied"), "{error}");
     }
 
     #[tokio::test]
@@ -515,5 +668,46 @@ mod tests {
             Vec::new(),
         );
         assert!(model_text(&raw).len() <= crate::optimizer::tool_budget(super::super::CODE));
+    }
+
+    #[test]
+    fn nested_response_serializes_raw_output_for_private_isolate_and_audit() {
+        let raw = "full native output".repeat(10_000);
+        let response = NestedResponse {
+            ok: true,
+            output: raw.clone(),
+            raw_output: Some(raw.clone()),
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(wire.contains("full native output"));
+        assert!(!wire.contains("raw_output"));
+        assert_eq!(response.into_audit_output(), raw);
+    }
+
+    #[tokio::test]
+    async fn isolate_can_select_from_beyond_native_tool_output_budget() {
+        let (request_tx, request_rx) = async_channel::bounded(MAX_CONCURRENCY);
+        let done = spawn_script(
+            "const value = await tools.Read({path: 'large'}); return value.slice(-12);".into(),
+            request_tx,
+            CancellationToken::new(),
+        );
+        let raw = format!(
+            "{}VISIBLE_TAIL",
+            "x".repeat(crate::optimizer::tool_budget(super::super::READ) * 2)
+        );
+        request_rx
+            .recv()
+            .await
+            .expect("nested request")
+            .response
+            .send(NestedResponse {
+                ok: true,
+                output: raw.clone(),
+                raw_output: Some(raw),
+            })
+            .unwrap();
+        let outcome = done.recv().await.unwrap().unwrap();
+        assert_eq!(outcome.returned.as_deref(), Some("VISIBLE_TAIL"));
     }
 }

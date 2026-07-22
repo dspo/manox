@@ -47,8 +47,18 @@ const MAX_ACTIVATED: usize = 24;
 
 /// Global activation state: thread_id → activated names in first-use order.
 static ACTIVATIONS: Mutex<Option<ActivationLedger>> = Mutex::new(None);
+static SEARCH_STATS: Mutex<Option<std::collections::HashMap<String, ToolSearchStats>>> =
+    Mutex::new(None);
 
 type ActivationLedger = std::collections::HashMap<String, Vec<String>>;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolSearchStats {
+    pub queries: u64,
+    pub hits: u64,
+    pub last_query: String,
+    pub last_hits: Vec<String>,
+}
 
 /// Activate one or more tools for a given thread. Non-core tools only (core
 /// tools are always present and don't need activation). Respects the
@@ -110,11 +120,36 @@ pub fn activated_for(thread_id: &str) -> Vec<String> {
     ledger.get(thread_id).cloned().unwrap_or_default()
 }
 
+pub fn search_stats_for(thread_id: &str) -> ToolSearchStats {
+    SEARCH_STATS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|stats| stats.get(thread_id))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn record_search(thread_id: &str, query: &str, hits: &[String]) {
+    let mut guard = SEARCH_STATS.lock().unwrap();
+    let stats = guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(thread_id.to_string())
+        .or_default();
+    stats.queries = stats.queries.saturating_add(1);
+    stats.hits = stats.hits.saturating_add(hits.len() as u64);
+    stats.last_query = query.to_string();
+    stats.last_hits = hits.to_vec();
+}
+
 /// Drop activation state for a thread when it shuts down. Idempotent.
 pub fn drop_activations(thread_id: &str) {
     let mut guard = ACTIVATIONS.lock().unwrap();
     if let Some(ledger) = guard.as_mut() {
         ledger.remove(thread_id);
+    }
+    if let Some(stats) = SEARCH_STATS.lock().unwrap().as_mut() {
+        stats.remove(thread_id);
     }
 }
 
@@ -218,6 +253,7 @@ impl AgentTool for ToolSearchTool {
         // descriptions) this turn, then can call them next turn when the
         // schema includes them.
         let discovered: Vec<String> = results.iter().map(|r| r.name.clone()).collect();
+        record_search(&thread_id, &query.query, &discovered);
         if !discovered.is_empty() {
             activate_tools(&thread_id, &discovered);
         }
@@ -452,6 +488,24 @@ mod tests {
         activate_tools(tid, &["Agent".into(), "Monitor".into()]);
         assert_eq!(activated_for(tid), ["WebFetch", "Agent", "List", "Monitor"]);
         drop_activations(tid);
+    }
+
+    #[test]
+    fn search_stats_record_queries_hits_and_last_result() {
+        let tid = "test_search_stats";
+        record_search(tid, "web", &["WebFetch".into(), "BrowserOpen".into()]);
+        record_search(tid, "agent", &["Agent".into()]);
+        assert_eq!(
+            search_stats_for(tid),
+            ToolSearchStats {
+                queries: 2,
+                hits: 3,
+                last_query: "agent".into(),
+                last_hits: vec!["Agent".into()],
+            }
+        );
+        drop_activations(tid);
+        assert_eq!(search_stats_for(tid), ToolSearchStats::default());
     }
 
     #[test]

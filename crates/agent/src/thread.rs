@@ -85,7 +85,11 @@ pub struct ContextOptimizationMetrics {
     pub active_tool_schemas: usize,
     pub total_tool_schemas: usize,
     pub activated_tools: Vec<String>,
+    pub tool_search_queries: u64,
+    pub tool_search_hits: u64,
+    pub tool_search_last_hits: Vec<String>,
     pub code_nested_calls: u64,
+    pub code_model_round_trips_avoided: u64,
     pub code_raw_tokens: u64,
     pub code_projected_tokens: u64,
     pub compactions_avoided: u64,
@@ -385,10 +389,9 @@ pub struct PendingAuthMeta {
     pub input: serde_json::Value,
 }
 
-/// Session-scoped goal-mode state. Not persisted — a goal is an ephemeral
-/// autonomy directive tied to the live session, so a reloaded thread always
-/// starts with no goal (mirrors the `worktree` session-scoped pattern, and
-/// `Instant` is not `Serialize` in any case).
+/// Goal-mode state. The deterministic compaction capsule persists the
+/// condition; reload resets monotonic timing/evaluation counters because
+/// `Instant` is intentionally not serialized.
 pub struct GoalState {
     /// The completion condition the agent works toward, in the user's words.
     pub condition: String,
@@ -1030,6 +1033,29 @@ impl Thread {
                 .cloned()
                 .map(crate::background_task::TaskSnapshot::normalize_after_restore)
                 .collect();
+            let restored_state = crate::compact::latest_compaction_state(&rec.messages);
+            let restored_mode = restored_state
+                .as_ref()
+                .and_then(|state| state.collaboration_mode.as_deref())
+                .and_then(|mode| match mode.to_ascii_lowercase().as_str() {
+                    "plan" => Some(ModeKind::Plan),
+                    "default" => Some(ModeKind::Default),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let restored_goal = restored_state
+                .as_ref()
+                .and_then(|state| state.goal.clone())
+                .filter(|_| restored_mode != ModeKind::Plan)
+                .map(|condition| GoalState {
+                    condition,
+                    started_at: Instant::now(),
+                    evaluations: 0,
+                    last_reason: "restored from compaction capsule".into(),
+                });
+            if let Some(state) = restored_state.as_ref() {
+                crate::tools::tool_search::activate_tools(&rec.id, &state.active_tools);
+            }
             Self {
                 id: ThreadId(rec.id),
                 messages: rec.messages,
@@ -1069,12 +1095,12 @@ impl Thread {
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
-                collaboration_mode: ModeKind::Default,
+                collaboration_mode: restored_mode,
                 proposed_plan_parser: ProposedPlanParser::new(),
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
                 reasoning_effort: ReasoningEffort::from_i64(rec.reasoning_effort),
-                goal: None,
+                goal: restored_goal,
                 goal_cancel: None,
                 title_state: TitleState::restore(
                     rec.title,
@@ -3956,7 +3982,7 @@ impl Thread {
                             tool_name: audit_name,
                             input: audit_input,
                             ok: response.ok,
-                            output: response.output,
+                            output: response.into_audit_output(),
                         }
                     })
                 })?;
@@ -3997,7 +4023,7 @@ impl Thread {
                                     tool_name: audit_name,
                                     input: audit_input,
                                     ok: response.ok,
-                                    output: response.output,
+                                    output: response.into_audit_output(),
                                 }
                             })
                         })?;
@@ -4045,7 +4071,11 @@ impl Thread {
         approval_gate: Arc<tokio::sync::Mutex<()>>,
         cx: &mut AsyncApp,
     ) -> crate::tools::code::NestedResponse {
-        let fail = |output: String| crate::tools::code::NestedResponse { ok: false, output };
+        let fail = |output: String| crate::tools::code::NestedResponse {
+            ok: false,
+            output,
+            raw_output: None,
+        };
         if cancel.is_cancelled() {
             return fail("Code cancelled".into());
         }
@@ -4206,11 +4236,6 @@ impl Thread {
             Ok(output) => (output, false),
             Err(error) => (error, true),
         };
-        let output = crate::optimizer::compact_tool_output(
-            &name,
-            &output,
-            crate::optimizer::tool_budget(&name),
-        );
         let _ = this.update(cx, |_, cx| {
             cx.emit(ThreadEvent::ToolCall {
                 id: id.clone(),
@@ -4227,7 +4252,12 @@ impl Thread {
         let _ = Self::emit_tool_result(&this, &id, &name, &title, &output, is_error, cx);
         crate::tools::code::NestedResponse {
             ok: !is_error,
-            output,
+            // QuickJS is the private deterministic processing boundary: it
+            // needs the complete native result so the script can select from
+            // any part of it. Only Code's final `text()` / return projection
+            // is compacted before the next model request.
+            output: output.clone(),
+            raw_output: Some(output),
         }
     }
 
@@ -5315,7 +5345,7 @@ impl Thread {
         LanguageModelRequest {
             messages,
             tools,
-            reasoning_effort: Some(active_effort),
+            reasoning_effort: Some(active_effort.into()),
             ..Default::default()
         }
     }
@@ -5497,6 +5527,7 @@ impl Thread {
                 .sum()
         };
         let mut code_nested_calls = 0u64;
+        let mut code_calls = 0u64;
         let mut code_raw_bytes = 0usize;
         let mut code_projected_bytes = 0usize;
         for result in self
@@ -5518,9 +5549,11 @@ impl Thread {
             if let Ok(envelope) =
                 serde_json::from_str::<crate::tools::code::CodeEnvelope>(&result.content)
             {
+                code_calls = code_calls.saturating_add(1);
                 code_nested_calls = code_nested_calls.saturating_add(envelope.calls as u64);
             }
         }
+        let search_stats = crate::tools::tool_search::search_stats_for(&self.id.0);
 
         let (actual_bytes, shadow_bytes) = [
             (rewrite_mode, rewrite_bytes),
@@ -5563,8 +5596,12 @@ impl Thread {
             image_saved_tokens: approx_tokens(image_bytes),
             active_tool_schemas: request.tools.len(),
             total_tool_schemas: all_tools.len(),
-            activated_tools: request.tools.iter().map(|tool| tool.name.clone()).collect(),
+            activated_tools: crate::tools::tool_search::activated_for(&self.id.0),
+            tool_search_queries: search_stats.queries,
+            tool_search_hits: search_stats.hits,
+            tool_search_last_hits: search_stats.last_hits,
             code_nested_calls,
+            code_model_round_trips_avoided: code_nested_calls.saturating_sub(code_calls),
             code_raw_tokens: approx_tokens(code_raw_bytes),
             code_projected_tokens: approx_tokens(code_projected_bytes),
             compactions_avoided: self.avoided_compactions.load(Ordering::Relaxed),
@@ -5803,6 +5840,7 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{model_facing_content, tool_title};
+    use crate::ModeKind;
     use crate::language_model::{
         AnyLanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
         LanguageModelToolResult, MessageContent,
@@ -6127,6 +6165,148 @@ mod tests {
     }
 
     #[test]
+    fn restore_rehydrates_goal_mode_and_tool_activations_from_capsule() {
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let state =
+            crate::compact::collect_compaction_state(crate::compact::CompactionStateInput {
+                cwd: std::path::Path::new("/tmp"),
+                covered_message_id: Some("covered"),
+                worktree_branch: None,
+                worktree_path: None,
+                git_branch: None,
+                git_status: None,
+                plan_steps: None,
+                goal: Some("all checks pass"),
+                collaboration_mode: Some("Default"),
+                active_tools: vec![crate::tools::WEB_FETCH.into()],
+                active_skills: Vec::new(),
+                background_shells: Vec::new(),
+                artifacts: Vec::new(),
+            });
+        let envelope = crate::compact::build_compaction_envelope("handoff".into(), state);
+        let messages = vec![Message::user_with_content(vec![
+            MessageContent::Compaction(envelope),
+        ])];
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("restore-capsule", "/tmp", messages),
+                None,
+                cx,
+            )
+        });
+        cx.update(|cx| {
+            let thread = thread.read(cx);
+            assert_eq!(thread.collaboration_mode, ModeKind::Default);
+            assert_eq!(
+                thread.goal.as_ref().map(|goal| goal.condition.as_str()),
+                Some("all checks pass")
+            );
+        });
+        assert_eq!(
+            crate::tools::tool_search::activated_for("restore-capsule"),
+            [crate::tools::WEB_FETCH]
+        );
+        crate::tools::tool_search::drop_activations("restore-capsule");
+    }
+
+    #[test]
+    fn code_nested_write_is_rejected_by_plan_mode_backstop() {
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            let thread = super::Thread::restore(
+                crate::db::ThreadRecord::for_test("code-plan-backstop", "/tmp", Vec::new()),
+                None,
+                cx,
+            );
+            thread.update(cx, |thread, _| {
+                thread.collaboration_mode = ModeKind::Plan;
+            });
+            thread
+        });
+        let result = Arc::new(Mutex::new(None));
+        let captured = result.clone();
+        let weak = thread.downgrade();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                let response = super::Thread::run_code_nested(
+                    weak,
+                    "code/1".into(),
+                    crate::tools::WRITE.into(),
+                    serde_json::json!({"path":"blocked.txt","content":"no"}),
+                    CancellationToken::new(),
+                    Arc::new(tokio::sync::Mutex::new(())),
+                    &mut cx,
+                )
+                .await;
+                *captured.lock().unwrap() = Some(response);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+        let response = result.lock().unwrap().take().expect("nested response");
+        assert!(!response.ok);
+        assert!(response.output.contains("Plan mode does not permit"));
+    }
+
+    #[test]
+    fn code_nested_write_waits_for_and_honors_approval() {
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("code-approval", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let result = Arc::new(Mutex::new(None));
+        let captured = result.clone();
+        let weak = thread.downgrade();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                let response = super::Thread::run_code_nested(
+                    weak,
+                    "code/approval".into(),
+                    crate::tools::WRITE.into(),
+                    serde_json::json!({"path":"blocked.txt","content":"no"}),
+                    CancellationToken::new(),
+                    Arc::new(tokio::sync::Mutex::new(())),
+                    &mut cx,
+                )
+                .await;
+                *captured.lock().unwrap() = Some(response);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+        assert!(result.lock().unwrap().is_none(), "write bypassed approval");
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                assert!(thread.pending_authorizations.contains_key("code/approval"));
+                thread.respond_authorization(
+                    "code/approval",
+                    super::ToolAuthorizationResponse::Decision(super::PermissionDecision::Deny),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        let response = result.lock().unwrap().take().expect("nested response");
+        assert!(!response.ok);
+        assert!(response.output.contains("User denied"));
+    }
+
+    #[test]
     fn cancel_emits_explicit_cancelled_stop_reason() {
         use crate::language_model::StopReason;
         use std::sync::Mutex;
@@ -6245,14 +6425,14 @@ mod tests {
             });
             thread.read(cx).build_completion_request()
         });
-        assert_eq!(req.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(req.reasoning_effort, Some(ReasoningEffort::High.into()));
 
         // Max → Max on the wire.
         let req = cx.update(|cx| {
             thread.update(cx, |t, cx| t.set_reasoning_effort(ReasoningEffort::Max, cx));
             thread.read(cx).build_completion_request()
         });
-        assert_eq!(req.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(req.reasoning_effort, Some(ReasoningEffort::Max.into()));
     }
 
     /// The multi-level CLAUDE.md block rides as a per-request user message in
@@ -6531,6 +6711,92 @@ mod tests {
             sys_text.contains("can process image"),
             "ground-truth image-capability line missing: {sys_text}"
         );
+    }
+
+    #[test]
+    fn request_projection_never_mutates_canonical_or_persisted_messages() {
+        crate::agent_def::init();
+        crate::skill::init();
+        let cx = gpui::TestAppContext::single();
+        let raw_audit = "raw nested result that must remain auditable".repeat(1_000);
+        let code_result = crate::tools::code::envelope_json(
+            Ok(crate::tools::code::ScriptOutcome {
+                selected: vec!["selected only".into()],
+                returned: None,
+                calls: 1,
+            }),
+            vec![crate::tools::code::AuditEntry {
+                sequence: 0,
+                tool_name: crate::tools::READ.into(),
+                input: serde_json::json!({"path":"large.txt"}),
+                ok: true,
+                output: raw_audit.clone(),
+            }],
+        );
+        let messages = vec![
+            Message::user_with_content(vec![
+                MessageContent::Text("inspect this".into()),
+                MessageContent::Image {
+                    data: "aGVsbG8=".into(),
+                    mime_type: "image/png".into(),
+                },
+            ]),
+            Message::assistant(vec![MessageContent::ToolUse(
+                crate::language_model::LanguageModelToolUse {
+                    id: "code-1".into(),
+                    name: crate::tools::CODE.into(),
+                    raw_input: String::new(),
+                    input: serde_json::json!({"script":"return 'selected only'"}),
+                    is_input_complete: true,
+                    thought_signature: None,
+                },
+            )]),
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "code-1".into(),
+                tool_name: crate::tools::CODE.into(),
+                is_error: false,
+                content: code_result,
+            })]),
+        ];
+        let model: AnyLanguageModel = Arc::new(CapabilityMockModel {
+            id: "test/nonvision-projection".into(),
+            supports_tools: true,
+            supports_images: false,
+        });
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test(
+                    "reg-canonical-projection",
+                    "/tmp",
+                    messages.clone(),
+                ),
+                Some(model),
+                cx,
+            )
+        });
+
+        let canonical_json = serde_json::to_string(&messages).unwrap();
+        let before = cx.update(|cx| serde_json::to_string(&thread.read(cx).messages).unwrap());
+        let request = cx.update(|cx| thread.read(cx).build_completion_request());
+        let after = cx.update(|cx| serde_json::to_string(&thread.read(cx).messages).unwrap());
+        let persisted = cx.update(|cx| {
+            serde_json::to_string(&thread.read(cx).snapshot().unwrap().messages).unwrap()
+        });
+
+        assert_eq!(before, canonical_json);
+        assert_eq!(after, before, "request projection mutated Thread::messages");
+        assert_eq!(persisted, before, "snapshot persisted projected messages");
+        assert!(
+            request
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|content| !matches!(content, MessageContent::Image { .. })),
+            "non-vision request retained raw image bytes"
+        );
+        let request_json = serde_json::to_string(&request.messages).unwrap();
+        assert!(request_json.contains("selected only"));
+        assert!(!request_json.contains(&raw_audit));
     }
 
     /// Regression guard: a fresh Default-mode main thread carries the mode's
@@ -6948,6 +7214,7 @@ mod tests {
 
         let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
         crate::agent_def::init();
+        crate::skill::init();
         let cx = gpui::TestAppContext::single();
         cx.update(|cx| {
             crate::runtime::init(cx);
@@ -7743,6 +8010,88 @@ mod tests {
         assert_eq!(count_nudges(&messages), 0, "overflow never injects a nudge");
     }
 
+    #[test]
+    fn failed_compaction_preserves_history_and_previous_capsule() {
+        use std::sync::{Arc, Mutex};
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let state =
+            crate::compact::collect_compaction_state(crate::compact::CompactionStateInput {
+                cwd: std::path::Path::new("/tmp"),
+                covered_message_id: Some("old"),
+                worktree_branch: None,
+                worktree_path: None,
+                git_branch: None,
+                git_status: None,
+                plan_steps: None,
+                goal: Some("preserve me"),
+                collaboration_mode: Some("Default"),
+                active_tools: Vec::new(),
+                active_skills: Vec::new(),
+                background_shells: Vec::new(),
+                artifacts: Vec::new(),
+            });
+        let messages = vec![
+            Message::user("old history".into()),
+            Message::user_with_content(vec![MessageContent::Compaction(
+                crate::compact::build_compaction_envelope("previous summary".into(), state),
+            )]),
+            Message::user("new work after the boundary".into()),
+        ];
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let model: AnyLanguageModel = Arc::new(OverflowScriptMockModel {
+            id: "test/failed-compaction".into(),
+            calls,
+            script: Arc::new(vec![OverflowCall::Overflow]),
+        });
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test(
+                    "reg-failed-compaction",
+                    "/tmp",
+                    messages.clone(),
+                ),
+                Some(model.clone()),
+                cx,
+            )
+        });
+        let before = serde_json::to_string(&messages).unwrap();
+        let result = Arc::new(Mutex::new(None));
+        let captured = result.clone();
+        let weak = thread.downgrade();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                *captured.lock().unwrap() = Some(
+                    super::Thread::perform_compaction(
+                        &weak,
+                        &model,
+                        messages.len(),
+                        &cancel,
+                        &mut cx,
+                    )
+                    .await,
+                );
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+
+        assert!(result.lock().unwrap().take().unwrap().is_err());
+        let after = cx.update(|cx| serde_json::to_string(&thread.read(cx).messages).unwrap());
+        assert_eq!(
+            after, before,
+            "failed compaction wrote a partial replacement"
+        );
+        let restored = crate::compact::latest_compaction_state(
+            &cx.update(|cx| thread.read(cx).messages.clone()),
+        )
+        .expect("previous capsule disappeared");
+        assert_eq!(restored.goal.as_deref(), Some("preserve me"));
+    }
+
     /// Sub-agents get the same overflow lifeline: depth does not disable the
     /// compact-and-retry rescue.
     #[test]
@@ -8308,6 +8657,7 @@ mod tests {
 
         let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
         crate::agent_def::init();
+        crate::skill::init();
         let cx = gpui::TestAppContext::single();
         cx.update(|cx| {
             crate::runtime::init(cx);

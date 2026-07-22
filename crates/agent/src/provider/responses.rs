@@ -778,7 +778,7 @@ mod tests {
     #[test]
     fn build_request_body_includes_reasoning_effort() {
         let mut req = req_with_tool();
-        req.reasoning_effort = Some(ReasoningEffort::Max);
+        req.reasoning_effort = Some(ReasoningEffort::Max.into());
         let body = build_request_body("m", 64, &req, "test-key", false);
         assert_eq!(body["reasoning"]["effort"], "max");
     }
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn build_request_body_clamps_reasoning_effort_for_official_openai() {
         let mut req = req_with_tool();
-        req.reasoning_effort = Some(ReasoningEffort::Max);
+        req.reasoning_effort = Some(ReasoningEffort::Max.into());
         let body = build_request_body("m", 64, &req, "test-key", true);
         assert_eq!(body["reasoning"]["effort"], "high");
     }

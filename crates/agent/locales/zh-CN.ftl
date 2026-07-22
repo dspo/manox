@@ -483,10 +483,10 @@ context-optimization-title = 上下文投影节省
 context-optimization-projection = 发送 {$projected} / 基线 {$baseline}
 context-optimization-breakdown = 系统 {$system} · 模式 {$mode} · 项目 {$project} · 工具定义 {$schemas} · 历史 {$history} · 结果 {$results}
 context-optimization-tools = 工具定义 {$active}/{$total} · 重写 {$rewrite} · 剪枝 {$pruning} · 发现 {$discovery}
-context-optimization-runtime = 前缀 {$prefix}% · 避免压缩 {$avoided} · Code {$nested} 次 {$raw}→{$projected} · 工具 {$tools}
+context-optimization-runtime = 前缀 {$prefix}% · 避免压缩 {$avoided} · Code {$nested} 次 / 减少 {$roundtrips} 轮 {$raw}→{$projected} · ToolSearch {$queries} 次 / {$hits} 命中（最近：{$last_hits}）· 已激活 {$tools}
 context-side-calls-title = 辅助调用
-context-side-calls-row = {$purpose} · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache} · 平均 {$latency}ms
-context-main-calls-row = 主调用 · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache} · 平均 {$latency}ms
+context-side-calls-row = {$purpose} · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache}（{$cache_rate}）· 平均 {$latency}ms
+context-main-calls-row = 主调用 · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache}（{$cache_rate}）· 平均 {$latency}ms
 
 # ── Cockpit（运行状态 / 里程碑 / 上下文预算）──────────────────────────
 # 运行状态行的阶段标签（三状态 tag：生成中 / 思考中 / 待输入）。

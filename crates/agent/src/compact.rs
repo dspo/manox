@@ -112,6 +112,20 @@ pub fn parse_compaction(content: &str) -> (String, Option<CompactionState>) {
     }
 }
 
+/// Latest valid deterministic state capsule in canonical history. Malformed
+/// and legacy compactions are skipped, allowing thread/UI restoration to fall
+/// back to the most recent usable capsule without trusting LLM prose.
+pub fn latest_compaction_state(messages: &[Message]) -> Option<CompactionState> {
+    messages.iter().rev().find_map(|message| {
+        message.content.iter().rev().find_map(|content| {
+            let MessageContent::Compaction(raw) = content else {
+                return None;
+            };
+            parse_compaction(raw).1
+        })
+    })
+}
+
 /// Build the JSON envelope for a new compaction. The caller provides the
 /// summary text and the current runtime state.
 pub fn build_compaction_envelope(summary: String, state: CompactionState) -> String {
@@ -660,7 +674,7 @@ pub fn build_compaction_request(
         thinking_allowed: false,
         reasoning_effort: crate::settings::side_call_effort(
             &crate::settings::side_calls().compaction_policy(),
-            crate::language_model::ReasoningEffort::Medium,
+            crate::language_model::RequestReasoningEffort::Medium,
         ),
         max_output_tokens: crate::settings::side_call_output_cap(
             crate::settings::side_calls().compaction_policy(),
@@ -1266,6 +1280,25 @@ mod tests {
         let (summary, state) = parse_compaction(&encoded);
         assert_eq!(summary, "handoff");
         assert_eq!(state, Some(expected));
+    }
+
+    #[test]
+    fn legacy_and_malformed_compactions_fall_back_to_plain_summary() {
+        for raw in ["legacy handoff", r#"{"version":2,"summary":17}"#] {
+            let (summary, state) = parse_compaction(raw);
+            assert_eq!(summary, raw);
+            assert!(state.is_none());
+        }
+    }
+
+    #[test]
+    fn latest_compaction_state_skips_newer_legacy_entry() {
+        let envelope = build_compaction_envelope("valid".into(), complete_state());
+        let messages = vec![
+            compaction("valid", &envelope),
+            compaction("legacy", "plain legacy summary"),
+        ];
+        assert_eq!(latest_compaction_state(&messages), Some(complete_state()));
     }
 
     #[test]

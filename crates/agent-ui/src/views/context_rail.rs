@@ -580,9 +580,16 @@ impl ContextRail {
                             ("prefix", &metrics.prefix_stability_pct.to_string()),
                             ("avoided", &metrics.compactions_avoided.to_string()),
                             ("nested", &metrics.code_nested_calls.to_string()),
+                            (
+                                "roundtrips",
+                                &metrics.code_model_round_trips_avoided.to_string(),
+                            ),
                             ("raw", &tokens(metrics.code_raw_tokens)),
                             ("projected", &tokens(metrics.code_projected_tokens)),
                             ("tools", &metrics.activated_tools.join(", ")),
+                            ("queries", &metrics.tool_search_queries.to_string()),
+                            ("hits", &metrics.tool_search_hits.to_string()),
+                            ("last_hits", &metrics.tool_search_last_hits.join(", ")),
                         ],
                     )),
             )
@@ -605,6 +612,9 @@ impl ContextRail {
             )
             .children(self.side_calls.iter().map(|metric| {
                 let average_ms = metric.latency_ms / metric.calls.max(1);
+                let cache_rate = cache_read_ratio(metric.token_usage)
+                    .map(|ratio| format!("{:.0}%", ratio * 100.0))
+                    .unwrap_or_else(|| "--".into());
                 gpui::div()
                     .pl(px(12.))
                     .text_xs()
@@ -629,6 +639,7 @@ impl ContextRail {
                                     metric.token_usage.cache_read_input_tokens,
                                 ),
                             ),
+                            ("cache_rate", &cache_rate),
                             ("latency", &average_ms.to_string()),
                         ],
                     ))
@@ -642,6 +653,9 @@ impl ContextRail {
             return gpui::div().into_any_element();
         };
         let average_ms = metric.latency_ms / metric.calls.max(1);
+        let cache_rate = cache_read_ratio(metric.token_usage)
+            .map(|ratio| format!("{:.0}%", ratio * 100.0))
+            .unwrap_or_else(|| "--".into());
         gpui::div()
             .text_xs()
             .text_color(theme.muted_foreground)
@@ -662,6 +676,7 @@ impl ContextRail {
                         "cache",
                         &crate::cockpit::format_tokens(metric.token_usage.cache_read_input_tokens),
                     ),
+                    ("cache_rate", &cache_rate),
                     ("latency", &average_ms.to_string()),
                 ],
             ))

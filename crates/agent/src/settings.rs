@@ -51,7 +51,7 @@ pub fn init_optimization() {
 
 /// Cached context-optimization settings. Defaults when not yet initialized.
 pub fn context_optimization() -> ContextOptimizationSettings {
-    CONTEXT_OPT.get().copied().unwrap_or_default()
+    CONTEXT_OPT.get().copied().unwrap_or_default().effective()
 }
 
 /// Cached side-call settings. Defaults when not yet initialized.
@@ -168,9 +168,13 @@ impl NetworkSettings {
 /// Feature flags for context optimization. Each dimension is independently
 /// toggleable: `off`, `shadow` (collect metrics only, don't alter model-facing
 /// content), or `on` (apply the optimization).
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ContextOptimizationSettings {
+    /// Master rollback switch. `false` forces every optimization axis off,
+    /// including Code, without discarding the configured per-axis rollout.
+    #[serde(default = "default_context_optimization_enabled")]
+    pub enabled: bool,
     /// Tool discovery via BM25 `ToolSearch`. When `shadow`, the tool schema
     /// is sent but activations are logged, not applied.
     #[serde(default)]
@@ -192,6 +196,17 @@ pub struct ContextOptimizationSettings {
 }
 
 impl ContextOptimizationSettings {
+    pub fn effective(mut self) -> Self {
+        if !self.enabled {
+            self.tool_discovery = Toggle::Off;
+            self.history_rewrite = Toggle::Off;
+            self.history_pruning = Toggle::Off;
+            self.compact_outputs = false;
+            self.code_mode = CodeModeToggle::Off;
+        }
+        self
+    }
+
     /// `compact_outputs` is the original boolean rollout knob; preserve it as
     /// an `On` alias so existing configurations are not silently ignored.
     pub fn effective_history_rewrite(self) -> Toggle {
@@ -199,6 +214,23 @@ impl ContextOptimizationSettings {
             Toggle::On
         } else {
             self.history_rewrite
+        }
+    }
+}
+
+const fn default_context_optimization_enabled() -> bool {
+    true
+}
+
+impl Default for ContextOptimizationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tool_discovery: Toggle::Shadow,
+            history_rewrite: Toggle::Shadow,
+            history_pruning: Toggle::Shadow,
+            compact_outputs: false,
+            code_mode: CodeModeToggle::Off,
         }
     }
 }
@@ -352,15 +384,15 @@ impl SideCallPolicy {
 /// purpose default here so serde-facing settings stay backwards-compatible.
 pub fn side_call_effort(
     policy: &SideCallPolicy,
-    default: crate::language_model::ReasoningEffort,
-) -> Option<crate::language_model::ReasoningEffort> {
+    default: crate::language_model::RequestReasoningEffort,
+) -> Option<crate::language_model::RequestReasoningEffort> {
     let raw = policy.reasoning_effort.as_deref().unwrap_or("").trim();
     let effort = match raw {
         "" => default,
-        "low" => crate::language_model::ReasoningEffort::Low,
-        "medium" => crate::language_model::ReasoningEffort::Medium,
-        "high" => crate::language_model::ReasoningEffort::High,
-        "xhigh" => crate::language_model::ReasoningEffort::XHigh,
+        "low" => crate::language_model::RequestReasoningEffort::Low,
+        "medium" => crate::language_model::RequestReasoningEffort::Medium,
+        "high" => crate::language_model::RequestReasoningEffort::High,
+        "max" | "xhigh" => crate::language_model::RequestReasoningEffort::Max,
         other => {
             tracing::warn!(
                 effort = other,
@@ -615,13 +647,32 @@ follow_up_behavior = "Steer"
     // ── context optimization / side-call tests ──────────────────────
 
     #[test]
-    fn context_optimization_defaults_all_off() {
+    fn context_optimization_defaults_to_shadow_rollout() {
         let s = ContextOptimizationSettings::default();
-        assert_eq!(s.tool_discovery, Toggle::Off);
-        assert_eq!(s.history_rewrite, Toggle::Off);
-        assert_eq!(s.history_pruning, Toggle::Off);
+        assert!(s.enabled);
+        assert_eq!(s.tool_discovery, Toggle::Shadow);
+        assert_eq!(s.history_rewrite, Toggle::Shadow);
+        assert_eq!(s.history_pruning, Toggle::Shadow);
         assert!(!s.compact_outputs);
         assert_eq!(s.code_mode, CodeModeToggle::Off);
+    }
+
+    #[test]
+    fn context_optimization_master_switch_forces_every_axis_off() {
+        let effective = ContextOptimizationSettings {
+            enabled: false,
+            tool_discovery: Toggle::On,
+            history_rewrite: Toggle::On,
+            history_pruning: Toggle::On,
+            compact_outputs: true,
+            code_mode: CodeModeToggle::Hybrid,
+        }
+        .effective();
+        assert_eq!(effective.tool_discovery, Toggle::Off);
+        assert_eq!(effective.history_rewrite, Toggle::Off);
+        assert_eq!(effective.history_pruning, Toggle::Off);
+        assert!(!effective.compact_outputs);
+        assert_eq!(effective.code_mode, CodeModeToggle::Off);
     }
 
     #[test]
@@ -698,6 +749,7 @@ follow_up_behavior = "Steer"
 ui_language = "en"
 
 [context_optimization]
+enabled = true
 tool_discovery = "shadow"
 history_rewrite = "shadow"
 history_pruning = "shadow"

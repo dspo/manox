@@ -82,7 +82,7 @@ pub fn build_title_request(
         thinking_allowed: false,
         reasoning_effort: crate::settings::side_call_effort(
             &crate::settings::side_calls().title_policy(),
-            crate::language_model::ReasoningEffort::Low,
+            crate::language_model::RequestReasoningEffort::Low,
         ),
         max_output_tokens: crate::settings::side_call_output_cap(
             crate::settings::side_calls().title_policy(),
@@ -168,7 +168,7 @@ pub fn build_topic_shift_request(
         thinking_allowed: false,
         reasoning_effort: crate::settings::side_call_effort(
             &crate::settings::side_calls().title_policy(),
-            crate::language_model::ReasoningEffort::Low,
+            crate::language_model::RequestReasoningEffort::Low,
         ),
         max_output_tokens: crate::settings::side_call_output_cap(
             crate::settings::side_calls().title_policy(),

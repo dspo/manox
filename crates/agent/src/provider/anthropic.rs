@@ -940,7 +940,7 @@ mod tests {
 
     fn request_with_effort(effort: ReasoningEffort) -> LanguageModelRequest {
         let mut req = simple_request("hi");
-        req.reasoning_effort = Some(effort);
+        req.reasoning_effort = Some(effort.into());
         req
     }
 

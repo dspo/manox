@@ -590,4 +590,122 @@ mod tests {
         ));
         assert!(prune_impl(&messages, cwd, "failed", false).is_none());
     }
+
+    fn eligible_history() -> Vec<Message> {
+        let mut messages = Vec::new();
+        messages.extend(pair(
+            "old",
+            crate::tools::READ,
+            serde_json::json!({"path":"a.rs"}),
+            "old\n".repeat(24_000),
+        ));
+        messages.extend(pair(
+            "new",
+            crate::tools::READ,
+            serde_json::json!({"path":"a.rs"}),
+            "new\n".repeat(24_000),
+        ));
+        messages.extend(pair(
+            "hot",
+            crate::tools::BASH,
+            serde_json::json!({"command":"long"}),
+            "hot\n".repeat(45_000),
+        ));
+        messages
+    }
+
+    #[test]
+    fn savings_below_threshold_do_not_rewrite_cold_prefix() {
+        let mut messages = Vec::new();
+        messages.extend(pair(
+            "old",
+            crate::tools::READ,
+            serde_json::json!({"path":"small.rs"}),
+            "x".repeat(MIN_SAVINGS_BYTES / 2),
+        ));
+        messages.extend(pair(
+            "new",
+            crate::tools::READ,
+            serde_json::json!({"path":"small.rs"}),
+            "y".repeat(MIN_SAVINGS_BYTES / 2),
+        ));
+        messages.extend(pair(
+            "hot",
+            crate::tools::BASH,
+            serde_json::json!({"command":"long"}),
+            "h".repeat(HOT_PREFIX_BYTES + 1),
+        ));
+        assert!(prune_impl(&messages, Path::new("/repo"), "threshold", false).is_none());
+    }
+
+    #[test]
+    fn cooldown_blocks_small_rewrites_but_compaction_flushes_it() {
+        let key = "cooldown-flush";
+        clear_cooldown(key);
+        let messages = eligible_history();
+        assert!(prune_for_model(&messages, Path::new("/repo"), key).is_some());
+        assert!(prune_for_model(&messages, Path::new("/repo"), key).is_none());
+        assert!(prune_for_compaction(&messages, Path::new("/repo"), key).is_some());
+        assert!(prune_for_model(&messages, Path::new("/repo"), key).is_some());
+        clear_cooldown(key);
+    }
+
+    #[test]
+    fn superseded_empty_searches_are_pruned_as_pairs() {
+        let mut messages = Vec::new();
+        for index in 0..100 {
+            messages.extend(pair(
+                &format!("empty-{index}"),
+                crate::tools::GREP,
+                serde_json::json!({"pattern":"missing","path":"src"}),
+                "No matches\n".repeat(100),
+            ));
+        }
+        messages.extend(pair(
+            "latest",
+            crate::tools::GREP,
+            serde_json::json!({"pattern":"missing","path":"src"}),
+            "No matches".into(),
+        ));
+        messages.extend(pair(
+            "hot",
+            crate::tools::BASH,
+            serde_json::json!({"command":"long"}),
+            "h".repeat(HOT_PREFIX_BYTES + 1),
+        ));
+        let pruned = prune_impl(&messages, Path::new("/repo"), "empty-search", false)
+            .expect("empty searches should batch-prune");
+        assert_protocol_pairs(&pruned);
+        assert!(pruned.iter().flat_map(|m| &m.content).all(
+            |content| !matches!(content, MessageContent::ToolUse(use_) if use_.id.starts_with("empty-"))
+        ));
+    }
+
+    #[test]
+    fn no_body_running_poll_is_useless_when_batch_savings_are_material() {
+        let mut messages = Vec::new();
+        messages.extend(pair(
+            "poll",
+            crate::tools::BASH_OUTPUT,
+            serde_json::json!({"shell_id":"shell-1"}),
+            format!(
+                "Shell status: running\n\n{}",
+                " ".repeat(MIN_SAVINGS_BYTES + 1)
+            ),
+        ));
+        messages.extend(pair(
+            "hot",
+            crate::tools::BASH,
+            serde_json::json!({"command":"long"}),
+            "h".repeat(HOT_PREFIX_BYTES + 1),
+        ));
+        let pruned = prune_impl(&messages, Path::new("/repo"), "useless-poll", false)
+            .expect("useless poll should prune");
+        assert_protocol_pairs(&pruned);
+        assert!(
+            !pruned.iter().flat_map(|m| &m.content).any(
+                |content| matches!(content, MessageContent::ToolUse(use_) if use_.id == "poll")
+            )
+        );
+    }
 }
