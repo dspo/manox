@@ -27,6 +27,11 @@ pub struct MessageUiMetadata {
     /// from an ordinary follow-up turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steered: Option<bool>,
+    /// Machine-generated background-task event. It remains a User-role message
+    /// for provider compatibility, but the UI must not attribute it to the
+    /// human user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_event: Option<bool>,
 }
 
 /// A single conversation message.

@@ -152,6 +152,20 @@ mod tests {
             ],
             request_token_usage: usage,
             per_model_token_usage: per_model,
+            background_tasks: vec![crate::background_task::TaskSnapshot {
+                task_id: "monitor_1".into(),
+                kind: crate::background_task::TaskKind::MonitorCommand,
+                owner_thread_id: id.into(),
+                description: "wait for CI".into(),
+                status: crate::background_task::TaskStatus::Completed,
+                created_at_ms: 1_700_000_000_000,
+                ended_at_ms: Some(1_700_000_001_000),
+                event_count: 2,
+                total_bytes: 42,
+                exit_code: Some(0),
+                failure_summary: None,
+                anchor_message_id: None,
+            }],
         }
     }
 
@@ -170,6 +184,8 @@ mod tests {
         assert_eq!(loaded.agent_language, "en");
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].role, Role::User);
+        assert_eq!(loaded.background_tasks.len(), 1);
+        assert_eq!(loaded.background_tasks[0].task_id, "monitor_1");
         assert!(!loaded.messages[0].id.is_empty());
         assert_eq!(loaded.cumulative_token_usage.input_tokens, 100);
         assert_eq!(loaded.cumulative_token_usage.cache_read_input_tokens, 20);

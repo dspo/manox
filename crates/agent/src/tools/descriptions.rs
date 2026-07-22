@@ -153,6 +153,7 @@ pub const BILINGUAL_TOOLS: &[(&str, &str)] = &[
     ("ExitWorktree", "worktree::ExitWorktreeInput"),
     ("BashOutput", "bash_output::BashOutputInput"),
     ("AskUserQuestion", "ask_user::AskUserQuestionInput"),
+    ("TaskStop", "task_stop::TaskStopInput"),
 ];
 
 #[cfg(test)]

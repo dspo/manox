@@ -1,13 +1,13 @@
-//! Process-global registry of background shell sessions, enabling the
+//! Background shell sessions backed by the unified `background_task` registry,
+//! enabling the
 //! `Bash` (`run_in_background: true`) + `BashOutput` (poll by shell id) pair
 //! that mirrors Claude Code's background-shell workflow.
 //!
 //! A background shell is a long-running `sh -c` process whose stdout/stderr
 //! are accumulated in a ring buffer with a per-poll read cursor, so
 //! `BashOutput` can return just the bytes produced since the last poll. The
-//! registry is a process-wide singleton (`OnceLock`) shared by the main thread
-//! and every sub-agent — shell ids are globally unique, matching Claude Code's
-//! behavior where any thread can poll any shell id.
+//! registry is shared by the main thread and every sub-agent, so shell ids are
+//! globally unique and any thread can poll a known shell id.
 //!
 //! Lifecycle: `spawn` registers a shell and returns its id immediately (the
 //! process keeps running in a spawned tokio task that drains output + records
@@ -16,48 +16,33 @@
 //! final poll can harvest the exit code; a periodic GC sweeps long-dead
 //! entries to bound memory.
 
-use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::AsyncReadExt;
-use tokio::process::Child;
 
+use crate::background_task::TaskId;
 /// Hard cap on the accumulated output buffer per shell. Matches `bash`/`monitor`.
 const MAX_BUFFER_BYTES: usize = 256 * 1024;
-/// Shells whose process exited more than this long ago are eligible for GC.
-const GC_AFTER_EXIT: Duration = Duration::from_secs(300);
-
-/// A registered background shell: the child process handle, accumulated
-/// output, and lifecycle state.
-struct BackgroundShell {
-    /// Wrapped in a mutex so the drain task (writer) and `poll` (reader) can
-    /// share access. The buffer is a byte ring with a read cursor.
-    state: Arc<std::sync::Mutex<ShellState>>,
-}
-
-struct ShellState {
+pub(crate) struct ShellState {
     /// All bytes seen so far (capped at `MAX_BUFFER_BYTES`; older bytes are
     /// dropped from the front once the cap is hit).
-    buffer: Vec<u8>,
+    pub(crate) buffer: Vec<u8>,
     /// Byte offset the last `poll` read up to. The next poll returns
     /// `buffer[read_cursor..]` (the incremental output since last poll).
-    read_cursor: usize,
+    pub(crate) read_cursor: usize,
     /// Total bytes ever produced (even after the ring drops old bytes).
-    total_bytes: u64,
+    pub(crate) total_bytes: u64,
     /// `None` while running, `Some(Some(code))` on clean exit, `Some(None)` on
     /// signal/abnormal termination.
-    exit_code: Option<Option<i32>>,
-    /// When the shell was spawned (for GC bookkeeping).
-    #[allow(dead_code)] // retained for future lifecycle diagnostics
-    created_at: Instant,
+    pub(crate) exit_code: Option<Option<i32>>,
+    #[allow(dead_code)]
+    pub(crate) created_at: Instant,
     /// When the process exited (`None` while running). Set by the drain task.
-    exited_at: Option<Instant>,
-    /// The child PID (== process group id, since we use `process_group(0)`).
-    /// Stored so `kill()` can signal the group even after the `Child` handle
-    /// is moved into the drain task.
-    pid: Option<u32>,
+    pub(crate) exited_at: Option<Instant>,
+    /// Owning thread id (for unified registry GC and `remove_all_for_thread`).
+    pub(crate) thread_id: String,
 }
 
 /// Result of a `poll` call.
@@ -99,24 +84,6 @@ impl PollResult {
     }
 }
 
-/// The process-global background shell registry.
-static REGISTRY: OnceLock<std::sync::Mutex<BackgroundShellRegistry>> = OnceLock::new();
-
-struct BackgroundShellRegistry {
-    shells: HashMap<String, BackgroundShell>,
-    next_id: u64,
-}
-
-/// Access the process-global registry. Lazily initialized on first call.
-fn registry() -> &'static std::sync::Mutex<BackgroundShellRegistry> {
-    REGISTRY.get_or_init(|| {
-        std::sync::Mutex::new(BackgroundShellRegistry {
-            shells: HashMap::new(),
-            next_id: 1,
-        })
-    })
-}
-
 /// Spawn `command` under `sh -c` in the background, register it, and return
 /// the shell id. The command runs in its own process group (so `kill` can reap
 /// the whole tree). A spawned tokio task drains stdout+stderr into the
@@ -125,8 +92,11 @@ fn registry() -> &'static std::sync::Mutex<BackgroundShellRegistry> {
 /// `plugin_root` (when `Some`) is injected as `CLAUDE_PLUGIN_ROOT` into the
 /// child env, so plugin-spawned background shells can resolve
 /// `${CLAUDE_PLUGIN_ROOT}` just like foreground bash.
-pub fn spawn(
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn(
     command: String,
+    thread_id: &str,
+    anchor_message_id: Option<String>,
     cwd: &std::path::Path,
     timeout: Option<Duration>,
     plugin_root: Option<&std::path::Path>,
@@ -139,9 +109,14 @@ pub fn spawn(
     // a seatbelt-wrapped `sandbox-exec` command with the same write/network/
     // `.git` confinement as foreground sandboxed bash. On platforms without
     // a sandbox backend, fall back to a raw `sh -c` (matching the foreground
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(test)))]
     let mut cmd = sandbox.wrap_command(&command, cwd, proxy_port);
-    #[cfg(not(target_os = "macos"))]
+    // Lifecycle tests run inside Codex's own macOS seatbelt, where nesting
+    // sandbox-exec is rejected by the kernel. They exercise the supervisor,
+    // event bus and polling path with raw sh; production remains sandboxed.
+    #[cfg(all(target_os = "macos", test))]
+    let _ = (sandbox, proxy_port);
+    #[cfg(any(not(target_os = "macos"), test))]
     let mut cmd = {
         let mut c = tokio::process::Command::new("sh");
         c.arg("-c").arg(&command);
@@ -149,98 +124,140 @@ pub fn spawn(
         c
     };
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.kill_on_drop(false);
-    // Own process group so kill reaches grandchildren.
-    #[cfg(unix)]
-    cmd.process_group(0);
     if let Some(root) = plugin_root {
         cmd.env("CLAUDE_PLUGIN_ROOT", root);
     }
 
-    let mut child: Child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn background shell: {e}"))?;
-    let pid = child.id();
+    let bg_cancel = tokio_util::sync::CancellationToken::new();
+    let (task_id, bg_task) = crate::background_task::register(
+        crate::background_task::TaskKind::BackgroundBash,
+        thread_id.into(),
+        command.clone(),
+        bg_cancel.clone(),
+    );
+    if let Some(anchor) = anchor_message_id {
+        bg_task.set_anchor_message_id(anchor);
+    }
+    let shell_id = task_id.0.clone();
 
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-
-    let shell_id = {
-        let mut reg = registry()
-            .lock()
-            .expect("background shell registry poisoned");
-        let id = format!("bash_{}", reg.next_id);
-        reg.next_id += 1;
-        reg.shells.insert(
-            id.clone(),
-            BackgroundShell {
-                state: Arc::new(std::sync::Mutex::new(ShellState {
-                    buffer: Vec::with_capacity(8 * 1024),
-                    read_cursor: 0,
-                    total_bytes: 0,
-                    exit_code: None,
-                    created_at: Instant::now(),
-                    exited_at: None,
-                    pid,
-                })),
-            },
-        );
-        id
+    let spawned = match supervisor::global()
+        .spawn_captured(
+            &format!("background-{shell_id}"),
+            cmd,
+            supervisor::ProcessKind::Bash,
+        )
+        .await
+    {
+        Ok(spawned) => spawned,
+        Err(e) => {
+            bg_task.set_failure_summary(e.to_string());
+            bg_task.push_terminal(&task_id, crate::background_task::TaskStatus::Failed);
+            return Err(format!("failed to spawn background shell: {e}"));
+        }
     };
+    let process = spawned.proc.clone();
+    bg_task.set_managed_proc(process.clone());
+    drop(spawned.stdin);
+    let stdout = spawned.stdout;
+    let stderr = spawned.stderr;
 
-    let state = {
-        let reg = registry()
-            .lock()
-            .expect("background shell registry poisoned");
-        reg.shells
-            .get(&shell_id)
-            .expect("just inserted")
-            .state
-            .clone()
-    };
+    let shell_state = Arc::new(std::sync::Mutex::new(ShellState {
+        buffer: Vec::with_capacity(8 * 1024),
+        read_cursor: 0,
+        total_bytes: 0,
+        exit_code: None,
+        created_at: Instant::now(),
+        exited_at: None,
+        thread_id: thread_id.to_string(),
+    }));
+    // BashOutput polling state lives in the same unified registry.
+    crate::background_task::register_bash_shell(&shell_id, shell_state.clone());
+
+    let state = shell_state;
 
     // Spawn the drain + wait task. Use the global tokio runtime when available
     // (production — agent::init has run); fall back to tokio::spawn for
     // #[tokio::test] contexts where the test provides its own runtime. Either
     // way, the task runs on a tokio reactor so tokio::process works.
+    let shell_id_for_driver = shell_id.clone();
     let state_clone = state.clone();
+    let bg_task_clone = bg_task.clone();
+    let bg_cancel_clone = bg_cancel.clone();
     let driver = async move {
-        let stdout_task = tokio::spawn(drain_stream(stdout, state_clone.clone(), "stdout"));
-        let stderr_task = tokio::spawn(drain_stream(stderr, state_clone.clone(), "stderr"));
+        let stdout_task = tokio::spawn(drain_stream(
+            stdout,
+            state_clone.clone(),
+            "stdout",
+            bg_task_clone.clone(),
+            TaskId(shell_id_for_driver.clone()),
+        ));
+        let stderr_task = tokio::spawn(drain_stream(
+            stderr,
+            state_clone.clone(),
+            "stderr",
+            bg_task_clone.clone(),
+            TaskId(shell_id_for_driver.clone()),
+        ));
 
-        let wait = async {
-            let status = child.wait().await;
-            if let Ok(mut s) = state_clone.lock() {
-                s.exit_code = Some(status.ok().and_then(|st| st.code()));
-                s.exited_at = Some(Instant::now());
+        // Race: natural exit vs. timeout vs. TaskStop cancellation. Publish
+        // terminal only after both pipe drainers finish, so it is observably
+        // the final event and no tail output is lost.
+        let (terminal_status, code) = tokio::select! {
+            code = process.wait_for_exit() => {
+                process.cleanup_process_group_after_exit().await;
+                (
+                    if code == Some(0) {
+                        crate::background_task::TaskStatus::Completed
+                    } else {
+                        crate::background_task::TaskStatus::Failed
+                    },
+                    code,
+                )
+            }
+            _ = bg_cancel_clone.cancelled() => {
+                process.close().await;
+                let code = process.wait_for_exit().await;
+                process.cleanup_process_group_after_exit().await;
+                (
+                    bg_task_clone.requested_stop_status(),
+                    code,
+                )
+            }
+            _ = async {
+                if let Some(t) = timeout {
+                    tokio::time::sleep(t).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                process.close().await;
+                let code = process.wait_for_exit().await;
+                process.cleanup_process_group_after_exit().await;
+                (
+                    crate::background_task::TaskStatus::TimedOut,
+                    code,
+                )
             }
         };
-        if let Some(t) = timeout {
-            tokio::select! {
-                _ = wait => {}
-                _ = tokio::time::sleep(t) => {
-                    kill_process_group(&child);
-                    if let Ok(mut s) = state_clone.lock() {
-                        s.exit_code = Some(None);
-                        s.exited_at = Some(Instant::now());
-                    }
-                }
-            }
-        } else {
-            wait.await;
-        }
 
         let _ = stdout_task.await;
         let _ = stderr_task.await;
+        if let Ok(mut s) = state_clone.lock() {
+            s.exit_code = Some(code);
+            s.exited_at = Some(Instant::now());
+        }
+        bg_task_clone.set_exit_code(code);
+        bg_task_clone.push_terminal(&TaskId(shell_id_for_driver), terminal_status);
     };
-    if let Some(h) = crate::runtime::try_handle() {
-        h.spawn(driver);
+    let driver_handle = if let Some(h) = crate::runtime::try_handle() {
+        h.spawn(driver)
     } else {
-        tokio::spawn(driver);
-    }
+        tokio::spawn(driver)
+    };
+    bg_task.set_driver(driver_handle);
 
     // Opportunistic GC: sweep shells that exited long ago.
-    gc();
+    crate::background_task::gc();
 
     Ok(shell_id)
 }
@@ -251,7 +268,9 @@ pub fn spawn(
 async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     state: Arc<std::sync::Mutex<ShellState>>,
-    _label: &str,
+    label: &str,
+    task: Arc<crate::background_task::BackgroundTask>,
+    task_id: TaskId,
 ) {
     let mut chunk = [0u8; 8192];
     loop {
@@ -259,6 +278,7 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let data = &chunk[..n];
+                let text = String::from_utf8_lossy(data).into_owned();
                 if let Ok(mut s) = state.lock() {
                     s.total_bytes = s.total_bytes.saturating_add(data.len() as u64);
                     // Append, but cap the buffer: if over the limit, drop old
@@ -276,6 +296,10 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
                         s.read_cursor = s.read_cursor.saturating_sub(excess).min(s.buffer.len());
                     }
                 }
+                if label == "stderr" && !text.trim().is_empty() {
+                    task.set_failure_summary(text.clone());
+                }
+                task.push_event(&task_id, text);
             }
         }
     }
@@ -284,14 +308,8 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
 /// Poll a background shell by id. Returns the output produced since the last
 /// poll, plus running/exit status. Returns an error string for an unknown id.
 pub fn poll(shell_id: &str) -> Result<PollResult, String> {
-    let reg = registry()
-        .lock()
-        .expect("background shell registry poisoned");
-    let Some(shell) = reg.shells.get(shell_id) else {
-        return Err(format!("Unknown shell id: {shell_id}"));
-    };
-    let state = shell.state.clone();
-    drop(reg);
+    let state = crate::background_task::get_bash_shell(shell_id)
+        .ok_or_else(|| format!("Unknown shell id: {shell_id}"))?;
 
     let mut s = state.lock().expect("shell state poisoned");
     let available = if s.read_cursor < s.buffer.len() {
@@ -309,65 +327,6 @@ pub fn poll(shell_id: &str) -> Result<PollResult, String> {
     })
 }
 
-/// Kill a background shell's process group. No-op if the shell already exited.
-pub fn kill(shell_id: &str) -> Result<(), String> {
-    let reg = registry()
-        .lock()
-        .expect("background shell registry poisoned");
-    let Some(shell) = reg.shells.get(shell_id) else {
-        return Err(format!("Unknown shell id: {shell_id}"));
-    };
-    let state = shell.state.clone();
-    drop(reg);
-
-    let s = state.lock().expect("shell state poisoned");
-    if s.exit_code.is_some() {
-        return Ok(());
-    }
-    // Kill the process group using the stored pid (== pgid).
-    if let Some(pid) = s.pid {
-        #[cfg(unix)]
-        unsafe {
-            libc::killpg(pid as i32, libc::SIGKILL);
-        }
-        return Ok(());
-    }
-    Err(format!("background shell {shell_id} has no stored pid"))
-}
-
-/// Run a garbage-collection pass: remove shells whose process exited more than
-/// `GC_AFTER_EXIT` ago. Called opportunistically by `spawn`/`poll` to bound
-/// memory without a dedicated timer.
-fn gc() {
-    let mut reg = registry()
-        .lock()
-        .expect("background shell registry poisoned");
-    let now = Instant::now();
-    reg.shells.retain(|_, shell| {
-        let s = shell.state.lock().expect("shell state poisoned");
-        match s.exited_at {
-            Some(t) => now.duration_since(t) < GC_AFTER_EXIT,
-            None => true,
-        }
-    });
-}
-
-/// Kill the child's whole process group. On Unix the child runs in its own
-/// group (set via `process_group(0)`), so `killpg` reaps grandchildren too.
-#[cfg(unix)]
-fn kill_process_group(child: &tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        // SAFETY: `killpg` is a libc call with no Rust invariants to uphold;
-        // the pid is the child's own group id (set by `process_group(0)`).
-        unsafe {
-            libc::killpg(pid as i32, libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_child: &tokio::process::Child) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,12 +338,15 @@ mod tests {
         let cwd = std::path::PathBuf::from(".");
         let id = spawn(
             "echo hello; sleep 0.2; echo world".to_string(),
+            "test-thread",
+            None,
             &cwd,
             None,
             None,
             &crate::sandbox::SandboxPolicy::for_project(&cwd),
             None,
         )
+        .await
         .expect("spawn must succeed");
 
         // First poll: should get "hello\n", still running.
@@ -413,12 +375,15 @@ mod tests {
         let cwd = std::path::PathBuf::from(".");
         let id = spawn(
             "printf a; sleep 0.1; printf b; sleep 0.1; printf c".to_string(),
+            "test-thread",
+            None,
             &cwd,
             None,
             None,
             &crate::sandbox::SandboxPolicy::for_project(&cwd),
             None,
         )
+        .await
         .expect("spawn");
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -435,5 +400,62 @@ mod tests {
             "a already consumed: {}",
             r2.new_output
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nonzero_exit_is_failed_and_terminal_is_last() {
+        let cwd = std::path::PathBuf::from(".");
+        let id = spawn(
+            "printf tail; exit 7".to_string(),
+            "test-thread-failed",
+            None,
+            &cwd,
+            None,
+            None,
+            &crate::sandbox::SandboxPolicy::for_project(&cwd),
+            None,
+        )
+        .await
+        .expect("spawn");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let task = crate::background_task::get_by_str(&id).expect("registered task");
+        assert_eq!(task.status(), crate::background_task::TaskStatus::Failed);
+        assert_eq!(task.exit_code(), Some(7));
+        let events = crate::background_task::drain_thread_events("test-thread-failed");
+        assert!(matches!(
+            events.last().map(|event| &event.event),
+            Some(crate::background_task::TaskEventKind::Terminal {
+                status: crate::background_task::TaskStatus::Failed,
+                exit_code: Some(7),
+                ..
+            })
+        ));
+        assert!(events.iter().any(|event| {
+            matches!(&event.event, crate::background_task::TaskEventKind::Output(text) if text.contains("tail"))
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_stop_waits_for_background_shell() {
+        let cwd = std::path::PathBuf::from(".");
+        let id = spawn(
+            "sleep 30".to_string(),
+            "test-thread-stop-shell",
+            None,
+            &cwd,
+            None,
+            None,
+            &crate::sandbox::SandboxPolicy::for_project(&cwd),
+            None,
+        )
+        .await
+        .expect("spawn");
+        crate::background_task::stop(&id)
+            .await
+            .expect("TaskStop should succeed");
+        let task = crate::background_task::get_by_str(&id).expect("registered task");
+        assert_eq!(task.status(), crate::background_task::TaskStatus::Stopped);
+        assert!(!poll(&id).expect("poll stopped shell").is_running);
     }
 }

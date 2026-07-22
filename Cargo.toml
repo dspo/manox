@@ -102,6 +102,8 @@ image = "0.25"
 # (claude/codex/copilot) on top of gpui-component-assets.
 rust-embed = "8"
 
+tokio-tungstenite = { version = "0.24", features = ["connect", "native-tls"] }
+
 rmcp = { version = "1.8", default-features = false }
 # lsp-types —— LSP protocol types (InitializeParams, Location, Hover, ...). The
 # wire framer is hand-rolled (see crates/lsp/src/proto.rs); this crate only

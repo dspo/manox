@@ -518,3 +518,16 @@ plan-drawer-clear = 清空并执行
 ### about.rs (About window)
 about-title = 关于 Manox
 about-ok = 确定
+
+# Background task status card
+background-task-kind-command = 监视器（命令）
+background-task-kind-websocket = 监视器（WebSocket）
+background-task-kind-bash = 后台 Bash
+background-task-status-running = 运行中
+background-task-status-stopping = 正在停止
+background-task-status-completed = 已完成
+background-task-status-failed = 失败
+background-task-status-timed-out = 已超时
+background-task-status-stopped = 已停止
+background-task-status-session-ended = 会话已结束
+background-task-stop = 停止

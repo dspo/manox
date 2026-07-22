@@ -414,8 +414,15 @@ fn main() {
     // (gpui's `run` returned here), so `Handle::block_on` is safe. Only manox's
     // own children are signaled — a server the user ran elsewhere is untouched.
     match agent::runtime::try_handle() {
-        Some(handle) => handle.block_on(supervisor::global().shutdown_all()),
-        None => supervisor::global().terminate_all(),
+        Some(handle) => {
+            handle.block_on(async {
+                agent::background_task::shutdown_all().await;
+                supervisor::global().shutdown_all().await;
+            });
+        }
+        None => {
+            supervisor::global().terminate_all();
+        }
     }
 }
 

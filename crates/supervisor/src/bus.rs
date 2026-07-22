@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 use crate::proc::{ManagedProcess, ProcessKind};
 
@@ -34,6 +34,17 @@ pub struct SpawnedProcess {
     pub stdin: ChildStdin,
 }
 
+/// A managed process whose stderr is returned to the caller instead of being
+/// consumed by the supervisor logger. Background command tools use this to
+/// retain user-facing failure diagnostics while keeping lifecycle ownership in
+/// the process bus.
+pub struct CapturedSpawnedProcess {
+    pub proc: Arc<ManagedProcess>,
+    pub stdout: ChildStdout,
+    pub stdin: ChildStdin,
+    pub stderr: ChildStderr,
+}
+
 /// Process-wide registry of spawned third-party processes.
 #[derive(Default)]
 pub struct ProcessBus {
@@ -56,9 +67,41 @@ impl ProcessBus {
     pub async fn spawn(
         &self,
         name: &str,
-        mut cmd: Command,
+        cmd: Command,
         kind: ProcessKind,
     ) -> anyhow::Result<SpawnedProcess> {
+        let (proc, stdout, stdin, stderr) = self.spawn_parts(name, cmd, kind).await?;
+        let stderr_name = name.to_string();
+        tokio::spawn(read_stderr(stderr_name, stderr));
+        Ok(SpawnedProcess {
+            proc,
+            stdout,
+            stdin,
+        })
+    }
+
+    /// Spawn a managed process while returning stderr to the caller.
+    pub async fn spawn_captured(
+        &self,
+        name: &str,
+        cmd: Command,
+        kind: ProcessKind,
+    ) -> anyhow::Result<CapturedSpawnedProcess> {
+        let (proc, stdout, stdin, stderr) = self.spawn_parts(name, cmd, kind).await?;
+        Ok(CapturedSpawnedProcess {
+            proc,
+            stdout,
+            stdin,
+            stderr,
+        })
+    }
+
+    async fn spawn_parts(
+        &self,
+        name: &str,
+        mut cmd: Command,
+        kind: ProcessKind,
+    ) -> anyhow::Result<(Arc<ManagedProcess>, ChildStdout, ChildStdin, ChildStderr)> {
         // Own process group: the child becomes leader of a new group whose pgid
         // equals its pid, so kill(-pid, sig) reaps the whole subtree.
         cmd.process_group(0);
@@ -81,31 +124,28 @@ impl ProcessBus {
         let stderr = child.stderr.take().expect("piped stderr");
 
         let proc = Arc::new(ManagedProcess::new(name.to_string(), kind, pid));
-        let (exited, exited_flag) = proc.reaper_handles();
+        let handles = proc.reaper_handles();
 
         let reaper_name = name.to_string();
         tokio::spawn(async move {
             let status = child.wait().await;
-            exited_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            *handles.exit_code.lock().expect("exit-code mutex poisoned") =
+                Some(status.as_ref().ok().and_then(|s| s.code()));
+            handles
+                .exited_flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             match status {
                 Ok(s) => tracing::info!(target: "supervisor", %reaper_name, ?s, "process exited"),
                 Err(e) => tracing::warn!(target: "supervisor", %reaper_name, "wait failed: {e}"),
             }
-            exited.notify_waiters();
+            handles.exited.notify_waiters();
         });
-
-        let stderr_name = name.to_string();
-        tokio::spawn(read_stderr(stderr_name, stderr));
 
         self.procs
             .lock()
             .expect("procs mutex poisoned")
             .push(proc.clone());
-        Ok(SpawnedProcess {
-            proc,
-            stdout,
-            stdin,
-        })
+        Ok((proc, stdout, stdin, stderr))
     }
 
     /// Register a process against a condition. `Shutdown` is already implicit in
@@ -250,5 +290,37 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    // A shell may exit successfully without waiting for a background child.
+    // The background-task driver observes that direct exit and must still
+    // terminate the remaining process group immediately.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_after_parent_exit_reaps_detached_descendant() {
+        let bus = ProcessBus::new();
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 >/dev/null 2>&1 &");
+        let spawned = bus
+            .spawn("detached-descendant-test", cmd, ProcessKind::Bash)
+            .await
+            .expect("spawn detached descendant");
+        let pgid = spawned.proc.pgid().expect("pgid");
+
+        tokio::time::timeout(Duration::from_secs(2), spawned.proc.wait_for_exit())
+            .await
+            .expect("shell should exit without waiting for its child");
+        assert_eq!(
+            unsafe { libc::kill(-(pgid as libc::pid_t), 0) },
+            0,
+            "the detached descendant should still demonstrate the leak before cleanup"
+        );
+
+        spawned.proc.cleanup_process_group_after_exit().await;
+        assert_ne!(
+            unsafe { libc::kill(-(pgid as libc::pid_t), 0) },
+            0,
+            "cleanup must leave no process in group {pgid}"
+        );
     }
 }

@@ -159,6 +159,58 @@ pub enum ConvItem {
         plan_text: String,
         active: bool,
     },
+    /// A background task status card — shows a Monitor or background Bash
+    /// task's kind, description, task ID, status, event count, and Stop
+    /// button while running. Updated in-place by task ID.
+    BackgroundTask(BackgroundTaskItem),
+}
+
+/// A background task card in the conversation, keyed by task ID so the UI
+/// can update it in-place as events arrive.
+#[derive(Debug, Clone)]
+pub struct BackgroundTaskItem {
+    pub task_id: String,
+    pub kind: agent::background_task::TaskKind,
+    pub description: String,
+    pub status: agent::background_task::TaskStatus,
+    pub event_count: u64,
+    pub total_bytes: u64,
+    pub exit_code: Option<i32>,
+    pub failure_summary: Option<String>,
+    pub created_at: Option<std::time::Instant>,
+    /// Recent events (for display in an expandable body).
+    pub recent_events: Vec<String>,
+}
+
+fn recent_background_task_output(task_id: &str) -> Vec<String> {
+    let Some(task) = agent::background_task::get_by_str(task_id) else {
+        return Vec::new();
+    };
+    latest_background_task_output(task.recent_events())
+}
+
+fn latest_background_task_output(events: Vec<agent::background_task::TaskEvent>) -> Vec<String> {
+    let mut output: Vec<String> = events
+        .into_iter()
+        .rev()
+        .filter_map(|event| match event.event {
+            agent::background_task::TaskEventKind::Output(text) => Some(text),
+            _ => None,
+        })
+        .take(20)
+        .collect();
+    output.reverse();
+    output
+}
+
+impl ConvItem {
+    /// Whether this item is a `BackgroundTask` card with the given task ID.
+    pub fn is_background_task_with_id(&self, task_id: &str) -> bool {
+        match self {
+            ConvItem::BackgroundTask(bt) => bt.task_id == task_id,
+            _ => false,
+        }
+    }
 }
 
 /// A tool-call item, tracking status/output by id.
@@ -1395,6 +1447,52 @@ impl ConversationState {
                 // hint, tab state), not rendered as conversation items. The
                 // owning Workspace subscriber handles the surface.
             }
+            ThreadEvent::BackgroundTaskUpdated { snapshot } => {
+                // Find an existing BackgroundTask card with this task_id and
+                // update it in-place; otherwise push a new card.
+                let task_id = snapshot.task_id.clone();
+                let existing = self.items.iter_mut().find(|e| {
+                    e.read(cx).kind().is_background_task_with_id(&task_id)
+                });
+                if let Some(entity) = existing {
+                    entity.update(cx, |item, _| {
+                        if let ConvItem::BackgroundTask(bt) = item.kind_mut() {
+                            bt.status = snapshot.status;
+                            bt.event_count = snapshot.event_count;
+                            bt.total_bytes = snapshot.total_bytes;
+                            bt.exit_code = snapshot.exit_code;
+                            bt.failure_summary = snapshot.failure_summary.clone();
+                            // Refresh recent events from the task's ring buffer.
+                            bt.recent_events = recent_background_task_output(&task_id);
+                        }
+                    });
+                } else {
+                    // New task card.
+                    let recent_events = recent_background_task_output(&task_id);
+                    let ix = self.items.len();
+                    let entity = cx.new(|_| {
+                        MessageItem::new(
+                            ConvItem::BackgroundTask(BackgroundTaskItem {
+                                task_id: snapshot.task_id.clone(),
+                                kind: snapshot.kind,
+                                description: snapshot.description.clone(),
+                                status: snapshot.status,
+                                event_count: snapshot.event_count,
+                                total_bytes: snapshot.total_bytes,
+                                exit_code: snapshot.exit_code,
+                                failure_summary: snapshot.failure_summary.clone(),
+                                created_at: Some(Instant::now()),
+                                recent_events,
+                            }),
+                            role.to_string(),
+                            ix,
+                            weak,
+                        )
+                    });
+                    self.items.push(entity);
+                }
+                // The workspace's event subscriber re-renders on the emitted event.
+            }
         }
     }
 
@@ -1468,6 +1566,40 @@ impl ConversationState {
             turn_started_at: Instant::now(),
         }
     }
+
+    /// Rehydrate persisted background-task cards after rebuilding canonical
+    /// messages. Running/Stopping snapshots have already been normalized to
+    /// SessionEnded by `Thread::restore`.
+    pub fn restore_background_tasks(
+        &mut self,
+        snapshots: &[agent::background_task::TaskSnapshot],
+        role: &str,
+        weak: WeakEntity<Workspace>,
+        cx: &mut App,
+    ) {
+        for snapshot in snapshots {
+            let id = self.items.len();
+            self.items.push(cx.new(|_| {
+                MessageItem::new(
+                    ConvItem::BackgroundTask(BackgroundTaskItem {
+                        task_id: snapshot.task_id.clone(),
+                        kind: snapshot.kind,
+                        description: snapshot.description.clone(),
+                        status: snapshot.status,
+                        event_count: snapshot.event_count,
+                        total_bytes: snapshot.total_bytes,
+                        exit_code: snapshot.exit_code,
+                        failure_summary: snapshot.failure_summary.clone(),
+                        created_at: None,
+                        recent_events: Vec::new(),
+                    }),
+                    role.to_string(),
+                    id,
+                    weak.clone(),
+                )
+            }));
+        }
+    }
 }
 
 /// Splice persisted UI notes back into the rebuilt canonical item list.
@@ -1502,6 +1634,13 @@ fn merge_ui_notes(
         .iter()
         .filter(|m| {
             if m.role != Role::User {
+                return false;
+            }
+            if m.ui
+                .as_ref()
+                .and_then(|ui| ui.external_event)
+                .unwrap_or(false)
+            {
                 return false;
             }
             let has_text = m.content.iter().any(|c| match c {
@@ -1639,6 +1778,24 @@ mod tests {
         LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn background_task_card_keeps_latest_twenty_output_events() {
+        let events = (0..25)
+            .map(|ix| agent::background_task::TaskEvent {
+                task_id: agent::background_task::TaskId("monitor-test".into()),
+                kind: agent::background_task::TaskKind::MonitorCommand,
+                event: agent::background_task::TaskEventKind::Output(format!("event-{ix}")),
+                thread_seq: ix,
+                task_seq: ix,
+                timestamp_ms: ix,
+            })
+            .collect();
+        let output = latest_background_task_output(events);
+        assert_eq!(output.len(), 20);
+        assert_eq!(output.first().map(String::as_str), Some("event-5"));
+        assert_eq!(output.last().map(String::as_str), Some("event-24"));
+    }
 
     #[test]
     fn optimistic_steer_rolls_back_and_late_confirmation_heals_tombstone() {

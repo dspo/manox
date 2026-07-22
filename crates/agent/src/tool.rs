@@ -32,6 +32,7 @@ pub use permission::{PermissionCache, PermissionDecision, ToolAuthorizationRespo
 /// `&dyn ToolContext` never crosses an await boundary.
 pub trait ToolContext {
     fn thread_id(&self) -> &str;
+    fn anchor_message_id(&self) -> Option<&str>;
     fn cwd(&self) -> &Path;
     fn project(&self) -> Option<&PathBuf>;
     fn model(&self) -> Option<&AnyLanguageModel>;
@@ -74,6 +75,7 @@ pub struct ToolContextSnapshot {
     team: Option<Entity<crate::team::Team>>,
     yolo: bool,
     network_proxy_port: Option<u16>,
+    anchor_message_id: Option<String>,
 }
 
 impl ToolContextSnapshot {
@@ -92,6 +94,7 @@ impl ToolContextSnapshot {
             team: t.team().cloned(),
             yolo: t.approval_mode() == crate::thread::ApprovalMode::Yolo,
             network_proxy_port: t.network_proxy_port(),
+            anchor_message_id: t.last_user_message_id().map(str::to_owned),
         }
     }
 }
@@ -99,6 +102,9 @@ impl ToolContextSnapshot {
 impl ToolContext for ToolContextSnapshot {
     fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+    fn anchor_message_id(&self) -> Option<&str> {
+        self.anchor_message_id.as_deref()
     }
     fn cwd(&self) -> &Path {
         &self.cwd
@@ -181,6 +187,13 @@ pub trait AgentTool: Send + Sync + 'static {
     fn is_read_only(&self) -> bool {
         false
     }
+    /// Whether this tool can be permanently allowed via the AlwaysAllow path.
+    /// The permission cache is keyed by tool name only; tools that need per-call
+    /// approval (e.g. WebSocket Monitor: each connection is a different target)
+    /// return false here to suppress the cache entry. Default true.
+    fn is_always_allowable(&self, _input: &serde_json::Value) -> bool {
+        true
+    }
     /// Whether the authorization flow is the tool's execution path rather than
     /// a permission gate — the tool produces its result from the
     /// `ToolAuthorizationResponse` itself and its `run` body is unreachable.
@@ -191,9 +204,6 @@ pub trait AgentTool: Send + Sync + 'static {
         false
     }
     /// Run the tool. `cancel` is the current turn's cancellation token; long-running
-    /// tools (e.g. `bash`) select on it so a user-initiated stop reaps the work
-    /// promptly. `Ok(output)` is a normal output string; `Err(output)` is an error
-    /// output string (still fed back to the model).
     fn run(
         &self,
         input: serde_json::Value,

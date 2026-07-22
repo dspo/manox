@@ -21,6 +21,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::conversation::{
+    ActivityEntry, AgentTaskItem, BackgroundTaskItem, ConvItem, ThinkingContainer, ToolCallItem,
+    UserImage, UserTurnMeta,
+};
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::thread::ApprovalMode;
 use agent::{Message, TokenUsage, ToolCallStatus, i18n};
@@ -46,10 +50,6 @@ use manox_components::turn_frame::TurnFrame;
 use std::path::{Path, PathBuf};
 
 use crate::Workspace;
-use crate::conversation::{
-    ActivityEntry, AgentTaskItem, ConvItem, ThinkingContainer, ToolCallItem, UserImage,
-    UserTurnMeta,
-};
 use crate::views::centered;
 use crate::workspace::AskCardSnapshot;
 
@@ -616,6 +616,7 @@ pub fn render_item(
             tool_ctx,
             cx,
         ),
+        ConvItem::BackgroundTask(bt) => render_background_task(bt, ix, theme, tool_ctx, cx),
     }
 }
 
@@ -2426,6 +2427,136 @@ pub fn render_agent_task(
         .into_any_element()
 }
 
+/// Render a background task status card. Shows the task kind icon,
+/// description, task ID, status badge, event/byte counts, and a Stop
+/// button while running.
+fn render_background_task(
+    bt: &BackgroundTaskItem,
+    ix: usize,
+    theme: &Theme,
+    tool_ctx: Option<&ToolCallCtx>,
+    _cx: &mut App,
+) -> gpui::AnyElement {
+    use agent::background_task::{TaskKind, TaskStatus};
+
+    let is_running = matches!(bt.status, TaskStatus::Running | TaskStatus::Stopping);
+    let kind_str = match bt.kind {
+        TaskKind::MonitorCommand => i18n::t("background-task-kind-command"),
+        TaskKind::MonitorWebSocket => i18n::t("background-task-kind-websocket"),
+        TaskKind::BackgroundBash => i18n::t("background-task-kind-bash"),
+    };
+    let status_str = match bt.status {
+        TaskStatus::Running => i18n::t("background-task-status-running"),
+        TaskStatus::Stopping => i18n::t("background-task-status-stopping"),
+        TaskStatus::Completed => i18n::t("background-task-status-completed"),
+        TaskStatus::Failed => i18n::t("background-task-status-failed"),
+        TaskStatus::TimedOut => i18n::t("background-task-status-timed-out"),
+        TaskStatus::Stopped => i18n::t("background-task-status-stopped"),
+        TaskStatus::SessionEnded => i18n::t("background-task-status-session-ended"),
+    };
+    let (icon_name, icon_color) = match bt.status {
+        TaskStatus::Running | TaskStatus::Stopping => (IconName::LoaderCircle, theme.accent),
+        TaskStatus::Completed => (IconName::CircleCheck, theme.success),
+        TaskStatus::Failed | TaskStatus::TimedOut => (IconName::CircleX, theme.danger),
+        TaskStatus::Stopped | TaskStatus::SessionEnded => (IconName::Minus, theme.muted_foreground),
+    };
+    let title = format!("{kind_str} · {desc}", desc = bt.description);
+    let mut status_text = format!(
+        "{status_str} · {task_id} · {events} events · {bytes} bytes",
+        task_id = bt.task_id,
+        events = bt.event_count,
+        bytes = bt.total_bytes,
+    );
+    if let Some(code) = bt.exit_code {
+        status_text.push_str(&format!(" · exit {code}"));
+    }
+    let detail = bt.failure_summary.clone().or_else(|| {
+        bt.recent_events
+            .last()
+            .map(|event| event.trim().to_string())
+            .filter(|event| !event.is_empty())
+    });
+    let _ = tool_ctx;
+    let task_id_for_stop = bt.task_id.clone();
+
+    let row = h_flex()
+        .id(("bg-task", ix))
+        .w_full()
+        .min_w_0()
+        .px_2()
+        .py_1p5()
+        .gap_1p5()
+        .items_center()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .when(is_running, |s| {
+            s.child(
+                Spinner::new()
+                    .icon(icon_name.clone())
+                    .xsmall()
+                    .color(icon_color),
+            )
+        })
+        .when(!is_running, |s| {
+            s.child(Icon::new(icon_name).xsmall().text_color(icon_color))
+        })
+        .child(
+            v_flex()
+                .gap_0p5()
+                .child(
+                    gpui::div()
+                        .truncate()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.foreground)
+                        .child(title),
+                )
+                .child(
+                    gpui::div()
+                        .truncate()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(status_text),
+                )
+                .when_some(detail, |column, detail| {
+                    column.child(
+                        gpui::div()
+                            .truncate()
+                            .whitespace_nowrap()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(detail),
+                    )
+                }),
+        );
+
+    // Stop button while running.
+    if is_running {
+        row.child(
+            Button::new(("stop-bg-task", ix))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Close)
+                .label(i18n::t("background-task-stop"))
+                .on_click({
+                    let task_id = task_id_for_stop.clone();
+                    move |_, _window, _cx: &mut App| {
+                        let task_id = task_id.clone();
+                        agent::runtime::handle().spawn(async move {
+                            let _ = agent::background_task::stop(&task_id).await;
+                        });
+                    }
+                }),
+        )
+        .into_any_element()
+    } else {
+        row.into_any_element()
+    }
+}
+
 /// Map a tool call to its panel rendering kind and the body text the panel
 /// renders. `read_file`/`write_file` → `File` (the agent-ui layer strips the
 /// hashline `[path#TAG]` header + `N:` prefixes for read_file so the panel shows
@@ -2607,15 +2738,20 @@ pub fn build_items(
     for m in messages {
         match m.role {
             Role::User => {
-                let has_prompt_text = m.content.iter().any(|c| match c {
-                    MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
-                        !t.is_empty()
-                    }
-                    _ => false,
-                }) || m
-                    .content
-                    .iter()
-                    .any(|c| matches!(c, MessageContent::Image { .. }));
+                let external_event =
+                    m.ui.as_ref()
+                        .and_then(|ui| ui.external_event)
+                        .unwrap_or(false);
+                let has_prompt_text = !external_event
+                    && m.content.iter().any(|c| match c {
+                        MessageContent::Text(t) | MessageContent::Thinking { text: t, .. } => {
+                            !t.is_empty()
+                        }
+                        _ => false,
+                    })
+                    || m.content
+                        .iter()
+                        .any(|c| matches!(c, MessageContent::Image { .. }));
                 if has_prompt_text {
                     // A new user prompt closes the current turn's activity
                     // segment so the next turn opens a fresh one. A pure-
@@ -2624,7 +2760,9 @@ pub fn build_items(
                     close_segment(&mut items, active_segment_ix);
                     active_segment_ix = None;
                 }
-                last_user_id = Some(m.id.as_str());
+                if !external_event {
+                    last_user_id = Some(m.id.as_str());
+                }
                 // Text becomes a user bubble; ToolResult blocks pair back to the
                 // ToolCall item emitted from the preceding assistant ToolUse.
                 // ToolResults live in user messages per the Anthropic wire contract.
@@ -2653,7 +2791,7 @@ pub fn build_items(
                         _ => None,
                     })
                     .collect();
-                if !text.is_empty() || !images.is_empty() {
+                if !external_event && (!text.is_empty() || !images.is_empty()) {
                     items.push(ConvItem::User {
                         text,
                         images,
@@ -3786,6 +3924,28 @@ mod tests {
                 .count(),
             1,
             "one assistant text between the two segments"
+        );
+    }
+
+    #[test]
+    fn build_items_does_not_render_external_event_as_user_bubble() {
+        let mut external = Message::user("CI pipeline completed".into());
+        external.ui = Some(agent::MessageUiMetadata {
+            external_event: Some(true),
+            ..Default::default()
+        });
+        let items = build_items(
+            &[Message::user("wait for CI".into()), external],
+            &HashMap::new(),
+            false,
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, ConvItem::User { .. }))
+                .count(),
+            1,
+            "machine-generated events must not be attributed to the user"
         );
     }
 }

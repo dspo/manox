@@ -6,6 +6,7 @@
 
 pub mod agent_def;
 pub mod approval;
+pub mod background_task;
 pub mod claude_md;
 pub mod collaboration_mode;
 pub mod command;
