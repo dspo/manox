@@ -199,14 +199,12 @@ impl AgentTool for MonitorTool {
             let tid_log = task_id.clone();
             let tid_result = task_id;
             let cmd_c = command;
-            let desc_c = description;
             let plugin_root = self.plugin_root.clone();
             let base_cwd = self.cwd.clone();
             let handle = runtime.spawn(async move {
                 let result = run_command_monitor(
                     &cmd_c,
                     &base_cwd,
-                    &desc_c,
                     timeout,
                     persistent,
                     task_cancel,
@@ -298,7 +296,6 @@ impl AgentTool for MonitorTool {
 async fn run_command_monitor(
     command: &str,
     cwd: &std::path::Path,
-    _description: &str,
     timeout: Duration,
     persistent: bool,
     cancel: CancellationToken,
