@@ -32,8 +32,8 @@ pub use permission::{PermissionCache, PermissionDecision, ToolAuthorizationRespo
 /// `&dyn ToolContext` never crosses an await boundary.
 pub trait ToolContext {
     fn thread_id(&self) -> &str;
-    /// Active Goal that owns this tool call. Absent for Plan turns,
-    /// sub-agents, and ordinary turns outside an Active Goal.
+    /// Active Goal that owns this tool call. Absent for sub-agents and
+    /// ordinary turns outside an Active Goal.
     fn goal_id(&self) -> Option<&str>;
     fn anchor_message_id(&self) -> Option<&str>;
     fn cwd(&self) -> &Path;
@@ -54,7 +54,6 @@ pub trait ToolContext {
     /// Whether the owning thread is in YOLO / AutoReview mode (bash uses this
     /// to force the unsandboxed branch without a per-call escalation flag).
     fn yolo(&self) -> bool;
-    fn plan_mode(&self) -> bool;
     /// The loopback port of the thread's in-process network proxy, when the
     /// sandbox network policy is `Restricted`. The sandboxed bash command
     /// is wrapped so the seatbelt only allows outbound to this port, and
@@ -79,11 +78,9 @@ pub struct ToolContextSnapshot {
     agent_label: String,
     team: Option<Entity<crate::team::Team>>,
     yolo: bool,
-    plan_mode: bool,
     network_proxy_port: Option<u16>,
     anchor_message_id: Option<String>,
 }
-
 impl ToolContextSnapshot {
     /// Build a snapshot from a `Thread`'s current state. Called by
     /// `run_tool_inner` immediately before invoking the tool.
@@ -92,11 +89,7 @@ impl ToolContextSnapshot {
             thread_id: t.id.0.clone(),
             goal_id: t
                 .goal()
-                .filter(|goal| {
-                    goal.status == crate::goal::GoalStatus::Active
-                        && t.collaboration_mode() != crate::ModeKind::Plan
-                        && t.depth() == 0
-                })
+                .filter(|goal| goal.status == crate::goal::GoalStatus::Active && t.depth() == 0)
                 .map(|goal| goal.goal_id.clone()),
             cwd: t.cwd().to_path_buf(),
             project: t.project().cloned(),
@@ -107,7 +100,6 @@ impl ToolContextSnapshot {
             agent_label: t.agent_label().to_string(),
             team: t.team().cloned(),
             yolo: t.approval_mode() == crate::thread::ApprovalMode::Yolo,
-            plan_mode: t.collaboration_mode() == crate::collaboration_mode::ModeKind::Plan,
             network_proxy_port: t.network_proxy_port(),
             anchor_message_id: t.last_user_message_id().map(str::to_owned),
         }
@@ -150,9 +142,6 @@ impl ToolContext for ToolContextSnapshot {
     }
     fn yolo(&self) -> bool {
         self.yolo
-    }
-    fn plan_mode(&self) -> bool {
-        self.plan_mode
     }
     fn network_proxy_port(&self) -> Option<u16> {
         self.network_proxy_port
@@ -201,10 +190,9 @@ pub trait AgentTool: Send + Sync + 'static {
     fn requires_approval(&self, _input: &serde_json::Value) -> bool {
         false
     }
-    /// Whether this tool only reads and never mutates the world. Plan mode
-    /// uses this to hide write tools from the model entirely (a filtered
-    /// request-tool list), so the model cannot even attempt them. Default
-    /// `false`; read-only tools override to `true`.
+    /// Whether this tool only reads and never mutates the world. Used by tool
+    /// discovery (`ToolSearch`) to categorize search results. Default `false`;
+    /// read-only tools override to `true`.
     fn is_read_only(&self) -> bool {
         false
     }
@@ -355,34 +343,6 @@ impl ToolRegistry {
             })
             .collect()
     }
-
-    /// Plan-mode tool set: only tools whose `is_read_only()` returns true.
-    /// Write/exec tools (`write_file`, `edit_file`, `bash`) are excluded; the
-    /// `agent` tool is read-only (`SpawnAgentTool::is_read_only`), so it
-    /// survives — letting the main thread delegate research to the `Explore`
-    /// sub-agent with isolated context.
-    pub fn to_request_tools_read_only(
-        &self,
-        lang: crate::language::Language,
-    ) -> Vec<LanguageModelRequestTool> {
-        self.tools
-            .values()
-            .filter(|t| t.is_read_only())
-            .map(|tool| LanguageModelRequestTool {
-                name: tool.name().to_string(),
-                description: crate::tools::descriptions::description_for(tool.name(), lang)
-                    .unwrap_or_else(|| tool.description())
-                    .to_string(),
-                input_schema: crate::tools::descriptions::override_schema(
-                    tool.input_schema(),
-                    tool.name(),
-                    lang,
-                ),
-                use_input_streaming: false,
-            })
-            .collect()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
@@ -474,33 +434,5 @@ mod tests {
         );
         assert_eq!(names.first(), Some(&"000_stub".to_string()));
         assert_eq!(names.last(), Some(&"zzz_stub".to_string()));
-    }
-
-    #[test]
-    fn filtered_excludes_write_tools_in_plan_mode() {
-        let r = registry();
-        let full = r.to_request_tools(crate::language::Language::En);
-        let ro = r.to_request_tools_read_only(crate::language::Language::En);
-
-        let full_names: Vec<&str> = full.iter().map(|t| t.name.as_str()).collect();
-        let ro_names: Vec<&str> = ro.iter().map(|t| t.name.as_str()).collect();
-
-        // Write/exec tools present in full are absent from the filtered set.
-        for blocked in ["Write", "Edit", "Bash"] {
-            assert!(full_names.contains(&blocked), "{blocked} in full set");
-            assert!(
-                !ro_names.contains(&blocked),
-                "{blocked} leaked into plan-mode set"
-            );
-        }
-        // Read-only tools survive the filter.
-        for allowed in ["Read", "List", "Grep", "Glob", "AskUserQuestion"] {
-            assert!(
-                ro_names.contains(&allowed),
-                "{allowed} missing from plan-mode set"
-            );
-        }
-        // The read-only set is strictly smaller than the full set.
-        assert!(ro.len() < full.len());
     }
 }

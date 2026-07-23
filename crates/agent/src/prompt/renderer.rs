@@ -596,17 +596,7 @@ mod tests {
                 &render(
                     PromptTemplate::WrapperEmptyTurnNudge,
                     lang,
-                    &crate::prompt::EmptyTurnNudgeData { in_plan: true },
-                )
-                .unwrap(),
-                PromptTemplate::WrapperEmptyTurnNudge,
-                lang,
-            );
-            assert_clean(
-                &render(
-                    PromptTemplate::WrapperEmptyTurnNudge,
-                    lang,
-                    &crate::prompt::EmptyTurnNudgeData { in_plan: false },
+                    &crate::prompt::EmptyTurnNudgeData {},
                 )
                 .unwrap(),
                 PromptTemplate::WrapperEmptyTurnNudge,

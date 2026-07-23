@@ -51,11 +51,6 @@ const PLUS_ADD_ROWS: &[MenuRow] = &[
         name: "composer-goal-name",
         desc: "composer-goal-desc",
     },
-    MenuRow {
-        icon: IconName::LayoutDashboard,
-        name: "composer-plan-mode-name",
-        desc: "composer-plan-mode-desc",
-    },
 ];
 
 /// `+` menu "Plugins" group — all static decoration. Literal English product
@@ -111,19 +106,18 @@ fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
     })
 }
 
-/// Build the `+` popup menu. `on_files` runs when the "Files and folders" row is
-/// clicked (index 0); `on_plan` runs when the "Plan mode" row is clicked (index 3).
+/// Build the `+` popup menu. `on_files` runs when the "Files and folders" row
+/// is clicked (index 0); `on_goal` runs when the "Goal" row is clicked
+/// (index 2).
 pub fn build_plus_menu(
     menu: PopupMenu,
     theme: &Theme,
     on_files: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
-    on_plan: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
     on_goal: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> PopupMenu {
     let mut menu = menu.max_w(gpui::px(360.)).scrollable(true);
     menu = menu.label(i18n::t("composer-add-label"));
     let on_files = std::rc::Rc::new(on_files);
-    let on_plan = std::rc::Rc::new(on_plan);
     let on_goal = std::rc::Rc::new(on_goal);
     for (ix, row) in PLUS_ADD_ROWS.iter().enumerate() {
         match ix {
@@ -137,12 +131,6 @@ pub fn build_plus_menu(
                 let on_goal = on_goal.clone();
                 menu = menu.item(
                     menu_row_item(row, theme).on_click(move |_, window, cx| on_goal(window, cx)),
-                );
-            }
-            3 => {
-                let on_plan = on_plan.clone();
-                menu = menu.item(
-                    menu_row_item(row, theme).on_click(move |_, window, cx| on_plan(window, cx)),
                 );
             }
             _ => {

@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_flags_match_plan_mode_allowlist() {
+    fn read_only_flags_match_tool_search_categorization() {
         let tools = base_tools(Arc::new(PathBuf::from(".")));
         let by_name = |n: &str| tools.iter().find(|t| t.name() == n).unwrap();
         for n in [
@@ -724,14 +724,12 @@ mod tests {
     }
 
     #[test]
-    fn update_plan_is_main_only_and_hidden_in_plan_mode() {
+    fn update_plan_is_main_only() {
         // The main registry builds the `agent` spawn tool, which reads the
         // agent-definition registry; initialize it so construction succeeds.
         crate::agent_def::init();
         // UpdatePlan is a main-agent tool: absent from the shared base set
-        // (so sub-agents never get it), present in the main registry, and not
-        // read-only — so plan mode's read-only filter hides it and the
-        // `run_tool_inner` backstop rejects a hallucinated call there.
+        // (so sub-agents never get it), present in the main registry.
         let base = base_tools(Arc::new(PathBuf::from(".")));
         assert!(
             !base.iter().any(|t| t.name() == UPDATE_PLAN),
@@ -746,15 +744,6 @@ mod tests {
         let tool = reg.get(UPDATE_PLAN).expect("UpdatePlan in main registry");
         assert!(!tool.is_read_only(), "UpdatePlan must not be read-only");
 
-        let plan_mode_names: Vec<String> = reg
-            .to_request_tools_read_only(crate::language::Language::En)
-            .into_iter()
-            .map(|t| t.name)
-            .collect();
-        assert!(
-            !plan_mode_names.iter().any(|n| n == UPDATE_PLAN),
-            "UpdatePlan leaked into the plan-mode tool set"
-        );
         let full_names: Vec<String> = reg
             .to_request_tools(crate::language::Language::En)
             .into_iter()
@@ -762,7 +751,7 @@ mod tests {
             .collect();
         assert!(
             full_names.iter().any(|n| n == UPDATE_PLAN),
-            "UpdatePlan missing from the Default-mode tool set"
+            "UpdatePlan missing from the tool set"
         );
     }
 
@@ -784,11 +773,6 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect();
-        let plan_names: Vec<String> = registry
-            .to_request_tools_read_only(crate::language::Language::En)
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect();
         let discovery_names: Vec<String> = registry
             .to_request_tools_in_order(
                 &tool_search::schema_order("goal-tools-stable"),
@@ -804,7 +788,6 @@ mod tests {
                 discovery_names.iter().any(|registered| registered == name),
                 "{name} must remain stable when tool discovery is enabled"
             );
-            assert!(!plan_names.iter().any(|registered| registered == name));
         }
     }
 }

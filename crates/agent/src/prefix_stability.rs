@@ -483,46 +483,40 @@ mod tests {
         }
     }
 
-    /// A request as `build_completion_request` would emit it for a given mode:
-    /// an identical system head, a fixed-position developer-instructions
-    /// `User` message (injected per request, never persisted into history),
-    /// the history tail, and the mode's tool set (Plan = read-only subset,
-    /// Default = full set).
-    fn request_for_mode(mode: crate::collaboration_mode::ModeKind) -> LanguageModelRequest {
-        use crate::collaboration_mode::{ModeKind, resolve};
-        // The system head is mode-independent — it never carries the mode
-        // instructions (those ride a User message), so its bytes are fixed.
+    /// A request as `build_completion_request` would emit it: an identical
+    /// system head, a fixed-position developer-instructions `User` message
+    /// (injected per request, never persisted into history), the history
+    /// tail, and the tool set.
+    fn request_with_instructions() -> LanguageModelRequest {
+        // The system head never carries the instructions (those ride a User
+        // message), so its bytes are fixed.
         let mut messages = vec![system_msg("main system prompt")];
         // Fixed-position developer-instructions injection (User role, cache).
-        let instructions = resolve(mode, &Default::default(), crate::language::Language::En)
-            .developer_instructions;
+        let instructions =
+            crate::collaboration_mode::unified_instructions(crate::language::Language::En);
         messages.push(LanguageModelRequestMessage {
             role: Role::User,
             content: vec![MessageContent::Text(format!(
-                "<collaboration_mode>{}</collaboration_mode>",
-                instructions.unwrap_or_default()
+                "<collaboration_mode>{instructions}</collaboration_mode>"
             ))],
             cache: true,
         });
-        // History tail — mode-independent (the injected message is not
-        // persisted, so the visible history is unaffected by a toggle).
+        // History tail — the injected message is not persisted, so the visible
+        // history is unaffected.
         messages.push(user_msg("what is 2+2"));
         messages.push(LanguageModelRequestMessage {
             role: Role::Assistant,
             content: vec![MessageContent::Text("4".into())],
             cache: false,
         });
-        let tools = match mode {
-            ModeKind::Plan => vec![tool("Read"), tool("Grep"), tool("List")],
-            ModeKind::Default => vec![
-                tool("Read"),
-                tool("Write"),
-                tool("Edit"),
-                tool("Bash"),
-                tool("Grep"),
-                tool("List"),
-            ],
-        };
+        let tools = vec![
+            tool("Read"),
+            tool("Write"),
+            tool("Edit"),
+            tool("Bash"),
+            tool("Grep"),
+            tool("List"),
+        ];
         LanguageModelRequest {
             messages,
             tools,
@@ -530,56 +524,32 @@ mod tests {
         }
     }
 
-    /// Plan → Default → Plan toggles: only the tool fingerprint drifts; the
-    /// system head stays byte-identical, and the per-request
-    /// developer-instructions User message never leaks into `system()` (it is
-    /// User role, not System). This is the prefix-stability invariant the
-    /// collaboration-mode port must preserve.
+    /// Two consecutive requests with the same instructions: the system head
+    /// stays byte-identical and the tool set is stable — the prefix-stability
+    /// invariant the instructions injection must preserve.
     #[test]
-    fn plan_default_plan_toggle_drifts_tools_only() {
-        use crate::collaboration_mode::ModeKind;
+    fn consecutive_requests_keep_prefix_stable() {
         let mut sp = StablePrefix::default();
 
-        // Plan baseline.
-        let plan = request_for_mode(ModeKind::Plan);
-        assert!(sp.build(&plan).is_none()); // baseline pins, no drift
-        let plan_sys: Vec<String> = sp.system().unwrap().to_vec();
-        assert_eq!(plan_sys, vec!["main system prompt".to_string()]);
+        // Baseline.
+        let req = request_with_instructions();
+        assert!(sp.build(&req).is_none()); // baseline pins, no drift
+        let sys: Vec<String> = sp.system().unwrap().to_vec();
+        assert_eq!(sys, vec!["main system prompt".to_string()]);
 
-        // Toggle to Default → tools change, system does not.
-        let default = request_for_mode(ModeKind::Default);
-        let change = sp.build(&default).expect("Plan→Default drifts");
-        assert!(change.tools_changed, "tool set must differ Plan↔Default");
-        assert!(
-            !change.system_changed,
-            "system head must be mode-independent"
-        );
-        assert_eq!(sp.system().unwrap(), plan_sys.as_slice());
-
-        // Toggle back to Plan → tools change again, system still stable.
-        let change = sp.build(&plan).expect("Default→Plan drifts");
-        assert!(change.tools_changed);
-        assert!(!change.system_changed);
-        assert_eq!(sp.system().unwrap(), plan_sys.as_slice());
-
-        // Two toggles produced two drift events, both tools-only.
-        assert_eq!(sp.change_count(), 2);
-        assert_eq!(
-            sp.last_change(),
-            Some(PrefixChange {
-                system_changed: false,
-                tools_changed: true
-            })
-        );
+        // Second identical request → no drift at all.
+        let change = sp.build(&req);
+        assert!(change.is_none(), "identical request must not drift");
+        assert_eq!(sp.system().unwrap(), sys.as_slice());
+        assert_eq!(sp.change_count(), 0);
     }
 
     /// The persisted history (excluding the per-request injected
-    /// developer-instructions message) is mode-independent: syncing it across a
-    /// Plan↔Default toggle churns nothing — the log length tracks the history
-    /// length, never the injected message or the tool set.
+    /// developer-instructions message) is stable: syncing it across turns
+    /// churns nothing — the log length tracks the history length, never the
+    /// injected message or the tool set.
     #[test]
-    fn mode_toggle_does_not_churn_history_log() {
-        use crate::collaboration_mode::ModeKind;
+    fn instructions_injection_does_not_churn_history_log() {
         let history: &[LanguageModelRequestMessage] = &[
             user_msg("what is 2+2"),
             LanguageModelRequestMessage {
@@ -590,21 +560,17 @@ mod tests {
         ];
         let mut log = AppendOnlyLog::default();
 
-        // Turn in Plan mode — history of 2.
+        // Turn — history of 2.
         log.sync_messages(history);
         assert_eq!(log.len(), 2);
 
-        // Toggle to Default and run a turn — same history, no churn.
-        let _ = request_for_mode(ModeKind::Default); // mode switch itself touches no history
+        // Same history next turn — no churn.
+        let _ = request_with_instructions();
         log.sync_messages(history);
-        assert_eq!(log.len(), 2, "history is mode-independent");
-
-        // Toggle back to Plan — still 2, no replay, no growth.
-        log.sync_messages(history);
-        assert_eq!(log.len(), 2);
+        assert_eq!(log.len(), 2, "history is stable across turns");
 
         // A genuine history append (next turn) is the only thing that grows
-        // the log — never the mode toggle.
+        // the log.
         let mut grown = history.to_vec();
         grown.push(user_msg("thanks"));
         log.sync_messages(&grown);

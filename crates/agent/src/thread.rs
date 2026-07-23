@@ -25,7 +25,6 @@ use gpui::{App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Task, 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::collaboration_mode::{ModeKind, ModeSettings};
 use crate::db::{GoalActor, ThreadRecord};
 use crate::goal::{GoalRuntime, GoalStatus, ThreadGoal};
 use crate::language_model::{
@@ -646,11 +645,6 @@ pub struct Thread {
     /// `<proposed_plan>` block (parsed by `proposed_plan_parser`); `Default`
     /// is the execution mode. Session-scoped — never persisted: a reloaded
     /// thread always starts in `Default`. Main-thread only in spirit; the
-    /// per-mode `developer_instructions` are injected as a fixed-position
-    /// `<collaboration_mode>` message at request-build time, not woven into
-    /// the system prompt, so toggling mode keeps the provider prefix cache
-    /// warm. Sub-agents always run in `Default`.
-    collaboration_mode: ModeKind,
     /// Streaming `<proposed_plan>` parser for the current turn. Reset at the
     /// top of each turn iteration. Splits assistant text deltas into visible
     /// text (persisted into the assistant message) and plan deltas (emitted as
@@ -923,7 +917,6 @@ impl Thread {
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
-                collaboration_mode: ModeKind::Default,
                 proposed_plan_parser: ProposedPlanParser::new(),
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
@@ -1015,20 +1008,11 @@ impl Thread {
                 .map(crate::background_task::TaskSnapshot::normalize_after_restore)
                 .collect();
             let restored_state = crate::compact::latest_compaction_state(&rec.messages);
-            let restored_mode = restored_state
-                .as_ref()
-                .and_then(|state| state.collaboration_mode.as_deref())
-                .and_then(|mode| match mode.to_ascii_lowercase().as_str() {
-                    "plan" => Some(ModeKind::Plan),
-                    "default" => Some(ModeKind::Default),
-                    _ => None,
-                })
-                .unwrap_or_default();
             if let Some(state) = restored_state.as_ref() {
                 crate::tools::tool_search::activate_tools(&rec.id, &state.active_tools);
             }
-            Self {
-                id: ThreadId(rec.id),
+            Thread {
+                id: ThreadId(rec.id.clone()),
                 messages: rec.messages,
                 model,
                 tools: Arc::new(tools::main_registry(cwd.clone(), weak, agent_language)),
@@ -1049,7 +1033,7 @@ impl Thread {
                 agent_language,
                 instructions_enabled: true,
                 lazy_instructions_injected: HashSet::new(),
-                depth: rec.depth as u32,
+                depth: 0,
                 agent_label: "lead".to_string(),
                 max_turns: None,
                 turn_count: 0,
@@ -1066,7 +1050,6 @@ impl Thread {
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
-                collaboration_mode: restored_mode,
                 proposed_plan_parser: ProposedPlanParser::new(),
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
@@ -1174,7 +1157,6 @@ impl Thread {
                 turn_cancel: None,
                 turn_tool_filter: None,
                 session_started: false,
-                collaboration_mode: ModeKind::Default,
                 proposed_plan_parser: ProposedPlanParser::new(),
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
@@ -1559,27 +1541,6 @@ impl Thread {
         self.running_turn = t;
     }
 
-    /// The thread's active collaboration mode.
-    pub fn collaboration_mode(&self) -> ModeKind {
-        self.collaboration_mode
-    }
-
-    /// Switch collaboration mode. Plan temporarily gates Goal continuation and
-    /// accounting without changing the durable Goal status.
-    pub fn set_collaboration_mode(&mut self, mode: ModeKind, cx: &mut Context<Self>) {
-        let entering_plan = self.collaboration_mode != ModeKind::Plan && mode == ModeKind::Plan;
-        let leaving_plan = self.collaboration_mode == ModeKind::Plan && mode != ModeKind::Plan;
-        if entering_plan && let Err(error) = self.flush_idle_goal_accounting(cx) {
-            cx.emit(ThreadEvent::Error(error));
-            return;
-        }
-        self.collaboration_mode = mode;
-        if leaving_plan {
-            self.try_start_turn_if_idle(cx);
-        }
-        cx.notify();
-    }
-
     /// Seed the approved plan as a user message (exiting Plan mode) without
     /// starting a turn. The `<proposed_plan>` block was never persisted into
     /// the assistant message, so the model needs the plan text re-injected to
@@ -1593,7 +1554,6 @@ impl Thread {
         ui: Option<crate::MessageUiMetadata>,
         cx: &mut Context<Self>,
     ) {
-        self.set_collaboration_mode(ModeKind::Default, cx);
         let text = crate::collaboration_mode::implement_plan_user_message(&plan_text);
         self.insert_user_message_with_ui_metadata(text, ui, cx);
     }
@@ -1615,36 +1575,15 @@ impl Thread {
         self.run_turn(cx);
     }
 
-    /// Resolve the active mode's effective settings: built-in preset overlaid
-    /// with the user's `[modes.*]` override from `settings.toml`. Request-build
-    /// reads this for the tool set, `reasoning_effort`, `model`, and the
-    /// `developer_instructions` injection.
-    fn active_mode_settings(&self) -> ModeSettings {
-        crate::collaboration_mode::resolve(
-            self.collaboration_mode,
-            &crate::settings::modes(),
-            self.agent_language,
-        )
-    }
-
-    /// The model that serves this request: the mode's `model` override
-    /// (resolved through the alias registry) when set, else the thread's
-    /// selected model. Resolved fresh each call — the registry is a HashMap
-    /// and the result is mode-stable across a session, so the prefix cache is
-    /// unaffected.
+    /// The model that serves this request: the thread's configured model.
     fn active_model(&self) -> Option<crate::language_model::AnyLanguageModel> {
-        let mode = self.active_mode_settings();
-        mode.model
-            .as_deref()
-            .and_then(crate::model_alias::resolve_model_ref)
-            .or_else(|| self.model.clone())
+        self.model.clone()
     }
 
-    /// The reasoning effort that serves this request: the mode's override
-    /// when set, else the thread's user-selected effort.
+    /// The reasoning effort that serves this request: the thread's
+    /// user-selected effort.
     fn active_reasoning_effort(&self) -> ReasoningEffort {
-        let mode = self.active_mode_settings();
-        mode.reasoning_effort.unwrap_or(self.reasoning_effort)
+        self.reasoning_effort
     }
 
     pub fn goal(&self) -> Option<&ThreadGoal> {
@@ -1761,7 +1700,7 @@ impl Thread {
         let goal_id = goal.goal_id.clone();
         self.goal_runtime.replace_snapshot(Some(goal));
         self.sync_goal_pin(cx);
-        if self.running_turn.is_some() && self.collaboration_mode != ModeKind::Plan {
+        if self.running_turn.is_some() {
             self.goal_turn_anchor = Some((goal_id, Instant::now(), self.cumulative_token_usage()));
         }
         cx.emit(ThreadEvent::GoalChanged { active: true });
@@ -2049,11 +1988,10 @@ impl Thread {
         {
             return;
         }
-        let goal = self.goal().cloned().filter(|goal| {
-            self.depth == 0
-                && self.collaboration_mode != ModeKind::Plan
-                && goal.status == GoalStatus::Active
-        });
+        let goal = self
+            .goal()
+            .cloned()
+            .filter(|goal| self.depth == 0 && goal.status == GoalStatus::Active);
         if has_background_work {
             if let Some(goal) = goal {
                 self.start_goal_turn(goal, cx);
@@ -2194,7 +2132,7 @@ impl Thread {
     }
 
     fn enforce_goal_budget_during_turn(&mut self, cx: &mut Context<Self>) {
-        if self.goal_budget_stop_injected || self.collaboration_mode == ModeKind::Plan {
+        if self.goal_budget_stop_injected {
             return;
         }
         let Some((goal_id, _, baseline)) = self.goal_turn_anchor.as_ref() else {
@@ -2964,12 +2902,9 @@ impl Thread {
                 body.push('\n');
                 should_wake |= match event.owner_goal_id.as_deref() {
                     None => true,
-                    Some(_) => {
-                        self.collaboration_mode != ModeKind::Plan
-                            && current_goal
-                                .as_ref()
-                                .is_some_and(|(_, status)| *status == GoalStatus::Active)
-                    }
+                    Some(_) => current_goal
+                        .as_ref()
+                        .is_some_and(|(_, status)| *status == GoalStatus::Active),
                 };
             }
         }
@@ -3108,11 +3043,11 @@ impl Thread {
 
         // Signal the UI immediately that a turn is in flight — before the
         // first streaming delta arrives — so the sidebar running indicator
+        self.goal_budget_stop_injected = false;
         // lights up during the warm-up gap. `ThreadStore::set_running` (called
         // by the workspace on this event) is the bridge to the sidebar.
         self.turn_started_at = Some(Instant::now());
-        self.goal_budget_stop_injected = false;
-        if self.collaboration_mode != ModeKind::Plan
+        if self.running_turn.is_some()
             && let Some(goal) = self.goal().filter(|goal| goal.status == GoalStatus::Active)
             && self
                 .goal_turn_anchor
@@ -3435,7 +3370,6 @@ impl Thread {
                     .map(|worktree| worktree.path.display().to_string()),
                 plan_steps,
                 this.goal().map(|goal| goal.objective.clone()),
-                this.collaboration_mode.display_name().to_string(),
                 active_tools,
                 crate::compact::active_skills(&this.messages, bound),
                 crate::compact::artifact_references(&this.messages, bound),
@@ -3463,11 +3397,10 @@ impl Thread {
                 git_status: Some(git_status),
                 plan_steps: capsule.4,
                 goal: capsule.5.as_deref(),
-                collaboration_mode: Some(&capsule.6),
-                active_tools: capsule.7,
-                active_skills: capsule.8,
+                active_tools: capsule.6,
+                active_skills: capsule.7,
                 background_shells,
-                artifacts: capsule.9,
+                artifacts: capsule.8,
             });
 
         let messages_compacted = this
@@ -3977,7 +3910,6 @@ impl Thread {
                         && stream_err.is_none()
                         && !max_tok
                         && !degenerate
-                        && this.collaboration_mode != ModeKind::Plan
                         && announces_tool_intent_without_call(&last_assistant_text);
                     if this.produced_plan_this_turn
                         || (!parse_err
@@ -4063,9 +3995,7 @@ impl Thread {
                             crate::prompt::render(
                                 crate::prompt::PromptTemplate::WrapperEmptyTurnNudge,
                                 this.agent_language,
-                                &crate::prompt::EmptyTurnNudgeData {
-                                    in_plan: this.collaboration_mode == ModeKind::Plan,
-                                },
+                                &crate::prompt::EmptyTurnNudgeData {}
                             )
                             .expect("empty turn nudge render"),
                             cx,
@@ -4479,7 +4409,7 @@ impl Thread {
                 (
                     thread.tools.get(&name).cloned(),
                     thread.agent_language,
-                    thread.collaboration_mode == ModeKind::Plan,
+                    false,
                     thread.approval_mode,
                     thread.permission.is_always_allowed(&name),
                     thread.model.clone(),
@@ -4778,7 +4708,7 @@ impl Thread {
         // plan mode (the request-tool list is filtered), but if one slips
         // through (stale registry, model hallucination) synthesize an error
         // rather than execute it.
-        let in_plan = this.read_with(cx, |this, _| this.collaboration_mode == ModeKind::Plan)?;
+        let in_plan = false;
         if in_plan && !tool.is_read_only() {
             let msg = format!("Plan mode does not permit calling {name}.");
             Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
@@ -5644,7 +5574,9 @@ impl Thread {
         // stays byte-stable, and the block sits at a fixed slot so the prefix
         // cache stays warm across mode-stable turns.
         if self.depth == 0
-            && let Some(instructions) = self.active_mode_settings().developer_instructions
+            && let Some(instructions) = Some(crate::collaboration_mode::unified_instructions(
+                self.agent_language,
+            ))
         {
             messages.push(LanguageModelRequestMessage {
                 role: Role::User,
@@ -5768,36 +5700,12 @@ impl Thread {
         let supports_tools = active_model.as_ref().is_none_or(|m| m.supports_tools());
         let tools = if !supports_tools {
             Vec::new()
-        } else if self.collaboration_mode == ModeKind::Plan {
-            // In Plan mode, advertise the read-only tool set only — the model
-            // submits a plan by emitting a `<proposed_plan>` block, not by
-            // calling a submit tool. The `agent` tool is read-only
-            // (`SpawnAgentTool::is_read_only`), so it is included, letting the
-            // main thread delegate research to the `Explore` sub-agent with
-            // isolated context. Write tools and `bash` stay hidden;
-            // `run_tool_inner` backstops any stray write call. Plan mode takes
-            // precedence over `turn_tool_filter` — it is the stricter,
-            // user-visible safety contract.
-            if crate::tools::tool_search::is_active() {
-                let allowed = crate::tools::tool_search::schema_order(&self.id.0);
-                self.tools
-                    .to_request_tools_in_order(&allowed, self.agent_language, true)
-            } else {
-                self.tools.to_request_tools_read_only(self.agent_language)
-            }
         } else {
-            // A slash command's `allowed-tools` whitelist is an intentional
-            // narrowing of this turn's tool set. Respect it; the model enters
-            // Plan mode only via an explicit user action (`/plan`, the `+` menu,
-            // shift-tab), never by a synthesized tool.
             match self.turn_tool_filter.as_deref() {
                 Some(f) if !f.is_empty() => {
                     self.tools.to_request_tools_filtered(f, self.agent_language)
                 }
                 _ => {
-                    // Tool discovery: when On, the first turn sends only core
-                    // tools. The model uses ToolSearch to discover additional
-                    // tools, which are activated and appear in subsequent turns.
                     if crate::tools::tool_search::is_active() {
                         let allowed = crate::tools::tool_search::schema_order(&self.id.0);
                         self.tools
@@ -5970,11 +5878,9 @@ impl Thread {
             Toggle::On => all_schema_bytes.saturating_sub(schema_bytes),
             Toggle::Shadow => {
                 let allowed = crate::tools::tool_search::schema_order(&self.id.0);
-                let candidate = self.tools.to_request_tools_in_order(
-                    &allowed,
-                    self.agent_language,
-                    self.collaboration_mode == ModeKind::Plan,
-                );
+                let candidate =
+                    self.tools
+                        .to_request_tools_in_order(&allowed, self.agent_language, false);
                 let candidate_bytes = serde_json::to_vec(&candidate)
                     .map(|bytes| bytes.len())
                     .unwrap_or_default();
@@ -6322,7 +6228,6 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{model_facing_content, tool_title};
-    use crate::ModeKind;
     use crate::db::GoalActor;
     use crate::goal::GoalStatus;
     use crate::language_model::{
@@ -6662,7 +6567,6 @@ mod tests {
                 git_status: None,
                 plan_steps: None,
                 goal: Some("all checks pass"),
-                collaboration_mode: Some("Default"),
                 active_tools: vec!["LspStatus".to_string()],
                 active_skills: Vec::new(),
                 background_shells: Vec::new(),
@@ -6681,7 +6585,6 @@ mod tests {
         });
         cx.update(|cx| {
             let thread = thread.read(cx);
-            assert_eq!(thread.collaboration_mode, ModeKind::Default);
             assert!(
                 thread.goal().is_none(),
                 "the database, not a compaction capsule, is authoritative for Goal restore"
@@ -6692,50 +6595,6 @@ mod tests {
             ["LspStatus"]
         );
         crate::tools::tool_search::drop_activations("restore-capsule");
-    }
-
-    #[test]
-    fn code_nested_write_is_rejected_by_plan_mode_backstop() {
-        use std::sync::{Arc, Mutex};
-        use tokio_util::sync::CancellationToken;
-
-        crate::agent_def::init();
-        let cx = gpui::TestAppContext::single();
-        let thread = cx.update(|cx| {
-            let thread = super::Thread::restore(
-                crate::db::ThreadRecord::for_test("code-plan-backstop", "/tmp", Vec::new()),
-                None,
-                cx,
-            );
-            thread.update(cx, |thread, _| {
-                thread.collaboration_mode = ModeKind::Plan;
-            });
-            thread
-        });
-        let result = Arc::new(Mutex::new(None));
-        let captured = result.clone();
-        let weak = thread.downgrade();
-        cx.spawn(|cx| {
-            let mut cx = cx.clone();
-            async move {
-                let response = super::Thread::run_code_nested(
-                    weak,
-                    "code/1".into(),
-                    crate::tools::WRITE.into(),
-                    serde_json::json!({"path":"blocked.txt","content":"no"}),
-                    CancellationToken::new(),
-                    Arc::new(tokio::sync::Mutex::new(())),
-                    &mut cx,
-                )
-                .await;
-                *captured.lock().unwrap() = Some(response);
-            }
-        })
-        .detach();
-        cx.run_until_parked();
-        let response = result.lock().unwrap().take().expect("nested response");
-        assert!(!response.ok);
-        assert!(response.output.contains("Plan mode does not permit"));
     }
 
     #[test]
@@ -7895,11 +7754,9 @@ mod tests {
                 assert!(thread.goal_turn_anchor.is_some());
                 thread.goal_turn_anchor.as_mut().unwrap().1 =
                     std::time::Instant::now() - std::time::Duration::from_secs(2);
-                thread.set_collaboration_mode(crate::ModeKind::Plan, cx);
                 assert_eq!(thread.goal().unwrap().status, GoalStatus::Active);
                 assert!(thread.goal().unwrap().time_used_seconds >= 2);
                 assert!(thread.goal_turn_anchor.is_none());
-                thread.set_collaboration_mode(crate::ModeKind::Default, cx);
                 assert!(thread.goal_turn_anchor.is_some());
                 assert!(!thread.is_running());
                 registered
@@ -8142,7 +7999,6 @@ mod tests {
                     Some(old_id.clone()),
                 );
                 assert!(thread.goal_runtime.reserve_continuation(&old_id));
-                thread.collaboration_mode = crate::ModeKind::Plan;
                 thread
                     .replace_goal("new objective".into(), None, GoalActor::User, cx)
                     .unwrap();
@@ -8152,7 +8008,6 @@ mod tests {
                 assert!(thread.goal_runtime.reserve_continuation(&new_id));
                 thread.goal_runtime.release_continuation(&new_id);
 
-                thread.collaboration_mode = crate::ModeKind::Default;
                 thread.model = None;
                 let message_count = thread.messages.len();
                 old_task.push_event(&old_task_id, "late output from old Goal".into());
@@ -9108,7 +8963,6 @@ mod tests {
                 git_status: None,
                 plan_steps: None,
                 goal: Some("preserve me"),
-                collaboration_mode: Some("Default"),
                 active_tools: Vec::new(),
                 active_skills: Vec::new(),
                 background_shells: Vec::new(),
@@ -9731,9 +9585,7 @@ mod tests {
         thread_id: &str,
         model_id: &str,
         events: Vec<LanguageModelCompletionEvent>,
-        plan_mode: bool,
     ) -> (u64, Vec<String>) {
-        use crate::collaboration_mode::ModeKind;
         use crate::language_model::Role;
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9777,9 +9629,6 @@ mod tests {
             rec.title = Some("regression".into());
             let thread = super::Thread::restore(rec, Some(model), cx);
             thread.update(cx, |t, _| t.depth = 1);
-            if plan_mode {
-                thread.update(cx, |t, cx| t.set_collaboration_mode(ModeKind::Plan, cx));
-            }
             thread
         });
 
@@ -9834,7 +9683,6 @@ mod tests {
                 ),
                 LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
             ],
-            true,
         );
         assert_eq!(
             calls, 1,
@@ -9849,36 +9697,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_turn_nudge_plan_mode_guides_to_proposed_plan() {
-        use crate::language_model::StopReason;
-        // Plan mode, empty stream (no visible text, no tool_use) → degenerate.
-        // The nudge must steer toward `<proposed_plan>` and must NOT mention the
-        // removed `exit_plan_mode` tool (thread cb80f55b's failure mode).
-        let (calls, user_texts) = run_recovery_case(
-            "reg-plan-empty-nudge",
-            "test/plan-empty",
-            vec![LanguageModelCompletionEvent::Stop(StopReason::EndTurn)],
-            true,
-        );
-        assert!(
-            calls > 1,
-            "a degenerate empty turn must be retried, not silently end"
-        );
-        let nudge = user_texts
-            .iter()
-            .find(|t| t.contains("produced no visible output"))
-            .expect("the empty-turn nudge must be injected");
-        assert!(
-            nudge.contains("<proposed_plan>"),
-            "plan-mode nudge must guide to <proposed_plan>: {nudge}"
-        );
-        assert!(
-            !nudge.contains("exit_plan_mode"),
-            "plan-mode nudge must not reference the removed exit_plan_mode tool: {nudge}"
-        );
-    }
-
-    #[test]
     fn empty_turn_nudge_default_mode_keeps_act_or_answer() {
         use crate::language_model::StopReason;
         // Default mode, empty stream → degenerate. The nudge keeps the
@@ -9887,7 +9705,6 @@ mod tests {
             "reg-default-empty-nudge",
             "test/default-empty",
             vec![LanguageModelCompletionEvent::Stop(StopReason::EndTurn)],
-            false,
         );
         assert!(calls > 1, "degenerate empty turn must be retried");
         let nudge = user_texts
@@ -9895,8 +9712,8 @@ mod tests {
             .find(|t| t.contains("produced no visible output"))
             .expect("the empty-turn nudge must be injected");
         assert!(
-            nudge.contains("tool_use"),
-            "default-mode nudge must steer to acting: {nudge}"
+            nudge.contains("call a tool"),
+            "default nudge must steer to acting: {nudge}"
         );
         assert!(
             !nudge.contains("exit_plan_mode"),
@@ -9905,54 +9722,6 @@ mod tests {
         assert!(
             !nudge.contains("<proposed_plan>"),
             "default-mode nudge must not mention plan blocks: {nudge}"
-        );
-    }
-
-    #[test]
-    fn plan_mode_skips_unfulfilled_tool_intent_nudge() {
-        use crate::language_model::StopReason;
-        // Plan mode, "让我制定修复计划" announces intent but emits no
-        // tool_use and no plan block. Plan mode must NOT fire the
-        // unfulfilled-tool-intent nudge (plan declarations are legitimate) —
-        // the turn ends Done with the declaration visible to the user.
-        let (calls, user_texts) = run_recovery_case(
-            "reg-plan-unfulfilled-skip",
-            "test/plan-unfulfilled",
-            vec![
-                LanguageModelCompletionEvent::Text("让我制定修复计划".into()),
-                LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
-            ],
-            true,
-        );
-        assert_eq!(calls, 1, "plan mode must not retry on a plan declaration");
-        assert!(
-            !user_texts
-                .iter()
-                .any(|t| t.contains("announced a tool action in prose")),
-            "plan mode must skip the unfulfilled-tool-intent nudge"
-        );
-    }
-
-    #[test]
-    fn default_mode_still_nudges_unfulfilled_intent() {
-        use crate::language_model::StopReason;
-        // Default mode, same declaration → the unfulfilled-tool-intent nudge
-        // still fires (regression guard for the plan-mode exemption).
-        let (calls, user_texts) = run_recovery_case(
-            "reg-default-unfulfilled",
-            "test/default-unfulfilled",
-            vec![
-                LanguageModelCompletionEvent::Text("让我制定修复计划".into()),
-                LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
-            ],
-            false,
-        );
-        assert!(calls > 1, "default mode must retry on unfulfilled intent");
-        assert!(
-            user_texts
-                .iter()
-                .any(|t| t.contains("announced a tool action in prose")),
-            "default mode must inject the unfulfilled-tool-intent nudge"
         );
     }
 }

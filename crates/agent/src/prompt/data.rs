@@ -135,19 +135,15 @@ pub struct RecoveryFailureData {
     pub reason: String,
 }
 
-/// Payload for the empty-turn nudge. `in_plan` selects the plan-mode branch,
-/// which steers the model toward emitting a `<proposed_plan>` block instead of
-/// referencing the removed `exit_plan_mode` tool.
-#[derive(Debug, Clone, Serialize)]
-pub struct EmptyTurnNudgeData {
-    pub in_plan: bool,
-}
+/// Payload for the empty-turn nudge. The template has no conditional branches
+/// — the nudge text is unconditional.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct EmptyTurnNudgeData {}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CompactionPreambleData {
     pub summary: String,
 }
-
 /// One loaded CLAUDE.md instruction file for the eager `<instructions>` block.
 /// `content` arrives import-expanded and comment-stripped from `claude_md`;
 /// the template owns only the tag wrapper and spacing.

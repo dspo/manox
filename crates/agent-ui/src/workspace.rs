@@ -20,8 +20,8 @@ use agent::settings;
 use agent::thread::ApprovalMode;
 use agent::webview_host::BrowserTabId;
 use agent::{
-    ModeKind, PermissionDecision, PlanReviewChoice, ReasoningEffort, Thread, ThreadEvent, ThreadId,
-    i18n, save_thread,
+    PermissionDecision, PlanReviewChoice, ReasoningEffort, Thread, ThreadEvent, ThreadId, i18n,
+    save_thread,
 };
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle,
@@ -1989,16 +1989,9 @@ impl Workspace {
         self.follow_message_tail();
         self.pending_auths.clear();
         self.pending_ask = None;
-        // Restore the incoming thread's stashed pending plan, if any. A reloaded
-        // thread always starts in `Default` mode (collaboration_mode is
-        // session-scoped and never persisted), so a restored verdict also
-        // re-enters `Plan` mode — the buttons are only meaningful while the
-        // model is paused in plan review, and a free-form message must keep
-        // routing through Plan mode (re-propose) rather than Default (execute).
+        // Restore the incoming thread's stashed pending plan, if any.
         self.pending_plan_review = self.pending_plans.remove(&new_id);
         if let Some(review) = self.pending_plan_review.as_ref() {
-            self.thread
-                .update(cx, |t, cx| t.set_collaboration_mode(ModeKind::Plan, cx));
             let plan_text = review.plan_text.clone();
             let weak = cx.weak_entity();
             self.conversation.update(cx, |c, cx| {
@@ -4455,7 +4448,6 @@ impl Workspace {
         let queue = self.render_queued_follow_ups(theme, cx);
         let plus = self.render_plus_button(cx);
         let project_chip = self.render_project_chip(theme, cx);
-        let mode_chip = self.render_mode_chip(theme, cx);
         let goal_chip = self.render_goal_chip(theme, cx);
         let team_chip = self.render_team_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
@@ -4550,7 +4542,6 @@ impl Workspace {
                             .min_w_0()
                             .child(plus)
                             .child(project_chip)
-                            .when_some(mode_chip, |el, chip| el.child(chip))
                             .when_some(goal_chip, |el, chip| el.child(chip))
                             .when_some(team_chip, |el, chip| el.child(chip))
                             .child(access),
@@ -4672,60 +4663,6 @@ impl Workspace {
             );
         }
         rows
-    }
-
-    /// Collaboration-mode chip — always visible, shows the active mode's
-    /// display name so the read-only Plan posture (vs execution Default) is
-    /// legible at a glance. Clicking cycles to the next mode, mirroring
-    /// `/plan`, the `+` menu row, and `shift-tab`.
-    fn render_mode_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let mode = self.thread.read(cx).collaboration_mode();
-        let in_plan = mode == ModeKind::Plan;
-        let accent = theme.accent;
-        let label: SharedString = i18n::t(if in_plan {
-            "mode-chip-plan"
-        } else {
-            "mode-chip-default"
-        });
-        Some(
-            h_flex()
-                .id("mode-chip")
-                .items_center()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .rounded(theme.radius)
-                .bg(theme.secondary)
-                .border_1()
-                .border_color(if in_plan { accent } else { theme.border })
-                .cursor_pointer()
-                .child(
-                    Icon::new(IconName::LayoutDashboard)
-                        .xsmall()
-                        .text_color(if in_plan {
-                            accent
-                        } else {
-                            theme.muted_foreground
-                        }),
-                )
-                .child(
-                    gpui::div()
-                        .text_xs()
-                        .text_color(if in_plan {
-                            accent
-                        } else {
-                            theme.muted_foreground
-                        })
-                        .child(label),
-                )
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.thread.update(cx, |t, cx| {
-                        t.set_collaboration_mode(t.collaboration_mode().next(), cx);
-                    });
-                    cx.notify();
-                }))
-                .into_any_element(),
-        )
     }
 
     /// Goal-mode chip — shown only while the thread has an active goal. Renders
@@ -5340,7 +5277,6 @@ impl Workspace {
         let ws = cx.entity().downgrade();
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
             let ws_files = ws.clone();
-            let ws_plan = ws.clone();
             let ws_goal = ws.clone();
             build_plus_menu(
                 menu,
@@ -5352,21 +5288,9 @@ impl Workspace {
                         cx.notify();
                     });
                 },
-                move |_window, cx| {
-                    let _ = ws_plan.update(cx, |this, cx| {
-                        this.close_plus_menu();
-                        this.thread.update(cx, |t, cx| {
-                            t.set_collaboration_mode(t.collaboration_mode().next(), cx);
-                        });
-                        cx.notify();
-                    });
-                },
                 move |window, cx| {
                     let _ = ws_goal.update(cx, |this, cx| {
                         this.close_plus_menu();
-                        // Insert `/goal ` so the user types the completion
-                        // condition and submits — same pattern as the `⁄` menu
-                        // inserting `/name ` for a slash command.
                         this.input_state.update(cx, |state, cx| {
                             state.set_value("/goal ".to_string(), window, cx);
                         });
@@ -6624,14 +6548,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &crate::UndoLastQueued, _window, cx| {
                 this.undo_last_queued(cx);
             }))
-            .on_action(
-                cx.listener(|this, _: &crate::CycleCollaborationMode, _window, cx| {
-                    this.thread.update(cx, |t, cx| {
-                        t.set_collaboration_mode(t.collaboration_mode().next(), cx);
-                    });
-                    cx.notify();
-                }),
-            )
             // Completion actions only match via the `completion == open > Input`
             // keybindings, so any fire means the popover was open and these
             // keystrokes belong to it. Stop propagation so the Input's own

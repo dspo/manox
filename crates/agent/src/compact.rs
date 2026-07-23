@@ -70,8 +70,6 @@ pub struct CompactionState {
     /// The active goal, if one is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub collaboration_mode: Option<String>,
     /// Tool names currently in the registry. Helps the next instance know what
     /// capabilities are available without re-discovering them.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -148,7 +146,6 @@ pub struct CompactionStateInput<'a> {
     pub git_status: Option<String>,
     pub plan_steps: Option<Vec<PlanStepCapsule>>,
     pub goal: Option<&'a str>,
-    pub collaboration_mode: Option<&'a str>,
     pub active_tools: Vec<String>,
     pub active_skills: Vec<String>,
     pub background_shells: Vec<String>,
@@ -166,10 +163,9 @@ pub fn collect_compaction_state(input: CompactionStateInput<'_>) -> CompactionSt
         git_status: input.git_status,
         plan_steps: input.plan_steps,
         goal: input.goal.map(str::to_string),
-        collaboration_mode: input.collaboration_mode.map(str::to_string),
         active_tools: input.active_tools,
-        active_skills: input.active_skills,
         background_shells: input.background_shells,
+        active_skills: input.active_skills,
         artifacts: input.artifacts,
     }
 }
@@ -1265,7 +1261,6 @@ mod tests {
                 status: "in_progress".into(),
             }]),
             goal: Some("finish issue 299"),
-            collaboration_mode: Some("default"),
             active_tools: vec!["Read".into(), "Code".into()],
             active_skills: vec!["github".into()],
             background_shells: vec!["shell-7: cargo test".into()],

@@ -437,8 +437,6 @@ composer-add-files = Files and folders
 composer-attach-editor = Attach editor
 composer-goal-name = Goal
 composer-goal-desc = Set a goal for sustained effort
-composer-plan-mode-name = Collaboration mode
-composer-plan-mode-desc = Cycle Plan ↔ Default
 composer-generate-memory = Generate
 composer-tag-personal = Personal
 composer-tag-system = System
@@ -456,13 +454,10 @@ turn-navigator-copied = Message copied to clipboard.
 
 ### slash_command.rs
 slash-yolo-desc = Switch to Full access (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
-slash-plan-desc = Cycle collaboration mode (Plan ↔ Default); bare `/plan` toggles, `/plan <prompt>` enters Plan with a prompt
+slash-plan-desc = Strongly hint to explore deeply and produce a <proposed_plan> block; bare `/plan` nudges planning, `/plan <prompt>` plans against your prompt
+slash-exit-desc = Archive the current thread and start a fresh one
 slash-goal-desc = Create or manage a persistent Goal (`/goal <objective>`, pause, resume, edit, clear)
 slash-compact-desc = Compact the conversation: summarize older history into a handoff note so the thread can keep going past the context limit
-slash-exit-desc = Archive the current thread and start a fresh one
-mode-chip-default = Default
-mode-chip-plan = Plan
-workspace-cycle-mode = Cycle collaboration mode
 workspace-chip-goal-active = Goal active
 goal-popover-title = Goal
 goal-popover-objective = Objective
