@@ -39,6 +39,7 @@ use agent::{PlanSnapshot, PlanStepStatus};
 
 use crate::cockpit::{CockpitPhase, cache_read_ratio, cockpit_phase_tag, context_budget_pct};
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
+use crate::views::braille_spinner::BrailleSpinner;
 use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_display_title};
 
 // ── Geometry ─────────────────────────────────────────────────────────────
@@ -112,6 +113,9 @@ pub(crate) struct ContextRail {
     /// Last request's model-facing projection breakdown and optimization
     /// savings, including estimates collected by shadow-mode features.
     pub(crate) optimization: Option<agent::ContextOptimizationMetrics>,
+    /// Per-turn prefix cache diagnostic for the current thread. Updated every
+    /// turn after token finalization; cleared on thread switch.
+    pub(crate) cache_diagnostic: Option<agent::CacheDiagnostic>,
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
     /// Latest git change stats for the thread's cwd. Refreshed (debounced) by
@@ -144,6 +148,7 @@ impl ContextRail {
             agents: Vec::new(),
             env_counter_state: HashMap::new(),
             optimization: None,
+            cache_diagnostic: None,
             side_calls: Vec::new(),
             main_call: None,
             git_change_stats: None,
@@ -170,6 +175,7 @@ impl ContextRail {
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.env_counter_state.clear();
         self.optimization = None;
+        self.cache_diagnostic = None;
         self.side_calls.clear();
         self.main_call = None;
         self.agents.clear();
@@ -892,15 +898,24 @@ impl ContextRail {
     /// cumulative token total moved to the usage row's trailing slot. Sits
     /// directly under the rail title.
     fn render_cockpit_status_row(&mut self, theme: &Theme, _cx: &mut Context<Self>) -> AnyElement {
-        let icon = match self.cockpit_phase {
+        let icon: AnyElement = match self.cockpit_phase {
             CockpitPhase::Thinking | CockpitPhase::Streaming | CockpitPhase::Summarizing => {
-                IconName::LoaderCircle
+                BrailleSpinner::new()
+                    .xsmall()
+                    .color(theme.muted_foreground)
+                    .into_any_element()
             }
-            CockpitPhase::RunningTool => IconName::Play,
-            CockpitPhase::AwaitingApproval => IconName::Bell,
-            CockpitPhase::Stopped => IconName::Pause,
-            CockpitPhase::Failed => IconName::CircleX,
-            CockpitPhase::Idle => IconName::Dash,
+            _ => Icon::new(match self.cockpit_phase {
+                CockpitPhase::RunningTool => IconName::Play,
+                CockpitPhase::AwaitingApproval => IconName::Bell,
+                CockpitPhase::Stopped => IconName::Pause,
+                CockpitPhase::Failed => IconName::CircleX,
+                CockpitPhase::Idle => IconName::Dash,
+                _ => unreachable!(),
+            })
+            .xsmall()
+            .text_color(theme.muted_foreground)
+            .into_any_element(),
         };
         cockpit_status_block(icon, self.render_cockpit_phase_tag(theme), theme)
     }
@@ -1368,12 +1383,12 @@ fn opt_row(label: &str, value: &str, muted: gpui::Hsla) -> AnyElement {
 /// Status block: a leading xs icon plus the phase element (the sliding
 /// three-tag pill), vertically centered on a single baseline like the other
 /// rail rows.
-fn cockpit_status_block(icon: IconName, phase: AnyElement, theme: &Theme) -> AnyElement {
+fn cockpit_status_block(icon: AnyElement, phase: AnyElement, _theme: &Theme) -> AnyElement {
     h_flex()
         .w_full()
         .items_center()
         .gap_2()
-        .child(Icon::new(icon).xsmall().text_color(theme.muted_foreground))
+        .child(icon)
         .child(v_flex().flex_1().min_w_0().child(phase))
         .into_any_element()
 }

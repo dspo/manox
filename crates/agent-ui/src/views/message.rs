@@ -39,7 +39,6 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
     button::{Button, ButtonVariants as _},
     h_flex,
-    spinner::Spinner,
     tag::{Tag, TagVariant},
     tooltip::Tooltip,
     v_flex,
@@ -51,6 +50,7 @@ use manox_components::turn_frame::TurnFrame;
 use std::path::{Path, PathBuf};
 
 use crate::Workspace;
+use crate::views::braille_spinner::BrailleSpinner;
 use crate::views::centered;
 use crate::workspace::AskCardSnapshot;
 
@@ -881,7 +881,7 @@ struct CollapsibleBanner {
 fn render_banner(
     accent: gpui::Hsla,
     label: SharedString,
-    icon: Option<IconName>,
+    icon: Option<gpui::AnyElement>,
     group: impl Into<SharedString>,
     ix: usize,
     copy_prefix: &'static str,
@@ -907,7 +907,7 @@ fn render_banner(
         };
         left = left.child(Icon::new(chevron).xsmall());
     }
-    left = left.when_some(icon, |row, name| row.child(Icon::new(name).xsmall()));
+    left = left.when_some(icon, |row, el| row.child(el));
     left = left.child(label);
 
     let label_row = h_flex()
@@ -1064,7 +1064,7 @@ pub fn render_recap(
     render_banner(
         theme.muted_foreground,
         i18n::t("recap-card-title"),
-        Some(IconName::BookOpen),
+        Some(Icon::new(IconName::BookOpen).xsmall().into_any_element()),
         format!("recap-{ix}"),
         ix,
         "copy-recap",
@@ -1149,7 +1149,12 @@ pub fn render_retry(
     render_banner(
         theme.warning,
         badge,
-        Some(IconName::LoaderCircle),
+        Some(
+            BrailleSpinner::new()
+                .xsmall()
+                .color(theme.warning)
+                .into_any_element(),
+        ),
         format!("retry-{ix}"),
         ix,
         "copy-retry",
@@ -1340,15 +1345,17 @@ fn render_reasoning_entry(
                 });
             })
             .child(disclosure_icon(collapsed, theme))
-            .child(
-                Icon::new(if streaming {
-                    IconName::LoaderCircle
-                } else {
-                    IconName::BookOpen
-                })
-                .xsmall()
-                .text_color(theme.muted_foreground),
-            )
+            .child(if streaming {
+                BrailleSpinner::new()
+                    .xsmall()
+                    .color(theme.muted_foreground)
+                    .into_any_element()
+            } else {
+                Icon::new(IconName::BookOpen)
+                    .xsmall()
+                    .text_color(theme.muted_foreground)
+                    .into_any_element()
+            })
             .child(
                 gpui::div()
                     .flex_1()
@@ -1394,15 +1401,32 @@ fn render_tool_entry(
     cx: &mut App,
 ) -> gpui::AnyElement {
     use agent::ToolCallStatus;
-    let (status_icon, status_color) = match e.status {
-        ToolCallStatus::PendingApproval | ToolCallStatus::Running => {
-            (IconName::LoaderCircle, theme.muted_foreground)
-        }
-        ToolCallStatus::Success | ToolCallStatus::Continued => {
-            (IconName::CircleCheck, theme.success)
-        }
-        ToolCallStatus::Error | ToolCallStatus::Denied => (IconName::CircleX, theme.danger),
-        ToolCallStatus::Cancelled => (IconName::Minus, theme.muted_foreground),
+    let is_active = matches!(
+        e.status,
+        ToolCallStatus::PendingApproval | ToolCallStatus::Running
+    );
+    let status_color = match e.status {
+        ToolCallStatus::PendingApproval | ToolCallStatus::Running => theme.muted_foreground,
+        ToolCallStatus::Success | ToolCallStatus::Continued => theme.success,
+        ToolCallStatus::Error | ToolCallStatus::Denied => theme.danger,
+        ToolCallStatus::Cancelled => theme.muted_foreground,
+    };
+    let status_el: gpui::AnyElement = if is_active {
+        BrailleSpinner::new()
+            .xsmall()
+            .color(status_color)
+            .into_any_element()
+    } else {
+        let icon = match e.status {
+            ToolCallStatus::Success | ToolCallStatus::Continued => IconName::CircleCheck,
+            ToolCallStatus::Error | ToolCallStatus::Denied => IconName::CircleX,
+            ToolCallStatus::Cancelled => IconName::Minus,
+            _ => unreachable!(),
+        };
+        Icon::new(icon)
+            .xsmall()
+            .text_color(status_color)
+            .into_any_element()
     };
     // Default-collapsed: a streaming tool does not auto-reveal its output —
     // only a manual expand does. The status icon still spins while running.
@@ -1469,7 +1493,7 @@ fn render_tool_entry(
                     });
                 })
                 .child(disclosure_icon(e.collapsed, theme))
-                .child(Icon::new(status_icon).xsmall().text_color(status_color))
+                .child(status_el)
                 .child(
                     gpui::div()
                         .flex_1()
@@ -2370,20 +2394,21 @@ fn render_tool_output(
         .into_any_element()
 }
 
-fn agent_status_icon_name(status: ToolCallStatus) -> IconName {
+fn agent_terminal_icon_name(status: ToolCallStatus) -> IconName {
     use agent::ToolCallStatus;
     match status {
-        ToolCallStatus::Running | ToolCallStatus::PendingApproval => IconName::LoaderCircle,
         ToolCallStatus::Success | ToolCallStatus::Continued => IconName::CircleCheck,
         ToolCallStatus::Error | ToolCallStatus::Denied => IconName::CircleX,
         ToolCallStatus::Cancelled => IconName::Minus,
+        ToolCallStatus::Running | ToolCallStatus::PendingApproval => {
+            unreachable!("running statuses use BrailleSpinner, not an icon")
+        }
     }
 }
 
-/// Status icon for a sub-agent task row. Running/Pending get a spinning accent
-/// loader; Success/Continued get a green check; Error/Denied get a red cross;
-/// Cancelled gets a muted minus.
-fn agent_status_icon(status: ToolCallStatus, theme: &Theme) -> (IconName, gpui::Hsla) {
+/// Status indicator for a sub-agent task row. Running/Pending get a braille
+/// spinner; terminal states get a static icon.
+fn agent_status_indicator(status: ToolCallStatus, theme: &Theme) -> gpui::AnyElement {
     use agent::ToolCallStatus;
     let color = match status {
         ToolCallStatus::Running | ToolCallStatus::PendingApproval => theme.accent,
@@ -2391,7 +2416,21 @@ fn agent_status_icon(status: ToolCallStatus, theme: &Theme) -> (IconName, gpui::
         ToolCallStatus::Error | ToolCallStatus::Denied => theme.danger,
         ToolCallStatus::Cancelled => theme.muted_foreground,
     };
-    (agent_status_icon_name(status), color)
+    let is_active = matches!(
+        status,
+        ToolCallStatus::Running | ToolCallStatus::PendingApproval
+    );
+    if is_active {
+        BrailleSpinner::new()
+            .xsmall()
+            .color(color)
+            .into_any_element()
+    } else {
+        Icon::new(agent_terminal_icon_name(status))
+            .xsmall()
+            .text_color(color)
+            .into_any_element()
+    }
 }
 
 /// Render a sub-agent task as a single-line clickable item:
@@ -2406,12 +2445,7 @@ pub fn render_agent_task(
     _tool_ctx: Option<&ToolCallCtx>,
     _cx: &mut App,
 ) -> gpui::AnyElement {
-    use agent::ToolCallStatus;
-    let (icon_name, icon_color) = agent_status_icon(item.status, theme);
-    let is_running = matches!(
-        item.status,
-        ToolCallStatus::Running | ToolCallStatus::PendingApproval
-    );
+    let icon_el = agent_status_indicator(item.status, theme);
 
     // Build the display title: "Type · Description", falling back gracefully.
     let display_title = if item.description.is_empty() {
@@ -2451,19 +2485,6 @@ pub fn render_agent_task(
                 w.open_subagent_tab_by_id(&id_for_click, cx);
             });
         });
-
-    let icon_el: gpui::AnyElement = if is_running {
-        Spinner::new()
-            .icon(icon_name)
-            .xsmall()
-            .color(icon_color)
-            .into_any_element()
-    } else {
-        Icon::new(icon_name)
-            .xsmall()
-            .text_color(icon_color)
-            .into_any_element()
-    };
 
     row.child(icon_el)
         .child(
@@ -2508,11 +2529,11 @@ fn render_background_task(
         TaskStatus::Stopped => i18n::t("background-task-status-stopped"),
         TaskStatus::SessionEnded => i18n::t("background-task-status-session-ended"),
     };
-    let (icon_name, icon_color) = match bt.status {
-        TaskStatus::Running | TaskStatus::Stopping => (IconName::LoaderCircle, theme.accent),
-        TaskStatus::Completed => (IconName::CircleCheck, theme.success),
-        TaskStatus::Failed | TaskStatus::TimedOut => (IconName::CircleX, theme.danger),
-        TaskStatus::Stopped | TaskStatus::SessionEnded => (IconName::Minus, theme.muted_foreground),
+    let icon_color = match bt.status {
+        TaskStatus::Running | TaskStatus::Stopping => theme.accent,
+        TaskStatus::Completed => theme.success,
+        TaskStatus::Failed | TaskStatus::TimedOut => theme.danger,
+        TaskStatus::Stopped | TaskStatus::SessionEnded => theme.muted_foreground,
     };
     // A background bash description is the full command, heredoc body
     // included — the title keeps only its first line; the complete text is
@@ -2555,15 +2576,16 @@ fn render_background_task(
         .border_1()
         .border_color(theme.border)
         .when(is_running, |s| {
-            s.child(
-                Spinner::new()
-                    .icon(icon_name.clone())
-                    .xsmall()
-                    .color(icon_color),
-            )
+            s.child(BrailleSpinner::new().xsmall().color(icon_color))
         })
         .when(!is_running, |s| {
-            s.child(Icon::new(icon_name).xsmall().text_color(icon_color))
+            let icon = match bt.status {
+                TaskStatus::Completed => IconName::CircleCheck,
+                TaskStatus::Failed | TaskStatus::TimedOut => IconName::CircleX,
+                TaskStatus::Stopped | TaskStatus::SessionEnded => IconName::Minus,
+                _ => unreachable!(),
+            };
+            s.child(Icon::new(icon).xsmall().text_color(icon_color))
         })
         .child(
             // flex_1 + min_w_0 give the text divs a definite width so
@@ -3214,36 +3236,28 @@ mod tests {
     }
 
     #[test]
-    fn agent_statuses_use_the_expected_icons() {
+    fn agent_terminal_statuses_use_the_expected_icons() {
         fn path(icon: IconName) -> SharedString {
             gpui_component::IconNamed::path(icon)
         }
         assert_eq!(
-            path(agent_status_icon_name(ToolCallStatus::PendingApproval)),
-            path(IconName::LoaderCircle)
-        );
-        assert_eq!(
-            path(agent_status_icon_name(ToolCallStatus::Running)),
-            path(IconName::LoaderCircle)
-        );
-        assert_eq!(
-            path(agent_status_icon_name(ToolCallStatus::Success)),
+            path(agent_terminal_icon_name(ToolCallStatus::Success)),
             path(IconName::CircleCheck)
         );
         assert_eq!(
-            path(agent_status_icon_name(ToolCallStatus::Continued)),
+            path(agent_terminal_icon_name(ToolCallStatus::Continued)),
             path(IconName::CircleCheck)
         );
         assert_eq!(
-            path(agent_status_icon_name(ToolCallStatus::Error)),
+            path(agent_terminal_icon_name(ToolCallStatus::Error)),
             path(IconName::CircleX)
         );
         assert_eq!(
-            path(agent_status_icon_name(ToolCallStatus::Denied)),
+            path(agent_terminal_icon_name(ToolCallStatus::Denied)),
             path(IconName::CircleX)
         );
         assert_eq!(
-            path(agent_status_icon_name(ToolCallStatus::Cancelled)),
+            path(agent_terminal_icon_name(ToolCallStatus::Cancelled)),
             path(IconName::Minus)
         );
     }

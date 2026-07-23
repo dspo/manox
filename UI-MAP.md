@@ -79,7 +79,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 
 ### Shared Primitives
 
-- [Button](#shared-primitives) · [Input](#shared-primitives) · [PopupMenu](#shared-primitives) · [PopupMenuItem](#shared-primitives) · [TabBar](#shared-primitives) · [Tag](#shared-primitives) · [Markdown](#markdown) · [TerminalPanel](#terminalpanel) · [TurnFrame](#turnframe) · [Icon](#shared-primitives) · [ScrollHandle](#shared-primitives) · [TitleBar](#shared-primitives) · [ContextMenu](#shared-primitives) · [Tooltip](#shared-primitives)
+- [Button](#shared-primitives) · [Input](#shared-primitives) · [PopupMenu](#shared-primitives) · [PopupMenuItem](#shared-primitives) · [TabBar](#shared-primitives) · [Tag](#shared-primitives) · [Markdown](#markdown) · [TerminalPanel](#terminalpanel) · [TurnFrame](#turnframe) · [Icon](#shared-primitives) · [BrailleSpinner](#braillespinner) · [ScrollHandle](#shared-primitives) · [TitleBar](#shared-primitives) · [ContextMenu](#shared-primitives) · [Tooltip](#shared-primitives)
 
 ### 状态
 
@@ -310,7 +310,7 @@ Collapsible: chevron + "Reasoning" label + left-bordered muted body. Each reason
 
 #### ThinkingStatusRow
 
-Folded batch of tool calls from one model response, rendered as one Claude Code–style status line. Header: spinner (live) or static dot (frozen) + "Thinking for Xs"/"Thought for Xs" label + aggregated action counts ("reading 2 files, running 1 shell command…") + chevron. Collapsed body shows only the most recent `⎿` entry; expanded lists every entry. Each `⎿` entry (`render_activity_entry`) is a one-line summary (status icon + tool title, mono) that expands to its full tool output via `render_tool_output`. The elapsed counter ticks every second via a gpui background timer spawned on `TurnStarted` and self-terminating on terminal `Stop`/`Error`; `frozen_secs` pins the final value so later re-renders don't inflate it. Ordinary tool calls now fold here instead of producing standalone cards.
+Folded batch of tool calls from one model response, rendered as one Claude Code–style status line. Header: braille spinner (live) or static dot (frozen) + "Thinking for Xs"/"Thought for Xs" label + aggregated action counts ("reading 2 files, running 1 shell command…") + chevron. Collapsed body shows only the most recent `⎿` entry; expanded lists every entry. Each `⎿` entry (`render_activity_entry`) is a one-line summary (status icon + tool title, mono) that expands to its full tool output via `render_tool_output`. The elapsed counter ticks every second via a gpui background timer spawned on `TurnStarted` and self-terminating on terminal `Stop`/`Error`; `frozen_secs` pins the final value so later re-renders don't inflate it. Ordinary tool calls now fold here instead of producing standalone cards.
 
 > Source: `agent-ui/src/views/message.rs` — `render_thinking`, `render_activity_entry`, `thinking_summary`. Container state: `ConversationState` (`ConvItem::Thinking` / `ThinkingContainer`).
 
@@ -324,13 +324,13 @@ Statuses: `PendingApproval` | `Running` | `Success` | `Error` | `Denied` — see
 
 #### AgentTaskCard
 
-Compact, single-line sub-agent row: `[status] type · short title`. Running and pending rows use an animated spinner; terminal rows use check, error, or minus icons. The title is always one line with truncation and a full-title tooltip. It deliberately renders no child text, nested messages, copy control, metrics, or expansion affordance. Clicking the row opens or focuses the corresponding read-only [SubagentPanel](#subagentpanel) in the right pane.
+Compact, single-line sub-agent row: `[status] type · short title`. Running and pending rows use a braille-dot spinner (`BrailleSpinner`); terminal rows use check, error, or minus icons. The title is always one line with truncation and a full-title tooltip. It deliberately renders no child text, nested messages, copy control, metrics, or expansion affordance. Clicking the row opens or focuses the corresponding read-only [SubagentPanel](#subagentpanel) in the right pane.
 
 > Source: `agent-ui/src/views/message.rs`
 
 #### BackgroundTaskCard
 
-Bordered card showing a background task's kind (Monitor command / Monitor WebSocket / Background Bash), description, status badge (Running / Stopping / Completed / Failed / Timed out / Stopped / Session ended), event count, and total bytes. The title row keeps only the description's first line (a background bash description is the full command, heredoc body included) with single-line ellipsis; the complete text is shown in a hover tooltip. The detail row (failure summary or latest event) wraps in full — it is the only UI surface for a task's error text. Running tasks show a spinner icon and a Stop button that calls `background_task::stop`. Terminal tasks show a static status icon. Updated in-place by task ID via `ThreadEvent::BackgroundTaskUpdated` — the card is created when the first event snapshot arrives and never duplicated.
+Bordered card showing a background task's kind (Monitor command / Monitor WebSocket / Background Bash), description, status badge (Running / Stopping / Completed / Failed / Timed out / Stopped / Session ended), event count, and total bytes. The title row keeps only the description's first line (a background bash description is the full command, heredoc body included) with single-line ellipsis; the complete text is shown in a hover tooltip. The detail row (failure summary or latest event) wraps in full — it is the only UI surface for a task's error text. Running tasks show a braille spinner and a Stop button that calls `background_task::stop`. Terminal tasks show a static status icon. Updated in-place by task ID via `ThreadEvent::BackgroundTaskUpdated` — the card is created when the first event snapshot arrives and never duplicated.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -354,7 +354,7 @@ Collapsible compaction summary card: chevron + book icon + "Context compacted" l
 
 #### RetryBadge
 
-Amber badge, `bg:warning/0.12`, spinner + "Retry N/M (in Xs)" text.
+Amber badge, `bg:warning/0.12`, braille spinner + "Retry N/M (in Xs)" text.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -613,7 +613,7 @@ Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` 
 
 #### ContextRailAgents
 
-Compact navigation tree headed by `Agents`. `Main` is the root row and reflects the current main thread state; direct and nested sub-agents are indented according to the parent tool-use id recorded by `Workspace`. Every sub-agent row shows the same spinner/terminal status language as [AgentTaskCard](#agenttaskcard), displays `type · short title` with single-line truncation and a tooltip, and opens or focuses its [SubagentPanel](#subagentpanel) when clicked. Completed nodes remain visible for the lifetime of the current main task, including nodes recursively recovered from persisted Agent result envelopes.
+Compact navigation tree headed by `Agents`. `Main` is the root row and reflects the current main thread state; direct and nested sub-agents are indented according to the parent tool-use id recorded by `Workspace`. Every sub-agent row shows the same braille-spinner/terminal status language as [AgentTaskCard](#agenttaskcard), displays `type · short title` with single-line truncation and a tooltip, and opens or focuses its [SubagentPanel](#subagentpanel) when clicked. Completed nodes remain visible for the lifetime of the current main task, including nodes recursively recovered from persisted Agent result envelopes.
 
 > Source: `agent-ui/src/views/context_rail.rs`, `agent-ui/src/workspace.rs`
 
@@ -870,7 +870,7 @@ Conditional notice banner.
 
 #### PluginManagerBusyIndicator
 
-Conditional busy spinner.
+Conditional braille-spinner busy indicator.
 
 > Source: `agent-ui/src/views/plugin_manager.rs`
 
@@ -1004,6 +1004,12 @@ Shared framed text container (`manox-components::turn_frame::TurnFrame`) used fo
 
 Named icon from the icon set (e.g., `IconName::Folder`, `IconName::Search`).
 
+#### BrailleSpinner
+
+Text-based braille-dot spinner cycling through `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` (10 frames, 800 ms cycle). Used wherever an in-progress indicator is needed, replacing the old rotating-circle `Spinner`.
+
+> Source: `agent-ui/src/views/braille_spinner.rs`
+
 #### ScrollHandle / ScrollableElement
 
 Scroll container with custom scrollbar.
@@ -1064,7 +1070,7 @@ Waiting for user, triggers [ApprovalOverlay](#approvaloverlay).
 
 #### Running
 
-Spinner or shimmer.
+Braille-dot spinner or shimmer.
 
 #### Success
 

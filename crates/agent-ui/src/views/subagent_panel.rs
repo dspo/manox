@@ -11,12 +11,12 @@ use gpui::{
     WeakEntity, Window, px,
 };
 use gpui_component::{
-    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, Theme, h_flex,
-    spinner::Spinner, v_flex,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, Sizable as _, Theme, h_flex, v_flex,
 };
 
 use crate::Workspace;
 use crate::conversation::{ApplyCtx, ConversationState, agent_task_labels};
+use crate::views::braille_spinner::BrailleSpinner;
 
 #[derive(Clone, Debug)]
 pub(crate) struct SubagentInfo {
@@ -45,8 +45,7 @@ pub(crate) fn subagent_display_title(info: &SubagentInfo) -> String {
 
 pub(crate) fn status_indicator(status: ToolCallStatus, theme: &Theme) -> AnyElement {
     match status {
-        ToolCallStatus::PendingApproval | ToolCallStatus::Running => Spinner::new()
-            .icon(IconName::LoaderCircle)
+        ToolCallStatus::PendingApproval | ToolCallStatus::Running => BrailleSpinner::new()
             .xsmall()
             .color(theme.accent)
             .into_any_element(),
