@@ -147,7 +147,7 @@ impl AgentBuilder {
         let agent =
             find_agent(&config, agent_name).ok_or_else(|| anyhow!("未知 agent: {agent_name}"))?;
         if agent.id == "Codex.app" {
-            bail!("Codex.app 不支持 library API（GUI detach，无 PTY 句柄）");
+            bail!("Codex.app/ChatGPT.app 不支持 library API（GUI detach，无 PTY 句柄）");
         }
 
         let provider_name = self

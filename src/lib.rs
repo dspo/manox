@@ -230,12 +230,14 @@ fn model_header_row() -> Line<'static> {
 
 /// Normalize a CLI-supplied agent name: case-insensitive, with alias collapsing.
 ///
-/// `CoDex.App` / `codexapp` / `codex_app` all resolve to the `Codex.app` agent; the
-/// remaining ids (`claude`, `codex`, `copilot`, `codex+`) are lowercased verbatim. This
-/// only touches user-facing input — internal config/registry ids are already canonical.
+/// `CoDex.App` / `codexapp` / `codex_app` / `ChatGPT.App` / `chatgptapp` all resolve
+/// to the `Codex.app` agent; the remaining ids (`claude`, `codex`, `copilot`, `codex+`)
+/// are lowercased verbatim. This only touches user-facing input — internal config/registry
+/// ids are already canonical.
 fn canonicalize_agent_name(input: &str) -> String {
     match input.to_lowercase().as_str() {
-        "codex_app" | "codexapp" | "codex.app" => "Codex.app".into(),
+        "codex_app" | "codexapp" | "codex.app" | "chatgpt_app" | "chatgptapp"
+        | "chatgpt.app" => "Codex.app".into(),
         other => other.into(),
     }
 }
@@ -1045,7 +1047,8 @@ fn injected_models_for_codex_app(
   cx --pty -- claude --dangerously-skip-permissions   跳过 agent 选择，透传该 flag
   cx --pty -- --dangerously-skip-permissions          进 TUI 选 agent，选定后透传该 flag
   cx --pty -S /tmp/cx.sock -- claude                 自定义 IPC socket 路径
-  cx -- Codex.App          大小写不敏感，等价 `cx -- codex.app`"
+  cx -- Codex.App          大小写不敏感，等价 `cx -- codex.app`
+  cx -- ChatGPT.App         ChatGPT.app 桌面端（同 Codex.app）"
 )]
 struct Cli {
     /// 经 PTY 中继启动（cx 持 master，终端 IO 透传，并暴露外部 IPC 注入入口）；默认直连。
@@ -3599,7 +3602,7 @@ impl AppState {
             Step::Provider => {
                 let providers = providers_for_agent(&self.config, &self.selected_agent_id);
                 let provider = providers[self.provider_index].clone();
-                // Codex.app 跳过 Model 选择步：直接把该 provider 下所有 Responses 模型
+                // Codex.app/ChatGPT.app 跳过 Model 选择步：直接把该 provider 下所有 Responses 模型
                 // 作为完整列表注入桌面端，由 cx 在启动时经 CDP 注入 renderer。
                 if self.selected_agent_id == "Codex.app" {
                     let injected = injected_models_for_codex_app(models, &provider.name);
@@ -4186,6 +4189,10 @@ mod tests {
         assert_eq!(canonicalize_agent_name("codex.app"), "Codex.app");
         assert_eq!(canonicalize_agent_name("CODEXAPP"), "Codex.app");
         assert_eq!(canonicalize_agent_name("codex_app"), "Codex.app");
+        assert_eq!(canonicalize_agent_name("ChatGPT.App"), "Codex.app");
+        assert_eq!(canonicalize_agent_name("chatgpt.app"), "Codex.app");
+        assert_eq!(canonicalize_agent_name("CHATGPTAPP"), "Codex.app");
+        assert_eq!(canonicalize_agent_name("chatgpt_app"), "Codex.app");
         assert_eq!(canonicalize_agent_name("Claude"), "claude");
         assert_eq!(canonicalize_agent_name("CODEX+"), "codex+");
     }

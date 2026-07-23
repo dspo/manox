@@ -27,21 +27,21 @@ use crate::probe::runtime;
 use crate::resolve_apikey_interactive;
 use crate::warp;
 
-const DEFAULT_APP_PATH: &str = "/Applications/Codex.app";
-/// 等待 Codex.app renderer 注册到 CDP 的最长时长。
+const DEFAULT_APP_PATH: &str = "/Applications/ChatGPT.app";
+/// 等待 ChatGPT.app renderer 注册到 CDP 的最长时长。
 const CDP_READY_TIMEOUT_SECS: u64 = 20;
 
-/// 启动 Codex.app 并注入自定义模型列表到 renderer。
+/// 启动 ChatGPT.app 并注入自定义模型列表到 renderer。
 pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]) -> Result<()> {
     let provider = &selection.provider;
     let default_model = selection
         .model
         .as_ref()
-        .context("Codex.app 未选中默认模型")?;
+        .context("ChatGPT.app 未选中默认模型")?;
     let injected = &selection.injected_models;
     if injected.is_empty() {
         bail!(
-            "Provider `{}` 下没有支持 Responses wire api 的模型，无法注入 Codex.app",
+            "Provider `{}` 下没有支持 Responses wire api 的模型，无法注入 ChatGPT.app",
             provider.name
         );
     }
@@ -56,7 +56,7 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
         );
     };
     if apikey.is_empty() {
-        bail!("Codex.app 需要 API Key，但未提供");
+        bail!("ChatGPT.app 需要 API Key，但未提供");
     }
 
     // 2. 写 config.toml，拿到 codex_home / env_key / reasoning_effort
@@ -109,7 +109,7 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
     // 打印启动摘要
     println!();
     println!(
-        "启动 Codex.app | Provider: {} | Model: {} | 注入 {} 个模型（CDP 端口 {debug_port}）",
+        "启动 ChatGPT.app | Provider: {} | Model: {} | 注入 {} 个模型（CDP 端口 {debug_port}）",
         provider.name,
         default_model.id,
         injected.len()
@@ -119,7 +119,7 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
     // 7. spawn（不等待），随后经 CDP 注入脚本
     let mut child = command
         .spawn()
-        .with_context(|| format!("启动 Codex.app 二进制失败: {}", binary.display()))?;
+        .with_context(|| format!("启动 ChatGPT.app 二进制失败: {}", binary.display()))?;
 
     // 8. 等待 CDP 就绪并注入脚本（async，复用 probe 的 tokio runtime）
     let injected_clone = injected.clone();
@@ -143,7 +143,7 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
     if let Err(err) = inject_result {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(err).context("CDP 注入失败，已终止 Codex.app");
+        return Err(err).context("CDP 注入失败，已终止 ChatGPT.app");
     }
 
     // 9. Codex.app 是 GUI 应用（独立窗口），不应阻塞终端。注入完成后 detach：
@@ -155,16 +155,19 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
     if let Some(session) = warp_session {
         session.emit_stop(None);
     }
-    println!("[cx] Codex.app 已在后台启动，终端已释放。");
+    println!("[cx] ChatGPT.app 已在后台启动，终端已释放。");
     Ok(())
 }
 
-/// 解析 Codex.app 内部可执行二进制路径。
+/// 解析 ChatGPT.app 内部可执行二进制路径。
 ///
-/// 优先环境变量 `CX_CODEX_APP`（指向 `.app` 或内部二进制均可），否则默认 `/Applications/Codex.app`。
+/// 优先环境变量 `CX_CHATGPT_APP`（指向 `.app` 或内部二进制均可），
+/// 其次 `CX_CODEX_APP`（向后兼容），否则默认 `/Applications/ChatGPT.app`。
 /// 从 `Info.plist` 的 `CFBundleExecutable` 读取可执行名，拼接 `Contents/MacOS/<name>`。
 fn resolve_codex_binary() -> Result<PathBuf> {
-    let app_or_bin = std::env::var("CX_CODEX_APP").unwrap_or_else(|_| DEFAULT_APP_PATH.to_string());
+    let app_or_bin = std::env::var("CX_CHATGPT_APP")
+        .or_else(|_| std::env::var("CX_CODEX_APP"))
+        .unwrap_or_else(|_| DEFAULT_APP_PATH.to_string());
     let path = Path::new(&app_or_bin);
 
     // 若直接指向 MacOS 内二进制，直接用
@@ -176,7 +179,7 @@ fn resolve_codex_binary() -> Result<PathBuf> {
     let info_plist = path.join("Contents/Info.plist");
     if !info_plist.exists() {
         bail!(
-            "未找到 Codex.app（{app_or_bin}）；可用 CX_CODEX_APP 环境变量指定 .app 路径或内部二进制"
+            "未找到 ChatGPT.app（{app_or_bin}）；可用 CX_CHATGPT_APP 或 CX_CODEX_APP 环境变量指定 .app 路径或内部二进制"
         );
     }
     let output = Command::new("/usr/libexec/PlistBuddy")
@@ -186,14 +189,14 @@ fn resolve_codex_binary() -> Result<PathBuf> {
             &info_plist.to_string_lossy(),
         ])
         .output()
-        .context("读取 Codex.app CFBundleExecutable 失败")?;
+        .context("读取 ChatGPT.app CFBundleExecutable 失败")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("解析 Codex.app CFBundleExecutable 失败: {}", stderr.trim());
+        bail!("解析 ChatGPT.app CFBundleExecutable 失败: {}", stderr.trim());
     }
     let exec_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if exec_name.is_empty() {
-        bail!("Codex.app CFBundleExecutable 为空");
+        bail!("ChatGPT.app CFBundleExecutable 为空");
     }
     Ok(path.join("Contents/MacOS").join(exec_name))
 }

@@ -48,11 +48,11 @@ pub async fn wait_for_page_target(debug_port: u16, timeout: Duration) -> Result<
             if got_http {
                 return Err(anyhow!(
                     "端口 {debug_port} 有进程在监听，但未返回 Codex page target——\
-                     该端口可能被其它程序（如 Chrome）占用，而非 Codex.app 的调试端口"
+                     该端口可能被其它程序（如 Chrome）占用，而非 ChatGPT.app 的调试端口"
                 ));
             }
             return Err(anyhow!(
-                "等待 Codex.app CDP 就绪超时（端口 {debug_port} 无响应）：\
+                "等待 ChatGPT.app CDP 就绪超时（端口 {debug_port} 无响应）：\
                  App 可能未启动、崩溃，或不支持远程调试端口"
             ));
         }
