@@ -32,7 +32,6 @@ pub struct LinkSpan {
     pub kind: LinkKind,
 }
 
-
 /// A contiguous run of inline text with style overlays on top of the base
 /// font/color (which `RichText` inherits from `window.text_style()`).
 /// `code_ranges` marks inline-code segments that get a rounded wash behind the
@@ -285,14 +284,20 @@ fn linkify(runs: &mut InlineRuns) {
         let mut url_end = i + proto;
         while url_end < bytes.len() {
             let b = bytes[url_end];
-            if b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'\\' | b'`' | b'^' | b'\'')
+            if b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'\\' | b'`' | b'^' | b'\''
+                )
             {
                 break;
             }
             url_end += 1;
         }
         // Backtrack trailing punctuation that is unlikely to be part of the URL.
-        while url_end > i + proto && matches!(bytes[url_end - 1], b'.' | b',' | b';' | b':' | b')' | b'\'') {
+        while url_end > i + proto
+            && matches!(bytes[url_end - 1], b'.' | b',' | b';' | b':' | b')' | b'\'')
+        {
             url_end -= 1;
         }
 
@@ -337,11 +342,18 @@ fn linkify_paths(text: &str, covered: &[Range<usize>], out: &mut Vec<LinkSpan>) 
     while i < len {
         // Advance to a potential path start: after whitespace / delimiter.
         let is_boundary = i == 0
-            || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'(' | b'[' | b'"' | b'\'');
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b'\n' | b'(' | b'[' | b'"' | b'\''
+            );
         if !is_boundary {
             // Also allow paths starting with `/` or `./` or `../` even mid-text.
-            if !(bytes[i] == b'/' || (i + 1 < len && bytes[i] == b'.' && bytes[i + 1] == b'/')
-                || (i + 2 < len && bytes[i] == b'.' && bytes[i + 1] == b'.' && bytes[i + 2] == b'/'))
+            if !(bytes[i] == b'/'
+                || (i + 1 < len && bytes[i] == b'.' && bytes[i + 1] == b'/')
+                || (i + 2 < len
+                    && bytes[i] == b'.'
+                    && bytes[i + 1] == b'.'
+                    && bytes[i + 2] == b'/'))
             {
                 i += 1;
                 continue;
@@ -373,9 +385,7 @@ fn collect_path_candidate(bytes: &[u8], pos: usize) -> Option<usize> {
     let mut end = pos;
     while end < bytes.len() {
         let b = bytes[end];
-        if b.is_ascii_alphanumeric()
-            || matches!(b, b'.' | b'_' | b'-' | b'@' | b'/' | b':')
-        {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@' | b'/' | b':') {
             end += 1;
         } else {
             break;
@@ -398,7 +408,9 @@ fn is_path_like(s: &str) -> bool {
     // Line-number suffix: `:42` or `:42-100`.
     if let Some(colon) = s.rfind(':') {
         let after = &s[colon + 1..];
-        if after.chars().all(|c| c.is_ascii_digit() || c == '-') && after.contains(|c: char| c.is_ascii_digit()) {
+        if after.chars().all(|c| c.is_ascii_digit() || c == '-')
+            && after.contains(|c: char| c.is_ascii_digit())
+        {
             return true;
         }
     }

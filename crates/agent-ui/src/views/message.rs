@@ -44,9 +44,9 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use manox_components::markdown::ast::LinkKind;
 use manox_components::markdown::terminal_panel::GitSummary;
 use manox_components::markdown::{HeadingMode, Markdown, PanelKind, TerminalPanel};
-use manox_components::markdown::ast::LinkKind;
 use manox_components::turn_frame::TurnFrame;
 use std::path::{Path, PathBuf};
 
@@ -166,13 +166,11 @@ impl MessageItem {
                     .theme(cx.theme())
                     .heading_mode(HeadingMode::Uniform)
                     .streaming(streaming)
-                    .on_open_link(Some(Arc::new(move |url, kind| {
-                        match kind {
-                            LinkKind::Url => {
-                                let _ = open::that(&url);
-                            }
-                            LinkKind::FilePath => open_file_in_vscode(&url, cwd.as_deref()),
+                    .on_open_link(Some(Arc::new(move |url, kind| match kind {
+                        LinkKind::Url => {
+                            let _ = open::that(&url);
                         }
+                        LinkKind::FilePath => open_file_in_vscode(&url, cwd.as_deref()),
                     })))
             }));
         }
