@@ -46,6 +46,7 @@ struct Question {
     options: Vec<QuestionOption>,
     /// When true, the user may select multiple options; otherwise exactly one.
     #[schemars(rename = "multiSelect")]
+    #[serde(rename = "multiSelect")]
     multi_select: bool,
 }
 
@@ -181,6 +182,30 @@ mod tests {
         assert!(!tool.is_always_allowable(&input));
         assert!(tool.requires_user_input());
         assert!(tool.is_read_only());
+    }
+
+    #[test]
+    fn deserialize_accepts_the_schema_declared_multi_select_field() {
+        // The JSON schema advertises `multiSelect` to the model; serde must
+        // accept that exact name or every schema-conforming call fails
+        // validation under `deny_unknown_fields`.
+        let raw = serde_json::json!({
+            "questions": [{
+                "question": "Pick one?",
+                "header": "Pick",
+                "options": [
+                    {"label": "A", "description": ""},
+                    {"label": "B", "description": ""}
+                ],
+                "multiSelect": false
+            }]
+        });
+        let parsed: Result<AskUserQuestionInput, _> = serde_json::from_value(raw);
+        assert!(
+            parsed.is_ok(),
+            "schema-declared multiSelect rejected: {:?}",
+            parsed.err()
+        );
     }
 
     #[test]
