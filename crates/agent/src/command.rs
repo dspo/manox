@@ -93,6 +93,12 @@ pub struct CommandRegistry {
 impl CommandRegistry {
     pub fn load() -> Self {
         let mut commands = BTreeMap::new();
+        // Built-in commands compiled into the binary. Inserted first so user
+        // and plugin commands with the same `name` override them, mirroring
+        // `agent_def.rs`'s `builtin_definitions` pattern.
+        for cmd in builtin_commands() {
+            commands.insert(cmd.name.clone(), Arc::new(cmd));
+        }
         if let Ok(dir) = paths::commands_dir() {
             scan_commands_dir(&dir, None, &mut commands);
         }
@@ -232,6 +238,42 @@ pub fn try_global() -> Option<&'static CommandRegistry> {
     REGISTRY.get()
 }
 
+/// The built-in slash commands compiled into the binary. Each entry is
+/// `include_str!`-embedded markdown (frontmatter + body) living next to the
+/// source, mirroring `agents/explore.md`. A malformed builtin is a compile-time
+/// authoring error, so failures are surfaced as panics at load time rather than
+/// silently skipped — same policy as `agent_def::builtin_definitions`.
+fn builtin_commands() -> Vec<CommandDefinition> {
+    const HEALTHZ: &str = include_str!("commands/healthz.md");
+    vec![parse_builtin_command(HEALTHZ, "healthz").expect("builtin healthz command must parse")]
+}
+
+/// Parse a built-in command from an embedded markdown string. Shared
+/// frontmatter + `tool_id_from_spec` logic with [`load_command_file`], but
+/// takes the raw text and name from the caller — no disk path. The `source`
+/// is `PathBuf::new()` (no on-disk origin), symmetring `agent_def.rs`'s
+/// `root: None` for built-in agent definitions.
+fn parse_builtin_command(raw: &str, name: &str) -> Result<CommandDefinition> {
+    let parsed = crate::frontmatter::parse::<CommandMeta>(raw)
+        .map_err(|e| anyhow::anyhow!("parsing builtin command {name}: {e:#}"))?;
+    let front = parsed.front;
+    let allowed_tools = front
+        .allowed_tools
+        .into_vec()
+        .into_iter()
+        .filter_map(|spec| tool_id_from_spec(&spec))
+        .collect();
+    Ok(CommandDefinition {
+        name: name.to_string(),
+        description: front.description,
+        argument_hint: front.argument_hint,
+        allowed_tools,
+        disable_model_invocation: front.disable_model_invocation,
+        body: parsed.body,
+        source: PathBuf::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +328,52 @@ allowed-tools: Bash(node:*), AskUserQuestion, Read\n\
         let parsed = crate::frontmatter::parse::<CommandMeta>(raw).unwrap();
         let v = parsed.front.allowed_tools.into_vec();
         assert_eq!(v, vec!["Read", "Glob"]);
+    }
+}
+
+#[cfg(test)]
+mod builtin_tests {
+    use super::*;
+
+    #[test]
+    fn builtin_commands_parse_and_contain_healthz() {
+        let cmds = builtin_commands();
+        let healthz = cmds
+            .iter()
+            .find(|c| c.name == "healthz")
+            .expect("builtin commands must contain healthz");
+        assert!(
+            !healthz.description.is_empty(),
+            "healthz description must be non-empty"
+        );
+        assert!(!healthz.body.is_empty(), "healthz body must be non-empty");
+        assert_eq!(
+            healthz.source,
+            PathBuf::new(),
+            "builtin command has no on-disk source"
+        );
+    }
+
+    #[test]
+    fn builtin_healthz_has_no_allowed_tools() {
+        let cmds = builtin_commands();
+        let healthz = cmds
+            .iter()
+            .find(|c| c.name == "healthz")
+            .expect("builtin commands must contain healthz");
+        assert!(
+            healthz.allowed_tools.is_empty(),
+            "healthz must inherit all tools (empty allowed_tools), got: {:?}",
+            healthz.allowed_tools
+        );
+    }
+
+    #[test]
+    fn load_includes_builtin_command() {
+        let registry = CommandRegistry::load();
+        assert!(
+            registry.get("healthz").is_some(),
+            "CommandRegistry::load must include the builtin healthz command"
+        );
     }
 }
