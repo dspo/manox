@@ -1005,7 +1005,7 @@ mod tests {
 
     // --- Live cache semantics probes (Bailian anthropic wire) ---
     // Require MANOX_RUN_LIVE=1 and the DASHSCOPE_API_KEY in the macOS Keychain
-    // (per the configured glm-5.2[1m] anthropic model). They answer three
+    // (per the configured glm-5.2[1m] anthropic model). They answer four
     // questions about how Bailian's anthropic-compatible endpoint treats
     // explicit `cache_control` breakpoints:
     //   1. Does a breakpoint on the last *tool* (manox's current
@@ -1014,6 +1014,8 @@ mod tests {
     //   2. Does a breakpoint on the *system* block (Bailian's documented
     //      pattern) produce a cache_read?
     //   3. Does Bailian honor *multiple* breakpoints, or only the last one?
+    //   4. Does the full `apply_prompt_caching(Full)` layout recover
+    //      message-history caching across turns, or only the system/tools head?
 
     async fn bailian_anthropic_endpoint() -> Option<(String, String, String)> {
         if std::env::var("MANOX_RUN_LIVE").is_err() {
@@ -1188,6 +1190,56 @@ mod tests {
             probe_cache(&url, &key, &model, body_for("how to optimize the code?")).await;
         eprintln!(
             "[PROBE3 multi] read1={read1} read2={read2} (read2≈1500 → both honored; read2≈10 → last-only)"
+        );
+    }
+
+    /// Probe 4: reproduce the real `apply_prompt_caching(Full)` layout across a
+    /// simulated two-turn conversation to settle whether the `Full` policy
+    /// recovers *message-history* caching on Bailian — the premise behind the
+    /// `prompt_caching: "full"` knob (#324). Turn 1 seeds a large stable prefix
+    /// (system + a ~1500-token history block + first question); turn 2 appends
+    /// an answer and a new question, so the turn-1 tail becomes an interior
+    /// stable prefix. Turn-2 read magnitude decides it:
+    ///   read2 ≈ system+history (~3000) → history IS cached, Full effective;
+    ///   read2 ≈ system only    (~1500) → history NOT cached, Full no better
+    ///     than LastBreakpointOnly for the growing tail;
+    ///   read2 ≈ 0              → the moving messages[-1] breakpoint zeroed reads.
+    #[tokio::test]
+    async fn live_anthropic_cache_full_layout() {
+        let Some((url, key, model)) = bailian_anthropic_endpoint().await else {
+            return;
+        };
+        let system = cacheable_prefix();
+        let history = cacheable_prefix();
+        let turn = |tail: Vec<serde_json::Value>| {
+            let mut msgs = vec![
+                serde_json::json!({"role":"user","content":[{"type":"text","text":history.clone()}]}),
+                serde_json::json!({"role":"assistant","content":[{"type":"text","text":"ack"}]}),
+            ];
+            msgs.extend(tail);
+            let mut body = serde_json::json!({"system": system.clone(), "messages": msgs});
+            crate::provider::anthropic_cache::apply_prompt_caching(
+                &mut body,
+                crate::provider::anthropic_cache::PromptCachingPolicy::Full,
+                false,
+            );
+            body
+        };
+        let turn1 = turn(vec![
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"what is the code about?"}]}),
+        ]);
+        let (_, _, read1) = probe_cache(&url, &key, &model, turn1).await;
+        let turn2 = turn(vec![
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"what is the code about?"}]}),
+            serde_json::json!({"role":"assistant","content":[{"type":"text","text":"a demo"}]}),
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"how to optimize it?"}]}),
+        ]);
+        let (_, _, read2) = probe_cache(&url, &key, &model, turn2).await;
+        eprintln!(
+            "[PROBE4 full-layout] read1={read1} read2={read2} \
+             (read2≈3000 → history cached, Full effective; \
+             read2≈1500 → system only, Full no better on tail; \
+             read2≈0 → moving breakpoint zeroed reads)"
         );
     }
 
