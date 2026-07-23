@@ -29,12 +29,22 @@ const NAME: &str = "ToolSearch";
 /// activated via ToolSearch or implicit first-use activation.
 pub const CORE_TOOLS: &[&str] = &[
     crate::tools::READ,
+    crate::tools::LIST,
     crate::tools::BASH,
     crate::tools::EDIT,
     crate::tools::WRITE,
     crate::tools::GREP,
     crate::tools::GLOB,
+    crate::tools::AGENT,
     crate::tools::ASK_USER_QUESTION,
+    crate::tools::SELF_INFO,
+    crate::tools::SKILL,
+    crate::tools::WEB_FETCH,
+    crate::tools::MONITOR,
+    crate::tools::BASH_OUTPUT,
+    crate::tools::TASK_STOP,
+    crate::tools::ENTER_WORKTREE,
+    crate::tools::EXIT_WORKTREE,
     crate::tools::UPDATE_PLAN,
     crate::tools::GET_GOAL,
     crate::tools::CREATE_GOAL,
@@ -447,13 +457,13 @@ mod tests {
     #[test]
     fn chinese_query_matches_bilingual_catalog() {
         let catalog = vec![ToolEntry {
-            name: "WebFetch".into(),
+            name: "LspStatus".into(),
             description: "Fetch a URL".into(),
             read_only: true,
-            search_text: "WebFetch Fetch a URL 获取网页内容".into(),
+            search_text: "LspStatus Fetch a URL 获取网页内容".into(),
         }];
         let results = search("获取网页", &catalog);
-        assert_eq!(results.first().map(|r| r.name.as_str()), Some("WebFetch"));
+        assert_eq!(results.first().map(|r| r.name.as_str()), Some("LspStatus"));
     }
 
     #[test]
@@ -487,10 +497,25 @@ mod tests {
     #[test]
     fn activation_preserves_first_seen_order() {
         let tid = "test_order";
-        activate_tools(tid, &["WebFetch".into(), "Agent".into(), "List".into()]);
-        assert_eq!(activated_for(tid), ["WebFetch", "Agent", "List"]);
-        activate_tools(tid, &["Agent".into(), "Monitor".into()]);
-        assert_eq!(activated_for(tid), ["WebFetch", "Agent", "List", "Monitor"]);
+        // Use non-core tools (LspStatus, TeamCreate, Diagnostics, Hover) so
+        // the activation ledger actually records them.
+        activate_tools(
+            tid,
+            &[
+                "LspStatus".into(),
+                "TeamCreate".into(),
+                "Diagnostics".into(),
+            ],
+        );
+        assert_eq!(
+            activated_for(tid),
+            ["LspStatus", "TeamCreate", "Diagnostics"]
+        );
+        activate_tools(tid, &["TeamCreate".into(), "Hover".into()]);
+        assert_eq!(
+            activated_for(tid),
+            ["LspStatus", "TeamCreate", "Diagnostics", "Hover"]
+        );
         drop_activations(tid);
     }
 
@@ -530,7 +555,8 @@ mod tests {
     #[test]
     fn core_tools_not_in_activation_set() {
         let tid = "test_core";
-        activate_tools(tid, &["Read".into(), "Bash".into(), "WebFetch".into()]);
+        // LspStatus is not in CORE_TOOLS — it's discoverable via ToolSearch.
+        activate_tools(tid, &["Read".into(), "Bash".into(), "LspStatus".into()]);
         let active = activated_for(tid);
         assert!(
             !active.contains(&"Read".to_string()),
@@ -541,7 +567,7 @@ mod tests {
             "core tool not activated"
         );
         assert!(
-            active.contains(&"WebFetch".to_string()),
+            active.contains(&"LspStatus".to_string()),
             "non-core tool activated"
         );
         drop_activations(tid);

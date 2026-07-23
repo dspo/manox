@@ -72,7 +72,7 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
     let supports_images = resolved.supports_images;
     let auto_compact_window =
         resolve_auto_compact_window(resolved.wire_api, &resolved.env, context);
-
+    let prompt_caching = resolved.env.get(MANOX_PROMPT_CACHING_ENV).cloned();
     let model: AnyLanguageModel = match resolved.wire_api {
         WireApi::Anthropic => Arc::new(AnthropicModel::new(AnthropicModelConfig {
             id: resolved.key(),
@@ -87,6 +87,7 @@ fn build_model(resolved: &ResolvedModel) -> anyhow::Result<AnyLanguageModel> {
             supports_images,
             auto_compact_window,
             visible_agents: resolved.visible_agents.clone(),
+            prompt_caching,
         })),
         WireApi::Responses => Arc::new(ResponsesModel::new(ResponsesModelConfig {
             id: resolved.key(),
@@ -165,6 +166,13 @@ fn resolve_max_output_tokens(resolved: &ResolvedModel, max_tokens: u64) -> u64 {
 /// the thread auto-compacts at 80% of the parsed token count instead of the
 /// model's full `max_token_count` at the settings threshold — Claude Code parity.
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+
+/// Provider/model `env` key that overrides the prompt-caching policy. Set to
+/// `"full"`, `"last_breakpoint"`, or `"none"` in `cx.providers.config.yaml` to
+/// force a specific cache strategy regardless of the endpoint host. When
+/// absent, the policy is decided by the endpoint URL (api.anthropic.com → Full,
+/// else LastBreakpointOnly).
+const MANOX_PROMPT_CACHING_ENV: &str = "MANOX_PROMPT_CACHING";
 
 /// Parse `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from a resolved model's env map.
 /// The value is a plain integer token count (e.g. `"202745"`) — no `k`/`m`

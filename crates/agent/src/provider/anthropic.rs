@@ -36,6 +36,10 @@ pub struct AnthropicModel {
     /// Whether the endpoint is real Anthropic (api.anthropic.com) and thus
     /// eligible for the long (1h) cache TTL + the extended-cache-ttl beta header.
     long_ttl: bool,
+    /// Explicit prompt-caching policy override from the provider/model `env`
+    /// field (`MANOX_PROMPT_CACHING`). `None` falls back to host-based
+    /// detection (api.anthropic.com → Full, else LastBreakpointOnly).
+    prompt_caching: Option<String>,
     /// Whether the model accepts `output_config.effort` (Opus 4.5+ / Sonnet
     /// 4.6+ / Fable 5 / Mythos 5). Older Claude and non-Claude models on an
     /// Anthropic-compatible wire do not — gating avoids a 400 and keeps the
@@ -67,6 +71,10 @@ pub struct AnthropicModelConfig {
     pub supports_images: bool,
     pub auto_compact_window: Option<u64>,
     pub visible_agents: Vec<String>,
+    /// Explicit prompt-caching policy override from the provider/model `env`
+    /// field (`MANOX_PROMPT_CACHING`). `None` falls back to host-based
+    /// detection (api.anthropic.com → Full, else LastBreakpointOnly).
+    pub prompt_caching: Option<String>,
 }
 
 impl AnthropicModel {
@@ -85,14 +93,14 @@ impl AnthropicModel {
             supports_images,
             auto_compact_window,
             visible_agents,
+            prompt_caching,
         } = cfg;
-        let long_ttl = crate::provider::anthropic_cache::supports_long_ttl(
-            crate::provider::anthropic_cache::resolve_prompt_caching_policy(
-                None,
-                Some(&endpoint_url),
-            ),
+        let policy = crate::provider::anthropic_cache::resolve_prompt_caching_policy(
+            prompt_caching.as_deref(),
             Some(&endpoint_url),
         );
+        let long_ttl =
+            crate::provider::anthropic_cache::supports_long_ttl(policy, Some(&endpoint_url));
         let supports_effort = crate::provider::anthropic_supports_effort(&api_model_id);
         Self {
             id,
@@ -105,6 +113,7 @@ impl AnthropicModel {
             max_token_count,
             auto_compact_window,
             long_ttl,
+            prompt_caching,
             supports_effort,
             visible_agents,
             supports_tools,
@@ -157,7 +166,7 @@ impl LanguageModel for AnthropicModel {
         let max_tokens =
             super::request_output_cap(request.max_output_tokens, self.max_output_tokens);
         let policy = crate::provider::anthropic_cache::resolve_prompt_caching_policy(
-            None,
+            self.prompt_caching.as_deref(),
             Some(&self.endpoint_url),
         );
         let long_ttl = self.long_ttl;
@@ -752,6 +761,7 @@ mod tests {
             supports_images: false,
             auto_compact_window: None,
             visible_agents: Vec::new(),
+            prompt_caching: None,
         });
         assert_eq!(
             big.max_output_tokens, 65_536,
@@ -770,6 +780,7 @@ mod tests {
             supports_images: false,
             auto_compact_window: None,
             visible_agents: Vec::new(),
+            prompt_caching: None,
         });
         assert_eq!(tiny.max_output_tokens, 1_024);
     }
@@ -791,6 +802,7 @@ mod tests {
             supports_images: true,
             auto_compact_window: None,
             visible_agents: Vec::new(),
+            prompt_caching: None,
         });
         assert!(!caps.supports_tools());
         assert!(caps.supports_images());
@@ -814,6 +826,7 @@ mod tests {
             max_output_tokens: 8_192,
             supports_tools: true,
             supports_images: false,
+            prompt_caching: None,
         });
         assert_eq!(with_override.auto_compact_window, Some(202_745));
 
@@ -830,6 +843,7 @@ mod tests {
             max_output_tokens: 8_192,
             supports_tools: true,
             supports_images: false,
+            prompt_caching: None,
         });
         assert_eq!(without_override.auto_compact_window, None);
     }
