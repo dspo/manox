@@ -18,6 +18,8 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::views::braille_spinner::BrailleSpinner;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PluginManagerTab {
     Marketplace,
@@ -414,7 +416,7 @@ impl Render for PluginManagerView {
                         .items_center()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child(Icon::new(IconName::LoaderCircle).small())
+                        .child(BrailleSpinner::new().small().color(theme.muted_foreground))
                         .child(i18n::t("plugins-busy")),
                 )
             })
