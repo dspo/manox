@@ -492,107 +492,38 @@ impl ContextRail {
         let Some(metrics) = self.optimization.as_ref() else {
             return gpui::div().into_any_element();
         };
-        let tokens = |value| crate::cockpit::format_tokens(value);
-        let mut savings = tokens(metrics.saved_tokens);
-        if metrics.shadow_saved_tokens > 0 {
-            savings.push_str(" + ");
-            savings.push_str(&tokens(metrics.shadow_saved_tokens));
-            savings.push_str(" shadow");
-        }
-        let muted = theme.muted_foreground;
-        v_flex()
+        let savings = crate::cockpit::format_tokens(metrics.saved_tokens);
+        // Clone out of `self` so the `'static` tooltip closure owns its data.
+        let metrics = metrics.clone();
+        let theme = theme.clone();
+        gpui::div()
+            .id("context-optimization-trigger")
             .w_full()
-            .gap_0p5()
+            .items_center()
+            .gap_2()
+            .child(Icon::new(IconName::ChartPie).xsmall().text_color(theme.muted_foreground))
             .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Icon::new(IconName::ChartPie).xsmall().text_color(muted))
-                    .child(
-                        gpui::div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(i18n::t("context-optimization-title")),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_xs()
-                            .text_color(theme.success)
-                            .child(savings),
-                    ),
+                gpui::div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(i18n::t("context-opt-title")),
             )
             .child(
                 gpui::div()
-                    .pl(px(12.))
                     .text_xs()
-                    .text_color(muted)
-                    .child(i18n::t_str(
-                        "context-optimization-projection",
-                        &[
-                            ("projected", &tokens(metrics.projected_tokens)),
-                            ("baseline", &tokens(metrics.estimated_baseline_tokens)),
-                        ],
-                    )),
+                    .text_color(theme.success)
+                    .child(SharedString::from(savings)),
             )
-            .child(
-                gpui::div()
-                    .pl(px(12.))
-                    .text_xs()
-                    .text_color(muted)
-                    .child(i18n::t_str(
-                        "context-optimization-breakdown",
-                        &[
-                            ("system", &tokens(metrics.system_tokens)),
-                            ("mode", &tokens(metrics.mode_tokens)),
-                            ("project", &tokens(metrics.project_context_tokens)),
-                            ("schemas", &tokens(metrics.tool_schema_tokens)),
-                            ("history", &tokens(metrics.history_tokens)),
-                            ("results", &tokens(metrics.tool_result_tokens)),
-                        ],
-                    )),
-            )
-            .child(
-                gpui::div()
-                    .pl(px(12.))
-                    .text_xs()
-                    .text_color(muted)
-                    .child(i18n::t_str(
-                        "context-optimization-tools",
-                        &[
-                            ("active", &metrics.active_tool_schemas.to_string()),
-                            ("total", &metrics.total_tool_schemas.to_string()),
-                            ("rewrite", &tokens(metrics.rewrite_saved_tokens)),
-                            ("pruning", &tokens(metrics.pruning_saved_tokens)),
-                            ("discovery", &tokens(metrics.discovery_saved_tokens)),
-                        ],
-                    )),
-            )
-            .child(
-                gpui::div()
-                    .pl(px(12.))
-                    .truncate()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(i18n::t_str(
-                        "context-optimization-runtime",
-                        &[
-                            ("prefix", &metrics.prefix_stability_pct.to_string()),
-                            ("avoided", &metrics.compactions_avoided.to_string()),
-                            ("nested", &metrics.code_nested_calls.to_string()),
-                            (
-                                "roundtrips",
-                                &metrics.code_model_round_trips_avoided.to_string(),
-                            ),
-                            ("raw", &tokens(metrics.code_raw_tokens)),
-                            ("projected", &tokens(metrics.code_projected_tokens)),
-                            ("tools", &metrics.activated_tools.join(", ")),
-                            ("queries", &metrics.tool_search_queries.to_string()),
-                            ("hits", &metrics.tool_search_hits.to_string()),
-                            ("last_hits", &metrics.tool_search_last_hits.join(", ")),
-                        ],
-                    )),
-            )
+            .tooltip(move |_window, _cx| {
+                let metrics = metrics.clone();
+                let theme = theme.clone();
+                Tooltip::element(move |_w, _c| {
+                    build_optimization_table(&metrics, &theme)
+                })
+                .build(_window, _cx)
+            })
             .into_any_element()
     }
 
@@ -1284,7 +1215,109 @@ impl Render for ContextRail {
     }
 }
 
-// ── Free helpers (moved from workspace.rs) ────────────────────────────────
+// ── Free helpers (moved from workspace.rs) ───────────────────────────────
+
+/// Build the hover-table shown when the user hovers the optimization title
+/// row. Two-column layout: label (left) / value (right). Category headers
+/// in semibold. Zero-value rows are skipped; projection and prefix-cache
+/// rows always render.
+fn build_optimization_table(
+    metrics: &agent::ContextOptimizationMetrics,
+    theme: &Theme,
+) -> AnyElement {
+    let tokens = |v: u64| crate::cockpit::format_tokens(v);
+    let muted = theme.muted_foreground;
+    v_flex()
+        .gap_1()
+        .child(opt_heading("Projection", muted))
+        .child(opt_row("Sent", &tokens(metrics.projected_tokens), muted))
+        .child(opt_row("Baseline", &tokens(metrics.estimated_baseline_tokens), muted))
+        .child(opt_row("Saved", &tokens(metrics.saved_tokens), muted))
+        .child(opt_heading("Breakdown", muted))
+        .child(opt_row("System", &tokens(metrics.system_tokens), muted))
+        .child(opt_row("Mode", &tokens(metrics.mode_tokens), muted))
+        .child(opt_row("Project", &tokens(metrics.project_context_tokens), muted))
+        .child(opt_row("Schemas", &tokens(metrics.tool_schema_tokens), muted))
+        .child(opt_row("History", &tokens(metrics.history_tokens), muted))
+        .child(opt_row("Results", &tokens(metrics.tool_result_tokens), muted))
+        .child(opt_heading("Tools", muted))
+        .child(opt_row(
+            "Schemas",
+            &format!("{}/{}", metrics.active_tool_schemas, metrics.total_tool_schemas),
+            muted,
+        ))
+        .when(metrics.rewrite_saved_tokens > 0, |el| {
+            el.child(opt_row("Rewrite", &tokens(metrics.rewrite_saved_tokens), muted))
+        })
+        .when(metrics.pruning_saved_tokens > 0, |el| {
+            el.child(opt_row("Pruning", &tokens(metrics.pruning_saved_tokens), muted))
+        })
+        .when(metrics.discovery_saved_tokens > 0, |el| {
+            el.child(opt_row("Discovery", &tokens(metrics.discovery_saved_tokens), muted))
+        })
+        .child(opt_heading("Runtime", muted))
+        .child(opt_row("Prefix", &format!("{}%", metrics.prefix_stability_pct), muted))
+        .when(metrics.compactions_avoided > 0, |el| {
+            el.child(opt_row("Avoided compact", &metrics.compactions_avoided.to_string(), muted))
+        })
+        .when(metrics.code_nested_calls > 0 || metrics.code_model_round_trips_avoided > 0, |el| {
+            el.child(opt_row(
+                "Code",
+                &format!(
+                    "{} calls / {} trips saved {}→{}",
+                    metrics.code_nested_calls,
+                    metrics.code_model_round_trips_avoided,
+                    tokens(metrics.code_raw_tokens),
+                    tokens(metrics.code_projected_tokens),
+                ),
+                muted,
+            ))
+        })
+        .when(metrics.tool_search_queries > 0, |el| {
+            el.child(opt_row(
+                "ToolSearch",
+                &format!(
+                    "{} queries / {} hits",
+                    metrics.tool_search_queries, metrics.tool_search_hits,
+                ),
+                muted,
+            ))
+        })
+        .into_any_element()
+}
+
+/// Category header row for the optimization hover table.
+fn opt_heading(text: &str, muted: gpui::Hsla) -> AnyElement {
+    gpui::div()
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(muted.opacity(0.55))
+        .child(SharedString::from(text))
+        .into_any_element()
+}
+
+/// One label/value row for the optimization hover table.
+fn opt_row(label: &str, value: &str, muted: gpui::Hsla) -> AnyElement {
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(
+            gpui::div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(muted)
+                .child(SharedString::from(label)),
+        )
+        .child(
+            gpui::div()
+                .text_xs()
+                .text_color(muted)
+                .child(SharedString::from(value)),
+        )
+        .into_any_element()
+}
 
 /// Multi-line run-status block. The phase slot is now an arbitrary element
 /// (the sliding three-tag pill) rather than a plain label, so the caller owns
