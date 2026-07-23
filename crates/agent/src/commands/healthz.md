@@ -73,7 +73,7 @@ This temp dir is the base for all FS tests. Clean it up at the end.
 | # | Tool | Action | PASS criterion |
 |---|------|--------|-----------------|
 | 5 | **Write** | Write `<tmpdir>/writable.txt` with content `healthz write test` | Success, no error |
-| 6 | **Edit** | Edit `<tmpdir>/writable.txt` — append a line via `INS.TAIL` with `+appended by edit` | Success, no error |
+| 6 | **Edit** | Edit `<tmpdir>/writable.txt` — use the hashline patch format: write `[<absolute_path>#<tag>]` header on line 1, then `INS.TAIL:` on line 2, then `+appended by edit` as the new content line. The `#<tag>` is any 4-hex-digit placeholder (e.g. `#A000`). | Success, no error |
 | — | (verify) | Read `<tmpdir>/writable.txt` back | Content contains both `healthz write test` and `appended by edit` |
 | — | (cleanup) | Delete `<tmpdir>/writable.txt` | — |
 
@@ -95,7 +95,7 @@ This temp dir is the base for all FS tests. Clean it up at the end.
 | # | Tool | Action | PASS criterion |
 |---|------|--------|-----------------|
 | 10 | **SelfInfo** | Call SelfInfo | Returns non-empty output containing a thread id |
-| 11 | **Skill** | Call Skill with name `gitwork:deliver` | Returns non-empty content (skill body) |
+| 11 | **Skill** | Call Skill with any registered skill name you know (e.g. `gitwork:deliver`). If you do not know any skill name, call Skill with name `gitwork:deliver` anyway — PASS if it returns skill content, SKIP if it returns an error indicating no skills are registered. | Returns non-empty content (skill body), or SKIP with reason |
 
 ### Group: Monitor
 
@@ -150,7 +150,7 @@ This group tests both the team coordination tools AND that a spawned member can 
 | 26 | **TaskGet** | Read the task by id | Returns the task with correct subject |
 | 27 | **TaskUpdate** | Update the task status to `in_progress` | Success, no error |
 | 28 | **SendMessage** | Send a message to the member "tester-1": "Please use the Read tool to read `<tmpdir>/hello.txt` and reply with the contents." | Success, no error |
-| — | (verify) | Wait for the member to process the message and reply. The member should use its Read tool and send back a message containing `healthz line 1`. | Member's reply contains `healthz line 1` — proving the team member could execute tool calls and report results back |
+| — | (verify) | Wait for the member to process the message and reply. Poll by calling SendMessage to yourself or by sending another message asking for status. In practice, the member's reply arrives as a user-role message in your conversation — continue your turn and check if the reply containing `healthz line 1` arrives. If no reply after 2-3 attempts, record FAIL for SendMessage with "no member reply" in Notes. | Member's reply contains `healthz line 1` — proving the team member could execute tool calls and report results back |
 | 29 | **TeamDisband** | Disband the team | Success, no error |
 
 ### Group: Browser (sequential, clean up after)

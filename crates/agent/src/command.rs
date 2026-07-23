@@ -168,24 +168,36 @@ fn load_command_file(path: &Path, fallback_name: String) -> Result<CommandDefini
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let parsed = crate::frontmatter::parse::<CommandMeta>(&raw)
         .map_err(|e| anyhow::anyhow!("parsing command {}: {e:#}", path.display()))?;
-    let front = parsed.front;
     // The command name is the filename stem; frontmatter carries no `name` key.
-    let name = fallback_name;
+    Ok(build_command(parsed, fallback_name, path.to_path_buf()))
+}
+
+/// Assemble a [`CommandDefinition`] from a parsed frontmatter file, an explicit
+/// name, and a source path. Shared by [`load_command_file`] (disk-sourced) and
+/// [`parse_builtin_command`] (embedded). The `name` is the filename stem for
+/// disk commands and the caller-provided id for builtins; `source` is the
+/// on-disk path for disk commands and empty for builtins.
+fn build_command(
+    parsed: crate::frontmatter::FrontmatterFile<CommandMeta>,
+    name: String,
+    source: PathBuf,
+) -> CommandDefinition {
+    let front = parsed.front;
     let allowed_tools = front
         .allowed_tools
         .into_vec()
         .into_iter()
         .filter_map(|spec| tool_id_from_spec(&spec))
         .collect();
-    Ok(CommandDefinition {
+    CommandDefinition {
         name,
         description: front.description,
         argument_hint: front.argument_hint,
         allowed_tools,
         disable_model_invocation: front.disable_model_invocation,
         body: parsed.body,
-        source: path.to_path_buf(),
-    })
+        source,
+    }
 }
 
 /// Map a Claude Code tool spec (`Bash(node:*)`, `Read`, `AskUserQuestion`) to a
@@ -237,7 +249,6 @@ pub fn global() -> &'static CommandRegistry {
 pub fn try_global() -> Option<&'static CommandRegistry> {
     REGISTRY.get()
 }
-
 /// The built-in slash commands compiled into the binary. Each entry is
 /// `include_str!`-embedded markdown (frontmatter + body) living next to the
 /// source, mirroring `agents/explore.md`. A malformed builtin is a compile-time
@@ -248,30 +259,13 @@ fn builtin_commands() -> Vec<CommandDefinition> {
     vec![parse_builtin_command(HEALTHZ, "healthz").expect("builtin healthz command must parse")]
 }
 
-/// Parse a built-in command from an embedded markdown string. Shared
-/// frontmatter + `tool_id_from_spec` logic with [`load_command_file`], but
-/// takes the raw text and name from the caller — no disk path. The `source`
-/// is `PathBuf::new()` (no on-disk origin), symmetring `agent_def.rs`'s
-/// `root: None` for built-in agent definitions.
+/// Parse a built-in command from an embedded markdown string. Delegates to
+/// [`build_command`] with an empty `source` (no on-disk origin), symmetring
+/// `agent_def.rs`'s `root: None` for built-in agent definitions.
 fn parse_builtin_command(raw: &str, name: &str) -> Result<CommandDefinition> {
     let parsed = crate::frontmatter::parse::<CommandMeta>(raw)
         .map_err(|e| anyhow::anyhow!("parsing builtin command {name}: {e:#}"))?;
-    let front = parsed.front;
-    let allowed_tools = front
-        .allowed_tools
-        .into_vec()
-        .into_iter()
-        .filter_map(|spec| tool_id_from_spec(&spec))
-        .collect();
-    Ok(CommandDefinition {
-        name: name.to_string(),
-        description: front.description,
-        argument_hint: front.argument_hint,
-        allowed_tools,
-        disable_model_invocation: front.disable_model_invocation,
-        body: parsed.body,
-        source: PathBuf::new(),
-    })
+    Ok(build_command(parsed, name.to_string(), PathBuf::new()))
 }
 
 #[cfg(test)]
