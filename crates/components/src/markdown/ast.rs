@@ -285,14 +285,14 @@ fn linkify(runs: &mut InlineRuns) {
         let mut url_end = i + proto;
         while url_end < bytes.len() {
             let b = bytes[url_end];
-            if b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'\\' | b'`' | b'^')
+            if b.is_ascii_whitespace() || matches!(b, b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'\\' | b'`' | b'^' | b'\'')
             {
                 break;
             }
             url_end += 1;
         }
         // Backtrack trailing punctuation that is unlikely to be part of the URL.
-        while url_end > i + proto && matches!(bytes[url_end - 1], b'.' | b',' | b';' | b':' | b')') {
+        while url_end > i + proto && matches!(bytes[url_end - 1], b'.' | b',' | b';' | b':' | b')' | b'\'') {
             url_end -= 1;
         }
 
@@ -374,7 +374,7 @@ fn collect_path_candidate(bytes: &[u8], pos: usize) -> Option<usize> {
     while end < bytes.len() {
         let b = bytes[end];
         if b.is_ascii_alphanumeric()
-            || matches!(b, b'.' | b'_' | b'-' | b'@' | b'/' | b':' | b'#')
+            || matches!(b, b'.' | b'_' | b'-' | b'@' | b'/' | b':')
         {
             end += 1;
         } else {

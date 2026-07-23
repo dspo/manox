@@ -1540,11 +1540,7 @@ fn open_file_in_vscode(raw: &str, cwd: Option<&Path>) {
     let resolved = if file.is_absolute() {
         file
     } else if let Some(cwd) = cwd {
-        if file.starts_with("./") || file.starts_with("../") {
-            cwd.join(file)
-        } else {
-            cwd.join(&file)
-        }
+        cwd.join(&file)
     } else {
         file
     };
