@@ -226,7 +226,7 @@ impl Default for ContextOptimizationSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            tool_discovery: Toggle::Shadow,
+            tool_discovery: Toggle::On,
             history_rewrite: Toggle::Shadow,
             history_pruning: Toggle::Shadow,
             compact_outputs: false,
@@ -632,10 +632,13 @@ follow_up_behavior = "Steer"
     // ── context optimization / side-call tests ──────────────────────
 
     #[test]
-    fn context_optimization_defaults_to_shadow_rollout() {
+    fn context_optimization_defaults_to_discovery_on() {
         let s = ContextOptimizationSettings::default();
         assert!(s.enabled);
-        assert_eq!(s.tool_discovery, Toggle::Shadow);
+        // Tool discovery defaults to On so only core tools appear in the
+        // initial schema; the rest are discovered via ToolSearch or activated
+        // on first use. History rewrite/pruning stay Shadow (metrics only).
+        assert_eq!(s.tool_discovery, Toggle::On);
         assert_eq!(s.history_rewrite, Toggle::Shadow);
         assert_eq!(s.history_pruning, Toggle::Shadow);
         assert!(!s.compact_outputs);

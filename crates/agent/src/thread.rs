@@ -6663,7 +6663,7 @@ mod tests {
                 plan_steps: None,
                 goal: Some("all checks pass"),
                 collaboration_mode: Some("Default"),
-                active_tools: vec![crate::tools::WEB_FETCH.into()],
+                active_tools: vec!["LspStatus".to_string()],
                 active_skills: Vec::new(),
                 background_shells: Vec::new(),
                 artifacts: Vec::new(),
@@ -6689,7 +6689,7 @@ mod tests {
         });
         assert_eq!(
             crate::tools::tool_search::activated_for("restore-capsule"),
-            [crate::tools::WEB_FETCH]
+            ["LspStatus"]
         );
         crate::tools::tool_search::drop_activations("restore-capsule");
     }
