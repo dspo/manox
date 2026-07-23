@@ -49,7 +49,7 @@ use gpui_component::{
 };
 use ropey::Rope;
 
-use crate::markdown::ast::{Block, InlineRuns, ListItem, TableAlign};
+use crate::markdown::ast::{Block, InlineRuns, LinkKind, LinkSpan, ListItem, TableAlign};
 use crate::markdown::incremental::IncrementalParser;
 use crate::markdown::rich_text::{CodeSpan, RichText};
 use crate::markdown::selection::DocSelection;
@@ -90,6 +90,10 @@ pub struct Markdown {
     /// Lazily created on first render so `new` needs no `cx` (callers construct
     /// `Markdown` inside `cx.new` and may not have a handle handy).
     focus: Option<FocusHandle>,
+    /// Optional callback invoked on Cmd+click of a link span. The opener
+    /// receives the link URL and kind; the caller decides what action to
+    /// take (open in browser, VS Code, etc.).
+    link_opener: Option<Arc<dyn Fn(String, LinkKind) + Send + Sync>>,
 }
 
 impl Markdown {
@@ -110,6 +114,7 @@ impl Markdown {
             heading_mode: HeadingMode::default(),
             selection: DocSelection::new(),
             focus: None,
+            link_opener: None,
         }
     }
 
@@ -152,6 +157,16 @@ impl Markdown {
     /// enlarged heading text would drown the body.
     pub fn heading_mode(mut self, mode: HeadingMode) -> Self {
         self.heading_mode = mode;
+        self
+    }
+
+    /// Set a callback invoked on Cmd+click of a detected link span. Pass `None`
+    /// to disable link opening (links are still underlined).
+    pub fn on_open_link(
+        mut self,
+        opener: Option<Arc<dyn Fn(String, LinkKind) + Send + Sync>>,
+    ) -> Self {
+        self.link_opener = opener;
         self
     }
 
@@ -275,6 +290,16 @@ impl Render for Markdown {
             MouseButton::Left,
             cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                 if let Some(ix) = this.selection.hit(e.position) {
+                    // Cmd+click on a link: open it, skip text selection.
+                    if e.modifiers.platform
+                        && let Some(link) = this.selection.link_at(ix)
+                    {
+                        if let Some(ref opener) = this.link_opener {
+                            opener(link.url.clone(), link.kind);
+                        }
+                        cx.notify();
+                        return;
+                    }
                     match e.click_count {
                         2 => this.selection.select_word(ix),
                         n if n >= 3 => this.selection.select_line(ix),
@@ -433,6 +458,13 @@ fn code_spans(runs: &InlineRuns, styles: &MdStyles) -> Vec<CodeSpan> {
         .collect()
 }
 
+/// Map `InlineRuns::link_spans` through unchanged — the spans are
+/// already fully-formed. Shared by every inline mount so Cmd+click
+/// resolution is consistent across paragraph, heading, and table cells.
+fn link_spans(runs: &InlineRuns) -> Vec<LinkSpan> {
+    runs.link_spans.clone()
+}
+
 /// Render a paragraph. When `streaming_tail` is true (the last block of a
 /// mid-stream document) the cursor `▌` is appended to the paragraph text so it
 /// lands at the end of the visible content. The cursor is plain text rather
@@ -461,11 +493,12 @@ fn paragraph(
             RichText::new(text, doc_start, selection.clone())
                 .highlights(runs.highlights.clone())
                 .code_spans(code_spans(runs, styles))
+                .link_spans(link_spans(runs))
+                .link_color(styles.link_color)
                 .selection_bg(styles.selection_bg),
         )
         .into_any_element()
 }
-
 /// How a heading maps its depth to a renderable style. `Scaled` (default) grows
 /// the font with depth; `Uniform` holds every heading at body size and
 /// discriminates levels by weight + decoration, for dense mounts like the
@@ -583,6 +616,8 @@ fn heading(
             RichText::new(runs.text.clone(), doc_start, selection.clone())
                 .highlights(runs.highlights.clone())
                 .code_spans(code_spans(runs, styles))
+                .link_spans(link_spans(runs))
+                .link_color(styles.link_color)
                 .selection_bg(styles.selection_bg),
         )
         .into_any_element()
@@ -1038,6 +1073,8 @@ fn table_block(
                     RichText::new(cell.text.clone(), doc_start, selection.clone())
                         .highlights(cell.highlights.clone())
                         .code_spans(code_spans(&cell, styles))
+                        .link_spans(link_spans(&cell))
+                        .link_color(styles.link_color)
                         .selection_bg(styles.selection_bg),
                 );
             cell_div = match align.get(c).copied().unwrap_or_default() {

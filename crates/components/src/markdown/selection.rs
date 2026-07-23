@@ -22,6 +22,8 @@ use std::rc::Rc;
 
 use gpui::{Bounds, ClipboardItem, Pixels, Point, TextLayout};
 
+use crate::markdown::ast::LinkSpan;
+
 /// One selectable leaf block's geometry, recorded during paint so the document
 /// mouse listeners can hit-test by window coordinate. Entries arrive in paint
 /// (i.e. document) order; their painted bounds are non-overlapping vertical
@@ -44,6 +46,9 @@ pub(crate) struct BlockHit {
     /// (`code in line`), so a code run reads as one selectable unit. Empty for
     /// plain-text blocks (e.g. the terminal panel's flat output).
     pub code_ranges: Vec<Range<usize>>,
+    /// Local link spans within this block's text. A Cmd+click landing inside one
+    /// opens the link target; a plain click starts text selection as usual.
+    pub link_spans: Vec<LinkSpan>,
 }
 
 /// Document-wide selection state, shared (via `Rc`) between the container
@@ -243,6 +248,27 @@ impl DocSelection {
             }
         }
         best.map(|(ix, _)| ix)
+    }
+
+    /// If `doc_index` falls inside a registered link span, return a clone of
+    /// that span. Returns `None` when the point is on plain text. The caller
+    /// can use this to decide between opening a link (Cmd+click) and starting
+    /// text selection (plain click).
+    pub(crate) fn link_at(&self, doc_index: usize) -> Option<LinkSpan> {
+        let blocks = self.blocks.borrow();
+        for hit in blocks.iter() {
+            let len = layout_len(&hit.layout);
+            if (hit.doc_start..hit.doc_start + len).contains(&doc_index) {
+                let local = doc_index - hit.doc_start;
+                for link in &hit.link_spans {
+                    if link.range.contains(&local) {
+                        return Some(link.clone());
+                    }
+                }
+                return None;
+            }
+        }
+        None
     }
 
     /// Copy the active selection's text to the clipboard. Builds the doc ranges
