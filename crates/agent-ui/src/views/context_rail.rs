@@ -501,7 +501,11 @@ impl ContextRail {
             .w_full()
             .items_center()
             .gap_2()
-            .child(Icon::new(IconName::ChartPie).xsmall().text_color(theme.muted_foreground))
+            .child(
+                Icon::new(IconName::ChartPie)
+                    .xsmall()
+                    .text_color(theme.muted_foreground),
+            )
             .child(
                 gpui::div()
                     .flex_1()
@@ -519,10 +523,8 @@ impl ContextRail {
             .tooltip(move |_window, _cx| {
                 let metrics = metrics.clone();
                 let theme = theme.clone();
-                Tooltip::element(move |_w, _c| {
-                    build_optimization_table(&metrics, &theme)
-                })
-                .build(_window, _cx)
+                Tooltip::element(move |_w, _c| build_optimization_table(&metrics, &theme))
+                    .build(_window, _cx)
             })
             .into_any_element()
     }
@@ -1231,48 +1233,90 @@ fn build_optimization_table(
         .gap_1()
         .child(opt_heading("Projection", muted))
         .child(opt_row("Sent", &tokens(metrics.projected_tokens), muted))
-        .child(opt_row("Baseline", &tokens(metrics.estimated_baseline_tokens), muted))
+        .child(opt_row(
+            "Baseline",
+            &tokens(metrics.estimated_baseline_tokens),
+            muted,
+        ))
         .child(opt_row("Saved", &tokens(metrics.saved_tokens), muted))
         .child(opt_heading("Breakdown", muted))
         .child(opt_row("System", &tokens(metrics.system_tokens), muted))
         .child(opt_row("Mode", &tokens(metrics.mode_tokens), muted))
-        .child(opt_row("Project", &tokens(metrics.project_context_tokens), muted))
-        .child(opt_row("Schemas", &tokens(metrics.tool_schema_tokens), muted))
+        .child(opt_row(
+            "Project",
+            &tokens(metrics.project_context_tokens),
+            muted,
+        ))
+        .child(opt_row(
+            "Schemas",
+            &tokens(metrics.tool_schema_tokens),
+            muted,
+        ))
         .child(opt_row("History", &tokens(metrics.history_tokens), muted))
-        .child(opt_row("Results", &tokens(metrics.tool_result_tokens), muted))
+        .child(opt_row(
+            "Results",
+            &tokens(metrics.tool_result_tokens),
+            muted,
+        ))
         .child(opt_heading("Tools", muted))
         .child(opt_row(
             "Schemas",
-            &format!("{}/{}", metrics.active_tool_schemas, metrics.total_tool_schemas),
+            &format!(
+                "{}/{}",
+                metrics.active_tool_schemas, metrics.total_tool_schemas
+            ),
             muted,
         ))
         .when(metrics.rewrite_saved_tokens > 0, |el| {
-            el.child(opt_row("Rewrite", &tokens(metrics.rewrite_saved_tokens), muted))
-        })
-        .when(metrics.pruning_saved_tokens > 0, |el| {
-            el.child(opt_row("Pruning", &tokens(metrics.pruning_saved_tokens), muted))
-        })
-        .when(metrics.discovery_saved_tokens > 0, |el| {
-            el.child(opt_row("Discovery", &tokens(metrics.discovery_saved_tokens), muted))
-        })
-        .child(opt_heading("Runtime", muted))
-        .child(opt_row("Prefix", &format!("{}%", metrics.prefix_stability_pct), muted))
-        .when(metrics.compactions_avoided > 0, |el| {
-            el.child(opt_row("Avoided compact", &metrics.compactions_avoided.to_string(), muted))
-        })
-        .when(metrics.code_nested_calls > 0 || metrics.code_model_round_trips_avoided > 0, |el| {
             el.child(opt_row(
-                "Code",
-                &format!(
-                    "{} calls / {} trips saved {}→{}",
-                    metrics.code_nested_calls,
-                    metrics.code_model_round_trips_avoided,
-                    tokens(metrics.code_raw_tokens),
-                    tokens(metrics.code_projected_tokens),
-                ),
+                "Rewrite",
+                &tokens(metrics.rewrite_saved_tokens),
                 muted,
             ))
         })
+        .when(metrics.pruning_saved_tokens > 0, |el| {
+            el.child(opt_row(
+                "Pruning",
+                &tokens(metrics.pruning_saved_tokens),
+                muted,
+            ))
+        })
+        .when(metrics.discovery_saved_tokens > 0, |el| {
+            el.child(opt_row(
+                "Discovery",
+                &tokens(metrics.discovery_saved_tokens),
+                muted,
+            ))
+        })
+        .child(opt_heading("Runtime", muted))
+        .child(opt_row(
+            "Prefix",
+            &format!("{}%", metrics.prefix_stability_pct),
+            muted,
+        ))
+        .when(metrics.compactions_avoided > 0, |el| {
+            el.child(opt_row(
+                "Avoided compact",
+                &metrics.compactions_avoided.to_string(),
+                muted,
+            ))
+        })
+        .when(
+            metrics.code_nested_calls > 0 || metrics.code_model_round_trips_avoided > 0,
+            |el| {
+                el.child(opt_row(
+                    "Code",
+                    &format!(
+                        "{} calls / {} trips saved {}→{}",
+                        metrics.code_nested_calls,
+                        metrics.code_model_round_trips_avoided,
+                        tokens(metrics.code_raw_tokens),
+                        tokens(metrics.code_projected_tokens),
+                    ),
+                    muted,
+                ))
+            },
+        )
         .when(metrics.tool_search_queries > 0, |el| {
             el.child(opt_row(
                 "ToolSearch",

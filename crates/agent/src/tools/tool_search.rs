@@ -258,8 +258,7 @@ impl AgentTool for ToolSearchTool {
             Ok(v) => v,
             Err(e) => return Task::ready(Err(format!("invalid input: {e}"))),
         };
-        let mut results = search(&query.query, &self.catalog);
-        filter_for_plan_mode(&mut results, context.plan_mode());
+        let results = search(&query.query, &self.catalog);
         let thread_id = context.thread_id().to_string();
 
         // Activate discovered tools so they appear in the schema on the next
@@ -284,12 +283,6 @@ impl AgentTool for ToolSearchTool {
             s
         };
         Task::ready(Ok(out))
-    }
-}
-
-fn filter_for_plan_mode(results: &mut Vec<ToolEntry>, plan_mode: bool) {
-    if plan_mode {
-        results.retain(|tool| tool.read_only);
     }
 }
 
@@ -464,34 +457,6 @@ mod tests {
         }];
         let results = search("获取网页", &catalog);
         assert_eq!(results.first().map(|r| r.name.as_str()), Some("LspStatus"));
-    }
-
-    #[test]
-    fn plan_mode_filters_write_tools_before_activation() {
-        let mut results = vec![
-            ToolEntry {
-                name: "WebFetch".into(),
-                description: "Fetch a URL".into(),
-                read_only: true,
-                search_text: "WebFetch Fetch a URL".into(),
-            },
-            ToolEntry {
-                name: "Write".into(),
-                description: "Write a file".into(),
-                read_only: false,
-                search_text: "Write Write a file".into(),
-            },
-        ];
-
-        filter_for_plan_mode(&mut results, true);
-
-        assert_eq!(
-            results
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            ["WebFetch"]
-        );
     }
 
     #[test]

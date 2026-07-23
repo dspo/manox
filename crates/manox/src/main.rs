@@ -222,10 +222,6 @@ fn main() {
                 agent_ui::CompletionDismiss,
                 Some("completion == open > Input"),
             ),
-            // Cycle the collaboration mode (Default ↔ Plan). Mirrors `/plan`,
-            // the `+` menu row, and the composer mode chip. The handler lives
-            // on the active Workspace (see `Workspace::Render`).
-            gpui::KeyBinding::new("shift-tab", agent_ui::CycleCollaborationMode, None),
             // Archive the current thread and start a fresh one.
             #[cfg(target_os = "macos")]
             gpui::KeyBinding::new("cmd-;", agent_ui::ArchiveCurrentThread, None),

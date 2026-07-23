@@ -54,9 +54,7 @@ pub mod webview_host;
 
 use gpui::App;
 
-pub use collaboration_mode::{
-    ModeKind, ModeSettings, ModeSettingsMap, PlanReviewChoice, implement_plan_user_message,
-};
+pub use collaboration_mode::{PlanReviewChoice, implement_plan_user_message, unified_instructions};
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
 pub use mcp::{McpRegistry, registry_global as mcp_global, registry_init as mcp_init};
@@ -78,7 +76,6 @@ pub fn init(cx: &mut App) {
     // i18n before anything that renders UI or builds a system prompt, so the
     // user's locale is settled before the first frame / first turn.
     i18n::init();
-    settings::init_modes();
     settings::init_optimization();
     provider::registry::init(cx);
     mcp::registry::init(cx);

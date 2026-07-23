@@ -470,7 +470,6 @@ mod tests {
                     },
                 ]),
                 goal: None,
-                collaboration_mode: Some("Plan"),
                 active_tools: Vec::new(),
                 active_skills: Vec::new(),
                 background_shells: Vec::new(),

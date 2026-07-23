@@ -385,8 +385,6 @@ composer-add-files = 文件和文件夹
 composer-attach-editor = 附加编辑器
 composer-goal-name = 目标
 composer-goal-desc = 设置持续努力实现的目标
-composer-plan-mode-name = 协作模式
-composer-plan-mode-desc = 切换 计划 ↔ 默认
 composer-generate-memory = 生成开
 composer-tag-personal = 个人
 composer-tag-system = 系统
@@ -404,13 +402,10 @@ turn-navigator-copied = 消息已复制到剪贴板。
 
 ### slash_command.rs
 slash-yolo-desc = 切换到完全访问（免审批 + bash 沙箱外）；带提示词则切换后直接开工
-slash-plan-desc = 切换协作模式（计划 ↔ 默认）；裸 `/plan` 切换，`/plan <提示>` 带提示进入计划模式
+slash-plan-desc = 强烈提示深入探索并以 <proposed_plan> 块产出计划；裸 `/plan` 引导规划，`/plan <提示>` 按你的提示规划
 slash-goal-desc = 创建或管理持久目标（`/goal <目标>`、pause、resume、edit、clear）
 slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行
 slash-exit-desc = 归档当前会话并开始一个新会话
-mode-chip-default = 默认
-mode-chip-plan = 计划
-workspace-cycle-mode = 切换协作模式
 workspace-chip-goal-active = 目标进行中
 goal-popover-title = 目标
 goal-popover-objective = 目标内容
