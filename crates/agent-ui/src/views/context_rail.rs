@@ -113,9 +113,6 @@ pub(crate) struct ContextRail {
     /// Last request's model-facing projection breakdown and optimization
     /// savings, including estimates collected by shadow-mode features.
     pub(crate) optimization: Option<agent::ContextOptimizationMetrics>,
-    /// Per-turn prefix cache diagnostic for the current thread. Updated every
-    /// turn after token finalization; cleared on thread switch.
-    pub(crate) cache_diagnostic: Option<agent::CacheDiagnostic>,
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
     /// Latest git change stats for the thread's cwd. Refreshed (debounced) by
@@ -148,7 +145,6 @@ impl ContextRail {
             agents: Vec::new(),
             env_counter_state: HashMap::new(),
             optimization: None,
-            cache_diagnostic: None,
             side_calls: Vec::new(),
             main_call: None,
             git_change_stats: None,
@@ -175,7 +171,6 @@ impl ContextRail {
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
         self.env_counter_state.clear();
         self.optimization = None;
-        self.cache_diagnostic = None;
         self.side_calls.clear();
         self.main_call = None;
         self.agents.clear();
