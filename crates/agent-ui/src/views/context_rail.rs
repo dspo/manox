@@ -19,10 +19,8 @@
 //! the conversation, and while it is open the card stays hidden so the
 //! conversation reclaims its width.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
-
 use agent::{Thread, ThreadEvent, i18n};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardItem, Context, Entity,
@@ -57,11 +55,6 @@ pub(crate) const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
 /// window never crowds the conversation.
 const RAIL_NARROW_BREAK: f32 = 900.;
 
-/// Longest model id rendered in full, calibrated to "MiniMax/MiniMax-M3[1m]"
-/// (22 chars). Longer ids are cut to this width then trimmed by 3 and given a
-/// "..." suffix, so the result stays one line at `ENV_MODEL_ID_MAX` chars
-/// (e.g. "MiniMax/MiniMax-M3[...").
-const ENV_MODEL_ID_MAX: usize = 22;
 
 // ── ContextRail view ──────────────────────────────────────────────────────
 
@@ -101,15 +94,6 @@ pub(crate) struct ContextRail {
     pub(crate) cockpit_auto_compact_threshold: f64,
     weak_workspace: WeakEntity<Workspace>,
     agents: Vec<SubagentInfo>,
-    /// Per-cell scoreboard state, keyed by `"{model_name}|{field}"` where
-    /// `field ∈ {in, out, cache_create, cache_read}`. Stored as
-    /// `(gen, last_value)`: `gen` is bumped on every value delta so the
-    /// animation's element id changes and gpui fires a fresh 0→1 tween;
-    /// `last_value` is the value the previous render committed and becomes
-    /// the start of the count-up interpolation. Rebuilt every render so
-    /// cells whose model disappeared (e.g. thread reset) are pruned, keeping
-    /// the map bounded by the number of live models.
-    pub(crate) env_counter_state: HashMap<String, (u64, u64)>,
     /// Last request's model-facing projection breakdown and optimization
     /// savings, including estimates collected by shadow-mode features.
     pub(crate) optimization: Option<agent::ContextOptimizationMetrics>,
@@ -123,6 +107,7 @@ pub(crate) struct ContextRail {
     /// until then.
     pub(crate) git_branch_display: Option<GitBranchDisplay>,
 }
+
 
 impl ContextRail {
     pub(crate) fn new(
@@ -143,7 +128,6 @@ impl ContextRail {
             cockpit_auto_compact_threshold: auto_compact_threshold,
             weak_workspace,
             agents: Vec::new(),
-            env_counter_state: HashMap::new(),
             optimization: None,
             side_calls: Vec::new(),
             main_call: None,
@@ -169,7 +153,6 @@ impl ContextRail {
     /// reset. Also clears the cached git stats so the incoming thread shows
     /// placeholders until its own refresh lands.
     pub(crate) fn reset_for_thread_switch(&mut self, running: bool, cx: &mut Context<Self>) {
-        self.env_counter_state.clear();
         self.optimization = None;
         self.side_calls.clear();
         self.main_call = None;
@@ -273,15 +256,9 @@ impl ContextRail {
     /// `Render` impl positions this as an absolute overlay over the
     /// conversation column's top-right; this fn only paints the card itself.
     fn render_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        // Approval mode used to live in the card's "Modes" section (now removed);
-        // the per-mode chip in the composer footer reads it directly, so we
-        // don't need to query it here.
-        let (project, per_model) = {
+        let project = {
             let thread = self.thread.read(cx);
-            (
-                thread.project().cloned(),
-                thread.per_model_token_usage().clone(),
-            )
+            thread.project().cloned()
         };
 
         v_flex()
@@ -307,10 +284,7 @@ impl ContextRail {
             .child(self.render_cockpit_status_row(theme, cx))
             .child(self.render_agents_section(theme, cx))
             .child(self.render_branch_block(&project, theme, cx))
-            .child(self.render_usage_section(theme, cx, per_model))
-            .child(self.render_optimization_section(theme))
-            .child(self.render_main_call_section(theme))
-            .child(self.render_side_calls_section(theme))
+            .child(self.render_usage_section(theme, cx))
             .child(self.render_cockpit_context_budget(theme, cx))
             .child(self.render_plan_section(theme, cx))
             .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
@@ -334,287 +308,64 @@ impl ContextRail {
             .into_any_element()
     }
 
-    /// Per-model token usage as a two-row tree: `├── 穿透 ↑{in} 缓存 ↑{ccr}`
-    /// (input + cache-read) and `└── 输出 ↓{out}`. Cache creation is no longer
-    /// surfaced — cache-read is the only "reused input" metric. A cache-hit
-    /// ratio rides beside the model name when the model has any cache-readable
-    /// input. The header row carries the conversation's cumulative token total
-    /// (moved here from the run-status row) right-aligned. Counter animation
-    /// state is diffed and rebuilt here so the per-cell `gen` bumps on every
-    /// value delta (see `env_counter_state`).
+    /// Cumulative token total row with a hover tooltip consolidating main
+    /// calls, side calls, and context optimization distribution data.
     fn render_usage_section(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
-        per_model: HashMap<String, agent::language_model::TokenUsage>,
     ) -> AnyElement {
         let muted = theme.muted_foreground;
         let total = crate::cockpit::format_tokens(
             self.thread.read(cx).cumulative_token_usage().total_tokens(),
         );
-        let mut model_rows: Vec<_> = per_model
-            .into_iter()
-            .filter(|(_, u)| u.total_tokens() > 0)
-            .collect();
-        model_rows.sort_by_key(|b| std::cmp::Reverse(b.1.total_tokens()));
-
-        let throughput_label = i18n::t("workspace-env-throughput");
-        let cache_label = i18n::t("workspace-env-cache");
-        let output_label = i18n::t("workspace-env-output");
-
-        let mut new_state: HashMap<String, (u64, u64)> = HashMap::new();
-        // Each model block carries: model id text + the two tree rows
-        // (throughput, output). The capture-based build keeps the closure
-        // machinery out of the outer builder.
-        let mut model_blocks: Vec<(String, Option<SharedString>, gpui::Div, gpui::Div)> =
-            Vec::with_capacity(model_rows.len());
-
-        for (model_name, usage) in model_rows {
-            let model_display = truncate_env_model_id(model_name.clone());
-            // Cache-hit ratio shown beside the model name when the model has
-            // any cache-readable input this turn.
-            let hit_rate = cache_read_ratio(usage).map(|r| {
-                let pct = (r * 100.0).round() as i64;
-                i18n::t_str("workspace-env-cache-hit-rate", &[("pct", &pct.to_string())])
-            });
-            // Three cells: input (穿透 ↑), output (输出 ↓), cache_read (缓存 ↑).
-            // Cache creation is dropped — cache-read is the only cache metric
-            // that reads as "reused input" to the user.
-            let cells: [(&str, u64); 3] = [
-                ("in", usage.input_tokens),
-                ("out", usage.output_tokens),
-                ("cache_read", usage.cache_read_input_tokens),
-            ];
-            let mut from_to_gen: [(u64, u64, u64); 3] = [(0, 0, 0); 3];
-            for (i, (field, value)) in cells.iter().enumerate() {
-                let cell_key = format!("{model_name}|{field}");
-                let (old_value, new_gen) = match self.env_counter_state.get(&cell_key) {
-                    None => (0u64, 1u64),
-                    Some(&(gen_, last)) if last == *value => (last, gen_),
-                    Some(&(gen_, last)) => (last, gen_.wrapping_add(1)),
-                };
-                new_state.insert(cell_key, (new_gen, *value));
-                from_to_gen[i] = (old_value, *value, new_gen);
-            }
-            let (in_f, in_t, in_g) = from_to_gen[0];
-            let (out_f, out_t, out_g) = from_to_gen[1];
-            let (ccr_f, ccr_t, ccr_g) = from_to_gen[2];
-
-            // Tree prefix glyph (`├── ` / `└── `) painted slightly muted so it
-            // reads as chrome rather than data.
-            let branch_prefix = |glyph: &'static str| -> gpui::Div {
-                gpui::div()
-                    .text_xs()
-                    .text_color(muted.opacity(0.55))
-                    .child(SharedString::from(glyph))
-            };
-            let throughput_row = h_flex()
-                .pl(px(12.))
-                .gap_1()
-                .items_center()
-                .text_xs()
-                .text_color(muted)
-                .child(branch_prefix("├── "))
-                .child(throughput_label.clone())
-                .child(counter_animated("↑", in_f, in_t, "in", in_g))
-                .child(cache_label.clone())
-                .child(counter_animated("↑", ccr_f, ccr_t, "cache_read", ccr_g));
-            let output_row = h_flex()
-                .pl(px(12.))
-                .gap_1()
-                .items_center()
-                .text_xs()
-                .text_color(muted)
-                .child(branch_prefix("└── "))
-                .child(output_label.clone())
-                .child(counter_animated("↓", out_f, out_t, "out", out_g));
-            model_blocks.push((model_display, hit_rate, throughput_row, output_row));
-        }
-        self.env_counter_state = new_state;
-
-        v_flex()
-            .w_full()
-            .gap_1()
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
-                    .child(
-                        gpui::div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(i18n::t("workspace-env-usage")),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(SharedString::from(total)),
-                    ),
-            )
-            .children(model_blocks.into_iter().map(
-                |(model_display, hit_rate, throughput_row, output_row)| {
-                    v_flex()
-                        .w_full()
-                        .gap_0p5()
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_1()
-                                .child(
-                                    gpui::div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_xs()
-                                        .text_color(theme.foreground)
-                                        .child(model_display),
-                                )
-                                .children(hit_rate.map(|r| {
-                                    gpui::div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(r)
-                                        .into_any_element()
-                                })),
-                        )
-                        .child(throughput_row)
-                        .child(output_row)
-                        .into_any_element()
-                },
-            ))
-            .into_any_element()
-    }
-
-    fn render_optimization_section(&self, theme: &Theme) -> AnyElement {
-        let Some(metrics) = self.optimization.as_ref() else {
-            return gpui::div().into_any_element();
-        };
-        let savings = crate::cockpit::format_tokens(metrics.saved_tokens);
-        // Clone out of `self` so the `'static` tooltip closure owns its data.
-        let metrics = metrics.clone();
-        let theme = theme.clone();
-        gpui::div()
-            .id("context-optimization-trigger")
-            .w_full()
+        let main_call = self.main_call.clone();
+        let side_calls = self.side_calls.clone();
+        let optimization = self.optimization.clone();
+        let theme_clone = theme.clone();
+        let has_tooltip = main_call.is_some()
+            || !side_calls.is_empty()
+            || optimization.is_some();
+        let header = h_flex()
             .items_center()
             .gap_2()
-            .child(
-                Icon::new(IconName::ChartPie)
-                    .xsmall()
-                    .text_color(theme.muted_foreground),
-            )
+            .child(Icon::new(IconName::MemoryStick).xsmall().text_color(muted))
             .child(
                 gpui::div()
                     .flex_1()
                     .min_w_0()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(i18n::t("context-opt-title")),
+                    .child(i18n::t("workspace-env-usage")),
             )
             .child(
                 gpui::div()
                     .text_xs()
-                    .text_color(theme.success)
-                    .child(SharedString::from(savings)),
-            )
-            .tooltip(move |_window, _cx| {
-                let metrics = metrics.clone();
-                let theme = theme.clone();
-                Tooltip::element(move |_w, _c| build_optimization_table(&metrics, &theme))
-                    .build(_window, _cx)
-            })
-            .into_any_element()
-    }
-
-    fn render_side_calls_section(&self, theme: &Theme) -> AnyElement {
-        if self.side_calls.is_empty() {
-            return gpui::div().into_any_element();
+                    .text_color(theme.muted_foreground)
+                    .child(SharedString::from(total)),
+            );
+        if has_tooltip {
+            header
+                .id("usage-tooltip-trigger")
+                .tooltip(move |window, cx| {
+                    let theme = theme_clone.clone();
+                    let main_call = main_call.clone();
+                    let side_calls = side_calls.clone();
+                    let optimization = optimization.clone();
+                    Tooltip::element(move |_w, _c| {
+                        build_usage_tooltip(
+                            main_call.as_ref(),
+                            &side_calls,
+                            optimization.as_ref(),
+                            &theme,
+                        )
+                    })
+                    .build(window, cx)
+                })
+                .into_any_element()
+        } else {
+            header.into_any_element()
         }
-        let muted = theme.muted_foreground;
-        v_flex()
-            .w_full()
-            .gap_0p5()
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(i18n::t("context-side-calls-title")),
-            )
-            .children(self.side_calls.iter().map(|metric| {
-                let average_ms = metric.latency_ms / metric.calls.max(1);
-                let cache_rate = cache_read_ratio(metric.token_usage)
-                    .map(|ratio| format!("{:.0}%", ratio * 100.0))
-                    .unwrap_or_else(|| "--".into());
-                gpui::div()
-                    .pl(px(12.))
-                    .text_xs()
-                    .text_color(muted)
-                    .child(i18n::t_str(
-                        "context-side-calls-row",
-                        &[
-                            ("purpose", &metric.purpose),
-                            ("model", &metric.model),
-                            ("calls", &metric.calls.to_string()),
-                            (
-                                "input",
-                                &crate::cockpit::format_tokens(metric.token_usage.input_tokens),
-                            ),
-                            (
-                                "output",
-                                &crate::cockpit::format_tokens(metric.token_usage.output_tokens),
-                            ),
-                            (
-                                "cache",
-                                &crate::cockpit::format_tokens(
-                                    metric.token_usage.cache_read_input_tokens,
-                                ),
-                            ),
-                            ("cache_rate", &cache_rate),
-                            ("latency", &average_ms.to_string()),
-                        ],
-                    ))
-                    .into_any_element()
-            }))
-            .into_any_element()
-    }
-
-    fn render_main_call_section(&self, theme: &Theme) -> AnyElement {
-        let Some(metric) = self.main_call.as_ref() else {
-            return gpui::div().into_any_element();
-        };
-        let average_ms = metric.latency_ms / metric.calls.max(1);
-        let cache_rate = cache_read_ratio(metric.token_usage)
-            .map(|ratio| format!("{:.0}%", ratio * 100.0))
-            .unwrap_or_else(|| "--".into());
-        gpui::div()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(i18n::t_str(
-                "context-main-calls-row",
-                &[
-                    ("model", &metric.model),
-                    ("calls", &metric.calls.to_string()),
-                    (
-                        "input",
-                        &crate::cockpit::format_tokens(metric.token_usage.input_tokens),
-                    ),
-                    (
-                        "output",
-                        &crate::cockpit::format_tokens(metric.token_usage.output_tokens),
-                    ),
-                    (
-                        "cache",
-                        &crate::cockpit::format_tokens(metric.token_usage.cache_read_input_tokens),
-                    ),
-                    ("cache_rate", &cache_rate),
-                    ("latency", &average_ms.to_string()),
-                ],
-            ))
-            .into_any_element()
     }
 
     /// Change counts `+added` / `-deleted` plus an untracked badge, themed
@@ -1227,157 +978,184 @@ impl Render for ContextRail {
     }
 }
 
-// ── Free helpers (moved from workspace.rs) ───────────────────────────────
+// ── Free helpers ───────────────────────────────────────────────────────────
 
-/// Build the hover-table shown when the user hovers the optimization title
-/// row. Two-column layout: label (left) / value (right). Category headers
-/// in semibold. Zero-value rows are skipped; projection and prefix-cache
-/// rows always render.
-fn build_optimization_table(
-    metrics: &agent::ContextOptimizationMetrics,
+/// Build the hover tooltip for the usage row, consolidating main calls,
+/// side calls, and context optimization distribution into one tree view.
+fn build_usage_tooltip(
+    main_call: Option<&agent::SideCallMetric>,
+    side_calls: &[agent::SideCallMetric],
+    optimization: Option<&agent::ContextOptimizationMetrics>,
     theme: &Theme,
 ) -> AnyElement {
-    let tokens = |v: u64| crate::cockpit::format_tokens(v);
     let muted = theme.muted_foreground;
+    let tokens = |v: u64| crate::cockpit::format_tokens(v);
+
     v_flex()
         .gap_1()
-        .child(opt_heading("Projection", muted))
-        .child(opt_row("Sent", &tokens(metrics.projected_tokens), muted))
-        .child(opt_row(
-            "Baseline",
-            &tokens(metrics.estimated_baseline_tokens),
-            muted,
-        ))
-        .child(opt_row("Saved", &tokens(metrics.saved_tokens), muted))
-        .child(opt_heading("Breakdown", muted))
-        .child(opt_row("System", &tokens(metrics.system_tokens), muted))
-        .child(opt_row("Mode", &tokens(metrics.mode_tokens), muted))
-        .child(opt_row(
-            "Project",
-            &tokens(metrics.project_context_tokens),
-            muted,
-        ))
-        .child(opt_row(
-            "Schemas",
-            &tokens(metrics.tool_schema_tokens),
-            muted,
-        ))
-        .child(opt_row("History", &tokens(metrics.history_tokens), muted))
-        .child(opt_row(
-            "Results",
-            &tokens(metrics.tool_result_tokens),
-            muted,
-        ))
-        .child(opt_heading("Tools", muted))
-        .child(opt_row(
-            "Schemas",
-            &format!(
-                "{}/{}",
-                metrics.active_tool_schemas, metrics.total_tool_schemas
-            ),
-            muted,
-        ))
-        .when(metrics.rewrite_saved_tokens > 0, |el| {
-            el.child(opt_row(
-                "Rewrite",
-                &tokens(metrics.rewrite_saved_tokens),
+        .when_some(main_call, |el, metric| {
+            let is_last = side_calls.is_empty() && optimization.is_none();
+            el.child(section_heading(
+                &i18n::t("context-tooltip-main-calls"),
                 muted,
             ))
-        })
-        .when(metrics.pruning_saved_tokens > 0, |el| {
-            el.child(opt_row(
-                "Pruning",
-                &tokens(metrics.pruning_saved_tokens),
+            .child(call_tree_row(
+                metric,
+                None,
+                is_last,
                 muted,
+                &tokens,
             ))
         })
-        .when(metrics.discovery_saved_tokens > 0, |el| {
-            el.child(opt_row(
-                "Discovery",
-                &tokens(metrics.discovery_saved_tokens),
+        .when(!side_calls.is_empty(), |el| {
+            let has_opt = optimization.is_some();
+            let section = el.child(section_heading(
+                &i18n::t("context-tooltip-side-calls"),
+                muted,
+            ));
+            let total = side_calls.len();
+            side_calls
+                .iter()
+                .enumerate()
+                .fold(section, |el, (i, metric)| {
+                    let is_last_in_section = !has_opt && i == total - 1;
+                    el.child(call_tree_row(
+                        metric,
+                        Some(&metric.purpose),
+                        is_last_in_section,
+                        muted,
+                        &tokens,
+                    ))
+                })
+        })
+        .when_some(optimization, |el, m| {
+            el.child(section_heading(
+                &i18n::t("context-tooltip-distribution"),
                 muted,
             ))
-        })
-        .child(opt_heading("Runtime", muted))
-        .child(opt_row(
-            "Prefix",
-            &format!("{}%", metrics.prefix_stability_pct),
-            muted,
-        ))
-        .when(metrics.compactions_avoided > 0, |el| {
-            el.child(opt_row(
-                "Avoided compact",
-                &metrics.compactions_avoided.to_string(),
-                muted,
-            ))
-        })
-        .when(
-            metrics.code_nested_calls > 0 || metrics.code_model_round_trips_avoided > 0,
-            |el| {
-                el.child(opt_row(
-                    "Code",
-                    &format!(
-                        "{} calls / {} trips saved {}→{}",
-                        metrics.code_nested_calls,
-                        metrics.code_model_round_trips_avoided,
-                        tokens(metrics.code_raw_tokens),
-                        tokens(metrics.code_projected_tokens),
-                    ),
-                    muted,
-                ))
-            },
-        )
-        .when(metrics.tool_search_queries > 0, |el| {
-            el.child(opt_row(
-                "ToolSearch",
+            .child(opt_tree_row(
+                "Projection",
                 &format!(
-                    "{} queries / {} hits",
-                    metrics.tool_search_queries, metrics.tool_search_hits,
+                    "Sent {} Baseline {} Saved {}",
+                    tokens(m.projected_tokens),
+                    tokens(m.estimated_baseline_tokens),
+                    tokens(m.saved_tokens)
                 ),
+                false,
+                muted,
+            ))
+            .child(opt_tree_row(
+                "Breakdown",
+                &format!(
+                    "System {} Mode {} Project {} Schemas {} History {} Results {}",
+                    tokens(m.system_tokens),
+                    tokens(m.mode_tokens),
+                    tokens(m.project_context_tokens),
+                    tokens(m.tool_schema_tokens),
+                    tokens(m.history_tokens),
+                    tokens(m.tool_result_tokens)
+                ),
+                false,
+                muted,
+            ))
+            .child({
+                let mut parts = vec![format!(
+                    "Schemas {}/{}",
+                    m.active_tool_schemas, m.total_tool_schemas
+                )];
+                if m.discovery_saved_tokens > 0 {
+                    parts.push(format!("Discovery {}", tokens(m.discovery_saved_tokens)));
+                }
+                opt_tree_row("Tools", &parts.join(" "), false, muted)
+            })
+            .child(opt_tree_row(
+                "Runtime",
+                &format!("Prefix {}%", m.prefix_stability_pct),
+                true,
                 muted,
             ))
         })
         .into_any_element()
 }
 
-/// Category header row for the optimization hover table.
-fn opt_heading(text: &str, muted: gpui::Hsla) -> AnyElement {
+/// Section heading in the usage tooltip (e.g. "主调用", "辅助调用", "Tokens 分布").
+fn section_heading(text: &str, muted: gpui::Hsla) -> AnyElement {
     gpui::div()
         .text_xs()
         .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(muted.opacity(0.55))
+        .text_color(muted.opacity(0.7))
         .child(SharedString::from(text))
         .into_any_element()
 }
 
-/// One label/value row for the optimization hover table.
-fn opt_row(label: &str, value: &str, muted: gpui::Hsla) -> AnyElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .child(
-            gpui::div()
-                .flex_1()
-                .min_w_0()
-                .text_xs()
-                .text_color(muted)
-                .child(SharedString::from(label)),
-        )
-        .child(
-            gpui::div()
-                .text_xs()
-                .text_color(muted)
-                .child(SharedString::from(value)),
-        )
+/// A tree row for a call metric (main or side call).
+/// Format: `{purpose?}·{model}·{calls}次·↑[{cache%}]{cache_read}/{input} ↓{output}·RTT {avg}ms`
+fn call_tree_row(
+    metric: &agent::SideCallMetric,
+    purpose_prefix: Option<&str>,
+    is_last: bool,
+    muted: gpui::Hsla,
+    tokens: &dyn Fn(u64) -> String,
+) -> AnyElement {
+    let prefix = if is_last { "╰─ " } else { "├─ " };
+    let avg_ms = metric.latency_ms / metric.calls.max(1);
+    let cache_pct = cache_read_ratio(metric.token_usage)
+        .map(|r| format!("{:.0}%", r * 100.0))
+        .unwrap_or_else(|| "--".into());
+    let text = match purpose_prefix {
+        Some(purpose) => format!(
+            "{}{}·{}·{}次·↑[{}]{} / {} ↓{}·RTT {}ms",
+            prefix,
+            purpose,
+            metric.model,
+            metric.calls,
+            cache_pct,
+            tokens(metric.token_usage.cache_read_input_tokens),
+            tokens(metric.token_usage.input_tokens),
+            tokens(metric.token_usage.output_tokens),
+            avg_ms,
+        ),
+        None => format!(
+            "{}{}·{}次·↑[{}]{} / {} ↓{}·RTT {}ms",
+            prefix,
+            metric.model,
+            metric.calls,
+            cache_pct,
+            tokens(metric.token_usage.cache_read_input_tokens),
+            tokens(metric.token_usage.input_tokens),
+            tokens(metric.token_usage.output_tokens),
+            avg_ms,
+        ),
+    };
+    gpui::div()
+        .pl(px(8.))
+        .text_xs()
+        .text_color(muted)
+        .child(SharedString::from(text))
         .into_any_element()
 }
 
-/// Multi-line run-status block. The phase slot is now an arbitrary element
-/// (the sliding three-tag pill) rather than a plain label, so the caller owns
-/// Status block: a leading xs icon plus the phase element (the sliding
-/// three-tag pill), vertically centered on a single baseline like the other
-/// rail rows.
+/// A tree row for an optimization distribution category.
+fn opt_tree_row(
+    category: &str,
+    detail: &str,
+    is_last: bool,
+    muted: gpui::Hsla,
+) -> AnyElement {
+    let prefix = if is_last { "╰─ " } else { "├─ " };
+    gpui::div()
+        .pl(px(8.))
+        .text_xs()
+        .text_color(muted)
+        .child(SharedString::from(format!(
+            "{}{} | {}",
+            prefix, category, detail
+        )))
+        .into_any_element()
+}
+
+/// Multi-line run-status block: a leading xs icon plus the phase element,
+/// vertically centered on a single baseline like the other rail rows.
 fn cockpit_status_block(icon: AnyElement, phase: AnyElement, _theme: &Theme) -> AnyElement {
     h_flex()
         .w_full()
@@ -1388,14 +1166,9 @@ fn cockpit_status_block(icon: AnyElement, phase: AnyElement, _theme: &Theme) -> 
         .into_any_element()
 }
 
-/// A clickable row with an icon, label, and optional trailing element. The
-/// whole row is a pointer cursor with an `on_click` handler. Used by the
-/// branch row to copy the branch name.
-///
+/// A clickable row with an icon, label, and optional trailing element.
 /// `icon_path` is a `icons/…` asset path resolved through `ExtrasAssetSource`,
-/// not an `IconName` — the rail's branch / worktree glyphs (lucide
-/// `git-branch`, `workflow`) live in manox's local asset bundle, not the
-/// `gpui-component-assets` set that `IconName` is generated from.
+/// not an `IconName`.
 fn env_row_clickable(
     icon_path: SharedString,
     label: SharedString,
@@ -1425,82 +1198,5 @@ fn env_row_clickable(
                 .child(label),
         )
         .children(trailing)
-        .into_any_element()
-}
-
-/// Clamp a model id so the rail never wraps it. Ids up to
-/// `ENV_MODEL_ID_MAX` ("MiniMax/MiniMax-M3[1m]") render in full; longer ones
-/// are cut to the cap, trimmed by 3 chars, then suffixed with "..." — so the
-/// result is exactly `ENV_MODEL_ID_MAX` chars (e.g. "MiniMax/MiniMax-M3[...").
-fn truncate_env_model_id(id: String) -> String {
-    let chars: Vec<char> = id.chars().collect();
-    if chars.len() <= ENV_MODEL_ID_MAX {
-        return id;
-    }
-    let head: String = chars.into_iter().take(ENV_MODEL_ID_MAX - 3).collect();
-    format!("{head}...")
-}
-
-/// Compact token count display: `1m357k`, `168k653`, `999`.
-fn format_tokens(n: u64) -> String {
-    const MILLION: u64 = 1_000_000;
-    const THOUSAND: u64 = 1_000;
-    if n >= MILLION {
-        let m = n / MILLION;
-        let r = (n % MILLION) / THOUSAND;
-        if r == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m{r}k")
-        }
-    } else if n >= THOUSAND {
-        let k = n / THOUSAND;
-        let r = n % THOUSAND;
-        if r == 0 {
-            format!("{k}k")
-        } else {
-            format!("{k}k{r}")
-        }
-    } else {
-        n.to_string()
-    }
-}
-
-/// Scoreboard-style token counter: linearly interpolates the displayed
-/// integer from `from` to `to` over 600ms with `ease_out_quint`, then
-/// formats it via [`format_tokens`]. The animation id embeds the cell's
-/// `field` identity plus `gen`; bumping `gen` on every value delta forces
-/// gpui to fire a fresh 0→1 tween, while a stable `gen` reuses the cached
-/// end-state and renders the value statically.
-///
-/// `arrow` is `&'static str` (`"↑"` / `"↓"`) so the closure stays
-/// `'static` without copying the arrow into a `SharedString` on every
-/// frame. `field` is also `&'static str` for the same reason — only the
-/// four canonical field names ever flow through here.
-///
-/// The visible text_color cascades from the parent `h_flex` row (which
-/// sets `text_color(muted)`), so this helper only owns the interpolated
-/// value text.
-fn counter_animated(
-    arrow: &'static str,
-    from: u64,
-    to: u64,
-    field: &'static str,
-    gen_: u64,
-) -> AnyElement {
-    let anim_id = format!("env-counter-{field}-{gen_}");
-    let from_f = from as f64;
-    let to_f = to as f64;
-    gpui::div()
-        .with_animation(
-            anim_id,
-            Animation::new(Duration::from_millis(600)).with_easing(ease_out_quint()),
-            move |el, t| {
-                let v = (from_f + (to_f - from_f) * t as f64) as u64;
-                el.child(SharedString::from(
-                    format!("{}{}", arrow, format_tokens(v),),
-                ))
-            },
-        )
         .into_any_element()
 }
