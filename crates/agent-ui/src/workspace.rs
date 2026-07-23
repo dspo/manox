@@ -601,9 +601,7 @@ impl Workspace {
 
         let editor_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .code_editor("markdown")
-                .line_number(true)
-                .folding(false)
+                .multi_line(true)
                 .soft_wrap(true)
                 .submit_on_enter(false)
                 .placeholder(i18n::t("workspace-composer-placeholder"))
@@ -7325,3 +7323,4 @@ mod tests {
         assert_eq!(active, 1);
     }
 }
+
