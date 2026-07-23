@@ -17,7 +17,13 @@ pub struct BackgroundRegion {
 
 impl BackgroundRegion {
     fn new(line: i32, col: i32, color: Hsla) -> Self {
-        Self { start_line: line, start_col: col, end_line: line, end_col: col, color }
+        Self {
+            start_line: line,
+            start_col: col,
+            end_line: line,
+            end_col: col,
+            color,
+        }
     }
 
     fn can_merge_with(&self, other: &BackgroundRegion) -> bool {
@@ -182,5 +188,3 @@ fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundReg
     }
     merged
 }
-
-

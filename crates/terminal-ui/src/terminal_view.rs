@@ -11,11 +11,10 @@
 //! the cursor.
 
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Font, FontFeatures,
-    FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, UTF16Selection, Window, div,
-    px, rgba,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, Font, FontFeatures, FontStyle,
+    FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, Styled, UTF16Selection, Window, div, px, rgba,
 };
 use gpui_component::ActiveTheme as _;
 use rmux_core::input::mode;
@@ -126,7 +125,12 @@ impl TerminalView {
         self.selecting = true;
     }
 
-    fn on_mouse_move(&mut self, _ev: &MouseMoveEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_mouse_move(
+        &mut self,
+        _ev: &MouseMoveEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
         // Selection tracking is handled at the element level in a future
         // iteration; for now, just keep the selecting flag.
     }
@@ -301,7 +305,11 @@ impl InputHandler for TerminalInputHandler {
         })
     }
 
-    fn marked_text_range(&mut self, _window: &mut Window, cx: &mut App) -> Option<std::ops::Range<usize>> {
+    fn marked_text_range(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<std::ops::Range<usize>> {
         self.view.read_with(cx, |v, _| {
             if v.marked_text.is_empty() {
                 None

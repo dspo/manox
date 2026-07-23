@@ -16,9 +16,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Context, Entity, EventEmitter, Task};
 use parking_lot::Mutex;
-use rmux_core::input::mode;
-use rmux_core::input::InputParser;
 use rmux_core::Screen;
+use rmux_core::input::InputParser;
+use rmux_core::input::mode;
 use rmux_types::TerminalSize;
 
 use crate::event::TerminalEvent;
@@ -35,9 +35,8 @@ struct ScreenState {
 }
 
 /// Mouse mode mask for checking whether the terminal captures the mouse.
-const MOUSE_MODE_MASK: u32 = mode::MODE_MOUSE_STANDARD
-    | mode::MODE_MOUSE_BUTTON
-    | mode::MODE_MOUSE_ALL;
+const MOUSE_MODE_MASK: u32 =
+    mode::MODE_MOUSE_STANDARD | mode::MODE_MOUSE_BUTTON | mode::MODE_MOUSE_ALL;
 
 /// SGR mouse mode flag.
 const MODE_MOUSE_SGR: u32 = mode::MODE_MOUSE_SGR;
@@ -266,7 +265,9 @@ impl Terminal {
             s.visit_visible_line_cells(row, col + 1, |cell| {
                 if found.is_none() {
                     let link = cell.link();
-                    if link != 0 && let Some(uri) = s.hyperlink_uri(link) {
+                    if link != 0
+                        && let Some(uri) = s.hyperlink_uri(link)
+                    {
                         found = Some(uri.to_owned());
                     }
                 }
@@ -328,9 +329,7 @@ fn decode_clipboard_passthrough(data: &[u8]) -> Option<String> {
         data_str
     };
     // Trim trailing ST/BEL terminators.
-    let content = content
-        .trim_end_matches('\x07')
-        .trim_end_matches("\x1b\\");
+    let content = content.trim_end_matches('\x07').trim_end_matches("\x1b\\");
 
     // Split on ';' to get the clipboard target and the base64 data.
     let parts: Vec<&str> = content.splitn(2, ';').collect();

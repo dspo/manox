@@ -147,15 +147,14 @@ impl Element for TerminalElement {
         }
 
         let origin = bounds.origin;
-        let (background, runs, cursor_grid) =
-            self.terminal.read_with(cx, |t, _cx| {
-                t.with_screen(|screen| {
-                    let (cursor_x, cursor_y) = screen.cursor_position();
-                    let cells = Self::collect_cells(screen, t.rows, t.cols);
-                    let GridPlan { background, runs } = layout_grid(cells.into_iter(), &self.theme);
-                    (background, runs, Some((cursor_y as i32, cursor_x as i32)))
-                })
-            });
+        let (background, runs, cursor_grid) = self.terminal.read_with(cx, |t, _cx| {
+            t.with_screen(|screen| {
+                let (cursor_x, cursor_y) = screen.cursor_position();
+                let cells = Self::collect_cells(screen, t.rows, t.cols);
+                let GridPlan { background, runs } = layout_grid(cells.into_iter(), &self.theme);
+                (background, runs, Some((cursor_y as i32, cursor_x as i32)))
+            })
+        });
 
         let mut shaped_runs: Vec<(Point<Pixels>, ShapedLine)> = Vec::with_capacity(runs.len());
         for run in &runs {

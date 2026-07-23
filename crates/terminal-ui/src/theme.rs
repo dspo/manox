@@ -6,7 +6,9 @@
 
 use gpui::Hsla;
 use gpui_component::Theme;
-use rmux_core::input::{Colour, COLOUR_DEFAULT, COLOUR_FLAG_256, COLOUR_FLAG_RGB, COLOUR_NONE, COLOUR_TERMINAL};
+use rmux_core::input::{
+    COLOUR_DEFAULT, COLOUR_FLAG_256, COLOUR_FLAG_RGB, COLOUR_NONE, COLOUR_TERMINAL, Colour,
+};
 
 /// Resolved terminal palette used by the renderer.
 pub struct TerminalTheme {

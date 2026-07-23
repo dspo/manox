@@ -24,12 +24,12 @@ use gpui::App;
 // Re-export the rmux-core types the rendering layer needs, so `terminal-ui`
 // depends only on `terminal` and never on `rmux-core` directly.
 pub use rmux_core;
+pub use rmux_core::TerminalPassthrough;
 pub use rmux_core::input::{
-    Colour, GridAttr, InputParser, ScreenWriter, COLOUR_DEFAULT, COLOUR_FLAG_256,
-    COLOUR_FLAG_RGB, COLOUR_NONE, COLOUR_TERMINAL,
+    COLOUR_DEFAULT, COLOUR_FLAG_256, COLOUR_FLAG_RGB, COLOUR_NONE, COLOUR_TERMINAL, Colour,
+    GridAttr, InputParser, ScreenWriter,
 };
 pub use rmux_core::{Screen, ScreenCellRef, ScreenCellView, ScreenLineView};
-pub use rmux_core::TerminalPassthrough;
 pub use rmux_types::TerminalSize;
 pub use term::Terminal;
 
