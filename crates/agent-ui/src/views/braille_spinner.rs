@@ -63,7 +63,7 @@ impl RenderOnce for BrailleSpinner {
                 "braille-spinner",
                 Animation::new(self.speed).repeat(),
                 move |this, delta| {
-                    let frame = (delta * frame_count) as usize % FRAMES.len();
+                    let frame = ((delta * frame_count) as usize).min(FRAMES.len() - 1);
                     this.child(SharedString::from(FRAMES[frame]))
                 },
             )
