@@ -157,13 +157,14 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee3
 gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1", features = ["tree-sitter-languages"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
 
-# Terminal emulator stack. alacritty_terminal provides the Term/Grid/Selection
-# data-structure layer (its own EventLoop/mio/tty are unused — manox drives the
-# PTY via portable-pty and feeds bytes to `Processor::advance(&mut term, ..)`
-# since `Term` itself implements `vte::ansi::Handler`). vte is not declared
-# separately; it is re-exported by alacritty_terminal, keeping a single version.
-alacritty_terminal = "0.24"
-portable-pty = "0.9"
+# Terminal emulator stack. rmux-core provides the Screen/Grid/VT-parser
+# domain model (pure in-memory, no OS/network deps); rmux-pty provides
+# PTY allocation, resize, and child-process control. Both are used as
+# in-process libraries — no daemon, conforming to the single-binary rule.
+rmux-core = "0.9"
+rmux-pty = "0.9"
+rmux-types = "0.9"
+rmux-proto = "0.9"
 parking_lot = "0.12"
 
 # psm 用 stacker 的版本（对齐 gpui-component）
@@ -174,3 +175,4 @@ psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
 [profile.dev.package]
 gpui = { opt-level = 3 }
 gpui_platform = { opt-level = 3 }
+

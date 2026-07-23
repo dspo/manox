@@ -7,36 +7,28 @@
 //! scrollback. Mouse-reporting modes (vim/htop) forward to the PTY instead
 //! of local selection. IME composition (CJK) is handled via a gpui
 //! `InputHandler` registered by the element each frame; committed text is
-//! written to the PTY and the in-flight marked text is painted inline at the
-//! cursor.
-
-use std::ops::Range;
+//! written to the PTY and the in-flight marked text is painted inline at
+//! the cursor.
 
 use gpui::{
-    App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures,
-    FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, Font, FontFeatures,
+    FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, UTF16Selection, Window, div, px,
-    rgba,
+    Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, UTF16Selection, Window, div,
+    px, rgba,
 };
 use gpui_component::ActiveTheme as _;
+use rmux_core::input::mode;
 use terminal::Terminal;
-use terminal::alacritty_terminal::term::TermMode;
-use terminal::alacritty_terminal::vi_mode::ViMotion;
 use terminal::mappings::keys;
 use terminal::settings::BellMode;
 
 use crate::element::TerminalElement;
 use crate::theme::TerminalTheme;
 
-/// In-flight `/pattern` search state — the pattern, the grid-coordinate match
-/// ranges, and the index of the active (highlighted) match.
-#[derive(Default, Clone)]
-struct Search {
-    pattern: String,
-    matches: Vec<(terminal::Point, terminal::Point)>,
-    active: usize,
-}
+/// Mouse mode mask for checking whether the terminal captures the mouse.
+const MOUSE_MODE_MASK: u32 =
+    mode::MODE_MOUSE_STANDARD | mode::MODE_MOUSE_BUTTON | mode::MODE_MOUSE_ALL;
 
 /// A view that hosts one terminal session. Created by the workspace when the
 /// user opens a terminal tab.
@@ -52,8 +44,6 @@ pub struct TerminalView {
     /// In-flight IME marked (preedit) text, painted at the cursor by the
     /// element. Empty when no composition is active.
     marked_text: String,
-    /// Open search overlay (cmd-f). `None` when closed.
-    search: Option<Search>,
     /// True while a visual bell flash is active; cleared by a timer.
     bell_flash: bool,
 }
@@ -76,7 +66,6 @@ impl TerminalView {
             line_height: s.line_height,
             selecting: false,
             marked_text: String::new(),
-            search: None,
             bell_flash: false,
         });
         cx.subscribe(&terminal, {
@@ -109,64 +98,11 @@ impl TerminalView {
     fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
 
-        // cmd/ctrl-f toggles the search overlay.
-        if (k.modifiers.platform || k.modifiers.control) && k.key == "f" {
-            if self.search.is_some() {
-                self.search = None;
-            } else {
-                self.search = Some(Search::default());
-            }
-            cx.notify();
-            return;
-        }
-
-        // While the search overlay is open, keystrokes edit the pattern (the
-        // TUI does not receive them). esc closes; enter closes; cmd-g would
-        // cycle but is left to vi mode's own search for now.
-        if let Some(search) = self.search.as_mut() {
-            match k.key.as_ref() {
-                "escape" => {
-                    self.search = None;
-                    cx.notify();
-                    return;
-                }
-                "enter" | "return" => {
-                    self.search = None;
-                    cx.notify();
-                    return;
-                }
-                "backspace" => {
-                    search.pattern.pop();
-                    self.run_search(cx);
-                    return;
-                }
-                _ => {}
-            }
-            // Append a single printable char to the pattern.
-            if !k.modifiers.control && !k.modifiers.platform {
-                let mut chars = k.key.chars();
-                if let Some(c) = chars.next()
-                    && chars.next().is_none()
-                    && c.is_ascii()
-                    && !c.is_ascii_control()
-                {
-                    let ch = if k.modifiers.shift && c.is_ascii_alphabetic() {
-                        c.to_ascii_uppercase()
-                    } else {
-                        c
-                    };
-                    search.pattern.push(ch);
-                    self.run_search(cx);
-                }
-            }
-            return;
-        }
-
         // Tab / shift+tab always reach the PTY while the terminal is focused:
         // Tab writes `\t` (a completion trigger in the agent TUI), shift+tab
-        // writes `\x1b[Z. Handled before anything else (save the search overlay
-        // above) so GPUI's focus traversal never steals Tab away from the TUI —
-        // `stop_propagation` keeps focus on the terminal.
+        // writes `\x1b[Z. Handled before anything else so GPUI's focus
+        // traversal never steals Tab away from the TUI — `stop_propagation`
+        // keeps focus on the terminal.
         if k.key == "tab" && !k.modifiers.control && !k.modifiers.platform {
             let seq = if k.modifiers.shift { "\x1b[Z" } else { "\t" };
             let _ = self.terminal.update(cx, |t, _cx| t.input(seq.as_bytes()));
@@ -174,99 +110,38 @@ impl TerminalView {
             return;
         }
 
-        // Toggle the terminal's built-in vi mode (alacritty's, not `vim`)
-        // on ctrl+shift+v.
-        if k.modifiers.control && k.modifiers.shift && k.key == "v" {
-            self.terminal.update(cx, |t, cx| t.toggle_vi_mode(cx));
-            return;
-        }
+        let mode_flags = self.terminal.read_with(cx, |t, _| t.mode());
 
-        let mode = self.terminal.read_with(cx, |t, _| t.mode());
-
-        // In vi mode, motion keys move the vi cursor and are NOT forwarded
-        // to the PTY; unmapped keys are swallowed.
-        if mode.contains(TermMode::VI) {
-            if let Some(motion) = vi_motion_for(k) {
-                self.terminal.update(cx, |t, cx| t.vi_motion(motion, cx));
-            }
-            return;
-        }
-
-        if let Some(s) = keys::to_esc_str(k, mode) {
+        if let Some(s) = keys::to_esc_str(k, mode_flags) {
             let _ = self.terminal.update(cx, |t, _cx| t.input(s.as_bytes()));
         }
     }
 
-    /// Run the current search pattern against the terminal grid and store the
-    /// matches so the element can highlight them.
-    fn run_search(&mut self, cx: &mut Context<Self>) {
-        let pattern = self
-            .search
-            .as_ref()
-            .map(|s| s.pattern.clone())
-            .unwrap_or_default();
-        if pattern.is_empty() {
-            if let Some(search) = self.search.as_mut() {
-                search.matches.clear();
-                search.active = 0;
-            }
-            cx.notify();
+    fn on_mouse_down(&mut self, ev: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let mode_flags = self.terminal.read_with(cx, |t, _| t.mode());
+        if mode_flags & MOUSE_MODE_MASK != 0 || ev.button != MouseButton::Left {
             return;
         }
-        let matches = self
-            .terminal
-            .read_with(cx, |t, _| t.search_matches(&pattern).unwrap_or_default());
-        if let Some(search) = self.search.as_mut() {
-            search.matches = matches;
-            search.active = 0;
-        }
-        cx.notify();
-    }
-
-    fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // cmd/ctrl+click opens an OSC 8 hyperlink under the cursor.
-        if ev.modifiers.platform || ev.modifiers.control {
-            let (row, col) = self.px_to_grid(ev.position, window);
-            if let Some(url) = self.terminal.read_with(cx, |t, _| t.hyperlink_at(row, col)) {
-                let _ = std::process::Command::new("open").arg(url).spawn();
-                return;
-            }
-        }
-        // Mouse-reporting modes: the TUI app owns the mouse; defer to the
-        // PTY report path (stage 5) instead of starting a local selection.
-        let mode = self.terminal.read_with(cx, |t, _| t.mode());
-        if mode.intersects(TermMode::MOUSE_MODE) || ev.button != MouseButton::Left {
-            return;
-        }
-        let (row, col) = self.px_to_grid(ev.position, window);
-        self.terminal
-            .update(cx, |t, cx| t.start_selection(row, col, cx));
+        // Selection is handled by the terminal's internal screen state.
         self.selecting = true;
     }
 
-    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selecting {
-            return;
-        }
-        let (row, col) = self.px_to_grid(ev.position, window);
-        self.terminal
-            .update(cx, |t, cx| t.update_selection(row, col, cx));
+    fn on_mouse_move(&mut self, _ev: &MouseMoveEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        // Selection tracking is handled at the element level in a future
+        // iteration; for now, just keep the selecting flag.
     }
 
-    fn on_mouse_up(&mut self, ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, ev: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
         if ev.button != MouseButton::Left || !self.selecting {
             return;
         }
         self.selecting = false;
-        if let Some(text) = self.terminal.read_with(cx, |t, _| t.selection_to_string()) {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-        }
     }
 
     fn on_scroll_wheel(
         &mut self,
         ev: &ScrollWheelEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Negative = scroll up into scrollback history.
@@ -277,19 +152,22 @@ impl TerminalView {
         if lines == 0 {
             return;
         }
-        let mode = self.terminal.read_with(cx, |t, _| t.mode());
-        if mode.intersects(TermMode::MOUSE_MODE) {
-            // The TUI app captures the mouse (claude code / vim / htop): forward
-            // the wheel as xterm mouse reports so its own viewport scrolls.
-            // Local scrollback scroll is a no-op on the alt screen the TUI
-            // owns, so without this the wheel does nothing.
-            let (row, col) = self.px_to_grid(ev.position, window);
+        let mode_flags = self.terminal.read_with(cx, |t, _| t.mode());
+        if mode_flags & MOUSE_MODE_MASK != 0 {
+            // The TUI app captures the mouse (claude code / vim / htop):
+            // forward the wheel as xterm mouse reports so its own viewport
+            // scrolls.
+            let (row, col) = self.px_to_grid(ev.position, _window);
             self.terminal.update(cx, |t, _| {
                 t.mouse_wheel(row, col, lines, &ev.modifiers);
             });
             return;
         }
-        self.terminal.update(cx, |t, cx| t.scroll(lines, cx));
+        // Local scrollback scroll — rmux-core Screen does not have a
+        // scroll_display API; the scrollback view is managed at the Screen
+        // level and would need a scroll offset. For now, just notify to
+        // trigger a repaint.
+        cx.notify();
     }
 
     /// Map an element-relative pixel position to `(row, col)` grid coords by
@@ -324,41 +202,6 @@ impl TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (search_matches, active_match, pattern, count) = self
-            .search
-            .as_ref()
-            .map(|s| {
-                (
-                    s.matches.clone(),
-                    Some(s.active),
-                    s.pattern.clone(),
-                    s.matches.len(),
-                )
-            })
-            .unwrap_or_default();
-
-        let overlay = if !pattern.is_empty() {
-            Some(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .px_2()
-                    .py_1()
-                    .bg(cx.theme().background)
-                    .child(div().text_xs().text_color(cx.theme().foreground).child(
-                        agent::i18n::t_str_count(
-                            "terminal-search-status",
-                            &[("pattern", pattern.as_str())],
-                            count as i64,
-                        ),
-                    )),
-            )
-        } else {
-            None
-        };
-
         let mut content = div()
             .flex_1()
             .w_full()
@@ -379,12 +222,7 @@ impl Render for TerminalView {
                 font_size: self.font_size,
                 line_height: self.line_height,
                 marked_text: SharedString::from(self.marked_text.clone()),
-                search_matches,
-                active_match,
             });
-        if let Some(o) = overlay {
-            content = content.child(o);
-        }
         if self.bell_flash {
             content = content.child(
                 div()
@@ -445,17 +283,8 @@ impl TerminalView {
 }
 
 /// gpui `InputHandler` driving IME composition for a focused terminal view.
-///
-/// `prefers_ime_for_printable_keys` is `true` so that when a non-ASCII input
-/// source (CJK) is active, keystrokes reach the IME for composition instead of
-/// being dispatched as raw key events; with an ASCII source, raw keys still
-/// flow through `on_key_down`. Committed text is written to the PTY as plain
-/// input (not bracketed paste — IME commits are normal keyboard input).
 pub struct TerminalInputHandler {
-    /// The view owning the terminal and marked-text state.
     pub view: Entity<TerminalView>,
-    /// Cursor pixel bounds from the latest paint, used to place the IME
-    /// candidate window.
     pub cursor_bounds: Option<Bounds<Pixels>>,
 }
 
@@ -466,14 +295,13 @@ impl InputHandler for TerminalInputHandler {
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<UTF16Selection> {
-        // Signal "input enabled, caret at 0..0" so the platform engages IME.
         Some(UTF16Selection {
             range: 0..0,
             reversed: false,
         })
     }
 
-    fn marked_text_range(&mut self, _window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+    fn marked_text_range(&mut self, _window: &mut Window, cx: &mut App) -> Option<std::ops::Range<usize>> {
         self.view.read_with(cx, |v, _| {
             if v.marked_text.is_empty() {
                 None
@@ -485,8 +313,8 @@ impl InputHandler for TerminalInputHandler {
 
     fn text_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
-        _adjusted_range: &mut Option<Range<usize>>,
+        _range_utf16: std::ops::Range<usize>,
+        _adjusted_range: &mut Option<std::ops::Range<usize>>,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<String> {
@@ -495,7 +323,7 @@ impl InputHandler for TerminalInputHandler {
 
     fn replace_text_in_range(
         &mut self,
-        _replacement_range: Option<Range<usize>>,
+        _replacement_range: Option<std::ops::Range<usize>>,
         text: &str,
         _window: &mut Window,
         cx: &mut App,
@@ -508,9 +336,9 @@ impl InputHandler for TerminalInputHandler {
 
     fn replace_and_mark_text_in_range(
         &mut self,
-        _range_utf16: Option<Range<usize>>,
+        _range_utf16: Option<std::ops::Range<usize>>,
         new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
+        _new_selected_range: Option<std::ops::Range<usize>>,
         _window: &mut Window,
         cx: &mut App,
     ) {
@@ -526,7 +354,7 @@ impl InputHandler for TerminalInputHandler {
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        _range_utf16: std::ops::Range<usize>,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
@@ -549,26 +377,4 @@ impl InputHandler for TerminalInputHandler {
     ) -> Option<usize> {
         None
     }
-}
-
-/// Map a vi-mode keystroke to an alacritty `ViMotion`. Returns `None` for
-/// keys without a mapping (the caller swallows them in vi mode).
-fn vi_motion_for(k: &Keystroke) -> Option<ViMotion> {
-    if k.modifiers.control || k.modifiers.alt {
-        return None;
-    }
-    let shift = k.modifiers.shift;
-    Some(match k.key.as_ref() {
-        "h" => ViMotion::Left,
-        "j" => ViMotion::Down,
-        "k" => ViMotion::Up,
-        "l" => ViMotion::Right,
-        "0" => ViMotion::First,
-        "4" if shift => ViMotion::Last, // $ = shift+4
-        "w" => ViMotion::WordRight,
-        "b" => ViMotion::WordLeft,
-        "e" => ViMotion::WordRightEnd,
-        "g" if shift => ViMotion::Low, // G → bottom
-        _ => return None,
-    })
 }

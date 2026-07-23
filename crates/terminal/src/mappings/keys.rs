@@ -7,8 +7,8 @@
 //! kitty keyboard protocol flags are intentionally not honored (rare in
 //! TUI agents).
 
-use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
+use rmux_core::input::mode;
 
 /// xterm modifier code: `1 + shift + 2*alt + 4*control`. `1` means none.
 fn modifier_code(k: &Keystroke) -> u8 {
@@ -31,12 +31,12 @@ fn has_modifier(k: &Keystroke) -> bool {
 
 /// Translate a gpui keystroke into the byte sequence the PTY expects, or
 /// `None` if the keystroke produces no input (bare modifier press, unknown
-/// key).
-pub fn to_esc_str(k: &Keystroke, mode: TermMode) -> Option<String> {
+/// key). `mode` is the rmux-core mode flag bitmask.
+pub fn to_esc_str(k: &Keystroke, mode_flags: u32) -> Option<String> {
     if k.key.is_empty() {
         return None;
     }
-    let app_cursor = mode.contains(TermMode::APP_CURSOR);
+    let app_cursor = mode_flags & mode::MODE_KCURSOR != 0;
     let mod_code = modifier_code(k);
     let has_mod = has_modifier(k);
 
@@ -179,13 +179,13 @@ mod tests {
 
     #[test]
     fn arrow_normal_mode() {
-        let s = to_esc_str(&ks("up", Modifiers::default()), TermMode::NONE);
+        let s = to_esc_str(&ks("up", Modifiers::default()), 0);
         assert_eq!(s.as_deref(), Some("\x1b[A"));
     }
 
     #[test]
     fn arrow_app_cursor_mode() {
-        let s = to_esc_str(&ks("up", Modifiers::default()), TermMode::APP_CURSOR);
+        let s = to_esc_str(&ks("up", Modifiers::default()), mode::MODE_KCURSOR);
         assert_eq!(s.as_deref(), Some("\x1bOA"));
     }
 
@@ -195,7 +195,7 @@ mod tests {
             shift: true,
             ..Default::default()
         };
-        let s = to_esc_str(&ks("up", mods), TermMode::APP_CURSOR);
+        let s = to_esc_str(&ks("up", mods), mode::MODE_KCURSOR);
         // Modifier overrides app-cursor: \x1b[1;2A (2 = shift).
         assert_eq!(s.as_deref(), Some("\x1b[1;2A"));
     }
@@ -206,7 +206,7 @@ mod tests {
             control: true,
             ..Default::default()
         };
-        let s = to_esc_str(&ks("c", mods), TermMode::NONE);
+        let s = to_esc_str(&ks("c", mods), 0);
         assert_eq!(s.as_deref(), Some("\x03"));
     }
 
@@ -216,13 +216,13 @@ mod tests {
             alt: true,
             ..Default::default()
         };
-        let s = to_esc_str(&ks("a", mods), TermMode::NONE);
+        let s = to_esc_str(&ks("a", mods), 0);
         assert_eq!(s.as_deref(), Some("\x1ba"));
     }
 
     #[test]
     fn tab_writes_horizontal_tab() {
-        let s = to_esc_str(&ks("tab", Modifiers::default()), TermMode::NONE);
+        let s = to_esc_str(&ks("tab", Modifiers::default()), 0);
         assert_eq!(s.as_deref(), Some("\t"));
     }
 
@@ -232,7 +232,7 @@ mod tests {
             shift: true,
             ..Default::default()
         };
-        let s = to_esc_str(&ks("tab", mods), TermMode::NONE);
+        let s = to_esc_str(&ks("tab", mods), 0);
         assert_eq!(s.as_deref(), Some("\x1b[Z"));
     }
 }

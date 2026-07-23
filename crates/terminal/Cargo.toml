@@ -17,12 +17,14 @@ parking_lot.workspace = true
 uuid = { workspace = true }
 chrono = { workspace = true }
 
-# Terminal data-structure layer: alacritty_terminal's Term/Grid/Selection/vi
-# modules. Its EventLoop/mio/tty are unused — manox drives the PTY via
-# portable-pty and feeds bytes through `Processor::advance`, since `Term`
-# itself implements `vte::ansi::Handler`. vte is re-exported by alacritty.
-alacritty_terminal = { workspace = true }
-portable-pty = { workspace = true }
+# Terminal data-structure layer: rmux-core's Screen/Grid/VT-parser domain
+# model (pure in-memory, no OS/network deps). manox drives the Screen via
+# `InputParser::parse(buf, &mut screen)` — the parser delegates screen writes
+# through the `ScreenWriter` trait that `Screen` implements.
+rmux-core = { workspace = true }
+rmux-pty = { workspace = true }
+rmux-types = { workspace = true }
+rmux-proto = { workspace = true }
 
 gpui.workspace = true
 agent.workspace = true

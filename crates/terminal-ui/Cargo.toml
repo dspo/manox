@@ -16,6 +16,7 @@ gpui-component-assets.workspace = true
 serde.workspace = true
 tracing.workspace = true
 terminal.workspace = true
+rmux-core.workspace = true
 agent.workspace = true
 
 [lints.clippy]
