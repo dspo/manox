@@ -12,6 +12,26 @@ use gpui::{FontStyle, FontWeight, HighlightStyle};
 use markdown::mdast::{AlignKind, Node};
 use markdown::{ParseOptions, to_mdast};
 
+/// The kind of a clickable link span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkKind {
+    /// An explicit markdown `[text](url)` or auto-detected bare URL.
+    Url,
+    /// A filesystem path auto-detected in plain text.
+    FilePath,
+}
+
+/// A clickable span embedded in inline text, carrying the display range and the
+/// resolved link target.
+#[derive(Clone, Debug)]
+pub struct LinkSpan {
+    /// Byte range (into `InlineRuns::text`) of the display text.
+    pub range: Range<usize>,
+    /// The link target: URL or path string.
+    pub url: String,
+    pub kind: LinkKind,
+}
+
 /// A contiguous run of inline text with style overlays on top of the base
 /// font/color (which `RichText` inherits from `window.text_style()`).
 /// `code_ranges` marks inline-code segments that get a rounded wash behind the
@@ -22,6 +42,7 @@ pub struct InlineRuns {
     pub text: String,
     pub highlights: Vec<(Range<usize>, HighlightStyle)>,
     pub code_ranges: Vec<Range<usize>>,
+    pub link_spans: Vec<LinkSpan>,
 }
 
 /// Column alignment for table cells. The manox-owned mirror of mdast's
@@ -229,7 +250,179 @@ fn is_conflict(value: &str) -> bool {
 fn inline_of(children: &[Node]) -> InlineRuns {
     let mut runs = InlineRuns::default();
     collect_inline(children, ActiveStyle::default(), &mut runs);
+    linkify(&mut runs);
     runs
+}
+
+/// Scan plain text for bare URLs and file-system paths and record them as
+/// `LinkSpan`s. Skips byte ranges already covered by explicit markdown links
+/// (added by `collect_inline`) so auto-detection does not double-link text.
+fn linkify(runs: &mut InlineRuns) {
+    let text = &runs.text;
+    let mut covered: Vec<Range<usize>> = runs.link_spans.iter().map(|s| s.range.clone()).collect();
+    covered.sort_by_key(|r| r.start);
+
+    // Collect new spans, then push them in one go so the immutable borrow on
+    // `text` does not overlap with the mutable borrow on `runs.link_spans`.
+    let mut new_spans: Vec<LinkSpan> = Vec::new();
+
+    // --- URL detection: https?://... ---
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for `http://` or `https://`
+        let proto = if i + 7 < bytes.len() && &bytes[i..i + 7] == b"http://" {
+            7
+        } else if i + 8 < bytes.len() && &bytes[i..i + 8] == b"https://" {
+            8
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let url_start = i;
+        let mut url_end = i + proto;
+        while url_end < bytes.len() {
+            let b = bytes[url_end];
+            if b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b'<' | b'>' | b'"' | b'{' | b'}' | b'|' | b'\\' | b'`' | b'^' | b'\''
+                )
+            {
+                break;
+            }
+            url_end += 1;
+        }
+        // Backtrack trailing punctuation that is unlikely to be part of the URL.
+        while url_end > i + proto
+            && matches!(bytes[url_end - 1], b'.' | b',' | b';' | b':' | b')' | b'\'')
+        {
+            url_end -= 1;
+        }
+
+        if url_end > i + proto && !is_covered(url_start..url_end, &covered) {
+            let url = &text[url_start..url_end];
+            new_spans.push(LinkSpan {
+                range: url_start..url_end,
+                url: url.to_string(),
+                kind: LinkKind::Url,
+            });
+        }
+        i = url_end;
+    }
+
+    // --- File-path detection ---
+    linkify_paths(text, &covered, &mut new_spans);
+
+    runs.link_spans.extend(new_spans);
+}
+
+/// Whether `range` overlaps any span in `covered` (sorted, non-overlapping).
+fn is_covered(range: Range<usize>, covered: &[Range<usize>]) -> bool {
+    for cov in covered {
+        if cov.start < range.end && range.start < cov.end {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detect filesystem-path patterns in `text` and push matching `LinkSpan`s.
+///
+/// A path must:
+/// - Contain at least one `/` directory separator.
+/// - End with a recognised file extension (`.rs`, `.go`, …) or a line-number
+///   suffix (`:42`, `:42-100`).
+/// - Start at a word boundary: after whitespace, `(`, `[`, `"`, or at position 0.
+fn linkify_paths(text: &str, covered: &[Range<usize>], out: &mut Vec<LinkSpan>) {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Advance to a potential path start: after whitespace / delimiter.
+        let is_boundary = i == 0
+            || matches!(
+                bytes[i - 1],
+                b' ' | b'\t' | b'\n' | b'(' | b'[' | b'"' | b'\''
+            );
+        if !is_boundary {
+            // Also allow paths starting with `/` or `./` or `../` even mid-text.
+            if !(bytes[i] == b'/'
+                || (i + 1 < len && bytes[i] == b'.' && bytes[i + 1] == b'/')
+                || (i + 2 < len
+                    && bytes[i] == b'.'
+                    && bytes[i + 1] == b'.'
+                    && bytes[i + 2] == b'/'))
+            {
+                i += 1;
+                continue;
+            }
+        }
+
+        // Collect the candidate span character by character.
+        let maybe = collect_path_candidate(bytes, i);
+        if maybe.is_none() {
+            i += 1;
+            continue;
+        }
+        let end = maybe.unwrap();
+
+        if is_path_like(&text[i..end]) && !is_covered(i..end, covered) {
+            out.push(LinkSpan {
+                range: i..end,
+                url: text[i..end].to_string(),
+                kind: LinkKind::FilePath,
+            });
+        }
+        i = end;
+    }
+}
+
+/// Collect a maximal run of path-safe characters starting at `pos`.
+/// Returns `Some(end)` or `None` if the candidate is trivially not a path.
+fn collect_path_candidate(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut end = pos;
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@' | b'/' | b':') {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    // Must span at least one `/` to be a path.
+    if !bytes[pos..end].contains(&b'/') {
+        return None;
+    }
+    Some(end)
+}
+
+/// Check whether a candidate string looks like a filesystem path: contains at
+/// least one `/` and ends with either a known extension or a `:NN` line-number
+/// suffix.
+fn is_path_like(s: &str) -> bool {
+    if !s.contains('/') {
+        return false;
+    }
+    // Line-number suffix: `:42` or `:42-100`.
+    if let Some(colon) = s.rfind(':') {
+        let after = &s[colon + 1..];
+        if after.chars().all(|c| c.is_ascii_digit() || c == '-')
+            && after.contains(|c: char| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    // Known file extension heuristic.
+    if let Some(dot) = s.rfind('.') {
+        let ext = &s[dot + 1..];
+        let ext_len = ext.len();
+        if (1..=10).contains(&ext_len) && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Cumulative inline formatting at the current recursion depth. One range is
@@ -302,9 +495,16 @@ fn collect_inline(children: &[Node], active: ActiveStyle, runs: &mut InlineRuns)
                 collect_inline(&d.children, a, runs);
             }
             Node::Link(l) => {
-                // Link text inherits surrounding style; underline/color arrives
-                // with the selection layer (which owns hovered-link state).
+                let start = runs.text.len();
                 collect_inline(&l.children, active, runs);
+                let end = runs.text.len();
+                if end > start {
+                    runs.link_spans.push(LinkSpan {
+                        range: start..end,
+                        url: l.url.clone(),
+                        kind: LinkKind::Url,
+                    });
+                }
             }
             Node::Image(i) => {
                 runs.text.push_str(&i.alt);
@@ -472,5 +672,89 @@ mod tests {
             );
             prev_end = range.end;
         }
+    }
+
+    #[test]
+    fn explicit_link_preserves_url() {
+        let blocks = parse("see [manox](https://github.com/dspo/manox) repo");
+        let runs = match blocks.first() {
+            Some(Block::Paragraph(r)) => r.clone(),
+            _ => panic!("expected paragraph"),
+        };
+        assert_eq!(runs.link_spans.len(), 1);
+        assert_eq!(runs.link_spans[0].url, "https://github.com/dspo/manox");
+        assert_eq!(runs.link_spans[0].kind, LinkKind::Url);
+        assert_eq!(&runs.text[runs.link_spans[0].range.clone()], "manox");
+    }
+
+    #[test]
+    fn auto_detects_bare_url() {
+        let blocks = parse("Visit https://example.com/path for details.");
+        let runs = match blocks.first() {
+            Some(Block::Paragraph(r)) => r.clone(),
+            _ => panic!("expected paragraph"),
+        };
+        assert_eq!(runs.link_spans.len(), 1);
+        assert_eq!(runs.link_spans[0].url, "https://example.com/path");
+        assert_eq!(runs.link_spans[0].kind, LinkKind::Url);
+    }
+
+    #[test]
+    fn bare_urls_are_not_double_linked_with_explicit_links() {
+        let blocks = parse("[click](https://a.com) and https://a.com again");
+        let runs = match blocks.first() {
+            Some(Block::Paragraph(r)) => r.clone(),
+            _ => panic!("expected paragraph"),
+        };
+        // Explicit link "click" + bare URL "https://a.com" = 2 spans.
+        // The bare URL portion of the explicit link's text is not double-linked.
+        assert_eq!(runs.link_spans.len(), 2);
+    }
+
+    #[test]
+    fn auto_detects_file_path_with_extension() {
+        let blocks = parse("see crates/agent/src/thread.rs for details");
+        let runs = match blocks.first() {
+            Some(Block::Paragraph(r)) => r.clone(),
+            _ => panic!("expected paragraph"),
+        };
+        assert_eq!(runs.link_spans.len(), 1);
+        assert_eq!(runs.link_spans[0].url, "crates/agent/src/thread.rs");
+        assert_eq!(runs.link_spans[0].kind, LinkKind::FilePath);
+    }
+
+    #[test]
+    fn auto_detects_file_path_with_line_number() {
+        let blocks = parse("see crates/agent/src/thread.rs:508 for the field");
+        let runs = match blocks.first() {
+            Some(Block::Paragraph(r)) => r.clone(),
+            _ => panic!("expected paragraph"),
+        };
+        assert_eq!(runs.link_spans.len(), 1);
+        assert_eq!(runs.link_spans[0].url, "crates/agent/src/thread.rs:508");
+        assert_eq!(runs.link_spans[0].kind, LinkKind::FilePath);
+    }
+
+    #[test]
+    fn absolute_path_detected() {
+        let blocks = parse("file at /Users/me/project/src/main.rs is interesting");
+        let runs = match blocks.first() {
+            Some(Block::Paragraph(r)) => r.clone(),
+            _ => panic!("expected paragraph"),
+        };
+        assert_eq!(runs.link_spans.len(), 1);
+        assert_eq!(runs.link_spans[0].url, "/Users/me/project/src/main.rs");
+        assert_eq!(runs.link_spans[0].kind, LinkKind::FilePath);
+    }
+
+    #[test]
+    fn bare_filename_without_directory_is_not_a_path() {
+        let blocks = parse("see README.md for instructions");
+        let runs = match blocks.first() {
+            Some(Block::Paragraph(r)) => r.clone(),
+            _ => panic!("expected paragraph"),
+        };
+        // "README.md" has no `/`, so it is not detected as a path.
+        assert!(runs.link_spans.is_empty());
     }
 }

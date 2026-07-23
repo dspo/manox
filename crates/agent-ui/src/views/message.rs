@@ -44,6 +44,7 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use manox_components::markdown::ast::LinkKind;
 use manox_components::markdown::terminal_panel::GitSummary;
 use manox_components::markdown::{HeadingMode, Markdown, PanelKind, TerminalPanel};
 use manox_components::turn_frame::TurnFrame;
@@ -159,11 +160,18 @@ impl MessageItem {
                 _ => false,
             };
             let id = self.id;
+            let cwd = std::env::current_dir().ok();
             self.markdown = Some(cx.new(|cx| {
                 Markdown::new(("md", id), "")
                     .theme(cx.theme())
                     .heading_mode(HeadingMode::Uniform)
                     .streaming(streaming)
+                    .on_open_link(Some(Arc::new(move |url, kind| match kind {
+                        LinkKind::Url => {
+                            let _ = open::that(&url);
+                        }
+                        LinkKind::FilePath => open_file_in_vscode(&url, cwd.as_deref()),
+                    })))
             }));
         }
         self.markdown.clone()
@@ -1510,6 +1518,52 @@ fn activity_summary_text(s: &crate::conversation::ActivitySummary) -> Option<Str
 /// input, so editing the same file twice reports "edited 1 file"; `bash`
 /// counts command invocations. Categories with zero calls are omitted.
 /// Trailing "…" mirrors the Claude Code "still working" cadence.
+/// Open a file path in VS Code. Strips `:line` and `:line-end` suffixes
+/// from the path string and passes them as `--goto file:line` arguments.
+/// Falls back to `open -a "Visual Studio Code"` if the `code` CLI is not
+/// available.
+fn open_file_in_vscode(raw: &str, cwd: Option<&Path>) {
+    // Strip line-number suffix: `:42` or `:42-100`.
+    let (file, line) = if let Some(colon) = raw.rfind(':') {
+        let after = &raw[colon + 1..];
+        if after.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            (PathBuf::from(&raw[..colon]), Some(after.to_string()))
+        } else {
+            (PathBuf::from(raw), None)
+        }
+    } else {
+        (PathBuf::from(raw), None)
+    };
+
+    let resolved = if file.is_absolute() {
+        file
+    } else if let Some(cwd) = cwd {
+        cwd.join(&file)
+    } else {
+        file
+    };
+
+    // Build --goto argument if we have a resolved path with an optional line.
+    let goto = if let Some(ln) = &line {
+        format!("{}:{}", resolved.display(), ln)
+    } else {
+        resolved.display().to_string()
+    };
+
+    // Try `code --goto <path>:<line>` first.
+    let result = std::process::Command::new("code")
+        .arg("--goto")
+        .arg(&goto)
+        .spawn();
+    if result.is_err() {
+        // Fall back to `open -a "Visual Studio Code"` on macOS.
+        let _ = std::process::Command::new("open")
+            .arg("-a")
+            .arg("Visual Studio Code")
+            .arg(&goto)
+            .spawn();
+    }
+}
 #[cfg(test)]
 fn thinking_summary(entries: &[ActivityEntry]) -> String {
     use std::collections::BTreeSet;

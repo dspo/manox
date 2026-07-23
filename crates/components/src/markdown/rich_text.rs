@@ -22,6 +22,7 @@ use gpui::{
     TextLayout, Window, fill, point, px, quad, size, transparent_black,
 };
 
+use crate::markdown::ast::LinkSpan;
 use crate::markdown::selection::{BlockHit, DocSelection};
 
 /// One rounded-wash span: a byte range, a fill color, and a corner radius.
@@ -47,6 +48,11 @@ pub struct RichText {
     selection: DocSelection,
     selection_bg: Hsla,
     join_before: &'static str,
+    /// Link spans detected in this block's text, registered in `BlockHit` so
+    /// the document container can resolve Cmd+click to a link target.
+    link_spans: Vec<LinkSpan>,
+    /// Color of the underline painted under link spans.
+    link_color: Hsla,
 }
 
 impl RichText {
@@ -59,6 +65,8 @@ impl RichText {
             selection,
             selection_bg: Hsla::default(),
             join_before: "\n\n",
+            link_spans: Vec::new(),
+            link_color: Hsla::default(),
         }
     }
 
@@ -83,6 +91,19 @@ impl RichText {
     /// `"\n\n"` for a block boundary. Defaults to `"\n\n"`.
     pub fn join_before(mut self, sep: &'static str) -> Self {
         self.join_before = sep;
+        self
+    }
+
+    /// Link spans to register for Cmd+click hit-testing and to paint as
+    /// underlined text.
+    pub fn link_spans(mut self, spans: Vec<LinkSpan>) -> Self {
+        self.link_spans = spans;
+        self
+    }
+
+    /// Color of the underline painted under link spans.
+    pub fn link_color(mut self, color: Hsla) -> Self {
+        self.link_color = color;
         self
     }
 }
@@ -160,6 +181,7 @@ impl Element for RichText {
                 .iter()
                 .map(|span| span.range.clone())
                 .collect(),
+            link_spans: self.link_spans.clone(),
         });
 
         // 1. Rounded code-span washes, painted behind the glyphs.
@@ -174,12 +196,6 @@ impl Element for RichText {
         //    virtual-document range shifted by `doc_start`.
         let block_len = layout.len();
         if let Some((s, e)) = self.selection.range() {
-            // Local byte indices are the document selection's endpoints shifted
-            // by this block's `doc_start`. A selection that ends before this
-            // block (e.g. a drag started in a later block, or ended in an
-            // earlier one) would underflow a bare `e - doc_start`, so clamp
-            // both ends with `saturating_sub`; the `lo < hi` guard then skips
-            // the block with no selection slice to paint.
             let lo = s.saturating_sub(self.doc_start).min(block_len);
             let hi = e.saturating_sub(self.doc_start).min(block_len);
             if lo < hi {
@@ -189,7 +205,22 @@ impl Element for RichText {
             }
         }
 
-        // 3. Text on top. `StyledText::paint` draws the glyph runs; since none
+        // 3. Link underlines, painted behind the glyphs. Each link span gets a
+        //    1px underline at the font baseline.
+        if self.link_color.a > 0.0 {
+            for link in &self.link_spans {
+                for quad_bounds in span_quads(&layout, link.range.start, link.range.end, px(0.)) {
+                    let y = quad_bounds.bottom() - px(2.);
+                    let underline = gpui::Bounds::new(
+                        point(quad_bounds.left(), y),
+                        size(quad_bounds.size.width, px(1.)),
+                    );
+                    window.paint_quad(fill(underline, self.link_color));
+                }
+            }
+        }
+
+        // 4. Text on top. `StyledText::paint` draws the glyph runs; since none
         //    carry a `background_color`, no flat wash is painted over the
         //    overlays above.
         styled.paint(None, inspector_id, bounds, &mut (), &mut (), window, _cx);

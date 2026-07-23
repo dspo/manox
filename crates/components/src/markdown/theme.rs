@@ -34,6 +34,8 @@ pub struct MdStyles {
     pub inline_code_radius: Pixels,
     /// Flat wash behind selected glyphs in selectable code/diff blocks.
     pub selection_bg: Hsla,
+    /// Underline color for clickable link spans.
+    pub link_color: Hsla,
 }
 
 impl MdStyles {
@@ -58,6 +60,7 @@ impl MdStyles {
             // background; a fixed blue keeps the drag highlight legible across
             // light/dark themes.
             selection_bg: hsla(211.0 / 360.0, 0.85, 0.6, 0.4),
+            link_color: theme.accent,
         }
     }
 }
