@@ -2,21 +2,19 @@
 //!
 //! The strategy is chosen by provider capability (`PromptCachingPolicy`):
 //! - `Full`: system last block + last tool + messages[-2] + messages[-1], up to
-//!   4 breakpoints. For providers that honor all breakpoints (real Anthropic etc.).
-//! - `LastBreakpointOnly`: last tool only (stable prefix system+tools). For
-//!   providers that only respect the last breakpoint (third-party Anthropic
-//!   compatible endpoints) — placing a breakpoint on messages[-1] (which
-//!   changes every turn) causes a rewrite every turn with zero reads (net
-//!   negative); placing only the tool breakpoint yields reads every turn with
-//!   zero creation.
+//!   4 breakpoints. The last-message breakpoint is read on the next turn
+//!   within its 5min TTL, so the conversation prefix is cached rather than
+//!   re-processed each turn.
+//! - `LastBreakpointOnly`: last tool only. Retained as an explicit opt-out for
+//!   a misbehaving endpoint that rejects multi-breakpoint layouts.
 //! - `None`: no caching.
 //!
-//! The default policy is decided by `resolve_prompt_caching_policy` against the
-//! endpoint host: an explicit `prompt_caching` config value wins; otherwise
-//! `api.anthropic.com` → Full, anything else → LastBreakpointOnly (conservative;
-//! third-party anthropic-compatible endpoints often have breakpoint
-//! restrictions). This mirrors the philosophy of "full config for the
-//! official endpoint, conservative for third parties".
+//! The default policy is `Full` for any endpoint: explicit `prompt_caching`
+//! config wins; otherwise `Full`. Third-party anthropic-compatible endpoints
+//! tolerate (or silently ignore) `cache_control`, and the last-message
+//! breakpoint is net positive (read within TTL), so caching is not gated on
+//! the host. Set `MANOX_PROMPT_CACHING=last_breakpoint` to opt a misbehaving
+//! endpoint out of the multi-breakpoint layout.
 
 use serde_json::{Value, json};
 
@@ -46,7 +44,8 @@ pub enum PromptCachingPolicy {
     None,
     /// Full 4-breakpoint layout: system last block + last tool + messages[-2] + messages[-1].
     Full,
-    /// Last tool breakpoint only (stable prefix system+tools).
+    /// Last tool breakpoint only. Explicit opt-out for endpoints that reject
+    /// the multi-breakpoint layout; not the default.
     LastBreakpointOnly,
 }
 
@@ -63,22 +62,22 @@ impl PromptCachingPolicy {
 }
 
 /// Resolve the policy from provider capability: explicit config `prompt_caching`
-/// wins; otherwise by `base_url` host — `api.anthropic.com` → Full (maxed out),
-/// anything else → LastBreakpointOnly (conservative). `base_url` of `None` is
-/// treated conservatively.
+/// wins; otherwise `Full` for any endpoint. Third-party anthropic-compatible
+/// endpoints tolerate (or silently ignore) `cache_control` breakpoints, and
+/// the last-message breakpoint is read on the next turn within its 5min TTL —
+/// net positive, not negative. `LastBreakpointOnly` is retained only as an
+/// explicit opt-out for a misbehaving endpoint via
+/// `MANOX_PROMPT_CACHING=last_breakpoint`.
 pub fn resolve_prompt_caching_policy(
     prompt_caching: Option<&str>,
-    base_url: Option<&str>,
+    _base_url: Option<&str>,
 ) -> PromptCachingPolicy {
     if let Some(s) = prompt_caching
         && let Some(p) = PromptCachingPolicy::parse(s)
     {
         return p;
     }
-    match endpoint_host(base_url).as_deref() {
-        Some("api.anthropic.com") => PromptCachingPolicy::Full,
-        _ => PromptCachingPolicy::LastBreakpointOnly,
-    }
+    PromptCachingPolicy::Full
 }
 
 /// Whether long (1h) TTL is appropriate: only on real Anthropic, i.e. the `Full`
@@ -385,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_policy_config_overrides_base_url() {
+    fn resolve_policy_config_overrides_default() {
         assert_eq!(
             resolve_prompt_caching_policy(Some("full"), Some("https://dashscope/v1")),
             PromptCachingPolicy::Full
@@ -394,10 +393,19 @@ mod tests {
             resolve_prompt_caching_policy(Some("none"), Some("https://api.anthropic.com")),
             PromptCachingPolicy::None
         );
+        assert_eq!(
+            resolve_prompt_caching_policy(
+                Some("last_breakpoint"),
+                Some("https://dashscope.aliyuncs.com/apps/anthropic")
+            ),
+            PromptCachingPolicy::LastBreakpointOnly
+        );
     }
 
     #[test]
-    fn resolve_policy_default_by_base_url() {
+    fn resolve_policy_default_is_full() {
+        // Default is Full for any endpoint, including third-party
+        // anthropic-compatible hosts and missing base URLs.
         assert_eq!(
             resolve_prompt_caching_policy(None, Some("https://api.anthropic.com")),
             PromptCachingPolicy::Full
@@ -407,16 +415,16 @@ mod tests {
                 None,
                 Some("https://dashscope.aliyuncs.com/apps/anthropic")
             ),
-            PromptCachingPolicy::LastBreakpointOnly
+            PromptCachingPolicy::Full
         );
         assert_eq!(
             resolve_prompt_caching_policy(None, None),
-            PromptCachingPolicy::LastBreakpointOnly
+            PromptCachingPolicy::Full
         );
     }
 
     #[test]
-    fn resolve_policy_unknown_config_falls_back_to_base_url() {
+    fn resolve_policy_unknown_config_falls_back_to_default() {
         assert_eq!(
             resolve_prompt_caching_policy(Some("garbage"), Some("https://api.anthropic.com")),
             PromptCachingPolicy::Full

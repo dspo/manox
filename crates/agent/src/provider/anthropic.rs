@@ -37,8 +37,10 @@ pub struct AnthropicModel {
     /// eligible for the long (1h) cache TTL + the extended-cache-ttl beta header.
     long_ttl: bool,
     /// Explicit prompt-caching policy override from the provider/model `env`
-    /// field (`MANOX_PROMPT_CACHING`). `None` falls back to host-based
-    /// detection (api.anthropic.com → Full, else LastBreakpointOnly).
+    /// field (`MANOX_PROMPT_CACHING`). `None` defaults to `Full` for any
+    /// endpoint (third-party anthropic-compatible hosts tolerate the
+    /// `cache_control` breakpoints); `last_breakpoint` opts a misbehaving
+    /// endpoint out of the multi-breakpoint layout.
     prompt_caching: Option<String>,
     /// Whether the model accepts `output_config.effort` (Opus 4.5+ / Sonnet
     /// 4.6+ / Fable 5 / Mythos 5). Older Claude and non-Claude models on an
@@ -72,8 +74,10 @@ pub struct AnthropicModelConfig {
     pub auto_compact_window: Option<u64>,
     pub visible_agents: Vec<String>,
     /// Explicit prompt-caching policy override from the provider/model `env`
-    /// field (`MANOX_PROMPT_CACHING`). `None` falls back to host-based
-    /// detection (api.anthropic.com → Full, else LastBreakpointOnly).
+    /// field (`MANOX_PROMPT_CACHING`). `None` defaults to `Full` for any
+    /// endpoint (third-party anthropic-compatible hosts tolerate the
+    /// `cache_control` breakpoints); `last_breakpoint` opts a misbehaving
+    /// endpoint out of the multi-breakpoint layout.
     pub prompt_caching: Option<String>,
 }
 
@@ -1008,7 +1012,7 @@ mod tests {
     // (per the configured glm-5.2[1m] anthropic model). They answer four
     // questions about how Bailian's anthropic-compatible endpoint treats
     // explicit `cache_control` breakpoints:
-    //   1. Does a breakpoint on the last *tool* (manox's current
+    //   1. Does a breakpoint on the last *tool* (the
     //      LastBreakpointOnly policy output) produce a cache_read on the second
     //      identical-prefix request?
     //   2. Does a breakpoint on the *system* block (Bailian's documented
@@ -1110,10 +1114,10 @@ mod tests {
         (input, creation, read)
     }
 
-    /// Probe 1: manox's current LastBreakpointOnly policy places the breakpoint
-    /// on the last *tool* and leaves `system` a bare string (no cache_control).
-    /// Does Bailian honor a tool-block breakpoint — i.e. does the second
-    /// identical-prefix request show cache_read > 0?
+    /// Probe 1: the `LastBreakpointOnly` policy places the breakpoint on the
+    /// last *tool* and leaves `system` a bare string (no cache_control). Does
+    /// Bailian honor a tool-block breakpoint — i.e. does the second identical
+    /// prefix request show cache_read > 0?
     #[tokio::test]
     async fn live_anthropic_cache_last_tool_breakpoint() {
         let Some((url, key, model)) = bailian_anthropic_endpoint().await else {
