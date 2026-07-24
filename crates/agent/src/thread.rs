@@ -1627,8 +1627,8 @@ impl Thread {
     }
 
     /// Persist an Active Goal's idle waiting interval before a lifecycle gate
-    /// such as Plan or Pause stops its clock.
-    fn flush_idle_goal_accounting(&mut self, cx: &mut Context<Self>) -> Result<()> {
+    /// such as Pause stops its clock.
+    pub(crate) fn flush_idle_goal_accounting(&mut self, cx: &mut Context<Self>) -> Result<()> {
         if self.running_turn.is_some() {
             return Ok(());
         }
@@ -3047,8 +3047,7 @@ impl Thread {
         // lights up during the warm-up gap. `ThreadStore::set_running` (called
         // by the workspace on this event) is the bridge to the sidebar.
         self.turn_started_at = Some(Instant::now());
-        if self.running_turn.is_some()
-            && let Some(goal) = self.goal().filter(|goal| goal.status == GoalStatus::Active)
+        if let Some(goal) = self.goal().filter(|goal| goal.status == GoalStatus::Active)
             && self
                 .goal_turn_anchor
                 .as_ref()
@@ -7882,9 +7881,11 @@ mod tests {
                 assert!(thread.goal_turn_anchor.is_some());
                 thread.goal_turn_anchor.as_mut().unwrap().1 =
                     std::time::Instant::now() - std::time::Duration::from_secs(2);
+                thread.flush_idle_goal_accounting(cx).unwrap();
                 assert_eq!(thread.goal().unwrap().status, GoalStatus::Active);
                 assert!(thread.goal().unwrap().time_used_seconds >= 2);
                 assert!(thread.goal_turn_anchor.is_none());
+                thread.try_start_turn_if_idle(cx);
                 assert!(thread.goal_turn_anchor.is_some());
                 assert!(!thread.is_running());
                 registered
@@ -8133,6 +8134,7 @@ mod tests {
                 let new_id = thread.goal().unwrap().goal_id.clone();
                 assert_ne!(old_id, new_id);
                 thread.goal_runtime.release_continuation(&old_id);
+                thread.goal_runtime.release_continuation(&new_id);
                 assert!(thread.goal_runtime.reserve_continuation(&new_id));
                 thread.goal_runtime.release_continuation(&new_id);
 
