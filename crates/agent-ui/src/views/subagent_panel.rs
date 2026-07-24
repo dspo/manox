@@ -49,10 +49,12 @@ pub(crate) fn status_indicator(status: ToolCallStatus, theme: &Theme) -> AnyElem
             .xsmall()
             .color(theme.accent)
             .into_any_element(),
-        ToolCallStatus::Success | ToolCallStatus::Continued => Icon::new(IconName::CircleCheck)
-            .xsmall()
-            .text_color(theme.success)
-            .into_any_element(),
+        ToolCallStatus::Success | ToolCallStatus::Continued => {
+            Icon::default().path("icons/circle-check-big.svg")
+                .xsmall()
+                .text_color(theme.success)
+                .into_any_element()
+        }
         ToolCallStatus::Error | ToolCallStatus::Denied => Icon::new(IconName::CircleX)
             .xsmall()
             .text_color(theme.danger)

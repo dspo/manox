@@ -103,4 +103,17 @@ mod tests {
             assert!(LocalAssets::get(path).is_some(), "missing {path}");
         }
     }
+
+    #[test]
+    fn embeds_custom_icon_overrides() {
+        // Icons not shipped by gpui-component-assets; layered in via
+        // ExtrasAssetSource so call sites can use Icon::default().path(…).
+        for path in [
+            "icons/circle-check-big.svg",
+            "icons/download.svg",
+            "icons/ship-wheel.svg",
+        ] {
+            assert!(LocalAssets::get(path).is_some(), "missing {path}");
+        }
+    }
 }

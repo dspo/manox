@@ -567,6 +567,35 @@ impl ContextRail {
         block.into_any_element()
     }
 
+
+/// Status indicator for the Captain (main agent) row.
+/// The Captain uses `ship-wheel` for the completed state, distinguishing it
+/// from sub-agents that use `circle-check-big`.
+fn captain_status_indicator(status: agent::ToolCallStatus, theme: &Theme) -> AnyElement {
+    use agent::ToolCallStatus;
+    match status {
+        ToolCallStatus::PendingApproval | ToolCallStatus::Running => {
+            crate::views::braille_spinner::BrailleSpinner::new()
+                .xsmall()
+                .color(theme.accent)
+                .into_any_element()
+        }
+        ToolCallStatus::Success | ToolCallStatus::Continued => Icon::default()
+            .path("icons/ship-wheel.svg")
+            .xsmall()
+            .text_color(theme.success)
+            .into_any_element(),
+        ToolCallStatus::Error | ToolCallStatus::Denied => Icon::new(IconName::CircleX)
+            .xsmall()
+            .text_color(theme.danger)
+            .into_any_element(),
+        ToolCallStatus::Cancelled => Icon::new(IconName::Minus)
+            .xsmall()
+            .text_color(theme.muted_foreground)
+            .into_any_element(),
+    }
+}
+
     fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         fn append_children(
             parent_id: Option<&str>,
@@ -632,7 +661,7 @@ impl ContextRail {
                 .py_0p5()
                 .gap_1p5()
                 .items_center()
-                .child(status_indicator(main_status, theme))
+                .child(Self::captain_status_indicator(main_status, theme))
                 .child(
                     gpui::div()
                         .text_xs()

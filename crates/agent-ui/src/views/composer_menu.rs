@@ -27,6 +27,9 @@ use gpui_component::{
 /// [`menu_row_item`]).
 struct MenuRow {
     icon: IconName,
+    /// Custom SVG path when the icon is not in the `IconName` enum
+    /// (layered via `ExtrasAssetSource`). When set, this overrides `icon`.
+    icon_path: Option<&'static str>,
     name: &'static str,
     desc: &'static str,
 }
@@ -38,66 +41,75 @@ struct MenuRow {
 const PLUS_ADD_ROWS: &[MenuRow] = &[
     MenuRow {
         icon: IconName::Folder,
+        icon_path: None,
         name: "composer-add-files",
         desc: "",
     },
     MenuRow {
         icon: IconName::SquareTerminal,
+        icon_path: None,
         name: "composer-attach-editor",
         desc: "",
     },
     MenuRow {
         icon: IconName::CircleCheck,
+        icon_path: Some("circle-check-big.svg"),
         name: "composer-goal-name",
         desc: "composer-goal-desc",
     },
 ];
 
 /// `+` menu "Plugins" group — all static decoration. Literal English product
-/// names (not localized); `i18n::t` returns them unchanged via the missing-key
-/// fallback, which is fine since they are proper nouns.
 const PLUS_PLUGIN_ROWS: &[MenuRow] = &[
     MenuRow {
         icon: IconName::File,
+        icon_path: None,
         name: "Documents",
         desc: "Create and edit document artifacts",
     },
     MenuRow {
         icon: IconName::File,
+        icon_path: None,
         name: "PDF",
         desc: "Read, create, and verify PDF files",
     },
     MenuRow {
         icon: IconName::File,
+        icon_path: None,
         name: "Spreadsheets",
         desc: "Create and edit spreadsheet files",
     },
     MenuRow {
         icon: IconName::File,
+        icon_path: None,
         name: "Presentations",
         desc: "Create and edit presentations",
     },
     MenuRow {
         icon: IconName::File,
+        icon_path: None,
         name: "Template Creator",
         desc: "Create or update personal artifact templates",
     },
 ];
-
 /// Render one menu row (icon + name + muted description) as a popup-menu element
-/// item. `name`/`desc` are resolved through `i18n::t`: fluent keys yield the
-/// localized text, literal English placeholders fall through unchanged.
 fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
     let fg = theme.foreground;
     let muted = theme.muted_foreground;
     let icon = row.icon.clone();
+    let icon_path = row.icon_path;
     let name = i18n::t(row.name);
     let desc = i18n::t(row.desc);
     PopupMenuItem::element(move |_window, _cx| {
+        let icon_el: Icon = if let Some(path) = icon_path {
+            Icon::default().path(format!("icons/{path}"))
+        } else {
+            Icon::new(icon.clone())
+        };
         let mut line = h_flex()
             .items_center()
             .gap_2()
-            .child(Icon::new(icon.clone()).small().text_color(muted))
+            .child(icon_el.small().text_color(muted))
             .child(gpui::div().text_sm().text_color(fg).child(name.clone()));
         if !desc.is_empty() {
             line = line.child(gpui::div().text_xs().text_color(muted).child(desc.clone()));
