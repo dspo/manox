@@ -1036,7 +1036,7 @@ fn build_usage_tooltip(
             .child(opt_tree_row(
                 "Projection",
                 &format!(
-                    "Sent {} Baseline {} Saved {}",
+                    "Sent {} Baseline {} Saved -{}",
                     tokens(m.projected_tokens),
                     tokens(m.estimated_baseline_tokens),
                     tokens(m.saved_tokens)
@@ -1064,7 +1064,7 @@ fn build_usage_tooltip(
                     m.active_tool_schemas, m.total_tool_schemas
                 )];
                 if m.discovery_saved_tokens > 0 {
-                    parts.push(format!("Discovery {}", tokens(m.discovery_saved_tokens)));
+                    parts.push(format!("Discovery -{}", tokens(m.discovery_saved_tokens)));
                 }
                 opt_tree_row("Tools", &parts.join(" "), false, muted)
             })
