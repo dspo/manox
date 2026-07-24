@@ -1598,6 +1598,16 @@ impl ConversationState {
                 ApplyOutcome::RemeasureAndAppend { remeasure_ix } => {
                     ApplyOutcome::RemeasureAndAppend { remeasure_ix }
                 }
+                // A plain `Appended` (no segment mutated) + a popped retry
+                // means the new tail item occupies the popped retry's slot
+                // (count net-0, no splice). Its cached height is the retry
+                // badge's, so remeasure the tail to correct it on this frame
+                // rather than leaving a one-frame vertical overlap until the
+                // next event's remeasure.
+                ApplyOutcome::Appended => {
+                    let tail = self.items.len().saturating_sub(1);
+                    ApplyOutcome::Remeasure(tail)
+                }
                 _ => ApplyOutcome::RemovedTail,
             }
         } else {
@@ -2037,6 +2047,67 @@ mod tests {
                     cx,
                 );
                 assert!(matches!(outcome, ApplyOutcome::Appended));
+                assert_eq!(c.items().len(), 1);
+            });
+        });
+    }
+
+    /// When a trailing `Retry` badge is popped and the following event pushes a
+    /// new tail item with no segment mutation (plain `Appended`), the popped
+    /// retry's slot is reused (count net-0, no splice) and the new item would
+    /// inherit the retry badge's stale `Measured` height. The post-processing
+    /// rewrites `Appended` → `Remeasure(tail)` so the reused slot is
+    /// remeasured on this frame. Pinned because a regression here leaves a
+    /// one-frame vertical overlap until the next event.
+    #[gpui::test]
+    fn popped_retry_then_append_remeasures_reused_tail_slot(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                // Push a trailing Retry badge.
+                let outcome = c.apply(
+                    &ThreadEvent::Retry {
+                        attempt: 1,
+                        max_attempts: 3,
+                        delay_secs: 1,
+                        reason: "503".into(),
+                        detail: None,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                assert!(matches!(outcome, ApplyOutcome::Appended));
+                assert_eq!(c.items().len(), 1);
+
+                // An AgentText delta with no prior segment: pop_trailing_retry
+                // removes the Retry (count 1→0), then needs_new pushes a new
+                // assistant bubble (count 0→1). Net count unchanged → no
+                // splice. Outcome must be Remeasure(tail=0) so the reused slot
+                // (now the assistant bubble, was the Retry badge) is
+                // remeasured instead of keeping the badge's cached height.
+                let outcome = c.apply(
+                    &ThreadEvent::AgentText("recovered".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                match outcome {
+                    ApplyOutcome::Remeasure(ix) => {
+                        assert_eq!(ix, 0, "remeasure the reused tail slot");
+                    }
+                    other => panic!(
+                        "expected Remeasure(tail) after popped_retry + Appended, got {other:?}"
+                    ),
+                }
                 assert_eq!(c.items().len(), 1);
             });
         });

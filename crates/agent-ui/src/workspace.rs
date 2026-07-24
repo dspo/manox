@@ -1805,7 +1805,11 @@ impl Workspace {
             // neutralized by a trailing `Retry` pop (count unchanged → no
             // splice), the new assistant bubble occupies a reused `Measured`
             // tail slot whose cached height is the popped retry badge's, so
-            // remeasure the tail too.
+            // remeasure the tail too. (When `popped_retry` was false the push
+            // grew the count by one, `count_changed` is true, and the splice
+            // already inserted the new bubble as `Unmeasured` — so the tail
+            // remeasure is skipped as redundant, not because the branch is
+            // dead.)
             ApplyOutcome::RemeasureAndAppend { remeasure_ix } => {
                 self.list_state
                     .remeasure_items(remeasure_ix..remeasure_ix + 1);
