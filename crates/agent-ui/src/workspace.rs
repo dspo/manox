@@ -214,9 +214,10 @@ struct DeferredUserTurn {
 }
 
 /// How far above/below the viewport the message `list` still measures items.
-/// Larger = smoother fast-scroll at the cost of less virtualization; one extra
-/// screenful is enough that a normal wheel flick never shows an unmeasured gap.
-const MSG_LIST_OVERDRAW: f32 = 800.;
+/// Larger = smoother fast-scroll at the cost of less virtualization; two extra
+/// screenfuls cover fast wheel-paging past long tool cards and expanded
+/// markdown without painting an unmeasured gap (zed's chat panel uses 2048).
+const MSG_LIST_OVERDRAW: f32 = 2048.;
 
 /// A thread parked in the background while still running a turn. The held
 /// `Subscription` is a minimal handler that only tracks terminal `Stop`/`Error`
@@ -1772,10 +1773,10 @@ impl Workspace {
     /// dangling slot out. Call after any direct conversation mutation that the
     /// `ApplyOutcome` path does not already cover (e.g. `push_user`/`push_notice`,
     /// which bypass `apply`).
-    fn sync_list_count(&mut self, cx: &App) {
+    fn sync_list_count(&mut self, cx: &App) -> bool {
         let new_count = self.conversation.read(cx).items().len();
         if new_count == self.list_count {
-            return;
+            return false;
         }
         if new_count > self.list_count {
             self.list_state.splice(
@@ -1786,6 +1787,7 @@ impl Workspace {
             self.list_state.splice(new_count..self.list_count, 0);
         }
         self.list_count = new_count;
+        true
     }
 
     /// Reconcile the `list_state` with a conversation mutation: splice the
@@ -1793,13 +1795,28 @@ impl Workspace {
     /// after any `ConversationState::apply` (the outcome tells which path) so
     /// the virtualized list's per-item height cache never goes stale.
     fn apply_list_outcome(&mut self, outcome: ApplyOutcome, cx: &App) {
-        self.sync_list_count(cx);
+        let count_changed = self.sync_list_count(cx);
         match outcome {
             ApplyOutcome::Remeasure(ix) => self.list_state.remeasure_items(ix..ix + 1),
             ApplyOutcome::RemeasureAll => self.list_state.remeasure(),
-            // `None` touched no item; `Appended`/`RemovedTail` only changed the
-            // count, which `sync_list_count` already spliced.
-            ApplyOutcome::None | ApplyOutcome::Appended | ApplyOutcome::RemovedTail => {}
+            // Remeasure the just-mutated segment (e.g. an activity segment
+            // closed for an incoming reply) in addition to the append splice
+            // `sync_list_count` already performed. When the append was net-
+            // neutralized by a trailing `Retry` pop (count unchanged → no
+            // splice), the new assistant bubble occupies a reused `Measured`
+            // tail slot whose cached height is the popped retry badge's, so
+            // remeasure the tail too.
+            ApplyOutcome::RemeasureAndAppend { remeasure_ix } => {
+                self.list_state
+                    .remeasure_items(remeasure_ix..remeasure_ix + 1);
+                if !count_changed {
+                    let tail = self.list_count.saturating_sub(1);
+                    self.list_state.remeasure_items(tail..tail + 1);
+                }
+            }
+            // `Unchanged` touched no item; `Appended`/`RemovedTail` only changed
+            // the count, which `sync_list_count` already spliced.
+            ApplyOutcome::Unchanged | ApplyOutcome::Appended | ApplyOutcome::RemovedTail => {}
         }
     }
 
@@ -2002,19 +2019,18 @@ impl Workspace {
         self.sync_completion(window, cx);
         // Reveal the latest turn for the new thread: `reset` drops the old
         // thread's measured heights and scroll position, then reveal the latest
-        // turn once. A running thread keeps following the tail; a completed
-        // history thread stays put once revealed so scrolling up is not snapped
-        // back (the list auto-disengages tail on any upward scroll anyway).
+        // turn once. Both running and completed threads arm `FollowMode::Tail`:
+        // the list pins to the end on each layout while following, and GPUI
+        // auto-disengages follow the moment the user scrolls up — matching the
+        // old per-frame re-pin arbitration (pinned-at-bottom re-pinned every
+        // frame; the instant the user scrolled up, follow dropped). Using
+        // `Normal` here would leave a one-shot `scroll_to_end` that never
+        // re-pins if a late delta or notice lands after the user scrolls.
         let count = self.conversation.read(cx).items().len();
         self.list_state.reset(count);
         self.list_count = count;
         self.list_state.scroll_to_end();
-        self.list_state
-            .set_follow_mode(if self.thread.read(cx).is_running() {
-                FollowMode::Tail
-            } else {
-                FollowMode::Normal
-            });
+        self.list_state.set_follow_mode(FollowMode::Tail);
         self.pending_auths.clear();
         self.pending_ask = None;
         // Restore the incoming thread's stashed pending plan, if any.
@@ -6658,10 +6674,14 @@ impl Render for Workspace {
                                 let list_el = gpui::list(list_state, move |ix, _window, cx| {
                                     let item = conv.read(cx).items().get(ix).cloned();
                                     match item {
-                                        // `flex_shrink_0` pins each row to its true
-                                        // content height so the list's per-item
-                                        // height cache stays honest and markdown
-                                        // never paints outside its row.
+                                        // Defensive `flex_shrink_0`: the gpui
+                                        // list measures each row by its natural
+                                        // content height, so this flag is not
+                                        // what makes heights honest — it only
+                                        // guards against any available height
+                                        // leaking down the flex chain and
+                                        // compressing a row (e.g. a tall
+                                        // markdown block under a short one).
                                         Some(item) => v_flex()
                                             .w_full()
                                             .pt_1()

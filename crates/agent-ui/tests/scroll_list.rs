@@ -75,6 +75,15 @@ fn draw_native_list(cx: &mut TestAppContext, body: Vec<Pixels>, viewport_h: Pixe
 /// Short content (fits the viewport) with `ListAlignment::Bottom`: the list
 /// anchors at the tail — the last item sits at the bottom of the viewport,
 /// matching chat-log semantics where the composer is below the last message.
+///
+/// Intentional behavioral pin: `ListAlignment::Bottom`'s native semantics pin
+/// short content to the *top* of the viewport (a typical bottom-aligned list
+/// grows downward). The chat-log "short content sits at the tail" behavior we
+/// rely on here is an emergent property of the virtualized layout under
+/// `ListSizingBehavior::Auto` — the list over-estimates total height (empty
+/// space below the last measured item) so the bottom anchor clamps the visible
+/// items to the tail. If a gpui change ever makes `Bottom` truly top-anchor
+/// short content, this test goes red first, which is the point.
 #[gpui::test]
 async fn native_bottom_list_anchors_short_content_in_h_flex_row(cx: &mut TestAppContext) {
     let state = draw_native_list(cx, vec![px(40.), px(40.)], px(100.));
