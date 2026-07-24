@@ -1,7 +1,7 @@
 //! The proxy itself: listener, connection handlers.
 //!
 //! All synchronous, thread-per-connection. `ProxyHandle::spawn` binds a
-//! `std::net::TcpListener` on `127.0.0.1:0` and returns once the listener
+//! `std::net::TcpListener` on `localhost:0` and returns once the listener
 //! is bound and the listener thread has been spawned. Drop the handle to
 //! shut everything down — the listener thread stops accepting new
 //! connections; in-flight connection threads finish on their own when
@@ -12,7 +12,7 @@ mod connection;
 use crate::allowlist::Allowlist;
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc;
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -119,13 +119,13 @@ pub struct ProxyHandle {
 }
 
 impl ProxyHandle {
-    /// Spawns the proxy: binds a listener on `127.0.0.1:0`, spawns the
+    /// Spawns the proxy: binds a listener on `localhost:0`, spawns the
     /// listener thread, sends a `Ready` event, and returns. The returned
     /// port is what callers should use for `HTTPS_PROXY`/`HTTP_PROXY` env
     /// vars and for the seatbelt rule narrowing `localhost:<port>`.
     pub fn spawn(config: ProxyConfig) -> Result<ProxyHandle> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .context("failed to bind proxy listener on 127.0.0.1:0")?;
+        let listener = TcpListener::bind(("localhost", 0))
+            .context("failed to bind proxy listener on localhost:0")?;
         let port = listener
             .local_addr()
             .context("failed to read proxy local addr")?
@@ -167,7 +167,7 @@ impl Drop for ProxyHandle {
         self.shutdown.store(true, Ordering::SeqCst);
         // Wake the blocked `accept()` by connecting to ourselves: the listener
         // accepts the connection, sees the shutdown flag, breaks the loop.
-        let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
+        let _ = TcpStream::connect(("localhost", self.port));
         if let Some(thread) = self.listener_thread.take()
             && thread.join().is_err()
         {
