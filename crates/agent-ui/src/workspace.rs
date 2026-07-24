@@ -124,15 +124,13 @@ struct SubagentSession {
 
 /// A pending tool-call authorization prompted by `ThreadEvent::ToolCallAuthorization`.
 ///
-/// `reason` is populated by the `AutoReview` approval agent when it returns
-/// `Ask` for a tool call. It is rendered as a one-line muted note under the
-/// tool title in the auth overlay so the user can see why the reviewer
-/// escalated the call rather than auto-approving it.
+/// Only interactive tools (`AskUserQuestion`) and bubbled sub-agent auth
+/// reach the overlay now — the AutoPilot reviewer denies `Ask` verdicts
+/// inline rather than escalating to the user.
 struct PendingAuth {
     id: String,
     tool_name: String,
     summary: String,
-    reason: Option<String>,
 }
 
 /// A completed `<proposed_plan>` block awaiting the user's three-way review
@@ -144,8 +142,8 @@ struct PendingPlanReview {
 
 /// A pending inbound-write request from a built-in browser tab, surfaced by
 /// `ThreadEvent::InboundAuthorization`. Unlike outbound tool approval this
-/// axis is `ApprovalMode`-blind — a web page must never gain a write path
-/// because the agent runs in Yolo — so the overlay always shows and the
+/// axis is mode-blind — a web page must never gain a write path
+/// because the agent runs in Danger — so the overlay always shows and the
 /// decision always routes through `Thread::respond_inbound`, not the outbound
 /// approval pipeline.
 struct PendingInbound {
@@ -340,7 +338,7 @@ pub struct Workspace {
     plus_open: bool,
     plus_menu: Option<Entity<PopupMenu>>,
     plus_menu_sub: Option<Subscription>,
-    /// Access-chip dropdown (Normal / YOLO mode). Mirrors the model selector pattern.
+    /// Access-chip dropdown (Normal / Danger mode). Mirrors the model selector pattern.
     access_open: bool,
     /// Reasoning-effort dropdown (High / Max).
     effort_open: bool,
@@ -734,20 +732,10 @@ impl Workspace {
                         this.ask_step = 0;
                         this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
                     } else {
-                        // The `AutoReview` approval agent attaches a one-line reason
-                        // to every tool it escalates back to the overlay; pull it
-                        // out here so the user can see *why* the reviewer did not
-                        // auto-approve. We snapshot-and-clear on the Thread side
-                        // because each reason is single-use — a stale reason on
-                        // the next tool call would mislead the user.
-                        let reason = this
-                            .thread
-                            .update(cx, |t, _cx| t.take_approval_ask_reason(id.as_str()));
                         this.pending_auths.push(PendingAuth {
                             id: id.clone(),
                             tool_name: tool_name.clone(),
                             summary: summary.clone(),
-                            reason,
                         });
                     }
                     this.context_rail.update(cx, |r, cx| {
@@ -781,8 +769,29 @@ impl Workspace {
                     });
                 }
                 ThreadEvent::ApprovalModeChanged { .. } => {
-                    // Refresh the access chip + YOLO badge; no conversation item.
+                    // Refresh the access chip + Danger badge; no conversation item.
                     cx.notify();
+                }
+                ThreadEvent::ApprovalDecision {
+                    tool_title,
+                    verdict,
+                    ..
+                } => {
+                    // Show a brief autopilot decision record in the
+                    // MessageList, mirroring Codex's approval cell.
+                    let msg = match &verdict {
+                        agent::approval::ReviewVerdict::Allow => i18n::t_str(
+                            "workspace-approval-autopilot-allowed",
+                            &[("tool", tool_title.as_str())],
+                        )
+                        .to_string(),
+                        agent::approval::ReviewVerdict::Ask { reason } => i18n::t_str(
+                            "workspace-approval-autopilot-escalated",
+                            &[("tool", tool_title.as_str()), ("reason", reason.as_str())],
+                        )
+                        .to_string(),
+                    };
+                    this.add_info_message(msg, cx);
                 }
                 ThreadEvent::ModelChanged { from, to } => {
                     // Persist a model_change event to the thread's event stream.
@@ -2166,14 +2175,10 @@ impl Workspace {
                 self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
                 continue;
             }
-            let reason = self
-                .thread
-                .update(cx, |t, _cx| t.take_approval_ask_reason(&id));
             self.pending_auths.push(PendingAuth {
                 id,
                 tool_name,
                 summary,
-                reason,
             });
         }
         if !self.pending_auths.is_empty() || self.pending_ask.is_some() {
@@ -3389,7 +3394,7 @@ impl Workspace {
 
     /// Push a system-styled notice into the conversation (no thread message,
     /// no model turn). Used by slash commands to report outcomes — e.g. the
-    /// `/yolo` toggle acknowledging the mode change. Renders as a neutral-toned
+    /// mode-change acknowledging the mode change. Renders as a neutral-toned
     /// `ConvItem::Notice` card (distinct from the red `ConvItem::Error`).
     ///
     /// Also persists the notice so a reloaded thread reproduces it. The live
@@ -3444,28 +3449,24 @@ impl Workspace {
         });
     }
 
-    /// Toggle YOLO mode on the current thread. Pushes a notice so the user
-    /// sees the state change in the conversation. Called by the `/yolo` slash
-    /// command and the access-chip dropdown.
-    pub(crate) fn toggle_yolo(&mut self, cx: &mut Context<Self>) {
-        // `/yolo` (no args) flips between full access and request-approval —
-        // `AutoReview` is its own state and is only reachable via the chip
-        // popover, since slash-command users explicitly want "the other
-        // extreme" rather than the middle tier.
-        let next = if self.thread.read(cx).approval_mode() == ApprovalMode::Yolo {
-            ApprovalMode::OnRequest
+    /// Toggle Danger mode on the current thread. Pushes a notice so the
+    /// user sees the state change in the conversation. Called by the
+    /// `/danger` slash command and the access-chip dropdown.
+    pub(crate) fn toggle_danger(&mut self, cx: &mut Context<Self>) {
+        let next = if self.thread.read(cx).approval_mode() == ApprovalMode::Danger {
+            ApprovalMode::AutoPilot
         } else {
-            ApprovalMode::Yolo
+            ApprovalMode::Danger
         };
         self.apply_approval_mode(next, cx);
     }
 
-    /// Enable full access and immediately send `prompt` as a user turn (the
-    /// `/yolo [prompt]` form). If full access is already on it stays on;
+    /// Enable Danger mode and immediately send `prompt` as a user turn
+    /// (the `/danger [prompt]` form). If Danger is already on it stays on;
     /// the prompt still runs.
-    pub(crate) fn start_yolo_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
-        if self.thread.read(cx).approval_mode() != ApprovalMode::Yolo {
-            self.apply_approval_mode(ApprovalMode::Yolo, cx);
+    pub(crate) fn start_danger_turn(&mut self, prompt: String, cx: &mut Context<Self>) {
+        if self.thread.read(cx).approval_mode() != ApprovalMode::Danger {
+            self.apply_approval_mode(ApprovalMode::Danger, cx);
         }
         self.send_user_turn(prompt, Vec::new(), cx);
     }
@@ -3744,7 +3745,6 @@ impl Workspace {
         let auth = self.pending_auths.last()?;
         let summary = auth.summary.clone();
         let tool_name = auth.tool_name.clone();
-        let reason = auth.reason.clone();
         // When several auths are queued behind the visible one, signal that
         // dismissing this card will surface the next.
         let queued = self.pending_auths.len().saturating_sub(1);
@@ -3792,19 +3792,6 @@ impl Workspace {
                                     &[("name", tool_name.as_str())],
                                 )),
                         )
-                        // Auto-review reason: a one-line muted note saying why the
-                        // reviewer escalated the call. Sourced from the thread's
-                        // `approval_ask_reasons` map; absent for tools that came
-                        // through `OnRequest` or `Yolo` paths.
-                        .children(reason.as_deref().map(|reason| {
-                            gpui::div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(i18n::t_str(
-                                    "workspace-approval-auto-review-note",
-                                    &[("reason", reason)],
-                                ))
-                        }))
                         .children(if queued > 0 {
                             Some(
                                 gpui::div()
@@ -3880,7 +3867,7 @@ impl Workspace {
 
     /// Confirmation overlay for an inbound-write request from a built-in
     /// browser tab. Mirrors `render_auth_overlay`'s scrim + card layout but
-    /// resolves through `respond_inbound` (the `ApprovalMode`-blind axis).
+    /// resolves through `respond_inbound` (the mode-blind axis).
     fn render_inbound_overlay(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let req = self.pending_inbounds.last()?;
         let intent = req.intent.clone();
@@ -5137,7 +5124,7 @@ impl Workspace {
     ///
     /// The chip is a mode-aware pill rendered next to the composer send button.
     /// Each `ApprovalMode` gets its own icon + accent color (green thumbs-up for
-    /// `OnRequest`, blue bot for `AutoReview`, red triangle for `Yolo`) so the
+    /// blue bot for AutoPilot, red triangle for Danger) so the
     /// current permission posture is legible at a glance — a 1-line summary of
     /// what the model is allowed to do without prompting.
     ///
@@ -6150,7 +6137,7 @@ impl Render for Workspace {
             )
         };
         // Hero occupies the message-list region on the first screen.
-        // Notice items on the first screen (e.g. YOLO toggle acknowledgement).
+        // Notice items on the first screen (e.g. Danger toggle acknowledgement).
         // They are stored in the conversation but hidden behind the hero layout;
         // show them as a temporary banner below the composer so the user sees
         // the feedback without leaving the first-screen view.
@@ -6912,22 +6899,17 @@ fn strip_recommended_suffix(label: String) -> (String, bool) {
 ///
 /// Colors are theme tokens, not raw hsla values, so the chip follows the
 /// active theme (light/dark) without bespoke palettes per mode. The
-/// `OnRequest` accent uses `success` (green) as a "this is the safe default"
+/// AutoPilot accent uses `info` (green) as a "this is the safe default"
 /// signal — staying gray would be visually identical to a disabled state.
 fn mode_chip_visual(mode: ApprovalMode, theme: &Theme) -> (SharedString, gpui::Hsla, IconName) {
     match mode {
-        ApprovalMode::OnRequest => (
-            i18n::t("workspace-chip-mode-on-request"),
-            theme.success,
-            IconName::ThumbsUp,
-        ),
-        ApprovalMode::AutoReview => (
-            i18n::t("workspace-chip-mode-auto-review"),
+        ApprovalMode::AutoPilot => (
+            i18n::t("workspace-chip-mode-autopilot"),
             theme.info,
             IconName::Bot,
         ),
-        ApprovalMode::Yolo => (
-            i18n::t("workspace-chip-mode-yolo"),
+        ApprovalMode::Danger => (
+            i18n::t("workspace-chip-mode-danger"),
             theme.danger,
             IconName::TriangleAlert,
         ),
@@ -7000,7 +6982,6 @@ fn build_approval_content(
 ) -> gpui::Div {
     let fg: gpui::Hsla = cx.theme().foreground;
     let muted: gpui::Hsla = cx.theme().muted_foreground;
-    let success: gpui::Hsla = cx.theme().success;
     let info: gpui::Hsla = cx.theme().info;
     let danger: gpui::Hsla = cx.theme().danger;
 
@@ -7079,28 +7060,20 @@ fn build_approval_content(
                 ),
         )
         .child(make_row(
-            ApprovalMode::OnRequest,
-            i18n::t("workspace-mode-on-request-title"),
-            i18n::t("workspace-mode-on-request-desc"),
-            IconName::ThumbsUp,
-            success,
-            current == ApprovalMode::OnRequest,
-        ))
-        .child(make_row(
-            ApprovalMode::AutoReview,
-            i18n::t("workspace-mode-auto-review-title"),
-            i18n::t("workspace-mode-auto-review-desc"),
+            ApprovalMode::AutoPilot,
+            i18n::t("workspace-mode-autopilot-title"),
+            i18n::t("workspace-mode-autopilot-desc"),
             IconName::Bot,
             info,
-            current == ApprovalMode::AutoReview,
+            current == ApprovalMode::AutoPilot,
         ))
         .child(make_row(
-            ApprovalMode::Yolo,
-            i18n::t("workspace-mode-yolo-title"),
-            i18n::t("workspace-mode-yolo-desc"),
+            ApprovalMode::Danger,
+            i18n::t("workspace-mode-danger-title"),
+            i18n::t("workspace-mode-danger-desc"),
             IconName::TriangleAlert,
             danger,
-            current == ApprovalMode::Yolo,
+            current == ApprovalMode::Danger,
         ))
 }
 
@@ -7110,9 +7083,8 @@ impl Workspace {
     /// future settings-panel wiring all funnel through one path.
     pub(crate) fn apply_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
         let mode_key = match mode {
-            ApprovalMode::OnRequest => "on-request",
-            ApprovalMode::AutoReview => "auto-review",
-            ApprovalMode::Yolo => "yolo",
+            ApprovalMode::AutoPilot => "autopilot",
+            ApprovalMode::Danger => "danger",
         };
         self.thread
             .update(cx, |t, cx| t.set_approval_mode(mode, cx));

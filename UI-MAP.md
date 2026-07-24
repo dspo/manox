@@ -524,7 +524,7 @@ Trigger: [ModelChip](#modelchip). Model selector dropdown.
 
 #### AccessMenu
 
-Trigger: [AccessChip](#accesschip). [ApprovalMode](#approval-modes) selector: OnRequest / AutoReview / Yolo.
+Trigger: [AccessChip](#accesschip). [ApprovalMode](#approval-modes) selector: AutoPilot / Danger.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -738,7 +738,7 @@ A right-pane tab (`RightTab::PlanPreview`, an equal citizen of the right tab bar
 
 #### InboundWriteOverlay
 
-A scrim + card modal mirroring the [ApprovalOverlay](#approvaloverlay), surfaced by `ThreadEvent::InboundAuthorization` when a built-in browser tab calls `window.__manox_request_write__`. Unlike outbound tool approval this axis is `ApprovalMode`-blind — a web page must never gain a write path because the agent runs in Yolo — so the overlay always shows and resolves through `Thread::respond_inbound`, not the outbound approval pipeline (`pending_auths` / `resolve_auth`). Stacked in `pending_inbounds` (LIFO); queued behind any open outbound approval overlay so only one modal shows at a time. Cleared on terminal `Stop` / `Error`.
+A scrim + card modal mirroring the [ApprovalOverlay](#approvaloverlay), surfaced by `ThreadEvent::InboundAuthorization` when a built-in browser tab calls `window.__manox_request_write__`. Unlike outbound tool approval this axis is mode-blind — a web page must never gain a write path because the agent runs in Danger — so the overlay always shows and resolves through `Thread::respond_inbound`, not the outbound approval pipeline (`pending_auths` / `resolve_auth`). Stacked in `pending_inbounds` (LIFO); queued behind any open outbound approval overlay so only one modal shows at a time. Cleared on terminal `Stop` / `Error`.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -1032,18 +1032,13 @@ Hover tooltip.
 
 Visual states of the [AccessChip](#accesschip).
 
-#### OnRequest
+#### AutoPilot
 
-Green — ask before each tool call (default).
+Blue — a safety reviewer automatically approves safe tool calls; risky ones are denied (default).
 
-#### AutoReview
+#### Danger
 
-Blue — auto-approve safe tools, ask for risky ones.
-
-#### Yolo
-
-Red — approve everything without asking.
-
+Red — bypass all approvals, bash runs outside the sandbox.
 ---
 
 ## 9. Collaboration Modes

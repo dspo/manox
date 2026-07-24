@@ -430,44 +430,32 @@ pub fn render_general(view: &mut SettingsView, cx: &mut Context<SettingsView>) -
                 )
                 .into_any_element()
         };
-        let desc_default = muted_text(i18n::t("settings-desc-permission-default"), muted);
         let desc_auto = build_desc(
-            i18n::t("settings-desc-permission-auto-review"),
+            i18n::t("settings-desc-permission-autopilot"),
             learn_more.clone(),
         );
-        let desc_full = build_desc(i18n::t("settings-desc-permission-full"), learn_more);
+        let desc_danger = build_desc(i18n::t("settings-desc-permission-danger"), learn_more);
         let children = vec![
             section_header("settings-section-permissions"),
             row_with_control(
-                i18n::t("settings-row-permission-default"),
-                Some(desc_default),
-                mock_switch(
-                    "perm-default",
-                    view.permission_default,
-                    entity.clone(),
-                    Arc::new(|this, v| this.permission_default = v),
-                ),
-            ),
-            hairline(theme.border.opacity(0.6)),
-            row_with_control(
-                i18n::t("settings-row-permission-auto-review"),
+                i18n::t("settings-row-permission-autopilot"),
                 Some(desc_auto),
                 mock_switch(
-                    "perm-auto",
-                    view.permission_auto_review,
+                    "perm-autopilot",
+                    view.permission_autopilot,
                     entity.clone(),
-                    Arc::new(|this, v| this.permission_auto_review = v),
+                    Arc::new(|this, v| this.permission_autopilot = v),
                 ),
             ),
             hairline(theme.border.opacity(0.6)),
             row_with_control(
-                i18n::t("settings-row-permission-full"),
-                Some(desc_full),
+                i18n::t("settings-row-permission-danger"),
+                Some(desc_danger),
                 mock_switch(
-                    "perm-full",
-                    view.permission_full_access,
+                    "perm-danger",
+                    view.permission_danger,
                     entity,
-                    Arc::new(|this, v| this.permission_full_access = v),
+                    Arc::new(|this, v| this.permission_danger = v),
                 ),
             ),
         ];

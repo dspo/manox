@@ -558,7 +558,7 @@ impl ConversationState {
     /// True when the conversation has no substantive items (user, assistant,
     /// reasoning, tool call, or agent task). Notice-only items (error cards
     /// used for slash-command acknowledgements and mode switches) don't count
-    /// so toggling YOLO on the empty first screen doesn't prematurely leave
+    /// so toggling Danger on the empty first screen doesn't prematurely leave
     /// the hero layout.
     pub fn is_empty(&self, cx: &App) -> bool {
         self.items.iter().all(|e| {
@@ -1293,6 +1293,10 @@ impl ConversationState {
             }
             ThreadEvent::ToolCallAuthorization { .. } => {
                 // Handled by `Workspace` as a prompt overlay; not part of the conversation flow.
+            }
+            ThreadEvent::ApprovalDecision { .. } => {
+                // Handled by `Workspace` as a Notice card; not part of the
+                // conversation flow.
             }
             ThreadEvent::Stop(reason) => {
                 // `StopReason::ToolUse` is mid-turn: the model paused to

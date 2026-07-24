@@ -23,8 +23,6 @@
 - python3：{{ runtime.python3 }}
 - node：{{ runtime.node }}
 - 今天：{{ runtime.today }}
-{% if runtime.approval_mode == "AutoReview" -%}
-- 模式：AutoReview（高风险工具调用仍会在运行前询问）
-{% elif runtime.approval_mode == "Yolo" -%}
-- 模式：YOLO（工具调用无需审批，bash 在沙箱外运行）
+{% if runtime.approval_mode == "Danger" -%}
+- 模式：危险驾驶（工具调用无需审批，bash 在沙箱外运行）
 {% endif -%}

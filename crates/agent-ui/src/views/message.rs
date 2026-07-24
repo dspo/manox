@@ -774,9 +774,8 @@ fn render_user(
 
 fn approval_mode_color(mode: ApprovalMode, theme: &Theme) -> gpui::Hsla {
     match mode {
-        ApprovalMode::OnRequest => theme.success,
-        ApprovalMode::AutoReview => theme.info,
-        ApprovalMode::Yolo => theme.danger,
+        ApprovalMode::AutoPilot => theme.info,
+        ApprovalMode::Danger => theme.danger,
     }
 }
 
@@ -978,7 +977,7 @@ pub fn render_error(msg: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::
 }
 
 /// Render an ephemeral system notice — status toggles, slash-command acks.
-/// Neutral tones so positive state changes (e.g. "YOLO mode is on") do not
+/// Neutral tones so positive state changes (e.g. "Danger mode is on") do not
 /// read as a runtime error.
 pub fn render_notice(msg: &str, ix: usize, theme: &Theme, cx: &mut App) -> gpui::AnyElement {
     render_banner(

@@ -77,7 +77,8 @@ pub struct ThreadRecord {
     /// post-creation; a global settings change only affects threads created
     /// afterwards, so an existing thread's prompt-cache prefix stays byte-stable.
     pub agent_language: String,
-    /// Three-state approval mode (0 = OnRequest, 1 = AutoReview, 2 = Yolo).
+    /// Two-state approval mode (0 = AutoPilot, 1 = Danger). Legacy values
+    /// (0 = OnRequest, 1 = AutoReview, 2 = Yolo) collapse via `from_i64`.
     /// Persisted as INTEGER for schema-stability across enum reorderings.
     pub approval_mode: i64,
     /// Reasoning effort (2 = High, 4 = Max).
@@ -135,7 +136,7 @@ pub fn create_table(conn: &Connection) -> Result<()> {
             cwd TEXT,
             project TEXT,
             agent_language TEXT NOT NULL DEFAULT 'en',
-            approval_mode INTEGER NOT NULL DEFAULT 1,
+            approval_mode INTEGER NOT NULL DEFAULT 0,
             reasoning_effort INTEGER NOT NULL DEFAULT 2,
             depth INTEGER NOT NULL DEFAULT 0,
             parent_id TEXT,

@@ -1210,9 +1210,8 @@ fn render_archive_button(id: String, kind: RowKind, cx: &mut Context<Sidebar>) -
 
 fn approval_mode_color(mode: i64, theme: &Theme) -> gpui::Hsla {
     match ApprovalMode::from_i64(mode) {
-        ApprovalMode::OnRequest => theme.success,
-        ApprovalMode::AutoReview => theme.info,
-        ApprovalMode::Yolo => theme.danger,
+        ApprovalMode::AutoPilot => theme.info,
+        ApprovalMode::Danger => theme.danger,
     }
 }
 

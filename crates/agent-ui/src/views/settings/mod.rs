@@ -154,9 +154,8 @@ pub struct SettingsView {
 
     // --- General panel state ---
     work_mode: WorkMode,
-    permission_default: bool,
-    permission_auto_review: bool,
-    permission_full_access: bool,
+    permission_autopilot: bool,
+    permission_danger: bool,
     file_target: SharedString,
     ui_language: SharedString,
     agent_language: SharedString,
@@ -222,9 +221,8 @@ impl SettingsView {
             selected: None,
             click_gen: 0,
             work_mode: WorkMode::default(),
-            permission_default: true,
-            permission_auto_review: false,
-            permission_full_access: false,
+            permission_autopilot: true,
+            permission_danger: false,
             file_target: i18n::t("settings-value-vscode"),
             // Endonyms are fixed per language and never re-localized, so the
             // picker always reads `English` / `简体中文` regardless of the

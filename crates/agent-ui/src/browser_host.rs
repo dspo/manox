@@ -17,7 +17,7 @@
 //!   the page side; the host routes it to a `ThreadEvent::InboundAuthorization`
 //!   whose resolution is parked in `Thread::pending_inbound`. This axis ignores
 //!   `ApprovalMode` — a page must never gain a write path because the agent
-//!   runs in Yolo.
+//!   runs in Danger.
 //!
 //! The webview crate's notify/inbound bridges fire on the gpui main thread via
 //! `PlatformDispatcher::dispatch_on_main_thread`, whose runnable carries no
