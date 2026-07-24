@@ -569,6 +569,7 @@ context-opt-label-tool-search = ToolSearch
 context-tooltip-main-calls = Main calls
 context-tooltip-side-calls = Side calls
 context-tooltip-distribution = Tokens distribution
+context-tooltip-calls-unit = calls
 context-side-calls-title = Side calls
 context-side-calls-row = {$purpose} · {$model} · {$calls} calls · in {$input} out {$output} cache {$cache} ({$cache_rate}) · avg {$latency}ms
 context-main-calls-row = Main · {$model} · {$calls} calls · in {$input} out {$output} cache {$cache} ({$cache_rate}) · avg {$latency}ms

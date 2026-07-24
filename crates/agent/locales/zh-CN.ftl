@@ -514,6 +514,7 @@ context-opt-label-tool-search = ToolSearch
 context-tooltip-main-calls = 主调用
 context-tooltip-side-calls = 辅助调用
 context-tooltip-distribution = Tokens 分布
+context-tooltip-calls-unit = 次
 context-side-calls-title = 辅助调用
 context-side-calls-row = {$purpose} · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache}（{$cache_rate}）· 平均 {$latency}ms
 context-main-calls-row = 主调用 · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache}（{$cache_rate}）· 平均 {$latency}ms

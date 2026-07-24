@@ -19,8 +19,6 @@
 //! the conversation, and while it is open the card stays hidden so the
 //! conversation reclaims its width.
 
-use std::path::PathBuf;
-use std::time::Duration;
 use agent::{Thread, ThreadEvent, i18n};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardItem, Context, Entity,
@@ -31,6 +29,8 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
     h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
+use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::Workspace;
 use agent::{PlanSnapshot, PlanStepStatus};
@@ -54,7 +54,6 @@ pub(crate) const ENV_CONTENT_INSET: f32 = ENV_CARD_WIDTH + 36.;
 /// column takes the full body. Matches the old env-card gate so a narrow
 /// window never crowds the conversation.
 const RAIL_NARROW_BREAK: f32 = 900.;
-
 
 // ── ContextRail view ──────────────────────────────────────────────────────
 
@@ -107,7 +106,6 @@ pub(crate) struct ContextRail {
     /// until then.
     pub(crate) git_branch_display: Option<GitBranchDisplay>,
 }
-
 
 impl ContextRail {
     pub(crate) fn new(
@@ -310,11 +308,7 @@ impl ContextRail {
 
     /// Cumulative token total row with a hover tooltip consolidating main
     /// calls, side calls, and context optimization distribution data.
-    fn render_usage_section(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_usage_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let muted = theme.muted_foreground;
         let total = crate::cockpit::format_tokens(
             self.thread.read(cx).cumulative_token_usage().total_tokens(),
@@ -323,9 +317,7 @@ impl ContextRail {
         let side_calls = self.side_calls.clone();
         let optimization = self.optimization.clone();
         let theme_clone = theme.clone();
-        let has_tooltip = main_call.is_some()
-            || !side_calls.is_empty()
-            || optimization.is_some();
+        let has_tooltip = main_call.is_some() || !side_calls.is_empty() || optimization.is_some();
         let header = h_flex()
             .items_center()
             .gap_2()
@@ -999,13 +991,7 @@ fn build_usage_tooltip(
                 &i18n::t("context-tooltip-main-calls"),
                 muted,
             ))
-            .child(call_tree_row(
-                metric,
-                None,
-                is_last,
-                muted,
-                &tokens,
-            ))
+            .child(call_tree_row(metric, None, is_last, muted, &tokens))
         })
         .when(!side_calls.is_empty(), |el| {
             let has_opt = optimization.is_some();
@@ -1089,7 +1075,6 @@ fn section_heading(text: &str, muted: gpui::Hsla) -> AnyElement {
 }
 
 /// A tree row for a call metric (main or side call).
-/// Format: `{purpose?}·{model}·{calls}次·↑[{cache%}]{cache_read}/{input} ↓{output}·RTT {avg}ms`
 fn call_tree_row(
     metric: &agent::SideCallMetric,
     purpose_prefix: Option<&str>,
@@ -1102,13 +1087,15 @@ fn call_tree_row(
     let cache_pct = cache_read_ratio(metric.token_usage)
         .map(|r| format!("{:.0}%", r * 100.0))
         .unwrap_or_else(|| "--".into());
+    let calls_unit = i18n::t("context-tooltip-calls-unit");
     let text = match purpose_prefix {
         Some(purpose) => format!(
-            "{}{}·{}·{}次·↑[{}]{} / {} ↓{}·RTT {}ms",
+            "{}{}·{}·{}{}·↑[{}]{} / {} ↓{}·RTT {}ms",
             prefix,
             purpose,
             metric.model,
             metric.calls,
+            calls_unit,
             cache_pct,
             tokens(metric.token_usage.cache_read_input_tokens),
             tokens(metric.token_usage.input_tokens),
@@ -1116,10 +1103,11 @@ fn call_tree_row(
             avg_ms,
         ),
         None => format!(
-            "{}{}·{}次·↑[{}]{} / {} ↓{}·RTT {}ms",
+            "{}{}·{}{}·↑[{}]{} / {} ↓{}·RTT {}ms",
             prefix,
             metric.model,
             metric.calls,
+            calls_unit,
             cache_pct,
             tokens(metric.token_usage.cache_read_input_tokens),
             tokens(metric.token_usage.input_tokens),
@@ -1136,12 +1124,7 @@ fn call_tree_row(
 }
 
 /// A tree row for an optimization distribution category.
-fn opt_tree_row(
-    category: &str,
-    detail: &str,
-    is_last: bool,
-    muted: gpui::Hsla,
-) -> AnyElement {
+fn opt_tree_row(category: &str, detail: &str, is_last: bool, muted: gpui::Hsla) -> AnyElement {
     let prefix = if is_last { "╰─ " } else { "├─ " };
     gpui::div()
         .pl(px(8.))
