@@ -92,6 +92,7 @@ const PLUS_PLUGIN_ROWS: &[MenuRow] = &[
         desc: "Create or update personal artifact templates",
     },
 ];
+
 /// Render one menu row (icon + name + muted description) as a popup-menu element
 fn menu_row_item(row: &'static MenuRow, theme: &Theme) -> PopupMenuItem {
     let fg = theme.foreground;
