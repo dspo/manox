@@ -63,8 +63,6 @@ pub struct ContextBudget {
 pub fn context_budget_pct(
     max_input_tokens: u64,
     active_tokens: u64,
-    _auto_compact_enabled: bool,
-    _threshold: f64,
 ) -> Option<ContextBudget> {
     if max_input_tokens == 0 {
         return None;
@@ -129,7 +127,7 @@ mod tests {
     #[test]
     fn context_budget_pct_basic() {
         // 200k window, 90k active → 45% used.
-        let b = context_budget_pct(200_000, 90_000, true, 0.9).unwrap();
+        let b = context_budget_pct(200_000, 90_000).unwrap();
         assert!((b.used_pct - 45.0).abs() < 0.01);
         assert_eq!(b.cap_tokens, 200_000);
         assert!(b.is_estimate);
@@ -137,20 +135,20 @@ mod tests {
 
     #[test]
     fn context_budget_pct_zero_window() {
-        assert_eq!(context_budget_pct(0, 0, true, 0.9), None);
+        assert_eq!(context_budget_pct(0, 0), None);
     }
 
     #[test]
     fn context_budget_pct_small_window() {
         // 50k window, 40k active → 80% used.
-        let b = context_budget_pct(50_000, 40_000, true, 0.9).unwrap();
+        let b = context_budget_pct(50_000, 40_000).unwrap();
         assert!((b.used_pct - 80.0).abs() < 0.01);
         assert_eq!(b.cap_tokens, 50_000);
     }
 
     #[test]
     fn context_budget_pct_clamps_at_100_when_over() {
-        let b = context_budget_pct(200_000, 500_000, true, 0.9).unwrap();
+        let b = context_budget_pct(200_000, 500_000).unwrap();
         assert_eq!(b.used_pct, 100.0);
         assert_eq!(b.cap_tokens, 200_000);
     }

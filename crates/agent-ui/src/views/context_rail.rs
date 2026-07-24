@@ -688,9 +688,7 @@ impl ContextRail {
                 thread.messages(),
                 thread.request_token_usage(),
                 thread.agent_language(),
-            ),
-            self.cockpit_auto_compact_enabled,
-            self.cockpit_auto_compact_threshold,
+            )
         );
         let muted = theme.muted_foreground;
         let warn = theme.warning;

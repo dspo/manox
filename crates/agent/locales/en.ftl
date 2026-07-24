@@ -78,7 +78,6 @@ status-cancelled = Cancelled
 
 ### views/message.rs — Thinking status row
 context-agents-title = Agents
-context-agents-main = Captain
 subagent-panel-read-only = Read only
 subagent-tab-fallback = Agent
 thinking-tool-result = tool result
@@ -592,10 +591,6 @@ cockpit-plan-progress = {$done}/{$total}
 cockpit-plan-remaining = +{$count} to do
 # Collapsed-state note when every step is completed.
 cockpit-plan-all-done = All done
-# Context-budget two rows. {$pct} is the remaining percent (0–100),
-# {$used}/{$cap} are pre-formatted used/cap counts.
-cockpit-context-remaining-ctx = {$pct}% context left {$used} / {$cap}
-
 composer-pasted-image = Pasted image
 composer-image-process-failed = Some pasted images could not be sent (unsupported format or too large)
 composer-placeholder-followup = Request a follow-up change…
