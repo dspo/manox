@@ -78,7 +78,7 @@ status-cancelled = Cancelled
 
 ### views/message.rs — Thinking status row
 context-agents-title = Agents
-context-agents-main = Main
+context-agents-main = Captain
 subagent-panel-read-only = Read only
 subagent-tab-fallback = Agent
 thinking-tool-result = tool result

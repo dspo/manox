@@ -65,7 +65,7 @@ status-cancelled = 已取消
 
 ### views/message.rs — Thinking 状态行
 context-agents-title = 智能体
-context-agents-main = 主任务
+context-agents-main = Captain
 subagent-panel-read-only = 只读
 subagent-tab-fallback = 智能体
 thinking-tool-result = 工具结果

@@ -8,7 +8,6 @@
 
 use std::time::Duration;
 
-use agent::compact::MIN_COMPACTION_CONTEXT_WINDOW;
 use agent::language_model::TokenUsage;
 
 /// Coarse run phase shown in the status row. Derived from `ThreadEvent`s in
@@ -41,58 +40,43 @@ pub fn cockpit_phase_tag(phase: CockpitPhase) -> u8 {
     }
 }
 
-/// Estimated headroom before the context budget is exhausted. `is_estimate` is
-/// always true — provider usage is reported per-request and the trigger is a
-/// configured threshold, not a hard limit.
+/// Share of the context window currently occupied by active tokens.
+/// `is_estimate` is always true — provider usage is reported per-request
+/// and the window is a soft bound, not a hard limit.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContextBudget {
-    /// 0.0–100.0; percent of the budget still free before auto-summary fires
-    /// (or before the raw window fills, when auto-summary is off / window too
-    /// small to qualify).
-    pub remaining_pct: f64,
+    /// 0.0–100.0; percent of the context window currently occupied.
+    pub used_pct: f64,
     pub is_estimate: bool,
-    /// Tokens counted against the budget in the last reported request
-    /// (`active_tokens` of the usage). UI shows this as the numerator of
-    /// `current / cap`.
+    /// Tokens counted against the window (`active_tokens` of the usage).
+    /// UI shows this as the numerator of `used / window`.
     pub active_tokens: u64,
-    /// The budget cap the percentage is measured against: the auto-summary
-    /// trigger when enabled and the window qualifies, else the raw window.
+    /// The model's context window size (max_input_tokens) — the real cap,
+    /// not the auto-compaction trigger threshold.
     pub cap_tokens: u64,
 }
 
-/// Estimate the remaining context budget. `None` only when the window is zero.
-/// The active token count is the thread's effective context fill (the larger
-/// of provider-reported usage and the local history estimate), matching the
-/// auto-compaction trigger's notion of "current" usage, so the percentage
-/// reads as "share of the context window the current history occupies". When
-/// auto-summary is enabled and the window qualifies (≥
-/// [`MIN_COMPACTION_CONTEXT_WINDOW`]), the budget is measured against the
-/// trigger threshold; otherwise against the raw window.
+/// Compute the share of the context window currently occupied.
+/// `None` only when the window is zero. The percentage is `active / window`;
+/// the cap displayed is the real model window size, not the auto-compaction
+/// trigger threshold.
 pub fn context_budget_pct(
     max_input_tokens: u64,
     active_tokens: u64,
-    auto_compact_enabled: bool,
-    threshold: f64,
+    _auto_compact_enabled: bool,
+    _threshold: f64,
 ) -> Option<ContextBudget> {
     if max_input_tokens == 0 {
         return None;
     }
     let active = active_tokens as f64;
     let cap = max_input_tokens as f64;
-    let trigger = if auto_compact_enabled && max_input_tokens >= MIN_COMPACTION_CONTEXT_WINDOW {
-        cap * threshold
-    } else {
-        cap
-    };
-    if trigger <= 0.0 {
-        return None;
-    }
-    let remaining = ((trigger - active) / trigger * 100.0).clamp(0.0, 100.0);
+    let used = (active / cap * 100.0).clamp(0.0, 100.0);
     Some(ContextBudget {
-        remaining_pct: remaining,
+        used_pct: used,
         is_estimate: true,
         active_tokens: active as u64,
-        cap_tokens: trigger as u64,
+        cap_tokens: max_input_tokens,
     })
 }
 
@@ -144,10 +128,10 @@ mod tests {
 
     #[test]
     fn context_budget_pct_basic() {
-        // 200k window, auto-compact on (threshold 0.9 → trigger 180k), 90k active.
+        // 200k window, 90k active → 45% used.
         let b = context_budget_pct(200_000, 90_000, true, 0.9).unwrap();
-        // remaining = (180k - 90k)/180k = 50%
-        assert!((b.remaining_pct - 50.0).abs() < 0.01);
+        assert!((b.used_pct - 45.0).abs() < 0.01);
+        assert_eq!(b.cap_tokens, 200_000);
         assert!(b.is_estimate);
     }
 
@@ -157,17 +141,18 @@ mod tests {
     }
 
     #[test]
-    fn context_budget_pct_small_window_uses_raw_cap() {
-        // Window < MIN_COMPACTION_CONTEXT_WINDOW (80k): budget vs raw cap, not trigger.
+    fn context_budget_pct_small_window() {
+        // 50k window, 40k active → 80% used.
         let b = context_budget_pct(50_000, 40_000, true, 0.9).unwrap();
-        // remaining = (50k - 40k)/50k = 20%
-        assert!((b.remaining_pct - 20.0).abs() < 0.01);
+        assert!((b.used_pct - 80.0).abs() < 0.01);
+        assert_eq!(b.cap_tokens, 50_000);
     }
 
     #[test]
-    fn context_budget_pct_clamps_at_zero_when_over() {
+    fn context_budget_pct_clamps_at_100_when_over() {
         let b = context_budget_pct(200_000, 500_000, true, 0.9).unwrap();
-        assert_eq!(b.remaining_pct, 0.0);
+        assert_eq!(b.used_pct, 100.0);
+        assert_eq!(b.cap_tokens, 200_000);
     }
 
     #[test]

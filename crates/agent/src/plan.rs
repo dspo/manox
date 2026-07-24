@@ -22,7 +22,7 @@ use crate::tools::UPDATE_PLAN;
 /// Upper bound on tasks in one snapshot. A rail overview stays legible only
 /// while the list is short; a plan that needs more than this many steps is
 /// really several plans.
-pub const MAX_PLAN_STEPS: usize = 12;
+pub const MAX_PLAN_STEPS: usize = 18;
 
 /// Maximum length (chars) of a single task title after trimming.
 pub const MAX_STEP_LEN: usize = 120;
