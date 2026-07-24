@@ -4071,12 +4071,17 @@ impl Thread {
                         approval_tus.extend(auto_review_tus);
                     }
                     Some(model) => {
+                        let wk_root = this
+                            .read_with(cx, |this, _| {
+                                this.worktree.as_ref().map(|w| w.path.clone())
+                            })?
+                            .unwrap_or_default();
                         let review_items: Vec<crate::approval::ReviewItem> = auto_review_tus
                             .iter()
                             .map(|tu| crate::approval::ReviewItem {
                                 id: tu.id.clone(),
                                 tool_name: tu.name.to_string(),
-                                tool_title: tool_title(&tu.name, &tu.input),
+                                tool_title: tool_title(&tu.name, &tu.input, Some(&wk_root)),
                                 tool_input: tu.input.clone(),
                             })
                             .collect();
@@ -4250,7 +4255,10 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<()> {
         let id = tu.id.clone();
-        let title = tool_title(crate::tools::CODE, &tu.input);
+        let wk_root = this
+            .read_with(cx, |this, _| this.worktree.as_ref().map(|w| w.path.clone()))?
+            .unwrap_or_default();
+        let title = tool_title(crate::tools::CODE, &tu.input, Some(&wk_root));
         let script = serde_json::from_value::<crate::tools::code::CodeInput>(tu.input.clone())
             .map(|input| input.script);
         let Ok(script) = script else {
@@ -4404,7 +4412,7 @@ impl Thread {
         if !crate::tools::code::ALLOWED_TOOLS.contains(&name.as_str()) {
             return fail(format!("tool not allowed in Code: {name}"));
         }
-        let (tool, lang, in_plan, approval_mode, always_allowed, model) =
+        let (tool, lang, in_plan, approval_mode, always_allowed, model, wk_root) =
             match this.read_with(cx, |thread, _| {
                 (
                     thread.tools.get(&name).cloned(),
@@ -4413,6 +4421,7 @@ impl Thread {
                     thread.approval_mode,
                     thread.permission.is_always_allowed(&name),
                     thread.model.clone(),
+                    thread.worktree.as_ref().map(|w| w.path.clone()),
                 )
             }) {
                 Ok(snapshot) => snapshot,
@@ -4425,7 +4434,7 @@ impl Thread {
             return fail(format!("Plan mode does not permit calling {name}."));
         }
 
-        let title = tool_title(&name, &input);
+        let title = tool_title(&name, &input, wk_root.as_deref());
         let mut needs_approval = tool.requires_approval(&input)
             && approval_mode != ApprovalMode::Yolo
             && !always_allowed;
@@ -4600,7 +4609,10 @@ impl Thread {
     ) -> Result<()> {
         let id = tu.id.clone();
         let name = tu.name.to_string();
-        let title = tool_title(&name, &tu.input);
+        let wk_root = this
+            .read_with(cx, |this, _| this.worktree.as_ref().map(|w| w.path.clone()))?
+            .unwrap_or_default();
+        let title = tool_title(&name, &tu.input, Some(&wk_root));
         let lang = this.read_with(cx, |this, _| this.agent_language)?;
 
         this.update(cx, |_, cx| {
@@ -4691,11 +4703,15 @@ impl Thread {
     ) -> Result<()> {
         let id = tu.id.clone();
         let name = tu.name.to_string();
-        let title = tool_title(&name, &tu.input);
 
-        let (tool, lang) = this.read_with(cx, |this, _| {
-            (this.tools.get(&name).cloned(), this.agent_language)
+        let (tool, lang, wk_root) = this.read_with(cx, |this, _| {
+            (
+                this.tools.get(&name).cloned(),
+                this.agent_language,
+                this.worktree.as_ref().map(|w| w.path.clone()),
+            )
         })?;
+        let title = tool_title(&name, &tu.input, wk_root.as_deref());
 
         let Some(tool) = tool else {
             let msg = format!("Unknown tool: {name}");
@@ -5002,7 +5018,10 @@ impl Thread {
     ) -> Result<()> {
         let id = tu.id.clone();
         let name = tu.name.to_string();
-        let title = tool_title(&name, &tu.input);
+        let wk_root = this
+            .read_with(cx, |this, _| this.worktree.as_ref().map(|w| w.path.clone()))
+            .unwrap_or_default();
+        let title = tool_title(&name, &tu.input, wk_root.as_deref());
         let msg = "Tool not executed (session cancelled)".to_string();
         this.update(cx, |_, cx| {
             cx.emit(ThreadEvent::ToolCall {
@@ -6118,12 +6137,20 @@ pub(crate) fn message_has_text(m: &Message) -> bool {
         .any(|c| matches!(c, MessageContent::Text(t) if !t.trim().is_empty()))
 }
 
-/// Build a human-readable title for a tool call.
-pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
+/// Build a human-readable title for a tool call. When `worktree_root` is
+/// `Some`, absolute paths that lie under it are rendered as
+/// `$WORKTREE/<relative>`, hiding the internal worktree location from the
+/// user-facing activity line.
+pub fn tool_title(
+    name: &str,
+    input: &serde_json::Value,
+    worktree_root: Option<&std::path::Path>,
+) -> String {
     use crate::tools;
     match name {
         x if x == tools::READ || x == tools::WRITE || x == tools::LIST => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = maybe_replace_worktree_prefix(path, worktree_root);
             format!("{name} {path}")
         }
         // edit_file's input is a single `patch` string whose first `[PATH#TAG]`
@@ -6139,6 +6166,7 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
                     Some(inner.rsplit_once('#')?.0.to_string())
                 })
                 .unwrap_or_default();
+            let path = maybe_replace_worktree_prefix(&path, worktree_root);
             format!("Edit {path}")
         }
         x if x == tools::BASH => {
@@ -6225,6 +6253,30 @@ pub fn tool_title(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// Replace an absolute path that lies under the active worktree root with a
+/// `$WORKTREE`-prefixed display path. When `worktree_root` is `None` the path
+/// is returned unchanged.
+fn maybe_replace_worktree_prefix(path: &str, worktree_root: Option<&std::path::Path>) -> String {
+    let Some(root) = worktree_root else {
+        return path.to_string();
+    };
+    let Some(root_str) = root.to_str() else {
+        return path.to_string();
+    };
+    let root_clean = root_str.trim_end_matches('/');
+
+    if path == root_clean {
+        return "$WORKTREE".to_string();
+    }
+    if let Some(rest) = path.strip_prefix(root_clean)
+        && rest.starts_with('/')
+    {
+        return format!("$WORKTREE{rest}");
+    }
+
+    path.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{model_facing_content, tool_title};
@@ -6249,20 +6301,20 @@ mod tests {
     fn edit_file_title_extracts_path_not_tag() {
         // The `[PATH#TAG]` header must surface the path, not the 4-hex tag.
         let input = json!({ "patch": "[src/main.rs#1A2B]\nSWAP 5.=5:\n+X" });
-        assert_eq!(tool_title("Edit", &input), "Edit src/main.rs");
+        assert_eq!(tool_title("Edit", &input, None), "Edit src/main.rs");
     }
 
     #[test]
     fn edit_file_title_path_with_hash_survives() {
         // A path containing `#` keeps everything before the LAST `#`.
         let input = json!({ "patch": "[a/b#issue.rs#FF0E]\nDEL 1" });
-        assert_eq!(tool_title("Edit", &input), "Edit a/b#issue.rs");
+        assert_eq!(tool_title("Edit", &input, None), "Edit a/b#issue.rs");
     }
 
     #[test]
     fn edit_file_title_missing_header_is_empty() {
         let input = json!({ "patch": "SWAP 5.=5:\n+X" });
-        assert_eq!(tool_title("Edit", &input), "Edit ");
+        assert_eq!(tool_title("Edit", &input, None), "Edit ");
     }
 
     #[test]
@@ -6274,14 +6326,14 @@ mod tests {
             ]
         });
         assert_eq!(
-            tool_title("AskUserQuestion", &input),
+            tool_title("AskUserQuestion", &input, None),
             "AskUserQuestion: Which framework?"
         );
     }
 
     #[test]
     fn ask_user_question_title_falls_back_without_questions() {
-        assert_eq!(tool_title("AskUserQuestion", &json!({})), "AskUserQuestion");
+        assert_eq!(tool_title("AskUserQuestion", &json!({}), None), "AskUserQuestion");
     }
 
     /// Bash tool title is the first line of the command, no `bash:` prefix —
@@ -6291,22 +6343,98 @@ mod tests {
     fn bash_title_strips_prefix_and_uses_first_line() {
         let input = json!({ "command": "gh pr create -R dspo/manox --title foo" });
         assert_eq!(
-            tool_title("Bash", &input),
+            tool_title("Bash", &input, None),
             "gh pr create -R dspo/manox --title foo"
         );
 
         let long = "a".repeat(120);
         let input = json!({ "command": long.clone() });
-        let out = tool_title("Bash", &input);
+        let out = tool_title("Bash", &input, None);
         assert_eq!(out.chars().count(), 81);
         assert!(out.ends_with('…'));
 
         let multi = "git status\ncargo build --release";
         let input = json!({ "command": multi });
-        assert_eq!(tool_title("Bash", &input), "git status");
+        assert_eq!(tool_title("Bash", &input, None), "git status");
 
         let input = json!({});
-        assert_eq!(tool_title("Bash", &input), "");
+        assert_eq!(tool_title("Bash", &input, None), "");
+    }
+
+
+    /// When a worktree root is provided, file paths under it are rendered
+    /// with a `$WORKTREE` prefix to hide the internal worktree location.
+    #[test]
+    fn worktree_prefix_replaces_read_path() {
+        use std::path::Path;
+        let root = Path::new("/tmp/wt-test");
+        let input = json!({ "path": "/tmp/wt-test/src/lib.rs" });
+        assert_eq!(
+            tool_title("Read", &input, Some(root)),
+            "Read $WORKTREE/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn worktree_prefix_replaces_write_path() {
+        use std::path::Path;
+        let root = Path::new("/tmp/wt-test");
+        let input = json!({ "path": "/tmp/wt-test/src/lib.rs" });
+        assert_eq!(
+            tool_title("Write", &input, Some(root)),
+            "Write $WORKTREE/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn worktree_prefix_replaces_list_path() {
+        use std::path::Path;
+        let root = Path::new("/tmp/wt-test");
+        let input = json!({ "path": "/tmp/wt-test/src" });
+        assert_eq!(
+            tool_title("List", &input, Some(root)),
+            "List $WORKTREE/src"
+        );
+    }
+
+    #[test]
+    fn worktree_prefix_replaces_edit_path() {
+        use std::path::Path;
+        let root = Path::new("/tmp/wt-test");
+        let input =
+            json!({ "patch": "[/tmp/wt-test/src/main.rs#A557]\nSWAP 1.=2:\n+hello\n+world" });
+        assert_eq!(
+            tool_title("Edit", &input, Some(root)),
+            "Edit $WORKTREE/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn worktree_prefix_exact_root_shows_as_worktree() {
+        use std::path::Path;
+        let root = Path::new("/tmp/wt-test");
+        let input = json!({ "path": "/tmp/wt-test" });
+        assert_eq!(tool_title("Read", &input, Some(root)), "Read $WORKTREE");
+    }
+
+    #[test]
+    fn worktree_prefix_non_matching_path_unchanged() {
+        use std::path::Path;
+        let root = Path::new("/tmp/wt-test");
+        let input = json!({ "path": "/other/dir/file.rs" });
+        assert_eq!(
+            tool_title("Read", &input, Some(root)),
+            "Read /other/dir/file.rs"
+        );
+    }
+
+    #[test]
+    fn worktree_prefix_none_leaves_path_unchanged() {
+        let input = json!({ "path": "/tmp/wt-test/src/lib.rs" });
+        assert_eq!(
+            tool_title("Read", &input, None),
+            "Read /tmp/wt-test/src/lib.rs"
+        );
     }
 
     /// The `agent` tool's persisted ToolResult carries a JSON envelope
