@@ -124,12 +124,13 @@ pub enum ApprovalMode {
 }
 
 impl ApprovalMode {
-    /// Map the persisted integer back to a variant. Legacy values
-    /// (0 = OnRequest, 1 = AutoReview, 2 = Yolo) all collapse into the
-    /// two-state world: OnRequest/AutoReview -> AutoPilot, Yolo -> Danger.
+    /// Map the persisted integer back to a variant. Current serialization
+    /// is `0 = AutoPilot, 1 = Danger`; legacy `2` (Yolo) also means Danger.
+    /// Fallback is AutoPilot so an unrecognized value never silently
+    /// escalates to unsandboxed execution.
     pub fn from_i64(v: i64) -> Self {
         match v {
-            2 => Self::Danger,
+            1 | 2 => Self::Danger,
             _ => Self::AutoPilot,
         }
     }
@@ -6310,6 +6311,21 @@ mod tests {
     /// map, so they must not overlap. Acquire at the top of each test that
     /// calls `init_for_test`.
     static THREAD_STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn approval_mode_i64_round_trip() {
+        // A persisted value must survive a write→reload cycle: a Danger
+        // thread that silently reverts to AutoPilot on reload would
+        // re-sandbox bash without the user's consent.
+        for mode in [super::ApprovalMode::AutoPilot, super::ApprovalMode::Danger] {
+            assert_eq!(super::ApprovalMode::from_i64(mode.as_i64()), mode);
+        }
+        // Legacy Yolo (2) maps to Danger so old databases reload unsandboxed
+        // rather than silently downgrading.
+        assert_eq!(super::ApprovalMode::from_i64(2), super::ApprovalMode::Danger);
+        // Unknown values fall back to AutoPilot — never silently escalate.
+        assert_eq!(super::ApprovalMode::from_i64(99), super::ApprovalMode::AutoPilot);
+    }
 
     #[test]
     fn edit_file_title_extracts_path_not_tag() {
