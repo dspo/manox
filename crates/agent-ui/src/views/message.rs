@@ -1424,9 +1424,7 @@ fn render_tool_entry(
             ToolCallStatus::Cancelled => Icon::new(IconName::Minus),
             _ => unreachable!(),
         };
-        icon.xsmall()
-            .text_color(status_color)
-            .into_any_element()
+        icon.xsmall().text_color(status_color).into_any_element()
     };
     // Default-collapsed: a streaming tool does not auto-reveal its output —
     // only a manual expand does. The status icon still spins while running.
