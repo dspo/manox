@@ -452,7 +452,11 @@ fn setup_child(
                 let activity = if !title.is_empty() {
                     title.clone()
                 } else {
-                    thread::tool_title(name, input.as_ref().unwrap_or(&serde_json::Value::Null), None)
+                    thread::tool_title(
+                        name,
+                        input.as_ref().unwrap_or(&serde_json::Value::Null),
+                        None,
+                    )
                 };
                 let is_new = {
                     let mut acc = metrics_cb.lock().expect("subagent metrics poisoned");

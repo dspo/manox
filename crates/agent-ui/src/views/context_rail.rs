@@ -362,7 +362,10 @@ impl ContextRail {
                     format!(
                         "{}  {}",
                         model_id,
-                        i18n::t_str("workspace-env-cache-hit-rate", &[("pct", &format!("{:.0}", pct * 100.0))])
+                        i18n::t_str(
+                            "workspace-env-cache-hit-rate",
+                            &[("pct", &format!("{:.0}", pct * 100.0))]
+                        )
                     )
                 } else {
                     model_id.clone()
@@ -612,13 +615,7 @@ impl ContextRail {
                         )
                         .into_any_element(),
                 );
-                append_children(
-                    Some(&info.id),
-                    agents,
-                    weak_workspace,
-                    theme,
-                    rows,
-                );
+                append_children(Some(&info.id), agents, weak_workspace, theme, rows);
             }
         }
 
@@ -644,13 +641,7 @@ impl ContextRail {
                 )
                 .into_any_element(),
         ];
-        append_children(
-            None,
-            &self.agents,
-            &self.weak_workspace,
-            theme,
-            &mut rows,
-        );
+        append_children(None, &self.agents, &self.weak_workspace, theme, &mut rows);
 
         v_flex()
             .w_full()
@@ -688,7 +679,7 @@ impl ContextRail {
                 thread.messages(),
                 thread.request_token_usage(),
                 thread.agent_language(),
-            )
+            ),
         );
         let muted = theme.muted_foreground;
         let warn = theme.warning;
@@ -732,17 +723,16 @@ impl ContextRail {
         rows.into_any_element()
     }
 
-
-/// Sort key for plan steps: InProgress (0) → Pending (1) → Completed (2).
-/// Within each priority group the original chronological order is preserved
-/// by `sort_by_key`'s stable sort.
-fn plan_sort_key(status: PlanStepStatus) -> u8 {
-    match status {
-        PlanStepStatus::InProgress => 0,
-        PlanStepStatus::Pending => 1,
-        PlanStepStatus::Completed => 2,
+    /// Sort key for plan steps: InProgress (0) → Pending (1) → Completed (2).
+    /// Within each priority group the original chronological order is preserved
+    /// by `sort_by_key`'s stable sort.
+    fn plan_sort_key(status: PlanStepStatus) -> u8 {
+        match status {
+            PlanStepStatus::InProgress => 0,
+            PlanStepStatus::Pending => 1,
+            PlanStepStatus::Completed => 2,
+        }
     }
-}
 
     /// Plan section: the model's `UpdatePlan` snapshot rendered as an execution
     /// overview. Collapsible by clicking the header or pressing
@@ -818,16 +808,13 @@ fn plan_sort_key(status: PlanStepStatus) -> u8 {
                 }
                 let shown = sorted.len().min(5);
                 if remaining > shown || plan.steps.len() > 5 {
-                    section = section.child(
-                        gpui::div()
-                            .pl(px(12.))
-                            .text_xs()
-                            .text_color(muted)
-                            .child(i18n::t_str(
+                    section =
+                        section.child(gpui::div().pl(px(12.)).text_xs().text_color(muted).child(
+                            i18n::t_str(
                                 "cockpit-plan-remaining",
                                 &[("count", &total.saturating_sub(shown).to_string())],
-                            )),
-                    );
+                            ),
+                        ));
                 }
             }
             return section.into_any_element();

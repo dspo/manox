@@ -3041,9 +3041,9 @@ impl Thread {
             return;
         };
 
+        self.goal_budget_stop_injected = false;
         // Signal the UI immediately that a turn is in flight — before the
         // first streaming delta arrives — so the sidebar running indicator
-        self.goal_budget_stop_injected = false;
         // lights up during the warm-up gap. `ThreadStore::set_running` (called
         // by the workspace on this event) is the bridge to the sidebar.
         self.turn_started_at = Some(Instant::now());
@@ -4411,8 +4411,8 @@ impl Thread {
         if !crate::tools::code::ALLOWED_TOOLS.contains(&name.as_str()) {
             return fail(format!("tool not allowed in Code: {name}"));
         }
-        let (tool, lang, in_plan, approval_mode, always_allowed, model, wk_root) =
-            match this.read_with(cx, |thread, _| {
+        let (tool, lang, in_plan, approval_mode, always_allowed, model, wk_root) = match this
+            .read_with(cx, |thread, _| {
                 (
                     thread.tools.get(&name).cloned(),
                     thread.agent_language,
@@ -4423,9 +4423,9 @@ impl Thread {
                     thread.worktree.as_ref().map(|w| w.path.clone()),
                 )
             }) {
-                Ok(snapshot) => snapshot,
-                Err(error) => return fail(format!("thread unavailable: {error}")),
-            };
+            Ok(snapshot) => snapshot,
+            Err(error) => return fail(format!("thread unavailable: {error}")),
+        };
         let Some(tool) = tool else {
             return fail(format!("Unknown tool: {name}"));
         };
@@ -6332,7 +6332,10 @@ mod tests {
 
     #[test]
     fn ask_user_question_title_falls_back_without_questions() {
-        assert_eq!(tool_title("AskUserQuestion", &json!({}), None), "AskUserQuestion");
+        assert_eq!(
+            tool_title("AskUserQuestion", &json!({}), None),
+            "AskUserQuestion"
+        );
     }
 
     /// Bash tool title is the first line of the command, no `bash:` prefix —
@@ -6359,7 +6362,6 @@ mod tests {
         let input = json!({});
         assert_eq!(tool_title("Bash", &input, None), "");
     }
-
 
     /// When a worktree root is provided, file paths under it are rendered
     /// with a `$WORKTREE` prefix to hide the internal worktree location.
@@ -6390,10 +6392,7 @@ mod tests {
         use std::path::Path;
         let root = Path::new("/tmp/wt-test");
         let input = json!({ "path": "/tmp/wt-test/src" });
-        assert_eq!(
-            tool_title("List", &input, Some(root)),
-            "List $WORKTREE/src"
-        );
+        assert_eq!(tool_title("List", &input, Some(root)), "List $WORKTREE/src");
     }
 
     #[test]
