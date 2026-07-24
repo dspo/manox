@@ -60,10 +60,7 @@ pub struct ContextBudget {
 /// `None` only when the window is zero. The percentage is `active / window`;
 /// the cap displayed is the real model window size, not the auto-compaction
 /// trigger threshold.
-pub fn context_budget_pct(
-    max_input_tokens: u64,
-    active_tokens: u64,
-) -> Option<ContextBudget> {
+pub fn context_budget_pct(max_input_tokens: u64, active_tokens: u64) -> Option<ContextBudget> {
     if max_input_tokens == 0 {
         return None;
     }
