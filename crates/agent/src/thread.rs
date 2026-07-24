@@ -391,14 +391,12 @@ const MAX_RECOVERY_ATTEMPTS: u32 = 3;
 /// Removes orphaned tool_results (tool_results without corresponding tool_use),
 /// ensures proper message structure, and fixes common issues that accumulate
 /// after multiple tool failures.
-fn sanitize_message_sequence(
-    messages: Vec<LanguageModelRequestMessage>,
-) -> Vec<LanguageModelRequestMessage> {
+fn sanitize_message_sequence(messages: &mut Vec<Message>) {
     use std::collections::HashSet;
 
     // First pass: collect all tool_use IDs from assistant messages
     let mut tool_use_ids: HashSet<String> = HashSet::new();
-    for msg in &messages {
+    for msg in messages.iter() {
         if msg.role == Role::Assistant {
             for content in &msg.content {
                 if let MessageContent::ToolUse(tool_use) = content {
@@ -409,52 +407,60 @@ fn sanitize_message_sequence(
     }
 
     // Second pass: filter out orphaned tool_results and empty messages
-    let mut sanitized: Vec<LanguageModelRequestMessage> = Vec::new();
-    for msg in messages {
+    let mut i = 0;
+    while i < messages.len() {
+        let msg = &mut messages[i];
+
         // Skip empty messages (no content)
         if msg.content.is_empty() {
+            messages.remove(i);
             continue;
         }
 
         // For user messages with tool_results, filter out orphaned ones
         if msg.role == Role::User {
-            let mut filtered_content: Vec<MessageContent> = Vec::new();
+            let original_len = msg.content.len();
             let mut has_tool_result = false;
             let mut has_valid_tool_result = false;
 
-            for content in msg.content {
+            msg.content.retain(|content| {
                 match content {
                     MessageContent::ToolResult(tool_result) => {
                         has_tool_result = true;
                         // Only keep tool_results that have a corresponding tool_use
                         if tool_use_ids.contains(&tool_result.tool_use_id) {
-                            filtered_content.push(MessageContent::ToolResult(tool_result));
                             has_valid_tool_result = true;
+                            true
+                        } else {
+                            // Orphaned tool_result, remove it
+                            tracing::warn!(
+                                tool_use_id = %tool_result.tool_use_id,
+                                "removing orphaned tool_result during recovery"
+                            );
+                            false
                         }
-                        // else: orphaned tool_result, skip it
                     }
-                    other => {
-                        filtered_content.push(other);
-                    }
+                    _ => true,
                 }
-            }
+            });
 
-            // If the message had tool_results but all were orphaned, skip the message
-            if has_tool_result && !has_valid_tool_result && filtered_content.is_empty() {
+            // If the message had tool_results but all were orphaned and no other content, remove it
+            if has_tool_result && !has_valid_tool_result && msg.content.is_empty() {
+                messages.remove(i);
                 continue;
             }
 
-            sanitized.push(LanguageModelRequestMessage {
-                role: msg.role,
-                content: filtered_content,
-                cache: msg.cache,
-            });
-        } else {
-            sanitized.push(msg);
+            // Log if we removed any content
+            if msg.content.len() < original_len {
+                tracing::debug!(
+                    removed_count = original_len - msg.content.len(),
+                    "removed orphaned tool_results from user message"
+                );
+            }
         }
-    }
 
-    sanitized
+        i += 1;
+    }
 }
 
 fn escape_xml(value: &str) -> String {
@@ -3742,6 +3748,10 @@ impl Thread {
                                     "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (stream errors); last error: {e}"
                                 ))
                             } else {
+                                // Sanitize messages before retry to remove orphaned tool_results
+                                // that accumulate after multiple failures and cause API 400 errors.
+                                // This runs only on recovery, preserving prefix cache stability.
+                                sanitize_message_sequence(&mut this.messages);
                                 tracing::warn!(
                                     round,
                                     error = %e,
@@ -4010,6 +4020,10 @@ impl Thread {
                         return RecoveryAction::CompactAndRetry;
                     }
                     this.recovery_retries += 1;
+                    // Sanitize messages before retry to remove orphaned tool_results
+                    // that accumulate after multiple failures and cause API 400 errors.
+                    // This runs only on recovery, preserving prefix cache stability.
+                    sanitize_message_sequence(&mut this.messages);
                     if this.recovery_retries > MAX_RECOVERY_ATTEMPTS {
                         cx.emit(ThreadEvent::Error(anyhow::anyhow!(
                             "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (stream error / tool_use JSON parse error / max_output_tokens truncation / degenerate empty turn / unfulfilled tool intent)"
@@ -5797,10 +5811,6 @@ impl Thread {
         // the rest). Cache flags survive — coalesce keeps the trailing
         // segment's flag, so the prefix and trailing cache anchors persist.
         let messages = crate::compact::coalesce_same_role(messages);
-        // Sanitize the message sequence to fix structural issues that cause
-        // API 400 errors: remove orphaned tool_results, ensure proper structure.
-        // This is a defensive measure after multiple tool failures accumulate.
-        let messages = sanitize_message_sequence(messages);
         let messages = crate::optimizer::apply_image_policy(
             messages,
             active_model
