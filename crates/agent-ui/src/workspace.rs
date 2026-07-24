@@ -1796,6 +1796,7 @@ impl Workspace {
         self.sync_list_count(cx);
         match outcome {
             ApplyOutcome::Remeasure(ix) => self.list_state.remeasure_items(ix..ix + 1),
+            ApplyOutcome::RemeasureAll => self.list_state.remeasure(),
             // `None` touched no item; `Appended`/`RemovedTail` only changed the
             // count, which `sync_list_count` already spliced.
             ApplyOutcome::None | ApplyOutcome::Appended | ApplyOutcome::RemovedTail => {}
@@ -3765,6 +3766,13 @@ impl Workspace {
                 c.push_user(text, Vec::new(), meta, weak, cx);
             });
             self.sync_list_count(cx);
+            // The tail slot was swapped in place (plan card out, verdict bubble
+            // in) — the count is unchanged, so `sync_list_count` alone leaves
+            // the list's cached height for that index pointing at the plan
+            // card. Remeasure it so the verdict bubble renders at its own
+            // height.
+            let ix = self.conversation.read(cx).items().len().saturating_sub(1);
+            self.list_state.remeasure_items(ix..ix + 1);
             self.list_state.set_follow_mode(FollowMode::Tail);
             // The rail's plan seeds from the model's first `UpdatePlan` call, not
             // the approved plan text — see the continue-in-plan branch above.

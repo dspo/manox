@@ -533,6 +533,9 @@ pub enum ApplyOutcome {
     None,
     /// An existing item's content changed at the index; remeasure that item.
     Remeasure(usize),
+    /// Every item may have changed height (terminal `Stop` collapses every
+    /// activity segment and tool card); remeasure the whole list.
+    RemeasureAll,
     /// A new item was appended at the end; splice the list count up.
     Appended,
     /// A trailing transient item (a `Retry` badge) was popped without a
@@ -1375,7 +1378,7 @@ impl ConversationState {
                 if self.items.is_empty() {
                     ApplyOutcome::None
                 } else {
-                    ApplyOutcome::Remeasure(self.items.len() - 1)
+                    ApplyOutcome::RemeasureAll
                 }
             }
             ThreadEvent::Error(e) => {
@@ -1561,7 +1564,13 @@ impl ConversationState {
             }
         };
         if popped_retry {
-            ApplyOutcome::RemovedTail
+            match outcome {
+                // A `Remeasure(ix)` against a post-pop index is still valid —
+                // the pop was at the tail, so `ix` still points at the same
+                // item. The retry pop itself is covered by the count splice.
+                ApplyOutcome::Remeasure(ix) => ApplyOutcome::Remeasure(ix),
+                _ => ApplyOutcome::RemovedTail,
+            }
         } else {
             outcome
         }
