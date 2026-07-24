@@ -384,7 +384,84 @@ pub struct PendingAuthMeta {
 /// budget. Each recovery continuation bumps `recovery_retries`; exceeding
 /// this emits `ThreadEvent::Error` and ends the turn rather than spinning
 /// forever.
-const MAX_RECOVERY_ATTEMPTS: u32 = 2;
+const MAX_RECOVERY_ATTEMPTS: u32 = 3;
+
+/// Sanitize a message sequence to fix structural issues that cause API 400 errors.
+///
+/// Removes orphaned tool_results (tool_results without corresponding tool_use),
+/// ensures proper message structure, and fixes common issues that accumulate
+/// after multiple tool failures.
+fn sanitize_message_sequence(messages: &mut Vec<Message>) {
+    use std::collections::HashSet;
+
+    // First pass: collect all tool_use IDs from assistant messages
+    let mut tool_use_ids: HashSet<String> = HashSet::new();
+    for msg in messages.iter() {
+        if msg.role == Role::Assistant {
+            for content in &msg.content {
+                if let MessageContent::ToolUse(tool_use) = content {
+                    tool_use_ids.insert(tool_use.id.clone());
+                }
+            }
+        }
+    }
+
+    // Second pass: filter out orphaned tool_results and empty messages
+    let mut i = 0;
+    while i < messages.len() {
+        let msg = &mut messages[i];
+
+        // Skip empty messages (no content)
+        if msg.content.is_empty() {
+            messages.remove(i);
+            continue;
+        }
+
+        // For user messages with tool_results, filter out orphaned ones
+        if msg.role == Role::User {
+            let original_len = msg.content.len();
+            let mut has_tool_result = false;
+            let mut has_valid_tool_result = false;
+
+            msg.content.retain(|content| {
+                match content {
+                    MessageContent::ToolResult(tool_result) => {
+                        has_tool_result = true;
+                        // Only keep tool_results that have a corresponding tool_use
+                        if tool_use_ids.contains(&tool_result.tool_use_id) {
+                            has_valid_tool_result = true;
+                            true
+                        } else {
+                            // Orphaned tool_result, remove it
+                            tracing::warn!(
+                                tool_use_id = %tool_result.tool_use_id,
+                                "removing orphaned tool_result during recovery"
+                            );
+                            false
+                        }
+                    }
+                    _ => true,
+                }
+            });
+
+            // If the message had tool_results but all were orphaned and no other content, remove it
+            if has_tool_result && !has_valid_tool_result && msg.content.is_empty() {
+                messages.remove(i);
+                continue;
+            }
+
+            // Log if we removed any content
+            if msg.content.len() < original_len {
+                tracing::debug!(
+                    removed_count = original_len - msg.content.len(),
+                    "removed orphaned tool_results from user message"
+                );
+            }
+        }
+
+        i += 1;
+    }
+}
 
 fn escape_xml(value: &str) -> String {
     value
@@ -3671,6 +3748,10 @@ impl Thread {
                                     "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (stream errors); last error: {e}"
                                 ))
                             } else {
+                                // Sanitize messages before retry to remove orphaned tool_results
+                                // that accumulate after multiple failures and cause API 400 errors.
+                                // This runs only on recovery, preserving prefix cache stability.
+                                sanitize_message_sequence(&mut this.messages);
                                 tracing::warn!(
                                     round,
                                     error = %e,
@@ -3939,6 +4020,10 @@ impl Thread {
                         return RecoveryAction::CompactAndRetry;
                     }
                     this.recovery_retries += 1;
+                    // Sanitize messages before retry to remove orphaned tool_results
+                    // that accumulate after multiple failures and cause API 400 errors.
+                    // This runs only on recovery, preserving prefix cache stability.
+                    sanitize_message_sequence(&mut this.messages);
                     if this.recovery_retries > MAX_RECOVERY_ATTEMPTS {
                         cx.emit(ThreadEvent::Error(anyhow::anyhow!(
                             "turn aborted: exceeded {MAX_RECOVERY_ATTEMPTS} recovery retries (stream error / tool_use JSON parse error / max_output_tokens truncation / degenerate empty turn / unfulfilled tool intent)"
@@ -4411,12 +4496,11 @@ impl Thread {
         if !crate::tools::code::ALLOWED_TOOLS.contains(&name.as_str()) {
             return fail(format!("tool not allowed in Code: {name}"));
         }
-        let (tool, lang, in_plan, approval_mode, always_allowed, model, wk_root) = match this
+        let (tool, lang, approval_mode, always_allowed, model, wk_root) = match this
             .read_with(cx, |thread, _| {
                 (
                     thread.tools.get(&name).cloned(),
                     thread.agent_language,
-                    false,
                     thread.approval_mode,
                     thread.permission.is_always_allowed(&name),
                     thread.model.clone(),
@@ -4429,9 +4513,6 @@ impl Thread {
         let Some(tool) = tool else {
             return fail(format!("Unknown tool: {name}"));
         };
-        if in_plan && !tool.is_read_only() {
-            return fail(format!("Plan mode does not permit calling {name}."));
-        }
 
         let title = tool_title(&name, &input, wk_root.as_deref());
         let mut needs_approval = tool.requires_approval(&input)
@@ -4718,18 +4799,6 @@ impl Thread {
             Self::append_tool_result(&this, tu, msg.clone(), true, cx)?;
             return Ok(());
         };
-
-        // Plan-mode write backstop: a write tool should never be advertised in
-        // plan mode (the request-tool list is filtered), but if one slips
-        // through (stale registry, model hallucination) synthesize an error
-        // rather than execute it.
-        let in_plan = false;
-        if in_plan && !tool.is_read_only() {
-            let msg = format!("Plan mode does not permit calling {name}.");
-            Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
-            Self::append_tool_result(&this, tu, msg, true, cx)?;
-            return Ok(());
-        }
 
         if name == crate::tools::CODE {
             return Self::run_code_inner(this, tu, cancel, cx).await;
@@ -9852,5 +9921,100 @@ mod tests {
             !nudge.contains("<proposed_plan>"),
             "default-mode nudge must not mention plan blocks: {nudge}"
         );
+    }
+
+    #[test]
+    fn sanitize_removes_orphaned_tool_results() {
+        use super::sanitize_message_sequence;
+        use crate::language_model::Role;
+        use std::sync::Arc;
+
+        let mut messages = vec![
+            // Assistant message with tool_use
+            Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
+                id: "tool_123".into(),
+                name: Arc::from("Read"),
+                raw_input: "{}".into(),
+                input: serde_json::json!({"path": "/tmp/test"}),
+                is_input_complete: true,
+                thought_signature: None,
+            })]),
+            // User message with valid tool_result (has corresponding tool_use)
+            Message::user_with_content(vec![MessageContent::ToolResult(
+                LanguageModelToolResult {
+                    tool_use_id: "tool_123".into(),
+                    tool_name: Arc::from("Read"),
+                    is_error: false,
+                    content: "file content".into(),
+                },
+            )]),
+            // User message with orphaned tool_result (no corresponding tool_use)
+            Message::user_with_content(vec![MessageContent::ToolResult(
+                LanguageModelToolResult {
+                    tool_use_id: "tool_999".into(),
+                    tool_name: Arc::from("Bash"),
+                    is_error: false,
+                    content: "orphaned result".into(),
+                },
+            )]),
+        ];
+
+        sanitize_message_sequence(&mut messages);
+
+        // Should keep assistant message and valid tool_result, remove orphaned message
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::Assistant);
+        assert_eq!(messages[1].role, Role::User);
+        assert!(matches!(
+            &messages[1].content[0],
+            MessageContent::ToolResult(tr) if tr.tool_use_id == "tool_123"
+        ));
+    }
+
+    #[test]
+    fn sanitize_removes_empty_messages() {
+        use super::sanitize_message_sequence;
+        use crate::language_model::Role;
+
+        let mut messages = vec![
+            Message::user("hello".into()),
+            Message::assistant(vec![]), // Empty message
+            Message::user("world".into()),
+        ];
+
+        sanitize_message_sequence(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::User);
+    }
+
+    #[test]
+    fn sanitize_keeps_text_with_orphaned_tool_result() {
+        use super::sanitize_message_sequence;
+        use std::sync::Arc;
+
+        let mut messages = vec![
+            // User message with both text and orphaned tool_result
+            Message::user_with_content(vec![
+                MessageContent::Text("user feedback".into()),
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "orphaned".into(),
+                    tool_name: Arc::from("Bash"),
+                    is_error: false,
+                    content: "orphaned result".into(),
+                }),
+            ]),
+        ];
+
+        sanitize_message_sequence(&mut messages);
+
+        // Should keep the message with text, but remove the orphaned tool_result
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.len(), 1);
+        assert!(matches!(
+            &messages[0].content[0],
+            MessageContent::Text(t) if t.as_str() == "user feedback"
+        ));
     }
 }

@@ -449,7 +449,7 @@ impl SandboxPolicy {
         if let NetworkPolicy::Restricted { .. } = &self.network
             && let Some(port) = proxy_port
         {
-            let proxy_url = format!("http://127.0.0.1:{port}");
+            let proxy_url = format!("http://localhost:{port}");
             for key in [
                 "HTTP_PROXY",
                 "http_proxy",
@@ -755,7 +755,7 @@ mod tests {
             .map(|v| v.to_string_lossy().into_owned());
         assert_eq!(
             proxy_val.as_deref(),
-            Some("http://127.0.0.1:54321"),
+            Some("http://localhost:54321"),
             "HTTP_PROXY must point at the proxy: {proxy_val:?}"
         );
         let no_proxy_val = env

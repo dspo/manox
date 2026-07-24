@@ -198,8 +198,9 @@ where
 
 #[derive(Deserialize, JsonSchema, Debug)]
 #[serde(deny_unknown_fields)]
+#[schemars(example = "bash_example")]
 pub(crate) struct BashInput {
-    /// Bash command to run in the persistent session (`cd` / `export` persist).
+    /// Bash command to run (REQUIRED). This is the only required field.
     command: String,
     /// Working directory override (persists across subsequent calls).
     #[serde(default)]
@@ -233,21 +234,31 @@ pub(crate) struct BashInput {
     run_in_background: Option<bool>,
 }
 
+/// Provide a concrete example for the JSON schema.
+fn bash_example() -> serde_json::Value {
+    serde_json::json!({
+        "command": "ls -la",
+        "cwd": "/path/to/project"
+    })
+}
+
 impl AgentTool for BashTool {
     fn name(&self) -> &str {
         super::BASH
     }
     fn description(&self) -> &str {
-        "Run a bash command and return stdout. Runs inside an OS sandbox by default (macOS seatbelt: writes \
-         confined to the project root and temp dir, `.git` read-only, network disabled); each call is a \
-         one-shot `bash -c` — `cd`/`export` don't persist across calls, so chain steps with `&&` or use \
-         the `cwd` parameter. For out-of-sandbox capabilities (network, writing outside the project root) \
-         set `unsandboxed: true`, which after user approval runs in a persistent shell session (cd/export \
-         persist across calls). Default timeout is 120s (override with timeout_secs); on timeout or cancel \
-         the whole process group is terminated. stdout/stderr stream back to the UI live. \
-         Do NOT pipe output to `head`/`tail` to reduce volume — that truncates the upstream pipe and can \
-         SIGPIPE-kill a long-running command; use `head_lines`/`tail_lines` instead, which keep the \
-         selection (first N, last N, or both with middle elided) while letting the command finish naturally."
+        "Run a bash command and return stdout. REQUIRED FIELD: `command` (string) — the bash command to execute. \
+         Optional fields: `cwd`, `timeout_secs`, `unsandboxed`, `head_lines`, `tail_lines`, `run_in_background`. \
+         Do NOT include any other fields (e.g., `description`, `name`, `id` are invalid). \
+         Runs inside an OS sandbox by default (macOS seatbelt: writes confined to the project root and temp dir, \
+         `.git` read-only, network disabled); each call is a one-shot `bash -c` — `cd`/`export` don't persist \
+         across calls, so chain steps with `&&` or use the `cwd` parameter. For out-of-sandbox capabilities \
+         (network, writing outside the project root) set `unsandboxed: true`, which after user approval runs in \
+         a persistent shell session (cd/export persist across calls). Default timeout is 120s (override with \
+         timeout_secs); on timeout or cancel the whole process group is terminated. stdout/stderr stream back to \
+         the UI live. Do NOT pipe output to `head`/`tail` to reduce volume — that truncates the upstream pipe and \
+         can SIGPIPE-kill a long-running command; use `head_lines`/`tail_lines` instead, which keep the selection \
+         (first N, last N, or both with middle elided) while letting the command finish naturally."
     }
     fn requires_approval(&self, input: &serde_json::Value) -> bool {
         let unsandboxed = input

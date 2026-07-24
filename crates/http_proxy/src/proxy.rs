@@ -122,7 +122,8 @@ impl ProxyHandle {
     /// Spawns the proxy: binds a listener on `127.0.0.1:0`, spawns the
     /// listener thread, sends a `Ready` event, and returns. The returned
     /// port is what callers should use for `HTTPS_PROXY`/`HTTP_PROXY` env
-    /// vars and for the seatbelt rule narrowing `localhost:<port>`.
+    /// vars (with `localhost` hostname for seatbelt compatibility) and for
+    /// the seatbelt rule narrowing `localhost:<port>`.
     pub fn spawn(config: ProxyConfig) -> Result<ProxyHandle> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .context("failed to bind proxy listener on 127.0.0.1:0")?;
