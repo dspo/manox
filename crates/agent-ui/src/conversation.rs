@@ -526,6 +526,33 @@ pub struct ConversationState {
     turn_started_at: Instant,
 }
 
+/// What `apply` did to the item list, so the caller can keep the `ListState`
+/// in sync (splice on append, remeasure on in-place mutation).
+#[derive(Debug)]
+pub enum ApplyOutcome {
+    /// No item touched (e.g. `ToolCallAuthorization`).
+    Unchanged,
+    /// An existing item's content changed at the index; remeasure that item.
+    Remeasure(usize),
+    /// Every item may have changed height (terminal `Stop` collapses every
+    /// activity segment and tool card); remeasure the whole list.
+    RemeasureAll,
+    /// A new item was appended at the end; splice the list count up.
+    Appended,
+    /// A trailing transient item (a `Retry` badge) was popped without a
+    /// replacement pushed. Splice the list count down by one at the tail.
+    RemovedTail,
+    /// An existing item was mutated at `remeasure_ix` (dirtying its height
+    /// cache) AND a new item was appended at the tail. The `AgentText`
+    /// `needs_new` arm hits this whenever a live activity segment is closed
+    /// for the incoming reply: `close_segment_for_text` finalizes the segment
+    /// (freezing elapsed, possibly collapsing entries → height change) right
+    /// before the new assistant bubble is pushed. Remeasure the segment so its
+    /// cached height catches up to the finalized state, and splice the count
+    /// for the appended bubble.
+    RemeasureAndAppend { remeasure_ix: usize },
+}
+
 impl Default for ConversationState {
     fn default() -> Self {
         Self {
@@ -541,6 +568,7 @@ impl Default for ConversationState {
 /// clippy's argument-count limit. The cwd is a per-call snapshot taken by the
 /// caller from the `Thread` entity — reading the `Workspace` itself would
 /// double-lease inside a `Workspace::update`.
+#[derive(Clone)]
 pub struct ApplyCtx {
     pub weak: WeakEntity<Workspace>,
     pub cwd: Option<SharedString>,
@@ -820,7 +848,7 @@ impl ConversationState {
         last_request_usage: Option<TokenUsage>,
         ctx: ApplyCtx,
         cx: &mut App,
-    ) {
+    ) -> ApplyOutcome {
         let ApplyCtx { weak, cwd } = ctx;
         // A trailing `Retry` badge is stale the moment a real content or
         // terminal-error event lands — that event means the retry either
@@ -828,18 +856,16 @@ impl ConversationState {
         // (Error). Pop the badge first so the arm below pushes its own item
         // into the freed slot. Non-item events (usage, mode change, …) and
         // the `Retry` event itself skip this.
-        if matches!(
+        let popped_retry = matches!(
             event,
             ThreadEvent::AgentText(_)
                 | ThreadEvent::AgentThinking(_)
                 | ThreadEvent::ToolCall { .. }
                 | ThreadEvent::Error(_)
                 | ThreadEvent::Compaction { .. }
-        ) {
-            self.pop_trailing_retry(cx);
-        }
+        ) && self.pop_trailing_retry(cx);
 
-        match event {
+        let outcome = match event {
             // A compaction landed — render the handoff summary as a Recap card.
             // The card is appended (never updated in place): a compaction is a
             // one-time boundary marker, and the summary text is final.
@@ -857,6 +883,7 @@ impl ConversationState {
                         weak,
                     )
                 }));
+                ApplyOutcome::Appended
             }
             // `<proposed_plan>` streaming + completion are owned by the
             // workspace's review overlay, not the conversation list — there is
@@ -866,7 +893,7 @@ impl ConversationState {
             // workspace subscription), not the conversation list.
             ThreadEvent::PlanDelta { .. }
             | ThreadEvent::PlanReady { .. }
-            | ThreadEvent::PlanUpdated { .. } => {}
+            | ThreadEvent::PlanUpdated { .. } => ApplyOutcome::Unchanged,
             // Token usage + model/effort changes are surfaced elsewhere (sidebar /
             // model-history overlay). No conversation item.
             ThreadEvent::TokenUsageUpdated(_)
@@ -878,12 +905,12 @@ impl ConversationState {
             // `CompactionStarted` is a cockpit-only phase signal (the side-LLM
             // summarization is in flight); the conversation list renders nothing
             // for it. The workspace flips the cockpit phase on this event.
-            | ThreadEvent::CompactionStarted { .. } => {},
+            | ThreadEvent::CompactionStarted { .. } => ApplyOutcome::Unchanged,
             // `SteerInjected` is fired by the turn loop at drain time. The
             // workspace owns the queue→list transition (it pairs the event with
             // the matching `SteerPending` queue card and pushes the bubble here
             // via `push_user`); the conversation list takes no direct action.
-            | ThreadEvent::SteerInjected { .. } => {},
+            | ThreadEvent::SteerInjected { .. } => ApplyOutcome::Unchanged,
             // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
             // workspace to light the sidebar running indicator; it carries no
             // conversation content. We capture the turn's start instant here so
@@ -892,11 +919,12 @@ impl ConversationState {
             // `ToolCall`.
             ThreadEvent::TurnStarted => {
                 self.turn_started_at = Instant::now();
+                ApplyOutcome::Unchanged
             }
-            ThreadEvent::TurnFinished { .. } => {}
+            ThreadEvent::TurnFinished { .. } => ApplyOutcome::Unchanged,
             // Goal lifecycle is surfaced by the composer chip + status popover,
             // not as a conversation item.
-            ThreadEvent::GoalChanged { .. } => {}
+            ThreadEvent::GoalChanged { .. } => ApplyOutcome::Unchanged,
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
@@ -915,22 +943,28 @@ impl ConversationState {
                     // Without this, thinking arriving after the answer text
                     // folds into the pre-answer segment (issue #216).
                     // Snapshot the just-closed segment's totals for the model
-                    // row. Read *after* `close_segment_for_text` so
-                    // `frozen_secs` is pinned — the row shows the segment's
-                    // elapsed instead of a live timer that would keep growing
-                    // on every re-render of the reply.
-                    let activity_summary = if let Some(cix) = self.find_active_activity_segment(cx) {
-                        self.items[cix].update(cx, |item, cx| {
-                            item.close_segment_for_text(cx);
-                            cx.notify();
-                        });
-                        match self.items[cix].read(cx).kind() {
-                            ConvItem::Thinking(t) => t.activity_summary(),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
+                    // row *after* `close_segment_for_text` so `frozen_secs` is
+                    // pinned — the row shows the segment's elapsed instead of a
+                    // live timer that would keep growing on every re-render of
+                    // the reply. `close_segment_for_text` may also collapse
+                    // entries, dirtying the segment's height cache; carry the
+                    // index back so the caller remeasures it alongside splicing
+                    // in the new bubble (a bare `Appended` would only splice the
+                    // tail and leave the closed segment's height stale).
+                    let (activity_summary, closed_segment_ix) =
+                        if let Some(cix) = self.find_active_activity_segment(cx) {
+                            self.items[cix].update(cx, |item, cx| {
+                                item.close_segment_for_text(cx);
+                                cx.notify();
+                            });
+                            let summary = match self.items[cix].read(cx).kind() {
+                                ConvItem::Thinking(t) => t.activity_summary(),
+                                _ => None,
+                            };
+                            (summary, Some(cix))
+                        } else {
+                            (None, None)
+                        };
                     let id = self.items.len();
                     self.items.push(cx.new(|cx| {
                         let mut item = MessageItem::new(
@@ -947,6 +981,10 @@ impl ConversationState {
                         item.update_text(delta, cx);
                         item
                     }));
+                    match closed_segment_ix {
+                        Some(remeasure_ix) => ApplyOutcome::RemeasureAndAppend { remeasure_ix },
+                        None => ApplyOutcome::Appended,
+                    }
                 } else {
                     let ix = self.items.len() - 1;
                     self.items[ix].update(cx, |item, cx| {
@@ -966,6 +1004,7 @@ impl ConversationState {
                         item.update_text(&full_text, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
                 }
             }
             ThreadEvent::AgentThinking(delta) => {
@@ -974,8 +1013,8 @@ impl ConversationState {
                 // a gap (interrupted by a tool call or new turn) starts a
                 // fresh round. If no segment exists yet, open one.
                 let turn_started_at = self.turn_started_at;
-                let cix = match self.find_active_activity_segment(cx) {
-                    Some(i) => i,
+                let (cix, pushed) = match self.find_active_activity_segment(cx) {
+                    Some(i) => (i, false),
                     None => {
                         let i = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -988,7 +1027,7 @@ impl ConversationState {
                                 weak.clone(),
                             )
                         }));
-                        i
+                        (i, true)
                     }
                 };
                 let delta = delta.clone();
@@ -1027,6 +1066,11 @@ impl ConversationState {
                     }
                     cx.notify();
                 });
+                if pushed {
+                    ApplyOutcome::Appended
+                } else {
+                    ApplyOutcome::Remeasure(cix)
+                }
             }
             ThreadEvent::ToolCall {
                 id,
@@ -1053,6 +1097,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
+                        ApplyOutcome::Remeasure(ix)
                     } else {
                         let ix = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -1069,6 +1114,7 @@ impl ConversationState {
                                 weak,
                             )
                         }));
+                        ApplyOutcome::Appended
                     }
                 } else if name == agent::tools::ASK_USER_QUESTION {
                     // Top-level card, never folded into an activity segment.
@@ -1084,6 +1130,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
+                        ApplyOutcome::Remeasure(ix)
                     } else {
                         let ix = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -1106,6 +1153,7 @@ impl ConversationState {
                                 weak,
                             )
                         }));
+                        ApplyOutcome::Appended
                     }
                 } else {
                     // Ordinary tool call: fold into the active activity
@@ -1116,8 +1164,8 @@ impl ConversationState {
                     // into one status line. The segment is seeded with the
                     // turn's start time so the elapsed covers the whole turn.
                     let turn_started_at = self.turn_started_at;
-                    let cix = match self.find_active_activity_segment(cx) {
-                        Some(i) => i,
+                    let (cix, pushed) = match self.find_active_activity_segment(cx) {
+                        Some(i) => (i, false),
                         None => {
                             let i = self.items.len();
                             self.items.push(cx.new(|_| {
@@ -1130,7 +1178,7 @@ impl ConversationState {
                                     weak,
                                 )
                             }));
-                            i
+                            (i, true)
                         }
                     };
                     let id = id.clone();
@@ -1173,6 +1221,11 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
+                    if pushed {
+                        ApplyOutcome::Appended
+                    } else {
+                        ApplyOutcome::Remeasure(cix)
+                    }
                 }
             }
             ThreadEvent::ToolOutput { id, chunk } => {
@@ -1191,6 +1244,9 @@ impl ConversationState {
                         item.sync_tool_entry_panel(eix, cwd, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(cix)
+                } else {
+                    ApplyOutcome::Unchanged
                 }
             }
             ThreadEvent::ToolResult {
@@ -1217,6 +1273,7 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
                 } else if let Some((cix, eix)) = self.find_thinking_entry(id, cx) {
                     let entry_output = output.clone();
                     let entry_is_error = *is_error;
@@ -1239,6 +1296,7 @@ impl ConversationState {
                         item.sync_tool_entry_panel(eix, cwd, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(cix)
                 } else if let Some(ix) = self.find_tool(id, cx) {
                     self.items[ix].update(cx, |item, cx| {
                         if let ConvItem::ToolCall(t) = item.kind_mut() {
@@ -1253,6 +1311,7 @@ impl ConversationState {
                         item.sync_tool_call_panel(cwd, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
                 } else {
                     // No matching entry; insert as a finalized single-entry
                     // activity segment so the orphan result still renders as a
@@ -1289,10 +1348,12 @@ impl ConversationState {
                         item.sync_tool_entry_panel(0, cwd, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Appended
                 }
             }
             ThreadEvent::ToolCallAuthorization { .. } => {
                 // Handled by `Workspace` as a prompt overlay; not part of the conversation flow.
+                ApplyOutcome::Unchanged
             }
             ThreadEvent::ApprovalDecision { .. } => {
                 // Handled by `Workspace` as a Notice card; not part of the
@@ -1332,12 +1393,20 @@ impl ConversationState {
                         }
                     }
                 }
+                // Finalizing may grow/shrink any item (streaming → finalized
+                // body swap, segment auto-collapse); remeasure everything.
+                if self.items.is_empty() {
+                    ApplyOutcome::Unchanged
+                } else {
+                    ApplyOutcome::RemeasureAll
+                }
             }
             ThreadEvent::Error(e) => {
                 let ix = self.items.len();
                 self.items.push(cx.new(|_| {
                     MessageItem::new(ConvItem::Error(e.to_string()), role.to_string(), ix, weak)
                 }));
+                ApplyOutcome::Appended
             }
             ThreadEvent::PeerMessage { from, content } => {
                 let ix = self.items.len();
@@ -1352,13 +1421,16 @@ impl ConversationState {
                         weak,
                     )
                 }));
+                ApplyOutcome::Appended
             }
             ThreadEvent::ApprovalModeChanged { .. } => {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
+                ApplyOutcome::Unchanged
             }
             ThreadEvent::PrefixStability { .. } => {
                 // Cache discipline signal: no conversation item, the drift
                 // flags are only consumed by debug telemetry views (if at all).
+                ApplyOutcome::Unchanged
             }
             ThreadEvent::Retry {
                 attempt,
@@ -1373,6 +1445,7 @@ impl ConversationState {
                 if let Some(last) = self.items.last() {
                     let is_retry = matches!(last.read(cx).kind(), ConvItem::Retry { .. });
                     if is_retry {
+                        let ix = self.items.len() - 1;
                         let last = last.clone();
                         let attempt = *attempt;
                         let max_attempts = *max_attempts;
@@ -1397,7 +1470,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        return;
+                        return ApplyOutcome::Remeasure(ix);
                     }
                 }
                 let id = self.items.len();
@@ -1417,6 +1490,7 @@ impl ConversationState {
                         weak.clone(),
                     )
                 }));
+                ApplyOutcome::Appended
             }
             ThreadEvent::SubagentProgress {
                 id,
@@ -1430,6 +1504,9 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
+                } else {
+                    ApplyOutcome::Unchanged
                 }
             }
             ThreadEvent::SubagentStarted {
@@ -1447,22 +1524,26 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
+                } else {
+                    ApplyOutcome::Unchanged
                 }
             }
             ThreadEvent::BrowserNotification { .. } | ThreadEvent::InboundAuthorization { .. } => {
                 // Browser-axis signals are routed for the UI chrome (overlay,
                 // hint, tab state), not rendered as conversation items. The
                 // owning Workspace subscriber handles the surface.
+                ApplyOutcome::Unchanged
             }
             ThreadEvent::BackgroundTaskUpdated { snapshot } => {
                 // Find an existing BackgroundTask card with this task_id and
                 // update it in-place; otherwise push a new card.
                 let task_id = snapshot.task_id.clone();
-                let existing = self.items.iter_mut().find(|e| {
+                let existing_ix = self.items.iter().position(|e| {
                     e.read(cx).kind().is_background_task_with_id(&task_id)
                 });
-                if let Some(entity) = existing {
-                    entity.update(cx, |item, _| {
+                if let Some(ix) = existing_ix {
+                    self.items[ix].update(cx, |item, _| {
                         if let ConvItem::BackgroundTask(bt) = item.kind_mut() {
                             bt.status = snapshot.status;
                             bt.event_count = snapshot.event_count;
@@ -1473,6 +1554,7 @@ impl ConversationState {
                             bt.recent_events = recent_background_task_output(&task_id);
                         }
                     });
+                    ApplyOutcome::Remeasure(ix)
                 } else {
                     // New task card.
                     let recent_events = recent_background_task_output(&task_id);
@@ -1497,22 +1579,56 @@ impl ConversationState {
                         )
                     });
                     self.items.push(entity);
+                    ApplyOutcome::Appended
                 }
-                // The workspace's event subscriber re-renders on the emitted event.
             }
+        };
+        if popped_retry {
+            match outcome {
+                // A `Remeasure(ix)` against a post-pop index is still valid —
+                // the pop was at the tail, so `ix` still points at the same
+                // item. The retry pop itself is covered by the count splice.
+                ApplyOutcome::Remeasure(ix) => ApplyOutcome::Remeasure(ix),
+                // `RemeasureAndAppend { remeasure_ix }` survives a tail retry
+                // pop unchanged: `remeasure_ix` points at a closed activity
+                // segment well before the tail, so the pop doesn't move it,
+                // and the appended bubble nets out against the popped retry
+                // (count splice in `sync_list_count` sees zero change). Keep
+                // the remeasure so the segment's stale height is corrected.
+                ApplyOutcome::RemeasureAndAppend { remeasure_ix } => {
+                    ApplyOutcome::RemeasureAndAppend { remeasure_ix }
+                }
+                // A plain `Appended` (no segment mutated) + a popped retry
+                // means the new tail item occupies the popped retry's slot
+                // (count net-0, no splice). Its cached height is the retry
+                // badge's, so remeasure the tail to correct it on this frame
+                // rather than leaving a one-frame vertical overlap until the
+                // next event's remeasure.
+                ApplyOutcome::Appended => {
+                    let tail = self.items.len().saturating_sub(1);
+                    ApplyOutcome::Remeasure(tail)
+                }
+                _ => ApplyOutcome::RemovedTail,
+            }
+        } else {
+            outcome
         }
     }
 
     /// Drop the trailing item if it is a stale `Retry` badge, so the real
     /// content event that follows pushes its own item into the freed slot.
-    fn pop_trailing_retry(&mut self, cx: &App) {
+    /// Returns whether an item was actually removed (for the `ListState`
+    /// splice-down).
+    fn pop_trailing_retry(&mut self, cx: &App) -> bool {
         if self
             .items
             .last()
             .is_some_and(|e| matches!(e.read(cx).kind(), ConvItem::Retry { .. }))
         {
             self.items.pop();
+            return true;
         }
+        false
     }
 
     pub fn clear(&mut self) {
@@ -1841,6 +1957,158 @@ mod tests {
                 };
                 assert_eq!(display_state, &UserMessageDisplayState::Normal);
                 assert!(meta.as_ref().is_some_and(|meta| meta.steered));
+            });
+        });
+    }
+
+    /// When assistant text arrives while a live activity segment exists, the
+    /// segment is closed in place (`close_segment_for_text` finalizes entries
+    /// and pins the elapsed timer — dirtying its height cache) and a new
+    /// assistant bubble is appended. The outcome must carry the closed
+    /// segment's index so the caller remeasures it; a bare `Appended` would
+    /// only splice the tail and leave the segment's cached height stale.
+    #[gpui::test]
+    fn agent_text_needs_new_with_live_segment_remeasures_closed_segment(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+        let ctx = ApplyCtx {
+            weak: weak.clone(),
+            cwd: None,
+        };
+
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                // Open an activity segment by emitting a tool call.
+                let outcome = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_1".into(),
+                        name: "Read".into(),
+                        title: "Read file".into(),
+                        status: ToolCallStatus::Running,
+                        input: None,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                assert!(matches!(outcome, ApplyOutcome::Appended));
+                assert_eq!(c.items().len(), 1);
+
+                // An assistant text delta with no prior streaming assistant
+                // bubble → `needs_new`. The live segment is closed, then a new
+                // assistant item is appended. The outcome must remeasure the
+                // closed segment (index 0) AND splice the new tail.
+                let outcome = c.apply(
+                    &ThreadEvent::AgentText("hello".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                match outcome {
+                    ApplyOutcome::RemeasureAndAppend { remeasure_ix } => {
+                        assert_eq!(
+                            remeasure_ix, 0,
+                            "remeasure the just-closed activity segment"
+                        );
+                    }
+                    other => panic!(
+                        "expected RemeasureAndAppend after closing a live segment, got {other:?}"
+                    ),
+                }
+                assert_eq!(c.items().len(), 2);
+            });
+        });
+    }
+
+    /// When assistant text arrives with no prior activity segment (a pure-text
+    /// answer, no preceding thinking/tool call), there is nothing to close, so
+    /// the outcome is a plain `Appended` — no remeasure needed.
+    #[gpui::test]
+    fn agent_text_needs_new_without_segment_is_plain_append(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                let outcome = c.apply(
+                    &ThreadEvent::AgentText("fresh".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                assert!(matches!(outcome, ApplyOutcome::Appended));
+                assert_eq!(c.items().len(), 1);
+            });
+        });
+    }
+
+    /// When a trailing `Retry` badge is popped and the following event pushes a
+    /// new tail item with no segment mutation (plain `Appended`), the popped
+    /// retry's slot is reused (count net-0, no splice) and the new item would
+    /// inherit the retry badge's stale `Measured` height. The post-processing
+    /// rewrites `Appended` → `Remeasure(tail)` so the reused slot is
+    /// remeasured on this frame. Pinned because a regression here leaves a
+    /// one-frame vertical overlap until the next event.
+    #[gpui::test]
+    fn popped_retry_then_append_remeasures_reused_tail_slot(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let ctx = ApplyCtx {
+            weak: gpui::WeakEntity::<Workspace>::new_invalid(),
+            cwd: None,
+        };
+
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                // Push a trailing Retry badge.
+                let outcome = c.apply(
+                    &ThreadEvent::Retry {
+                        attempt: 1,
+                        max_attempts: 3,
+                        delay_secs: 1,
+                        reason: "503".into(),
+                        detail: None,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                assert!(matches!(outcome, ApplyOutcome::Appended));
+                assert_eq!(c.items().len(), 1);
+
+                // An AgentText delta with no prior segment: pop_trailing_retry
+                // removes the Retry (count 1→0), then needs_new pushes a new
+                // assistant bubble (count 0→1). Net count unchanged → no
+                // splice. Outcome must be Remeasure(tail=0) so the reused slot
+                // (now the assistant bubble, was the Retry badge) is
+                // remeasured instead of keeping the badge's cached height.
+                let outcome = c.apply(
+                    &ThreadEvent::AgentText("recovered".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+                match outcome {
+                    ApplyOutcome::Remeasure(ix) => {
+                        assert_eq!(ix, 0, "remeasure the reused tail slot");
+                    }
+                    other => panic!(
+                        "expected Remeasure(tail) after popped_retry + Appended, got {other:?}"
+                    ),
+                }
+                assert_eq!(c.items().len(), 1);
             });
         });
     }
