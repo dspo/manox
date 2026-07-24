@@ -6322,9 +6322,15 @@ mod tests {
         }
         // Legacy Yolo (2) maps to Danger so old databases reload unsandboxed
         // rather than silently downgrading.
-        assert_eq!(super::ApprovalMode::from_i64(2), super::ApprovalMode::Danger);
+        assert_eq!(
+            super::ApprovalMode::from_i64(2),
+            super::ApprovalMode::Danger
+        );
         // Unknown values fall back to AutoPilot — never silently escalate.
-        assert_eq!(super::ApprovalMode::from_i64(99), super::ApprovalMode::AutoPilot);
+        assert_eq!(
+            super::ApprovalMode::from_i64(99),
+            super::ApprovalMode::AutoPilot
+        );
     }
 
     #[test]
