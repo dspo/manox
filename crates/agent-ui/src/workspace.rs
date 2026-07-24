@@ -4048,11 +4048,6 @@ impl Workspace {
             .hover(|s| s.bg(theme.accent.opacity(0.08)))
             .cursor_pointer()
             .child(
-                Icon::new(IconName::Cpu)
-                    .xsmall()
-                    .text_color(theme.muted_foreground),
-            )
-            .child(
                 gpui::div()
                     .text_xs()
                     .text_color(theme.foreground)
@@ -4602,8 +4597,8 @@ impl Workspace {
                             .items_center()
                             .gap_1()
                             .flex_shrink_0()
-                            .child(effort)
                             .child(model)
+                            .child(effort)
                             .child(send),
                     ),
             )
