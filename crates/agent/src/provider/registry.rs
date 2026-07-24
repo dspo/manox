@@ -168,10 +168,11 @@ fn resolve_max_output_tokens(resolved: &ResolvedModel, max_tokens: u64) -> u64 {
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 
 /// Provider/model `env` key that overrides the prompt-caching policy. Set to
-/// `"full"`, `"last_breakpoint"`, or `"none"` in `cx.providers.config.yaml` to
-/// force a specific cache strategy regardless of the endpoint host. When
-/// absent, the policy is decided by the endpoint URL (api.anthropic.com → Full,
-/// else LastBreakpointOnly).
+/// `"full"`, `"last_breakpoint"`, or `"none"` in `cx.providers.config.yaml`
+/// to force a specific cache strategy. When absent, the policy defaults to
+/// `Full` for any endpoint (third-party anthropic-compatible hosts tolerate
+/// the `cache_control` breakpoints); `last_breakpoint` opts a misbehaving
+/// endpoint out of the multi-breakpoint layout.
 const MANOX_PROMPT_CACHING_ENV: &str = "MANOX_PROMPT_CACHING";
 
 /// Parse `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from a resolved model's env map.

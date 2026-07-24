@@ -443,4 +443,42 @@ mod tests {
             "branch name from measurement: {p}"
         );
     }
+
+    #[test]
+    fn prompt_contains_delivery_discipline() {
+        // Read-only tasks (review, analysis) must deliver and stop instead of
+        // running the implementation-time gauntlet (build/clippy/fmt/tests)
+        // that the project CLAUDE.md pushes. Guards against the over-verify
+        // regression where a "review PR" task never produced a review.
+        let en = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::En,
+        );
+        assert!(en.contains("## Delivery discipline"), "en section: {en}");
+        assert!(
+            en.contains("deliver your finding"),
+            "en deliver-on-sufficiency: {en}"
+        );
+
+        let zh = build_main_system_prompt(
+            Path::new("/tmp"),
+            None,
+            ApprovalMode::OnRequest,
+            None,
+            Language::ZhCn,
+        );
+        assert!(zh.contains("## 交付纪律"), "zh section: {zh}");
+        assert!(
+            zh.contains("把结论交付给用户或 PR 后即止"),
+            "zh deliver-on-sufficiency: {zh}"
+        );
+        // English section must not leak into zh-CN and vice versa.
+        assert!(
+            !zh.contains("## Delivery discipline"),
+            "en heading leaked into zh: {zh}"
+        );
+    }
 }
