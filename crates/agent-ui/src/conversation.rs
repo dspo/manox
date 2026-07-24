@@ -526,6 +526,20 @@ pub struct ConversationState {
     turn_started_at: Instant,
 }
 
+/// What `apply` did to the item list, so the caller can keep the `ListState`
+/// in sync (splice on append, remeasure on in-place mutation).
+pub enum ApplyOutcome {
+    /// No item touched (e.g. `ToolCallAuthorization`).
+    None,
+    /// An existing item's content changed at the index; remeasure that item.
+    Remeasure(usize),
+    /// A new item was appended at the end; splice the list count up.
+    Appended,
+    /// A trailing transient item (a `Retry` badge) was popped without a
+    /// replacement pushed. Splice the list count down by one at the tail.
+    RemovedTail,
+}
+
 impl Default for ConversationState {
     fn default() -> Self {
         Self {
@@ -820,7 +834,7 @@ impl ConversationState {
         last_request_usage: Option<TokenUsage>,
         ctx: ApplyCtx,
         cx: &mut App,
-    ) {
+    ) -> ApplyOutcome {
         let ApplyCtx { weak, cwd } = ctx;
         // A trailing `Retry` badge is stale the moment a real content or
         // terminal-error event lands — that event means the retry either
@@ -828,18 +842,16 @@ impl ConversationState {
         // (Error). Pop the badge first so the arm below pushes its own item
         // into the freed slot. Non-item events (usage, mode change, …) and
         // the `Retry` event itself skip this.
-        if matches!(
+        let popped_retry = matches!(
             event,
             ThreadEvent::AgentText(_)
                 | ThreadEvent::AgentThinking(_)
                 | ThreadEvent::ToolCall { .. }
                 | ThreadEvent::Error(_)
                 | ThreadEvent::Compaction { .. }
-        ) {
-            self.pop_trailing_retry(cx);
-        }
+        ) && self.pop_trailing_retry(cx);
 
-        match event {
+        let outcome = match event {
             // A compaction landed — render the handoff summary as a Recap card.
             // The card is appended (never updated in place): a compaction is a
             // one-time boundary marker, and the summary text is final.
@@ -857,6 +869,7 @@ impl ConversationState {
                         weak,
                     )
                 }));
+                ApplyOutcome::Appended
             }
             // `<proposed_plan>` streaming + completion are owned by the
             // workspace's review overlay, not the conversation list — there is
@@ -866,7 +879,7 @@ impl ConversationState {
             // workspace subscription), not the conversation list.
             ThreadEvent::PlanDelta { .. }
             | ThreadEvent::PlanReady { .. }
-            | ThreadEvent::PlanUpdated { .. } => {}
+            | ThreadEvent::PlanUpdated { .. } => ApplyOutcome::None,
             // Token usage + model/effort changes are surfaced elsewhere (sidebar /
             // model-history overlay). No conversation item.
             ThreadEvent::TokenUsageUpdated(_)
@@ -878,12 +891,12 @@ impl ConversationState {
             // `CompactionStarted` is a cockpit-only phase signal (the side-LLM
             // summarization is in flight); the conversation list renders nothing
             // for it. The workspace flips the cockpit phase on this event.
-            | ThreadEvent::CompactionStarted { .. } => {},
+            | ThreadEvent::CompactionStarted { .. } => ApplyOutcome::None,
             // `SteerInjected` is fired by the turn loop at drain time. The
             // workspace owns the queue→list transition (it pairs the event with
             // the matching `SteerPending` queue card and pushes the bubble here
             // via `push_user`); the conversation list takes no direct action.
-            | ThreadEvent::SteerInjected { .. } => {},
+            | ThreadEvent::SteerInjected { .. } => ApplyOutcome::None,
             // `TurnStarted` is a UI-only signal routed to `ThreadStore` by the
             // workspace to light the sidebar running indicator; it carries no
             // conversation content. We capture the turn's start instant here so
@@ -892,11 +905,12 @@ impl ConversationState {
             // `ToolCall`.
             ThreadEvent::TurnStarted => {
                 self.turn_started_at = Instant::now();
+                ApplyOutcome::None
             }
-            ThreadEvent::TurnFinished { .. } => {}
+            ThreadEvent::TurnFinished { .. } => ApplyOutcome::None,
             // Goal lifecycle is surfaced by the composer chip + status popover,
             // not as a conversation item.
-            ThreadEvent::GoalChanged { .. } => {}
+            ThreadEvent::GoalChanged { .. } => ApplyOutcome::None,
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
@@ -947,6 +961,7 @@ impl ConversationState {
                         item.update_text(delta, cx);
                         item
                     }));
+                    ApplyOutcome::Appended
                 } else {
                     let ix = self.items.len() - 1;
                     self.items[ix].update(cx, |item, cx| {
@@ -966,6 +981,7 @@ impl ConversationState {
                         item.update_text(&full_text, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
                 }
             }
             ThreadEvent::AgentThinking(delta) => {
@@ -974,8 +990,8 @@ impl ConversationState {
                 // a gap (interrupted by a tool call or new turn) starts a
                 // fresh round. If no segment exists yet, open one.
                 let turn_started_at = self.turn_started_at;
-                let cix = match self.find_active_activity_segment(cx) {
-                    Some(i) => i,
+                let (cix, pushed) = match self.find_active_activity_segment(cx) {
+                    Some(i) => (i, false),
                     None => {
                         let i = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -988,7 +1004,7 @@ impl ConversationState {
                                 weak.clone(),
                             )
                         }));
-                        i
+                        (i, true)
                     }
                 };
                 let delta = delta.clone();
@@ -1027,6 +1043,11 @@ impl ConversationState {
                     }
                     cx.notify();
                 });
+                if pushed {
+                    ApplyOutcome::Appended
+                } else {
+                    ApplyOutcome::Remeasure(cix)
+                }
             }
             ThreadEvent::ToolCall {
                 id,
@@ -1053,6 +1074,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
+                        ApplyOutcome::Remeasure(ix)
                     } else {
                         let ix = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -1069,6 +1091,7 @@ impl ConversationState {
                                 weak,
                             )
                         }));
+                        ApplyOutcome::Appended
                     }
                 } else if name == agent::tools::ASK_USER_QUESTION {
                     // Top-level card, never folded into an activity segment.
@@ -1084,6 +1107,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
+                        ApplyOutcome::Remeasure(ix)
                     } else {
                         let ix = self.items.len();
                         self.items.push(cx.new(|_| {
@@ -1106,6 +1130,7 @@ impl ConversationState {
                                 weak,
                             )
                         }));
+                        ApplyOutcome::Appended
                     }
                 } else {
                     // Ordinary tool call: fold into the active activity
@@ -1116,8 +1141,8 @@ impl ConversationState {
                     // into one status line. The segment is seeded with the
                     // turn's start time so the elapsed covers the whole turn.
                     let turn_started_at = self.turn_started_at;
-                    let cix = match self.find_active_activity_segment(cx) {
-                        Some(i) => i,
+                    let (cix, pushed) = match self.find_active_activity_segment(cx) {
+                        Some(i) => (i, false),
                         None => {
                             let i = self.items.len();
                             self.items.push(cx.new(|_| {
@@ -1130,7 +1155,7 @@ impl ConversationState {
                                     weak,
                                 )
                             }));
-                            i
+                            (i, true)
                         }
                     };
                     let id = id.clone();
@@ -1173,6 +1198,11 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
+                    if pushed {
+                        ApplyOutcome::Appended
+                    } else {
+                        ApplyOutcome::Remeasure(cix)
+                    }
                 }
             }
             ThreadEvent::ToolOutput { id, chunk } => {
@@ -1191,6 +1221,9 @@ impl ConversationState {
                         item.sync_tool_entry_panel(eix, cwd, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(cix)
+                } else {
+                    ApplyOutcome::None
                 }
             }
             ThreadEvent::ToolResult {
@@ -1217,6 +1250,7 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
                 } else if let Some((cix, eix)) = self.find_thinking_entry(id, cx) {
                     let entry_output = output.clone();
                     let entry_is_error = *is_error;
@@ -1239,6 +1273,7 @@ impl ConversationState {
                         item.sync_tool_entry_panel(eix, cwd, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(cix)
                 } else if let Some(ix) = self.find_tool(id, cx) {
                     self.items[ix].update(cx, |item, cx| {
                         if let ConvItem::ToolCall(t) = item.kind_mut() {
@@ -1253,6 +1288,7 @@ impl ConversationState {
                         item.sync_tool_call_panel(cwd, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
                 } else {
                     // No matching entry; insert as a finalized single-entry
                     // activity segment so the orphan result still renders as a
@@ -1289,10 +1325,12 @@ impl ConversationState {
                         item.sync_tool_entry_panel(0, cwd, cx);
                         cx.notify();
                     });
+                    ApplyOutcome::Appended
                 }
             }
             ThreadEvent::ToolCallAuthorization { .. } => {
                 // Handled by `Workspace` as a prompt overlay; not part of the conversation flow.
+                ApplyOutcome::None
             }
             ThreadEvent::ApprovalDecision { .. } => {
                 // Handled by `Workspace` as a Notice card; not part of the
@@ -1332,12 +1370,20 @@ impl ConversationState {
                         }
                     }
                 }
+                // Finalizing may grow/shrink any item (streaming → finalized
+                // body swap, segment auto-collapse); remeasure everything.
+                if self.items.is_empty() {
+                    ApplyOutcome::None
+                } else {
+                    ApplyOutcome::Remeasure(self.items.len() - 1)
+                }
             }
             ThreadEvent::Error(e) => {
                 let ix = self.items.len();
                 self.items.push(cx.new(|_| {
                     MessageItem::new(ConvItem::Error(e.to_string()), role.to_string(), ix, weak)
                 }));
+                ApplyOutcome::Appended
             }
             ThreadEvent::PeerMessage { from, content } => {
                 let ix = self.items.len();
@@ -1352,13 +1398,16 @@ impl ConversationState {
                         weak,
                     )
                 }));
+                ApplyOutcome::Appended
             }
             ThreadEvent::ApprovalModeChanged { .. } => {
                 // UI state (badge/chip) handled by `Workspace`; not a conversation item.
+                ApplyOutcome::None
             }
             ThreadEvent::PrefixStability { .. } => {
                 // Cache discipline signal: no conversation item, the drift
                 // flags are only consumed by debug telemetry views (if at all).
+                ApplyOutcome::None
             }
             ThreadEvent::Retry {
                 attempt,
@@ -1373,6 +1422,7 @@ impl ConversationState {
                 if let Some(last) = self.items.last() {
                     let is_retry = matches!(last.read(cx).kind(), ConvItem::Retry { .. });
                     if is_retry {
+                        let ix = self.items.len() - 1;
                         let last = last.clone();
                         let attempt = *attempt;
                         let max_attempts = *max_attempts;
@@ -1397,7 +1447,7 @@ impl ConversationState {
                             }
                             cx.notify();
                         });
-                        return;
+                        return ApplyOutcome::Remeasure(ix);
                     }
                 }
                 let id = self.items.len();
@@ -1417,6 +1467,7 @@ impl ConversationState {
                         weak.clone(),
                     )
                 }));
+                ApplyOutcome::Appended
             }
             ThreadEvent::SubagentProgress {
                 id,
@@ -1430,6 +1481,9 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
+                } else {
+                    ApplyOutcome::None
                 }
             }
             ThreadEvent::SubagentStarted {
@@ -1447,22 +1501,26 @@ impl ConversationState {
                         }
                         cx.notify();
                     });
+                    ApplyOutcome::Remeasure(ix)
+                } else {
+                    ApplyOutcome::None
                 }
             }
             ThreadEvent::BrowserNotification { .. } | ThreadEvent::InboundAuthorization { .. } => {
                 // Browser-axis signals are routed for the UI chrome (overlay,
                 // hint, tab state), not rendered as conversation items. The
                 // owning Workspace subscriber handles the surface.
+                ApplyOutcome::None
             }
             ThreadEvent::BackgroundTaskUpdated { snapshot } => {
                 // Find an existing BackgroundTask card with this task_id and
                 // update it in-place; otherwise push a new card.
                 let task_id = snapshot.task_id.clone();
-                let existing = self.items.iter_mut().find(|e| {
+                let existing_ix = self.items.iter().position(|e| {
                     e.read(cx).kind().is_background_task_with_id(&task_id)
                 });
-                if let Some(entity) = existing {
-                    entity.update(cx, |item, _| {
+                if let Some(ix) = existing_ix {
+                    self.items[ix].update(cx, |item, _| {
                         if let ConvItem::BackgroundTask(bt) = item.kind_mut() {
                             bt.status = snapshot.status;
                             bt.event_count = snapshot.event_count;
@@ -1473,6 +1531,7 @@ impl ConversationState {
                             bt.recent_events = recent_background_task_output(&task_id);
                         }
                     });
+                    ApplyOutcome::Remeasure(ix)
                 } else {
                     // New task card.
                     let recent_events = recent_background_task_output(&task_id);
@@ -1497,22 +1556,31 @@ impl ConversationState {
                         )
                     });
                     self.items.push(entity);
+                    ApplyOutcome::Appended
                 }
-                // The workspace's event subscriber re-renders on the emitted event.
             }
+        };
+        if popped_retry {
+            ApplyOutcome::RemovedTail
+        } else {
+            outcome
         }
     }
 
     /// Drop the trailing item if it is a stale `Retry` badge, so the real
     /// content event that follows pushes its own item into the freed slot.
-    fn pop_trailing_retry(&mut self, cx: &App) {
+    /// Returns whether an item was actually removed (for the `ListState`
+    /// splice-down).
+    fn pop_trailing_retry(&mut self, cx: &App) -> bool {
         if self
             .items
             .last()
             .is_some_and(|e| matches!(e.read(cx).kind(), ConvItem::Retry { .. }))
         {
             self.items.pop();
+            return true;
         }
+        false
     }
 
     pub fn clear(&mut self) {

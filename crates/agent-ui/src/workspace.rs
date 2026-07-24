@@ -25,9 +25,10 @@ use agent::{
 };
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, Context, CursorStyle,
-    DismissEvent, DragMoveEvent, Entity, FocusHandle, MouseButton, MouseUpEvent, Pixels, Render,
-    ScrollHandle, SharedString, Subscription, WeakEntity, Window, anchored, deferred,
-    ease_out_quint, prelude::*, px,
+    DismissEvent, DragMoveEvent, Entity, FocusHandle, FollowMode, ListAlignment, ListOffset,
+    ListSizingBehavior, ListState, MouseButton, MouseUpEvent, Pixels, Render, ScrollHandle,
+    SharedString, Subscription, WeakEntity, Window, anchored, deferred, ease_out_quint, prelude::*,
+    px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, StyledExt as _,
@@ -44,7 +45,7 @@ use gpui_component::{
 use manox_components::markdown::{HeadingMode, Markdown};
 
 use crate::cockpit::CockpitPhase;
-use crate::conversation::{ConvItem, ConversationState, UserImage, UserTurnMeta};
+use crate::conversation::{ApplyOutcome, ConvItem, ConversationState, UserImage, UserTurnMeta};
 use crate::external_session::{ExternalSession, SessionKind};
 use crate::views::browser_view::BrowserView;
 use crate::views::centered;
@@ -212,11 +213,10 @@ struct DeferredUserTurn {
     user_images: Vec<UserImage>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct PendingMessageReveal {
-    generation: u64,
-    item_ix: usize,
-}
+/// How far above/below the viewport the message `list` still measures items.
+/// Larger = smoother fast-scroll at the cost of less virtualization; one extra
+/// screenful is enough that a normal wheel flick never shows an unmeasured gap.
+const MSG_LIST_OVERDRAW: f32 = 800.;
 
 /// A thread parked in the background while still running a turn. The held
 /// `Subscription` is a minimal handler that only tracks terminal `Stop`/`Error`
@@ -397,26 +397,20 @@ pub struct Workspace {
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
-    /// Pixel-anchored scroll state for the message column. Unlike `gpui::list`
-    /// (index-anchored), a plain `track_scroll` container anchors the viewport
-    /// to an absolute pixel offset: an item growing below the viewport, a width
-    /// change reflowing every block, or a streaming-to-finalized body swap never
-    /// shifts the viewport — the "messages fly off the top" failure mode is
-    /// structurally gone, not patched over. `child_bounds` (populated from the
-    /// div's direct children) still drives `bounds_for_item` / `scroll_to_item`
-    /// for click-to-reveal.
-    message_scroll: ScrollHandle,
-    /// Tail-follow pin. Driven each render from the live scroll offset: pinned
-    /// to the bottom means following (re-pin to bottom while content streams
-    /// in); scrolled away means hold the absolute pixel offset so the user's
-    /// readback survives the stream.
-    auto_follow: bool,
-    /// Holds tail-follow off while a navigator jump crosses GPUI's prepaint
-    /// boundary. The first protected frame drains any previously queued
-    /// `scroll_to_bottom`; the second applies `scroll_to_top_of_item` without
-    /// that stale request overriding it.
-    pending_message_reveal: Option<PendingMessageReveal>,
-    message_reveal_generation: u64,
+    /// Scroll/virtualization state for the message column. The gpui `list`
+    /// element anchors the viewport to a `ListOffset { item_ix,
+    /// offset_in_item }` (index + pixel offset into that item), so a width
+    /// reflow that re-measures every item re-anchors proportionally and never
+    /// strands the viewport in empty space — the pixel-anchored container's
+    /// "whole list goes blank on resize" failure mode. `ListAlignment::Bottom`
+    /// gives the list native chat-log semantics: short histories sit at the
+    /// bottom, long ones scroll, and `FollowMode::Tail` re-pins to the end
+    /// each layout while following (disengaging on upward scroll, re-arming
+    /// at the bottom). Only the items in the viewport plus overdraw render.
+    list_state: ListState,
+    /// Cached `items().len()`; the event handler reconciles the list count via
+    /// `splice` whenever the conversation grows or shrinks.
+    list_count: usize,
     /// Top-level view mode. `Settings` replaces the entire window content
     /// with the SettingsView overlay until the user requests exit.
     view_mode: ViewMode,
@@ -678,10 +672,8 @@ impl Workspace {
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
-            message_scroll: ScrollHandle::new(),
-            auto_follow: true,
-            pending_message_reveal: None,
-            message_reveal_generation: 0,
+            list_state: ListState::new(0, ListAlignment::Bottom, px(MSG_LIST_OVERDRAW)),
+            list_count: 0,
             view_mode: ViewMode::default(),
             exiting_settings: false,
             settings_transition_gen: 0,
@@ -758,8 +750,10 @@ impl Workspace {
                         c.push_plan_review(pt.clone(), role, weak, cx);
                     });
                     this.pending_plan_review = Some(PendingPlanReview { plan_text: pt });
-                    this.auto_follow = true;
-                    this.message_scroll.scroll_to_bottom();
+                    this.sync_list_count(cx);
+                    // The finalized plan surfaces at the tail; reveal it like any
+                    // user-initiated jump to the live end.
+                    this.list_state.set_follow_mode(FollowMode::Tail);
                     cx.notify();
                 }
                 ThreadEvent::PlanUpdated { snapshot } => {
@@ -882,7 +876,7 @@ impl Workspace {
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
                     let cwd = thread_cwd(&this.thread, cx);
-                    this.conversation.update(cx, |c, cx| {
+                    let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
                             &role,
@@ -891,11 +885,12 @@ impl Workspace {
                             cx,
                         )
                     });
-                    // Stop flips streaming flags off, so finalized bodies switch
+                    this.apply_list_outcome(outcome, cx);
+                    // `Stop` flips streaming flags off, so finalized bodies switch
                     // to full `Markdown` layout and may grow a frame or two later;
-                    // the pixel-anchored scroll holds the viewport steady across
-                    // that growth, and tail-follow — if still engaged — re-pins
-                    // to the end via the per-frame arbitration in `render`.
+                    // the list's Absolute scroll anchor holds the viewport steady
+                    // across that growth, and `FollowMode::Tail` — if still
+                    // engaged — re-pins to the end on the next layout.
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
                         // A terminal stop is exactly when a finalized plan
@@ -991,6 +986,10 @@ impl Workspace {
                         if this.pending_plan_review.take().is_some() {
                             this.conversation
                                 .update(cx, |c, cx| c.consume_plan_review(cx));
+                            // The demoted plan card stays in place but flips
+                            // inactive — remeasure so the list's cached height
+                            // for it stays honest.
+                            this.list_state.remeasure();
                         }
                         // Symmetric to the terminal `Stop` arm: retire parked
                         // browser yields + stranded inbound overlays so an
@@ -1045,7 +1044,7 @@ impl Workspace {
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
                     let cwd = thread_cwd(&this.thread, cx);
-                    this.conversation.update(cx, |c, cx| {
+                    let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
                             &role,
@@ -1054,6 +1053,7 @@ impl Workspace {
                             cx,
                         )
                     });
+                    this.apply_list_outcome(outcome, cx);
                     cx.notify();
                 }
             }
@@ -1765,51 +1765,60 @@ impl Workspace {
         cx.notify();
     }
 
-    fn cancel_pending_message_reveal(&mut self) {
-        self.message_reveal_generation = self.message_reveal_generation.wrapping_add(1);
-        self.pending_message_reveal = None;
+    /// Reconcile the `list_state` item count with the live conversation length
+    /// via `splice`, which preserves scroll position. Append (the common case,
+    /// every user/assistant/tool item) splices new tail items in as Unmeasured;
+    /// a tail removal (a `Retry` badge popped without replacement) splices the
+    /// dangling slot out. Call after any direct conversation mutation that the
+    /// `ApplyOutcome` path does not already cover (e.g. `push_user`/`push_notice`,
+    /// which bypass `apply`).
+    fn sync_list_count(&mut self, cx: &App) {
+        let new_count = self.conversation.read(cx).items().len();
+        if new_count == self.list_count {
+            return;
+        }
+        if new_count > self.list_count {
+            self.list_state.splice(
+                self.list_count..self.list_count,
+                new_count - self.list_count,
+            );
+        } else {
+            self.list_state.splice(new_count..self.list_count, 0);
+        }
+        self.list_count = new_count;
     }
 
+    /// Reconcile the `list_state` with a conversation mutation: splice the
+    /// count (append/remove) and remeasure the affected index/indices. Call
+    /// after any `ConversationState::apply` (the outcome tells which path) so
+    /// the virtualized list's per-item height cache never goes stale.
+    fn apply_list_outcome(&mut self, outcome: ApplyOutcome, cx: &App) {
+        self.sync_list_count(cx);
+        match outcome {
+            ApplyOutcome::Remeasure(ix) => self.list_state.remeasure_items(ix..ix + 1),
+            // `None` touched no item; `Appended`/`RemovedTail` only changed the
+            // count, which `sync_list_count` already spliced.
+            ApplyOutcome::None | ApplyOutcome::Appended | ApplyOutcome::RemovedTail => {}
+        }
+    }
+
+    /// Re-engage tail-follow: the list re-pins to the end on each layout while
+    /// following. This is the user-initiated "jump to live tail" path (submit,
+    /// slash command, thread open) — it always re-arms follow, even if the
+    /// user had scrolled up to read back.
     fn follow_message_tail(&mut self) {
-        self.cancel_pending_message_reveal();
-        self.auto_follow = true;
-        self.message_scroll.scroll_to_bottom();
+        self.list_state.set_follow_mode(FollowMode::Tail);
     }
 
-    fn reveal_message(&mut self, item_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.message_reveal_generation = self.message_reveal_generation.wrapping_add(1);
-        let pending = PendingMessageReveal {
-            generation: self.message_reveal_generation,
+    /// Jump the viewport so the given conversation item is at the top. Index-
+    /// anchored, so it is a single atomic state change — no frame protection
+    /// needed against a stale `scroll_to_bottom` (there is no such flag on a
+    /// `ListState`).
+    fn reveal_message(&mut self, item_ix: usize, _window: &mut Window, cx: &mut Context<Self>) {
+        self.list_state.set_follow_mode(FollowMode::Normal);
+        self.list_state.scroll_to(ListOffset {
             item_ix,
-        };
-        self.pending_message_reveal = Some(pending);
-        self.auto_follow = false;
-
-        // A tail-follow render may already have queued `scroll_to_bottom` on
-        // the handle. GPUI applies an active-item jump before consuming that
-        // flag, so submitting both for one prepaint always leaves us at the
-        // bottom. The first protected frame only consumes the stale flag; its
-        // next-frame callback then queues the jump for a second protected
-        // frame. Protection is released before the third frame renders.
-        cx.on_next_frame(window, move |this, window, cx| {
-            if this.pending_message_reveal != Some(pending) {
-                return;
-            }
-            cx.notify();
-            cx.on_next_frame(window, move |this, window, cx| {
-                if this.pending_message_reveal != Some(pending) {
-                    return;
-                }
-                this.message_scroll.scroll_to_top_of_item(pending.item_ix);
-                cx.notify();
-                cx.on_next_frame(window, move |this, _window, cx| {
-                    if this.pending_message_reveal == Some(pending) {
-                        this.pending_message_reveal = None;
-                        this.auto_follow = false;
-                        cx.notify();
-                    }
-                });
-            });
+            offset_in_item: px(0.),
         });
         cx.notify();
     }
@@ -1990,12 +1999,21 @@ impl Workspace {
         self.input_state
             .update(cx, |s, cx| s.set_value(saved, window, cx));
         self.sync_completion(window, cx);
-        // Reveal the latest turn for the new thread: pin the pixel-anchored
-        // scroll to the bottom. A running thread keeps following the tail
-        // (re-pinned each frame while at the bottom); a completed history
-        // thread stays at the bottom once revealed, and scrolling up holds
-        // because the per-frame arbitration disengages follow on upward scroll.
-        self.follow_message_tail();
+        // Reveal the latest turn for the new thread: `reset` drops the old
+        // thread's measured heights and scroll position, then reveal the latest
+        // turn once. A running thread keeps following the tail; a completed
+        // history thread stays put once revealed so scrolling up is not snapped
+        // back (the list auto-disengages tail on any upward scroll anyway).
+        let count = self.conversation.read(cx).items().len();
+        self.list_state.reset(count);
+        self.list_count = count;
+        self.list_state.scroll_to_end();
+        self.list_state
+            .set_follow_mode(if self.thread.read(cx).is_running() {
+                FollowMode::Tail
+            } else {
+                FollowMode::Normal
+            });
         self.pending_auths.clear();
         self.pending_ask = None;
         // Restore the incoming thread's stashed pending plan, if any.
@@ -2006,10 +2024,10 @@ impl Workspace {
             self.conversation.update(cx, |c, cx| {
                 c.push_plan_review(plan_text, role.clone(), weak, cx);
             });
-            // The card is appended after the earlier `scroll_to_bottom`, so
-            // re-pin so the restored drawer is in view.
-            self.auto_follow = true;
-            self.message_scroll.scroll_to_bottom();
+            // The card is appended after the earlier `reset`, so splice the
+            // list count and re-pin so the restored drawer is in view.
+            self.sync_list_count(cx);
+            self.list_state.set_follow_mode(FollowMode::Tail);
         }
         self.restore_queued_follow_ups(&new_id, &messages, running, cx);
         self.thread_sub = Some(self.subscribe_thread(cx));
@@ -2399,8 +2417,8 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(display_text, Vec::new(), meta, weak, cx)
         });
-        // Re-engage tail-follow so the streaming reply stays in view: the
-        // per-frame arbitration re-pins to the bottom while the user rides it.
+        self.sync_list_count(cx);
+        // Re-engage tail-follow so the streaming reply stays in view.
         self.follow_message_tail();
         let hit = self
             .thread
@@ -2434,6 +2452,7 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(display_text, Vec::new(), meta, weak, cx)
         });
+        self.sync_list_count(cx);
         self.follow_message_tail();
         let hit = self
             .thread
@@ -2491,6 +2510,9 @@ impl Workspace {
         if let Some(review) = dismissed_plan.as_ref() {
             self.conversation
                 .update(cx, |c, cx| c.consume_plan_review(cx));
+            // The demoted plan card stays in place but flips inactive —
+            // remeasure so the list's cached height for it stays honest.
+            self.list_state.remeasure();
             // Persist the dismissed plan as a UI note so the collapsed record
             // survives a thread switch / reload — the live card is UI-only and
             // never enters `Thread::messages`. `record_ui_note` anchors to the
@@ -2521,6 +2543,7 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(turn.text.clone(), turn.user_images, turn.meta, weak, cx)
         });
+        self.sync_list_count(cx);
         // Re-engage tail-follow so the streaming reply stays pinned as it grows.
         if follow_tail {
             self.follow_message_tail();
@@ -2633,8 +2656,8 @@ impl Workspace {
             });
         }
         if !self.queued_follow_ups.is_empty() {
-            self.auto_follow = true;
-            self.message_scroll.scroll_to_bottom();
+            self.sync_list_count(cx);
+            self.list_state.set_follow_mode(FollowMode::Tail);
         }
     }
 
@@ -2726,8 +2749,8 @@ impl Workspace {
                 cx,
             )
         });
-        self.auto_follow = true;
-        self.message_scroll.scroll_to_bottom();
+        self.sync_list_count(cx);
+        self.list_state.set_follow_mode(FollowMode::Tail);
     }
 
     fn append_and_run_user_turn(
@@ -2758,7 +2781,12 @@ impl Workspace {
         while let Some(item) = self.queued_follow_ups.pop_front() {
             match item.state {
                 FollowUpState::Queued => {
-                    self.append_user_turn(item.turn, weak.clone(), self.auto_follow, cx);
+                    self.append_user_turn(
+                        item.turn,
+                        weak.clone(),
+                        self.list_state.is_following_tail(),
+                        cx,
+                    );
                     drained = true;
                 }
                 _ => retain.push(item),
@@ -2794,6 +2822,7 @@ impl Workspace {
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.rollback_pending_steer(message_id, cx);
                 });
+                self.list_state.remeasure();
                 // Keep the id so a later `SteerInjected` can still heal this
                 // provisional rollback.
                 let message_id = message_id.clone();
@@ -2825,11 +2854,12 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.confirm_pending_steer(message_id, cx);
         });
+        self.list_state.remeasure();
         // Only re-engage tail-follow if the user hasn't scrolled away —
         // a steer injection is event-driven, not user-initiated, so it
         // should not yank the viewport back to the bottom.
-        if self.auto_follow {
-            self.message_scroll.scroll_to_bottom();
+        if self.list_state.is_following_tail() {
+            self.list_state.scroll_to_end();
         }
         cx.notify();
     }
@@ -2897,6 +2927,7 @@ impl Workspace {
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.rollback_pending_steer(&id, cx);
                 });
+                self.list_state.remeasure();
             }
             cx.notify();
         }
@@ -2915,6 +2946,7 @@ impl Workspace {
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.rollback_pending_steer(&id, cx);
                 });
+                self.list_state.remeasure();
             }
             cx.notify();
         }
@@ -3278,6 +3310,7 @@ impl Workspace {
         self.conversation.update(cx, |c, cx| {
             c.push_user(text.clone(), Vec::new(), meta, weak, cx)
         });
+        self.sync_list_count(cx);
         self.follow_message_tail();
         self.thread.update(cx, |thread, cx| {
             thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
@@ -3407,9 +3440,10 @@ impl Workspace {
             c.push_notice(text.clone(), weak, cx);
         });
         self.record_ui_note(agent::db::UiNoteKind::Notice, text, cx);
-        // If tail-follow is engaged the scroll reveals the notice; if the user
-        // scrolled up the per-frame arbitration has already disengaged follow so
-        // the viewport stays put.
+        self.sync_list_count(cx);
+        // If tail-follow is engaged the list reveals the notice; if the user
+        // scrolled up, `FollowMode::Tail` has already disengaged so the
+        // viewport stays put.
         cx.notify();
     }
 
@@ -3730,8 +3764,8 @@ impl Workspace {
             self.conversation.update(cx, |c, cx| {
                 c.push_user(text, Vec::new(), meta, weak, cx);
             });
-            self.auto_follow = true;
-            self.message_scroll.scroll_to_bottom();
+            self.sync_list_count(cx);
+            self.list_state.set_follow_mode(FollowMode::Tail);
             // The rail's plan seeds from the model's first `UpdatePlan` call, not
             // the approved plan text — see the continue-in-plan branch above.
             self.thread.update(cx, |thread, cx| {
@@ -6582,33 +6616,6 @@ impl Render for Workspace {
                     .relative()
                     .overflow_hidden()
                     .child({
-                        // Tail-follow arbitration, driven from the live scroll
-                        // offset (reflecting the prior frame's layout). Pinned to
-                        // the bottom => follow: re-pin each frame so streaming
-                        // growth at the tail stays in view. Scrolled away => hold
-                        // the absolute pixel offset so the user's readback of an
-                        // earlier turn survives the stream below.
-                        if self.pending_message_reveal.is_some() {
-                            self.auto_follow = false;
-                        } else {
-                            let max_y = self.message_scroll.max_offset().y;
-                            let off_y = self.message_scroll.offset().y;
-                            // gpui scroll offset is non-positive: 0 at the top,
-                            // -max at the bottom. "At the bottom" therefore means
-                            // the offset has bottomed out near -max — not crossed
-                            // the positive max (which a non-positive offset can
-                            // never satisfy, so the prior comparison never fired
-                            // and tail-follow silently died whenever content
-                            // overflowed). The `max <= 0` clause also holds the
-                            // follow alive while a streaming/history body is still
-                            // shorter than the viewport (max == 0, no overflow),
-                            // so the first frame that overflows still re-pins.
-                            let at_bottom = max_y <= px(0.5) || off_y <= -max_y + px(1.0);
-                            self.auto_follow = at_bottom;
-                            if at_bottom {
-                                self.message_scroll.scroll_to_bottom();
-                            }
-                        }
                         // Body wrapper: hero / list / footer / overlay. `pt`
                         // reserves space for the title-bar overlay; `pr` (when
                         // the card is shown) reserves the floating card's width
@@ -6625,68 +6632,60 @@ impl Render for Workspace {
                                 this.pr(px(crate::views::context_rail::ENV_CONTENT_INSET))
                             })
                             // Empty first screen shows the centered hero in place
-                            // of the (empty) message list; otherwise a pixel-
-                            // anchored, tail-following conversation column. Each
-                            // item is its own `Entity<MessageItem>`, so a streaming
-                            // delta only marks that item's entity dirty. The plain
-                            // `track_scroll` container anchors the viewport to an
-                            // absolute pixel offset, so an item growing below, a
-                            // width reflow, or a streaming-to-finalized body swap
-                            // never shifts the viewport.
+                            // of the (empty) message list; otherwise an
+                            // index-anchored, tail-following virtualized list.
                             .children(hero)
                             .children((!first_screen).then(|| {
-                                // Snapshot the item handles out of the read guard so
-                                // no borrow spans the element tree. The scroll div's
-                                // direct children are one row per item, so
-                                // `child_bounds` (and thus `bounds_for_item` /
-                                // `scroll_to_item`) key off the item index for
-                                // click-to-reveal.
-                                let items: Vec<_> = self.conversation.read(cx).items().to_vec();
-                                let scroll = self.message_scroll.clone();
-                                // Plain pixel-anchored scroll: no `min_h_full` /
-                                // `justify_end`. A `min_h_full` against an unbounded
-                                // ancestor inflates the scroll content-box to a
-                                // near-infinite height, and `justify_end` then pins
-                                // the messages to the bottom of that void —
-                                // `scroll_to_bottom` lands the viewport in empty
-                                // space below the content, so opening a thread shows
-                                // nothing until the user wheels up through the gap.
-                                // The plain container measures content at its real
-                                // height, so `max_offset` tracks the actual overflow
-                                // and the tail-follow arbitration below pins to the
-                                // true bottom. Short threads sit at the top; that is
-                                // the spec'd plain-container trade-off.
-                                let list_el = v_flex()
-                                    .id("message-list")
-                                    .w_full()
-                                    .min_w_0()
-                                    .overflow_y_scroll()
-                                    .track_scroll(&scroll)
-                                    // Body typeface: Lilex Light. Every message row
-                                    // (assistant, user, reasoning, tool cards, notices)
-                                    // inherits from here; markdown bold/headings
-                                    // resolve to Medium via nearest-weight, italic syntax
-                                    // and tool-card overrides hit the italic cuts.
-                                    .font_family(theme.mono_font_family.clone())
-                                    .font_weight(gpui::FontWeight::LIGHT)
-                                    .children(items.into_iter().enumerate().map(|(ix, item)| {
-                                        v_flex()
-                                            .id(("msg", ix))
+                                let conv = self.conversation.clone();
+                                let list_state = self.list_state.clone();
+                                // `ListAlignment::Bottom` gives the list native
+                                // chat-log semantics: short conversations sit at
+                                // the bottom, long ones scroll. The list only
+                                // renders/measures the items in the viewport plus
+                                // overdraw, so a long thread's first frame pays
+                                // only for the visible turn. Item heights are
+                                // reconciled from the ThreadEvent handler via
+                                // `splice`/`remeasure_items`, so the per-item
+                                // height cache never falls out of sync.
+                                let list_el = gpui::list(list_state, move |ix, _window, cx| {
+                                    let item = conv.read(cx).items().get(ix).cloned();
+                                    match item {
+                                        // `flex_shrink_0` pins each row to its true
+                                        // content height so the list's per-item
+                                        // height cache stays honest and markdown
+                                        // never paints outside its row.
+                                        Some(item) => v_flex()
                                             .w_full()
                                             .pt_1()
                                             .pb_4()
                                             .flex_shrink_0()
                                             .min_w_0()
                                             .child(item)
-                                    }));
+                                            .into_any_element(),
+                                        // Index out of range mid-splice (count changed
+                                        // between a layout pass and the render closure):
+                                        // render an empty row rather than panic.
+                                        None => gpui::div().into_any_element(),
+                                    }
+                                })
+                                .with_sizing_behavior(ListSizingBehavior::Auto)
+                                .w_full()
+                                .h_full()
+                                .min_h_0()
+                                .min_w_0()
+                                // Body typeface: Lilex Light. Every message row
+                                // (assistant, user, reasoning, tool cards, notices)
+                                // inherits from here; markdown bold/headings
+                                // resolve to Medium via nearest-weight, italic syntax
+                                // and tool-card overrides hit the italic cuts.
+                                .font_family(theme.mono_font_family.clone())
+                                .font_weight(gpui::FontWeight::LIGHT);
                                 let list_wrap = v_flex()
                                     .flex_1()
                                     .h_full()
                                     .min_h_0()
                                     .min_w_0()
                                     .child(list_el);
-                                // Outline rail (left) + flat message column (right)
-                                // share the scroll region's height.
                                 h_flex()
                                     .flex_1()
                                     .w_full()
