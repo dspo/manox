@@ -566,6 +566,10 @@ context-opt-label-avoided-compact = Avoided compact
 context-opt-label-code-calls = Code calls
 context-opt-label-code-trips = Code trips saved
 context-opt-label-tool-search = ToolSearch
+context-tooltip-main-calls = Main calls
+context-tooltip-side-calls = Side calls
+context-tooltip-distribution = Tokens distribution
+context-tooltip-calls-unit = calls
 context-side-calls-title = Side calls
 context-side-calls-row = {$purpose} · {$model} · {$calls} calls · in {$input} out {$output} cache {$cache} ({$cache_rate}) · avg {$latency}ms
 context-main-calls-row = Main · {$model} · {$calls} calls · in {$input} out {$output} cache {$cache} ({$cache_rate}) · avg {$latency}ms
@@ -627,3 +631,4 @@ background-task-status-timed-out = Timed out
 background-task-status-stopped = Stopped
 background-task-status-session-ended = Session ended
 background-task-stop = Stop
+

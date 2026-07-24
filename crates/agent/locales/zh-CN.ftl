@@ -511,6 +511,10 @@ context-opt-label-avoided-compact = 避免压缩
 context-opt-label-code-calls = Code 调用
 context-opt-label-code-trips = Code 减少轮次
 context-opt-label-tool-search = ToolSearch
+context-tooltip-main-calls = 主调用
+context-tooltip-side-calls = 辅助调用
+context-tooltip-distribution = Tokens 分布
+context-tooltip-calls-unit = 次
 context-side-calls-title = 辅助调用
 context-side-calls-row = {$purpose} · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache}（{$cache_rate}）· 平均 {$latency}ms
 context-main-calls-row = 主调用 · {$model} · {$calls} 次 · 输入 {$input} 输出 {$output} 缓存 {$cache}（{$cache_rate}）· 平均 {$latency}ms
@@ -567,3 +571,4 @@ background-task-status-timed-out = 已超时
 background-task-status-stopped = 已停止
 background-task-status-session-ended = 会话已结束
 background-task-stop = 停止
+
