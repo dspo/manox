@@ -1358,6 +1358,7 @@ impl ConversationState {
             ThreadEvent::ApprovalDecision { .. } => {
                 // Handled by `Workspace` as a Notice card; not part of the
                 // conversation flow.
+                ApplyOutcome::Unchanged
             }
             ThreadEvent::Stop(reason) => {
                 // `StopReason::ToolUse` is mid-turn: the model paused to
