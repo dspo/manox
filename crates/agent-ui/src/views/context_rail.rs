@@ -21,23 +21,20 @@
 
 use agent::{Thread, ThreadEvent, i18n};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ClickEvent, ClipboardItem, Context, Entity,
-    MouseButton, MouseUpEvent, Render, SharedString, WeakEntity, Window, ease_out_quint,
-    prelude::*, px,
+    AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
+    SharedString, WeakEntity, Window, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
     h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
 use std::path::PathBuf;
-use std::time::Duration;
 
 use crate::Workspace;
 use agent::{PlanSnapshot, PlanStepStatus};
 
-use crate::cockpit::{CockpitPhase, cache_read_ratio, cockpit_phase_tag, context_budget_pct};
+use crate::cockpit::{CockpitPhase, cache_read_ratio, context_budget_pct};
 use crate::git_status::{GitBranchDisplay, GitChangeStats};
-use crate::views::braille_spinner::BrailleSpinner;
 use crate::views::subagent_panel::{SubagentInfo, status_indicator, subagent_display_title};
 
 // ── Geometry ─────────────────────────────────────────────────────────────
@@ -63,17 +60,9 @@ const RAIL_NARROW_BREAK: f32 = 900.;
 /// conversation.
 pub(crate) struct ContextRail {
     pub(crate) thread: Entity<Thread>,
-    /// Coarse run phase shown in the status row. Derived from `ThreadEvent`s
-    /// routed here by `Workspace`; the per-second thinking ticker's
-    /// `cx.notify()` also refreshes the elapsed display.
+    /// Coarse run phase. Derived from `ThreadEvent`s routed here by
+    /// `Workspace`; used to determine the main agent's status indicator.
     pub(crate) cockpit_phase: CockpitPhase,
-    /// Last tag index the status-row slider committed. The slider animates from
-    /// this to the freshly computed [`cockpit_phase_tag`] index whenever the
-    /// phase drifts to a different tag; `cockpit_tag_gen` bumps to force a fresh
-    /// 0→1 tween. Computed in render (not on every phase write) so the
-    /// workspace's direct `cockpit_phase = …` assignments need no hook.
-    pub(crate) cockpit_tag_prev: u8,
-    pub(crate) cockpit_tag_gen: u64,
     /// The model's current execution plan, published via `UpdatePlan` and
     /// recovered from history on reload. `None` until the model publishes one
     /// (or after it clears its list). The rail renders the snapshot's own
@@ -117,8 +106,6 @@ impl ContextRail {
         Self {
             thread,
             cockpit_phase: CockpitPhase::Idle,
-            cockpit_tag_prev: cockpit_phase_tag(CockpitPhase::Idle),
-            cockpit_tag_gen: 0,
             plan: None,
             cockpit_hide_tasks: false,
             plan_seen: false,
@@ -161,7 +148,6 @@ impl ContextRail {
             CockpitPhase::Idle
         };
         self.cockpit_phase = new_phase;
-        self.cockpit_tag_prev = cockpit_phase_tag(new_phase);
         // The incoming thread's plan is seeded separately from its history by
         // `set_plan`; clear here so a thread with no plan starts empty rather
         // than inheriting the outgoing thread's list.
@@ -279,7 +265,6 @@ impl ContextRail {
                     .text_color(theme.foreground)
                     .child(i18n::t("context-rail-title")),
             )
-            .child(self.render_cockpit_status_row(theme, cx))
             .child(self.render_agents_section(theme, cx))
             .child(self.render_branch_block(&project, theme, cx))
             .child(self.render_usage_section(theme, cx))
@@ -308,6 +293,10 @@ impl ContextRail {
 
     /// Cumulative token total row with a hover tooltip consolidating main
     /// calls, side calls, and context optimization distribution data.
+    /// Usage section: a header row with the cumulative token total, followed by
+    /// a per-model token breakdown tree when per-model data is available.
+    /// Side-call metrics and context optimization distribution data ride as a
+    /// hover tooltip on the header row.
     fn render_usage_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let muted = theme.muted_foreground;
         let total = crate::cockpit::format_tokens(
@@ -336,7 +325,7 @@ impl ContextRail {
                     .text_color(theme.muted_foreground)
                     .child(SharedString::from(total)),
             );
-        if has_tooltip {
+        let header: AnyElement = if has_tooltip {
             header
                 .id("usage-tooltip-trigger")
                 .tooltip(move |window, cx| {
@@ -357,7 +346,66 @@ impl ContextRail {
                 .into_any_element()
         } else {
             header.into_any_element()
+        };
+
+        // Per-model token breakdown tree: model name → input/cache row → output row.
+        let thread = self.thread.read(cx);
+        let per_model = thread.per_model_token_usage();
+        let mut section = v_flex().w_full().gap_0p5().child(header);
+        if !per_model.is_empty() {
+            let mut models: Vec<(&String, &agent::language_model::TokenUsage)> =
+                per_model.iter().collect();
+            models.sort_by_key(|(_, u)| -(u.total_tokens() as i64));
+            for (model_id, usage) in models {
+                let cache_pct = crate::cockpit::cache_read_ratio(*usage);
+                let model_label = if let Some(pct) = cache_pct {
+                    format!(
+                        "{}  {}",
+                        model_id,
+                        i18n::t_str("workspace-env-cache-hit-rate", &[("pct", &format!("{:.0}", pct * 100.0))])
+                    )
+                } else {
+                    model_id.clone()
+                };
+
+                let throughput = format!(
+                    "{} ↑{}  {} ↑{}",
+                    i18n::t("workspace-env-throughput"),
+                    crate::cockpit::format_tokens(usage.input_tokens),
+                    i18n::t("workspace-env-cache"),
+                    crate::cockpit::format_tokens(usage.cache_read_input_tokens),
+                );
+                let output_line = format!(
+                    "{} ↓{}",
+                    i18n::t("workspace-env-output"),
+                    crate::cockpit::format_tokens(usage.output_tokens),
+                );
+
+                section = section
+                    .child(
+                        gpui::div()
+                            .text_xs()
+                            .text_color(theme.foreground)
+                            .truncate()
+                            .child(SharedString::from(model_label)),
+                    )
+                    .child(
+                        gpui::div()
+                            .pl(px(12.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(SharedString::from(throughput)),
+                    )
+                    .child(
+                        gpui::div()
+                            .pl(px(12.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(SharedString::from(output_line)),
+                    );
+            }
         }
+        section.into_any_element()
     }
 
     /// Change counts `+added` / `-deleted` plus an untracked badge, themed
@@ -519,7 +567,6 @@ impl ContextRail {
     fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         fn append_children(
             parent_id: Option<&str>,
-            depth: usize,
             agents: &[SubagentInfo],
             weak_workspace: &WeakEntity<Workspace>,
             theme: &Theme,
@@ -538,8 +585,8 @@ impl ContextRail {
                         .id(SharedString::from(format!("context-agent-{}", info.id)))
                         .w_full()
                         .min_w_0()
-                        .pl(px(12. + depth as f32 * 12.))
                         .py_0p5()
+                        .pl(px(12.))
                         .gap_1p5()
                         .items_center()
                         .rounded(px(4.))
@@ -567,7 +614,6 @@ impl ContextRail {
                 );
                 append_children(
                     Some(&info.id),
-                    depth + 1,
                     agents,
                     weak_workspace,
                     theme,
@@ -594,13 +640,12 @@ impl ContextRail {
                     gpui::div()
                         .text_xs()
                         .text_color(theme.foreground)
-                        .child(i18n::t("context-agents-main")),
+                        .child("Captain"),
                 )
                 .into_any_element(),
         ];
         append_children(
             None,
-            0,
             &self.agents,
             &self.weak_workspace,
             theme,
@@ -630,114 +675,9 @@ impl ContextRail {
             .children(rows)
             .into_any_element()
     }
-
-    /// Run-status row: a sliding three-tag pill (生成中 / 思考中 / 待输入) +
-    /// elapsed meta (per-second refresh via the thinking ticker). The
-    /// cumulative token total moved to the usage row's trailing slot. Sits
-    /// directly under the rail title.
-    fn render_cockpit_status_row(&mut self, theme: &Theme, _cx: &mut Context<Self>) -> AnyElement {
-        let icon: AnyElement = match self.cockpit_phase {
-            CockpitPhase::Thinking | CockpitPhase::Streaming | CockpitPhase::Summarizing => {
-                BrailleSpinner::new()
-                    .xsmall()
-                    .color(theme.muted_foreground)
-                    .into_any_element()
-            }
-            _ => Icon::new(match self.cockpit_phase {
-                CockpitPhase::RunningTool => IconName::Play,
-                CockpitPhase::AwaitingApproval => IconName::Bell,
-                CockpitPhase::Stopped => IconName::Pause,
-                CockpitPhase::Failed => IconName::CircleX,
-                CockpitPhase::Idle => IconName::Dash,
-                _ => unreachable!(),
-            })
-            .xsmall()
-            .text_color(theme.muted_foreground)
-            .into_any_element(),
-        };
-        cockpit_status_block(icon, self.render_cockpit_phase_tag(theme), theme)
-    }
-
-    /// Sliding three-tag pill: 生成中 / 思考中 / 待输入. The highlight block
-    /// animates from the previously committed tag index to the freshly
-    /// computed [`cockpit_phase_tag`] index over 240ms with `ease_out_quint`;
-    /// `cockpit_tag_gen` bumps on every tag change so gpui fires a fresh tween,
-    /// while a stable tag reuses the cached end-state and renders statically.
-    fn render_cockpit_phase_tag(&mut self, theme: &Theme) -> AnyElement {
-        let cur = cockpit_phase_tag(self.cockpit_phase);
-        let prev = self.cockpit_tag_prev;
-        if cur != prev {
-            self.cockpit_tag_gen = self.cockpit_tag_gen.wrapping_add(1);
-        }
-        let tag_gen = self.cockpit_tag_gen;
-        self.cockpit_tag_prev = cur;
-
-        const SLOT_W: f32 = 52.;
-        const PILL_H: f32 = 22.;
-        let pill_w = SLOT_W * 3.0;
-        let from_x = prev as f64 * SLOT_W as f64;
-        let to_x = cur as f64 * SLOT_W as f64;
-        let anim_id = format!("cockpit-tag-{tag_gen}");
-
-        let labels = [
-            i18n::t("cockpit-status-streaming"),
-            i18n::t("cockpit-status-thinking"),
-            i18n::t("cockpit-status-awaiting-input"),
-        ];
-
-        let muted = theme.muted_foreground;
-        let fg = theme.foreground;
-        let accent = theme.accent;
-        let border = theme.border;
-
-        let mut slots = h_flex().w(px(pill_w)).h(px(PILL_H)).relative();
-        for (i, label) in labels.iter().enumerate() {
-            let color = if i as u8 == cur { fg } else { muted };
-            slots = slots.child(
-                gpui::div()
-                    .w(px(SLOT_W))
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_xs()
-                    .text_color(color)
-                    .child(label.clone()),
-            );
-        }
-
-        let highlight = gpui::div()
-            .absolute()
-            .top_0()
-            .h_full()
-            .w(px(SLOT_W))
-            .rounded(px(6.))
-            .bg(accent.opacity(0.15))
-            .border_1()
-            .border_color(border)
-            .with_animation(
-                anim_id,
-                Animation::new(Duration::from_millis(240)).with_easing(ease_out_quint()),
-                move |el, t| {
-                    let x = from_x + (to_x - from_x) * t as f64;
-                    el.left(px(x as f32))
-                },
-            );
-
-        gpui::div()
-            .relative()
-            .w(px(pill_w))
-            .h(px(PILL_H))
-            .child(highlight)
-            .child(slots)
-            .into_any_element()
-    }
-
-    /// Context-budget block — one line: remaining context-window budget
-    /// (tokens, against the auto-compact trigger or raw window), omitted when
-    /// the thread has no model / zero window. The active fill is the thread's
-    /// effective context tokens — the same max(provider usage, local estimate)
-    /// the auto-compaction trigger uses, so the display and the trigger agree.
+    /// Context-window fill — one line: `Context {pct}% {used} / {cap}`.
+    /// The percentage is `active / window`; the cap is the model's real
+    /// max_input_tokens. Omitted when the thread has no model / zero window.
     /// The cumulative token total lives in the usage row.
     fn render_cockpit_context_budget(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let thread = self.thread.read(cx);
@@ -748,9 +688,7 @@ impl ContextRail {
                 thread.messages(),
                 thread.request_token_usage(),
                 thread.agent_language(),
-            ),
-            self.cockpit_auto_compact_enabled,
-            self.cockpit_auto_compact_threshold,
+            )
         );
         let muted = theme.muted_foreground;
         let warn = theme.warning;
@@ -761,13 +699,11 @@ impl ContextRail {
 
         let mut rows = v_flex().w_full().gap_0p5();
 
-        // Context-window budget (tokens). Omitted when the thread has no
-        // model / zero window — no honest percentage to show.
         if let Some(budget) = budget {
-            let pct = (budget.remaining_pct.round() as i64).clamp(0, 100);
+            let pct = (budget.used_pct.round() as i64).clamp(0, 100);
             let used = crate::cockpit::format_tokens(budget.active_tokens);
             let cap = crate::cockpit::format_tokens(budget.cap_tokens);
-            let near = budget.remaining_pct <= 10.0;
+            let near = budget.used_pct >= 90.0;
             let color = if near { warn } else { muted };
             rows = rows.child(
                 h_flex()
@@ -788,16 +724,25 @@ impl ContextRail {
                             .min_w_0()
                             .text_xs()
                             .text_color(color)
-                            .child(i18n::t_str(
-                                "cockpit-context-remaining-ctx",
-                                &[("pct", &pct.to_string()), ("used", &used), ("cap", &cap)],
-                            )),
+                            .child(format!("Context {pct}% {used} / {cap}")),
                     ),
             );
         }
 
         rows.into_any_element()
     }
+
+
+/// Sort key for plan steps: InProgress (0) → Pending (1) → Completed (2).
+/// Within each priority group the original chronological order is preserved
+/// by `sort_by_key`'s stable sort.
+fn plan_sort_key(status: PlanStepStatus) -> u8 {
+    match status {
+        PlanStepStatus::InProgress => 0,
+        PlanStepStatus::Pending => 1,
+        PlanStepStatus::Completed => 2,
+    }
+}
 
     /// Plan section: the model's `UpdatePlan` snapshot rendered as an execution
     /// overview. Collapsible by clicking the header or pressing
@@ -852,9 +797,9 @@ impl ContextRail {
             );
 
         if hidden {
-            // Collapsed: surface the current task (or a done summary) plus the
-            // remaining count, so the header row alone tells the user where the
-            // work stands without expanding.
+            // Collapsed: show the first 5 steps sorted by priority
+            // (InProgress → Pending → Completed), so the rail gives a
+            // glanceable overview without expanding.
             let mut section = v_flex().w_full().gap_1().child(header);
             if plan.all_completed() {
                 section = section.child(
@@ -864,29 +809,37 @@ impl ContextRail {
                         .text_color(muted)
                         .child(i18n::t("cockpit-plan-all-done")),
                 );
-            } else if let Some(current) = plan.current() {
+            } else {
+                let mut sorted: Vec<&agent::PlanStep> = plan.steps.iter().collect();
+                sorted.sort_by_key(|s| Self::plan_sort_key(s.status));
                 let remaining = total.saturating_sub(done);
-                section = section.child(self.render_plan_row(current, theme));
-                if remaining > 1 {
-                    section =
-                        section.child(gpui::div().pl(px(12.)).text_xs().text_color(muted).child(
-                            i18n::t_str(
+                for step in sorted.iter().take(5) {
+                    section = section.child(self.render_plan_row(step, theme));
+                }
+                let shown = sorted.len().min(5);
+                if remaining > shown || plan.steps.len() > 5 {
+                    section = section.child(
+                        gpui::div()
+                            .pl(px(12.))
+                            .text_xs()
+                            .text_color(muted)
+                            .child(i18n::t_str(
                                 "cockpit-plan-remaining",
-                                &[("count", &(remaining - 1).to_string())],
-                            ),
-                        ));
+                                &[("count", &total.saturating_sub(shown).to_string())],
+                            )),
+                    );
                 }
             }
             return section.into_any_element();
         }
 
         // Expanded: every step, in a bounded scroll region so a long plan does
-        // not push the rest of the rail off-screen. Incomplete steps (Pending,
-        // InProgress) sort before completed ones; within each group the
-        // original chronological order is preserved.
+        // not push the rest of the rail off-screen. Steps sort by priority:
+        // InProgress first, then Pending, then Completed; original
+        // chronological order is preserved within each group.
         let mut list = v_flex().w_full().gap_1();
         let mut steps: Vec<&agent::PlanStep> = plan.steps.iter().collect();
-        steps.sort_by_key(|s| s.status == PlanStepStatus::Completed);
+        steps.sort_by_key(|s| Self::plan_sort_key(s.status));
         for step in steps {
             list = list.child(self.render_plan_row(step, theme));
         }
@@ -1134,18 +1087,6 @@ fn opt_tree_row(category: &str, detail: &str, is_last: bool, muted: gpui::Hsla) 
             "{}{} | {}",
             prefix, category, detail
         )))
-        .into_any_element()
-}
-
-/// Multi-line run-status block: a leading xs icon plus the phase element,
-/// vertically centered on a single baseline like the other rail rows.
-fn cockpit_status_block(icon: AnyElement, phase: AnyElement, _theme: &Theme) -> AnyElement {
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .child(icon)
-        .child(v_flex().flex_1().min_w_0().child(phase))
         .into_any_element()
 }
 

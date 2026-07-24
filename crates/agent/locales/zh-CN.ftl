@@ -65,7 +65,6 @@ status-cancelled = 已取消
 
 ### views/message.rs — Thinking 状态行
 context-agents-title = 智能体
-context-agents-main = 主任务
 subagent-panel-read-only = 只读
 subagent-tab-fallback = 智能体
 thinking-tool-result = 工具结果
@@ -533,9 +532,6 @@ cockpit-plan-progress = {$done}/{$total}
 cockpit-plan-remaining = +{$count} 项待办
 # 折叠态下全部任务完成的提示。
 cockpit-plan-all-done = 全部完成
-# 上下文预算行。{$pct} 为剩余百分比（0–100），{$used}/{$cap} 为已用/上限的预格式化计数。
-cockpit-context-remaining-ctx = 剩余上下文大小 {$pct}% {$used} / {$cap}
-
 composer-pasted-image = 粘贴的图片
 composer-image-process-failed = 部分粘贴的图片无法发送（格式不支持或过大）
 composer-placeholder-followup = 要求后续变更…

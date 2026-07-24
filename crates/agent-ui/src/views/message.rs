@@ -3007,7 +3007,7 @@ pub fn build_items(
                                 items.push(ConvItem::ToolCall(ToolCallItem {
                                     id: tu.id.clone(),
                                     name: tu.name.to_string(),
-                                    title: agent::thread::tool_title(tu.name.as_ref(), &tu.input),
+                                    title: agent::thread::tool_title(tu.name.as_ref(), &tu.input, None),
                                     status: ToolCallStatus::PendingApproval,
                                     output: String::new(),
                                     is_error: false,
@@ -3027,7 +3027,7 @@ pub fn build_items(
                                 let entry = ActivityEntry::Tool(ToolCallItem {
                                     id: tu.id.clone(),
                                     name: tu.name.to_string(),
-                                    title: agent::thread::tool_title(tu.name.as_ref(), &tu.input),
+                                    title: agent::thread::tool_title(tu.name.as_ref(), &tu.input, None),
                                     status: ToolCallStatus::Success,
                                     output: String::new(),
                                     is_error: false,
