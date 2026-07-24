@@ -197,6 +197,7 @@ where
 }
 
 #[derive(Deserialize, JsonSchema, Debug)]
+#[serde(deny_unknown_fields)]
 #[schemars(example = "bash_example")]
 pub(crate) struct BashInput {
     /// Bash command to run (REQUIRED). This is the only required field.
@@ -231,10 +232,6 @@ pub(crate) struct BashInput {
     /// `background_shell` registry; they keep running across turns.
     #[serde(default, deserialize_with = "lenient_bool_opt")]
     run_in_background: Option<bool>,
-    /// Ignore unknown fields (models sometimes hallucinate extra fields).
-    #[serde(flatten, default, skip_serializing)]
-    #[schemars(skip)]
-    _unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Provide a concrete example for the JSON schema.
