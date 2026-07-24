@@ -9922,4 +9922,99 @@ mod tests {
             "default-mode nudge must not mention plan blocks: {nudge}"
         );
     }
+
+    #[test]
+    fn sanitize_removes_orphaned_tool_results() {
+        use super::sanitize_message_sequence;
+        use crate::language_model::Role;
+        use std::sync::Arc;
+
+        let mut messages = vec![
+            // Assistant message with tool_use
+            Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
+                id: "tool_123".into(),
+                name: Arc::from("Read"),
+                raw_input: "{}".into(),
+                input: serde_json::json!({"path": "/tmp/test"}),
+                is_input_complete: true,
+                thought_signature: None,
+            })]),
+            // User message with valid tool_result (has corresponding tool_use)
+            Message::user_with_content(vec![MessageContent::ToolResult(
+                LanguageModelToolResult {
+                    tool_use_id: "tool_123".into(),
+                    tool_name: Arc::from("Read"),
+                    is_error: false,
+                    content: "file content".into(),
+                },
+            )]),
+            // User message with orphaned tool_result (no corresponding tool_use)
+            Message::user_with_content(vec![MessageContent::ToolResult(
+                LanguageModelToolResult {
+                    tool_use_id: "tool_999".into(),
+                    tool_name: Arc::from("Bash"),
+                    is_error: false,
+                    content: "orphaned result".into(),
+                },
+            )]),
+        ];
+
+        sanitize_message_sequence(&mut messages);
+
+        // Should keep assistant message and valid tool_result, remove orphaned message
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::Assistant);
+        assert_eq!(messages[1].role, Role::User);
+        assert!(matches!(
+            &messages[1].content[0],
+            MessageContent::ToolResult(tr) if tr.tool_use_id == "tool_123"
+        ));
+    }
+
+    #[test]
+    fn sanitize_removes_empty_messages() {
+        use super::sanitize_message_sequence;
+        use crate::language_model::Role;
+
+        let mut messages = vec![
+            Message::user("hello".into()),
+            Message::assistant(vec![]), // Empty message
+            Message::user("world".into()),
+        ];
+
+        sanitize_message_sequence(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(messages[1].role, Role::User);
+    }
+
+    #[test]
+    fn sanitize_keeps_text_with_orphaned_tool_result() {
+        use super::sanitize_message_sequence;
+        use std::sync::Arc;
+
+        let mut messages = vec![
+            // User message with both text and orphaned tool_result
+            Message::user_with_content(vec![
+                MessageContent::Text("user feedback".into()),
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "orphaned".into(),
+                    tool_name: Arc::from("Bash"),
+                    is_error: false,
+                    content: "orphaned result".into(),
+                }),
+            ]),
+        ];
+
+        sanitize_message_sequence(&mut messages);
+
+        // Should keep the message with text, but remove the orphaned tool_result
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.len(), 1);
+        assert!(matches!(
+            &messages[0].content[0],
+            MessageContent::Text(t) if t.as_str() == "user feedback"
+        ));
+    }
 }
