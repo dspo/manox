@@ -4511,8 +4511,8 @@ impl Thread {
         if !crate::tools::code::ALLOWED_TOOLS.contains(&name.as_str()) {
             return fail(format!("tool not allowed in Code: {name}"));
         }
-        let (tool, lang, approval_mode, always_allowed, model, wk_root) = match this
-            .read_with(cx, |thread, _| {
+        let (tool, lang, approval_mode, always_allowed, model, wk_root) =
+            match this.read_with(cx, |thread, _| {
                 (
                     thread.tools.get(&name).cloned(),
                     thread.agent_language,
@@ -4522,9 +4522,9 @@ impl Thread {
                     thread.worktree.as_ref().map(|w| w.path.clone()),
                 )
             }) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return fail(format!("thread unavailable: {error}")),
-        };
+                Ok(snapshot) => snapshot,
+                Err(error) => return fail(format!("thread unavailable: {error}")),
+            };
         let Some(tool) = tool else {
             return fail(format!("Unknown tool: {name}"));
         };
@@ -9903,23 +9903,19 @@ mod tests {
                 thought_signature: None,
             })]),
             // User message with valid tool_result (has corresponding tool_use)
-            Message::user_with_content(vec![MessageContent::ToolResult(
-                LanguageModelToolResult {
-                    tool_use_id: "tool_123".into(),
-                    tool_name: Arc::from("Read"),
-                    is_error: false,
-                    content: "file content".into(),
-                },
-            )]),
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tool_123".into(),
+                tool_name: Arc::from("Read"),
+                is_error: false,
+                content: "file content".into(),
+            })]),
             // User message with orphaned tool_result (no corresponding tool_use)
-            Message::user_with_content(vec![MessageContent::ToolResult(
-                LanguageModelToolResult {
-                    tool_use_id: "tool_999".into(),
-                    tool_name: Arc::from("Bash"),
-                    is_error: false,
-                    content: "orphaned result".into(),
-                },
-            )]),
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tool_999".into(),
+                tool_name: Arc::from("Bash"),
+                is_error: false,
+                content: "orphaned result".into(),
+            })]),
         ];
 
         sanitize_message_sequence(&mut messages);
