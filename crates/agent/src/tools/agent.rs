@@ -295,8 +295,8 @@ fn setup_child(
         .map(|p| p.read_with(cx, |t, _| t.permission_snapshot()))
         .unwrap_or_default();
     let permission = Arc::new(PermissionCache::from_snapshot(parent_snapshot));
-    // Inherit the parent's approval mode so an AutoReview/Yolo session's
-    // sub-agents also bypass the relevant permission gate and (for Yolo) run
+    // Inherit the parent's approval mode so an AutoPilot/Danger session's
+    // sub-agents also bypass the relevant permission gate and (for Danger) run
     // bash unsandboxed.
     let parent_mode = parent
         .upgrade()

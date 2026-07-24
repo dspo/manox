@@ -77,14 +77,12 @@ pub fn build_main_system_prompt(
     let os = std::env::consts::OS;
     let (python3, node) = runtime_versions();
 
-    // `None` approval mode stays silent (the default `OnRequest` case), keeping
-    // the identity block byte-stable for the common path. AutoReview and Yolo
-    // are the two modes the model can act differently on, so only those are
-    // advertised — without revealing the internal reviewer mechanism.
+    // The default (AutoPilot) stays silent to keep the identity block
+    // byte-stable for the common path; Danger is advertised so the model
+    // knows it can call tools freely.
     let approval_mode = match approval_mode {
-        ApprovalMode::OnRequest => None,
-        ApprovalMode::AutoReview => Some("AutoReview"),
-        ApprovalMode::Yolo => Some("Yolo"),
+        ApprovalMode::AutoPilot => None,
+        ApprovalMode::Danger => Some("Danger"),
     };
 
     let data = MainSystemPromptData {
@@ -161,7 +159,7 @@ mod tests {
     #[test]
     fn prompt_contains_cwd_and_identity() {
         let cwd = Path::new("/tmp/some-proj");
-        let p = build_main_system_prompt(cwd, None, ApprovalMode::OnRequest, None, Language::En);
+        let p = build_main_system_prompt(cwd, None, ApprovalMode::AutoPilot, None, Language::En);
         assert!(p.contains("/tmp/some-proj"), "cwd must appear: {p}");
         assert!(p.contains("You are manox"), "identity must appear: {p}");
         assert!(p.contains("Today:"), "date row must appear: {p}");
@@ -180,7 +178,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -197,7 +195,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -222,7 +220,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -236,7 +234,7 @@ mod tests {
         let cwd = Path::new("/tmp/some-proj");
         let proj = Path::new("/tmp/some-proj");
         let p =
-            build_main_system_prompt(cwd, Some(proj), ApprovalMode::OnRequest, None, Language::En);
+            build_main_system_prompt(cwd, Some(proj), ApprovalMode::AutoPilot, None, Language::En);
         assert!(p.contains("Project root"));
     }
 
@@ -245,7 +243,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -276,7 +274,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -300,7 +298,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -316,7 +314,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -330,7 +328,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -342,29 +340,29 @@ mod tests {
     }
 
     #[test]
-    fn yolo_mode_advertised_when_enabled() {
+    fn danger_mode_advertised_when_enabled() {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::Yolo,
+            ApprovalMode::Danger,
             None,
             Language::En,
         );
-        assert!(p.contains("YOLO"), "yolo mode line missing: {p}");
+        assert!(p.contains("Danger"), "danger mode line missing: {p}");
     }
 
     #[test]
-    fn yolo_mode_silent_when_disabled() {
+    fn autopilot_mode_silent_when_disabled() {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
         assert!(
-            !p.contains("YOLO"),
-            "yolo must not appear when disabled: {p}"
+            !p.contains("Danger"),
+            "danger must not appear when disabled: {p}"
         );
     }
 
@@ -377,7 +375,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp/some-proj"),
             None,
-            ApprovalMode::Yolo,
+            ApprovalMode::Danger,
             None,
             Language::ZhCn,
         );
@@ -390,8 +388,8 @@ mod tests {
             "zh-CN language directive missing: {p}"
         );
         assert!(
-            p.contains("YOLO"),
-            "yolo must still be advertised in zh-CN: {p}"
+            p.contains("危险驾驶"),
+            "danger mode must be advertised in zh-CN: {p}"
         );
         assert!(
             !p.contains("## Runtime identity"),
@@ -407,7 +405,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -425,7 +423,7 @@ mod tests {
         let p = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -453,7 +451,7 @@ mod tests {
         let en = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::En,
         );
@@ -466,7 +464,7 @@ mod tests {
         let zh = build_main_system_prompt(
             Path::new("/tmp"),
             None,
-            ApprovalMode::OnRequest,
+            ApprovalMode::AutoPilot,
             None,
             Language::ZhCn,
         );

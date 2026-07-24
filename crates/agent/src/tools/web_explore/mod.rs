@@ -9,9 +9,9 @@
 //! Read tools (`read_text` / `read_dom` / `screenshot`) are approval-free and
 //! `is_read_only` so plan mode exposes them. Write tools (`open` / `navigate` /
 //! `click` / `type` / `scroll` / `yield` / `close`) declare `requires_approval`
-//! and ride the owning thread's `ApprovalMode` — OnRequest prompts, Yolo does
-//! not — so the outbound trust axis is governed by the same mode that gates
-//! `bash` / `write_file`.
+//! and ride the owning thread's `ApprovalMode` — AutoPilot vets via the
+//! reviewer, Danger bypasses — so the outbound trust axis is governed by
+//! the same mode that gates `bash` / `write_file`.
 
 mod click;
 mod close;

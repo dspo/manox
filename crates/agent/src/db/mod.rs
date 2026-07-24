@@ -136,7 +136,7 @@ mod tests {
             cwd: "/tmp".into(),
             project: "/tmp".into(),
             agent_language: "en".into(),
-            approval_mode: 2,
+            approval_mode: 1,
             reasoning_effort: 4,
             depth: 0,
             parent_id: None,
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(loaded.summary, "你好");
         assert_eq!(loaded.title.as_deref(), Some("关于登录"));
         assert_eq!(loaded.provider_id.as_deref(), Some("百炼"));
-        assert_eq!(loaded.approval_mode, 2);
+        assert_eq!(loaded.approval_mode, 1);
         assert_eq!(loaded.agent_language, "en");
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].role, Role::User);

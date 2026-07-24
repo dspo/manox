@@ -511,7 +511,7 @@ mod tests {
                     python3: "3.12".to_string(),
                     node: "20".to_string(),
                     today: "2026-07-14".to_string(),
-                    approval_mode: Some("Yolo"),
+                    approval_mode: Some("Danger"),
                 },
             };
             assert_clean(

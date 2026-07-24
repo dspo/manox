@@ -51,9 +51,9 @@ pub trait ToolContext {
     /// non-team threads. Team tools reach the shared task list and the message
     /// router through this.
     fn team(&self) -> Option<&Entity<crate::team::Team>>;
-    /// Whether the owning thread is in YOLO / AutoReview mode (bash uses this
-    /// to force the unsandboxed branch without a per-call escalation flag).
-    fn yolo(&self) -> bool;
+    /// Whether the owning thread is in Danger mode (bash uses this to force
+    /// the unsandboxed branch without a per-call escalation flag).
+    fn danger(&self) -> bool;
     /// The loopback port of the thread's in-process network proxy, when the
     /// sandbox network policy is `Restricted`. The sandboxed bash command
     /// is wrapped so the seatbelt only allows outbound to this port, and
@@ -77,7 +77,7 @@ pub struct ToolContextSnapshot {
     depth: u32,
     agent_label: String,
     team: Option<Entity<crate::team::Team>>,
-    yolo: bool,
+    danger: bool,
     network_proxy_port: Option<u16>,
     anchor_message_id: Option<String>,
 }
@@ -99,7 +99,7 @@ impl ToolContextSnapshot {
             depth: t.depth(),
             agent_label: t.agent_label().to_string(),
             team: t.team().cloned(),
-            yolo: t.approval_mode() == crate::thread::ApprovalMode::Yolo,
+            danger: t.approval_mode() == crate::thread::ApprovalMode::Danger,
             network_proxy_port: t.network_proxy_port(),
             anchor_message_id: t.last_user_message_id().map(str::to_owned),
         }
@@ -140,8 +140,8 @@ impl ToolContext for ToolContextSnapshot {
     fn team(&self) -> Option<&Entity<crate::team::Team>> {
         self.team.as_ref()
     }
-    fn yolo(&self) -> bool {
-        self.yolo
+    fn danger(&self) -> bool {
+        self.danger
     }
     fn network_proxy_port(&self) -> Option<u16> {
         self.network_proxy_port
@@ -206,7 +206,7 @@ pub trait AgentTool: Send + Sync + 'static {
     /// Whether the authorization flow is the tool's execution path rather than
     /// a permission gate — the tool produces its result from the
     /// `ToolAuthorizationResponse` itself and its `run` body is unreachable.
-    /// YOLO mode and `AlwaysAllow` must not bypass such tools, or the model
+    /// Danger mode and `AlwaysAllow` must not bypass such tools, or the model
     /// would hit the unreachable `run` and lose the user's input. Only
     /// `AskUserQuestion` overrides this.
     fn requires_user_input(&self) -> bool {

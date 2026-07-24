@@ -1,18 +1,17 @@
 //! Built-in approval reviewer agent.
 //!
-//! When the thread's `ApprovalMode` is `AutoReview`, each tool call that would
-//! normally show the authorization overlay is instead vetted by [`review`]
-//! before running. The reviewer makes a single-shot LLM call (no tools, no
-//! streaming) and returns one of two verdicts:
+//! When the thread's `ApprovalMode` is `AutoPilot`, each tool call that would
+//! normally require approval is instead vetted by [`review`] before running.
+//! The reviewer makes a single-shot LLM call (no tools, no streaming) and
+//! returns one of two verdicts:
 //!
-//! - [`ReviewVerdict::Allow`] — the tool runs immediately, same as YOLO.
-//! - [`ReviewVerdict::Ask { reason }`] — the auth overlay is shown; the
-//!   `reason` is rendered under the tool title so the user knows why the
-//!   reviewer escalated the call.
+//! - [`ReviewVerdict::Allow`] — the tool runs immediately.
+//! - [`ReviewVerdict::Ask { reason }`] — the tool is denied and the `reason`
+//!   is returned to the model so it can adjust its approach.
 //!
 //! Failures (LLM unavailable, timeout, malformed response) **all** downgrade
 //! to `Ask` with a generic reason — the reviewer is fail-closed so a broken
-//! auto-review path never silently widens access.
+//! autopilot path never silently widens access.
 //!
 //! The reviewer prompt lives in the `side_call/approval_system.tera.md`
 //! template and is rendered at the request-build boundary. It is model-facing
@@ -46,8 +45,8 @@ const REVIEW_TIMEOUT: Duration = Duration::from_secs(8);
 pub enum ReviewVerdict {
     /// The tool is safe to run without prompting the user.
     Allow,
-    /// The reviewer could not auto-approve; show the auth overlay with
-    /// `reason` rendered as a one-line justification.
+    /// The reviewer could not auto-approve; the tool is denied and `reason`
+    /// is returned to the model so it can adjust its approach.
     Ask { reason: String },
 }
 
@@ -86,7 +85,7 @@ struct BatchVerdictPayload {
     reason: Option<String>,
 }
 
-/// Vet every AutoReview tool call from one assistant response in one side
+/// Vet every AutoPilot tool call from one assistant response in one side
 /// request. Missing or malformed per-id verdicts fail closed independently.
 pub async fn review_batch(
     model: &AnyLanguageModel,
@@ -116,7 +115,7 @@ async fn review_batch_with_timeout(
         };
     }
     let fallback = || ReviewVerdict::Ask {
-        reason: "auto-review unavailable; please confirm".to_string(),
+        reason: "autopilot reviewer unavailable; tool call denied".to_string(),
     };
     let fail_closed = || {
         items
@@ -245,13 +244,14 @@ fn parse_batch_verdicts(text: &str, items: &[ReviewItem]) -> HashMap<String, Rev
         parsed
             .entry(item.id.clone())
             .or_insert_with(|| ReviewVerdict::Ask {
-                reason: "auto-review verdict missing or malformed; please confirm".to_string(),
+                reason: "autopilot reviewer verdict missing or malformed; tool call denied"
+                    .to_string(),
             });
     }
     parsed
 }
 
-/// Vet a single tool call under `AutoReview`. Blocks until the reviewer
+/// Vet a single tool call under `AutoPilot`. Blocks until the reviewer
 /// responds, the per-call timeout elapses, or `cancel` fires — every
 /// non-success path returns [`ReviewVerdict::Ask`].
 ///
@@ -400,7 +400,7 @@ pub async fn review(
     let Some((text, usage)) = outcome else {
         return ReviewOutcome {
             verdict: ReviewVerdict::Ask {
-                reason: "auto-review unavailable; please confirm".to_string(),
+                reason: "autopilot reviewer unavailable; tool call denied".to_string(),
             },
             usage: None,
             model_name,
@@ -409,7 +409,7 @@ pub async fn review(
 
     ReviewOutcome {
         verdict: parse_verdict(&text).unwrap_or(ReviewVerdict::Ask {
-            reason: "auto-review response unparseable; please confirm".to_string(),
+            reason: "autopilot reviewer response unparseable; tool call denied".to_string(),
         }),
         usage,
         model_name,
@@ -484,7 +484,7 @@ fn verdict_from(payload: VerdictPayload) -> Option<ReviewVerdict> {
     match payload.verdict.to_ascii_uppercase().as_str() {
         "ALLOW" => Some(ReviewVerdict::Allow),
         "ASK" => Some(ReviewVerdict::Ask {
-            reason: reason.unwrap_or_else(|| "auto-review asked to confirm".to_string()),
+            reason: reason.unwrap_or_else(|| "autopilot reviewer denied the call".to_string()),
         }),
         _ => None,
     }

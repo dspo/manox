@@ -31,7 +31,7 @@ pub struct LanguagePromptData {
 /// Runtime identity block. Session-stable rows first (cwd / project / os /
 /// shell / python3 / node), then daily-volatile `today`, then
 /// toggle-volatile approval mode last — so the cacheable prefix extends as far
-/// as possible. `None` approval mode stays silent (the default `OnRequest`
+/// as possible. `None` approval mode stays silent (the default `AutoPilot`
 /// case), keeping the identity block byte-stable for the common path.
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeIdentityPromptData {
@@ -43,8 +43,8 @@ pub struct RuntimeIdentityPromptData {
     pub python3: String,
     pub node: String,
     pub today: String,
-    /// `None` = `OnRequest` (silent). `Some("AutoReview")` / `Some("Yolo")`
-    /// advertise the two modes the model can act differently on.
+    /// `None` = `AutoPilot` (silent). `Some("Danger")` advertises the mode
+    /// the model can act differently on.
     pub approval_mode: Option<&'static str>,
 }
 

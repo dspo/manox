@@ -10,8 +10,8 @@
 //! ([`init`]). Each command is an erased `&'static dyn SlashCommand`. The
 //! `⁄` popover in the composer lists registered commands dynamically.
 //!
-//! Built-in commands: `/yolo` (toggle YOLO mode — bypass approvals +
-//! unsandboxed bash, see [`YoloCommand`]), `/plan` (enter/exit plan mode,
+//! Built-in commands: `/danger` (toggle Danger mode — bypass approvals +
+//! unsandboxed bash, see [`DangerCommand`]), `/plan` (enter/exit plan mode,
 //! see [`PlanCommand`]), `/goal` (set a completion condition, see
 //! [`GoalCommand`]), `/compact` (manual context compaction, see
 //! [`CompactCommand`]), and `/exit` (archive the current thread and start
@@ -40,7 +40,7 @@ pub enum SlashResult {
     #[default]
     Handled,
     /// The command wants the remaining text sent as a normal user turn after
-    /// performing any side effects (e.g. `/yolo fix it` enables YOLO then runs
+    /// performing any side effects (e.g. `/danger fix it` enables Danger then runs
     /// the prompt). The `String` is the text to send (may differ from input).
     InjectUserTurn(String),
     /// The command did nothing; the input should be treated as a normal
@@ -61,7 +61,7 @@ pub struct ParsedSlash {
 /// typed `Context<Workspace>` so they can toggle thread state, push messages,
 /// etc., exactly like inline workspace methods.
 pub trait SlashCommand: Send + Sync {
-    /// Canonical name without the leading `/` (e.g. `yolo`).
+    /// Canonical name without the leading `/` (e.g. `danger`).
     fn name(&self) -> &str;
     /// One-line description shown in the `⁄` popover. Localized via `i18n` for
     /// built-in commands; markdown-defined commands return their frontmatter
@@ -121,10 +121,10 @@ impl SlashCommandRegistry {
 /// `OnceLock::set`.
 pub fn init(_cx: &mut App) {
     let mut commands: Vec<Box<dyn SlashCommand>> = vec![
-        // /yolo: toggle YOLO mode (no args), or enable YOLO and immediately run
+        // /danger: toggle Danger mode (no args), or enable Danger and immediately run
         // the prompt as a user turn (with args). Bypasses approvals and runs
         // bash unsandboxed for the session.
-        Box::new(YoloCommand),
+        Box::new(DangerCommand),
         Box::new(PlanCommand),
         Box::new(GoalCommand),
         Box::new(CompactCommand),
@@ -134,7 +134,7 @@ pub fn init(_cx: &mut App) {
     // skill sharing one is skipped — keeps one popover row per name and routes
     // dispatch to the higher-priority command/built-in.
     let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from([
-        "yolo".to_string(),
+        "danger".to_string(),
         "plan".to_string(),
         "goal".to_string(),
         "compact".to_string(),
@@ -150,7 +150,7 @@ pub fn init(_cx: &mut App) {
         .map(|r| r.entries())
         .unwrap_or_default()
     {
-        // A macro sharing a built-in name (e.g. `commands/yolo.md`) is skipped —
+        // A macro sharing a built-in name (e.g. `commands/danger.md`) is skipped —
         // the built-in wins, mirroring the skill-skip rule below, so the popover
         // never shows two rows for the same name.
         if command_keys.contains(key.as_str()) {
@@ -231,19 +231,19 @@ pub fn dispatch(
 
 // ─── built-in commands ─────────────────────────────────────────────────────
 
-/// `/yolo` — toggle YOLO mode on the current thread.
+/// `/danger` — toggle Danger mode on the current thread.
 ///
-/// `/yolo` (no args) toggles YOLO on/off and pushes a notice.
-/// `/yolo [prompt]` enables YOLO (if not already on) and immediately sends
+/// `/danger` (no args) toggles Danger on/off and pushes a notice.
+/// `/danger [prompt]` enables Danger (if not already on) and immediately sends
 /// `prompt` as a user turn so the agent starts working with full autonomy.
-struct YoloCommand;
+struct DangerCommand;
 
-impl SlashCommand for YoloCommand {
+impl SlashCommand for DangerCommand {
     fn name(&self) -> &str {
-        "yolo"
+        "danger"
     }
     fn description(&self) -> SharedString {
-        i18n::t("slash-yolo-desc")
+        i18n::t("slash-danger-desc")
     }
     fn execute(
         &self,
@@ -253,10 +253,10 @@ impl SlashCommand for YoloCommand {
         cx: &mut Context<Workspace>,
     ) -> SlashResult {
         if args.is_empty() {
-            workspace.toggle_yolo(cx);
+            workspace.toggle_danger(cx);
             SlashResult::Handled
         } else {
-            workspace.start_yolo_turn(args.to_string(), cx);
+            workspace.start_danger_turn(args.to_string(), cx);
             SlashResult::Handled
         }
     }
@@ -587,24 +587,24 @@ mod tests {
     #[test]
     fn parse_basic_command() {
         register_for_tests();
-        let p = parse("/yolo").unwrap();
-        assert_eq!(p.name, "yolo");
+        let p = parse("/danger").unwrap();
+        assert_eq!(p.name, "danger");
         assert_eq!(p.args, "");
     }
 
     #[test]
     fn parse_command_with_args() {
         register_for_tests();
-        let p = parse("/yolo fix the bug").unwrap();
-        assert_eq!(p.name, "yolo");
+        let p = parse("/danger fix the bug").unwrap();
+        assert_eq!(p.name, "danger");
         assert_eq!(p.args, "fix the bug");
     }
 
     #[test]
     fn parse_leading_whitespace_ok() {
         register_for_tests();
-        let p = parse("   /yolo hi").unwrap();
-        assert_eq!(p.name, "yolo");
+        let p = parse("   /danger hi").unwrap();
+        assert_eq!(p.name, "danger");
         assert_eq!(p.args, "hi");
     }
 
@@ -626,14 +626,14 @@ mod tests {
     fn parse_inline_slash_is_none() {
         // Slash not at line start must not be treated as a command.
         register_for_tests();
-        assert!(parse("hello /yolo").is_none());
+        assert!(parse("hello /danger").is_none());
     }
 
     #[test]
     fn registry_lookup() {
         register_for_tests();
         let r = REGISTRY.get().unwrap();
-        assert!(r.get("yolo").is_some());
+        assert!(r.get("danger").is_some());
         assert!(r.get("plan").is_some());
         assert!(r.get("goal").is_some());
         assert!(r.get("compact").is_some());
@@ -726,8 +726,8 @@ mod tests {
         // → `get` (first match) returns the command, so dispatch never lands on
         // the shadowed skill.
         let cmd_def = Arc::new(CommandDefinition {
-            name: "yolo".to_string(),
-            description: "macro yolo".to_string(),
+            name: "danger".to_string(),
+            description: "macro danger".to_string(),
             argument_hint: None,
             allowed_tools: Vec::new(),
             disable_model_invocation: false,
@@ -735,20 +735,20 @@ mod tests {
             source: PathBuf::new(),
         });
         let skill_def = Arc::new(SkillDefinition {
-            name: "yolo".to_string(),
-            description: "skill yolo".to_string(),
+            name: "danger".to_string(),
+            description: "skill danger".to_string(),
             body: "body".to_string(),
             source: PathBuf::new(),
         });
         let reg = SlashCommandRegistry::new(vec![
-            Box::new(MarkdownSlashCommand::new("yolo".to_string(), cmd_def))
+            Box::new(MarkdownSlashCommand::new("danger".to_string(), cmd_def))
                 as Box<dyn SlashCommand>,
-            Box::new(SkillSlashCommand::new("yolo".to_string(), skill_def))
+            Box::new(SkillSlashCommand::new("danger".to_string(), skill_def))
                 as Box<dyn SlashCommand>,
         ]);
-        let found = reg.get("yolo").expect("key resolves");
+        let found = reg.get("danger").expect("key resolves");
         assert_eq!(found.kind(), CompletionKind::Command);
-        assert_eq!(found.description().as_ref(), "macro yolo");
+        assert_eq!(found.description().as_ref(), "macro danger");
     }
 
     /// Ensure the registry is populated for tests (idempotent).
@@ -757,7 +757,7 @@ mod tests {
             return;
         }
         let _ = REGISTRY.set(SlashCommandRegistry::new(vec![
-            Box::new(YoloCommand),
+            Box::new(DangerCommand),
             Box::new(PlanCommand),
             Box::new(GoalCommand),
             Box::new(CompactCommand),

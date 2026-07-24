@@ -174,12 +174,10 @@ settings-row-work-mode-workday = For daily work
 settings-desc-work-mode-workday = Just as capable, with less technical detail
 
 settings-section-permissions = Permissions
-settings-row-permission-default = Default permissions
-settings-desc-permission-default = By default, manox can read and edit files in its workspace. When needed, it can request additional access permissions
-settings-row-permission-auto-review = Automatic review
-settings-desc-permission-auto-review = manox can read and edit files in its workspace. manox automatically reviews additional access requests. Automatic review can make mistakes.
-settings-row-permission-full = Full access permissions
-settings-desc-permission-full = When manox runs with full access, it can edit any file on your computer and run internet commands without your approval. This significantly increases the risk of data loss, leaks, or unintended actions.
+settings-row-permission-autopilot = AutoPilot
+settings-desc-permission-autopilot = manox can read and edit files in its workspace. A safety reviewer automatically approves additional access requests. It can make mistakes.
+settings-row-permission-danger = Danger
+settings-desc-permission-danger = When manox runs in Danger, it can edit any file on your computer and run internet commands without your approval. This significantly increases the risk of data loss, leaks, or unintended actions.
 settings-link-learn-more = Learn more
 
 settings-section-general-misc = General
@@ -398,30 +396,25 @@ workspace-cancel = Cancel
 workspace-submit = Submit
 workspace-mode-normal = Normal
 workspace-mode-section = Mode
-workspace-mode-on-request-title = Request approval
-workspace-mode-on-request-desc = Always ask when editing external files or using the internet
-workspace-mode-auto-review-title = Approve for me
-workspace-mode-auto-review-desc = Only request approval for detected risky operations
-workspace-mode-yolo-title = Full access
-workspace-mode-yolo-desc = Unrestricted access to the internet and any file on your computer
-workspace-chip-mode-on-request = Request approval
-workspace-chip-mode-auto-review = Approve for me
-workspace-chip-mode-yolo = Full access
+workspace-mode-autopilot-title = AutoPilot
+workspace-mode-autopilot-desc = A safety reviewer automatically approves safe tool calls; risky ones are denied
+workspace-mode-danger-title = Danger
+workspace-mode-danger-desc = Tool calls need no approval, bash runs outside the sandbox
+workspace-chip-mode-autopilot = AutoPilot
+workspace-chip-mode-danger = Danger
 workspace-mode-title = How should manox actions be approved?
 workspace-mode-learn-more = Learn more
 workspace-mode-notice = { $mode ->
-    [on-request] Switched to request-approval mode.
-    [auto-review] Approve-for-me mode: safe tool calls run without prompting, risky ones still ask.
-   *[yolo] Full access: tool calls need no approval, bash runs outside the sandbox.
+    [autopilot] AutoPilot mode: safe tool calls run without prompting, risky ones are denied.
+   *[danger] Danger: tool calls need no approval, bash runs outside the sandbox.
 }
-workspace-approval-auto-review-note = Auto-review: {$reason}
+workspace-approval-autopilot-allowed = ✔ Auto-approved: {$tool}
+workspace-approval-autopilot-escalated = ✗ Denied: {$tool} — {$reason}
 workspace-project-choose = Choose project
 workspace-project-new = New project
 workspace-project-blank = Create blank project
 workspace-project-select-folder = Select folder
 workspace-project-name-prompt = Project folder name
-workspace-yolo-on-notice = Full access on: tool calls need no approval, bash runs outside the sandbox.
-workspace-yolo-off-notice = Switched to request-approval mode: approvals and sandbox restored.
 workspace-empty-prompt = What should we do?
 workspace-effort-section = Reasoning effort
 workspace-provider-reload-failed = Failed to reload provider config; keeping previous providers: {$error}
@@ -452,7 +445,7 @@ turn-navigator-empty-message = Empty message
 turn-navigator-copied = Message copied to clipboard.
 
 ### slash_command.rs
-slash-yolo-desc = Switch to Full access (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
+slash-danger-desc = Switch to Danger (no approvals + bash outside sandbox); with a prompt, switches and starts working immediately
 slash-plan-desc = Strongly hint to explore deeply and produce a <proposed_plan> block; bare `/plan` nudges planning, `/plan <prompt>` plans against your prompt
 slash-exit-desc = Archive the current thread and start a fresh one
 slash-goal-desc = Create or manage a persistent Goal (`/goal <objective>`, pause, resume, edit, clear)

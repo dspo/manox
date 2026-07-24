@@ -23,8 +23,6 @@ Unless the user specifies otherwise, write your user-facing responses in {{ lang
 - python3: {{ runtime.python3 }}
 - node: {{ runtime.node }}
 - Today: {{ runtime.today }}
-{% if runtime.approval_mode == "AutoReview" -%}
-- Mode: AutoReview (risky tool calls still ask before running)
-{% elif runtime.approval_mode == "Yolo" -%}
-- Mode: YOLO (tool calls need no approval, bash runs outside the sandbox)
+{% if runtime.approval_mode == "Danger" -%}
+- Mode: Danger (tool calls need no approval, bash runs outside the sandbox)
 {% endif -%}

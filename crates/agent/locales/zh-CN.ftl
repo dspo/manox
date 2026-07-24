@@ -122,12 +122,10 @@ settings-row-work-mode-workday = 适用于日常工作
 settings-desc-work-mode-workday = 同样强大，技术细节更少
 
 settings-section-permissions = 权限
-settings-row-permission-default = 默认权限
-settings-desc-permission-default = 默认情况下，manox 可以读取并编辑其工作区中的文件。必要时，它可以请求额外的访问权限
-settings-row-permission-auto-review = 自动审核
-settings-desc-permission-auto-review = manox 可以读取和编辑其工作区中的文件。manox 会自动审核额外访问权限请求。自动审核可能会出错。
-settings-row-permission-full = 完全访问权限
-settings-desc-permission-full = 当 manox 以完全访问权限运行时，无需你批准，即可编辑你的电脑上的任何文件并运行互联网命令。这会显著增加数据丢失、泄露或意外行为的风险。
+settings-row-permission-autopilot = 自动驾驶
+settings-desc-permission-autopilot = manox 可以读取和编辑其工作区中的文件。安全审查器自动批准额外访问权限请求。自动审批可能会出错。
+settings-row-permission-danger = 危险驾驶
+settings-desc-permission-danger = 当 manox 以危险驾驶模式运行时，无需你批准，即可编辑你的电脑上的任何文件并运行互联网命令。这会显著增加数据丢失、泄露或意外行为的风险。
 settings-link-learn-more = 了解更多
 
 settings-section-general-misc = 常规
@@ -346,30 +344,25 @@ workspace-cancel = 取消
 workspace-submit = 提交
 workspace-mode-normal = 普通
 workspace-mode-section = 模式
-workspace-mode-on-request-title = 请求审批
-workspace-mode-on-request-desc = 编辑外部文件或使用网络时总是询问
-workspace-mode-auto-review-title = 替我审批
-workspace-mode-auto-review-desc = 仅对检测到的风险操作请求审批
-workspace-mode-yolo-title = 完全访问
-workspace-mode-yolo-desc = 不受限制地访问互联网和电脑上的任何文件
-workspace-chip-mode-on-request = 请求审批
-workspace-chip-mode-auto-review = 替我审批
-workspace-chip-mode-yolo = 完全访问
+workspace-mode-autopilot-title = 自动驾驶
+workspace-mode-autopilot-desc = 安全审查器自动批准安全工具调用，风险操作将被拒绝
+workspace-mode-danger-title = 危险驾驶
+workspace-mode-danger-desc = 工具调用免审批，bash 在沙箱外运行
+workspace-chip-mode-autopilot = 自动驾驶
+workspace-chip-mode-danger = 危险驾驶
 workspace-mode-title = 如何批准 manox 操作？
 workspace-mode-learn-more = 了解更多
 workspace-mode-notice = { $mode ->
-    [on-request] 已切换到请求审批模式。
-    [auto-review] 替我审批模式：安全工具调用免提示，风险操作仍会询问。
-   *[yolo] 完全访问：工具调用免审批，bash 在沙箱外运行。
+    [autopilot] 自动驾驶模式：安全工具调用免提示，风险操作将被拒绝。
+   *[danger] 危险驾驶：工具调用免审批，bash 在沙箱外运行。
 }
-workspace-approval-auto-review-note = 自动审核：{$reason}
+workspace-approval-autopilot-allowed = ✔ 自动批准：{$tool}
+workspace-approval-autopilot-escalated = ✗ 已拒绝：{$tool} — {$reason}
 workspace-project-choose = 选择项目
 workspace-project-new = 新建项目
 workspace-project-blank = 新建空白项目
 workspace-project-select-folder = 选择文件夹
 workspace-project-name-prompt = 项目文件夹名称
-workspace-yolo-on-notice = 完全访问已开启：工具调用免审批，bash 在沙箱外运行。
-workspace-yolo-off-notice = 已切换到请求审批模式：恢复审批与沙箱。
 workspace-empty-prompt = 我们该做什么？
 workspace-effort-section = 推理强度
 workspace-provider-reload-failed = 重新加载 provider 配置失败，已保留原有 providers：{$error}
@@ -400,7 +393,7 @@ turn-navigator-empty-message = 空消息
 turn-navigator-copied = 消息已复制到剪贴板。
 
 ### slash_command.rs
-slash-yolo-desc = 切换到完全访问（免审批 + bash 沙箱外）；带提示词则切换后直接开工
+slash-danger-desc = 切换到危险驾驶（免审批 + bash 沙箱外）；带提示词则切换后直接开工
 slash-plan-desc = 强烈提示深入探索并以 <proposed_plan> 块产出计划；裸 `/plan` 引导规划，`/plan <提示>` 按你的提示规划
 slash-goal-desc = 创建或管理持久目标（`/goal <目标>`、pause、resume、edit、clear）
 slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行

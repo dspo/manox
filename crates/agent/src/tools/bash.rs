@@ -273,8 +273,8 @@ impl AgentTool for BashTool {
         // `(allow default)` base admits the Mach IPC Apple Events ride on.
         // Gate it on approval regardless of the `unsandboxed` flag so the model
         // cannot drive other apps without explicit, auditable user consent.
-        // A YOLO session pre-authorizes every tool (like it does for
-        // unsandboxed bash and write tools); outside YOLO this gate fires.
+        // A Danger session pre-authorizes every tool (like it does for
+        // unsandboxed bash and write tools); outside Danger this gate fires.
         if let Some(cmd) = input.get("command").and_then(serde_json::Value::as_str)
             && crate::sandbox::is_cross_app_automation(cmd)
         {
@@ -321,11 +321,11 @@ impl AgentTool for BashTool {
         let cwd_override = parsed.cwd.clone();
         let timeout = Duration::from_secs(parsed.timeout_secs.unwrap_or(BASH_DEFAULT_TIMEOUT_SECS));
         let command = parsed.command.clone();
-        // YOLO mode forces the unsandboxed branch (DangerFullAccess): when the
-        // owning thread has YOLO on, ignore the per-call `unsandboxed` flag and
-        // always run via the persistent shell without seatbelt confinement.
-        let yolo = ctx.yolo();
-        let unsandboxed = parsed.unsandboxed.unwrap_or(false) || yolo;
+        // Danger mode forces the unsandboxed branch: when the owning thread
+        // is in Danger, ignore the per-call `unsandboxed` flag and always
+        // run via the persistent shell without seatbelt confinement.
+        let danger = ctx.danger();
+        let unsandboxed = parsed.unsandboxed.unwrap_or(false) || danger;
         let head_lines = parsed.head_lines;
         let tail_lines = parsed.tail_lines;
         let run_in_background = parsed.run_in_background.unwrap_or(false);
@@ -386,7 +386,7 @@ until the process exits."
         }
         bridge_tokio(cx, async move {
             if unsandboxed {
-                // Approved escalation / YOLO: brush's persistent shell, no confinement.
+                // Approved escalation / Danger: brush's persistent shell, no confinement.
                 run_bash(
                     shell,
                     &command,
@@ -464,7 +464,7 @@ enum Outcome {
 /// or inside a protected subtree (`.git`) is rejected before brush runs. This
 /// is the c5aefe4d escape — `cd` into a sibling worktree then git ops against
 /// its `.git`. Direct writes outside the project root are NOT blocked here:
-/// the unsandboxed path is the user-approved / YOLO escape route, and
+/// the unsandboxed path is the user-approved / Danger escape route, and
 /// constraining writes (not cwd) would defeat its purpose.
 // too_many_arguments: the bash entry points pass the full subprocess-spawn +
 // capture + cancel knob set down the call chain, and `run_sandboxed_bash`

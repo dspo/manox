@@ -110,36 +110,35 @@ pub struct SideCallMetric {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ApprovalMode {
-    /// Every approval-required tool call shows the authorization overlay.
-    #[serde(rename = "on-request")]
-    OnRequest,
-    /// A built-in security-reviewer LLM agent vet each approval-required tool
-    /// call. Safe calls run without prompting; risky ones still raise the
-    /// overlay (with a one-line reason from the agent). Failures (timeout,
-    /// parse error, unsupported verdict) fall back to the overlay.
-    #[serde(rename = "auto-review")]
+    /// A built-in safety-reviewer LLM agent vets each approval-required tool
+    /// call. Safe calls run without prompting; risky ones are denied and
+    /// returned to the model so it can adjust its approach. Failures
+    /// (timeout, parse error, unsupported verdict) fall back to denial.
+    #[serde(rename = "autopilot")]
     #[default]
-    AutoReview,
-    /// All approvals are bypassed and `bash` runs unsandboxed
-    /// (DangerFullAccess equivalent). Inherited by sub-agents.
-    #[serde(rename = "yolo")]
-    Yolo,
+    AutoPilot,
+    /// All approvals are bypassed and `bash` runs unsandboxed. Inherited by
+    /// sub-agents.
+    #[serde(rename = "danger")]
+    Danger,
 }
 
 impl ApprovalMode {
+    /// Map the persisted integer back to a variant. Current serialization
+    /// is `0 = AutoPilot, 1 = Danger`; legacy `2` (Yolo) also means Danger.
+    /// Fallback is AutoPilot so an unrecognized value never silently
+    /// escalates to unsandboxed execution.
     pub fn from_i64(v: i64) -> Self {
         match v {
-            1 => Self::AutoReview,
-            2 => Self::Yolo,
-            _ => Self::OnRequest,
+            1 | 2 => Self::Danger,
+            _ => Self::AutoPilot,
         }
     }
 
     pub fn as_i64(self) -> i64 {
         match self {
-            Self::OnRequest => 0,
-            Self::AutoReview => 1,
-            Self::Yolo => 2,
+            Self::AutoPilot => 0,
+            Self::Danger => 1,
         }
     }
 }
@@ -203,12 +202,24 @@ pub enum ThreadEvent {
         latest_activity: Option<String>,
         status: ToolCallStatus,
     },
-    /// Request user authorization for a tool call. The UI resolves the prompt and calls `Thread::respond_authorization` with a `ToolAuthorizationResponse` (a decision, or — for `AskUserQuestion` — the user's answers).
+    /// Request user authorization for a tool call. Only emitted for
+    /// interactive tools (AskUserQuestion) whose execution IS the
+    /// authorization flow, and for bubbled sub-agent auth. The UI resolves
+    /// the prompt and calls `Thread::respond_authorization` with a
+    /// `ToolAuthorizationResponse`.
     ToolCallAuthorization {
         id: String,
         tool_name: String,
         summary: String,
         input: serde_json::Value,
+    },
+    /// An autopilot approval decision. Emitted after the safety reviewer
+    /// vets a tool call in AutoPilot mode so the MessageList can show a
+    /// brief "auto-approved / escalated: <tool>" record.
+    ApprovalDecision {
+        tool_name: String,
+        tool_title: String,
+        verdict: crate::approval::ReviewVerdict,
     },
     /// Approval mode changed. The UI refreshes its badge, access chip, and
     /// the popover's selected row.
@@ -352,7 +363,7 @@ pub enum ThreadEvent {
     /// `__manox_request_write__(intent, payload)`. This is orthogonal to the
     /// outbound `ApprovalMode` axis: every inbound request surfaces a
     /// confirmation overlay regardless of mode (a page must never gain a write
-    /// path into manox just because the agent runs in Yolo). The UI resolves
+    /// path into manox just because the agent runs in Danger). The UI resolves
     /// the prompt and calls `Thread::respond_inbound` with the decision; the
     /// host's parked oneshot — stored in `pending_inbound` — is the sink.
     InboundAuthorization {
@@ -577,10 +588,6 @@ pub struct Thread {
     /// sub-agents. Distinct from the always-allow cache so flipping modes
     /// returns to normal approval without leaving stale always-allow grants.
     approval_mode: ApprovalMode,
-    /// Reasons the auto-review approval agent attached to `Ask` verdicts, keyed
-    /// by `tool_use.id`. Drained into the auth overlay as a one-line
-    /// justification. Cleared every turn with the rest of the per-turn state.
-    approval_ask_reasons: HashMap<String, String>,
     cwd: PathBuf,
     /// The project directory the thread is bound to, chosen on the first screen.
     /// `None` means no project was chosen; tools then resolve paths against the
@@ -962,7 +969,6 @@ impl Thread {
                 tools: Arc::new(tools::main_registry(cwd.clone(), weak, agent_language)),
                 permission: Arc::new(PermissionCache::default()),
                 approval_mode: ApprovalMode::default(),
-                approval_ask_reasons: HashMap::new(),
                 cwd,
                 project: None,
                 worktree: None,
@@ -1095,7 +1101,6 @@ impl Thread {
                 tools: Arc::new(tools::main_registry(cwd.clone(), weak, agent_language)),
                 permission: Arc::new(PermissionCache::default()),
                 approval_mode: ApprovalMode::from_i64(rec.approval_mode),
-                approval_ask_reasons: HashMap::new(),
                 cwd,
                 project,
                 worktree: None,
@@ -1202,7 +1207,6 @@ impl Thread {
                 tools: Arc::new(tools_fn(weak)),
                 permission,
                 approval_mode,
-                approval_ask_reasons: HashMap::new(),
                 cwd,
                 project: None,
                 worktree: None,
@@ -2299,7 +2303,7 @@ impl Thread {
     }
 
     /// Switch approval mode. Emits [`ThreadEvent::ApprovalModeChanged`] so the
-    /// UI refreshes the chip, the popover's selected row, and (for Yolo) the
+    /// UI refreshes the chip, the popover's selected row, and (for Danger) the
     /// seatbelt branch in the next tool call. No-op when the mode is unchanged.
     pub fn set_approval_mode(&mut self, mode: ApprovalMode, cx: &mut Context<Self>) {
         if self.approval_mode == mode {
@@ -2355,13 +2359,6 @@ impl Thread {
             crate::background_task::ensure_thread_mailbox(&self.id.0).notify_one();
         }
         cx.notify();
-    }
-
-    /// Take a reason the auto-review agent attached to an `Ask` verdict,
-    /// removing it so a follow-up call with the same id is empty. Used by the
-    /// auth overlay to render the justification under the tool title.
-    pub fn take_approval_ask_reason(&mut self, id: &str) -> Option<String> {
-        self.approval_ask_reasons.remove(id)
     }
 
     pub fn model(&self) -> Option<&AnyLanguageModel> {
@@ -3859,14 +3856,14 @@ impl Thread {
                 }
             })?;
 
-            // Categorize tool_uses into free / approval / auto-review queues.
-            // The auto-review queue is settled in a second pass below — we
-            // need a model handle and the cancel token, so it cannot be
+            // Categorize tool_uses into free / interactive / autopilot-review
+            // queues. The autopilot queue is settled in a second pass below —
+            // we need a model handle and the cancel token, so it cannot be
             // decided inside the borrow of `this`.
             let (
                 tool_uses,
                 mut free_tus,
-                mut approval_tus,
+                approval_tus,
                 auto_review_tus,
                 model,
                 cancel_for_review,
@@ -3878,11 +3875,6 @@ impl Thread {
                 let mut appr = Vec::new();
                 let mut review = Vec::new();
                 for tu in &tool_uses {
-                    // YOLO/AutoReview bypass the permission gate, but not tools
-                    // whose authorization flow IS their execution
-                    // (AskUserQuestion): bypassing those would drop the user's
-                    // input and hit an unreachable `run`. AutoReview also
-                    // consults the security-reviewer agent before allowing.
                     let tool = this.tools.get(tu.name.as_ref());
                     let requires_approval = tool
                         .map(|t| t.requires_approval(&tu.input))
@@ -3894,27 +3886,17 @@ impl Thread {
                         .unwrap_or(true);
                     let always_allowed =
                         always_allowable && this.permission.is_always_allowed(tu.name.as_ref());
-                    let bypassed = matches!(
-                        this.approval_mode,
-                        ApprovalMode::Yolo | ApprovalMode::AutoReview
-                    ) && !requires_user_input;
 
                     if (!requires_approval || always_allowed) && !requires_user_input {
                         free.push(tu.clone());
-                    } else if bypassed && this.approval_mode == ApprovalMode::Yolo {
-                        // Yolo short-circuits; AutoReview must consult the
-                        // reviewer below.
-                        free.push(tu.clone());
-                    } else if bypassed {
-                        review.push(tu.clone());
-                    } else {
+                    } else if requires_user_input {
                         appr.push(tu.clone());
+                    } else if this.approval_mode == ApprovalMode::Danger {
+                        free.push(tu.clone());
+                    } else {
+                        review.push(tu.clone());
                     }
                 }
-                // Reset per-turn ask-reason map so a previous turn's
-                // reasons never bleed into the current one if a tool id
-                // collides across turns.
-                this.approval_ask_reasons.clear();
                 let model = this.model.clone();
                 let cancel = this
                     .turn_cancel
@@ -4139,27 +4121,53 @@ impl Thread {
                 }
             }
 
-            // AutoReview: ask the security-reviewer agent for each pending call.
-            // Allow verdicts flow into `free_tus`; Ask verdicts flow into
-            // `approval_tus` with a one-line reason surfaced in the overlay.
-            // When the side-call policy disables the reviewer, all
-            // auto-review calls fall through to user approval.
+            // AutoPilot: ask the safety reviewer for each pending call.
+            // Allow verdicts flow into `free_tus`; Ask verdicts deny the
+            // call and return the reason to the model. An
+            // `ApprovalDecision` event is emitted for the MessageList
+            // record. When the side-call policy disables the reviewer, all
+            // calls are denied (fail-closed).
             if !auto_review_tus.is_empty() {
                 let review_enabled = crate::settings::side_calls().approval_policy().enabled;
+                let wk_root = this
+                    .read_with(cx, |this, _| this.worktree.as_ref().map(|w| w.path.clone()))?
+                    .unwrap_or_default();
                 match model.as_ref() {
                     None => {
-                        approval_tus.extend(auto_review_tus);
+                        for tu in auto_review_tus {
+                            let title = tool_title(&tu.name, &tu.input, Some(&wk_root));
+                            let reason = "no model configured for the safety reviewer".to_string();
+                            let verdict = crate::approval::ReviewVerdict::Ask {
+                                reason: reason.clone(),
+                            };
+                            let _ = this.update(cx, |_, cx| {
+                                cx.emit(ThreadEvent::ApprovalDecision {
+                                    tool_name: tu.name.to_string(),
+                                    tool_title: title.clone(),
+                                    verdict: verdict.clone(),
+                                });
+                            });
+                            Self::deny_autopilot_tool(this, &tu, &title, &reason, lang, cx)?;
+                        }
                     }
                     Some(_) if !review_enabled => {
-                        // Reviewer disabled — fall through to user approval.
-                        approval_tus.extend(auto_review_tus);
+                        for tu in auto_review_tus {
+                            let title = tool_title(&tu.name, &tu.input, Some(&wk_root));
+                            let reason = "safety reviewer is disabled in settings".to_string();
+                            let verdict = crate::approval::ReviewVerdict::Ask {
+                                reason: reason.clone(),
+                            };
+                            let _ = this.update(cx, |_, cx| {
+                                cx.emit(ThreadEvent::ApprovalDecision {
+                                    tool_name: tu.name.to_string(),
+                                    tool_title: title.clone(),
+                                    verdict: verdict.clone(),
+                                });
+                            });
+                            Self::deny_autopilot_tool(this, &tu, &title, &reason, lang, cx)?;
+                        }
                     }
                     Some(model) => {
-                        let wk_root = this
-                            .read_with(cx, |this, _| {
-                                this.worktree.as_ref().map(|w| w.path.clone())
-                            })?
-                            .unwrap_or_default();
                         let review_items: Vec<crate::approval::ReviewItem> = auto_review_tus
                             .iter()
                             .map(|tu| crate::approval::ReviewItem {
@@ -4192,22 +4200,34 @@ impl Thread {
                         let verdicts = review.verdicts;
                         for tu in auto_review_tus {
                             if cancel_for_review.is_cancelled() {
-                                approval_tus.push(tu);
                                 continue;
                             }
+                            let title = tool_title(&tu.name, &tu.input, Some(&wk_root));
                             let verdict = verdicts.get(&tu.id).cloned().unwrap_or(
                                 crate::approval::ReviewVerdict::Ask {
-                                    reason: "auto-review verdict missing; please confirm".into(),
+                                    reason: "reviewer verdict missing".into(),
                                 },
                             );
-                            match verdict {
-                                crate::approval::ReviewVerdict::Allow => free_tus.push(tu),
-                                crate::approval::ReviewVerdict::Ask { reason } => {
-                                    let id = tu.id.clone();
-                                    let _ = this.update(cx, |this, _cx| {
-                                        this.approval_ask_reasons.insert(id, reason);
+                            match &verdict {
+                                crate::approval::ReviewVerdict::Allow => {
+                                    let _ = this.update(cx, |_, cx| {
+                                        cx.emit(ThreadEvent::ApprovalDecision {
+                                            tool_name: tu.name.to_string(),
+                                            tool_title: title,
+                                            verdict: verdict.clone(),
+                                        });
                                     });
-                                    approval_tus.push(tu);
+                                    free_tus.push(tu);
+                                }
+                                crate::approval::ReviewVerdict::Ask { reason } => {
+                                    let _ = this.update(cx, |_, cx| {
+                                        cx.emit(ThreadEvent::ApprovalDecision {
+                                            tool_name: tu.name.to_string(),
+                                            tool_title: title.clone(),
+                                            verdict: verdict.clone(),
+                                        });
+                                    });
+                                    Self::deny_autopilot_tool(this, &tu, &title, reason, lang, cx)?;
                                 }
                             }
                         }
@@ -4215,11 +4235,11 @@ impl Thread {
                 }
             }
 
-            // Approval-free tools run in parallel; approval-needed tools run
-            // serially so the single-slot UI auth overlay never holds two
-            // pending prompts at once (the second would overwrite the first and
-            // strand the first tool's `oneshot` forever). gpui `Task`s are
-            // `!Send`, so concurrency is "spawn all, then await in order".
+            // Free tools run in parallel; interactive tools (AskUserQuestion)
+            // run serially so the single-slot question card never holds two
+            // pending prompts at once (the second would overwrite the first
+            // and strand the first tool's `oneshot` forever). gpui `Task`s
+            // are `!Send`, so concurrency is "spawn all, then await in order".
             let free_tasks: Vec<Task<Result<()>>> = this.update(cx, |_this, cx| {
                 free_tus
                     .iter()
@@ -4250,12 +4270,12 @@ impl Thread {
                 }
             }
 
-            // Approval-needed tools run one at a time; a cancelled turn or a
-            // sibling error skips the rest (they are synthesized below).
-            // Fail-fast on a sibling error mirrors the pre-parallel serial
-            // loop: an infrastructure error aborts the turn rather than
-            // continuing to prompt the user for tools that may be running in
-            // a half-broken state.
+            // Interactive tools (AskUserQuestion) run one at a time; a
+            // cancelled turn or a sibling error skips the rest (they are
+            // synthesized below). Fail-fast on a sibling error mirrors the
+            // pre-parallel serial loop: an infrastructure error aborts the
+            // turn rather than continuing to prompt the user for tools that
+            // may be running in a half-broken state.
             for tu in approval_tus {
                 if cancel.is_cancelled() || first_err.is_some() {
                     break;
@@ -4364,7 +4384,6 @@ impl Thread {
         let (request_tx, request_rx) = async_channel::bounded(crate::tools::code::MAX_CONCURRENCY);
         let done = crate::tools::code::spawn_script(script, request_tx, cancel.clone());
         let mut active = futures::stream::FuturesUnordered::new();
-        let approval_gate = Arc::new(tokio::sync::Mutex::new(()));
         let mut outcome: Option<Result<crate::tools::code::ScriptOutcome, String>> = None;
         let mut audit = Vec::new();
 
@@ -4377,7 +4396,6 @@ impl Thread {
                 let audit_name = request.tool_name.clone();
                 let audit_input = request.input.clone();
                 let nested_cancel = cancel.clone();
-                let nested_approval_gate = approval_gate.clone();
                 let task = this.update(cx, |_, cx| {
                     cx.spawn(async move |this, cx: &mut AsyncApp| {
                         let response = Self::run_code_nested(
@@ -4386,7 +4404,6 @@ impl Thread {
                             request.tool_name,
                             request.input,
                             nested_cancel,
-                            nested_approval_gate,
                             cx,
                         )
                         .await;
@@ -4419,7 +4436,6 @@ impl Thread {
                         let audit_name = request.tool_name.clone();
                         let audit_input = request.input.clone();
                         let nested_cancel = cancel.clone();
-                        let nested_approval_gate = approval_gate.clone();
                         let task = this.update(cx, |_, cx| {
                             cx.spawn(async move |this, cx: &mut AsyncApp| {
                                 let response = Self::run_code_nested(
@@ -4428,9 +4444,9 @@ impl Thread {
                                     request.tool_name,
                                     request.input,
                                     nested_cancel,
-                                    nested_approval_gate,
                                     cx,
-                                ).await;
+                                )
+                                .await;
                                 let _ = request.response.send(response.clone());
                                 crate::tools::code::AuditEntry {
                                     sequence: request.sequence,
@@ -4482,7 +4498,6 @@ impl Thread {
         name: String,
         input: serde_json::Value,
         cancel: CancellationToken,
-        approval_gate: Arc<tokio::sync::Mutex<()>>,
         cx: &mut AsyncApp,
     ) -> crate::tools::code::NestedResponse {
         let fail = |output: String| crate::tools::code::NestedResponse {
@@ -4496,8 +4511,8 @@ impl Thread {
         if !crate::tools::code::ALLOWED_TOOLS.contains(&name.as_str()) {
             return fail(format!("tool not allowed in Code: {name}"));
         }
-        let (tool, lang, approval_mode, always_allowed, model, wk_root) = match this
-            .read_with(cx, |thread, _| {
+        let (tool, lang, approval_mode, always_allowed, model, wk_root) =
+            match this.read_with(cx, |thread, _| {
                 (
                     thread.tools.get(&name).cloned(),
                     thread.agent_language,
@@ -4507,19 +4522,18 @@ impl Thread {
                     thread.worktree.as_ref().map(|w| w.path.clone()),
                 )
             }) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return fail(format!("thread unavailable: {error}")),
-        };
+                Ok(snapshot) => snapshot,
+                Err(error) => return fail(format!("thread unavailable: {error}")),
+            };
         let Some(tool) = tool else {
             return fail(format!("Unknown tool: {name}"));
         };
 
         let title = tool_title(&name, &input, wk_root.as_deref());
         let mut needs_approval = tool.requires_approval(&input)
-            && approval_mode != ApprovalMode::Yolo
+            && approval_mode == ApprovalMode::AutoPilot
             && !always_allowed;
         if needs_approval
-            && approval_mode == ApprovalMode::AutoReview
             && crate::settings::side_calls().approval_policy().enabled
             && let Some(model) = model.as_ref()
         {
@@ -4546,63 +4560,25 @@ impl Thread {
                     cx,
                 );
             });
+            let _ = this.update(cx, |_, cx| {
+                cx.emit(ThreadEvent::ApprovalDecision {
+                    tool_name: name.clone(),
+                    tool_title: title.clone(),
+                    verdict: review.verdict.clone(),
+                });
+            });
             match review.verdict {
                 crate::approval::ReviewVerdict::Allow => needs_approval = false,
                 crate::approval::ReviewVerdict::Ask { reason } => {
-                    let _ = this.update(cx, |thread, _| {
-                        thread.approval_ask_reasons.insert(id.clone(), reason);
-                    });
+                    return fail(format!(
+                        "The safety reviewer denied this tool call: {reason}"
+                    ));
                 }
             }
         }
-
         if needs_approval {
-            // Promise.all may execute many safe reads concurrently, but the UI
-            // has a single authorization overlay. Serialize only the prompts,
-            // not the native tool executions themselves.
-            let _approval_guard = approval_gate.lock().await;
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let registered = this.update(cx, |thread, cx| {
-                thread.pending_authorizations.insert(id.clone(), tx);
-                thread.pending_auth_meta.insert(
-                    id.clone(),
-                    PendingAuthMeta {
-                        tool_name: name.clone(),
-                        summary: title.clone(),
-                        input: input.clone(),
-                    },
-                );
-                cx.emit(ThreadEvent::ToolCallAuthorization {
-                    id: id.clone(),
-                    tool_name: name.clone(),
-                    summary: title.clone(),
-                    input: input.clone(),
-                });
-            });
-            if let Err(error) = registered {
-                return fail(format!("approval unavailable: {error}"));
-            }
-            let response = tokio::select! {
-                response = rx => response.unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
-                _ = cancel.cancelled() => ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
-            };
-            let _ = this.update(cx, |thread, _| {
-                thread.pending_authorizations.remove(&id);
-                thread.pending_auth_meta.remove(&id);
-            });
-            match response {
-                ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {
-                    return fail("User denied this nested tool call".into());
-                }
-                ToolAuthorizationResponse::Decision(PermissionDecision::AlwaysAllow) => {
-                    let _ =
-                        this.read_with(cx, |thread, _| thread.permission.set_always_allowed(&name));
-                }
-                ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {}
-                ToolAuthorizationResponse::AskUserQuestion { .. } => {
-                    return fail("interactive tools are not allowed inside Code".into());
-                }
-            }
+            // Reviewer disabled or no model: deny (fail-closed).
+            return fail("The safety reviewer is unavailable; tool call denied.".into());
         }
 
         let emitted = this.update(cx, |_, cx| {
@@ -4675,7 +4651,7 @@ impl Thread {
     /// Interactive tools (`requires_user_input`, today only `AskUserQuestion`)
     /// produce their result from the user's response instead of `run`. They
     /// are read-only by contract and bypass the entire permission pipeline —
-    /// approval modes, the AutoReview side call, and the always-allow cache
+    /// approval modes, the AutoPilot side call, and the always-allow cache
     /// must never gate or swallow a question to the user. Emits the same
     /// `ToolCallAuthorization` event the UI's question card listens for, then
     /// parks on the response oneshot. Serialized by the caller (interactive
@@ -4810,90 +4786,27 @@ impl Thread {
             return Self::run_interactive_tool_inner(this, tu, cancel, cx).await;
         }
 
-        // YOLO/AutoReview bypasses the permission gate: skip the authorization
-        // prompt entirely so the tool runs immediately. YOLO is the
-        // session-level "never ask" policy;
-        // AutoReview additionally consults the security-reviewer agent before
-        // allowing. Tools whose authorization flow IS their execution
-        // (`AskUserQuestion`) are exempt: bypassing them would drop the user's
-        // input and hit an unreachable `run`.
-        let requires_user_input = tool.requires_user_input();
+        // Approval gate: interactive tools (AskUserQuestion) are dispatched
+        // to `run_interactive_tool_inner` above. Regular approval-required
+        // tools are either in the free batch (Danger mode or always-allowed)
+        // or were already vetted by the safety reviewer in the AutoPilot
+        // branch of `run_turn_loop` — a `needs_approval` tool reaching here
+        // is an unexpected fallback. Deny it rather than running unsandboxed
+        // code the user never saw.
         let needs_approval = tool.requires_approval(&tu.input)
             && !this.read_with(cx, |this, _| {
-                // is_always_allowable gates the AlwaysAllow cache: tools
-                // whose every call needs fresh user input (e.g.
-                // AskUserQuestion) must not be eligible for a name-keyed
-                // permission cache entry.
                 let always_allowable = tool.is_always_allowable(&tu.input);
-                (matches!(
-                    this.approval_mode,
-                    ApprovalMode::Yolo | ApprovalMode::AutoReview
-                ) && !requires_user_input)
-                    || (always_allowable && this.permission.is_always_allowed(&name))
+                always_allowable && this.permission.is_always_allowed(&name)
             })?;
         if needs_approval {
-            this.update(cx, |_, cx| {
-                cx.emit(ThreadEvent::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    title: title.clone(),
-                    status: ToolCallStatus::PendingApproval,
-                    input: Some(tu.input.clone()),
-                });
-            })?;
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            this.update(cx, |this, _cx| {
-                this.pending_authorizations.insert(id.clone(), tx);
-                this.pending_auth_meta.insert(
-                    id.clone(),
-                    PendingAuthMeta {
-                        tool_name: name.clone(),
-                        summary: title.clone(),
-                        input: tu.input.clone(),
-                    },
-                );
-            })?;
-            this.update(cx, |_, cx| {
-                cx.emit(ThreadEvent::ToolCallAuthorization {
-                    id: id.clone(),
-                    tool_name: name.clone(),
-                    summary: title.clone(),
-                    input: tu.input.clone(),
-                });
-            })?;
-
-            let response = tokio::select! {
-                r = rx => r.unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
-                _ = cancel.cancelled() => ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
-            };
-            // The pending responder is spent whether the UI answered or cancel
-            // fired; remove it so a late `respond_authorization` cannot revive a
-            // cancelled turn.
-            this.update(cx, |this, _cx| {
-                this.pending_authorizations.remove(&id);
-                this.pending_auth_meta.remove(&id);
-            })?;
-            match response {
-                ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => {
-                    let msg = crate::prompt::render_static(
-                        crate::prompt::PromptTemplate::WrapperToolDenied,
-                        lang,
-                    )
-                    .expect("tool denied render");
-                    Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
-                    Self::append_tool_result(&this, tu, msg, true, cx)?;
-                    return Ok(());
-                }
-                ToolAuthorizationResponse::Decision(PermissionDecision::AlwaysAllow) => {
-                    this.read_with(cx, |this, _| this.permission.set_always_allowed(&name))?;
-                }
-                ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {}
-                // Interactive tools never reach this path (dispatched to
-                // `run_interactive_tool_inner` above), and no regular tool's
-                // response carries answers — the variant is unmatchable here.
-                ToolAuthorizationResponse::AskUserQuestion { .. } => {}
-            }
+            let msg = crate::prompt::render_static(
+                crate::prompt::PromptTemplate::WrapperToolDenied,
+                lang,
+            )
+            .expect("tool denied render");
+            Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
+            Self::append_tool_result(&this, tu, msg, true, cx)?;
+            return Ok(());
         }
 
         this.update(cx, |_, cx| {
@@ -5102,6 +5015,40 @@ impl Thread {
         })?;
         Self::emit_tool_result(this, &id, &name, &title, &msg, true, cx)?;
         Self::append_tool_result(this, tu, msg, true, cx)?;
+        Ok(())
+    }
+
+    /// Synthesize a denied `ToolResult` for a tool the autopilot safety
+    /// reviewer refused to run. The reviewer's `reason` is returned to the
+    /// model so it can adjust its approach, and the ToolCall card shows
+    /// `Denied` status.
+    fn deny_autopilot_tool(
+        this: &gpui::WeakEntity<Self>,
+        tu: &LanguageModelToolUse,
+        title: &str,
+        reason: &str,
+        lang: crate::language::Language,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let id = tu.id.clone();
+        let name = tu.name.to_string();
+        let msg = format!(
+            "{}\n\n{}",
+            crate::prompt::render_static(crate::prompt::PromptTemplate::WrapperToolDenied, lang)
+                .unwrap_or_default(),
+            reason
+        );
+        this.update(cx, |_, cx| {
+            cx.emit(ThreadEvent::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title: title.to_string(),
+                status: ToolCallStatus::Denied,
+                input: Some(tu.input.clone()),
+            });
+        })?;
+        Self::emit_tool_result(this, &id, &name, title, &msg, true, cx)?;
+        Self::append_tool_result(this, tu.clone(), msg, true, cx)?;
         Ok(())
     }
 
@@ -6366,6 +6313,27 @@ mod tests {
     static THREAD_STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn approval_mode_i64_round_trip() {
+        // A persisted value must survive a write→reload cycle: a Danger
+        // thread that silently reverts to AutoPilot on reload would
+        // re-sandbox bash without the user's consent.
+        for mode in [super::ApprovalMode::AutoPilot, super::ApprovalMode::Danger] {
+            assert_eq!(super::ApprovalMode::from_i64(mode.as_i64()), mode);
+        }
+        // Legacy Yolo (2) maps to Danger so old databases reload unsandboxed
+        // rather than silently downgrading.
+        assert_eq!(
+            super::ApprovalMode::from_i64(2),
+            super::ApprovalMode::Danger
+        );
+        // Unknown values fall back to AutoPilot — never silently escalate.
+        assert_eq!(
+            super::ApprovalMode::from_i64(99),
+            super::ApprovalMode::AutoPilot
+        );
+    }
+
+    #[test]
     fn edit_file_title_extracts_path_not_tag() {
         // The `[PATH#TAG]` header must surface the path, not the 4-hex tag.
         let input = json!({ "patch": "[src/main.rs#1A2B]\nSWAP 5.=5:\n+X" });
@@ -6793,7 +6761,9 @@ mod tests {
     }
 
     #[test]
-    fn code_nested_write_waits_for_and_honors_approval() {
+    fn code_nested_write_denied_without_model() {
+        // AutoPilot with no model: the safety reviewer is unavailable, so
+        // a write inside Code is denied (fail-closed) — no overlay.
         use std::sync::{Arc, Mutex};
         use tokio_util::sync::CancellationToken;
 
@@ -6818,7 +6788,6 @@ mod tests {
                     crate::tools::WRITE.into(),
                     serde_json::json!({"path":"blocked.txt","content":"no"}),
                     CancellationToken::new(),
-                    Arc::new(tokio::sync::Mutex::new(())),
                     &mut cx,
                 )
                 .await;
@@ -6827,21 +6796,15 @@ mod tests {
         })
         .detach();
         cx.run_until_parked();
-        assert!(result.lock().unwrap().is_none(), "write bypassed approval");
-        cx.update(|cx| {
-            thread.update(cx, |thread, cx| {
-                assert!(thread.pending_authorizations.contains_key("code/approval"));
-                thread.respond_authorization(
-                    "code/approval",
-                    super::ToolAuthorizationResponse::Decision(super::PermissionDecision::Deny),
-                    cx,
-                );
-            });
-        });
-        cx.run_until_parked();
+        // No model — the reviewer is unavailable, so the call is denied
+        // immediately (fail-closed) rather than parking on an overlay.
         let response = result.lock().unwrap().take().expect("nested response");
         assert!(!response.ok);
-        assert!(response.output.contains("User denied"));
+        assert!(
+            response.output.contains("safety reviewer is unavailable"),
+            "expected fail-closed denial, got: {}",
+            response.output
+        );
     }
 
     /// Interactive tools (`requires_user_input`) resolve through their own
@@ -6863,12 +6826,12 @@ mod tests {
             )
         });
         // Simulate the pre-fix poisoned state: a leftover always-allow grant
-        // and YOLO mode. Neither may skip the question card.
+        // and Danger mode. Neither may skip the question card.
         cx.update(|cx| {
             thread.update(cx, |t, cx| {
                 t.permission
                     .set_always_allowed(crate::tools::ASK_USER_QUESTION);
-                t.set_approval_mode(super::ApprovalMode::Yolo, cx);
+                t.set_approval_mode(super::ApprovalMode::Danger, cx);
             });
         });
 
@@ -6914,7 +6877,7 @@ mod tests {
         .detach();
         cx.run_until_parked();
 
-        // The authorization event fired even with a poisoned cache + YOLO.
+        // The authorization event fired even with a poisoned cache + Danger.
         assert_eq!(
             auths.lock().unwrap().as_slice(),
             &[(
@@ -7530,16 +7493,16 @@ mod tests {
         );
     }
 
-    /// Regression guard for the YOLO + `AskUserQuestion` interaction.
+    /// Regression guard for the Danger + `AskUserQuestion` interaction.
     /// `AskUserQuestion`'s `run` body is unreachable — its result is built
-    /// from the `ToolAuthorizationResponse` at the authorization gate. YOLO
+    /// from the `ToolAuthorizationResponse` at the authorization gate. Danger
     /// bypasses *permission* gates, but must not bypass this tool, or the
     /// model would hit the unreachable `run` and get an error string instead
-    /// of the user's answers. Under the fix, YOLO + `AskUserQuestion` still
+    /// of the user's answers. Under the fix, Danger + `AskUserQuestion` still
     /// enters the gate; a cancelled turn resolves the gate to `Deny`, so the
     /// tool result is the user-refusal message — not the `run`-body error.
     #[test]
-    fn run_tool_inner_yolo_ask_user_question_hits_gate_not_run() {
+    fn run_tool_inner_danger_ask_user_question_hits_gate_not_run() {
         use crate::language_model::{LanguageModelToolResult, LanguageModelToolUse};
         use std::sync::{Arc, Mutex};
         use tokio_util::sync::CancellationToken;
@@ -7549,8 +7512,8 @@ mod tests {
         let cx = gpui::TestAppContext::single();
         let thread = cx.update(|cx| {
             let mut rec =
-                crate::db::ThreadRecord::for_test("reg-yolo-ask-user", "/tmp", Vec::new());
-            rec.approval_mode = crate::thread::ApprovalMode::Yolo.as_i64();
+                crate::db::ThreadRecord::for_test("reg-danger-ask-user", "/tmp", Vec::new());
+            rec.approval_mode = crate::thread::ApprovalMode::Danger.as_i64();
             super::Thread::restore(rec, None, cx)
         });
         let tu = LanguageModelToolUse {
@@ -7592,12 +7555,12 @@ mod tests {
         };
         assert!(
             content.contains("User denied execution"),
-            "YOLO + AskUserQuestion should hit the authorization gate (Deny on cancel), \
+            "Danger + AskUserQuestion should hit the authorization gate (Deny on cancel), \
              got: {content}"
         );
         assert!(
             !content.contains("resolved by the UI"),
-            "YOLO must not bypass AskUserQuestion into its unreachable run body, got: {content}"
+            "Danger must not bypass AskUserQuestion into its unreachable run body, got: {content}"
         );
     }
 
@@ -9940,23 +9903,19 @@ mod tests {
                 thought_signature: None,
             })]),
             // User message with valid tool_result (has corresponding tool_use)
-            Message::user_with_content(vec![MessageContent::ToolResult(
-                LanguageModelToolResult {
-                    tool_use_id: "tool_123".into(),
-                    tool_name: Arc::from("Read"),
-                    is_error: false,
-                    content: "file content".into(),
-                },
-            )]),
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tool_123".into(),
+                tool_name: Arc::from("Read"),
+                is_error: false,
+                content: "file content".into(),
+            })]),
             // User message with orphaned tool_result (no corresponding tool_use)
-            Message::user_with_content(vec![MessageContent::ToolResult(
-                LanguageModelToolResult {
-                    tool_use_id: "tool_999".into(),
-                    tool_name: Arc::from("Bash"),
-                    is_error: false,
-                    content: "orphaned result".into(),
-                },
-            )]),
+            Message::user_with_content(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tool_999".into(),
+                tool_name: Arc::from("Bash"),
+                is_error: false,
+                content: "orphaned result".into(),
+            })]),
         ];
 
         sanitize_message_sequence(&mut messages);
