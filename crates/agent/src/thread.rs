@@ -5716,7 +5716,7 @@ impl Thread {
         // The `cache` flag marks the trailing two user/assistant messages as
         // cache-anchor candidates. It is advisory metadata today — the actual
         // `cache_control` breakpoints are placed by `apply_prompt_caching`
-        // against messages[-2]/messages[-1] — but keeping the flag aligned with
+        // against messages[-2] only — but keeping the flag aligned with
         // that intent documents the contract for a future wire mapper that
         // reads it.
         let len = mapped.len();
