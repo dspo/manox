@@ -453,6 +453,10 @@ fn sanitize_message_sequence(messages: &mut Vec<Message>) {
         // For user messages with tool_results, filter out orphaned ones
         if msg.role == Role::User {
             let original_len = msg.content.len();
+            // Track seen tool_use_ids within this message so duplicates
+            // (same id, multiple tool_result blocks) are removed. Duplicates
+            // cause API 400 errors ("each tool_use must have a single result").
+            let mut seen_tool_result_ids: HashSet<String> = HashSet::new();
             let mut has_tool_result = false;
             let mut has_valid_tool_result = false;
 
@@ -460,18 +464,25 @@ fn sanitize_message_sequence(messages: &mut Vec<Message>) {
                 match content {
                     MessageContent::ToolResult(tool_result) => {
                         has_tool_result = true;
-                        // Only keep tool_results that have a corresponding tool_use
-                        if tool_use_ids.contains(&tool_result.tool_use_id) {
-                            has_valid_tool_result = true;
-                            true
-                        } else {
-                            // Orphaned tool_result, remove it
+                        // Remove orphaned tool_results (no matching tool_use)
+                        if !tool_use_ids.contains(&tool_result.tool_use_id) {
                             tracing::warn!(
                                 tool_use_id = %tool_result.tool_use_id,
                                 "removing orphaned tool_result during recovery"
                             );
-                            false
+                            return false;
                         }
+                        // Remove duplicate tool_results for the same id
+                        // (keep the first, drop the rest)
+                        if !seen_tool_result_ids.insert(tool_result.tool_use_id.clone()) {
+                            tracing::warn!(
+                                tool_use_id = %tool_result.tool_use_id,
+                                "removing duplicate tool_result during recovery"
+                            );
+                            return false;
+                        }
+                        has_valid_tool_result = true;
+                        true
                     }
                     _ => true,
                 }
@@ -4236,6 +4247,11 @@ impl Thread {
             // `ApprovalDecision` event is emitted for the MessageList
             // record. When the side-call policy disables the reviewer, all
             // calls are denied (fail-closed).
+            // Track tool_use IDs that were denied during auto-review so
+            // synthesize_unrun_tool_result does not add a second tool_result
+            // for the same id (which causes a 400 from the API).
+            let mut denied_tool_use_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             if !auto_review_tus.is_empty() {
                 let review_enabled = crate::settings::side_calls().approval_policy().enabled;
                 let wk_root = this
@@ -4257,6 +4273,7 @@ impl Thread {
                                 });
                             });
                             Self::deny_tool_with_reason(this, &tu, &title, &reason, lang, cx)?;
+                            denied_tool_use_ids.insert(tu.id.clone());
                         }
                     }
                     Some(_) if !review_enabled => {
@@ -4274,6 +4291,7 @@ impl Thread {
                                 });
                             });
                             Self::deny_tool_with_reason(this, &tu, &title, &reason, lang, cx)?;
+                            denied_tool_use_ids.insert(tu.id.clone());
                         }
                     }
                     Some(model) => {
@@ -4346,6 +4364,7 @@ impl Thread {
                                     Self::deny_tool_with_reason(
                                         this, &tu, &title, &reason, lang, cx,
                                     )?;
+                                    denied_tool_use_ids.insert(tu.id.clone());
                                 }
                             }
                         }
@@ -4415,6 +4434,11 @@ impl Thread {
                     Err(_) => {}
                 }
             }
+
+            // Merge denied tool_use IDs into fulfilled so synthesize_unrun_tool_result
+            // does not add a second tool_result for tool_uses already handled by
+            // deny_tool_with_reason above.
+            fulfilled.extend(denied_tool_use_ids);
 
             // Cancel or error may have left tool_uses without a paired
             // tool_result. Anthropic requires every tool_use to have one or the
@@ -10231,6 +10255,51 @@ mod tests {
             &messages[0].content[0],
             MessageContent::Text(t) if t.as_str() == "user feedback"
         ));
+    }
+
+    #[test]
+    fn sanitize_dedupes_duplicate_tool_results_same_id() {
+        use super::sanitize_message_sequence;
+        use std::sync::Arc;
+
+        let mut messages = vec![
+            // Assistant message with tool_use
+            Message::assistant(vec![MessageContent::ToolUse(LanguageModelToolUse {
+                id: "tool_123".into(),
+                name: Arc::from("Bash"),
+                raw_input: "{}".into(),
+                input: serde_json::json!({}),
+                is_input_complete: true,
+                thought_signature: None,
+            })]),
+            // User message with duplicate tool_results for the same id
+            Message::user_with_content(vec![
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "tool_123".into(),
+                    tool_name: Arc::from("Bash"),
+                    is_error: true,
+                    content: "denied by reviewer".into(),
+                }),
+                MessageContent::ToolResult(LanguageModelToolResult {
+                    tool_use_id: "tool_123".into(),
+                    tool_name: Arc::from("Bash"),
+                    is_error: true,
+                    content: "Tool not executed (session cancelled)".into(),
+                }),
+            ]),
+        ];
+
+        sanitize_message_sequence(&mut messages);
+
+        // Should keep only the first tool_result for tool_123
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content.len(), 1);
+        let tr = match &messages[1].content[0] {
+            MessageContent::ToolResult(tr) => tr,
+            _ => panic!("expected tool_result"),
+        };
+        assert_eq!(tr.tool_use_id, "tool_123");
+        assert_eq!(tr.content, "denied by reviewer");
     }
 
     /// Extract the first tool_result in history, for assertions on the
