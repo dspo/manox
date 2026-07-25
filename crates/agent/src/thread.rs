@@ -1698,6 +1698,11 @@ impl Thread {
         self.running_turn = t;
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_gate_for_test(&mut self, gate: Arc<dyn crate::turn_ext::ToolGate>) {
+        self.extensions.gates.push(gate);
+    }
+
     /// Seed the approved plan as a user message (exiting Plan mode) without
     /// starting a turn. The `<proposed_plan>` block was never persisted into
     /// the assistant message, so the model needs the plan text re-injected to
@@ -4913,14 +4918,34 @@ impl Thread {
             return Self::run_interactive_tool_inner(this, tu, cancel, cx).await;
         }
 
-        // Approval gate: interactive tools (AskUserQuestion) are dispatched
-        // to `run_interactive_tool_inner` above. Regular approval-required
-        // tools reach here only when Danger bypassed the gate, an always-allow
-        // grant covers them, or the AutoPilot reviewer already allowed them in
-        // `run_turn_loop`. Anything else is an unexpected fallback: deny it
-        // rather than running unsandboxed code the user never saw, and say so
-        // in the result so the model stops retrying instead of looping.
-        let needs_approval = tool.requires_approval(&tu.input)
+        // Static tool gates run first: a `Deny` blocks the call outright with
+        // the gate's reason, an `Allow` waives the fallback gate below (a
+        // trusted static policy vouched for the call), and `Defer` (the empty-
+        // registry default) falls through to the core's turn-local approval
+        // path — so with no gates registered this is a no-op. Gates encode only
+        // static rules; they never see the reviewer / always-allow / Danger
+        // state, which the fallback gate owns.
+        let gate_verdict = this.read_with(cx, |this, _| {
+            this.extensions.gate(&tu, tool.as_ref(), &this.turn_ctx())
+        })?;
+        let gate_allowed = match gate_verdict {
+            crate::turn_ext::ToolDecision::Deny { reason } => {
+                Self::deny_tool_with_reason(&this, &tu, &title, &reason, lang, cx)?;
+                return Ok(());
+            }
+            crate::turn_ext::ToolDecision::Allow => true,
+            crate::turn_ext::ToolDecision::Defer => false,
+        };
+
+        // Fallback approval gate: regular approval-required tools reach here
+        // only when a gate allowed them, Danger bypassed the gate, an
+        // always-allow grant covers them, or the AutoPilot reviewer already
+        // allowed them in `run_turn_loop`. Anything else is an unexpected
+        // fallback: deny it rather than running unsandboxed code the user never
+        // saw, and say so in the result so the model stops retrying instead of
+        // looping.
+        let needs_approval = !gate_allowed
+            && tool.requires_approval(&tu.input)
             && !this.read_with(cx, |this, _| {
                 let always_allowable = tool.is_always_allowable(&tu.input);
                 this.approval_mode == ApprovalMode::Danger
@@ -10540,6 +10565,92 @@ mod tests {
             );
         });
         let _ = std::fs::remove_file("/tmp/manox-reviewer-allow-test.txt");
+    }
+
+    /// A registered `ToolGate` runs before the fallback gate: a `Deny` blocks a
+    /// call that the core would otherwise let through (here a reviewer-allowed
+    /// Write), and the gate's own reason rides the error tool_result. Proves the
+    /// gate seam is consulted, ordered ahead of the turn-local approval path,
+    /// and that `Deny` short-circuits execution.
+    #[test]
+    fn tool_gate_deny_blocks_reviewer_allowed_call() {
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        struct DenyWrite;
+        impl crate::turn_ext::ToolGate for DenyWrite {
+            fn decide(
+                &self,
+                tu: &LanguageModelToolUse,
+                _tool: &dyn crate::tool::AgentTool,
+                _ctx: &crate::turn_ext::TurnCtx,
+            ) -> crate::turn_ext::ToolDecision {
+                if tu.name.as_ref() == crate::tools::WRITE {
+                    crate::turn_ext::ToolDecision::Deny {
+                        reason: "GATE_DENIED_MARKER".to_string(),
+                    }
+                } else {
+                    crate::turn_ext::ToolDecision::Defer
+                }
+            }
+        }
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("gate-deny", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        // Reviewer already vetted the call AND register a Deny gate: the gate
+        // must win, proving it runs ahead of the fallback path.
+        cx.update(|cx| {
+            thread.update(cx, |t, _| {
+                t.reviewer_allowed.insert("tu_gated".to_string());
+                t.register_gate_for_test(Arc::new(DenyWrite));
+            });
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_gated".into(),
+            name: crate::tools::WRITE.into(),
+            raw_input: String::new(),
+            input: json!({"path": "/tmp/manox-gate-deny-test.txt", "content": "blocked"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let weak = thread.downgrade();
+        let slot: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *s.lock().unwrap() = Some(
+                    super::Thread::run_tool_inner(weak, tu, CancellationToken::new(), &mut cx)
+                        .await,
+                );
+            }
+        })
+        .detach();
+        let res = await_run_tool_inner(&cx, &slot);
+        assert!(res.is_ok(), "run_tool_inner failed: {:?}", res.err());
+
+        cx.update(|cx| {
+            let result = first_tool_result(thread.read(cx)).expect("tool result appended");
+            assert!(result.is_error, "gate Deny must produce an error result");
+            assert!(
+                result.content.contains("GATE_DENIED_MARKER"),
+                "denied result must carry the gate's reason, got: {}",
+                result.content
+            );
+        });
+        assert!(
+            !std::path::Path::new("/tmp/manox-gate-deny-test.txt").exists(),
+            "gate Deny must prevent the Write from executing"
+        );
     }
 
     /// End-to-end for thread dfdb0880's failure shape: AutoPilot, reviewer
