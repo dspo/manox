@@ -860,6 +860,12 @@ pub struct Thread {
     /// prefix or prompt-cache hits. Reload splices these back into the
     /// conversation at the end of their owning turn.
     ui_notes: Vec<crate::db::UiNoteRecord>,
+    /// In-process turn extensions: fixed-slot context injectors, the compaction
+    /// policy, and tool gates. Decouples cross-cutting concerns from the core
+    /// loop. `build_completion_request` routes its fixed slot through the
+    /// injectors; the gate and compaction hooks are registered but not yet
+    /// consulted (later PRs). See [`crate::turn_ext`].
+    extensions: crate::turn_ext::TurnExtensions,
 }
 
 /// A forwarded authorization request from a sub-agent: which child thread holds
@@ -1068,6 +1074,7 @@ impl Thread {
                 persist_revision: AtomicU64::new(0),
                 background_tasks: Vec::new(),
                 ui_notes: Vec::new(),
+                extensions: crate::turn_ext::main_extensions(),
             }
         })
     }
@@ -1213,6 +1220,7 @@ impl Thread {
                 persist_revision: AtomicU64::new(rec.revision),
                 background_tasks,
                 ui_notes: Vec::new(),
+                extensions: crate::turn_ext::main_extensions(),
             }
         })
     }
@@ -1314,6 +1322,7 @@ impl Thread {
                 persist_revision: AtomicU64::new(0),
                 background_tasks: Vec::new(),
                 ui_notes: Vec::new(),
+                extensions: crate::turn_ext::child_extensions(),
             }
         })
     }
@@ -5616,6 +5625,20 @@ impl Thread {
         cx.notify();
     }
 
+    /// Read-only snapshot of turn state for the extension hooks, so they never
+    /// re-enter the `Thread` entity. See [`crate::turn_ext::TurnCtx`].
+    fn turn_ctx(&self) -> crate::turn_ext::TurnCtx<'_> {
+        crate::turn_ext::TurnCtx {
+            messages: &self.messages,
+            approval_mode: self.approval_mode,
+            depth: self.depth,
+            cwd: &self.cwd,
+            agent_language: self.agent_language,
+            turn_count: self.turn_count,
+            instructions_enabled: self.instructions_enabled,
+        }
+    }
+
     /// Map `messages` into a `LanguageModelRequest` (including tool definitions).
     /// A sub-agent's system prompt, when set, is prepended as a `System` message;
     /// the Anthropic wire mapper lifts `System` messages into the top-level
@@ -5697,47 +5720,17 @@ impl Thread {
             content: vec![MessageContent::Text(system)],
             cache: true,
         });
-        // Multi-level CLAUDE.md instructions ride as a per-request user
-        // message in the fixed slot right after the system head — the same
-        // contract as the `<collaboration_mode>` block below: never written
-        // into `self.messages`, byte-stable while the files on disk are
-        // unchanged, so the prefix cache treats it as part of the system
-        // head. An empty load set omits the message entirely, keeping the
-        // prefix byte-identical to a session with no instruction files.
-        if self.instructions_enabled
-            && let Some(text) = crate::claude_md::render_eager(
-                &crate::claude_md::load(&self.cwd, &crate::settings::claude_md_load_context()),
-                self.agent_language,
-            )
-        {
-            messages.push(LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![MessageContent::Text(text)],
-                cache: true,
-            });
-        }
-        // Inject the active mode's `developer_instructions` as a fixed-position
-        // user-role message wrapped in a `<collaboration_mode>` tag — the
-        // codex port's equivalent of the developer-role message. manox has no
-        // Developer role, so it rides as User. Main-thread only: sub-agents
-        // carry their own `agents/*.md` system body and run in `Default`.
-        // Never written into `self.messages` (it is per-request, mode-stable),
-        // so toggling mode does not rewrite history — the system head before it
-        // stays byte-stable, and the block sits at a fixed slot so the prefix
-        // cache stays warm across mode-stable turns.
-        if self.depth == 0
-            && let Some(instructions) = Some(crate::collaboration_mode::unified_instructions(
-                self.agent_language,
-            ))
-        {
-            messages.push(LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![MessageContent::Text(format!(
-                    "<collaboration_mode>\n{instructions}\n</collaboration_mode>"
-                ))],
-                cache: true,
-            });
-        }
+        // Fixed-slot context injectors ride right after the system head: the
+        // multi-level CLAUDE.md eager block and the `<collaboration_mode>`
+        // block. They are per-request (never written into `self.messages`) and
+        // byte-stable while their inputs (files on disk, mode, agent language)
+        // are unchanged, so the prefix cache treats them as part of the system
+        // head. An injector that contributes nothing leaves the prefix
+        // byte-identical to a session without it. Each injector carries its own
+        // gating (`instructions_enabled`, `depth == 0`), so the ordered set is
+        // the single source of truth for what lands here. See
+        // [`crate::turn_ext`].
+        messages.extend(self.extensions.inject_all(&self.turn_ctx()));
         // Map canonical messages to the request, stripping the `agent` tool's
         // JSON envelope to just its `final` text. The full sub-conversation
         // stays in `self.messages` for persistence and UI rebuild, but the
@@ -7217,6 +7210,91 @@ mod tests {
                 .all(|m| !text_of_req(m).contains("PROJECT RULE MARKER")),
             "disabled thread must not carry instructions"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Prefix-cache regression gate for the `turn_ext` seam: the fixed-slot
+    /// messages `build_completion_request` now sources from the context
+    /// injectors must be byte-identical to the previously-inlined CLAUDE.md +
+    /// `<collaboration_mode>` logic. Any injector drift that would silently
+    /// bust the provider's prefix cache trips this assertion.
+    #[test]
+    fn build_completion_request_injector_slot_is_byte_stable() {
+        use crate::language_model::{LanguageModelRequestMessage, MessageContent, Role};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "manox_thread_turn_ext_{}_{}",
+            std::process::id(),
+            "equiv"
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("CLAUDE.md"), "EQUIV RULE MARKER").unwrap();
+
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let cwd = tmp.to_string_lossy().to_string();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("turn-ext-equiv", &cwd, Vec::new()),
+                None,
+                cx,
+            )
+        });
+
+        // Reconstruct the exact fixed-slot sequence the inlined code produced:
+        // the CLAUDE.md eager block (main thread, instructions enabled) followed
+        // by the `<collaboration_mode>` block (depth 0), both cache:true User
+        // messages.
+        let lang = cx.update(|cx| thread.read(cx).agent_language);
+        let mut expected: Vec<LanguageModelRequestMessage> = Vec::new();
+        if let Some(text) = crate::claude_md::render_eager(
+            &crate::claude_md::load(
+                std::path::Path::new(&cwd),
+                &crate::settings::claude_md_load_context(),
+            ),
+            lang,
+        ) {
+            expected.push(LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![MessageContent::Text(text)],
+                cache: true,
+            });
+        }
+        let instructions = crate::collaboration_mode::unified_instructions(lang);
+        expected.push(LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::Text(format!(
+                "<collaboration_mode>\n{instructions}\n</collaboration_mode>"
+            ))],
+            cache: true,
+        });
+
+        let actual = cx.update(|cx| {
+            let t = thread.read(cx);
+            t.extensions.inject_all(&t.turn_ctx())
+        });
+        assert_eq!(
+            actual, expected,
+            "injector fixed slot must be byte-identical to the inlined logic"
+        );
+
+        // The full request is byte-stable across two builds (the prefix-cache
+        // invariant) and carries every injected block's text. The downstream
+        // `coalesce_same_role` pass may merge the adjacent User injector
+        // messages into the following turn, so the slot is asserted by content
+        // presence rather than by position.
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
+        assert_eq!(req.messages[0].role, Role::System);
+        for m in &expected {
+            let want = text_of_req(m);
+            assert!(
+                req.messages.iter().any(|r| text_of_req(r).contains(&want)),
+                "request must carry injected block: {want}"
+            );
+        }
+        let req2 = cx.update(|cx| thread.read(cx).build_completion_request());
+        assert_eq!(req.messages, req2.messages, "request prefix is byte-stable");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
