@@ -341,10 +341,6 @@ pub struct Workspace {
     plus_menu_sub: Option<Subscription>,
     /// Access-chip dropdown (Normal / Danger mode). Mirrors the model selector pattern.
     access_open: bool,
-    /// Reasoning-effort dropdown (High / Max).
-    effort_open: bool,
-    effort_menu: Option<Entity<PopupMenu>>,
-    effort_menu_sub: Option<Subscription>,
     /// Project-chip dropdown (recent projects + new project submenu).
     project_chip_open: bool,
     project_chip_menu: Option<Entity<PopupMenu>>,
@@ -647,9 +643,6 @@ impl Workspace {
             plus_menu: None,
             plus_menu_sub: None,
             access_open: false,
-            effort_open: false,
-            effort_menu: None,
-            effort_menu_sub: None,
             project_chip_open: false,
             project_chip_menu: None,
             project_chip_menu_sub: None,
@@ -1726,12 +1719,6 @@ impl Workspace {
     /// Close the access-chip dropdown, dropping the menu entity + subscription.
     fn close_access_menu(&mut self) {
         self.access_open = false;
-    }
-
-    fn close_effort_menu(&mut self) {
-        self.effort_open = false;
-        self.effort_menu = None;
-        self.effort_menu_sub = None;
     }
 
     /// Close the project-chip dropdown.
@@ -4046,123 +4033,14 @@ impl Workspace {
         )
     }
 
-    fn render_reasoning_effort_selector(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let open = self.effort_open;
-        let selected = self.thread.read(cx).reasoning_effort();
-        let workspace = cx.entity().downgrade();
-        // Effort enum values are provider wire literals (high/max), not UI
-        // chrome — they are not localized.
-        let label = selected.wire_value();
-
-        let trigger = h_flex()
-            .id("reasoning-effort-chip")
-            .items_center()
-            .gap_1()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .hover(|s| s.bg(theme.accent.opacity(0.08)))
-            .cursor_pointer()
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(theme.foreground)
-                    .child(label),
-            )
-            .child(
-                Icon::new(if open {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                })
-                .xsmall()
-                .text_color(theme.muted_foreground),
-            )
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                if this.effort_open {
-                    this.close_effort_menu();
-                    cx.notify();
-                    return;
-                }
-
-                let current = this.thread.read(cx).reasoning_effort();
-                this.effort_open = true;
-                let menu_workspace = workspace.clone();
-                let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-                    let mut menu = menu
-                        .max_w(gpui::px(220.))
-                        .label(i18n::t("workspace-effort-section"));
-                    for effort in ReasoningEffort::ALL {
-                        let ws = menu_workspace.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(effort.wire_value())
-                                .checked(effort == current)
-                                .on_click(move |_, _window, cx| {
-                                    let _ = ws.update(cx, |this, cx| {
-                                        this.thread
-                                            .update(cx, |t, cx| t.set_reasoning_effort(effort, cx));
-                                        this.close_effort_menu();
-                                        cx.notify();
-                                    });
-                                }),
-                        );
-                    }
-                    menu
-                });
-                let sub = cx.subscribe(
-                    &menu,
-                    |this: &mut Workspace,
-                     _menu: Entity<PopupMenu>,
-                     _: &DismissEvent,
-                     cx: &mut Context<Workspace>| {
-                        this.close_effort_menu();
-                        cx.notify();
-                    },
-                );
-                this.effort_menu = Some(menu);
-                this.effort_menu_sub = Some(sub);
-                cx.notify();
-            }));
-
-        if !open {
-            return trigger.into_any_element();
-        }
-
-        let menu = self
-            .effort_menu
-            .clone()
-            .expect("effort_menu exists when open");
-        gpui::div()
-            .relative()
-            .child(trigger)
-            .child(
-                deferred(
-                    gpui::div()
-                        .id("reasoning-effort-dropdown")
-                        .absolute()
-                        .bottom_full()
-                        .right_0()
-                        .occlude()
-                        .child(menu),
-                )
-                .with_priority(1),
-            )
-            .into_any_element()
-    }
-
-    /// Cascading model selector using PopupMenu with Provider → Model submenus.
-    ///
-    /// Closed: a ghost button showing the current model with a chevron.
-    /// Open: an absolute-positioned PopupMenu; hovering a Provider row expands
-    /// a flyout submenu listing its Models. PopupMenu handles all hover,
-    /// click-outside, and keyboard-dismiss behavior internally.
+    /// Combined model + reasoning-effort selector. Closed: a ghost button
+    /// showing `provider · model · effort` with the model name tinted to
+    /// match its wire API. Open: a PopupMenu with Provider submenus, a
+    /// separator, then High / Max effort items.
     fn render_model_selector(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let label = self.model_label(cx);
         let open = self.model_open;
+        let model = self.thread.read(cx).model().cloned();
+        let effort = self.thread.read(cx).reasoning_effort();
 
         let trigger = h_flex()
             .id("model-trigger")
@@ -4173,12 +4051,43 @@ impl Workspace {
             .rounded(theme.radius)
             .hover(|s| s.bg(theme.accent.opacity(0.08)))
             .cursor_pointer()
-            .child(
-                gpui::div()
-                    .text_xs()
-                    .text_color(theme.foreground)
-                    .child(label),
-            )
+            .children(if let Some(ref m) = model {
+                let wire = m.wire_api();
+                let model_color = Self::wire_api_text_color(wire, theme);
+                let dot = || {
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("·")
+                };
+                vec![
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(m.provider_name())
+                        .into_any_element(),
+                    dot().into_any_element(),
+                    gpui::div()
+                        .text_xs()
+                        .text_color(model_color)
+                        .child(m.name().to_string())
+                        .into_any_element(),
+                    dot().into_any_element(),
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(effort.wire_value())
+                        .into_any_element(),
+                ]
+            } else {
+                vec![
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(i18n::t("workspace-no-model").to_string())
+                        .into_any_element(),
+                ]
+            })
             .child(
                 Icon::new(if open {
                     IconName::ChevronUp
@@ -4196,8 +4105,9 @@ impl Workspace {
                 } else {
                     this.model_open = true;
                     let workspace = cx.entity().downgrade();
+                    let current_effort = this.thread.read(cx).reasoning_effort();
                     let menu = PopupMenu::build(window, cx, |menu, window, cx| {
-                        Self::build_model_popup_menu(menu, workspace, window, cx)
+                        Self::build_model_popup_menu(menu, workspace, current_effort, window, cx)
                     });
                     let sub = cx.subscribe(
                         &menu,
@@ -4230,9 +4140,6 @@ impl Workspace {
             .relative()
             .child(trigger)
             .child(
-                // PopupMenu has its own bg/border/shadow and on_mouse_down_out.
-                // `.occlude()` renders the dropdown above all non-occluded elements
-                // (footer borders, message list, etc.).
                 deferred(
                     gpui::div()
                         .id("model-dropdown")
@@ -4247,6 +4154,16 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Wire API → text color for the composer model label.
+    fn wire_api_text_color(wire: WireApi, theme: &Theme) -> gpui::Hsla {
+        match wire {
+            WireApi::Anthropic => theme.primary,
+            WireApi::Responses => theme.info,
+            WireApi::Completions => theme.warning,
+            WireApi::Unavailable => theme.muted_foreground,
+        }
+    }
+
     /// WireApi → Tag variant + label mapping for the model menu.
     fn wire_tag_variant(wire: WireApi) -> (TagVariant, &'static str) {
         match wire {
@@ -4256,11 +4173,12 @@ impl Workspace {
             WireApi::Unavailable => (TagVariant::Secondary, "N/A"),
         }
     }
-
-    /// Cascading model menu grouped by provider; each model row shows a wire-api Tag.
+    /// Cascading model menu grouped by provider, followed by a separator and
+    /// reasoning-effort items (High / Max). Each model row shows a wire-api Tag.
     fn build_model_popup_menu(
         menu: PopupMenu,
         workspace: WeakEntity<Workspace>,
+        current_effort: ReasoningEffort,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
@@ -4275,9 +4193,9 @@ impl Workspace {
                 providers.push((prov, vec![m.clone()]));
             }
         }
-
         let mut menu = menu;
-        if providers.is_empty() {
+        let has_providers = !providers.is_empty();
+        if !has_providers {
             menu = menu.item(PopupMenuItem::Label("No models configured".into()));
         }
         for (prov_name, models) in providers {
@@ -4315,6 +4233,25 @@ impl Workspace {
                 }
                 submenu
             });
+        }
+
+        // Reasoning effort items, separated from the provider/model list.
+        if has_providers {
+            menu = menu.separator();
+        }
+        for effort in ReasoningEffort::ALL {
+            let ws = workspace.clone();
+            menu = menu.item(
+                PopupMenuItem::new(effort.wire_value())
+                    .checked(effort == current_effort)
+                    .on_click(move |_, _window, cx| {
+                        let _ = ws.update(cx, |this, cx| {
+                            this.thread
+                                .update(cx, |t, cx| t.set_reasoning_effort(effort, cx));
+                            cx.notify();
+                        });
+                    }),
+            );
         }
         menu
     }
@@ -4515,7 +4452,6 @@ impl Workspace {
         let goal_chip = self.render_goal_chip(theme, cx);
         let team_chip = self.render_team_chip(theme, cx);
         let access = self.render_access_placeholder(theme, cx);
-        let effort = self.render_reasoning_effort_selector(theme, cx);
         let model = self.render_model_selector(theme, cx);
         let send = self.render_send_button(
             running && self.pending_plan_review.is_none() && self.pending_ask.is_none(),
@@ -4610,15 +4546,12 @@ impl Workspace {
                             .when_some(team_chip, |el, chip| el.child(chip))
                             .child(access),
                     )
-                    // Effort lives next to the model selector — both describe
-                    // how the model reasons, so they read as one group.
                     .child(
                         h_flex()
                             .items_center()
                             .gap_1()
                             .flex_shrink_0()
                             .child(model)
-                            .child(effort)
                             .child(send),
                     ),
             )
