@@ -1198,16 +1198,18 @@ mod tests {
     }
 
     /// Probe 4: reproduce the real `apply_prompt_caching(Full)` layout across a
-    /// simulated two-turn conversation to settle whether the `Full` policy
-    /// recovers *message-history* caching on Bailian — the premise behind the
-    /// `prompt_caching: "full"` knob (#324). Turn 1 seeds a large stable prefix
-    /// (system + a ~1500-token history block + first question); turn 2 appends
-    /// an answer and a new question, so the turn-1 tail becomes an interior
-    /// stable prefix. Turn-2 read magnitude decides it:
-    ///   read2 ≈ system+history (~3000) → history IS cached, Full effective;
-    ///   read2 ≈ system only    (~1500) → history NOT cached, Full no better
-    ///     than LastBreakpointOnly for the growing tail;
-    ///   read2 ≈ 0              → the moving messages[-1] breakpoint zeroed reads.
+    /// simulated multi-turn conversation to settle whether the 3-breakpoint
+    /// `Full` policy (system + last tool + messages[-2]) recovers monotonic
+    /// message-history caching on Bailian — the premise behind the
+    /// `prompt_caching: "full"` knob (#324) and the 3-breakpoint fix (#345).
+    /// Each turn seeds a large stable prefix (system + a ~1500-token history
+    /// block + prior turns); the next turn appends an answer and a new
+    /// question, so the prior tail becomes an interior stable prefix cached at
+    /// messages[-2]. Turn-N read magnitude decides it:
+    ///   read grows monotonically (read1 < read2 < read3) → 3-breakpoint caches
+    ///     the stable prefix, matching Claude Code's layout on the same endpoint;
+    ///   read stays ~0 every turn → the moving breakpoint zeroed reads (the old
+    ///     4-breakpoint messages[-1] failure, now fixed).
     #[tokio::test]
     async fn live_anthropic_cache_full_layout() {
         let Some((url, key, model)) = bailian_anthropic_endpoint().await else {
@@ -1239,11 +1241,29 @@ mod tests {
             serde_json::json!({"role":"user","content":[{"type":"text","text":"how to optimize it?"}]}),
         ]);
         let (_, _, read2) = probe_cache(&url, &key, &model, turn2).await;
+        let turn3 = turn(vec![
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"what is the code about?"}]}),
+            serde_json::json!({"role":"assistant","content":[{"type":"text","text":"a demo"}]}),
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"how to optimize it?"}]}),
+            serde_json::json!({"role":"assistant","content":[{"type":"text","text":"refactor it"}]}),
+            serde_json::json!({"role":"user","content":[{"type":"text","text":"any risks?"}]}),
+        ]);
+        let (_, _, read3) = probe_cache(&url, &key, &model, turn3).await;
         eprintln!(
-            "[PROBE4 full-layout] read1={read1} read2={read2} \
-             (read2≈3000 → history cached, Full effective; \
-             read2≈1500 → system only, Full no better on tail; \
-             read2≈0 → moving breakpoint zeroed reads)"
+            "[PROBE4 full-layout 3-breakpoint] read1={read1} read2={read2} read3={read3} \
+             (monotonic read1<read2<read3 → stable prefix cached; read≈0 → layout broken)"
+        );
+        // 3-breakpoint: the stable prefix (system+history+prior turns) must be
+        // cached and grow monotonically. read2==0 reproduces the old
+        // 4-breakpoint messages[-1] failure (cache_creation=0 → unwritten segment
+        // poisons the stable-prefix key).
+        assert!(
+            read2 > 0,
+            "read2={read2} zeroed — 3-breakpoint layout still poisons the stable prefix"
+        );
+        assert!(
+            read3 >= read2,
+            "read3={read3} < read2={read2} — cache_read not monotonic under 3-breakpoint Full"
         );
     }
 

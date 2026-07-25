@@ -1,20 +1,28 @@
 //! Anthropic Messages API prompt caching (`cache_control` breakpoints).
 //!
 //! The strategy is chosen by provider capability (`PromptCachingPolicy`):
-//! - `Full`: system last block + last tool + messages[-2] + messages[-1], up to
-//!   4 breakpoints. The last-message breakpoint is read on the next turn
-//!   within its 5min TTL, so the conversation prefix is cached rather than
-//!   re-processed each turn.
+//! - `Full`: system last block + last tool + messages[-2], 3 breakpoints. The
+//!   current turn's new content (messages[-1]) is intentionally left uncached —
+//!   it becomes messages[-2] next turn and is cached then, so the stable prefix
+//!   (system + tools + history) is cached across turns while only the small
+//!   per-turn delta is re-processed.
 //! - `LastBreakpointOnly`: last tool only. Retained as an explicit opt-out for
 //!   a misbehaving endpoint that rejects multi-breakpoint layouts.
 //! - `None`: no caching.
 //!
 //! The default policy is `Full` for any endpoint: explicit `prompt_caching`
 //! config wins; otherwise `Full`. Third-party anthropic-compatible endpoints
-//! tolerate (or silently ignore) `cache_control`, and the last-message
-//! breakpoint is net positive (read within TTL), so caching is not gated on
+//! tolerate (or silently ignore) `cache_control`, so caching is not gated on
 //! the host. Set `MANOX_PROMPT_CACHING=last_breakpoint` to opt a misbehaving
 //! endpoint out of the multi-breakpoint layout.
+//!
+//! Why 3 breakpoints, not 4: a 4th breakpoint on messages[-1] is harmful on
+//! endpoints that never write the segment (e.g. 阿里云百炼/DashScope's
+//! anthropic-compatible endpoint reports `cache_creation_input_tokens` as 0
+//! every turn). The unwritten last-message breakpoint still perturbs the
+//! stable-prefix cache key, so the whole prefix is re-processed every turn.
+//! Dropping it restores monotonic `cache_read` growth — verified against the
+//! same model (kimi-k3) and endpoint under Claude Code's 3-breakpoint layout.
 
 use serde_json::{Value, json};
 
@@ -42,7 +50,9 @@ pub enum PromptCachingPolicy {
     /// No caching.
     #[default]
     None,
-    /// Full 4-breakpoint layout: system last block + last tool + messages[-2] + messages[-1].
+    /// Full 3-breakpoint layout: system last block + last tool + messages[-2].
+    /// The current turn's messages[-1] is left uncached; it is cached next turn
+    /// once it becomes messages[-2].
     Full,
     /// Last tool breakpoint only. Explicit opt-out for endpoints that reject
     /// the multi-breakpoint layout; not the default.
@@ -63,11 +73,9 @@ impl PromptCachingPolicy {
 
 /// Resolve the policy from provider capability: explicit config `prompt_caching`
 /// wins; otherwise `Full` for any endpoint. Third-party anthropic-compatible
-/// endpoints tolerate (or silently ignore) `cache_control` breakpoints, and
-/// the last-message breakpoint is read on the next turn within its 5min TTL —
-/// net positive, not negative. `LastBreakpointOnly` is retained only as an
-/// explicit opt-out for a misbehaving endpoint via
-/// `MANOX_PROMPT_CACHING=last_breakpoint`.
+/// endpoints tolerate (or silently ignore) `cache_control` breakpoints.
+/// `LastBreakpointOnly` is retained only as an explicit opt-out for a
+/// misbehaving endpoint via `MANOX_PROMPT_CACHING=last_breakpoint`.
 pub fn resolve_prompt_caching_policy(
     prompt_caching: Option<&str>,
     _base_url: Option<&str>,
@@ -149,13 +157,16 @@ pub fn apply_prompt_caching(body: &mut Value, policy: PromptCachingPolicy, long_
         used += 1;
     }
 
-    // (3)(4) messages[-2], messages[-1] last text block (Full only).
+    // (3) messages[-2] last text/tool_result block (Full only). The current
+    // turn's messages[-1] is left uncached; it becomes messages[-2] next turn
+    // and is cached then.
     if policy == PromptCachingPolicy::Full
         && let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut())
     {
         let len = messages.len();
         let start = len.saturating_sub(2);
-        for i in start..len {
+        let end = len.saturating_sub(1);
+        for i in start..end {
             if used >= MAX_CACHE_BREAKPOINTS {
                 break;
             }
@@ -311,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn full_places_4_breakpoints() {
+    fn full_places_3_breakpoints() {
         let system = Some(Value::String("sys".into()));
         let tools = vec![
             json!({"name": "a", "input_schema": {}}),
@@ -331,7 +342,14 @@ mod tests {
         assert!(
             !matches!(req["tools"].as_array().unwrap().first(), Some(Value::Object(m)) if m.contains_key("cache_control"))
         );
-        assert_eq!(count_breakpoints(&req), 4);
+        // messages[-2] (messages[0]) carries cache_control; messages[-1] (messages[1]) does not.
+        assert!(
+            matches!(req["messages"][0]["content"].as_array().unwrap().last(), Some(Value::Object(m)) if m.contains_key("cache_control"))
+        );
+        assert!(
+            !matches!(req["messages"][1]["content"].as_array().unwrap().last(), Some(Value::Object(m)) if m.contains_key("cache_control"))
+        );
+        assert_eq!(count_breakpoints(&req), 3);
     }
 
     #[test]
