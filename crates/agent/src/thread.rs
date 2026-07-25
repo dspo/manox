@@ -599,6 +599,36 @@ enum RecoveryAction {
     CompactAndRetry,
 }
 
+/// Main-thread Goal state, grouped so the three previously-loose fields travel
+/// together. `runtime` holds the durable snapshot + continuation fencing;
+/// `turn_anchor` is the accounting anchor for a Goal-owned Default-mode turn
+/// (goal-id fence, active-time start, thread usage baseline); `budget_stop_injected`
+/// is the one-shot guard for the safe-stop directive. Sub-agents never own a
+/// Goal, so a sub-agent thread carries the default (empty) state.
+struct GoalState {
+    runtime: GoalRuntime,
+    turn_anchor: Option<(String, Instant, TokenUsage)>,
+    budget_stop_injected: bool,
+}
+
+impl GoalState {
+    fn new() -> Self {
+        Self {
+            runtime: GoalRuntime::default(),
+            turn_anchor: None,
+            budget_stop_injected: false,
+        }
+    }
+
+    fn restore(goal: Option<ThreadGoal>) -> Self {
+        Self {
+            runtime: GoalRuntime::restore(goal),
+            turn_anchor: None,
+            budget_stop_injected: false,
+        }
+    }
+}
+
 pub struct Thread {
     pub id: ThreadId,
     messages: Vec<Message>,
@@ -788,16 +818,10 @@ pub struct Thread {
     /// `respond_inbound` with an allow/deny decision; orthogonal to
     /// `approval_mode` (a page's write request is never auto-allowed).
     pending_inbound: HashMap<String, tokio::sync::oneshot::Sender<bool>>,
-    /// Durable main-thread Goal state and continuation fencing. The snapshot is
-    /// updated only after its SQLite transaction commits; sub-agents never own
-    /// a Goal and completion is reported explicitly through `UpdateGoal`.
-    goal_runtime: GoalRuntime,
-    /// Accounting anchor for a Goal-owned Default-mode turn. The tuple carries
-    /// the goal-id fence, active-time start, and thread usage baseline.
-    goal_turn_anchor: Option<(String, Instant, TokenUsage)>,
-    /// One-shot guard for the safe-stop directive injected when streaming
-    /// usage reaches the explicit Goal budget during a live turn.
-    goal_budget_stop_injected: bool,
+    /// Main-thread Goal state: durable snapshot + continuation fencing, the
+    /// per-turn accounting anchor, and the budget safe-stop guard. Sub-agents
+    /// never own a Goal and report completion explicitly through `UpdateGoal`.
+    goal: GoalState,
     /// LLM title + re-eval cadence + user rename. The spawn that drives a
     /// title turn lives in [`TitleState::maybe_generate`]; `Thread` passes in
     /// depth / model / messages each call. `pub(crate)` so the spawn callback
@@ -1051,9 +1075,7 @@ impl Thread {
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
                 reasoning_effort: ReasoningEffort::default(),
-                goal_runtime: GoalRuntime::default(),
-                goal_turn_anchor: None,
-                goal_budget_stop_injected: false,
+                goal: GoalState::new(),
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
                 proxy: None,
@@ -1189,9 +1211,7 @@ impl Thread {
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
                 reasoning_effort: ReasoningEffort::from_i64(rec.reasoning_effort),
-                goal_runtime: GoalRuntime::restore(goal),
-                goal_turn_anchor: None,
-                goal_budget_stop_injected: false,
+                goal: GoalState::restore(goal),
                 title_state: TitleState::restore(
                     rec.title,
                     rec.title_override,
@@ -1299,9 +1319,7 @@ impl Thread {
                 pending_plan_text: String::new(),
                 produced_plan_this_turn: false,
                 reasoning_effort,
-                goal_runtime: GoalRuntime::default(),
-                goal_turn_anchor: None,
-                goal_budget_stop_injected: false,
+                goal: GoalState::new(),
                 title_state: TitleState::default(),
                 prefix_stability: StablePrefix::default(),
                 proxy: None,
@@ -1749,13 +1767,14 @@ impl Thread {
     }
 
     pub fn goal(&self) -> Option<&ThreadGoal> {
-        self.goal_runtime.current()
+        self.goal.runtime.current()
     }
 
     pub fn goal_elapsed_seconds(&self) -> Option<u64> {
         let goal = self.goal()?;
         let live = self
-            .goal_turn_anchor
+            .goal
+            .turn_anchor
             .as_ref()
             .filter(|(goal_id, _, _)| goal_id == &goal.goal_id)
             .map(|(_, started_at, _)| started_at.elapsed().as_secs())
@@ -1794,11 +1813,11 @@ impl Thread {
         if self.running_turn.is_some() {
             return Ok(());
         }
-        let Some((goal_id, started_at, baseline)) = self.goal_turn_anchor.as_ref() else {
+        let Some((goal_id, started_at, baseline)) = self.goal.turn_anchor.as_ref() else {
             return Ok(());
         };
         let Some(_) = self.goal().filter(|goal| goal.goal_id == *goal_id) else {
-            self.goal_turn_anchor = None;
+            self.goal.turn_anchor = None;
             return Ok(());
         };
         let usage = self.cumulative_token_usage();
@@ -1821,8 +1840,8 @@ impl Thread {
             started_at.elapsed().as_secs(),
             self.last_user_message_id(),
         )?;
-        self.goal_runtime.replace_snapshot(Some(goal));
-        self.goal_turn_anchor = None;
+        self.goal.runtime.replace_snapshot(Some(goal));
+        self.goal.turn_anchor = None;
         self.sync_goal_pin(cx);
         Ok(())
     }
@@ -1860,10 +1879,10 @@ impl Thread {
         db.upsert(&record, true)?;
         db.create_goal(&goal, actor)?;
         let goal_id = goal.goal_id.clone();
-        self.goal_runtime.replace_snapshot(Some(goal));
+        self.goal.runtime.replace_snapshot(Some(goal));
         self.sync_goal_pin(cx);
         if self.running_turn.is_some() {
-            self.goal_turn_anchor = Some((goal_id, Instant::now(), self.cumulative_token_usage()));
+            self.goal.turn_anchor = Some((goal_id, Instant::now(), self.cumulative_token_usage()));
         }
         cx.emit(ThreadEvent::GoalChanged { active: true });
         cx.notify();
@@ -1894,7 +1913,7 @@ impl Thread {
         updated.updated_at = chrono::Utc::now().timestamp();
         let db = crate::thread_store::global().read(cx).database();
         db.update_goal(&current.goal_id, &updated, actor, None)?;
-        self.goal_runtime.replace_snapshot(Some(updated.clone()));
+        self.goal.runtime.replace_snapshot(Some(updated.clone()));
         self.sync_goal_pin(cx);
         if current.objective != updated.objective {
             let directive = format!(
@@ -1927,7 +1946,8 @@ impl Thread {
             .ok_or_else(|| anyhow::anyhow!("thread has no Goal to replace"))?;
         let replacement = ThreadGoal::new(self.id.0.clone(), objective, token_budget)?;
         let (token_delta, time_delta, turn_id) = self
-            .goal_turn_anchor
+            .goal
+            .turn_anchor
             .as_ref()
             .filter(|(goal_id, _, _)| goal_id == &current.goal_id)
             .map(|(_, started_at, baseline)| {
@@ -1962,8 +1982,8 @@ impl Thread {
         if let Some(cancel) = self.turn_cancel.as_ref() {
             cancel.cancel();
         }
-        self.goal_turn_anchor = None;
-        self.goal_runtime.replace_snapshot(Some(replacement));
+        self.goal.turn_anchor = None;
+        self.goal.runtime.replace_snapshot(Some(replacement));
         self.sync_goal_pin(cx);
         cx.emit(ThreadEvent::GoalChanged { active: true });
         self.try_start_turn_if_idle(cx);
@@ -2001,7 +2021,7 @@ impl Thread {
         updated.updated_at = chrono::Utc::now().timestamp();
         let db = crate::thread_store::global().read(cx).database();
         db.update_goal(&current.goal_id, &updated, actor, None)?;
-        self.goal_runtime.replace_snapshot(Some(updated));
+        self.goal.runtime.replace_snapshot(Some(updated));
         self.sync_goal_pin(cx);
         if status != GoalStatus::Active {
             self.cancel_goal_background_tasks(&current.goal_id);
@@ -2029,7 +2049,8 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Result<()> {
         let expected_goal_id = self
-            .goal_turn_anchor
+            .goal
+            .turn_anchor
             .as_ref()
             .map(|(goal_id, _, _)| goal_id.clone())
             .ok_or_else(|| anyhow::anyhow!("model Goal update is not bound to a Goal turn"))?;
@@ -2040,7 +2061,7 @@ impl Thread {
             .ok_or_else(|| anyhow::anyhow!("stale model Goal update"))?;
         match status {
             GoalStatus::Complete => {
-                self.goal_runtime.clear_blocker();
+                self.goal.runtime.clear_blocker();
                 self.set_goal_status(status, reason, GoalActor::Model, cx)
             }
             GoalStatus::Blocked => {
@@ -2052,7 +2073,7 @@ impl Thread {
                     .last_user_message_id()
                     .ok_or_else(|| anyhow::anyhow!("Goal turn has no stable id"))?
                     .to_string();
-                let count = self.goal_runtime.record_blocker(&reason, &turn_id);
+                let count = self.goal.runtime.record_blocker(&reason, &turn_id);
                 if count >= 3 {
                     return self.set_goal_status(
                         GoalStatus::Blocked,
@@ -2071,7 +2092,7 @@ impl Thread {
                     GoalActor::Model,
                     Some(&turn_id),
                 )?;
-                self.goal_runtime.replace_snapshot(Some(updated));
+                self.goal.runtime.replace_snapshot(Some(updated));
                 cx.emit(ThreadEvent::GoalChanged { active: true });
                 cx.notify();
                 Ok(())
@@ -2088,7 +2109,8 @@ impl Thread {
         };
         let db = crate::thread_store::global().read(cx).database();
         let (token_delta, time_delta, turn_id) = self
-            .goal_turn_anchor
+            .goal
+            .turn_anchor
             .as_ref()
             .filter(|(goal_id, _, _)| goal_id == &goal.goal_id)
             .map(|(_, started_at, baseline)| {
@@ -2122,8 +2144,8 @@ impl Thread {
         if let Some(cancel) = self.turn_cancel.take() {
             cancel.cancel();
         }
-        self.goal_runtime.replace_snapshot(None);
-        self.goal_turn_anchor = None;
+        self.goal.runtime.replace_snapshot(None);
+        self.goal.turn_anchor = None;
         self.sync_goal_pin(cx);
         cx.emit(ThreadEvent::GoalChanged { active: false });
         cx.notify();
@@ -2166,8 +2188,8 @@ impl Thread {
             return;
         };
         if crate::background_task::goal_has_running_tasks(&self.id.0, &goal.goal_id) {
-            if self.goal_turn_anchor.is_none() {
-                self.goal_turn_anchor = Some((
+            if self.goal.turn_anchor.is_none() {
+                self.goal.turn_anchor = Some((
                     goal.goal_id.clone(),
                     Instant::now(),
                     self.cumulative_token_usage(),
@@ -2179,7 +2201,7 @@ impl Thread {
     }
 
     fn start_goal_turn(&mut self, goal: ThreadGoal, cx: &mut Context<Self>) {
-        if !self.goal_runtime.reserve_continuation(&goal.goal_id) {
+        if !self.goal.runtime.reserve_continuation(&goal.goal_id) {
             return;
         }
         let remaining = goal
@@ -2199,7 +2221,7 @@ impl Thread {
     }
 
     fn finish_goal_turn(&mut self, cancelled: bool, failed: bool, cx: &mut Context<Self>) {
-        let Some((goal_id, started_at, baseline)) = self.goal_turn_anchor.take() else {
+        let Some((goal_id, started_at, baseline)) = self.goal.turn_anchor.take() else {
             return;
         };
         let Some(_) = self.goal().filter(|goal| goal.goal_id == goal_id) else {
@@ -2207,7 +2229,7 @@ impl Thread {
         };
         let turn_id = self.last_user_message_id().map(str::to_owned);
         if let Some(turn_id) = turn_id.as_deref() {
-            self.goal_runtime.finish_blocker_turn(turn_id);
+            self.goal.runtime.finish_blocker_turn(turn_id);
         }
         let usage = self.cumulative_token_usage();
         let delta = TokenUsage {
@@ -2230,13 +2252,13 @@ impl Thread {
             turn_id.as_deref(),
         ) {
             Ok(goal) => {
-                self.goal_runtime.replace_snapshot(Some(goal));
+                self.goal.runtime.replace_snapshot(Some(goal));
                 self.sync_goal_pin(cx);
             }
             Err(error) => {
                 // Release the reservation but keep a fail-closed latch until a
                 // later successful persisted Goal mutation explicitly recovers.
-                self.goal_runtime.fail_continuation(&goal_id);
+                self.goal.runtime.fail_continuation(&goal_id);
                 tracing::error!(%error, goal_id, "Goal accounting failed; automatic work stopped");
                 cx.emit(ThreadEvent::Error(anyhow::anyhow!(
                     "Goal accounting failed; automatic work stopped: {error}"
@@ -2276,13 +2298,13 @@ impl Thread {
                 None => {}
             }
         }
-        self.goal_runtime.release_continuation(&goal_id);
+        self.goal.runtime.release_continuation(&goal_id);
         if self.goal().is_some_and(|goal| {
             goal.goal_id == goal_id
                 && goal.status == GoalStatus::Active
                 && crate::background_task::goal_has_running_tasks(&self.id.0, &goal_id)
         }) {
-            self.goal_turn_anchor = Some((
+            self.goal.turn_anchor = Some((
                 goal_id.clone(),
                 Instant::now(),
                 self.cumulative_token_usage(),
@@ -2294,10 +2316,10 @@ impl Thread {
     }
 
     fn enforce_goal_budget_during_turn(&mut self, cx: &mut Context<Self>) {
-        if self.goal_budget_stop_injected {
+        if self.goal.budget_stop_injected {
             return;
         }
-        let Some((goal_id, _, baseline)) = self.goal_turn_anchor.as_ref() else {
+        let Some((goal_id, _, baseline)) = self.goal.turn_anchor.as_ref() else {
             return;
         };
         let Some(goal) = self
@@ -2328,7 +2350,7 @@ impl Thread {
         {
             return;
         }
-        self.goal_budget_stop_injected = true;
+        self.goal.budget_stop_injected = true;
         if let Err(error) = self.set_goal_status(
             GoalStatus::BudgetLimited,
             Some("token budget exhausted".into()),
@@ -3189,14 +3211,14 @@ impl Thread {
         }
 
         let Some(model) = self.active_model() else {
-            if let Some(goal_id) = self.goal_runtime.expected_goal_id().map(str::to_owned) {
-                self.goal_runtime.release_continuation(&goal_id);
+            if let Some(goal_id) = self.goal.runtime.expected_goal_id().map(str::to_owned) {
+                self.goal.runtime.release_continuation(&goal_id);
             }
             cx.emit(ThreadEvent::Error(anyhow::anyhow!("No model configured")));
             return;
         };
 
-        self.goal_budget_stop_injected = false;
+        self.goal.budget_stop_injected = false;
         // Signal the UI immediately that a turn is in flight — before the
         // first streaming delta arrives — so the sidebar running indicator
         // lights up during the warm-up gap. `ThreadStore::set_running` (called
@@ -3204,11 +3226,12 @@ impl Thread {
         self.turn_started_at = Some(Instant::now());
         if let Some(goal) = self.goal().filter(|goal| goal.status == GoalStatus::Active)
             && self
-                .goal_turn_anchor
+                .goal
+                .turn_anchor
                 .as_ref()
                 .is_none_or(|(goal_id, _, _)| goal_id != &goal.goal_id)
         {
-            self.goal_turn_anchor = Some((
+            self.goal.turn_anchor = Some((
                 goal.goal_id.clone(),
                 Instant::now(),
                 self.cumulative_token_usage(),
@@ -8142,15 +8165,15 @@ mod tests {
                 );
                 thread.try_start_turn_if_idle(cx);
                 assert!(!thread.is_running());
-                assert!(thread.goal_turn_anchor.is_some());
-                thread.goal_turn_anchor.as_mut().unwrap().1 =
+                assert!(thread.goal.turn_anchor.is_some());
+                thread.goal.turn_anchor.as_mut().unwrap().1 =
                     std::time::Instant::now() - std::time::Duration::from_secs(2);
                 thread.flush_idle_goal_accounting(cx).unwrap();
                 assert_eq!(thread.goal().unwrap().status, GoalStatus::Active);
                 assert!(thread.goal().unwrap().time_used_seconds >= 2);
-                assert!(thread.goal_turn_anchor.is_none());
+                assert!(thread.goal.turn_anchor.is_none());
                 thread.try_start_turn_if_idle(cx);
-                assert!(thread.goal_turn_anchor.is_some());
+                assert!(thread.goal.turn_anchor.is_some());
                 assert!(!thread.is_running());
                 registered
             })
@@ -8254,7 +8277,7 @@ mod tests {
                         "<goal_continuation>turn {turn}</goal_continuation>"
                     )));
                     let goal_id = thread.goal().unwrap().goal_id.clone();
-                    thread.goal_turn_anchor = Some((
+                    thread.goal.turn_anchor = Some((
                         goal_id,
                         std::time::Instant::now(),
                         thread.cumulative_token_usage(),
@@ -8317,7 +8340,7 @@ mod tests {
                     .create_goal("stay within budget".into(), Some(10), GoalActor::User, cx)
                     .unwrap();
                 let goal_id = thread.goal().unwrap().goal_id.clone();
-                thread.goal_turn_anchor = Some((
+                thread.goal.turn_anchor = Some((
                     goal_id,
                     std::time::Instant::now(),
                     thread.cumulative_token_usage(),
@@ -8391,16 +8414,16 @@ mod tests {
                     tokio_util::sync::CancellationToken::new(),
                     Some(old_id.clone()),
                 );
-                assert!(thread.goal_runtime.reserve_continuation(&old_id));
+                assert!(thread.goal.runtime.reserve_continuation(&old_id));
                 thread
                     .replace_goal("new objective".into(), None, GoalActor::User, cx)
                     .unwrap();
                 let new_id = thread.goal().unwrap().goal_id.clone();
                 assert_ne!(old_id, new_id);
-                thread.goal_runtime.release_continuation(&old_id);
-                thread.goal_runtime.release_continuation(&new_id);
-                assert!(thread.goal_runtime.reserve_continuation(&new_id));
-                thread.goal_runtime.release_continuation(&new_id);
+                thread.goal.runtime.release_continuation(&old_id);
+                thread.goal.runtime.release_continuation(&new_id);
+                assert!(thread.goal.runtime.reserve_continuation(&new_id));
+                thread.goal.runtime.release_continuation(&new_id);
 
                 thread.model = None;
                 let message_count = thread.messages.len();
@@ -8415,7 +8438,7 @@ mod tests {
                         )
                     })
                 }));
-                assert!(thread.goal_runtime.reserve_continuation(&new_id));
+                assert!(thread.goal.runtime.reserve_continuation(&new_id));
                 old_task_id
             })
         });
