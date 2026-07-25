@@ -232,6 +232,25 @@ pub async fn stream_anthropic(
         long_ttl,
         supports_effort,
     )?;
+
+    // Log every outbound request: model, message count, and body size at info
+    // level (cheap, always visible). Full body at debug for post-incident
+    // replay — gate with RUST_LOG=debug or a narrower filter.
+    let msg_count = request.messages.len();
+    let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+    tracing::info!(
+        model,
+        url,
+        messages = msg_count,
+        body_bytes = body_bytes.len(),
+        "anthropic request",
+    );
+    tracing::debug!(
+        model,
+        body = %String::from_utf8_lossy(&body_bytes),
+        "anthropic request body",
+    );
+
     let client = reqwest::Client::builder()
         .build()
         .context("Failed to build reqwest client")?;
@@ -266,7 +285,24 @@ pub async fn stream_anthropic(
     )
     .await
     {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            let status = resp.status();
+            tracing::info!(model, status = status.as_u16(), "anthropic response");
+            // Non-2xx: drain and log the raw body for post-mortem. The SSE
+            // parser downstream will see an empty stream and exit cleanly —
+            // the error is already captured at warn level above.
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
+                tracing::warn!(
+                    model,
+                    status = status.as_u16(),
+                    body = %body_text,
+                    "anthropic non-2xx response",
+                );
+                return Ok(());
+            }
+            resp
+        }
         // Terminal failure or cancellation — the error has already been
         // forwarded through `tx` (or the receiver was dropped). Stop the stream
         // without emitting a second error.
@@ -295,6 +331,20 @@ pub async fn stream_anthropic(
                     continue;
                 }
             };
+            // Log SSE-level error events with the raw payload for post-mortem.
+            // The mapper will also surface this as an Err through `tx`, but the
+            // raw JSON is lost by the time it reaches the caller.
+            if let AnthropicEvent::Error { ref error } = event {
+                tracing::warn!(
+                    model,
+                    error_type = ?error.error_type,
+                    code = ?error.code,
+                    error_message = %error.message,
+                    request_id = ?error.request_id,
+                    raw = %data,
+                    "anthropic SSE error event",
+                );
+            }
             for mapped in mapper.map_event(event) {
                 if tx.send(mapped).await.is_err() {
                     return Ok(()); // Receiver dropped; stop.
@@ -541,8 +591,19 @@ struct AnthropicMessageDelta {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct AnthropicErrorPayload {
+    /// Standard Anthropic: `type` (e.g. "invalid_request_error").
+    /// Bailian: absent (uses `code` instead).
+    #[serde(default)]
+    error_type: Option<String>,
+    /// Bailian: `code` (e.g. "InvalidParameter"). Standard Anthropic: absent.
+    #[serde(default)]
+    code: Option<String>,
     message: String,
+    /// Bailian: `request_id`. Standard Anthropic: absent.
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 // ─── Anthropic SSE event mapper ──────────────────────────────────────────
