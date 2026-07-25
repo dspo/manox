@@ -20,12 +20,14 @@
 //!   short-circuits, which depend on turn-local state and the async reviewer;
 //!   [`ToolDecision::Defer`] falls back to the core's default gate.
 //!
-//! PR1 wires only [`ContextInjector`] into the core (`build_completion_request`
-//! routes its fixed slot through [`TurnExtensions::inject_all`]). The gate and
-//! compaction hooks are defined and registered but not yet consulted by the
-//! loop — they land in later PRs. The [`CoreContextInjector`] forwards the
-//! previously-inlined CLAUDE.md + collaboration-mode logic verbatim, so the
-//! request stays byte-identical.
+//! Only [`ContextInjector`] is wired into the core today
+//! (`build_completion_request` routes its fixed slot through
+//! [`TurnExtensions::inject_all`]). The gate and compaction hooks are defined
+//! and registered but not yet consulted by the loop — they land in later PRs.
+//! Two single-purpose injectors carry the fixed slot: [`ClaudeMdInjector`]
+//! (multi-level CLAUDE.md eager block) then [`CollaborationModeInjector`] (the
+//! `<collaboration_mode>` block), in that registration order — byte-identical
+//! to the logic they replaced.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -112,62 +114,78 @@ impl TurnExtensions {
     }
 }
 
-/// A main thread's turn extensions. The fixed-slot injector forwards the
-/// CLAUDE.md eager block and the `<collaboration_mode>` block; both gate
-/// themselves on the same conditions the inlined code used, so registering the
-/// injector for every thread keeps behavior identical.
+/// A main thread's turn extensions. The fixed slot is the CLAUDE.md eager
+/// block followed by the `<collaboration_mode>` block, each carried by its own
+/// single-purpose injector so registration order is the sole source of slot
+/// order.
 pub fn main_extensions() -> TurnExtensions {
     TurnExtensions {
         gates: Vec::new(),
-        injectors: vec![Arc::new(CoreContextInjector)],
+        injectors: vec![
+            Arc::new(ClaudeMdInjector),
+            Arc::new(CollaborationModeInjector),
+        ],
         compaction: Arc::new(CoreCompactionPolicy),
     }
 }
 
 /// A sub-agent's turn extensions. A sub-agent (depth > 0) still receives the
-/// CLAUDE.md block when `instructions_enabled`, and the injector's own
-/// `depth == 0` guard omits the collaboration-mode block — so the same
-/// injector serves both, matching the single inlined code path it replaced.
+/// CLAUDE.md block when `instructions_enabled`; [`CollaborationModeInjector`]'s
+/// own `depth == 0` guard makes it a no-op here, so registering both injectors
+/// matches the single code path they replaced while keeping the two threads'
+/// registries structurally identical for later divergence.
 pub fn child_extensions() -> TurnExtensions {
     TurnExtensions {
         gates: Vec::new(),
-        injectors: vec![Arc::new(CoreContextInjector)],
+        injectors: vec![
+            Arc::new(ClaudeMdInjector),
+            Arc::new(CollaborationModeInjector),
+        ],
         compaction: Arc::new(CoreCompactionPolicy),
     }
 }
 
-/// Identity injector: forwards the exact fixed-slot messages
-/// `build_completion_request` emitted inline before the extension seam —
-/// multi-level CLAUDE.md eager block (gated on `instructions_enabled`), then
-/// the `<collaboration_mode>` block (gated on `depth == 0`), in that order.
-struct CoreContextInjector;
+/// Injects the multi-level CLAUDE.md eager block as a fixed-slot user message,
+/// gated on `instructions_enabled` (off only for the built-in `Explore`
+/// sub-agent). Contributes nothing when no instruction files load.
+struct ClaudeMdInjector;
 
-impl ContextInjector for CoreContextInjector {
+impl ContextInjector for ClaudeMdInjector {
     fn inject(&self, ctx: &TurnCtx) -> Vec<LanguageModelRequestMessage> {
-        let mut out = Vec::new();
         if ctx.instructions_enabled
             && let Some(text) = crate::claude_md::render_eager(
                 &crate::claude_md::load(ctx.cwd, &crate::settings::claude_md_load_context()),
                 ctx.agent_language,
             )
         {
-            out.push(LanguageModelRequestMessage {
+            return vec![LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec![MessageContent::Text(text)],
                 cache: true,
-            });
+            }];
         }
-        if ctx.depth == 0 {
-            let instructions = crate::collaboration_mode::unified_instructions(ctx.agent_language);
-            out.push(LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![MessageContent::Text(format!(
-                    "<collaboration_mode>\n{instructions}\n</collaboration_mode>"
-                ))],
-                cache: true,
-            });
+        Vec::new()
+    }
+}
+
+/// Injects the `<collaboration_mode>` block as a fixed-slot user message, gated
+/// on `depth == 0` (main thread only; sub-agents carry their own `agents/*.md`
+/// body and run in `Default`).
+struct CollaborationModeInjector;
+
+impl ContextInjector for CollaborationModeInjector {
+    fn inject(&self, ctx: &TurnCtx) -> Vec<LanguageModelRequestMessage> {
+        if ctx.depth != 0 {
+            return Vec::new();
         }
-        out
+        let instructions = crate::collaboration_mode::unified_instructions(ctx.agent_language);
+        vec![LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![MessageContent::Text(format!(
+                "<collaboration_mode>\n{instructions}\n</collaboration_mode>"
+            ))],
+            cache: true,
+        }]
     }
 }
 
