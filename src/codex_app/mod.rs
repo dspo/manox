@@ -88,7 +88,7 @@ pub fn launch_with_injection(selection: &Selection, _passthrough_args: &[String]
         ])
         .env("CODEX_HOME", &codex_home)
         .env(&env_key, &apikey)
-        .env("CX_MODEL", &default_model.id)
+        .env("CX_MODEL", default_model.api_model_id())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

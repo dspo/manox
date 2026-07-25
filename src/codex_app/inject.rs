@@ -38,12 +38,19 @@ const REASONING_EFFORTS: &[(&str, &str)] = &[
 ];
 
 /// 生成完整注入脚本。`default_reasoning_effort` 应与 config.toml 的 `model_reasoning_effort` 一致。
+///
+/// Model IDs injected into the renderer have the `[Nm]` context-window suffix
+/// stripped — it is a cx-internal convention that providers do not recognise.
 pub fn build_injection_script(models: &[ResolvedModel], default_reasoning_effort: &str) -> String {
-    let default_model = models.first().map(|m| m.id.clone()).unwrap_or_default();
+    let default_model = models
+        .first()
+        .map(|m| m.api_model_id())
+        .unwrap_or_default();
     let descriptors = model_descriptors(models, &default_model);
     let models_json = serde_json::to_string(&descriptors).unwrap_or_else(|_| "[]".into());
-    let names: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    let names_json = serde_json::to_string(&names).unwrap_or_else(|_| "[]".into());
+    let names: Vec<String> = models.iter().map(|m| m.api_model_id()).collect();
+    let names_json =
+        serde_json::to_string(&names).unwrap_or_else(|_| "[]".into());
     let default_json = serde_json::to_string(&default_model).unwrap_or_else(|_| "\"\"".into());
     let effort_json =
         serde_json::to_string(default_reasoning_effort).unwrap_or_else(|_| "\"medium\"".into());
@@ -66,15 +73,17 @@ fn model_descriptors(models: &[ResolvedModel], default_model: &str) -> serde_jso
     let arr: Vec<_> = models
         .iter()
         .map(|m| {
+            // The id sent to the API must not carry the `[Nm]` context suffix.
+            let api_id = m.api_model_id();
             json!({
-                "model": m.id,
-                "id": m.id,
-                "slug": m.id,
-                "name": m.id,
-                "displayName": m.id,
+                "model": api_id,
+                "id": api_id,
+                "slug": api_id,
+                "name": api_id,
+                "displayName": api_id,
                 "description": if m.desc.is_empty() { "Custom model".to_string() } else { m.desc.clone() },
                 "hidden": false,
-                "isDefault": m.id == default_model,
+                "isDefault": api_id == default_model,
                 "upgrade": null,
                 "upgradeInfo": null,
                 "availabilityNux": null,
@@ -348,6 +357,18 @@ mod tests {
         assert!(script.contains("\"slug\""));
         assert!(script.contains("supportedReasoningEfforts"));
         assert!(script.contains("\"isDefault\":true"));
+    }
+
+    #[test]
+    fn injection_script_strips_context_window_suffix() {
+        let models = vec![rm("qwen3.7-max[1m]"), rm("glm-5.2[1m123k]")];
+        let script = build_injection_script(&models, "high");
+        // The [Nm] suffix must not leak into the injected model IDs.
+        assert!(script.contains("\"qwen3.7-max\""));
+        assert!(script.contains("\"glm-5.2\""));
+        assert!(!script.contains("[1m]"));
+        assert!(!script.contains("[1m123k]"));
+        assert!(script.contains("window.__cxDefaultModel = \"qwen3.7-max\""));
     }
 
     #[test]
