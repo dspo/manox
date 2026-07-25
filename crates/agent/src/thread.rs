@@ -3306,7 +3306,7 @@ impl Thread {
     /// history — crosses `max_input * threshold_pct` (see
     /// `compact::effective_context_tokens`).
     fn auto_compaction_target(&self) -> Option<usize> {
-        if self.depth != 0 || !crate::settings::side_calls().compaction_policy().enabled {
+        if !crate::settings::side_calls().compaction_policy().enabled {
             return None;
         }
         let settings = crate::settings::load();
@@ -3324,32 +3324,32 @@ impl Thread {
             Some(window) => (window, crate::compact::CLAUDE_CODE_AUTO_COMPACT_THRESHOLD),
             None => (model.max_token_count(), settings.auto_compact.threshold),
         };
-        let target = crate::compact::auto_compaction_target_ix(
-            &self.messages,
-            self.token_meter.per_request(),
-            settings.auto_compact.enabled,
-            max_input,
-            threshold,
-            self.agent_language,
-        )?;
-        if crate::settings::context_optimization().history_pruning == crate::settings::Toggle::On {
-            let prefix = &self.messages[..target.min(self.messages.len())];
-            if let Some(pruned) =
-                crate::retention::prune_for_compaction(prefix, self.cwd.as_ref(), &self.id.0)
-            {
-                let threshold_tokens = ((max_input as f64) * threshold).ceil() as u64;
-                if crate::compact::effective_context_tokens(
-                    &pruned,
-                    &std::collections::HashMap::new(),
-                    self.agent_language,
-                ) < threshold_tokens
-                {
-                    self.avoided_compactions.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
+        // The judgement (target search + history-pruning avoidance) lives in
+        // the thread's compaction policy — `DefaultCompactionPolicy` for the
+        // main thread, `NoCompactionPolicy` for a sub-agent (so the depth-0
+        // guard is now encoded by which policy is registered). The metric bump
+        // stays here: the policy is a pure function and reports an avoided
+        // compaction as an outcome variant.
+        let outcome = self
+            .extensions
+            .compaction
+            .decide(&crate::turn_ext::CompactionInput {
+                messages: &self.messages,
+                per_request: self.token_meter.per_request(),
+                cwd: self.cwd.as_ref(),
+                thread_id: &self.id.0,
+                agent_language: self.agent_language,
+                max_input_tokens: max_input,
+                threshold_pct: threshold,
+            });
+        match outcome {
+            crate::turn_ext::CompactionOutcome::Compact { insertion_ix } => Some(insertion_ix),
+            crate::turn_ext::CompactionOutcome::Avoided => {
+                self.avoided_compactions.fetch_add(1, Ordering::Relaxed);
+                None
             }
+            crate::turn_ext::CompactionOutcome::Skip => None,
         }
-        Some(target)
     }
 
     /// Manually trigger a compaction (`/compact`). No-op when a turn is in
