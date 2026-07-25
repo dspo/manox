@@ -364,7 +364,6 @@ workspace-project-blank = 新建空白项目
 workspace-project-select-folder = 选择文件夹
 workspace-project-name-prompt = 项目文件夹名称
 workspace-empty-prompt = 我们该做什么？
-workspace-effort-section = 推理强度
 workspace-provider-reload-failed = 重新加载 provider 配置失败，已保留原有 providers：{$error}
 
 ### views/composer_menu.rs

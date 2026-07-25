@@ -416,7 +416,6 @@ workspace-project-blank = Create blank project
 workspace-project-select-folder = Select folder
 workspace-project-name-prompt = Project folder name
 workspace-empty-prompt = What should we do?
-workspace-effort-section = Reasoning effort
 workspace-provider-reload-failed = Failed to reload provider config; keeping previous providers: {$error}
 
 ### views/composer_menu.rs
