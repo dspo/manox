@@ -1,0 +1,1 @@
+{{ count }} consecutive tool calls were denied in this turn. The user or the safety policy is rejecting this approach. Stop calling tools. Summarize the situation, state exactly what you were trying to run, and ask the user how to proceed.
