@@ -103,7 +103,7 @@ fn conditional_core(name: &str) -> bool {
             ))
 }
 
-/// Core schemas followed by conditional Skill and then discovered schemas in
+/// Core schemas followed by conditional Code and then discovered schemas in
 /// first-activation order. Existing entries never move between turns.
 pub fn schema_order(thread_id: &str) -> Vec<String> {
     let mut order: Vec<String> = CORE_TOOLS.iter().map(|name| (*name).to_string()).collect();
@@ -112,9 +112,6 @@ pub fn schema_order(thread_id: &str) -> Vec<String> {
         crate::settings::CodeModeToggle::Hybrid
     ) {
         order.push(crate::tools::CODE.to_string());
-    }
-    if crate::skill::try_global().is_some_and(|skills| !skills.list().is_empty()) {
-        order.push(crate::tools::SKILL.to_string());
     }
     for name in activated_for(thread_id) {
         if !order.contains(&name) {
