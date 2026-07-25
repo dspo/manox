@@ -81,11 +81,41 @@ pub trait ContextInjector: 'static {
     fn inject(&self, ctx: &TurnCtx) -> Vec<LanguageModelRequestMessage>;
 }
 
-/// Decides the compaction insertion point for the upcoming request, or `None`
-/// to skip. Pure judgement — the async summarization side-call stays in the
-/// core loop.
+/// Read-only inputs for the compaction judgement. Distinct from [`TurnCtx`]
+/// (the injector snapshot): compaction needs the model-derived window and the
+/// provider-reported per-request usage, which the injector slot never reads.
+/// The core resolves these once — after gating on depth / settings / a live
+/// model — and hands them to the policy, so the policy stays a pure function of
+/// its inputs.
+pub struct CompactionInput<'a> {
+    pub messages: &'a [Message],
+    pub per_request: &'a std::collections::HashMap<String, crate::language_model::TokenUsage>,
+    pub cwd: &'a Path,
+    pub thread_id: &'a str,
+    pub agent_language: Language,
+    /// The effective input-token window (model's `auto_compact_window`, else
+    /// its `max_token_count`).
+    pub max_input_tokens: u64,
+    /// The trigger threshold as a fraction of `max_input_tokens`.
+    pub threshold_pct: f64,
+}
+
+/// The compaction judgement. `Avoided` reports that a target was found but
+/// history pruning brought the projection back under the threshold, so no
+/// compaction is needed — the core records this as an avoided compaction. The
+/// side effect (the metric bump) is thus a return value, keeping the policy
+/// pure.
+pub enum CompactionOutcome {
+    Skip,
+    Compact { insertion_ix: usize },
+    Avoided,
+}
+
+/// Decides whether and where to compact before the upcoming request. Pure
+/// judgement — the async summarization side-call stays in the core loop, as
+/// does the metric bookkeeping the core derives from [`CompactionOutcome`].
 pub trait CompactionPolicy: 'static {
-    fn target_ix(&self, ctx: &TurnCtx) -> Option<usize>;
+    fn decide(&self, input: &CompactionInput) -> CompactionOutcome;
 }
 
 /// The per-thread registry of turn extensions. Constructed by
@@ -99,7 +129,7 @@ pub struct TurnExtensions {
     /// Ordered injectors; their contributions are concatenated at the fixed
     /// slot in registration order.
     pub injectors: Vec<Arc<dyn ContextInjector>>,
-    /// Exactly one compaction policy. Not yet consulted by the loop (PR3).
+    /// Exactly one compaction policy, consulted by `auto_compaction_target`.
     pub compaction: Arc<dyn CompactionPolicy>,
 }
 
@@ -125,7 +155,7 @@ pub fn main_extensions() -> TurnExtensions {
             Arc::new(ClaudeMdInjector),
             Arc::new(CollaborationModeInjector),
         ],
-        compaction: Arc::new(CoreCompactionPolicy),
+        compaction: Arc::new(DefaultCompactionPolicy),
     }
 }
 
@@ -141,7 +171,7 @@ pub fn child_extensions() -> TurnExtensions {
             Arc::new(ClaudeMdInjector),
             Arc::new(CollaborationModeInjector),
         ],
-        compaction: Arc::new(CoreCompactionPolicy),
+        compaction: Arc::new(NoCompactionPolicy),
     }
 }
 
@@ -189,13 +219,56 @@ impl ContextInjector for CollaborationModeInjector {
     }
 }
 
-/// Identity compaction policy: contributes no target, so the core's
-/// `Thread::auto_compaction_target` remains the sole decision-maker until PR3
-/// moves that logic here.
-struct CoreCompactionPolicy;
+/// The main thread's auto-compaction judgement: find the target insertion
+/// point for the effective context fill, then — when history pruning is on —
+/// re-check whether pruning the cold prefix brings the projection back under
+/// the threshold, in which case the compaction is avoided. The core has
+/// already gated on depth / settings / a live model and resolved the window,
+/// so this is a pure function of its inputs.
+struct DefaultCompactionPolicy;
 
-impl CompactionPolicy for CoreCompactionPolicy {
-    fn target_ix(&self, _ctx: &TurnCtx) -> Option<usize> {
-        None
+impl CompactionPolicy for DefaultCompactionPolicy {
+    fn decide(&self, input: &CompactionInput) -> CompactionOutcome {
+        let Some(target) = crate::compact::auto_compaction_target_ix(
+            input.messages,
+            input.per_request,
+            true,
+            input.max_input_tokens,
+            input.threshold_pct,
+            input.agent_language,
+        ) else {
+            return CompactionOutcome::Skip;
+        };
+        if crate::settings::context_optimization().history_pruning == crate::settings::Toggle::On {
+            let prefix = &input.messages[..target.min(input.messages.len())];
+            if let Some(pruned) =
+                crate::retention::prune_for_compaction(prefix, input.cwd, input.thread_id)
+            {
+                let threshold_tokens =
+                    ((input.max_input_tokens as f64) * input.threshold_pct).ceil() as u64;
+                if crate::compact::effective_context_tokens(
+                    &pruned,
+                    &std::collections::HashMap::new(),
+                    input.agent_language,
+                ) < threshold_tokens
+                {
+                    return CompactionOutcome::Avoided;
+                }
+            }
+        }
+        CompactionOutcome::Compact {
+            insertion_ix: target,
+        }
+    }
+}
+
+/// A sub-agent's compaction policy: never compact. A delegated sub-thread does
+/// not silently rewrite its own context under the parent's nose; its overflow
+/// rescue path is separate and unconditional.
+struct NoCompactionPolicy;
+
+impl CompactionPolicy for NoCompactionPolicy {
+    fn decide(&self, _input: &CompactionInput) -> CompactionOutcome {
+        CompactionOutcome::Skip
     }
 }
