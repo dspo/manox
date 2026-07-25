@@ -110,6 +110,10 @@ pub struct ThreadRecord {
     /// thread the moment it opens, without waiting for a fresh stream.
     pub per_model_token_usage: std::collections::HashMap<String, TokenUsage>,
     pub background_tasks: Vec<crate::background_task::TaskSnapshot>,
+    /// Tools the user permanently allowed in this thread (the AlwaysAllow
+    /// grant). Persisted so a restart does not silently revoke the grant and
+    /// push every approval-required call back through the reviewer.
+    pub always_allowed_tools: Vec<String>,
 }
 
 /// Decompressed payload of the `thread_data` BLOB.
@@ -120,6 +124,8 @@ struct ThreadData {
     per_model_token_usage: std::collections::HashMap<String, TokenUsage>,
     #[serde(default)]
     background_tasks: Vec<crate::background_task::TaskSnapshot>,
+    #[serde(default)]
+    always_allowed_tools: Vec<String>,
 }
 
 const COMPRESSION_LEVEL: i32 = 3;
@@ -179,6 +185,7 @@ impl ThreadsDatabase {
             request_token_usage: rec.request_token_usage.clone(),
             per_model_token_usage: rec.per_model_token_usage.clone(),
             background_tasks: rec.background_tasks.clone(),
+            always_allowed_tools: rec.always_allowed_tools.clone(),
         };
         let json = serde_json::to_vec(&data).context("serialize thread data")?;
         let compressed =
@@ -353,6 +360,7 @@ impl ThreadsDatabase {
                     request_token_usage: std::collections::HashMap::new(),
                     per_model_token_usage: std::collections::HashMap::new(),
                     background_tasks: Vec::new(),
+                    always_allowed_tools: Vec::new(),
                 })
             },
         );
@@ -381,6 +389,7 @@ impl ThreadsDatabase {
         rec.request_token_usage = data.request_token_usage;
         rec.per_model_token_usage = data.per_model_token_usage;
         rec.background_tasks = data.background_tasks;
+        rec.always_allowed_tools = data.always_allowed_tools;
         Ok(Some(rec))
     }
 
@@ -534,6 +543,7 @@ impl ThreadRecord {
             request_token_usage: std::collections::HashMap::new(),
             per_model_token_usage: std::collections::HashMap::new(),
             background_tasks: Vec::new(),
+            always_allowed_tools: Vec::new(),
         }
     }
 }

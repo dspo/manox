@@ -111,6 +111,11 @@ pub struct MaxTurnsSummaryData {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DenialBreakerData {
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PeerMessageData {
     pub from: String,
     pub content: String,

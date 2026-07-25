@@ -56,6 +56,10 @@ const TPL_WRAPPER_UNFULFILLED_TOOL_INTENT_NUDGE_EN: &str =
     include_str!("templates/en/wrapper/unfulfilled_tool_intent_nudge.tera.md");
 const TPL_WRAPPER_UNFULFILLED_TOOL_INTENT_NUDGE_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/unfulfilled_tool_intent_nudge.tera.md");
+const TPL_WRAPPER_DENIAL_BREAKER_DIRECTIVE_EN: &str =
+    include_str!("templates/en/wrapper/denial_breaker_directive.tera.md");
+const TPL_WRAPPER_DENIAL_BREAKER_DIRECTIVE_ZH_CN: &str =
+    include_str!("templates/zh-CN/wrapper/denial_breaker_directive.tera.md");
 const TPL_WRAPPER_PEER_MESSAGE_EN: &str = include_str!("templates/en/wrapper/peer_message.tera.md");
 const TPL_WRAPPER_PEER_MESSAGE_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/peer_message.tera.md");
@@ -141,6 +145,11 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::WrapperUnfulfilledToolIntentNudge,
         TPL_WRAPPER_UNFULFILLED_TOOL_INTENT_NUDGE_EN,
         TPL_WRAPPER_UNFULFILLED_TOOL_INTENT_NUDGE_ZH_CN,
+    ),
+    (
+        PromptTemplate::WrapperDenialBreakerDirective,
+        TPL_WRAPPER_DENIAL_BREAKER_DIRECTIVE_EN,
+        TPL_WRAPPER_DENIAL_BREAKER_DIRECTIVE_ZH_CN,
     ),
     (
         PromptTemplate::WrapperPeerMessage,
@@ -441,8 +450,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 21);
-        assert_eq!(REGISTRATIONS.len(), 21);
+        assert_eq!(template::ALL.len(), 22);
+        assert_eq!(REGISTRATIONS.len(), 22);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -600,6 +609,16 @@ mod tests {
                 )
                 .unwrap(),
                 PromptTemplate::WrapperEmptyTurnNudge,
+                lang,
+            );
+            assert_clean(
+                &render(
+                    PromptTemplate::WrapperDenialBreakerDirective,
+                    lang,
+                    &crate::prompt::DenialBreakerData { count: 5 },
+                )
+                .unwrap(),
+                PromptTemplate::WrapperDenialBreakerDirective,
                 lang,
             );
             assert_clean(

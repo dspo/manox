@@ -397,6 +397,28 @@ pub struct PendingAuthMeta {
 /// forever.
 const MAX_RECOVERY_ATTEMPTS: u32 = 3;
 
+/// Consecutive denied tool calls within one turn before the circuit breaker
+/// fires: the model is re-trying an approach the user or the safety policy
+/// keeps rejecting (thread dfdb0880 looped on 250 bare denials). One last
+/// directive round-trip runs on the first hit; a second hit hard-stops.
+const MAX_CONSECUTIVE_TOOL_DENIALS: usize = 5;
+
+/// Byte cap applied to the autopilot reviewer's Ask reason before it is
+/// shown to the model. The reviewer is *asked* for <=200 chars but nothing
+/// enforces that; a rambling reason both blows up the tool result and
+/// nudges the model into argumentative retry loops.
+const REVIEWER_REASON_CAP: usize = 500;
+
+/// Longest char-boundary-safe prefix of `s` not exceeding `max_bytes`,
+/// marked when truncated.
+fn truncate_str(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let end = s.floor_char_boundary(max_bytes);
+    format!("{}…[truncated]", &s[..end])
+}
+
 /// Sanitize a message sequence to fix structural issues that cause API 400 errors.
 ///
 /// Removes orphaned tool_results (tool_results without corresponding tool_use),
@@ -684,6 +706,18 @@ pub struct Thread {
     /// `run_turn_loop` entry — it accumulates within a single turn's retries,
     /// not across turns.
     recovery_retries: u32,
+    /// Tool-use ids the AutoPilot reviewer allowed this turn. The fallback
+    /// gate in `run_tool_inner` cannot otherwise distinguish a reviewer-
+    /// approved call from an unrouted one, and would deny both.
+    reviewer_allowed: std::collections::HashSet<String>,
+    /// Denied tool calls in a row this turn (autopilot reviewer refusals,
+    /// fallback-gate denials). Reset at `run_turn_loop` entry and on any
+    /// successful tool result; trips the breaker at
+    /// `MAX_CONSECUTIVE_TOOL_DENIALS`.
+    consecutive_tool_denials: usize,
+    /// Set when the breaker already granted its one directive round-trip — a
+    /// second hit ends the turn for good.
+    denial_breaker_directive_injected: bool,
     /// Set alongside `pending_stream_error` when the mid-stream error is a
     /// classified `ContextOverflow` — the empty-tool-use branch then routes to
     /// a single compact-and-retry instead of the generic nudge, because
@@ -833,6 +867,10 @@ pub struct Thread {
 struct ChildAuthRoute {
     child: WeakEntity<Thread>,
     child_auth_id: String,
+    /// The sub-agent's tool awaiting approval. Needed so an AlwaysAllow grant
+    /// on the bubbled prompt can be recorded in the parent's permission
+    /// cache (children inherit a copy of it at spawn time).
+    tool_name: String,
 }
 
 /// Session-scoped state for a thread currently inside a git worktree. Not
@@ -991,6 +1029,9 @@ impl Thread {
                 pending_parse_error: false,
                 pending_stream_error: None,
                 recovery_retries: 0,
+                reviewer_allowed: std::collections::HashSet::new(),
+                consecutive_tool_denials: 0,
+                denial_breaker_directive_injected: false,
                 pending_context_overflow: false,
                 overflow_recovery_attempted: false,
                 last_stop_reason: None,
@@ -1099,7 +1140,9 @@ impl Thread {
                 messages: rec.messages,
                 model,
                 tools: Arc::new(tools::main_registry(cwd.clone(), weak, agent_language)),
-                permission: Arc::new(PermissionCache::default()),
+                permission: Arc::new(PermissionCache::from_snapshot(
+                    rec.always_allowed_tools.into_iter().collect(),
+                )),
                 approval_mode: ApprovalMode::from_i64(rec.approval_mode),
                 cwd,
                 project,
@@ -1123,6 +1166,9 @@ impl Thread {
                 pending_parse_error: false,
                 pending_stream_error: None,
                 recovery_retries: 0,
+                reviewer_allowed: std::collections::HashSet::new(),
+                consecutive_tool_denials: 0,
+                denial_breaker_directive_injected: false,
                 pending_context_overflow: false,
                 overflow_recovery_attempted: false,
                 last_stop_reason: None,
@@ -1229,6 +1275,9 @@ impl Thread {
                 pending_parse_error: false,
                 pending_stream_error: None,
                 recovery_retries: 0,
+                reviewer_allowed: std::collections::HashSet::new(),
+                consecutive_tool_denials: 0,
+                denial_breaker_directive_injected: false,
                 pending_context_overflow: false,
                 overflow_recovery_attempted: false,
                 last_stop_reason: None,
@@ -1307,6 +1356,7 @@ impl Thread {
             request_token_usage: self.token_meter.per_request().clone(),
             per_model_token_usage: self.token_meter.per_model().clone(),
             background_tasks: self.background_task_snapshots(),
+            always_allowed_tools: self.permission.allowed_tools().into_iter().collect(),
         })
     }
 
@@ -1455,6 +1505,22 @@ impl Thread {
         response: ToolAuthorizationResponse,
         cx: &mut Context<Self>,
     ) {
+        // An AlwaysAllow grant outlives the single call: record it in the
+        // session cache so the approval gate stops prompting for this tool.
+        // Without this the UI's AlwaysAllow button silently behaves like
+        // AllowOnce (PR #340 dropped the grant along with the old flow).
+        // Sub-agent auths are routed here by composite id: the grant lands in
+        // the parent's cache, which children inherit a copy of at spawn.
+        if matches!(
+            response,
+            ToolAuthorizationResponse::Decision(PermissionDecision::AlwaysAllow)
+        ) {
+            if let Some(meta) = self.pending_auth_meta.get(id) {
+                self.permission.set_always_allowed(&meta.tool_name);
+            } else if let Some(route) = self.pending_child_auth.get(id) {
+                self.permission.set_always_allowed(&route.tool_name.clone());
+            }
+        }
         if let Some(tx) = self.pending_authorizations.remove(id) {
             self.pending_auth_meta.remove(id);
             let _ = tx.send(response);
@@ -1537,6 +1603,7 @@ impl Thread {
             ChildAuthRoute {
                 child,
                 child_auth_id,
+                tool_name: tool_name.clone(),
             },
         );
         cx.emit(ThreadEvent::ToolCallAuthorization {
@@ -3635,6 +3702,11 @@ impl Thread {
             this.recovery_retries = 0;
             this.overflow_recovery_attempted = false;
             this.last_stop_reason = None;
+            // Turn-scoped denial streak: a prior turn's denials must not arm
+            // the breaker against this turn's first rejections.
+            this.consecutive_tool_denials = 0;
+            this.denial_breaker_directive_injected = false;
+            this.reviewer_allowed.clear();
         })?;
         loop {
             // Increment at the top so `turn_count` is 1-indexed for the
@@ -4147,7 +4219,7 @@ impl Thread {
                                     verdict: verdict.clone(),
                                 });
                             });
-                            Self::deny_autopilot_tool(this, &tu, &title, &reason, lang, cx)?;
+                            Self::deny_tool_with_reason(this, &tu, &title, &reason, lang, cx)?;
                         }
                     }
                     Some(_) if !review_enabled => {
@@ -4164,7 +4236,7 @@ impl Thread {
                                     verdict: verdict.clone(),
                                 });
                             });
-                            Self::deny_autopilot_tool(this, &tu, &title, &reason, lang, cx)?;
+                            Self::deny_tool_with_reason(this, &tu, &title, &reason, lang, cx)?;
                         }
                     }
                     Some(model) => {
@@ -4210,7 +4282,8 @@ impl Thread {
                             );
                             match &verdict {
                                 crate::approval::ReviewVerdict::Allow => {
-                                    let _ = this.update(cx, |_, cx| {
+                                    let _ = this.update(cx, |this, cx| {
+                                        this.reviewer_allowed.insert(tu.id.clone());
                                         cx.emit(ThreadEvent::ApprovalDecision {
                                             tool_name: tu.name.to_string(),
                                             tool_title: title,
@@ -4227,7 +4300,15 @@ impl Thread {
                                             verdict: verdict.clone(),
                                         });
                                     });
-                                    Self::deny_autopilot_tool(this, &tu, &title, reason, lang, cx)?;
+                                    // Hard-cap the reviewer's prose: the
+                                    // reviewer is asked for <=200 chars but
+                                    // nothing enforces it, and a multi-KB
+                                    // reason is what wedges the model into
+                                    // re-try loops.
+                                    let reason = truncate_str(reason, REVIEWER_REASON_CAP);
+                                    Self::deny_tool_with_reason(
+                                        this, &tu, &title, &reason, lang, cx,
+                                    )?;
                                 }
                             }
                         }
@@ -4311,6 +4392,38 @@ impl Thread {
                 return Err(e);
             }
             if cancel.is_cancelled() {
+                break;
+            }
+
+            // Denial circuit breaker: a model whose tool calls keep getting
+            // refused (reviewer Ask, user Deny, fallback gate) must not spin
+            // forever — the main thread has no `max_turns` cap. The first hit
+            // grants one directive round-trip so the model wraps up with a
+            // user-facing explanation instead of ending mid-work; a second
+            // hit (the directive was ignored) hard-stops the turn.
+            let hit_denial_breaker = this.update(cx, |this, cx| {
+                if this.consecutive_tool_denials < MAX_CONSECUTIVE_TOOL_DENIALS {
+                    return false;
+                }
+                if !this.denial_breaker_directive_injected {
+                    this.denial_breaker_directive_injected = true;
+                    this.insert_user_message(
+                        crate::prompt::render(
+                            crate::prompt::PromptTemplate::WrapperDenialBreakerDirective,
+                            this.agent_language,
+                            &crate::prompt::DenialBreakerData {
+                                count: this.consecutive_tool_denials,
+                            },
+                        )
+                        .expect("denial breaker directive render"),
+                        cx,
+                    );
+                    return false;
+                }
+                cx.emit(ThreadEvent::Stop(StopReason::EndTurn));
+                true
+            })?;
+            if hit_denial_breaker {
                 break;
             }
 
@@ -4735,14 +4848,19 @@ impl Thread {
             ),
             // Any bare decision means the question never reached the user:
             // Deny (cancel, timeout, or a rejected prompt) is surfaced as-is.
-            _ => (
-                crate::prompt::render_static(
-                    crate::prompt::PromptTemplate::WrapperToolDenied,
-                    lang,
+            _ => {
+                this.update(cx, |this, _| {
+                    this.consecutive_tool_denials += 1;
+                })?;
+                (
+                    crate::prompt::render_static(
+                        crate::prompt::PromptTemplate::WrapperToolDenied,
+                        lang,
+                    )
+                    .expect("tool denied render"),
+                    true,
                 )
-                .expect("tool denied render"),
-                true,
-            ),
+            }
         };
         Self::emit_tool_result(&this, &id, &name, &title, &output, is_error, cx)?;
         Self::append_tool_result(&this, tu, output, is_error, cx)?;
@@ -4788,24 +4906,21 @@ impl Thread {
 
         // Approval gate: interactive tools (AskUserQuestion) are dispatched
         // to `run_interactive_tool_inner` above. Regular approval-required
-        // tools are either in the free batch (Danger mode or always-allowed)
-        // or were already vetted by the safety reviewer in the AutoPilot
-        // branch of `run_turn_loop` — a `needs_approval` tool reaching here
-        // is an unexpected fallback. Deny it rather than running unsandboxed
-        // code the user never saw.
+        // tools reach here only when Danger bypassed the gate, an always-allow
+        // grant covers them, or the AutoPilot reviewer already allowed them in
+        // `run_turn_loop`. Anything else is an unexpected fallback: deny it
+        // rather than running unsandboxed code the user never saw, and say so
+        // in the result so the model stops retrying instead of looping.
         let needs_approval = tool.requires_approval(&tu.input)
             && !this.read_with(cx, |this, _| {
                 let always_allowable = tool.is_always_allowable(&tu.input);
-                always_allowable && this.permission.is_always_allowed(&name)
+                this.approval_mode == ApprovalMode::Danger
+                    || (always_allowable && this.permission.is_always_allowed(&name))
+                    || this.reviewer_allowed.contains(&id)
             })?;
         if needs_approval {
-            let msg = crate::prompt::render_static(
-                crate::prompt::PromptTemplate::WrapperToolDenied,
-                lang,
-            )
-            .expect("tool denied render");
-            Self::emit_tool_result(&this, &id, &name, &title, &msg, true, cx)?;
-            Self::append_tool_result(&this, tu, msg, true, cx)?;
+            let reason = "this call was neither vetted by the safety reviewer nor covered by an always-allow grant; it will not run in this session. Do not retry the same call — report what you were trying to run and ask the user how to proceed.";
+            Self::deny_tool_with_reason(&this, &tu, &title, reason, lang, cx)?;
             return Ok(());
         }
 
@@ -5018,11 +5133,12 @@ impl Thread {
         Ok(())
     }
 
-    /// Synthesize a denied `ToolResult` for a tool the autopilot safety
-    /// reviewer refused to run. The reviewer's `reason` is returned to the
-    /// model so it can adjust its approach, and the ToolCall card shows
-    /// `Denied` status.
-    fn deny_autopilot_tool(
+    /// Synthesize a denied `ToolResult` for a tool that will not run (autopilot
+    /// reviewer refusal or the fallback approval gate). The `reason` is
+    /// returned to the model so it can adjust its approach, the ToolCall card
+    /// shows `Denied` status, and the turn's denial streak advances toward the
+    /// circuit breaker.
+    fn deny_tool_with_reason(
         this: &gpui::WeakEntity<Self>,
         tu: &LanguageModelToolUse,
         title: &str,
@@ -5038,7 +5154,8 @@ impl Thread {
                 .unwrap_or_default(),
             reason
         );
-        this.update(cx, |_, cx| {
+        this.update(cx, |this, cx| {
+            this.consecutive_tool_denials += 1;
             cx.emit(ThreadEvent::ToolCall {
                 id: id.clone(),
                 name: name.clone(),
@@ -5263,6 +5380,7 @@ impl Thread {
             // make it available in the schema for subsequent turns. Core tools
             // are always present and need no activation.
             if !is_error {
+                this.consecutive_tool_denials = 0;
                 crate::tools::tool_search::activate_tools(&this.id.0, &[(*tu.name).to_string()]);
                 // BashOutput is needed only for a background Bash invocation.
                 if tu.name.as_ref() == crate::tools::BASH
@@ -6655,6 +6773,7 @@ mod tests {
                     super::ChildAuthRoute {
                         child: gpui::WeakEntity::<super::Thread>::new_invalid(),
                         child_auth_id: "child".to_string(),
+                        tool_name: crate::tools::BASH.to_string(),
                     },
                 );
             });
@@ -9975,5 +10094,447 @@ mod tests {
             &messages[0].content[0],
             MessageContent::Text(t) if t.as_str() == "user feedback"
         ));
+    }
+
+    /// Extract the first tool_result in history, for assertions on the
+    /// outcome a tool call produced.
+    #[cfg(test)]
+    fn first_tool_result(thread: &super::Thread) -> Option<LanguageModelToolResult> {
+        thread
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|c| match c {
+                MessageContent::ToolResult(tr) => Some(tr.clone()),
+                _ => None,
+            })
+    }
+
+    /// A spawned `run_tool_inner` awaits a background-executor tool task,
+    /// which the test foreground does not pump on its own — poll with real
+    /// time slices until the slot fills (mirrors the goal e2e tests above).
+    #[cfg(test)]
+    fn await_run_tool_inner(
+        cx: &gpui::TestAppContext,
+        slot: &std::sync::Mutex<Option<anyhow::Result<()>>>,
+    ) -> anyhow::Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if let Some(res) = slot.lock().unwrap().take() {
+                return res;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run_tool_inner did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Regression for thread dfdb0880: a Danger session's approval-required
+    /// tool calls must actually run. PR #340 dropped the Danger exemption
+    /// from `run_tool_inner`'s fallback gate, so every unsandboxed Bash call
+    /// was silently auto-denied ("用户拒绝执行") and the model retried 250
+    /// times.
+    #[test]
+    fn danger_mode_runs_approval_required_tool() {
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test("danger-gate", "/tmp", Vec::new());
+            rec.approval_mode = super::ApprovalMode::Danger.as_i64();
+            super::Thread::restore(rec, None, cx)
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_danger".into(),
+            name: crate::tools::WRITE.into(),
+            raw_input: String::new(),
+            input: json!({"path": "/tmp/manox-danger-gate-test.txt", "content": "ok"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let weak = thread.downgrade();
+        let cancel = CancellationToken::new();
+        let result: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let r = result.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *r.lock().unwrap() =
+                    Some(super::Thread::run_tool_inner(weak, tu, cancel, &mut cx).await);
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+
+        let res = await_run_tool_inner(&cx, &result);
+        assert!(res.is_ok(), "run_tool_inner failed: {:?}", res.err());
+
+        cx.update(|cx| {
+            let t = thread.read(cx);
+            let result = first_tool_result(t).expect("tool result appended");
+            assert!(
+                !result.is_error,
+                "Danger must run the call, got: {}",
+                result.content
+            );
+            assert_eq!(t.consecutive_tool_denials, 0);
+        });
+        let _ = std::fs::remove_file("/tmp/manox-danger-gate-test.txt");
+    }
+
+    /// An approval-required call with no reviewer, no always-allow grant, and
+    /// no Danger mode must be denied *with a reason the model can act on* —
+    /// the bare `User denied execution` string was indistinguishable from a
+    /// human rejection, so models retried the identical call forever.
+    #[test]
+    fn fallback_gate_denial_carries_reason() {
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("fallback-gate", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_fallback".into(),
+            name: crate::tools::WRITE.into(),
+            raw_input: String::new(),
+            input: json!({"path": "/tmp/manox-fallback-gate-test.txt", "content": "no"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let weak = thread.downgrade();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                let _ = super::Thread::run_tool_inner(weak, tu, CancellationToken::new(), &mut cx)
+                    .await;
+            }
+        })
+        .detach();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let result = first_tool_result(thread.read(cx)).expect("tool result appended");
+            assert!(result.is_error);
+            assert!(
+                result.content.contains("Do not retry"),
+                "denial must tell the model to stop retrying, got: {}",
+                result.content
+            );
+            assert_eq!(thread.read(cx).consecutive_tool_denials, 1);
+        });
+        assert!(
+            !std::path::Path::new("/tmp/manox-fallback-gate-test.txt").exists(),
+            "the denied call must not have written the file"
+        );
+    }
+
+    /// A successful tool result resets the denial streak; a streak of denials
+    /// accumulates. This is the counter the circuit breaker reads.
+    #[test]
+    fn denial_streak_counts_and_resets() {
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test("denial-streak", "/tmp", Vec::new());
+            rec.approval_mode = super::ApprovalMode::Danger.as_i64();
+            super::Thread::restore(rec, None, cx)
+        });
+        let weak = thread.downgrade();
+
+        // Two denials via the fallback gate (AutoPilot first, so the gate
+        // applies), then one success (Danger), then one more denial.
+        for (id, mode) in [
+            ("d1", super::ApprovalMode::AutoPilot),
+            ("d2", super::ApprovalMode::AutoPilot),
+            ("ok", super::ApprovalMode::Danger),
+            ("d3", super::ApprovalMode::AutoPilot),
+        ] {
+            cx.update(|cx| {
+                thread.update(cx, |t, cx| t.set_approval_mode(mode, cx));
+            });
+            let tu = LanguageModelToolUse {
+                id: id.into(),
+                name: crate::tools::WRITE.into(),
+                raw_input: String::new(),
+                input: json!({"path": "/tmp/manox-streak-test.txt", "content": "x"}),
+                is_input_complete: true,
+                thought_signature: None,
+            };
+            let weak = weak.clone();
+            let slot: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+            let s = slot.clone();
+            cx.spawn(|cx| {
+                let mut cx = cx.clone();
+                async move {
+                    *s.lock().unwrap() = Some(
+                        super::Thread::run_tool_inner(weak, tu, CancellationToken::new(), &mut cx)
+                            .await,
+                    );
+                }
+            })
+            .detach();
+            let res = await_run_tool_inner(&cx, &slot);
+            assert!(res.is_ok(), "{id}: {:?}", res.err());
+        }
+
+        cx.update(|cx| {
+            // d1, d2 denied (streak 2) → ok succeeds (reset) → d3 denied.
+            assert_eq!(thread.read(cx).consecutive_tool_denials, 1);
+        });
+        let _ = std::fs::remove_file("/tmp/manox-streak-test.txt");
+    }
+
+    /// The UI's AlwaysAllow button must plant a grant in the permission cache
+    /// (and thus into the next snapshot's `always_allowed_tools`). PR #340
+    /// dropped the grant along with the old approval flow, so the button
+    /// silently behaved like AllowOnce.
+    #[test]
+    fn always_allow_response_plants_grant() {
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("always-allow", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        cx.update(|cx| {
+            thread.update(cx, |t, cx| {
+                t.pending_auth_meta.insert(
+                    "auth1".into(),
+                    super::PendingAuthMeta {
+                        tool_name: crate::tools::BASH.to_string(),
+                        summary: "Bash ls".into(),
+                        input: json!({}),
+                    },
+                );
+                t.respond_authorization(
+                    "auth1",
+                    super::ToolAuthorizationResponse::Decision(
+                        crate::tool::PermissionDecision::AlwaysAllow,
+                    ),
+                    cx,
+                );
+                assert!(t.permission.is_always_allowed(crate::tools::BASH));
+            });
+        });
+    }
+
+    /// A model that emits one approval-required Write call per round, forever.
+    struct WriteLoopMockModel;
+
+    impl crate::language_model::LanguageModel for WriteLoopMockModel {
+        fn id(&self) -> String {
+            "test/write-loop".into()
+        }
+        fn name(&self) -> String {
+            self.id()
+        }
+        fn provider_id(&self) -> String {
+            "test".into()
+        }
+        fn provider_name(&self) -> String {
+            "test".into()
+        }
+        fn wire_api(&self) -> crate::provider::WireApi {
+            crate::provider::WireApi::Anthropic
+        }
+        fn max_token_count(&self) -> u64 {
+            4096
+        }
+        fn stream_completion(
+            &self,
+            _request: LanguageModelRequest,
+            _cx: &gpui::AsyncApp,
+        ) -> futures::future::BoxFuture<
+            'static,
+            anyhow::Result<
+                futures::stream::BoxStream<'static, anyhow::Result<LanguageModelCompletionEvent>>,
+            >,
+        > {
+            Box::pin(async move {
+                use futures::StreamExt as _;
+                let id = uuid::Uuid::new_v4().to_string();
+                Ok(futures::stream::iter(vec![
+                    Ok(LanguageModelCompletionEvent::ToolUse(
+                        LanguageModelToolUse {
+                            id: id.clone(),
+                            name: Arc::from(crate::tools::WRITE),
+                            raw_input: String::new(),
+                            input: serde_json::json!({"path": "/tmp/manox-breaker-test.txt", "content": "x"}),
+                            is_input_complete: true,
+                            thought_signature: None,
+                        },
+                    )),
+                    Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)),
+                ])
+                .boxed())
+            })
+        }
+    }
+
+    /// An approval-required call the AutoPilot reviewer allowed must pass the
+    /// fallback gate: PR #340 gave the gate no way to tell a reviewer-
+    /// approved call from an unrouted one, so Allow verdicts were executed
+    /// as denials and AutoPilot could never run an unsandboxed call.
+    #[test]
+    fn reviewer_allowed_call_passes_fallback_gate() {
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        crate::agent_def::init();
+        crate::hashline::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+        let thread = cx.update(|cx| {
+            super::Thread::restore(
+                crate::db::ThreadRecord::for_test("reviewer-allow", "/tmp", Vec::new()),
+                None,
+                cx,
+            )
+        });
+        cx.update(|cx| {
+            thread.update(cx, |t, _| {
+                t.reviewer_allowed.insert("tu_vetted".to_string());
+            });
+        });
+        let tu = LanguageModelToolUse {
+            id: "tu_vetted".into(),
+            name: crate::tools::WRITE.into(),
+            raw_input: String::new(),
+            input: json!({"path": "/tmp/manox-reviewer-allow-test.txt", "content": "ok"}),
+            is_input_complete: true,
+            thought_signature: None,
+        };
+        let weak = thread.downgrade();
+        let slot: Arc<Mutex<Option<anyhow::Result<()>>>> = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        cx.spawn(|cx| {
+            let mut cx = cx.clone();
+            async move {
+                *s.lock().unwrap() = Some(
+                    super::Thread::run_tool_inner(weak, tu, CancellationToken::new(), &mut cx)
+                        .await,
+                );
+            }
+        })
+        .detach();
+        let res = await_run_tool_inner(&cx, &slot);
+        assert!(res.is_ok(), "run_tool_inner failed: {:?}", res.err());
+
+        cx.update(|cx| {
+            let result = first_tool_result(thread.read(cx)).expect("tool result appended");
+            assert!(
+                !result.is_error,
+                "reviewer-allowed call must run, got: {}",
+                result.content
+            );
+        });
+        let _ = std::fs::remove_file("/tmp/manox-reviewer-allow-test.txt");
+    }
+
+    /// End-to-end for thread dfdb0880's failure shape: AutoPilot, reviewer
+    /// disabled (fail-closed denial), model retries the identical Write call
+    /// every round. The denial circuit breaker must stop the turn instead of
+    /// looping forever — the main thread has no max_turns cap.
+    #[test]
+    fn denial_breaker_stops_runaway_turn() {
+        let _store_lock = THREAD_STORE_TEST_LOCK.lock().unwrap();
+        crate::agent_def::init();
+        let cx = gpui::TestAppContext::single();
+        cx.update(crate::runtime::init);
+
+        struct StoreGuard;
+        impl Drop for StoreGuard {
+            fn drop(&mut self) {
+                crate::thread_store::drop_for_test();
+            }
+        }
+        let _store_guard = StoreGuard;
+        let db = Arc::new(
+            crate::db::ThreadsDatabase::open(std::path::Path::new(":memory:"))
+                .expect("open memory database"),
+        );
+        cx.update(|cx| crate::thread_store::init_for_test(db, cx));
+
+        let model: AnyLanguageModel = Arc::new(WriteLoopMockModel);
+        let thread = cx.update(|cx| {
+            let mut rec = crate::db::ThreadRecord::for_test(
+                "denial-breaker",
+                "/tmp",
+                vec![Message::user("keep writing".into())],
+            );
+            rec.title = Some("breaker".into());
+            super::Thread::restore(rec, Some(model), cx)
+        });
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| thread.run_turn(cx));
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            cx.run_until_parked();
+            if cx.update(|cx| thread.read(cx).is_running()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "denial breaker did not stop the turn"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            break;
+        }
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let t = thread.read(cx);
+            let denied: std::collections::HashSet<&str> = t
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter_map(|c| match c {
+                    MessageContent::ToolResult(tr) if tr.is_error => Some(tr.tool_use_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            // 5 denials arm the breaker; the directive round-trip adds one
+            // more before the hard stop — never the unbounded loop dfdb0880
+            // spun into (250 and counting when the user gave up).
+            assert!(
+                denied.len() <= super::MAX_CONSECUTIVE_TOOL_DENIALS + 1,
+                "expected the breaker to cap denials, saw {}",
+                denied.len()
+            );
+            let directive = t
+                .messages
+                .iter()
+                .filter(|m| m.role == crate::language_model::Role::User)
+                .any(|m| {
+                    m.content.iter().any(|c| {
+                        matches!(c, MessageContent::Text(s) if s.contains("Stop calling tools"))
+                    })
+                });
+            assert!(directive, "breaker directive was injected into history");
+        });
     }
 }

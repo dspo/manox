@@ -32,6 +32,7 @@ pub enum PromptTemplate {
     WrapperRecoveryFailure,
     WrapperEmptyTurnNudge,
     WrapperUnfulfilledToolIntentNudge,
+    WrapperDenialBreakerDirective,
     WrapperPeerMessage,
     WrapperAskUserQuestions,
     WrapperToolDenied,
@@ -74,6 +75,7 @@ impl PromptTemplate {
             Self::WrapperUnfulfilledToolIntentNudge => {
                 "wrapper/unfulfilled_tool_intent_nudge.tera.md"
             }
+            Self::WrapperDenialBreakerDirective => "wrapper/denial_breaker_directive.tera.md",
             Self::WrapperPeerMessage => "wrapper/peer_message.tera.md",
             Self::WrapperAskUserQuestions => "wrapper/ask_user_questions.tera.md",
             Self::WrapperToolDenied => "wrapper/tool_denied.tera.md",
@@ -96,7 +98,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 21] = [
+pub const ALL: [PromptTemplate; 22] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::WrapperMaxTurnsSummary,
@@ -104,6 +106,7 @@ pub const ALL: [PromptTemplate; 21] = [
     PromptTemplate::WrapperRecoveryFailure,
     PromptTemplate::WrapperEmptyTurnNudge,
     PromptTemplate::WrapperUnfulfilledToolIntentNudge,
+    PromptTemplate::WrapperDenialBreakerDirective,
     PromptTemplate::WrapperPeerMessage,
     PromptTemplate::WrapperAskUserQuestions,
     PromptTemplate::WrapperToolDenied,
