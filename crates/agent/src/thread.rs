@@ -7279,20 +7279,31 @@ mod tests {
             "injector fixed slot must be byte-identical to the inlined logic"
         );
 
-        // The full request is byte-stable across two builds (the prefix-cache
-        // invariant) and carries every injected block's text. The downstream
-        // `coalesce_same_role` pass may merge the adjacent User injector
-        // messages into the following turn, so the slot is asserted by content
-        // presence rather than by position.
+        // The injected slot rides immediately after the system head, in order.
+        // On this empty-history thread the two adjacent User injector messages
+        // are merged by `coalesce_same_role` into the single message at index 1,
+        // which must lead with the CLAUDE.md block and carry the
+        // collaboration_mode block after it — pinning slot POSITION, not just
+        // content presence, so a future reorder is caught rather than only a
+        // content-drop. The request is byte-stable across two builds (the
+        // prefix-cache invariant).
         let req = cx.update(|cx| thread.read(cx).build_completion_request());
-        assert_eq!(req.messages[0].role, Role::System);
-        for m in &expected {
-            let want = text_of_req(m);
-            assert!(
-                req.messages.iter().any(|r| text_of_req(r).contains(&want)),
-                "request must carry injected block: {want}"
-            );
-        }
+        assert_eq!(req.messages[0].role, Role::System, "system head first");
+        assert_eq!(req.messages[1].role, Role::User, "injector slot at index 1");
+        let slot = text_of_req(&req.messages[1]);
+        let claude_md = text_of_req(&expected[0]);
+        let collab = text_of_req(&expected[1]);
+        assert!(
+            slot.starts_with(&claude_md),
+            "slot must lead with the CLAUDE.md block: {slot}"
+        );
+        let claude_end = slot
+            .find(&collab)
+            .expect("slot must carry collaboration_mode");
+        assert!(
+            claude_end >= claude_md.len(),
+            "collaboration_mode must follow the CLAUDE.md block, not precede it"
+        );
         let req2 = cx.update(|cx| thread.read(cx).build_completion_request());
         assert_eq!(req.messages, req2.messages, "request prefix is byte-stable");
 
