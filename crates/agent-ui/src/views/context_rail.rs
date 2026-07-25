@@ -19,6 +19,7 @@
 //! the conversation, and while it is open the card stays hidden so the
 //! conversation reclaims its width.
 
+use agent::provider::registry;
 use agent::{Thread, ThreadEvent, i18n};
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
@@ -268,7 +269,6 @@ impl ContextRail {
             .child(self.render_agents_section(theme, cx))
             .child(self.render_branch_block(&project, theme, cx))
             .child(self.render_usage_section(theme, cx))
-            .child(self.render_cockpit_context_budget(theme, cx))
             .child(self.render_plan_section(theme, cx))
             .child(gpui::div().h(px(1.)).w_full().bg(theme.border))
             // Sources section.
@@ -293,10 +293,12 @@ impl ContextRail {
 
     /// Cumulative token total row with a hover tooltip consolidating main
     /// calls, side calls, and context optimization distribution data.
-    /// Usage section: a header row with the cumulative token total, followed by
-    /// a per-model token breakdown tree when per-model data is available.
-    /// Side-call metrics and context optimization distribution data ride as a
-    /// hover tooltip on the header row.
+    /// Usage section: a header row (icon + "消费" + total tokens), followed by
+    /// a per-model token breakdown tree when per-model data is available. Each
+    /// model node now carries a tree prefix (├─ / └─), shows its context-window
+    /// size as `[1m]`, and integrates its context-budget fill as the first
+    /// tree child (Context X% used/cap). Input/cache and output are the second
+    /// and third children.
     fn render_usage_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let muted = theme.muted_foreground;
         let total = crate::cockpit::format_tokens(
@@ -348,38 +350,92 @@ impl ContextRail {
             header.into_any_element()
         };
 
-        // Per-model token breakdown tree: model name → input/cache row → output row.
+        // Per-model token breakdown tree with context budget integrated.
         let thread = self.thread.read(cx);
         let per_model = thread.per_model_token_usage();
+        let effective_tokens = agent::compact::effective_context_tokens(
+            thread.messages(),
+            thread.request_token_usage(),
+            thread.agent_language(),
+        );
+        let warn_color = theme.warning;
         let mut section = v_flex().w_full().gap_0p5().child(header);
         if !per_model.is_empty() {
             let mut models: Vec<(&String, &agent::language_model::TokenUsage)> =
                 per_model.iter().collect();
             models.sort_by_key(|(_, u)| -(u.total_tokens() as i64));
-            for (model_id, usage) in models {
-                let cache_pct = crate::cockpit::cache_read_ratio(*usage);
+            let total_models = models.len();
+            for (i, (model_id, usage)) in models.iter().enumerate() {
+                let is_last_model = i == total_models - 1;
+                // Tree glyphs: model node gets the root branch glyph; children
+                // share a vertical-line or empty-line indent prefix plus their
+                // own branch glyph.
+                let branch = if is_last_model { "└─" } else { "├─" };
+                let indent = if is_last_model { "   " } else { "│  " };
+
+                let cache_pct = crate::cockpit::cache_read_ratio(**usage);
+                let window_label = registry::global()
+                    .get_model(model_id)
+                    .map(|m| {
+                        let cap = crate::cockpit::format_tokens(m.max_token_count());
+                        format!("[{cap}]")
+                    })
+                    .unwrap_or_default();
                 let model_label = if let Some(pct) = cache_pct {
                     format!(
-                        "{}  {}",
+                        "{} {}{}  {}",
+                        branch,
                         model_id,
+                        window_label,
                         i18n::t_str(
                             "workspace-env-cache-hit-rate",
                             &[("pct", &format!("{:.0}", pct * 100.0))]
                         )
                     )
                 } else {
-                    model_id.clone()
+                    format!("{} {}{}", branch, model_id, window_label)
                 };
 
+                section = section.child(
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .child(SharedString::from(model_label)),
+                );
+
+                // Context budget row — first tree child.
+                if let Some(m) = registry::global().get_model(model_id) {
+                    let max_input = m.max_token_count();
+                    if let Some(budget) = context_budget_pct(max_input, effective_tokens) {
+                        let pct = (budget.used_pct.round() as i64).clamp(0, 100);
+                        let used = crate::cockpit::format_tokens(budget.active_tokens);
+                        let cap = crate::cockpit::format_tokens(budget.cap_tokens);
+                        let near_full = budget.used_pct >= 90.0;
+                        let ctx_color = if near_full { warn_color } else { muted };
+                        let ctx_line = i18n::t_str(
+                            "workspace-env-context-budget",
+                            &[("pct", &pct.to_string()), ("used", &used), ("cap", &cap)],
+                        );
+                        section = section.child(
+                            gpui::div()
+                                .pl(px(16.))
+                                .text_xs()
+                                .text_color(ctx_color)
+                                .child(SharedString::from(format!("{indent}├─ {ctx_line}"))),
+                        );
+                    }
+                }
+
                 let throughput = format!(
-                    "{} ↑{}  {} ↑{}",
+                    "{indent}├─ {} ↑{}  {} ↑{}",
                     i18n::t("workspace-env-throughput"),
                     crate::cockpit::format_tokens(usage.input_tokens),
                     i18n::t("workspace-env-cache"),
                     crate::cockpit::format_tokens(usage.cache_read_input_tokens),
                 );
                 let output_line = format!(
-                    "{} ↓{}",
+                    "{indent}└─ {} ↓{}",
                     i18n::t("workspace-env-output"),
                     crate::cockpit::format_tokens(usage.output_tokens),
                 );
@@ -387,21 +443,14 @@ impl ContextRail {
                 section = section
                     .child(
                         gpui::div()
-                            .text_xs()
-                            .text_color(theme.foreground)
-                            .truncate()
-                            .child(SharedString::from(model_label)),
-                    )
-                    .child(
-                        gpui::div()
-                            .pl(px(12.))
+                            .pl(px(16.))
                             .text_xs()
                             .text_color(muted)
                             .child(SharedString::from(throughput)),
                     )
                     .child(
                         gpui::div()
-                            .pl(px(12.))
+                            .pl(px(16.))
                             .text_xs()
                             .text_color(muted)
                             .child(SharedString::from(output_line)),
@@ -410,7 +459,6 @@ impl ContextRail {
         }
         section.into_any_element()
     }
-
     /// Change counts `+added` / `-deleted` plus an untracked badge, themed
     /// directly with no label or icon. Rides as the branch row's trailing
     /// element (right-aligned). `--` / no-project is the placeholder before
@@ -694,63 +742,6 @@ impl ContextRail {
             .children(rows)
             .into_any_element()
     }
-    /// Context-window fill — one line: `Context {pct}% {used} / {cap}`.
-    /// The percentage is `active / window`; the cap is the model's real
-    /// max_input_tokens. Omitted when the thread has no model / zero window.
-    /// The cumulative token total lives in the usage row.
-    fn render_cockpit_context_budget(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let thread = self.thread.read(cx);
-        let max_input = thread.model().map(|m| m.max_token_count()).unwrap_or(0);
-        let budget = context_budget_pct(
-            max_input,
-            agent::compact::effective_context_tokens(
-                thread.messages(),
-                thread.request_token_usage(),
-                thread.agent_language(),
-            ),
-        );
-        let muted = theme.muted_foreground;
-        let warn = theme.warning;
-
-        // The label starts at a fixed x whether or not the leading slot holds
-        // the icon (kept for alignment with sibling rows).
-        const LEAD_W: f32 = 14.;
-
-        let mut rows = v_flex().w_full().gap_0p5();
-
-        if let Some(budget) = budget {
-            let pct = (budget.used_pct.round() as i64).clamp(0, 100);
-            let used = crate::cockpit::format_tokens(budget.active_tokens);
-            let cap = crate::cockpit::format_tokens(budget.cap_tokens);
-            let near = budget.used_pct >= 90.0;
-            let color = if near { warn } else { muted };
-            rows = rows.child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        gpui::div()
-                            .w(px(LEAD_W))
-                            .h(px(LEAD_W))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(IconName::BatteryFull).xsmall().text_color(muted)),
-                    )
-                    .child(
-                        gpui::div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(color)
-                            .child(format!("Context {pct}% {used} / {cap}")),
-                    ),
-            );
-        }
-
-        rows.into_any_element()
-    }
-
     /// Sort key for plan steps: InProgress (0) → Pending (1) → Completed (2).
     /// Within each priority group the original chronological order is preserved
     /// by `sort_by_key`'s stable sort.

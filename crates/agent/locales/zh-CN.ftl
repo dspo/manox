@@ -469,6 +469,7 @@ workspace-env-cache = 缓存
 workspace-env-output = 输出
 workspace-env-cache-hit-rate = 缓存 {$pct}%
 workspace-env-sources = 来源
+workspace-env-context-budget = Context {$pct}% {$used} / {$cap}
 workspace-env-no-sources = 暂无来源
 workspace-env-git-unavailable = git 不可用
 workspace-env-git-not-a-repo = 非 git 仓库

@@ -524,6 +524,7 @@ workspace-env-cache = Cache
 workspace-env-output = Output
 workspace-env-cache-hit-rate = cache {$pct}%
 workspace-env-sources = Sources
+workspace-env-context-budget = Context {$pct}% {$used} / {$cap}
 workspace-env-no-sources = No sources yet
 workspace-env-git-unavailable = git unavailable
 workspace-env-git-not-a-repo = Not a git repo
