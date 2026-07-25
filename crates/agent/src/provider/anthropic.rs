@@ -288,9 +288,10 @@ pub async fn stream_anthropic(
         Ok(resp) => {
             let status = resp.status();
             tracing::info!(model, status = status.as_u16(), "anthropic response");
-            // Non-2xx: drain and log the raw body for post-mortem. The SSE
-            // parser downstream will see an empty stream and exit cleanly —
-            // the error is already captured at warn level above.
+            // Non-2xx: drain the body for logging, forward an error through
+            // `tx` so the caller sees the failure (otherwise the stream looks
+            // empty and the recovery mechanism can't distinguish "zero tokens"
+            // from "HTTP error").
             if !status.is_success() {
                 let body_text = resp.text().await.unwrap_or_else(|_| "<unreadable>".into());
                 tracing::warn!(
@@ -299,6 +300,13 @@ pub async fn stream_anthropic(
                     body = %body_text,
                     "anthropic non-2xx response",
                 );
+                let _ = tx
+                    .send(Err(anyhow!(
+                        "Anthropic HTTP {}: {}",
+                        status.as_u16(),
+                        body_text
+                    )))
+                    .await;
                 return Ok(());
             }
             resp
@@ -595,7 +603,7 @@ struct AnthropicMessageDelta {
 struct AnthropicErrorPayload {
     /// Standard Anthropic: `type` (e.g. "invalid_request_error").
     /// Bailian: absent (uses `code` instead).
-    #[serde(default)]
+    #[serde(default, rename = "type")]
     error_type: Option<String>,
     /// Bailian: `code` (e.g. "InvalidParameter"). Standard Anthropic: absent.
     #[serde(default)]
