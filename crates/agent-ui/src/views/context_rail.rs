@@ -65,6 +65,7 @@ pub(crate) struct ContextRail {
     /// `Workspace`; used to determine the main agent's status indicator.
     pub(crate) cockpit_phase: CockpitPhase,
     /// The model's current execution plan, published via `UpdatePlan` and
+    /// recovered from history on reload. `None` until the model publishes one
     /// (or after it clears its list). The rail renders the snapshot's own
     /// step statuses verbatim — nothing here infers progress.
     pub(crate) plan: Option<PlanSnapshot>,
