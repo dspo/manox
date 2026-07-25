@@ -590,22 +590,22 @@ Floating absolute card over the conversation column's top-right (`absolute().top
 
 #### ContextRailPanel
 
-Panel body (the card's content, content height — no internal scroll surface, though the plan section has its own bounded scroll region). The conversation-info rows (title, status, changes, branch) sit above the usage tree; the plan section and context budget render from cockpit state owned by the rail.
+Panel body (the card's content, content height — no internal scroll surface, though the plan section has its own bounded scroll region). The conversation-info rows (title, status, changes, branch) sit above the usage tree; the plan section renders from cockpit state owned by the rail.
 
 Contents, top to bottom:
 
 - **Header**: bold title (i18n `context-rail-title`) + a [ContextRailCollapseBtn](#contextrailcollapsebtn) ghost button.
 - **Status block** (`cockpit_status_block`): a two-line card — phase label (semibold) on line 1, an xs muted elapsed+tokens meta line (i18n `cockpit-run-status-meta`) on line 2. Elapsed refreshes per-second via the thinking ticker.
 - **Agents tree**: [ContextRailAgents](#contextrailagents), with `Main` as the root and every direct or nested sub-agent underneath it.
-- **Context budget row**: `context_budget_pct` reads the thread's effective context fill — `agent::compact::effective_context_tokens(thread.messages(), thread.request_token_usage())`, the same max(provider-reported usage, local bytes/4 estimate) the auto-compaction trigger uses, so the display and the trigger agree — against the model window and the `cockpit_auto_compact_threshold` cached on the rail. Renders one line with `pct%` remaining + explicit `used / cap` token counts (i18n `cockpit-context-remaining-ctx`); warning-colored within 10% of the trigger. Hidden entirely when no model is configured.
-- **Plan section** (`render_plan_section`, collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): the model's execution plan, taken verbatim from the `PlanSnapshot` it publishes via the `UpdatePlan` tool — NOT inferred from the approved `<proposed_plan>` Markdown (that produced a stale dump of implementation bullets). Each step's status (`pending` / `in_progress` / `completed`) is the model's own report; nothing here auto-promotes or infers progress. The header carries a `done/total` count (i18n `cockpit-plan-progress`) and a chevron — those are the only collapse affordance (no hint text). Collapsed shows just the current step (first `in_progress`, else first `pending`) plus a `+N to do` remaining count (i18n `cockpit-plan-remaining`), or an "All done" note (i18n `cockpit-plan-all-done`) when every step is completed. Expanded lists every step in a bounded `max_h(160px).overflow_y_scroll()` region; each row truncates its one-line title with a full-text tooltip. The first snapshot for a thread auto-collapses when it has more than 5 steps (`plan_seen` guards this so later updates preserve the user's collapse choice); the plan is recovered on reload/thread-switch by `agent::plan::rebuild_from_messages` (the latest non-errored `UpdatePlan` tool call in history). Hidden entirely when there is no plan.
+- **Usage section** (`render_usage_section`): `MemoryStick` icon + "Usage" / "消费" header with cumulative token total, then a per-model tree (sorted by total tokens desc, empty for unused models). Each model node carries a tree prefix (`├─` / `└─`), shows its context-window size as `[1m]` via `registry::global().get_model`, and has a trailing `cache {pct}%` hit-rate badge (i18n `workspace-env-cache-hit-rate`). Three tree children per model, all indented with `│  ` / `   ` + `├─` / `└─`:
+  1. **Context budget row** (i18n `workspace-env-context-budget`): per-model `Context {pct}% {used} / {cap}`, computed by `context_budget_pct(model.max_token_count(), effective_context_tokens(...))`. Goes warning-colored at ≥90%.
+  2. **Input/cache row**: `├─ 穿透 ↑{input}  缓存 ↑{cache}` (i18n `workspace-env-throughput` / `workspace-env-cache`).
+  3. **Output row**: `└─ 输出 ↓{output}` (i18n `workspace-env-output`).
+- **Plan section** (`render_plan_section`, collapsible via `ToggleCockpitTasks` / ctrl/cmd-shift-m, `cockpit_hide_tasks`): the model's execution plan, taken verbatim from the `PlanSnapshot` it publishes via the `UpdatePlan` tool.
 - **Changes row**: [ContextRailChangesRow](#contextrailchangesrow).
 - **Branch row**: [ContextRailBranchRow](#contextrailbranchrow).
-- **Usage section** (`render_usage_section`): `MemoryStick` icon + "Usage" header, then per-model blocks (sorted by total tokens desc; empty for unused models). Each block is:
-  - Model id line (truncated to `ENV_MODEL_ID_MAX` chars) + trailing `cache {pct}%` hit-rate badge (i18n `workspace-env-cache-hit-rate`) computed by `cockpit::cache_read_ratio` (denominator = uncached input + cache-read).
-  - A two-row tree: `├── 穿透` (i18n `workspace-env-throughput`) carrying `↑{input}` / `↓{output}` animated counters, and `└── 缓存` (i18n `workspace-env-cache`) carrying `↑{cache_create}` / `↓{cache_read}`. The throughput / cache split keeps the cache-read share legible as a branch rather than buried among flat rows. Tree prefixes (`├── ` / `└── `) are painted at `muted.opacity(0.55)` so they read as chrome.
 - **Hairline divider**.
-- **Sources section**: `Sources` label + "No sources yet" placeholder (ε track).
+- **Sources section**: `Sources` label + "No sources yet" placeholder.
 
 Each numeric cell animates scoreboard-style (`counter_animated`): a fresh `gen` is appended to the animation id on every value delta, so gpui fires a 600ms `ease_out_quint` tween from the previous rendered value to the new one. `env_counter_state: HashMap<String, (u64, u64)>` lives on `ContextRail`, rebuilt every render inside `render_usage_section` to auto-prune cells whose model disappeared.
 
