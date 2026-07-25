@@ -142,6 +142,26 @@ impl TurnExtensions {
         }
         out
     }
+
+    /// Consult the gates in order; the first non-`Defer` verdict wins. An empty
+    /// gate list (or all-`Defer`) yields `Defer`, leaving the core's default
+    /// approval path untouched. Gates encode only static, turn-independent
+    /// rules — the Danger / always-allow / reviewer short-circuits stay in the
+    /// core, so a gate never sees or overrides turn-local approval state.
+    pub fn gate(
+        &self,
+        tu: &LanguageModelToolUse,
+        tool: &dyn AgentTool,
+        ctx: &TurnCtx,
+    ) -> ToolDecision {
+        for gate in &self.gates {
+            match gate.decide(tu, tool, ctx) {
+                ToolDecision::Defer => continue,
+                verdict => return verdict,
+            }
+        }
+        ToolDecision::Defer
+    }
 }
 
 /// A main thread's turn extensions. The fixed slot is the CLAUDE.md eager
