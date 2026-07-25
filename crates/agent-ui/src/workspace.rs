@@ -845,6 +845,26 @@ impl Workspace {
                     failed,
                     stranded_steer_ids,
                 } => {
+                    // Seal the conversation's streaming state at the
+                    // authoritative turn boundary: a turn that ended without
+                    // a terminal `Stop` (provider error, stream closed without
+                    // `MessageStop`) would otherwise leave its activity
+                    // segment accepting entries — a perpetual spinner and the
+                    // root condition for the next turn's thinking folding into
+                    // a segment above the new user bubble.
+                    let weak = cx.weak_entity();
+                    let role = this.model_label(cx);
+                    let cwd = thread_cwd(&this.thread, cx);
+                    let outcome = this.conversation.update(cx, |c, cx| {
+                        c.apply(
+                            ev,
+                            &role,
+                            None,
+                            crate::conversation::ApplyCtx { weak, cwd },
+                            cx,
+                        )
+                    });
+                    this.apply_list_outcome(outcome, cx);
                     // This is the authoritative end-of-turn boundary: unlike a
                     // provider Stop event, `Thread::is_running()` is already
                     // false, so a queued follow-up can safely start a new turn.

@@ -831,11 +831,28 @@ impl ConversationState {
     /// is still accepting entries (the turn is in progress, surviving
     /// `StopReason::ToolUse`). A new `ToolCall` folds into this segment; `None`
     /// when no live segment exists, in which case the caller opens a fresh one.
-    /// Scans from the tail so the most recent live segment wins.
+    ///
+    /// A segment sitting *above* the most recent user message is never active:
+    /// a user message is a hard turn boundary (mirroring `build_items`'s
+    /// `close_segment` on a prompt), so later activity must open a fresh
+    /// segment below the bubble rather than fold into a stale segment above
+    /// it — which would render above the message the user just sent, in
+    /// inverted chronological order. This holds even when the prior segment
+    /// was left accepting entries because its turn ended without a terminal
+    /// `Stop` (a provider error that only emitted `Error`, or a stream that
+    /// closed without `MessageStop`) and for a mid-turn steer, without needing
+    /// the stale segment to have been finalized first.
     fn find_active_activity_segment(&self, cx: &App) -> Option<usize> {
-        self.items.iter().rposition(
-            |e| matches!(e.read(cx).kind(), ConvItem::Thinking(t) if t.accepting_entries),
-        )
+        let last_user_ix = self
+            .items
+            .iter()
+            .rposition(|e| matches!(e.read(cx).kind(), ConvItem::User { .. }));
+        self.items
+            .iter()
+            .rposition(
+                |e| matches!(e.read(cx).kind(), ConvItem::Thinking(t) if t.accepting_entries),
+            )
+            .filter(|&ix| last_user_ix.is_none_or(|u| ix > u))
     }
 
     /// Apply a `ThreadEvent` delta (excludes `ToolCallAuthorization`, which `Workspace` handles).
@@ -921,7 +938,25 @@ impl ConversationState {
                 self.turn_started_at = Instant::now();
                 ApplyOutcome::Unchanged
             }
-            ThreadEvent::TurnFinished { .. } => ApplyOutcome::Unchanged,
+            ThreadEvent::TurnFinished { .. } => {
+                // Authoritative end-of-turn boundary. A turn that ended
+                // without a terminal `Stop` (a provider error that only
+                // emitted `Error`, or a stream that closed without
+                // `MessageStop`) would otherwise leave its last activity
+                // segment accepting entries — a perpetual spinner whose
+                // elapsed never pins, and the root condition for the
+                // next turn's thinking folding into a segment above the
+                // new user bubble (guarded against independently by
+                // `find_active_activity_segment` ignoring segments above
+                // the last user bubble). Seal it here. Idempotent with
+                // the `Stop` arm.
+                let changed = self.finalize_streaming_items(true, cx);
+                if changed {
+                    ApplyOutcome::RemeasureAll
+                } else {
+                    ApplyOutcome::Unchanged
+                }
+            }
             // Goal lifecycle is surfaced by the composer chip + status popover,
             // not as a conversation item.
             ThreadEvent::GoalChanged { .. } => ApplyOutcome::Unchanged,
@@ -1368,12 +1403,7 @@ impl ConversationState {
                 // A terminal stop (`EndTurn`/`MaxTokens`/`Refusal`) freezes
                 // the segment and auto-collapses everything.
                 let terminal = !matches!(reason, StopReason::ToolUse);
-                for e in &self.items {
-                    e.update(cx, |item, cx| {
-                        item.finalize_streaming(terminal, cx);
-                        cx.notify();
-                    });
-                }
+                self.finalize_streaming_items(terminal, cx);
                 // Stamp the per-turn usage onto the last assistant reply so its
                 // footer can show input/output/cache totals for this turn. Walk
                 // backward: the last item may be a tool call or reasoning block
@@ -1630,6 +1660,32 @@ impl ConversationState {
             return true;
         }
         false
+    }
+
+    /// Sweep every item through `MessageItem::finalize_streaming` — the
+    /// terminal-`Stop` treatment, reused at the `TurnFinished` boundary so a
+    /// turn that ended without a terminal `Stop` (a provider error that only
+    /// emitted `Error`, or a stream that closed without `MessageStop`) still
+    /// freezes its activity segment instead of leaving a perpetual spinner.
+    /// Returns whether any item had live streaming state that finalizing could
+    /// change the height of, so the caller can decide whether the list's
+    /// per-item height cache needs a remeasure. `terminal` distinguishes a
+    /// hard boundary (turn end, which freezes segments and pins elapsed) from
+    /// a mid-turn `Stop(ToolUse)` (reasoning rounds only). Idempotent.
+    fn finalize_streaming_items(&mut self, terminal: bool, cx: &mut App) -> bool {
+        let changed = self.items.iter().any(|e| match e.read(cx).kind() {
+            ConvItem::Thinking(t) => t.accepting_entries || t.streaming,
+            ConvItem::Assistant { streaming, .. } => *streaming,
+            ConvItem::ToolCall(t) => t.streaming,
+            _ => false,
+        });
+        for e in &self.items {
+            e.update(cx, |item, cx| {
+                item.finalize_streaming(terminal, cx);
+                cx.notify();
+            });
+        }
+        changed
     }
 
     pub fn clear(&mut self) {
@@ -2723,5 +2779,259 @@ mod tests {
         }));
         assert!(t.get_tool_entry_mut("tu_1").is_some());
         assert!(t.get_tool_entry_mut("nonexistent").is_none());
+    }
+
+    /// Joined reasoning text of a segment's reasoning rounds, for ordering
+    /// assertions.
+    fn reasoning_text(t: &ThinkingContainer) -> String {
+        t.entries
+            .iter()
+            .filter_map(|e| match e {
+                ActivityEntry::Reasoning { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn stale_segment_conv(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<ConversationState>, ApplyCtx) {
+        cx.update(gpui_component::init);
+        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let weak = gpui::WeakEntity::<Workspace>::new_invalid();
+        let ctx = ApplyCtx {
+            weak: weak.clone(),
+            cwd: None,
+        };
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.push_user(
+                    "first".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(1, "model".into(), None),
+                    weak.clone(),
+                    cx,
+                );
+                // A turn whose segment was left accepting entries because it
+                // ended without a terminal `Stop` (provider error that only
+                // emitted `Error`, or a stream that closed without
+                // `MessageStop`).
+                let _ = c.apply(
+                    &ThreadEvent::AgentThinking("old".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+            });
+        });
+        (conversation, ctx)
+    }
+
+    /// A new user message is a hard segment boundary: the next turn's
+    /// thinking must open a fresh segment *below* the bubble, not fold into
+    /// the stale accepting segment sitting above it (which would render above
+    /// the message the user just sent). `find_active_activity_segment` ignores
+    /// segments above the most recent user bubble.
+    #[gpui::test]
+    fn agent_thinking_after_user_message_does_not_fold_into_stale_segment(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (conversation, ctx) = stale_segment_conv(cx);
+        let weak = ctx.weak.clone();
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.push_user(
+                    "second".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(2, "model".into(), None),
+                    weak.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::AgentThinking("new".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+            });
+        });
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                // [U(first), T(old), U(second), T(new)]
+                assert_eq!(c.items().len(), 4);
+                let stale = match c.items()[1].read(cx).kind() {
+                    ConvItem::Thinking(t) => reasoning_text(t),
+                    _ => panic!("expected Thinking at index 1"),
+                };
+                assert_eq!(
+                    stale, "old",
+                    "stale segment above the bubble must not absorb the new turn's thinking"
+                );
+                let fresh = match c.items()[3].read(cx).kind() {
+                    ConvItem::Thinking(t) => reasoning_text(t),
+                    _ => panic!("expected Thinking at index 3"),
+                };
+                assert_eq!(
+                    fresh, "new",
+                    "new turn's thinking must open a fresh segment below the user bubble"
+                );
+            });
+        });
+    }
+
+    /// A mid-turn steer is also a user-message boundary: the optimistic steer
+    /// bubble must not have the turn's subsequent thinking fold into the segment
+    /// above it. Mirrors the rebuild path's `close_segment` on a prompt.
+    #[gpui::test]
+    fn agent_thinking_after_pending_steer_does_not_fold_into_segment_above(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (conversation, ctx) = stale_segment_conv(cx);
+        let weak = ctx.weak.clone();
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.push_pending_steer(
+                    "adjust".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(2, "model".into(), None),
+                    "s1".into(),
+                    weak.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::AgentThinking("b".into()),
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+            });
+        });
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                // [U(first), T(a="old"), U(steer), T(b)]
+                assert_eq!(c.items().len(), 4);
+                let pre = match c.items()[1].read(cx).kind() {
+                    ConvItem::Thinking(t) => reasoning_text(t),
+                    _ => panic!("expected Thinking at index 1"),
+                };
+                assert_eq!(pre, "old");
+                let post = match c.items()[3].read(cx).kind() {
+                    ConvItem::Thinking(t) => reasoning_text(t),
+                    _ => panic!("expected Thinking at index 3"),
+                };
+                assert_eq!(
+                    post, "b",
+                    "post-steer thinking must open a fresh segment below the steer bubble"
+                );
+            });
+        });
+    }
+
+    /// A tool call is the other code path that folds into the active activity
+    /// segment (`find_active_activity_segment`). It must respect the same
+    /// user-message boundary as `AgentThinking`: a `ToolCall` after a new user
+    /// message opens a fresh segment below the bubble instead of folding into
+    /// the stale accepting segment above it.
+    #[gpui::test]
+    fn tool_call_after_user_message_does_not_fold_into_stale_segment(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (conversation, ctx) = stale_segment_conv(cx);
+        let weak = ctx.weak.clone();
+        cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.push_user(
+                    "second".into(),
+                    Vec::new(),
+                    UserTurnMeta::new(2, "model".into(), None),
+                    weak.clone(),
+                    cx,
+                );
+                let _ = c.apply(
+                    &ThreadEvent::ToolCall {
+                        id: "tu_new".into(),
+                        name: "Read".into(),
+                        title: "Read file".into(),
+                        status: ToolCallStatus::Running,
+                        input: None,
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                );
+            });
+        });
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| {
+                // [U(first), T(old), U(second), T(tool)]
+                assert_eq!(c.items().len(), 4);
+                // Stale segment kept its reasoning round, gained no tool entry.
+                let stale = match c.items()[1].read(cx).kind() {
+                    ConvItem::Thinking(t) => t,
+                    _ => panic!("expected Thinking at index 1"),
+                };
+                assert_eq!(reasoning_text(stale), "old");
+                assert!(
+                    stale.find_tool_entry_index("tu_new").is_none(),
+                    "stale segment above the bubble must not absorb the new turn's tool call"
+                );
+                // New segment holds the tool call.
+                let fresh = match c.items()[3].read(cx).kind() {
+                    ConvItem::Thinking(t) => t,
+                    _ => panic!("expected Thinking at index 3"),
+                };
+                assert!(
+                    fresh.find_tool_entry_index("tu_new").is_some(),
+                    "new turn's tool call must open a fresh segment below the user bubble"
+                );
+            });
+        });
+    }
+
+    /// `TurnFinished` is the authoritative end-of-turn boundary and the
+    /// backstop for turns that ended without a terminal `Stop` (a provider
+    /// error emits only `Error`; a stream can close without `MessageStop`).
+    /// It must seal any still-accepting segment so the elapsed pins and the
+    /// spinner stops, and report a remeasure so the list's height cache stays
+    /// honest.
+    #[gpui::test]
+    fn turn_finished_seals_stale_accepting_segment(cx: &mut gpui::TestAppContext) {
+        let (conversation, ctx) = stale_segment_conv(cx);
+        let outcome = cx.update(|cx| {
+            conversation.update(cx, |c, cx| {
+                c.apply(
+                    &ThreadEvent::TurnFinished {
+                        cancelled: false,
+                        failed: true,
+                        stranded_steer_ids: Vec::new(),
+                    },
+                    "model",
+                    None,
+                    ctx.clone(),
+                    cx,
+                )
+            })
+        });
+        assert!(
+            matches!(outcome, ApplyOutcome::RemeasureAll),
+            "sealing a stale segment must remeasure, got {outcome:?}"
+        );
+        cx.update(|cx| {
+            conversation.read_with(cx, |c, cx| match c.items()[1].read(cx).kind() {
+                ConvItem::Thinking(t) => {
+                    assert!(
+                        !t.accepting_entries,
+                        "TurnFinished must seal the stale segment"
+                    );
+                    assert!(!t.streaming);
+                }
+                _ => panic!("expected Thinking at index 1"),
+            });
+        });
     }
 }
