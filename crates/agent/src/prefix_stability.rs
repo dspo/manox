@@ -1,34 +1,37 @@
-//! Prefix-stability diagnostics for provider-side prompt caching.
+//! Prefix-stability diagnostics and cache-invalidation detection for
+//! provider-side prompt caching.
 //!
-//! manox's `Thread::messages` is append-only today, so the byte prefix sent to
-//! the LLM (system prompt + tool specs + message history) is naturally stable
-//! across turns — only the new tail is a cache miss each turn. `StablePrefix`
-//! fingerprints the system prompt + tool specs each turn and reports drift
-//! (system-prompt change, tool-set change) so the UI can surface a cache-hit
-//! chip and accidental drift (a future feature that rewrites messages or
-//! hot-reloads tools) is visible.
+//! Two mechanisms:
 //!
-//! The `AppendOnlyLog` / `AppendOnlyContextManager` below remain scaffolding
-//! for the day per-turn tool-result truncation, image stripping, or history
-//! rewriting lands — at that point the request can be routed through
-//! [`AppendOnlyContextManager`] to preserve the byte-stable prefix up to the
-//! divergence point instead of re-sending the entire conversation (which would
-//! silently break the provider's prefix cache).
+//! 1. **StablePrefix** — system prompt + tool specs are fingerprinted each turn
+//!    and drift (system-prompt change, tool-set change) is reported so the UI
+//!    can surface a cache-hit chip and accidental drift (from future features
+//!    that rewrite messages or hot-reload tools) is visible.
 //!
-//! The digest covers every field the provider may serialize — role, content,
-//! tool calls (both `tool_calls` and OpenAI-wire `tool_calls`), tool-result
-//! ids/names/error flags, and assistant `id` — so an in-place rewrite of *any*
-//! of these fields is visible to [`AppendOnlyContextManager::sync_messages`].
+//! 2. **AppendOnlyLog** — the fully-normalized model-facing message list is
+//!    synced into an append-only log each turn via [`AppendOnlyLog::sync_messages`].
+//!    When later turns rewrite messages in-place (retention pruning, image
+//!    stripping, coalescing), `sync_messages` finds the longest byte-stable
+//!    prefix shared with the previously-synced log, preserves it, and only
+//!    appends the diverged tail — so the provider's KV cache stays warm up to
+//!    the divergence point instead of forcing a full re-prefill.
 //!
-//! The `StablePrefix` + `AppendOnlyLog` + per-message digest design,
-//! adapted to manox's
-//! `LanguageModelRequestMessage`.
-
-#![allow(dead_code)]
+//! 3. **CacheInvalidationDetector** — after each turn, inspects the provider's
+//!    usage report for a hot→cold cache transition (a turn that demonstrably had
+//!    a warm prefix that was lost on the current request). Mirrors oh-my-pi's
+//!    `detectCacheInvalidation` algorithm: requires a prior turn with meaningful
+//!    `cacheRead`, a current turn with `cacheRead` collapsed to zero, and a
+//!    `cacheWrite > 0` (the hallmark of an *explicit* prefix-controlled cache
+//!    that re-builds the prefix on a cold turn). Implicit best-effort caches
+//!    (Google/OpenAI/Fireworks, and DashScope/百炼 where `cache_creation` is
+//!    always 0) are excluded — they drop `cacheRead` to zero intermittently as
+//!    propagation noise, not a real invalidation.
 
 use xxhash_rust::xxh32::xxh32;
 
-use crate::language_model::{LanguageModelRequest, LanguageModelRequestMessage, MessageContent};
+use crate::language_model::{
+    LanguageModelRequest, LanguageModelRequestMessage, MessageContent, TokenUsage,
+};
 
 /// A fingerprinted prefix (system prompt + tool specs) tracked across turns
 /// so drift is detectable. Also tallies check/change counts for a stability
@@ -250,9 +253,7 @@ impl AppendOnlyLog {
         bound
     }
 }
-
-/// Manages a stable prefix + append-only log for the agent loop. Not yet wired
-/// into `build_completion_request`; see the module docs.
+/// Manages a stable prefix + append-only log for the agent loop.
 #[derive(Default)]
 pub struct AppendOnlyContextManager {
     pub prefix: StablePrefix,
@@ -275,6 +276,71 @@ impl AppendOnlyContextManager {
         self.prefix.invalidate();
         self.log.clear();
         self.prefix.build(request);
+    }
+}
+
+/// Minimum prefix the previous turn must have read from cache before a
+/// cold turn counts as a cache invalidation. Filters out tiny contexts
+/// where a zero `cacheRead` is expected rather than a reset.
+pub const MIN_CACHE_FOOTPRINT: u64 = 2048;
+
+/// A prompt-cache invalidation detected from a turn's usage.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheInvalidation {
+    /// Prompt tokens the cold turn had to (re)process instead of reading
+    /// from cache.
+    pub reprocessed_tokens: u64,
+}
+
+/// Detects hot→cold cache transitions by comparing the previous turn's
+/// final usage with the current turn's final usage.
+///
+/// Algorithm mirrors oh-my-pi's `detectCacheInvalidation`:
+/// 1. Previous turn must have read ≥ `MIN_CACHE_FOOTPRINT` from cache.
+/// 2. Current turn reads zero from cache.
+/// 3. Current turn wrote to cache (`cacheWrite > 0`). This is the hallmark
+///    of an *explicit* prefix-controlled cache (Anthropic/Bedrock
+///    `cache_control`) that re-builds the prefix on a cold turn. Implicit
+///    best-effort caches (Google/OpenAI/Fireworks) report `cacheWrite: 0`
+///    and drop `cacheRead` to zero intermittently as propagation noise.
+/// 4. Reprocessed tokens ≥ `MIN_CACHE_FOOTPRINT`.
+///
+/// DashScope/百炼 anthropic-compatible endpoints always report
+/// `cache_creation_input_tokens` as 0 (see `CLAUDE.md`), so condition 3
+/// is never satisfied for those endpoints — the detector correctly
+/// excludes them.
+#[derive(Default)]
+pub struct CacheInvalidationDetector {
+    last_turn_usage: Option<TokenUsage>,
+}
+
+impl CacheInvalidationDetector {
+    /// Test the current turn's final usage for a cache invalidation.
+    pub fn detect(&self, current: TokenUsage) -> Option<CacheInvalidation> {
+        let prev = self.last_turn_usage?;
+        if prev.cache_read_input_tokens < MIN_CACHE_FOOTPRINT {
+            return None;
+        }
+        if current.cache_read_input_tokens > 0 {
+            return None;
+        }
+        if current.cache_creation_input_tokens == 0 {
+            return None;
+        }
+        let reprocessed = current
+            .cache_creation_input_tokens
+            .saturating_add(current.input_tokens);
+        if reprocessed < MIN_CACHE_FOOTPRINT {
+            return None;
+        }
+        Some(CacheInvalidation {
+            reprocessed_tokens: reprocessed,
+        })
+    }
+
+    /// Record the current turn's final usage for comparison on the next turn.
+    pub fn record(&mut self, usage: TokenUsage) {
+        self.last_turn_usage = Some(usage);
     }
 }
 
