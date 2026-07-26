@@ -601,6 +601,7 @@ impl ConversationState {
                 e.read(cx).kind(),
                 ConvItem::Error(_)
                     | ConvItem::Notice(_)
+                    | ConvItem::CacheMiss { .. }
                     | ConvItem::User {
                         display_state: UserMessageDisplayState::RolledBackSteer { .. },
                         ..

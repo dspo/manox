@@ -2679,7 +2679,7 @@ fn render_cache_miss(
 ) -> gpui::AnyElement {
     let rule_width = 10;
     let tokens_str = crate::cockpit::format_tokens(reprocessed_tokens);
-    let label = format!("cache miss · {tokens_str} tokens");
+    let label = i18n::t("cache-miss-label").replace("{ $tokens }", &tokens_str);
     let rule = "\u{2500}".repeat(rule_width);
     let line = format!("{rule} {label}");
     gpui::div()

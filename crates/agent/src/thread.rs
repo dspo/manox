@@ -33,7 +33,7 @@ use crate::language_model::{
     ReasoningEffort, Role, StopReason, TokenUsage,
 };
 use crate::message::Message;
-use crate::prefix_stability::{AppendOnlyContextManager, CacheInvalidationDetector};
+use crate::prefix_stability::{CacheInvalidationDetector, StablePrefix};
 use crate::proposed_plan::{ProposedPlanParser, ProposedPlanSegment};
 use crate::title_state::TitleState;
 use crate::token_meter::TokenMeter;
@@ -847,7 +847,7 @@ pub struct Thread {
     /// Stable prefix + append-only log that preserves the byte-stable prefix
     /// across turns when messages are rewritten in-place (retention pruning,
     /// image stripping, coalescing). See [`crate::prefix_stability`].
-    ctx_mgr: AppendOnlyContextManager,
+    prefix: StablePrefix,
     /// Detects hot→cold prompt-cache transitions across turns by inspecting
     /// provider usage reports. Records the current turn's final usage on
     /// `Stop` and compares it against the next turn's final usage.
@@ -1097,7 +1097,7 @@ impl Thread {
                 reasoning_effort: ReasoningEffort::default(),
                 goal: GoalState::new(),
                 title_state: TitleState::default(),
-                ctx_mgr: AppendOnlyContextManager::new(),
+                prefix: StablePrefix::default(),
                 cache_detector: CacheInvalidationDetector::default(),
                 proxy: None,
                 provider_id,
@@ -1238,7 +1238,7 @@ impl Thread {
                     rec.title_override,
                     title_last_eval_user_count,
                 ),
-                ctx_mgr: AppendOnlyContextManager::new(),
+                prefix: StablePrefix::default(),
                 cache_detector: CacheInvalidationDetector::default(),
                 proxy: None,
                 provider_id,
@@ -1343,7 +1343,7 @@ impl Thread {
                 reasoning_effort,
                 goal: GoalState::new(),
                 title_state: TitleState::default(),
-                ctx_mgr: AppendOnlyContextManager::new(),
+                prefix: StablePrefix::default(),
                 cache_detector: CacheInvalidationDetector::default(),
                 proxy: None,
                 provider_id: None,
@@ -2673,6 +2673,8 @@ impl Thread {
     /// instead of diffing against a stale counter.
     fn finalize_request_usage(&mut self) {
         let uid = self.last_user_message_id().map(str::to_owned);
+        let current = self.token_meter.current_request();
+        self.cache_detector.record(current);
         self.token_meter.finalize_request(uid.as_deref());
     }
 
@@ -2765,7 +2767,7 @@ impl Thread {
         // tool registry's baked sandbox — force a clean prefix re-baseline so
         // the next turn captures the new prefix as a version bump rather than
         // silent drift.
-        self.ctx_mgr.prefix.invalidate();
+        self.prefix.invalidate();
         cx.notify();
     }
 
@@ -2792,7 +2794,7 @@ impl Thread {
             cx.weak_entity(),
             self.agent_language,
         ));
-        self.ctx_mgr.prefix.invalidate();
+        self.prefix.invalidate();
         cx.notify();
         Ok(())
     }
@@ -2941,7 +2943,7 @@ impl Thread {
     /// session-end auto-cleanup (Drop) can remove it when clean.
     pub(crate) fn set_worktree_state(&mut self, state: WorktreeState, cx: &mut Context<Self>) {
         self.worktree = Some(state);
-        self.ctx_mgr.prefix.invalidate();
+        self.prefix.invalidate();
         cx.notify();
     }
 
@@ -3629,7 +3631,7 @@ impl Thread {
             // cost of reclaiming context; invalidate the fingerprint so the
             // stability diagnostic reports a deliberate reset rather than a
             // silent drift.
-            this.ctx_mgr.prefix.invalidate();
+            this.prefix.invalidate();
             cx.emit(ThreadEvent::Compaction {
                 summary: summary.clone(),
                 messages_compacted,
@@ -3812,9 +3814,9 @@ impl Thread {
                 // toggle) is observable. Emitted every turn with the current
                 // stability ratio; drift flags are `true` only when that
                 // component changed this turn.
-                let change = this.ctx_mgr.prefix.build(&request);
+                let change = this.prefix.build(&request);
                 cx.emit(ThreadEvent::PrefixStability {
-                    stability_pct: this.ctx_mgr.prefix.stability_pct(),
+                    stability_pct: this.prefix.stability_pct(),
                     system_changed: change.is_some_and(|c| c.system_changed),
                     tools_changed: change.is_some_and(|c| c.tools_changed),
                 });
@@ -5348,6 +5350,17 @@ impl Thread {
                 // round (a tool-use loop iteration or a new user turn) starts
                 // from zero.
                 self.record_main_call(cx);
+                // Detect hot→cold prompt-cache transitions BEFORE the meter
+                // resets `current_request`. Uses the turn's final usage against
+                // the previous turn's final usage. `finalize_request_usage`
+                // records this turn into the detector for next-turn comparison
+                // and then resets the meter.
+                let current = self.token_meter.current_request();
+                if let Some(invalidation) = self.cache_detector.detect(current) {
+                    cx.emit(ThreadEvent::CacheInvalidation {
+                        reprocessed_tokens: invalidation.reprocessed_tokens,
+                    });
+                }
                 self.finalize_request_usage();
                 // Fire Stop hooks (e.g. a stop-gate reviewer) fail-open; the
                 // turn has already ended, so the handler runs detached.
@@ -5361,19 +5374,6 @@ impl Thread {
                     }),
                 );
                 self.last_stop_reason = Some(reason);
-                // Detect hot→cold prompt-cache transitions. Uses the turn's
-                // final usage (snapshot before reset) against the previous
-                // turn's final usage. Explicit caches (Anthropic/Bedrock)
-                // re-create the prefix on a cold turn (`cacheWrite > 0`);
-                // implicit caches (Google/OpenAI/Fireworks/DashScope) report
-                // `cacheWrite: 0` and are excluded by the detector.
-                let current = self.token_meter.current_request();
-                if let Some(invalidation) = self.cache_detector.detect(current) {
-                    cx.emit(ThreadEvent::CacheInvalidation {
-                        reprocessed_tokens: invalidation.reprocessed_tokens,
-                    });
-                }
-                self.cache_detector.record(current);
                 cx.emit(ThreadEvent::Stop(reason));
             }
             Ok(LanguageModelCompletionEvent::Retry {
@@ -5742,7 +5742,7 @@ impl Thread {
     /// project, os, shell, date) is minted here instead — see
     /// `system_prompt::build_main_system_prompt`. Thread id is deliberately
     /// absent; the model fetches it via the `self_info` tool.
-    fn build_completion_request(&mut self) -> LanguageModelRequest {
+    fn build_completion_request(&self) -> LanguageModelRequest {
         let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
         // System message: a pre-rendered base plus optional mode addendums,
         // assembled through the `system/assembly` template so no `push_str` of
@@ -5963,14 +5963,6 @@ impl Thread {
                 .is_some_and(|model| model.supports_images()),
             None,
         );
-        // Sync the normalized messages into the append-only log so later
-        // turns can preserve the byte-stable prefix when messages are
-        // rewritten in-place (retention pruning, image stripping,
-        // coalescing). The log tracks digests of every message; on the
-        // next build a `longest_stable_prefix` scan detects and preserves
-        // the shared head, keeping the provider's KV cache warm up to
-        // the divergence point.
-        self.ctx_mgr.log.sync_messages(&messages);
         LanguageModelRequest {
             messages,
             tools,
@@ -6232,7 +6224,7 @@ impl Thread {
             code_raw_tokens: approx_tokens(code_raw_bytes),
             code_projected_tokens: approx_tokens(code_projected_bytes),
             compactions_avoided: self.avoided_compactions.load(Ordering::Relaxed),
-            prefix_stability_pct: self.ctx_mgr.prefix.stability_pct(),
+            prefix_stability_pct: self.prefix.stability_pct(),
         }
     }
 }
@@ -7241,14 +7233,14 @@ mod tests {
             thread.update(cx, |t, cx| {
                 t.set_reasoning_effort(ReasoningEffort::High, cx)
             });
-            thread.update(cx, |t, _| t.build_completion_request())
+            thread.read(cx).build_completion_request()
         });
         assert_eq!(req.reasoning_effort, Some(ReasoningEffort::High.into()));
 
         // Max → Max on the wire.
         let req = cx.update(|cx| {
             thread.update(cx, |t, cx| t.set_reasoning_effort(ReasoningEffort::Max, cx));
-            thread.update(cx, |t, _| t.build_completion_request())
+            thread.read(cx).build_completion_request()
         });
         assert_eq!(req.reasoning_effort, Some(ReasoningEffort::Max.into()));
     }
@@ -7282,7 +7274,7 @@ mod tests {
             )
         });
 
-        let req = cx.update(|cx| thread.update(cx, |t, _| t.build_completion_request()));
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
         assert_eq!(req.messages[0].role, Role::System, "system head first");
         assert_eq!(req.messages[1].role, Role::User, "instructions slot");
         let block = text_of_req(&req.messages[1]);
@@ -7291,14 +7283,14 @@ mod tests {
         assert!(req.messages[1].cache, "instructions block is cacheable");
 
         // Byte-stable across builds while the files on disk are unchanged.
-        let req2 = cx.update(|cx| thread.update(cx, |t, _| t.build_completion_request()));
+        let req2 = cx.update(|cx| thread.read(cx).build_completion_request());
         assert_eq!(block, text_of_req(&req2.messages[1]));
 
         // Disabled (built-in Explore carve-out) → the slot vanishes.
         cx.update(|cx| {
             thread.update(cx, |t, _cx| t.set_instructions_enabled(false));
         });
-        let req3 = cx.update(|cx| thread.update(cx, |t, _| t.build_completion_request()));
+        let req3 = cx.update(|cx| thread.read(cx).build_completion_request());
         assert!(
             req3.messages
                 .iter()
@@ -7382,7 +7374,7 @@ mod tests {
         // content presence, so a future reorder is caught rather than only a
         // content-drop. The request is byte-stable across two builds (the
         // prefix-cache invariant).
-        let req = cx.update(|cx| thread.update(cx, |t, _| t.build_completion_request()));
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
         assert_eq!(req.messages[0].role, Role::System, "system head first");
         assert_eq!(req.messages[1].role, Role::User, "injector slot at index 1");
         let slot = text_of_req(&req.messages[1]);
@@ -7399,7 +7391,7 @@ mod tests {
             claude_end >= claude_md.len(),
             "collaboration_mode must follow the CLAUDE.md block, not precede it"
         );
-        let req2 = cx.update(|cx| thread.update(cx, |t, _| t.build_completion_request()));
+        let req2 = cx.update(|cx| thread.read(cx).build_completion_request());
         assert_eq!(req.messages, req2.messages, "request prefix is byte-stable");
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -7567,7 +7559,7 @@ mod tests {
                 cx,
             )
         });
-        let req = cx.update(|cx| thread.update(cx, |t, _| t.build_completion_request()));
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
         assert!(
             req.tools.is_empty(),
             "supports_tools=false must omit all tools (incl. plan tools)"
@@ -7605,7 +7597,7 @@ mod tests {
                 cx,
             )
         });
-        let req = cx.update(|cx| thread.update(cx, |t, _| t.build_completion_request()));
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
         assert!(
             !req.tools.is_empty(),
             "supports_tools=true must advertise the tool list"
@@ -7691,7 +7683,7 @@ mod tests {
 
         let canonical_json = serde_json::to_string(&messages).unwrap();
         let before = cx.update(|cx| serde_json::to_string(&thread.read(cx).messages).unwrap());
-        let request = cx.update(|cx| thread.update(cx, |t, _| t.build_completion_request()));
+        let request = cx.update(|cx| thread.read(cx).build_completion_request());
         let after = cx.update(|cx| serde_json::to_string(&thread.read(cx).messages).unwrap());
         let persisted = cx.update(|cx| {
             serde_json::to_string(&thread.read(cx).snapshot().unwrap().messages).unwrap()
@@ -7746,7 +7738,7 @@ mod tests {
         cx.update(|cx| {
             thread.update(cx, |t, cx| t.insert_user_message("hello".into(), cx));
         });
-        let req = cx.update(|cx| thread.update(cx, |t, _| t.build_completion_request()));
+        let req = cx.update(|cx| thread.read(cx).build_completion_request());
 
         // The wire-facing list drops System-role messages (Anthropic hoists
         // them to the top-level `system` field). Assert what remains

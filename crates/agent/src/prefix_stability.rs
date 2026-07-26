@@ -4,21 +4,14 @@
 //! Two mechanisms:
 //!
 //! 1. **StablePrefix** — system prompt + tool specs are fingerprinted each turn
-//!    and drift (system-prompt change, tool-set change) is reported so the UI
-//!    can surface a cache-hit chip and accidental drift (from future features
-//!    that rewrite messages or hot-reload tools) is visible.
+//!    against a pinned baseline snapshot. Drift (system-prompt change, tool-set
+//!    change) is reported as a `PrefixChange` so the UI can surface a cache-hit
+//!    chip. `invalidate()` is called on compaction, tool-registry changes, and
+//!    model switches so the next turn re-establishes a fresh baseline.
 //!
-//! 2. **AppendOnlyLog** — the fully-normalized model-facing message list is
-//!    synced into an append-only log each turn via [`AppendOnlyLog::sync_messages`].
-//!    When later turns rewrite messages in-place (retention pruning, image
-//!    stripping, coalescing), `sync_messages` finds the longest byte-stable
-//!    prefix shared with the previously-synced log, preserves it, and only
-//!    appends the diverged tail — so the provider's KV cache stays warm up to
-//!    the divergence point instead of forcing a full re-prefill.
-//!
-//! 3. **CacheInvalidationDetector** — after each turn, inspects the provider's
-//!    usage report for a hot→cold cache transition (a turn that demonstrably had
-//!    a warm prefix that was lost on the current request). Mirrors oh-my-pi's
+//! 2. **CacheInvalidationDetector** — after each turn, inspects the provider's
+//!    usage report for a hot→cold cache transition (a turn that demonstrably
+//!    had a warm prefix that was lost on the current request). Mirrors oh-my-pi's
 //!    `detectCacheInvalidation` algorithm: requires a prior turn with meaningful
 //!    `cacheRead`, a current turn with `cacheRead` collapsed to zero, and a
 //!    `cacheWrite > 0` (the hallmark of an *explicit* prefix-controlled cache
@@ -26,6 +19,11 @@
 //!    (Google/OpenAI/Fireworks, and DashScope/百炼 where `cache_creation` is
 //!    always 0) are excluded — they drop `cacheRead` to zero intermittently as
 //!    propagation noise, not a real invalidation.
+//!
+//! The `AppendOnlyLog` below remains scaffolding for the day a provider
+//! requiring manual prefix management (llama.cpp, local backends) is added —
+//! Anthropic's prefix cache is a server-side transparent optimization that
+//! needs no client-side freezing of history.
 
 use xxhash_rust::xxh32::xxh32;
 
