@@ -336,6 +336,12 @@ impl CacheInvalidationDetector {
         })
     }
 
+    /// Reset the detector so the next turn starts from a clean baseline
+    /// (e.g. after a cancel or compaction rewrites history).
+    pub fn reset(&mut self) {
+        self.last_turn_usage = None;
+    }
+
     /// Record the current turn's final usage for comparison on the next turn.
     pub fn record(&mut self, usage: TokenUsage) {
         self.last_turn_usage = Some(usage);
@@ -639,5 +645,92 @@ mod tests {
         grown.push(user_msg("thanks"));
         log.sync_messages(&grown);
         assert_eq!(log.len(), 3);
+    }
+
+    // ---- CacheInvalidationDetector ----
+
+    #[test]
+    fn detector_hot_to_cold_transition() {
+        let mut d = CacheInvalidationDetector::default();
+        // Previous turn had a warm cache.
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        // Current turn: cacheRead collapsed, explicit re-creation.
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        let inv = d.detect(current).expect("hot→cold should be detected");
+        assert_eq!(inv.reprocessed_tokens, 9000); // cache_creation + input
+    }
+
+    #[test]
+    fn detector_prev_below_footprint_is_quiet() {
+        let mut d = CacheInvalidationDetector::default();
+        d.record(TokenUsage {
+            cache_read_input_tokens: 1024, // below MIN_CACHE_FOOTPRINT (2048)
+            ..Default::default()
+        });
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        assert!(d.detect(current).is_none());
+    }
+
+    #[test]
+    fn detector_current_has_cache_read_is_quiet() {
+        let mut d = CacheInvalidationDetector::default();
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        let current = TokenUsage {
+            cache_read_input_tokens: 1000, // still cached
+            cache_creation_input_tokens: 0,
+            ..Default::default()
+        };
+        assert!(d.detect(current).is_none());
+    }
+
+    #[test]
+    fn detector_implicit_cache_excluded() {
+        let mut d = CacheInvalidationDetector::default();
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        // DashScope/百炼 / implicit cache: cache_creation always 0.
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        assert!(d.detect(current).is_none());
+    }
+
+    #[test]
+    fn detector_reset_clears_baseline() {
+        let mut d = CacheInvalidationDetector::default();
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        d.reset();
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        // After reset, there's no prev → detect returns None.
+        assert!(d.detect(current).is_none());
     }
 }

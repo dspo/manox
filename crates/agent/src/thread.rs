@@ -844,9 +844,9 @@ pub struct Thread {
     /// depth / model / messages each call. `pub(crate)` so the spawn callback
     /// in `title_state.rs` can write back the in-flight lock and the new title.
     pub(crate) title_state: TitleState,
-    /// Stable prefix + append-only log that preserves the byte-stable prefix
-    /// across turns when messages are rewritten in-place (retention pruning,
-    /// image stripping, coalescing). See [`crate::prefix_stability`].
+    /// Fingerprint of the system prompt + tool specs, tracked turn-over-turn
+    /// so prefix drift (a history rewrite, tool hot-reload, plan-mode toggle)
+    /// is observable. See [`crate::prefix_stability`].
     prefix: StablePrefix,
     /// Detects hot→cold prompt-cache transitions across turns by inspecting
     /// provider usage reports. Records the current turn's final usage on
@@ -3689,6 +3689,10 @@ impl Thread {
             // response no-ops at the parent instead of traversing to a child
             // whose own pending map is already empty.
             self.pending_child_auth.clear();
+            // Cancel invalidates the detector baseline: a partially-streamed
+            // turn's usage doesn't represent a "warm" prefix worth tracking.
+            // The next turn starts fresh.
+            self.cache_detector.reset();
             // Attribute partial usage from the cancelled turn and reset the
             // per-request counter so the next turn's delta starts from zero.
             self.record_main_call(cx);
