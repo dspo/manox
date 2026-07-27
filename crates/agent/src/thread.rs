@@ -3632,6 +3632,10 @@ impl Thread {
             // stability diagnostic reports a deliberate reset rather than a
             // silent drift.
             this.prefix.invalidate();
+            // Compaction rewrites history, so the next turn will inevitably
+            // cold-start. Reset the detector baseline to avoid an expected
+            // cache miss showing as an "invalidation" marker.
+            this.cache_detector.reset();
             cx.emit(ThreadEvent::Compaction {
                 summary: summary.clone(),
                 messages_compacted,
@@ -3689,14 +3693,16 @@ impl Thread {
             // response no-ops at the parent instead of traversing to a child
             // whose own pending map is already empty.
             self.pending_child_auth.clear();
-            // Cancel invalidates the detector baseline: a partially-streamed
-            // turn's usage doesn't represent a "warm" prefix worth tracking.
-            // The next turn starts fresh.
-            self.cache_detector.reset();
             // Attribute partial usage from the cancelled turn and reset the
             // per-request counter so the next turn's delta starts from zero.
             self.record_main_call(cx);
             self.finalize_request_usage();
+            // Cancel invalidates the detector baseline: a partially-streamed
+            // turn's usage doesn't represent a "warm" prefix worth tracking.
+            // Must run AFTER finalize_request_usage — that method internally
+            // records the current usage into the detector, and this reset
+            // clears it so the next turn starts from a clean baseline.
+            self.cache_detector.reset();
             cx.emit(ThreadEvent::Stop(StopReason::Cancelled));
             cx.notify();
         }

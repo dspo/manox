@@ -733,4 +733,35 @@ mod tests {
         // After reset, there's no prev → detect returns None.
         assert!(d.detect(current).is_none());
     }
+
+    #[test]
+    fn detector_cancel_then_next_turn_is_quiet() {
+        let mut d = CacheInvalidationDetector::default();
+        // Previous turn had warm cache.
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        // Cancel sequence: record partial usage (as finalize_request_usage
+        // does internally), then reset baseline.
+        d.record(TokenUsage {
+            cache_read_input_tokens: 500,
+            ..Default::default()
+        });
+        d.reset();
+        // Next turn: cold start. Without the reset, prev would be the
+        // cancel's partial usage (cacheRead=500 which is < footprint),
+        // or worse, the pre-cancel warm usage that escaped the reset.
+        // With reset, prev is None → detect returns None.
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        assert!(
+            d.detect(current).is_none(),
+            "cancel+reset must clear baseline"
+        );
+    }
 }
