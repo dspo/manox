@@ -89,7 +89,7 @@ fn model_descriptors(models: &[ResolvedModel], default_model: &str) -> serde_jso
                 "availabilityNux": null,
                 "defaultReasoningEffort": "medium",
                 "supportedReasoningEfforts": efforts,
-                "inputModalities": ["text"],
+                "inputModalities": if m.supports_images { vec!["text", "image"] } else { vec!["text"] },
                 "supportsPersonality": false,
                 "additionalSpeedTiers": [],
                 "serviceTiers": [],
@@ -376,5 +376,23 @@ mod tests {
         let script = build_injection_script(&[], "medium");
         assert!(script.contains("window.__cxModels = []"));
         assert!(script.contains("window.__cxDefaultModel = \"\""));
+    }
+
+    #[test]
+    fn injection_script_respects_supports_images() {
+        let mut model = rm("qwen3.7-max");
+        model.supports_images = true;
+        let script = build_injection_script(&[model], "medium");
+        // Vision models must include "image" in inputModalities.
+        assert!(script.contains("\"inputModalities\":[\"text\",\"image\"]"));
+    }
+
+    #[test]
+    fn injection_script_text_only_by_default() {
+        let model = rm("qwen3.6-plus");
+        let script = build_injection_script(&[model], "medium");
+        // Models without explicit image support must stay text-only.
+        assert!(script.contains("\"inputModalities\":[\"text\"]"));
+        assert!(!script.contains("\"inputModalities\":[\"text\",\"image\"]"));
     }
 }
