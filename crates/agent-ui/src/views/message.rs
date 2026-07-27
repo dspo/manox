@@ -625,6 +625,9 @@ pub fn render_item(
             cx,
         ),
         ConvItem::BackgroundTask(bt) => render_background_task(bt, ix, theme, tool_ctx, cx),
+        ConvItem::CacheMiss { reprocessed_tokens } => {
+            render_cache_miss(*reprocessed_tokens, ix, theme, cx)
+        }
     }
 }
 
@@ -2661,6 +2664,29 @@ fn render_background_task(
     } else {
         row.into_any_element()
     }
+}
+
+/// Slim cache-miss divider matching oh-my-pi's `CacheInvalidationMarkerComponent`:
+///
+/// ```text
+/// ────────── ⊘ cache miss · 50.9k tokens
+/// ```
+fn render_cache_miss(
+    reprocessed_tokens: u64,
+    _ix: usize,
+    theme: &Theme,
+    _cx: &mut App,
+) -> gpui::AnyElement {
+    let rule_width = 10;
+    let tokens_str = crate::cockpit::format_tokens(reprocessed_tokens);
+    let label = i18n::t_str("cache-miss-label", &[("tokens", &tokens_str)]);
+    let rule = "\u{2500}".repeat(rule_width);
+    let line = format!("{rule} {label}");
+    gpui::div()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(line)
+        .into_any_element()
 }
 
 /// Map a tool call to its panel rendering kind and the body text the panel

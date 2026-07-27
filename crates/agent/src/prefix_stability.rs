@@ -1,34 +1,35 @@
-//! Prefix-stability diagnostics for provider-side prompt caching.
+//! Prefix-stability diagnostics and cache-invalidation detection for
+//! provider-side prompt caching.
 //!
-//! manox's `Thread::messages` is append-only today, so the byte prefix sent to
-//! the LLM (system prompt + tool specs + message history) is naturally stable
-//! across turns — only the new tail is a cache miss each turn. `StablePrefix`
-//! fingerprints the system prompt + tool specs each turn and reports drift
-//! (system-prompt change, tool-set change) so the UI can surface a cache-hit
-//! chip and accidental drift (a future feature that rewrites messages or
-//! hot-reloads tools) is visible.
+//! Two mechanisms:
 //!
-//! The `AppendOnlyLog` / `AppendOnlyContextManager` below remain scaffolding
-//! for the day per-turn tool-result truncation, image stripping, or history
-//! rewriting lands — at that point the request can be routed through
-//! [`AppendOnlyContextManager`] to preserve the byte-stable prefix up to the
-//! divergence point instead of re-sending the entire conversation (which would
-//! silently break the provider's prefix cache).
+//! 1. **StablePrefix** — system prompt + tool specs are fingerprinted each turn
+//!    against a pinned baseline snapshot. Drift (system-prompt change, tool-set
+//!    change) is reported as a `PrefixChange` so the UI can surface a cache-hit
+//!    chip. `invalidate()` is called on compaction, tool-registry changes, and
+//!    model switches so the next turn re-establishes a fresh baseline.
 //!
-//! The digest covers every field the provider may serialize — role, content,
-//! tool calls (both `tool_calls` and OpenAI-wire `tool_calls`), tool-result
-//! ids/names/error flags, and assistant `id` — so an in-place rewrite of *any*
-//! of these fields is visible to [`AppendOnlyContextManager::sync_messages`].
+//! 2. **CacheInvalidationDetector** — after each turn, inspects the provider's
+//!    usage report for a hot→cold cache transition (a turn that demonstrably
+//!    had a warm prefix that was lost on the current request). Mirrors oh-my-pi's
+//!    `detectCacheInvalidation` algorithm: requires a prior turn with meaningful
+//!    `cacheRead`, a current turn with `cacheRead` collapsed to zero, and a
+//!    `cacheWrite > 0` (the hallmark of an *explicit* prefix-controlled cache
+//!    that re-builds the prefix on a cold turn). Implicit best-effort caches
+//!    (Google/OpenAI/Fireworks, and DashScope/百炼 where `cache_creation` is
+//!    always 0) are excluded — they drop `cacheRead` to zero intermittently as
+//!    propagation noise, not a real invalidation.
 //!
-//! The `StablePrefix` + `AppendOnlyLog` + per-message digest design,
-//! adapted to manox's
-//! `LanguageModelRequestMessage`.
-
-#![allow(dead_code)]
+//! The `AppendOnlyLog` below remains scaffolding for the day a provider
+//! requiring manual prefix management (llama.cpp, local backends) is added —
+//! Anthropic's prefix cache is a server-side transparent optimization that
+//! needs no client-side freezing of history.
 
 use xxhash_rust::xxh32::xxh32;
 
-use crate::language_model::{LanguageModelRequest, LanguageModelRequestMessage, MessageContent};
+use crate::language_model::{
+    LanguageModelRequest, LanguageModelRequestMessage, MessageContent, TokenUsage,
+};
 
 /// A fingerprinted prefix (system prompt + tool specs) tracked across turns
 /// so drift is detectable. Also tallies check/change counts for a stability
@@ -250,9 +251,7 @@ impl AppendOnlyLog {
         bound
     }
 }
-
-/// Manages a stable prefix + append-only log for the agent loop. Not yet wired
-/// into `build_completion_request`; see the module docs.
+/// Manages a stable prefix + append-only log for the agent loop.
 #[derive(Default)]
 pub struct AppendOnlyContextManager {
     pub prefix: StablePrefix,
@@ -275,6 +274,77 @@ impl AppendOnlyContextManager {
         self.prefix.invalidate();
         self.log.clear();
         self.prefix.build(request);
+    }
+}
+
+/// Minimum prefix the previous turn must have read from cache before a
+/// cold turn counts as a cache invalidation. Filters out tiny contexts
+/// where a zero `cacheRead` is expected rather than a reset.
+pub const MIN_CACHE_FOOTPRINT: u64 = 2048;
+
+/// A prompt-cache invalidation detected from a turn's usage.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheInvalidation {
+    /// Prompt tokens the cold turn had to (re)process instead of reading
+    /// from cache.
+    pub reprocessed_tokens: u64,
+}
+
+/// Detects hot→cold cache transitions by comparing the previous turn's
+/// final usage with the current turn's final usage.
+///
+/// Algorithm mirrors oh-my-pi's `detectCacheInvalidation`:
+/// 1. Previous turn must have read ≥ `MIN_CACHE_FOOTPRINT` from cache.
+/// 2. Current turn reads zero from cache.
+/// 3. Current turn wrote to cache (`cacheWrite > 0`). This is the hallmark
+///    of an *explicit* prefix-controlled cache (Anthropic/Bedrock
+///    `cache_control`) that re-builds the prefix on a cold turn. Implicit
+///    best-effort caches (Google/OpenAI/Fireworks) report `cacheWrite: 0`
+///    and drop `cacheRead` to zero intermittently as propagation noise.
+/// 4. Reprocessed tokens ≥ `MIN_CACHE_FOOTPRINT`.
+///
+/// DashScope/百炼 anthropic-compatible endpoints always report
+/// `cache_creation_input_tokens` as 0 (see `CLAUDE.md`), so condition 3
+/// is never satisfied for those endpoints — the detector correctly
+/// excludes them.
+#[derive(Default)]
+pub struct CacheInvalidationDetector {
+    last_turn_usage: Option<TokenUsage>,
+}
+
+impl CacheInvalidationDetector {
+    /// Test the current turn's final usage for a cache invalidation.
+    pub fn detect(&self, current: TokenUsage) -> Option<CacheInvalidation> {
+        let prev = self.last_turn_usage?;
+        if prev.cache_read_input_tokens < MIN_CACHE_FOOTPRINT {
+            return None;
+        }
+        if current.cache_read_input_tokens > 0 {
+            return None;
+        }
+        if current.cache_creation_input_tokens == 0 {
+            return None;
+        }
+        let reprocessed = current
+            .cache_creation_input_tokens
+            .saturating_add(current.input_tokens);
+        if reprocessed < MIN_CACHE_FOOTPRINT {
+            return None;
+        }
+        Some(CacheInvalidation {
+            reprocessed_tokens: reprocessed,
+        })
+    }
+
+    /// Reset the detector so the next turn starts from a clean baseline
+    /// (e.g. after a cancel or compaction rewrites history).
+    pub fn reset(&mut self) {
+        self.last_turn_usage = None;
+    }
+
+    /// Record the current turn's final usage for comparison on the next turn.
+    pub fn record(&mut self, usage: TokenUsage) {
+        self.last_turn_usage = Some(usage);
     }
 }
 
@@ -575,5 +645,123 @@ mod tests {
         grown.push(user_msg("thanks"));
         log.sync_messages(&grown);
         assert_eq!(log.len(), 3);
+    }
+
+    // ---- CacheInvalidationDetector ----
+
+    #[test]
+    fn detector_hot_to_cold_transition() {
+        let mut d = CacheInvalidationDetector::default();
+        // Previous turn had a warm cache.
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        // Current turn: cacheRead collapsed, explicit re-creation.
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        let inv = d.detect(current).expect("hot→cold should be detected");
+        assert_eq!(inv.reprocessed_tokens, 9000); // cache_creation + input
+    }
+
+    #[test]
+    fn detector_prev_below_footprint_is_quiet() {
+        let mut d = CacheInvalidationDetector::default();
+        d.record(TokenUsage {
+            cache_read_input_tokens: 1024, // below MIN_CACHE_FOOTPRINT (2048)
+            ..Default::default()
+        });
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        assert!(d.detect(current).is_none());
+    }
+
+    #[test]
+    fn detector_current_has_cache_read_is_quiet() {
+        let mut d = CacheInvalidationDetector::default();
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        let current = TokenUsage {
+            cache_read_input_tokens: 1000, // still cached
+            cache_creation_input_tokens: 0,
+            ..Default::default()
+        };
+        assert!(d.detect(current).is_none());
+    }
+
+    #[test]
+    fn detector_implicit_cache_excluded() {
+        let mut d = CacheInvalidationDetector::default();
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        // DashScope/百炼 / implicit cache: cache_creation always 0.
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        assert!(d.detect(current).is_none());
+    }
+
+    #[test]
+    fn detector_reset_clears_baseline() {
+        let mut d = CacheInvalidationDetector::default();
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        d.reset();
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        // After reset, there's no prev → detect returns None.
+        assert!(d.detect(current).is_none());
+    }
+
+    #[test]
+    fn detector_cancel_then_next_turn_is_quiet() {
+        let mut d = CacheInvalidationDetector::default();
+        // Previous turn had warm cache.
+        d.record(TokenUsage {
+            cache_read_input_tokens: 4096,
+            ..Default::default()
+        });
+        // Cancel sequence: record partial usage (as finalize_request_usage
+        // does internally), then reset baseline.
+        d.record(TokenUsage {
+            cache_read_input_tokens: 500,
+            ..Default::default()
+        });
+        d.reset();
+        // Next turn: cold start. Without the reset, prev would be the
+        // cancel's partial usage (cacheRead=500 which is < footprint),
+        // or worse, the pre-cancel warm usage that escaped the reset.
+        // With reset, prev is None → detect returns None.
+        let current = TokenUsage {
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 5000,
+            input_tokens: 4000,
+            ..Default::default()
+        };
+        assert!(
+            d.detect(current).is_none(),
+            "cancel+reset must clear baseline"
+        );
     }
 }

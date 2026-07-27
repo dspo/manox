@@ -125,6 +125,13 @@ pub enum ConvItem {
         collapsed: bool,
         user_toggled: bool,
     },
+
+    /// Prompt-cache invalidation divider: the provider-side prefix cache was
+    /// lost since the previous turn. Rendered as a slim rule + label (not
+    /// full-width), matching oh-my-pi's `CacheInvalidationMarkerComponent`.
+    CacheMiss {
+        reprocessed_tokens: u64,
+    },
     /// Provider is retrying the HTTP handshake after a transient failure
     /// (429 / 5xx / network). Transient: the first real content or terminal
     /// error event replaces it in place. `reason` is a short label shown on the
@@ -594,6 +601,7 @@ impl ConversationState {
                 e.read(cx).kind(),
                 ConvItem::Error(_)
                     | ConvItem::Notice(_)
+                    | ConvItem::CacheMiss { .. }
                     | ConvItem::User {
                         display_state: UserMessageDisplayState::RolledBackSteer { .. },
                         ..
@@ -896,6 +904,26 @@ impl ConversationState {
                             user_toggled: false,
                         },
                         role.to_string(),
+                        id,
+                        weak,
+                    )
+                }));
+                ApplyOutcome::Appended
+            }
+
+            // Prompt-cache invalidation landed — insert a slim divider
+            // card above the current assistant turn. Same insertion pattern
+            // as the Recap (compaction) card: append, never update.
+            ThreadEvent::CacheInvalidation {
+                reprocessed_tokens,
+            } => {
+                let id = self.items.len();
+                self.items.push(cx.new(|_| {
+                    MessageItem::new(
+                        ConvItem::CacheMiss {
+                            reprocessed_tokens: *reprocessed_tokens,
+                        },
+                        String::new(),
                         id,
                         weak,
                     )

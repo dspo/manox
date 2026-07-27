@@ -33,7 +33,7 @@ use crate::language_model::{
     ReasoningEffort, Role, StopReason, TokenUsage,
 };
 use crate::message::Message;
-use crate::prefix_stability::StablePrefix;
+use crate::prefix_stability::{CacheInvalidationDetector, StablePrefix};
 use crate::proposed_plan::{ProposedPlanParser, ProposedPlanSegment};
 use crate::title_state::TitleState;
 use crate::token_meter::TokenMeter;
@@ -286,6 +286,12 @@ pub enum ThreadEvent {
         stability_pct: u16,
         system_changed: bool,
         tools_changed: bool,
+    },
+    /// The provider-side prompt cache was lost since the previous turn.
+    /// Carries the token count that had to be cold-reprocessed instead of
+    /// reading from cache.
+    CacheInvalidation {
+        reprocessed_tokens: u64,
     },
     /// Actual and shadow savings for the just-built model request. This is a
     /// projection-only diagnostic; canonical thread history is never sampled
@@ -840,9 +846,12 @@ pub struct Thread {
     pub(crate) title_state: TitleState,
     /// Fingerprint of the system prompt + tool specs, tracked turn-over-turn
     /// so prefix drift (a history rewrite, tool hot-reload, plan-mode toggle)
-    /// is observable rather than silently busting the provider's prefix cache.
-    /// See [`crate::prefix_stability`].
-    prefix_stability: StablePrefix,
+    /// is observable. See [`crate::prefix_stability`].
+    prefix: StablePrefix,
+    /// Detects hot→cold prompt-cache transitions across turns by inspecting
+    /// provider usage reports. Records the current turn's final usage on
+    /// `Stop` and compares it against the next turn's final usage.
+    cache_detector: CacheInvalidationDetector,
     /// In-process HTTP proxy for the restricted-network sandbox policy.
     /// Spawned lazily on the first sandboxed bash call when the thread's
     /// sandbox `NetworkPolicy` is `Restricted`; dropped when the policy
@@ -1088,7 +1097,8 @@ impl Thread {
                 reasoning_effort: ReasoningEffort::default(),
                 goal: GoalState::new(),
                 title_state: TitleState::default(),
-                prefix_stability: StablePrefix::default(),
+                prefix: StablePrefix::default(),
+                cache_detector: CacheInvalidationDetector::default(),
                 proxy: None,
                 provider_id,
                 parent_id: None,
@@ -1228,7 +1238,8 @@ impl Thread {
                     rec.title_override,
                     title_last_eval_user_count,
                 ),
-                prefix_stability: StablePrefix::default(),
+                prefix: StablePrefix::default(),
+                cache_detector: CacheInvalidationDetector::default(),
                 proxy: None,
                 provider_id,
                 parent_id: rec.parent_id,
@@ -1332,7 +1343,8 @@ impl Thread {
                 reasoning_effort,
                 goal: GoalState::new(),
                 title_state: TitleState::default(),
-                prefix_stability: StablePrefix::default(),
+                prefix: StablePrefix::default(),
+                cache_detector: CacheInvalidationDetector::default(),
                 proxy: None,
                 provider_id: None,
                 parent_id: None,
@@ -2661,6 +2673,8 @@ impl Thread {
     /// instead of diffing against a stale counter.
     fn finalize_request_usage(&mut self) {
         let uid = self.last_user_message_id().map(str::to_owned);
+        let current = self.token_meter.current_request();
+        self.cache_detector.record(current);
         self.token_meter.finalize_request(uid.as_deref());
     }
 
@@ -2753,7 +2767,7 @@ impl Thread {
         // tool registry's baked sandbox — force a clean prefix re-baseline so
         // the next turn captures the new prefix as a version bump rather than
         // silent drift.
-        self.prefix_stability.invalidate();
+        self.prefix.invalidate();
         cx.notify();
     }
 
@@ -2780,7 +2794,7 @@ impl Thread {
             cx.weak_entity(),
             self.agent_language,
         ));
-        self.prefix_stability.invalidate();
+        self.prefix.invalidate();
         cx.notify();
         Ok(())
     }
@@ -2929,7 +2943,7 @@ impl Thread {
     /// session-end auto-cleanup (Drop) can remove it when clean.
     pub(crate) fn set_worktree_state(&mut self, state: WorktreeState, cx: &mut Context<Self>) {
         self.worktree = Some(state);
-        self.prefix_stability.invalidate();
+        self.prefix.invalidate();
         cx.notify();
     }
 
@@ -3617,7 +3631,11 @@ impl Thread {
             // cost of reclaiming context; invalidate the fingerprint so the
             // stability diagnostic reports a deliberate reset rather than a
             // silent drift.
-            this.prefix_stability.invalidate();
+            this.prefix.invalidate();
+            // Compaction rewrites history, so the next turn will inevitably
+            // cold-start. Reset the detector baseline to avoid an expected
+            // cache miss showing as an "invalidation" marker.
+            this.cache_detector.reset();
             cx.emit(ThreadEvent::Compaction {
                 summary: summary.clone(),
                 messages_compacted,
@@ -3679,6 +3697,12 @@ impl Thread {
             // per-request counter so the next turn's delta starts from zero.
             self.record_main_call(cx);
             self.finalize_request_usage();
+            // Cancel invalidates the detector baseline: a partially-streamed
+            // turn's usage doesn't represent a "warm" prefix worth tracking.
+            // Must run AFTER finalize_request_usage — that method internally
+            // records the current usage into the detector, and this reset
+            // clears it so the next turn starts from a clean baseline.
+            self.cache_detector.reset();
             cx.emit(ThreadEvent::Stop(StopReason::Cancelled));
             cx.notify();
         }
@@ -3794,24 +3818,22 @@ impl Thread {
                 // system was idle. Each event becomes an untrusted-external-data
                 // user message injected into the conversation.
                 this.drain_background_events(cx);
-                this.build_completion_request()
-            })?;
-
-            // Fingerprint the request's system prompt + tool specs against the
-            // previous turn so prefix drift (history rewrite, tool hot-reload,
-            // plan-mode toggle) is observable. Emitted every turn with the
-            // current stability ratio; drift flags are `true` only when that
-            // component changed this turn.
-            this.update(cx, |this, cx| {
-                let change = this.prefix_stability.build(&request);
+                let request = this.build_completion_request();
+                // Fingerprint the request against the pinned snapshot so
+                // prefix drift (history rewrite, tool hot-reload, plan-mode
+                // toggle) is observable. Emitted every turn with the current
+                // stability ratio; drift flags are `true` only when that
+                // component changed this turn.
+                let change = this.prefix.build(&request);
                 cx.emit(ThreadEvent::PrefixStability {
-                    stability_pct: this.prefix_stability.stability_pct(),
+                    stability_pct: this.prefix.stability_pct(),
                     system_changed: change.is_some_and(|c| c.system_changed),
                     tools_changed: change.is_some_and(|c| c.tools_changed),
                 });
                 cx.emit(ThreadEvent::ContextOptimizationUpdated(
                     this.context_optimization_metrics(&request),
                 ));
+                request
             })?;
 
             this.update(cx, |this, _| {
@@ -5338,6 +5360,17 @@ impl Thread {
                 // round (a tool-use loop iteration or a new user turn) starts
                 // from zero.
                 self.record_main_call(cx);
+                // Detect hot→cold prompt-cache transitions BEFORE the meter
+                // resets `current_request`. Uses the turn's final usage against
+                // the previous turn's final usage. `finalize_request_usage`
+                // records this turn into the detector for next-turn comparison
+                // and then resets the meter.
+                let current = self.token_meter.current_request();
+                if let Some(invalidation) = self.cache_detector.detect(current) {
+                    cx.emit(ThreadEvent::CacheInvalidation {
+                        reprocessed_tokens: invalidation.reprocessed_tokens,
+                    });
+                }
                 self.finalize_request_usage();
                 // Fire Stop hooks (e.g. a stop-gate reviewer) fail-open; the
                 // turn has already ended, so the handler runs detached.
@@ -5720,14 +5753,6 @@ impl Thread {
     /// `system_prompt::build_main_system_prompt`. Thread id is deliberately
     /// absent; the model fetches it via the `self_info` tool.
     fn build_completion_request(&self) -> LanguageModelRequest {
-        // TODO(prefix-cache): once per-turn tool-result truncation / image
-        // stripping / history rewriting lands, route the request through
-        // `prefix_stability::AppendOnlyContextManager` so the byte-stable
-        // prefix is preserved up to the divergence point. manox's
-        // `Thread::messages` is append-only today, so the prefix is naturally
-        // stable and no stabilization pass is needed yet — but introducing any
-        // rewrite without that layer would silently break the provider's
-        // prefix cache.
         let mut messages: Vec<LanguageModelRequestMessage> = Vec::new();
         // System message: a pre-rendered base plus optional mode addendums,
         // assembled through the `system/assembly` template so no `push_str` of
@@ -6209,7 +6234,7 @@ impl Thread {
             code_raw_tokens: approx_tokens(code_raw_bytes),
             code_projected_tokens: approx_tokens(code_projected_bytes),
             compactions_avoided: self.avoided_compactions.load(Ordering::Relaxed),
-            prefix_stability_pct: self.prefix_stability.stability_pct(),
+            prefix_stability_pct: self.prefix.stability_pct(),
         }
     }
 }

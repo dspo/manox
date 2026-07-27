@@ -53,6 +53,7 @@ team-drawer-tasks = { $count ->
 }
 message-user-role = 你
 recap-card-title = 上下文已压缩
+cache-miss-label = 缓存未命中 · { $tokens } tokens
 retry-badge = 重试中… { $attempt }/{ $max } · { $secs }秒 · { $reason }
 message-omitted-prefix = …（已省略前面部分）
 status-pending = 待审批
