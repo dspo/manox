@@ -2,7 +2,7 @@
 // session management, and built-in tools.
 //
 // Layers (bottom-up):
-//   loop.rs  — run_loop: the pure dual-loop state machine
+//   agent_loop.rs  — run_loop: the pure dual-loop state machine
 //   agent.rs — Agent: stateful wrapper with event subscription and queues
 //   harness  — AgentHarness: orchestration layer with session persistence and hooks
 //

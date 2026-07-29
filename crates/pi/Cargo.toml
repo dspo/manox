@@ -8,17 +8,16 @@ publish.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "process"] }
 tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
-schemars.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 globset.workspace = true
 ignore.workspace = true
 similar.workspace = true
+regex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait = "0.1"

@@ -73,6 +73,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
+regex = "1"
 # markdown-rs (mdast) — markdown 解析。经 gpui-component 已在 Cargo.lock,workspace 声明复用同一版本。
 markdown = "1"
 # ropey — SyntaxHighlighter::update 接收 &Rope;版本对齐 gpui-component 在 Cargo.lock 锁定的 2.0.0-beta.1。
