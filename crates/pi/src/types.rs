@@ -306,6 +306,24 @@ impl Model {
     }
 }
 
+/// Prompt cache retention preference.
+///
+/// Providers map this to their supported values: the Anthropic shape marks
+/// `cache_control` breakpoints ("long" adds `ttl:"1h"`); the OpenAI shapes
+/// forward `session_id` as `prompt_cache_key` and send
+/// `prompt_cache_retention: "24h"` on "long".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheRetention {
+    /// No caching — no cache markers are sent.
+    None,
+    /// Ephemeral caching (Anthropic default TTL; OpenAI automatic cache).
+    #[default]
+    Short,
+    /// Extended retention (Anthropic `ttl:"1h"`; OpenAI `"24h"`).
+    Long,
+}
+
 /// The context passed into the agent loop at the start of each turn.
 pub struct AgentContext {
     /// The current system prompt.
@@ -318,6 +336,11 @@ pub struct AgentContext {
     pub model: Model,
     /// Current thinking level.
     pub thinking_level: Option<String>,
+    /// Prompt cache retention preference for this turn.
+    pub cache_retention: CacheRetention,
+    /// Session identifier forwarded to providers that support session-based
+    /// caching (`prompt_cache_key`). Ignored by providers that don't.
+    pub session_id: Option<String>,
     /// Additional context metadata.
     pub metadata: HashMap<String, JsonValue>,
 }
@@ -330,6 +353,8 @@ impl Clone for AgentContext {
             tools: Vec::new(), // tools are not cloned — caller must re-set
             model: self.model.clone(),
             thinking_level: self.thinking_level.clone(),
+            cache_retention: self.cache_retention,
+            session_id: self.session_id.clone(),
             metadata: self.metadata.clone(),
         }
     }
@@ -343,6 +368,8 @@ impl std::fmt::Debug for AgentContext {
             .field("tools_count", &self.tools.len())
             .field("model", &self.model)
             .field("thinking_level", &self.thinking_level)
+            .field("cache_retention", &self.cache_retention)
+            .field("session_id", &self.session_id)
             .field("metadata", &self.metadata)
             .finish()
     }
@@ -423,12 +450,11 @@ impl AgentState {
 // ── Stream options ──────────────────────────────────────────────────────────
 
 /// Options passed to the LLM streaming function.
+///
+/// Cache preferences are NOT carried here: they are per-conversation state
+/// owned by [`AgentContext::cache_retention`] / [`AgentContext::session_id`].
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
-    /// Prompt cache retention preference.
-    pub cache_retention: Option<String>,
-    /// Session identifier for cache affinity.
-    pub session_id: Option<String>,
     /// Maximum output tokens.
     pub max_tokens: Option<usize>,
     /// Temperature override.

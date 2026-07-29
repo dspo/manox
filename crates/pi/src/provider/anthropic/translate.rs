@@ -8,7 +8,8 @@
 //   2. Supplying defaults the API requires — `max_tokens`, thinking budgets.
 
 use crate::types::{
-    AgentContext, AgentMessage, ContentBlock, ImageSource, StreamOptions, ThinkingKind,
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
+    ThinkingKind,
 };
 use super::wire::*;
 
@@ -32,31 +33,17 @@ fn map_effort(level: &str) -> Effort {
 
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCreateParams {
+    let cache_control = cache_control(context);
     MessageCreateParams {
         model: context.model.id.clone(),
         max_tokens: options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         system: Some(vec![SystemBlock {
             kind: "text",
             text: context.system_prompt.clone(),
-            cache_control: cache_control(options),
+            cache_control: cache_control.clone(),
         }]),
-        messages: to_message_params(&context.messages),
-        tools: if context.tools.is_empty() {
-            None
-        } else {
-            Some(
-                context
-                    .tools
-                    .iter()
-                    .map(|t| ToolParam {
-                        name: t.name().to_string(),
-                        description: Some(t.description().to_string()),
-                        input_schema: t.parameters_schema(),
-                        cache_control: None,
-                    })
-                    .collect(),
-            )
-        },
+        messages: to_message_params(&context.messages, cache_control.as_ref()),
+        tools: tools_param(context, cache_control.as_ref()),
         thinking: thinking_config(context),
         output_config: output_config(context),
         temperature: options.temperature,
@@ -65,13 +52,36 @@ pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCre
     }
 }
 
-fn cache_control(options: &StreamOptions) -> Option<CacheControl> {
-    options.cache_retention.as_ref()?;
-    let ttl = match options.cache_retention.as_deref() {
-        Some("1h") => Some("1h"),
-        _ => None, // "5m" and anything unrecognised falls back to the default 5m
-    };
-    Some(CacheControl { kind: "ephemeral", ttl })
+/// The cache marker shared by every breakpoint in a request: absent when
+/// caching is off, `ttl: "1h"` under extended retention.
+fn cache_control(context: &AgentContext) -> Option<CacheControl> {
+    match context.cache_retention {
+        CacheRetention::None => None,
+        CacheRetention::Short => Some(CacheControl::ephemeral()),
+        CacheRetention::Long => Some(CacheControl { kind: "ephemeral", ttl: Some("1h") }),
+    }
+}
+
+/// Tool definitions form a cacheable prefix; the breakpoint sits on the last
+/// one so the whole list is covered by a single marker.
+fn tools_param(context: &AgentContext, cache_control: Option<&CacheControl>) -> Option<Vec<ToolParam>> {
+    if context.tools.is_empty() {
+        return None;
+    }
+    let last = context.tools.len() - 1;
+    Some(
+        context
+            .tools
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ToolParam {
+                name: t.name().to_string(),
+                description: Some(t.description().to_string()),
+                input_schema: t.parameters_schema(),
+                cache_control: if i == last { cache_control.cloned() } else { None },
+            })
+            .collect(),
+    )
 }
 
 /// The thinking field mirrors the model's thinking protocol: `"off"` forces
@@ -111,7 +121,14 @@ fn output_config(context: &AgentContext) -> Option<OutputConfig> {
 
 /// Convert domain messages to wire messages, merging every run of consecutive
 /// `ToolResult` messages into a single user message of `tool_result` blocks.
-fn to_message_params(messages: &[AgentMessage]) -> Vec<MessageParam> {
+///
+/// The conversation tail is the final cache breakpoint: when caching is on,
+/// the last block of the last message carries the marker, provided that
+/// message is a user message — a trailing assistant message is never marked.
+fn to_message_params(
+    messages: &[AgentMessage],
+    cache_control: Option<&CacheControl>,
+) -> Vec<MessageParam> {
     let mut out: Vec<MessageParam> = Vec::new();
     let mut pending_results: Vec<ContentBlockParam> = Vec::new();
 
@@ -132,6 +149,7 @@ fn to_message_params(messages: &[AgentMessage]) -> Vec<MessageParam> {
                     tool_use_id: tool_call_id.clone(),
                     content: content.iter().map(block_to_param).collect(),
                     is_error: if *is_error { Some(true) } else { None },
+                    cache_control: None,
                 });
             }
             AgentMessage::User { content, .. } => {
@@ -154,6 +172,15 @@ fn to_message_params(messages: &[AgentMessage]) -> Vec<MessageParam> {
         }
     }
     flush(&mut out, &mut pending_results);
+
+    if let Some(cc) = cache_control
+        && let Some(last) = out.last_mut()
+        && matches!(last.role, Role::User)
+        && let Some(block) = last.content.last_mut()
+    {
+        block.set_cache_control(cc.clone());
+    }
+
     out
 }
 
@@ -166,6 +193,7 @@ fn block_to_param(block: &ContentBlock) -> ContentBlockParam {
         },
         ContentBlock::Image { source } => ContentBlockParam::Image {
             source: image_source(source),
+            cache_control: None,
         },
         // tool_use / thinking don't appear in user messages; degrade to text.
         ContentBlock::ToolUse { name, .. } => ContentBlockParam::Text {
@@ -209,6 +237,7 @@ fn assistant_block_to_param(block: &ContentBlock) -> Option<ContentBlockParam> {
         }
         ContentBlock::Image { source } => Some(ContentBlockParam::Image {
             source: image_source(source),
+            cache_control: None,
         }),
     }
 }
@@ -305,7 +334,33 @@ mod tests {
             tools: Vec::new(),
             model: model(thinking),
             thinking_level: level.map(|s| s.into()),
+            cache_retention: Default::default(),
+            session_id: None,
             metadata: Default::default(),
+        }
+    }
+
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::tool::AgentTool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "d"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            _signal: tokio_util::sync::CancellationToken,
+            _ctx: &dyn crate::tool::ToolContext,
+        ) -> Result<crate::tool::AgentToolResult, crate::tool::ToolError> {
+            unreachable!()
         }
     }
 
@@ -452,17 +507,91 @@ mod tests {
     }
 
     #[test]
-    fn cache_control_on_system_and_default_max_tokens() {
-        let ctx = ctx(vec![user("hi")], ThinkingKind::None, None);
-        let opts = StreamOptions {
-            cache_retention: Some("1h".into()),
-            ..Default::default()
-        };
-        let req = to_request(&ctx, &opts);
+    fn cache_breakpoints_mark_system_last_tool_and_last_user_message() {
+        let mut c = ctx(
+            vec![
+                user("first"),
+                assistant_tool_call("t1"),
+                tool_result("t1", "aaa"),
+                user("latest"),
+            ],
+            ThinkingKind::None,
+            None,
+        );
+        c.tools = vec![Box::new(NamedTool("a")), Box::new(NamedTool("b"))];
+        let req = to_request(&c, &StreamOptions::default());
         assert_eq!(req.max_tokens, DEFAULT_MAX_TOKENS);
-        let v = serde_json::to_value(&req.system).unwrap();
-        assert_eq!(v[0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(v[0]["cache_control"]["ttl"], "1h");
+
+        // Breakpoint 1: the system block.
+        let system = serde_json::to_value(&req.system).unwrap();
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert!(system[0]["cache_control"].get("ttl").is_none());
+
+        // Breakpoint 2: the last tool only.
+        let tools = serde_json::to_value(&req.tools).unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+
+        // Breakpoint 3: the last block of the last (user) message only.
+        let messages = serde_json::to_value(&req.messages).unwrap();
+        let messages = messages.as_array().unwrap();
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+        let last_user = messages.last().unwrap();
+        let blocks = last_user["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn cache_breakpoint_lands_on_tool_result_block() {
+        let c = ctx(
+            vec![assistant_tool_call("t1"), tool_result("t1", "aaa")],
+            ThinkingKind::None,
+            None,
+        );
+        let req = to_request(&c, &StreamOptions::default());
+        let messages = serde_json::to_value(&req.messages).unwrap();
+        let messages = messages.as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["content"][0]["type"], "tool_result");
+        assert_eq!(last["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_retention_none_sends_no_markers() {
+        let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
+        c.cache_retention = crate::types::CacheRetention::None;
+        c.tools = vec![Box::new(NamedTool("a"))];
+        let req = to_request(&c, &StreamOptions::default());
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v["system"][0].get("cache_control").is_none());
+        assert!(v["tools"][0].get("cache_control").is_none());
+        assert!(v["messages"][0]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cache_retention_long_adds_one_hour_ttl() {
+        let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
+        c.cache_retention = crate::types::CacheRetention::Long;
+        c.tools = vec![Box::new(NamedTool("a"))];
+        let req = to_request(&c, &StreamOptions::default());
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["system"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(v["tools"][0]["cache_control"]["ttl"], "1h");
+        assert_eq!(v["messages"][0]["content"][0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn trailing_assistant_message_gets_no_breakpoint() {
+        let c = ctx(vec![assistant_tool_call("t1")], ThinkingKind::None, None);
+        let req = to_request(&c, &StreamOptions::default());
+        let messages = serde_json::to_value(&req.messages).unwrap();
+        let messages = messages.as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["role"], "assistant");
+        assert!(last["content"][0].get("cache_control").is_none());
     }
 
     #[test]

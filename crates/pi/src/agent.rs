@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{run_loop, run_loop_continue, StreamFn, EventSink};
-use crate::types::{AgentState, AgentMessage, AgentEvent, AgentContext, AgentLoopConfig, Model, ContentBlock};
+use crate::types::{AgentState, AgentMessage, AgentEvent, AgentContext, AgentLoopConfig, CacheRetention, Model, ContentBlock};
 
 /// Controls how queued messages are drained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +95,11 @@ pub struct Agent {
     active_run: Option<CancellationToken>,
     stream_fn: Arc<dyn StreamFn>,
     sink: SubscriberSink,
+    /// Session identifier forwarded to providers that support session-based
+    /// caching (`prompt_cache_key`).
+    session_id: Option<String>,
+    /// Prompt cache retention preference forwarded to providers.
+    cache_retention: CacheRetention,
 }
 
 impl Agent {
@@ -111,7 +116,20 @@ impl Agent {
             active_run: None,
             stream_fn,
             sink: SubscriberSink::new(),
+            session_id: None,
+            cache_retention: CacheRetention::default(),
         }
+    }
+
+    /// Set the session identifier forwarded to providers for cache-aware
+    /// backends.
+    pub fn set_session_id(&mut self, session_id: Option<String>) {
+        self.session_id = session_id;
+    }
+
+    /// Set the prompt cache retention preference forwarded to providers.
+    pub fn set_cache_retention(&mut self, retention: CacheRetention) {
+        self.cache_retention = retention;
     }
 
     /// Current agent state.
@@ -227,6 +245,8 @@ impl Agent {
             tools: Vec::new(), // tools are set externally
             model: self.state.model.clone(),
             thinking_level: self.state.thinking_level.clone(),
+            cache_retention: self.cache_retention,
+            session_id: self.session_id.clone(),
             metadata: Default::default(),
         }
     }

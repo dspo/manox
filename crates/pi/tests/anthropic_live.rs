@@ -29,6 +29,8 @@ fn ctx_with(prompt: &str) -> AgentContext {
         tools: Vec::new(),
         model: real_model(),
         thinking_level: None,
+        cache_retention: Default::default(),
+        session_id: None,
         metadata: Default::default(),
     }
 }

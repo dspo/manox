@@ -25,7 +25,8 @@ use serde_json::Value as JsonValue;
 
 use crate::provider::openai::clamp_cache_key;
 use crate::types::{
-    AgentContext, AgentMessage, ContentBlock, ImageSource, StreamOptions, ThinkingKind,
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
+    ThinkingKind,
 };
 use super::wire::*;
 
@@ -43,9 +44,12 @@ pub fn to_request(context: &AgentContext, options: &StreamOptions) -> ResponsesP
         tools: tools_param(context),
         reasoning,
         include,
-        prompt_cache_key: options.session_id.as_deref().map(clamp_cache_key),
-        prompt_cache_retention: match options.cache_retention.as_deref() {
-            Some("1h") | Some("long") => Some("24h"),
+        prompt_cache_key: match context.cache_retention {
+            CacheRetention::None => None,
+            _ => context.session_id.as_deref().map(clamp_cache_key),
+        },
+        prompt_cache_retention: match context.cache_retention {
+            CacheRetention::Long => Some("24h"),
             _ => None,
         },
     }
@@ -554,6 +558,8 @@ mod tests {
             tools: Vec::new(),
             model: model(thinking),
             thinking_level: level.map(|s| s.into()),
+            cache_retention: Default::default(),
+            session_id: None,
             metadata: Default::default(),
         }
     }
@@ -610,15 +616,25 @@ mod tests {
 
     #[test]
     fn cache_fields() {
-        let c = ctx(vec![user("hi")], ThinkingKind::None, None);
-        let opts = StreamOptions {
-            session_id: Some("s".repeat(100)),
-            cache_retention: Some("1h".into()),
-            ..Default::default()
-        };
-        let v = serde_json::to_value(to_request(&c, &opts)).unwrap();
+        let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
+        c.session_id = Some("s".repeat(100));
+
+        // Default (short) retention: key sent, clamped to 64 chars; no
+        // retention field.
+        let v = serde_json::to_value(to_request(&c, &StreamOptions::default())).unwrap();
         assert_eq!(v["prompt_cache_key"].as_str().unwrap().len(), 64);
+        assert!(v.get("prompt_cache_retention").is_none());
+
+        // Long retention adds the 24h retention field.
+        c.cache_retention = crate::types::CacheRetention::Long;
+        let v = serde_json::to_value(to_request(&c, &StreamOptions::default())).unwrap();
         assert_eq!(v["prompt_cache_retention"], "24h");
+
+        // Retention off sends neither field.
+        c.cache_retention = crate::types::CacheRetention::None;
+        let v = serde_json::to_value(to_request(&c, &StreamOptions::default())).unwrap();
+        assert!(v.get("prompt_cache_key").is_none());
+        assert!(v.get("prompt_cache_retention").is_none());
     }
 
     // ── system prompt ───────────────────────────────────────────────────────

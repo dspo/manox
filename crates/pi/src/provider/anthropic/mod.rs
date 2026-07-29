@@ -287,6 +287,8 @@ mod tests {
                 metadata: Default::default(),
             },
             thinking_level: None,
+            cache_retention: Default::default(),
+            session_id: None,
             metadata: Default::default(),
         }
     }

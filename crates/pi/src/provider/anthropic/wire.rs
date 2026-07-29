@@ -85,7 +85,11 @@ pub enum ContentBlockParam {
         cache_control: Option<CacheControl>,
     },
     #[serde(rename = "image")]
-    Image { source: ImageSourceParam },
+    Image {
+        source: ImageSourceParam,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -98,11 +102,29 @@ pub enum ContentBlockParam {
         content: Vec<ContentBlockParam>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     #[serde(rename = "thinking")]
     Thinking { thinking: String, signature: String },
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
+}
+
+impl ContentBlockParam {
+    /// Attach a cache breakpoint. Only the block kinds the API accepts a
+    /// breakpoint on (text, image, tool_result) are marked; other kinds are
+    /// left untouched.
+    pub fn set_cache_control(&mut self, cache_control: CacheControl) {
+        match self {
+            ContentBlockParam::Text { cache_control: slot, .. }
+            | ContentBlockParam::Image { cache_control: slot, .. }
+            | ContentBlockParam::ToolResult { cache_control: slot, .. } => {
+                *slot = Some(cache_control);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

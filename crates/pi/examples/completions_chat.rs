@@ -104,6 +104,8 @@ async fn main() {
             metadata: Default::default(),
         },
         thinking_level: args.thinking_level.clone(),
+        cache_retention: Default::default(),
+        session_id: None,
         metadata: Default::default(),
     };
 

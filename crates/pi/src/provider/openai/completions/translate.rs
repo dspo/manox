@@ -14,7 +14,8 @@
 
 use crate::provider::openai::{clamp_cache_key, requires_reasoning_content_on_assistant, uses_legacy_max_tokens};
 use crate::types::{
-    AgentContext, AgentMessage, ContentBlock, ImageSource, StreamOptions, ThinkingKind,
+    AgentContext, AgentMessage, CacheRetention, ContentBlock, ImageSource, StreamOptions,
+    ThinkingKind,
 };
 use super::wire::*;
 
@@ -40,12 +41,25 @@ pub fn to_request(
         tools: tools_param(context),
         thinking,
         reasoning_effort,
-        prompt_cache_key: options.session_id.as_deref().map(clamp_cache_key),
-        prompt_cache_retention: match options.cache_retention.as_deref() {
-            Some("1h") | Some("long") => Some("24h"),
+        prompt_cache_key: prompt_cache_key(context, base_url),
+        prompt_cache_retention: match context.cache_retention {
+            CacheRetention::Long => Some("24h"),
             _ => None,
         },
         stream_options: WireStreamOptions { include_usage: true },
+    }
+}
+
+/// The session-affinity cache key goes to the official OpenAI endpoint
+/// whenever caching is on, and to any endpoint under extended retention.
+fn prompt_cache_key(context: &AgentContext, base_url: &str) -> Option<String> {
+    let send = (base_url.contains("api.openai.com")
+        && context.cache_retention != CacheRetention::None)
+        || context.cache_retention == CacheRetention::Long;
+    if send {
+        context.session_id.as_deref().map(clamp_cache_key)
+    } else {
+        None
     }
 }
 
@@ -324,6 +338,8 @@ mod tests {
             tools: Vec::new(),
             model: model(thinking),
             thinking_level: level.map(|s| s.into()),
+            cache_retention: Default::default(),
+            session_id: None,
             metadata: Default::default(),
         }
     }
@@ -519,21 +535,41 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_clamped_and_retention_mapped() {
-        let c = ctx(vec![user("hi")], ThinkingKind::None, None);
-        let opts = StreamOptions {
-            session_id: Some("s".repeat(100)),
-            cache_retention: Some("1h".into()),
-            ..Default::default()
-        };
-        let v = serde_json::to_value(to_request(&c, &opts, OPENAI)).unwrap();
+    fn cache_key_follows_endpoint_and_retention_gate() {
+        let mut c = ctx(vec![user("hi")], ThinkingKind::None, None);
+        c.session_id = Some("s".repeat(100));
+
+        // Official endpoint + default (short) retention: key sent, clamped to
+        // 64 chars; no retention field.
+        let v = serde_json::to_value(to_request(&c, &StreamOptions::default(), OPENAI)).unwrap();
+        assert_eq!(v["prompt_cache_key"].as_str().unwrap().len(), 64);
+        assert!(v.get("prompt_cache_retention").is_none());
+
+        // Non-official endpoint + short retention: neither field.
+        let v = serde_json::to_value(to_request(
+            &c,
+            &StreamOptions::default(),
+            "https://example.com/v1",
+        ))
+        .unwrap();
+        assert!(v.get("prompt_cache_key").is_none());
+        assert!(v.get("prompt_cache_retention").is_none());
+
+        // Non-official endpoint + long retention: key and 24h retention.
+        c.cache_retention = crate::types::CacheRetention::Long;
+        let v = serde_json::to_value(to_request(
+            &c,
+            &StreamOptions::default(),
+            "https://example.com/v1",
+        ))
+        .unwrap();
         assert_eq!(v["prompt_cache_key"].as_str().unwrap().len(), 64);
         assert_eq!(v["prompt_cache_retention"], "24h");
 
-        // Default retention sends neither cache field beyond the key.
-        let opts = StreamOptions { session_id: Some("s".into()), ..Default::default() };
-        let v = serde_json::to_value(to_request(&c, &opts, OPENAI)).unwrap();
-        assert_eq!(v["prompt_cache_key"], "s");
+        // Retention off: neither field, even on the official endpoint.
+        c.cache_retention = crate::types::CacheRetention::None;
+        let v = serde_json::to_value(to_request(&c, &StreamOptions::default(), OPENAI)).unwrap();
+        assert!(v.get("prompt_cache_key").is_none());
         assert!(v.get("prompt_cache_retention").is_none());
     }
 
