@@ -18,7 +18,7 @@
 crates/pi/src/
   harness.rs          -- AgentHarness（编排层：session 持久化、hooks、compaction 集成）
   agent.rs            -- Agent（状态管理：steering/follow-up 队列、事件订阅、生命周期）
-  loop.rs             -- run_loop（纯引擎：双循环状态机、工具调用管道）
+  agent_loop.rs       -- run_loop（纯引擎：双循环状态机、工具调用管道）
   types.rs            -- 核心类型：AgentMessage、AgentEvent、AgentContext、AgentLoopConfig
   tool.rs             -- AgentTool trait、工具执行管道
   compaction.rs       -- Compaction 算法（切点选择、token 估算、摘要生成）
@@ -107,7 +107,7 @@ pub trait AgentTool: Send + Sync {
 
 ### Phase 2: 核心引擎（1-2 天）
 
-**文件：** `loop.rs`, `agent.rs`
+**文件：** `agent_loop.rs`, `agent.rs`
 
 1. 实现 `run_loop()` —— 双循环状态机
    - 外层：follow-up 消息循环

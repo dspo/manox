@@ -257,7 +257,7 @@ impl Agent {
             let msgs = owned_messages.clone();
 
             Box::pin(async move {
-                let msgs = run_loop(&msgs, &mut context, &config, Some(signal), stream_fn.as_ref(), &sink).await?;
+                let msgs = run_loop(&msgs, &mut context, &config, Some(signal), stream_fn, &sink).await?;
                 Ok((msgs, context))
             })
         }).await?;
@@ -273,7 +273,7 @@ impl Agent {
             let sink = agent.sink.clone();
 
             Box::pin(async move {
-                let msgs = run_loop_continue(&mut context, &config, Some(signal), stream_fn.as_ref(), &sink).await?;
+                let msgs = run_loop_continue(&mut context, &config, Some(signal), stream_fn, &sink).await?;
                 Ok((msgs, context))
             })
         }).await?;
@@ -330,7 +330,7 @@ mod tests {
             &self,
             _context: &AgentContext,
             _signal: CancellationToken,
-            _on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> Result<AgentMessage, anyhow::Error> {
             Ok(AgentMessage::Assistant {
                 content: vec![ContentBlock::Text {

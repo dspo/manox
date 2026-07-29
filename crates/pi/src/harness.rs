@@ -385,7 +385,7 @@ mod tests {
             &self,
             _context: &AgentContext,
             _signal: CancellationToken,
-            _on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
         ) -> Result<AgentMessage, anyhow::Error> {
             Ok(AgentMessage::Assistant {
                 content: vec![ContentBlock::Text {

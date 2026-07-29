@@ -10,6 +10,9 @@
 //   Inner loop — processes tool calls and steering messages within a single
 //                turn.
 
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::{AgentToolResult, execute_tool_calls};
@@ -23,19 +26,20 @@ pub trait EventSink: Send {
 /// The function that streams an assistant response from an LLM.
 ///
 /// The harness doesn't know or care which provider is on the other end. The
-/// response is a sequence of events that the loop processes to build the
-/// assistant message and emit lifecycle events.
+/// stream function sends events through an mpsc channel. The loop collects
+/// them on the receiver side, building the assistant message and forwarding
+/// events to subscribers.
 #[async_trait::async_trait]
 pub trait StreamFn: Send + Sync {
     /// Stream the assistant's response for the given context.
     ///
-    /// Returns each event in order. The last event should be `AgentEnd` or
-    /// the returned `AssistantMessage` should be the final one.
+    /// Sends lifecycle events through `event_tx` as the response streams in.
+    /// Returns the final assistant message when the stream completes.
     async fn stream(
         &self,
         context: &AgentContext,
         signal: CancellationToken,
-        on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+        event_tx: mpsc::Sender<AgentEvent>,
     ) -> Result<AgentMessage, anyhow::Error>;
 }
 
@@ -48,7 +52,7 @@ pub async fn run_loop(
     context: &mut AgentContext,
     config: &AgentLoopConfig,
     signal: Option<CancellationToken>,
-    stream_fn: &dyn StreamFn,
+    stream_fn: Arc<dyn StreamFn>,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<Vec<AgentMessage>, anyhow::Error> {
     let signal = signal.unwrap_or_else(CancellationToken::new);
@@ -68,7 +72,7 @@ pub async fn run_loop_continue(
     context: &mut AgentContext,
     config: &AgentLoopConfig,
     signal: Option<CancellationToken>,
-    stream_fn: &dyn StreamFn,
+    stream_fn: Arc<dyn StreamFn>,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<Vec<AgentMessage>, anyhow::Error> {
     let signal = signal.unwrap_or_else(CancellationToken::new);
@@ -91,7 +95,7 @@ async fn run_loop_inner(
     new_messages: &mut Vec<AgentMessage>,
     config: &AgentLoopConfig,
     signal: &CancellationToken,
-    stream_fn: &dyn StreamFn,
+    stream_fn: Arc<dyn StreamFn>,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<(), anyhow::Error> {
     sink.emit(AgentEvent::AgentStart);
@@ -137,7 +141,7 @@ async fn run_loop_inner(
             }
 
             // Stream assistant response.
-            let message = stream_assistant_response(context, signal, stream_fn, sink).await?;
+            let message = stream_assistant_response(context, signal, Arc::clone(&stream_fn), sink).await?;
 
             new_messages.push(message.clone());
             context.messages.push(message.clone());
@@ -185,7 +189,7 @@ async fn run_loop_inner(
                         &tool_calls,
                         &context.tools,
                         signal.clone(),
-                        &NoopToolContext, // tools don't need context from the loop
+                        &NoopToolContext,
                         config.sequential_tool_execution,
                     )
                     .await
@@ -268,39 +272,49 @@ async fn run_loop_inner(
 }
 
 /// Stream an assistant response from the LLM and emit lifecycle events.
+///
+/// Creates an mpsc channel, spawns the stream function on a tokio task,
+/// and collects events on the receiver side. This avoids the Cell/RefCell
+/// issues that arise from Fn closures — state accumulation happens on the
+/// receiver side without any Sync requirements.
 async fn stream_assistant_response(
     context: &AgentContext,
     signal: &CancellationToken,
-    stream_fn: &dyn StreamFn,
+    stream_fn: Arc<dyn StreamFn>,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<AgentMessage, anyhow::Error> {
-    let first = std::sync::Mutex::new(true);
-    let partial_message: std::sync::Mutex<Option<AgentMessage>> = std::sync::Mutex::new(None);
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
 
-    let message = stream_fn
-        .stream(
-            context,
-            signal.clone(),
-            &|event: AgentEvent| {
-                match &event {
-                    AgentEvent::MessageStart { message } => {
-                        if *first.lock().unwrap() {
-                            *first.lock().unwrap() = false;
-                            *partial_message.lock().unwrap() = Some((**message).clone());
-                        }
-                    }
-                    AgentEvent::MessageUpdate { message } => {
-                        *partial_message.lock().unwrap() = Some((**message).clone());
-                    }
-                    _ => {}
-                }
-                sink.emit(event);
-            },
-        )
-        .await?;
+    // Clone what the spawned task needs.
+    let ctx = context.clone();
+    let sig = signal.clone();
+
+    // Spawn the stream function so it can send events concurrently.
+    let stream_handle = tokio::spawn(async move {
+        stream_fn.stream(&ctx, sig, event_tx).await
+    });
+
+    // Accumulate streaming state on the receiver side.
+    let mut first = true;
+
+    // Process events as they arrive from the channel.
+    // The channel closes when the sender is dropped (stream completes or errors).
+    while let Some(event) = event_rx.recv().await {
+        match &event {
+            AgentEvent::MessageStart { .. } => {
+                first = false;
+            }
+            AgentEvent::MessageUpdate { .. } => {}
+            _ => {}
+        }
+        sink.emit(event);
+    }
+
+    // Wait for the stream to complete and get the final message.
+    let message = stream_handle.await??;
 
     // Emit message_start/message_end if not already emitted by the stream.
-    if *first.lock().unwrap() {
+    if first {
         sink.emit(AgentEvent::MessageStart {
             message: Box::new(message.clone()),
         });
@@ -366,8 +380,6 @@ struct NoopToolContext;
 
 impl crate::tool::ToolContext for NoopToolContext {
     fn env(&self) -> &dyn crate::env::ExecutionEnv {
-        // Tools using this context should not call env().
-        // Real tools will receive a proper context from the harness.
         unimplemented!("NoopToolContext::env() — real tools need a proper context")
     }
     fn cwd(&self) -> &std::path::Path {
@@ -404,7 +416,7 @@ mod tests {
             &self,
             _context: &AgentContext,
             _signal: CancellationToken,
-            _on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+            _event_tx: mpsc::Sender<AgentEvent>,
         ) -> Result<AgentMessage, anyhow::Error> {
             Ok(AgentMessage::Assistant {
                 content: vec![ContentBlock::Text {
@@ -422,7 +434,6 @@ mod tests {
     #[tokio::test]
     async fn test_run_loop_single_turn() {
         let sink = MockSink::new();
-        let stream_fn = MockStreamFn;
         let config = AgentLoopConfig::default();
 
         let mut context = AgentContext {
@@ -445,7 +456,7 @@ mod tests {
             &mut context,
             &config,
             None,
-            &stream_fn,
+            Arc::new(MockStreamFn),
             &sink,
         )
         .await;

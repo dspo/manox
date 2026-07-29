@@ -22,7 +22,7 @@ similar.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait = "0.1"
-jsonschema = "0.18"
+jsonschema.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "fs"] }
