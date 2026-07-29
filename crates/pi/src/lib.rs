@@ -36,5 +36,6 @@ pub use types::{AgentMessage, AgentEvent, AgentContext, AgentLoopConfig, AgentSt
 pub use env::ExecutionEnv;
 pub use provider::ProviderError;
 pub use provider::anthropic::AnthropicStreamFn;
+pub use provider::openai::completions::CompletionsStreamFn;
 pub use tool::{AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext};
 pub use tools::ToolRegistry;

@@ -6,6 +6,7 @@
 // The SSE parser (`sse`) is transport-level and is shared.
 
 pub mod anthropic;
+pub mod openai;
 pub mod sse;
 
 use thiserror::Error;
@@ -32,4 +33,9 @@ pub enum ProviderError {
     /// A transport-level failure (connect, timeout, reset).
     #[error("transport error: {0}")]
     Transport(String),
+
+    /// The API signalled an error mid-stream: a 2xx response whose event
+    /// stream carries an `{"error": ...}` payload instead of protocol events.
+    #[error("provider error mid-stream: {0}")]
+    MidStream(String),
 }
