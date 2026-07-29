@@ -8,7 +8,7 @@ publish.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 futures.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs"] }
 tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,7 +25,8 @@ async-trait = "0.1"
 jsonschema = "0.18"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "fs"] }
+tempfile = "3"
 
 [lints.clippy]
 dbg_macro = "deny"
