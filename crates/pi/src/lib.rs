@@ -15,6 +15,7 @@ pub mod compaction;
 pub mod env;
 pub mod harness;
 pub mod output_guard;
+pub mod provider;
 pub mod session;
 pub mod settings;
 pub mod system_prompt;
