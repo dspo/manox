@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The trust status of a project directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +31,7 @@ impl TrustManager {
     }
 
     /// Check the trust status of a directory.
-    pub fn check(&self, path: &PathBuf) -> TrustStatus {
+    pub fn check(&self, path: &Path) -> TrustStatus {
         // Normalize the path for consistent comparison.
         let normalized = normalize_path(path);
         if self.trusted.contains(&normalized) {
@@ -48,19 +48,19 @@ impl TrustManager {
     }
 
     /// Revoke trust for a directory.
-    pub fn revoke(&mut self, path: &PathBuf) {
+    pub fn revoke(&mut self, path: &Path) {
         let normalized = normalize_path(path);
         self.trusted.remove(&normalized);
     }
 
     /// Whether a directory is trusted.
-    pub fn is_trusted(&self, path: &PathBuf) -> bool {
+    pub fn is_trusted(&self, path: &Path) -> bool {
         matches!(self.check(path), TrustStatus::Trusted)
     }
 }
 
 /// Normalize a path for consistent trust lookups.
-fn normalize_path(path: &PathBuf) -> PathBuf {
+fn normalize_path(path: &Path) -> PathBuf {
     // Canonicalize if possible, otherwise clean up the path.
     path.canonicalize().unwrap_or_else(|_| {
         // Fallback: clean up redundant separators and dots.

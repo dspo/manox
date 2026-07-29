@@ -205,17 +205,16 @@ fn search_files(
             Err(_) => continue,
         };
 
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
 
         let path = entry.path();
 
-        if let Some(globs) = glob_set {
-            if !globs.is_match(path) {
+        if let Some(globs) = glob_set
+            && !globs.is_match(path) {
                 continue;
             }
-        }
 
         if results.len() >= limit {
             break;
@@ -263,9 +262,9 @@ fn format_with_context(
     let mut output = String::new();
     output.push_str(&format!("--- {} ---\n", path.display()));
 
-    for i in start..end {
+    for (i, line) in lines.iter().enumerate().take(end).skip(start) {
         let marker = if i == line_idx { ">" } else { " " };
-        output.push_str(&format!("{} {}:{}\n", marker, i + 1, lines[i]));
+        output.push_str(&format!("{} {}:{}\n", marker, i + 1, line));
     }
 
     output

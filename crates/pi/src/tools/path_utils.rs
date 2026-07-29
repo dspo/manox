@@ -28,11 +28,10 @@ fn expand_tilde(path_str: &str) -> String {
         if let Some(home) = dirs_home() {
             return home.to_string_lossy().to_string() + &path_str[1..];
         }
-    } else if path_str == "~" {
-        if let Some(home) = dirs_home() {
+    } else if path_str == "~"
+        && let Some(home) = dirs_home() {
             return home.to_string_lossy().to_string();
         }
-    }
     path_str.to_string()
 }
 
@@ -41,7 +40,7 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| {
+        .or({
             #[cfg(target_os = "windows")]
             {
                 std::env::var("USERPROFILE").ok().map(PathBuf::from)

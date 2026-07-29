@@ -25,6 +25,12 @@ pub struct OutputAccumulator {
     sealed: bool,
 }
 
+impl Default for OutputAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OutputAccumulator {
     /// Create a new output accumulator.
     pub fn new() -> Self {
@@ -44,11 +50,11 @@ impl OutputAccumulator {
 
         self.total_bytes += chunk.len();
 
-        if self.spill_path.is_some() {
+        if let Some(spill_path) = &self.spill_path {
             // Already spilling — append to the temp file.
             let mut file = tokio::fs::OpenOptions::new()
                 .append(true)
-                .open(self.spill_path.as_ref().unwrap())
+                .open(spill_path)
                 .await?;
             file.write_all(chunk.as_bytes()).await?;
         } else if self.buffer.len() + chunk.len() > MAX_IN_MEMORY_BYTES {

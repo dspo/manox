@@ -300,44 +300,38 @@ impl std::fmt::Debug for AgentContext {
     }
 }
 
+/// Supplies queued messages to inject into the run.
+pub type MessageQueueFn = Box<dyn Fn() -> Vec<AgentMessage> + Send + Sync>;
+/// Refreshes the context/model before a turn; `None` keeps the current turn.
+pub type PrepareTurnFn = Box<dyn Fn(&mut AgentContext) -> Option<AgentContext> + Send + Sync>;
+/// Decides whether the run should stop after a turn.
+pub type StopAfterTurnFn = Box<dyn Fn(&AgentMessage, &[AgentMessage]) -> bool + Send + Sync>;
+/// Gates a tool call before execution; `Some(reason)` blocks it.
+pub type BeforeToolCallFn = Box<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
+/// Patches a tool result after execution.
+pub type AfterToolCallFn = Box<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
+
 /// Configuration for a single agent loop invocation.
+#[derive(Default)]
 pub struct AgentLoopConfig {
     /// Callback to get queued steering messages (injected mid-turn).
-    pub get_steering_messages: Option<Box<dyn Fn() -> Vec<AgentMessage> + Send + Sync>>,
+    pub get_steering_messages: Option<MessageQueueFn>,
     /// Callback to get follow-up messages (injected after turn settles).
-    pub get_follow_up_messages: Option<Box<dyn Fn() -> Vec<AgentMessage> + Send + Sync>>,
+    pub get_follow_up_messages: Option<MessageQueueFn>,
     /// Called before each turn to potentially refresh context/model.
-    pub prepare_next_turn:
-        Option<Box<dyn Fn(&mut AgentContext) -> Option<AgentContext> + Send + Sync>>,
+    pub prepare_next_turn: Option<PrepareTurnFn>,
     /// Called after each turn to decide whether to stop.
-    pub should_stop_after_turn:
-        Option<Box<dyn Fn(&AgentMessage, &[AgentMessage]) -> bool + Send + Sync>>,
+    pub should_stop_after_turn: Option<StopAfterTurnFn>,
     /// Called before a tool call executes. Return `Some(reason)` to block.
-    pub before_tool_call:
-        Option<Box<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>>,
+    pub before_tool_call: Option<BeforeToolCallFn>,
     /// Called after a tool call executes to patch the result.
-    pub after_tool_call:
-        Option<Box<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>>,
+    pub after_tool_call: Option<AfterToolCallFn>,
     /// Whether tools execute sequentially (default: parallel).
     pub sequential_tool_execution: bool,
     /// Maximum number of turns before forcing a stop.
     pub max_turns: Option<usize>,
 }
 
-impl Default for AgentLoopConfig {
-    fn default() -> Self {
-        AgentLoopConfig {
-            get_steering_messages: None,
-            get_follow_up_messages: None,
-            prepare_next_turn: None,
-            should_stop_after_turn: None,
-            before_tool_call: None,
-            after_tool_call: None,
-            sequential_tool_execution: false,
-            max_turns: None,
-        }
-    }
-}
 
 // ── Agent state ─────────────────────────────────────────────────────────────
 

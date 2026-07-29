@@ -59,10 +59,7 @@ impl AgentTool for WriteTool {
         let path = ctx.cwd().join(path_str);
 
         // Read existing content for diff, if the file exists.
-        let old_content = match ctx.env().read_file(&path, None, None).await {
-            Ok(c) => Some(c),
-            Err(_) => None,
-        };
+        let old_content = ctx.env().read_file(&path, None, None).await.ok();
 
         ctx.env()
             .write_file(&path, content)

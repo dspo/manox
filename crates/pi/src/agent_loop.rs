@@ -55,7 +55,7 @@ pub async fn run_loop(
     stream_fn: Arc<dyn StreamFn>,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<Vec<AgentMessage>, anyhow::Error> {
-    let signal = signal.unwrap_or_else(CancellationToken::new);
+    let signal = signal.unwrap_or_default();
     let mut new_messages: Vec<AgentMessage> = prompts.to_vec();
 
     // Prepend prompts to the context.
@@ -75,7 +75,7 @@ pub async fn run_loop_continue(
     stream_fn: Arc<dyn StreamFn>,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<Vec<AgentMessage>, anyhow::Error> {
-    let signal = signal.unwrap_or_else(CancellationToken::new);
+    let signal = signal.unwrap_or_default();
 
     if context.messages.is_empty() {
         anyhow::bail!("Cannot continue: no messages in context");
@@ -216,34 +216,31 @@ async fn run_loop_inner(
             });
 
             // Apply next-turn context update.
-            if let Some(ref prepare_next_turn) = config.prepare_next_turn {
-                if let Some(updated) = prepare_next_turn(context) {
+            if let Some(ref prepare_next_turn) = config.prepare_next_turn
+                && let Some(updated) = prepare_next_turn(context) {
                     *context = updated;
                 }
-            }
 
             // Check early stop.
             if let Some(ref should_stop) = config.should_stop_after_turn {
                 let last_msg = context.messages.last().cloned();
-                if let Some(last_msg) = last_msg {
-                    if should_stop(&last_msg, &tool_results) {
+                if let Some(last_msg) = last_msg
+                    && should_stop(&last_msg, &tool_results) {
                         sink.emit(AgentEvent::AgentEnd {
                             messages: new_messages.clone(),
                         });
                         return Ok(());
                     }
-                }
             }
 
             // Check max turns.
-            if let Some(max_turns) = config.max_turns {
-                if turn_count >= max_turns {
+            if let Some(max_turns) = config.max_turns
+                && turn_count >= max_turns {
                     sink.emit(AgentEvent::AgentEnd {
                         messages: new_messages.clone(),
                     });
                     return Ok(());
                 }
-            }
 
             // Poll steering queue.
             pending_messages = config

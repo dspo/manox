@@ -52,11 +52,10 @@ pub fn build_system_prompt(
         context.push_str(&format!("\nGit branch: {branch}"));
     }
 
-    if let Some(ref status) = project.git_status {
-        if !status.is_empty() {
+    if let Some(ref status) = project.git_status
+        && !status.is_empty() {
             context.push_str(&format!("\nGit status:\n{status}"));
         }
-    }
 
     context.push_str("\n</project_context>");
     parts.push(context);
@@ -84,11 +83,10 @@ pub fn find_project_instructions(cwd: &Path) -> Option<String> {
 
     for candidate in &candidates {
         let path = cwd.join(candidate);
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
+        if path.exists()
+            && let Ok(content) = std::fs::read_to_string(&path) {
                 return Some(content);
             }
-        }
     }
 
     None

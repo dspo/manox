@@ -172,13 +172,12 @@ impl ExecutionEnv for TokioExecutionEnv {
     }
 
     async fn write_file(&self, path: &Path, content: &str) -> Result<(), FileError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| map_io_error(e, parent))?;
             }
-        }
         tokio::fs::write(path, content)
             .await
             .map_err(|e| map_io_error(e, path))
@@ -249,7 +248,9 @@ impl ExecutionEnv for TokioExecutionEnv {
         command: &str,
         timeout_dur: Duration,
     ) -> Result<CommandResult, ExecutionError> {
-        let result = tokio::time::timeout(timeout_dur, async {
+        
+
+        tokio::time::timeout(timeout_dur, async {
             let output = tokio::process::Command::new("sh")
                 .arg("-c")
                 .arg(command)
@@ -265,9 +266,7 @@ impl ExecutionEnv for TokioExecutionEnv {
             })
         })
         .await
-        .map_err(|_| ExecutionError::Timeout(timeout_dur))?;
-
-        result
+        .map_err(|_| ExecutionError::Timeout(timeout_dur))?
     }
 }
 

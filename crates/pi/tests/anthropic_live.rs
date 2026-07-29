@@ -34,8 +34,15 @@ fn ctx_with(prompt: &str) -> AgentContext {
 }
 
 fn stream_fn() -> Option<AnthropicStreamFn> {
-    // from_env honours ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL (gateways).
-    AnthropicStreamFn::from_env()
+    let key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty())?;
+    let mut f = AnthropicStreamFn::new(key);
+    // The caller points the SDK at a gateway explicitly; the SDK reads no env.
+    if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
+        if !base.is_empty() {
+            f = f.with_base_url(base);
+        }
+    }
+    Some(f)
 }
 
 #[tokio::test]
