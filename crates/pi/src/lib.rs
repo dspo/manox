@@ -34,5 +34,7 @@ pub use agent_loop::{StreamFn, EventSink};
 pub use harness::AgentHarness;
 pub use types::{AgentMessage, AgentEvent, AgentContext, AgentLoopConfig, AgentState};
 pub use env::ExecutionEnv;
+pub use provider::ProviderError;
+pub use provider::anthropic::AnthropicStreamFn;
 pub use tool::{AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext};
 pub use tools::ToolRegistry;

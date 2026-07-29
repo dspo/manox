@@ -40,6 +40,20 @@ impl AnthropicStreamFn {
         }
     }
 
+    /// Build from environment variables: `ANTHROPIC_API_KEY` (required) and
+    /// `ANTHROPIC_BASE_URL` (optional, for Anthropic-compatible gateways).
+    /// Returns `None` when the key is absent or empty.
+    pub fn from_env() -> Option<Self> {
+        let key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty())?;
+        let mut f = Self::new(key);
+        if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
+            if !base.is_empty() {
+                f.base_url = base;
+            }
+        }
+        Some(f)
+    }
+
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
