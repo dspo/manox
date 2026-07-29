@@ -6,6 +6,7 @@
 // different whitespace or indentation than the actual file content.
 
 use crate::tool::{AgentTool, AgentToolResult, ToolError, ToolContext};
+use crate::tools::edit_diff;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -79,9 +80,18 @@ impl AgentTool for EditTool {
         ctx.env().write_file(&path, &new_content).await
             .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
 
-        Ok(AgentToolResult::text(format!(
-            "Edited file: {path}", path = path.display()
-        )))
+        // Compute diff showing what changed.
+        let diff = edit_diff::compute_unified_diff(&content, &new_content, &path);
+
+        let mut output = format!("Edited file: {path}", path = path.display());
+        if !edit_diff::is_diff_empty(&diff) {
+            output.push_str(&format!(
+                "\n\nChanges ({hunks} hunk(s)):\n```diff\n{diff}```",
+                hunks = edit_diff::count_diff_hunks(&diff)
+            ));
+        }
+
+        Ok(AgentToolResult::text(output))
     }
 }
 

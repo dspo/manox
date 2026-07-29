@@ -390,10 +390,11 @@ impl crate::tool::ToolContext for NoopToolContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
     use crate::types::{Model, Usage};
+    use serde_json::Value as JsonValue;
     use std::sync::Mutex;
 
-    struct MockStreamFn;
     struct MockSink {
         events: Mutex<Vec<AgentEvent>>,
     }
@@ -409,6 +410,10 @@ mod tests {
             self.events.lock().unwrap().push(event);
         }
     }
+
+    // ── Simple mock: always returns a text response ──────────────────────────
+
+    struct MockStreamFn;
 
     #[async_trait::async_trait]
     impl StreamFn for MockStreamFn {
@@ -470,5 +475,342 @@ mod tests {
         let has_agent_end = events.iter().any(|e| matches!(e, AgentEvent::AgentEnd { .. }));
         assert!(has_agent_start, "expected AgentStart event");
         assert!(has_agent_end, "expected AgentEnd event");
+    }
+
+    // ── Stateful mock: returns different messages based on call count ─────────
+
+    struct StatefulMockStreamFn {
+        responses: Mutex<Vec<AgentMessage>>,
+    }
+
+    impl StatefulMockStreamFn {
+        fn new(responses: Vec<AgentMessage>) -> Self {
+            StatefulMockStreamFn {
+                responses: Mutex::new(responses),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for StatefulMockStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let mut guard = self.responses.lock().unwrap();
+            if guard.is_empty() {
+                // Fallback: return a default end-turn response.
+                return Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    model: "mock".into(),
+                    provider: "mock".into(),
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Usage::default(),
+                    timestamp: chrono::Utc::now(),
+                });
+            }
+            Ok(guard.remove(0))
+        }
+    }
+
+    // ── Mock tool that echoes arguments ──────────────────────────────────────
+
+    struct EchoTool;
+
+    #[async_trait::async_trait]
+    impl AgentTool for EchoTool {
+        fn name(&self) -> &str { "echo" }
+        fn description(&self) -> &str { "Echoes input" }
+        fn is_read_only(&self) -> bool { true }
+        fn parameters_schema(&self) -> JsonValue {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                },
+                "required": ["message"]
+            })
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            params: JsonValue,
+            _signal: CancellationToken,
+            _ctx: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            let msg = params["message"].as_str().unwrap_or("no message");
+            Ok(AgentToolResult::text(msg))
+        }
+    }
+
+    // ── Multi-turn tool call loop ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_loop_multi_turn_tool_calls() {
+        let sink = MockSink::new();
+
+        let mut config = AgentLoopConfig::default();
+        // Set a max turns to prevent infinite loops.
+        config.max_turns = Some(10);
+
+        let mut context = AgentContext {
+            system_prompt: "You are a test assistant.".into(),
+            messages: Vec::new(),
+            tools: vec![Box::new(EchoTool)],
+            model: Model {
+                provider: "mock".into(),
+                id: "mock".into(),
+                context_window: 100_000,
+                supports_thinking: false,
+                metadata: Default::default(),
+            },
+            thinking_level: None,
+            metadata: Default::default(),
+        };
+
+        // First response: a tool call.
+        let tool_call_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolCall {
+                id: "call_1".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"message": "hello"}),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Usage::default(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        // Second response: text after tool result.
+        let text_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: "Tool executed successfully.".into(),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage::default(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        let stream_fn = Arc::new(StatefulMockStreamFn::new(vec![
+            tool_call_msg,
+            text_msg,
+        ]));
+
+        let result = run_loop(
+            &[AgentMessage::user("echo hello")],
+            &mut context,
+            &config,
+            None,
+            stream_fn,
+            &sink,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+
+        // Should have: user, assistant(tool_call), tool_result, assistant(text)
+        let has_tool_result = messages.iter().any(|m| {
+            matches!(m, AgentMessage::ToolResult { .. })
+        });
+        assert!(has_tool_result, "expected a tool result message");
+
+        let has_tool_call = messages.iter().any(|m| {
+            matches!(m, AgentMessage::Assistant { stop_reason, .. } if *stop_reason == Some(StopReason::ToolUse))
+        });
+        assert!(has_tool_call, "expected a tool call message");
+
+        let events = sink.events.lock().unwrap();
+        let turn_count = events.iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count();
+        assert!(turn_count >= 2, "expected at least 2 turns, got {turn_count}");
+    }
+
+    // ── Truncation safety: stop_reason == Length fails all tool calls ────────
+
+    #[tokio::test]
+    async fn test_run_loop_truncation_safety() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+
+        let mut context = AgentContext {
+            system_prompt: "You are a test assistant.".into(),
+            messages: Vec::new(),
+            tools: vec![Box::new(EchoTool)],
+            model: Model {
+                provider: "mock".into(),
+                id: "mock".into(),
+                context_window: 100_000,
+                supports_thinking: false,
+                metadata: Default::default(),
+            },
+            thinking_level: None,
+            metadata: Default::default(),
+        };
+
+        // Assistant message with stop_reason == Length and a tool call.
+        // The tool call should be failed because the response was truncated.
+        let truncated_msg = AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolCall {
+                id: "call_truncated".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"message": "incomplete"}),
+            }],
+            model: "mock".into(),
+            provider: "mock".into(),
+            stop_reason: Some(StopReason::Length),
+            usage: Usage::default(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        let stream_fn = Arc::new(StatefulMockStreamFn::new(vec![truncated_msg]));
+
+        let result = run_loop(
+            &[AgentMessage::user("test")],
+            &mut context,
+            &config,
+            None,
+            stream_fn,
+            &sink,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+
+        // The tool call should have been failed with an error result.
+        let tool_result = messages.iter().find(|m| {
+            matches!(m, AgentMessage::ToolResult { .. })
+        });
+        assert!(tool_result.is_some(), "expected a tool result message");
+
+        if let Some(AgentMessage::ToolResult { is_error, content, .. }) = tool_result {
+            assert!(is_error, "truncated tool call should be an error");
+            let text = content.iter().filter_map(|b| {
+                if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
+            }).collect::<Vec<_>>().join("");
+            assert!(
+                text.contains("output token limit") || text.contains("truncated"),
+                "error should mention truncation, got: {text}"
+            );
+        }
+    }
+
+    // ── Abort during loop ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_loop_abort() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let signal = CancellationToken::new();
+
+        let mut context = AgentContext {
+            system_prompt: "You are a test assistant.".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            model: Model {
+                provider: "mock".into(),
+                id: "mock".into(),
+                context_window: 100_000,
+                supports_thinking: false,
+                metadata: Default::default(),
+            },
+            thinking_level: None,
+            metadata: Default::default(),
+        };
+
+        // Cancel before any stream — the loop should exit immediately.
+        signal.cancel();
+
+        let result = run_loop(
+            &[AgentMessage::user("test")],
+            &mut context,
+            &config,
+            Some(signal),
+            Arc::new(MockStreamFn),
+            &sink,
+        )
+        .await;
+
+        // Should complete without error (loop exits early).
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        // The user message was prepended, but no assistant message should be produced.
+        let assistant_count = messages.iter().filter(|m| matches!(m, AgentMessage::Assistant { .. })).count();
+        assert_eq!(assistant_count, 0, "aborted loop should not produce assistant messages");
+    }
+
+    // ── Follow-up messages: outer loop continues ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_loop_follow_up() {
+        let sink = MockSink::new();
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let follow_up_count = Arc::new(AtomicUsize::new(0));
+        let follow_up_count_clone = Arc::clone(&follow_up_count);
+
+        let mut config = AgentLoopConfig::default();
+        config.max_turns = Some(10);
+
+        // Provide one follow-up message, then none.
+        let follow_up_provided = Arc::new(AtomicUsize::new(0));
+        let follow_up_provided_clone = Arc::clone(&follow_up_provided);
+
+        config.get_follow_up_messages = Some(Box::new(move || {
+            let count = follow_up_provided_clone.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                follow_up_count_clone.fetch_add(1, Ordering::SeqCst);
+                vec![AgentMessage::user("follow-up message")]
+            } else {
+                Vec::new()
+            }
+        }));
+
+        let mut context = AgentContext {
+            system_prompt: "You are a test assistant.".into(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            model: Model {
+                provider: "mock".into(),
+                id: "mock".into(),
+                context_window: 100_000,
+                supports_thinking: false,
+                metadata: Default::default(),
+            },
+            thinking_level: None,
+            metadata: Default::default(),
+        };
+
+        let stream_fn = Arc::new(MockStreamFn);
+
+        let result = run_loop(
+            &[AgentMessage::user("initial")],
+            &mut context,
+            &config,
+            None,
+            stream_fn,
+            &sink,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+
+        // Should have: user(initial), assistant, user(follow-up), assistant
+        let user_count = messages.iter().filter(|m| matches!(m, AgentMessage::User { .. })).count();
+        assert_eq!(user_count, 2, "expected 2 user messages, got {user_count}");
+
+        let assistant_count = messages.iter().filter(|m| matches!(m, AgentMessage::Assistant { .. })).count();
+        assert_eq!(assistant_count, 2, "expected 2 assistant messages, got {assistant_count}");
+
+        assert_eq!(follow_up_count.load(Ordering::SeqCst), 1, "follow-up should have been triggered once");
     }
 }

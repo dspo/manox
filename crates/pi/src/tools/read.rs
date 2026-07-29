@@ -89,6 +89,7 @@ impl AgentTool for ReadTool {
 
         let selected = &lines[start_line..end_line];
         let display_start = start_line + 1;
+        let total_lines = lines.len();
 
         let formatted = format_with_line_numbers(selected, display_start, &path);
 
@@ -99,7 +100,22 @@ impl AgentTool for ReadTool {
         };
         let result = truncate::truncate(&formatted, &config);
 
-        let mut output = result.content;
+        let range_info = if offset.is_some() || limit.is_some() {
+            format!(
+                " (lines {}-{} of {})",
+                display_start,
+                end_line,
+                total_lines
+            )
+        } else {
+            format!(" ({} lines)", total_lines)
+        };
+
+        let mut output = format!(
+            "File: {path}{range_info}\n\n{content}",
+            path = path.display(),
+            content = result.content
+        );
         if result.was_truncated {
             output.push_str(&format!(
                 "\n\n[read: {} lines, {} bytes — output truncated]",
