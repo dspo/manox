@@ -8,7 +8,7 @@
 //   2. Supplying defaults the API requires — `max_tokens`, thinking budgets.
 
 use crate::types::{
-    AgentContext, AgentMessage, ContentBlock, ImageSource, StreamOptions,
+    AgentContext, AgentMessage, ContentBlock, ImageSource, StreamOptions, ThinkingKind,
 };
 use super::wire::*;
 
@@ -74,25 +74,36 @@ fn cache_control(options: &StreamOptions) -> Option<CacheControl> {
     Some(CacheControl { kind: "ephemeral", ttl })
 }
 
-/// Adaptive thinking is enabled when the model supports it and a thinking
-/// level is set. Thinking text comes back summarized; its signature is always
-/// preserved for multi-turn continuity.
+/// The thinking field mirrors the model's thinking protocol: `"off"` forces
+/// `disabled`, a set level picks `adaptive` or `enabled` per the model's
+/// [`ThinkingKind`], and no level at all omits the field (server default).
+/// Thinking text comes back summarized; its signature is always preserved for
+/// multi-turn continuity.
 fn thinking_config(context: &AgentContext) -> Option<ThinkingConfig> {
-    if !context.model.supports_thinking {
-        return None;
+    let display = Some(ThinkingDisplay::Summarized);
+    match context.model.thinking {
+        ThinkingKind::None => None,
+        kind => match context.thinking_level.as_deref() {
+            None => None,
+            Some("off") => Some(ThinkingConfig::Disabled),
+            Some(_) => Some(match kind {
+                ThinkingKind::Adaptive => ThinkingConfig::Adaptive { display },
+                ThinkingKind::Enabled => ThinkingConfig::Enabled { display },
+                ThinkingKind::None => unreachable!(),
+            }),
+        },
     }
-    context.thinking_level.as_deref()?;
-    Some(ThinkingConfig::Adaptive {
-        display: Some(ThinkingDisplay::Summarized),
-    })
 }
 
 /// The effort tier lives in `output_config`, separate from `thinking`.
 fn output_config(context: &AgentContext) -> Option<OutputConfig> {
-    if !context.model.supports_thinking {
+    if !context.model.supports_thinking() {
         return None;
     }
     let level = context.thinking_level.as_deref()?;
+    if level == "off" {
+        return None;
+    }
     Some(OutputConfig {
         effort: Some(map_effort(level)),
     })
@@ -247,12 +258,12 @@ mod tests {
     use crate::types::{AgentMessage, ContentBlock, Model, StopReason, Usage};
     use serde_json::json;
 
-    fn model(supports_thinking: bool) -> Model {
+    fn model(thinking: ThinkingKind) -> Model {
         Model {
             provider: "anthropic".into(),
             id: "claude-test".into(),
             context_window: 200_000,
-            supports_thinking,
+            thinking,
             metadata: Default::default(),
         }
     }
@@ -287,13 +298,13 @@ mod tests {
         }
     }
 
-    fn ctx(messages: Vec<AgentMessage>, thinking: Option<&str>) -> AgentContext {
+    fn ctx(messages: Vec<AgentMessage>, thinking: ThinkingKind, level: Option<&str>) -> AgentContext {
         AgentContext {
             system_prompt: "sys".into(),
             messages,
             tools: Vec::new(),
-            model: model(thinking.is_some()),
-            thinking_level: thinking.map(|s| s.into()),
+            model: model(thinking),
+            thinking_level: level.map(|s| s.into()),
             metadata: Default::default(),
         }
     }
@@ -308,6 +319,7 @@ mod tests {
                 tool_result("t2", "bbb"),
                 user("next"),
             ],
+            ThinkingKind::None,
             None,
         );
         let req = to_request(&ctx, &StreamOptions::default());
@@ -324,7 +336,7 @@ mod tests {
 
     #[test]
     fn assistant_tool_use_maps_input_field() {
-        let ctx = ctx(vec![assistant_tool_call("t1")], None);
+        let ctx = ctx(vec![assistant_tool_call("t1")], ThinkingKind::None, None);
         let req = to_request(&ctx, &StreamOptions::default());
         let v = serde_json::to_value(&req.messages[0]).unwrap();
         assert_eq!(v["content"][0]["type"], "tool_use");
@@ -345,7 +357,7 @@ mod tests {
             usage: Usage::default(),
             timestamp: chrono::Utc::now(),
         };
-        let ctx = ctx(vec![msg], None);
+        let ctx = ctx(vec![msg], ThinkingKind::None, None);
         let req = to_request(&ctx, &StreamOptions::default());
         let v = serde_json::to_value(&req.messages[0]).unwrap();
         assert_eq!(v["content"][0]["type"], "thinking");
@@ -354,7 +366,7 @@ mod tests {
 
     #[test]
     fn adaptive_thinking_sets_thinking_and_effort() {
-        let with = ctx(vec![user("hi")], Some("high"));
+        let with = ctx(vec![user("hi")], ThinkingKind::Adaptive, Some("high"));
         let req = to_request(&with, &StreamOptions::default());
         assert!(matches!(
             req.thinking,
@@ -366,12 +378,49 @@ mod tests {
         ));
 
         // A non-thinking model emits neither, even with a level set.
-        let mut no_think = ctx(vec![user("hi")], None);
-        no_think.model = model(false);
-        no_think.thinking_level = Some("high".into());
+        let no_think = ctx(vec![user("hi")], ThinkingKind::None, Some("high"));
         let req = to_request(&no_think, &StreamOptions::default());
         assert!(req.thinking.is_none());
         assert!(req.output_config.is_none());
+    }
+
+    #[test]
+    fn enabled_kind_uses_enabled_shape_without_budget() {
+        let ctx = ctx(vec![user("hi")], ThinkingKind::Enabled, Some("high"));
+        let req = to_request(&ctx, &StreamOptions::default());
+        assert!(matches!(
+            req.thinking,
+            Some(ThinkingConfig::Enabled { display: Some(ThinkingDisplay::Summarized) })
+        ));
+        assert!(matches!(
+            req.output_config,
+            Some(OutputConfig { effort: Some(Effort::High) })
+        ));
+
+        // The enabled wire shape carries no budget_tokens — depth comes from effort.
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["thinking"]["type"], "enabled");
+        assert!(v["thinking"].get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn off_level_disables_thinking_without_effort() {
+        for kind in [ThinkingKind::Enabled, ThinkingKind::Adaptive] {
+            let ctx = ctx(vec![user("hi")], kind, Some("off"));
+            let req = to_request(&ctx, &StreamOptions::default());
+            assert!(matches!(req.thinking, Some(ThinkingConfig::Disabled)), "{kind:?}");
+            assert!(req.output_config.is_none(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn no_level_omits_thinking_field() {
+        for kind in [ThinkingKind::Enabled, ThinkingKind::Adaptive] {
+            let ctx = ctx(vec![user("hi")], kind, None);
+            let req = to_request(&ctx, &StreamOptions::default());
+            assert!(req.thinking.is_none(), "{kind:?}");
+            assert!(req.output_config.is_none(), "{kind:?}");
+        }
     }
 
     #[test]
@@ -391,7 +440,7 @@ mod tests {
 
     #[test]
     fn thinking_wire_shape_matches_api() {
-        let with = ctx(vec![user("hi")], Some("max"));
+        let with = ctx(vec![user("hi")], ThinkingKind::Adaptive, Some("max"));
         let req = to_request(&with, &StreamOptions::default());
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["thinking"]["type"], "adaptive");
@@ -404,7 +453,7 @@ mod tests {
 
     #[test]
     fn cache_control_on_system_and_default_max_tokens() {
-        let ctx = ctx(vec![user("hi")], None);
+        let ctx = ctx(vec![user("hi")], ThinkingKind::None, None);
         let opts = StreamOptions {
             cache_retention: Some("1h".into()),
             ..Default::default()

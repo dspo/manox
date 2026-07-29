@@ -124,13 +124,24 @@ pub struct ToolParam {
     pub cache_control: Option<CacheControl>,
 }
 
-/// Adaptive thinking: the model decides when and how much to reason. `display`
-/// controls whether thinking text is returned (`summarized`) or only its
-/// signature (`omitted`). Budget-based thinking is intentionally not modelled —
-/// we target adaptive models only.
+/// The `thinking` request field. All three protocol variants are supported;
+/// `budget_tokens` is intentionally omitted — reasoning depth is controlled by
+/// `output_config.effort`, not by a token budget.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum ThinkingConfig {
+    /// Enable thinking without a token budget (the gateway/model decides how
+    /// much to think; effort is set separately in `output_config`).
+    #[serde(rename = "enabled")]
+    Enabled {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+    },
+    /// Explicitly disable thinking. Omitting the field entirely leaves the
+    /// server default in place; this variant forces thinking off.
+    #[serde(rename = "disabled")]
+    Disabled,
+    /// Adaptive thinking: the model decides when and how much to reason.
     #[serde(rename = "adaptive")]
     Adaptive {
         #[serde(skip_serializing_if = "Option::is_none")]

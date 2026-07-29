@@ -391,7 +391,7 @@ impl crate::tool::ToolContext for NoopToolContext {
 mod tests {
     use super::*;
     use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
-    use crate::types::{Model, Usage};
+    use crate::types::{Model, ThinkingKind, Usage};
     use serde_json::Value as JsonValue;
     use std::sync::Mutex;
 
@@ -449,7 +449,7 @@ mod tests {
                 provider: "mock".into(),
                 id: "mock".into(),
                 context_window: 100_000,
-                supports_thinking: false,
+                thinking: ThinkingKind::None,
                 metadata: Default::default(),
             },
             thinking_level: None,
@@ -553,9 +553,11 @@ mod tests {
     async fn test_run_loop_multi_turn_tool_calls() {
         let sink = MockSink::new();
 
-        let mut config = AgentLoopConfig::default();
         // Set a max turns to prevent infinite loops.
-        config.max_turns = Some(10);
+        let config = AgentLoopConfig {
+            max_turns: Some(10),
+            ..Default::default()
+        };
 
         let mut context = AgentContext {
             system_prompt: "You are a test assistant.".into(),
@@ -565,7 +567,7 @@ mod tests {
                 provider: "mock".into(),
                 id: "mock".into(),
                 context_window: 100_000,
-                supports_thinking: false,
+                thinking: ThinkingKind::None,
                 metadata: Default::default(),
             },
             thinking_level: None,
@@ -647,7 +649,7 @@ mod tests {
                 provider: "mock".into(),
                 id: "mock".into(),
                 context_window: 100_000,
-                supports_thinking: false,
+                thinking: ThinkingKind::None,
                 metadata: Default::default(),
             },
             thinking_level: None,
@@ -718,7 +720,7 @@ mod tests {
                 provider: "mock".into(),
                 id: "mock".into(),
                 context_window: 100_000,
-                supports_thinking: false,
+                thinking: ThinkingKind::None,
                 metadata: Default::default(),
             },
             thinking_level: None,
@@ -757,8 +759,10 @@ mod tests {
         let follow_up_count = Arc::new(AtomicUsize::new(0));
         let follow_up_count_clone = Arc::clone(&follow_up_count);
 
-        let mut config = AgentLoopConfig::default();
-        config.max_turns = Some(10);
+        let mut config = AgentLoopConfig {
+            max_turns: Some(10),
+            ..Default::default()
+        };
 
         // Provide one follow-up message, then none.
         let follow_up_provided = Arc::new(AtomicUsize::new(0));
@@ -782,7 +786,7 @@ mod tests {
                 provider: "mock".into(),
                 id: "mock".into(),
                 context_window: 100_000,
-                supports_thinking: false,
+                thinking: ThinkingKind::None,
                 metadata: Default::default(),
             },
             thinking_level: None,

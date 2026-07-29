@@ -252,10 +252,33 @@ pub struct Model {
     pub id: String,
     /// Maximum context window in tokens.
     pub context_window: usize,
-    /// Whether the model supports reasoning/thinking.
-    pub supports_thinking: bool,
+    /// How the model handles reasoning/thinking.
+    pub thinking: ThinkingKind,
     /// Arbitrary provider-specific metadata.
     pub metadata: HashMap<String, JsonValue>,
+}
+
+/// How a model handles reasoning.
+///
+/// Distinguishes the two "thinking on" wire shapes: adaptive models take an
+/// effort tier and decide their own depth; enabled models reason when switched
+/// on but take no effort-independent budget (depth via `output_config.effort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThinkingKind {
+    /// No reasoning support — the thinking field is never sent.
+    #[default]
+    None,
+    /// `thinking: {type: "enabled"}` switches reasoning on.
+    Enabled,
+    /// `thinking: {type: "adaptive"}` — the model decides when/how much.
+    Adaptive,
+}
+
+impl Model {
+    /// Whether any form of thinking can be requested for this model.
+    pub fn supports_thinking(&self) -> bool {
+        !matches!(self.thinking, ThinkingKind::None)
+    }
 }
 
 /// The context passed into the agent loop at the start of each turn.

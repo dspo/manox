@@ -374,7 +374,7 @@ mod tests {
     use super::*;
     use crate::session::SessionStorage;
     use crate::session::SessionTreeEntry;
-    use crate::types::{AgentEvent, ContentBlock, StopReason, Usage};
+    use crate::types::{AgentEvent, ContentBlock, StopReason, ThinkingKind, Usage};
     use tokio_util::sync::CancellationToken;
 
     struct TestStreamFn;
@@ -405,7 +405,7 @@ mod tests {
             provider: "test".into(),
             id: "test".into(),
             context_window: 100_000,
-            supports_thinking: false,
+            thinking: ThinkingKind::None,
             metadata: Default::default(),
         }
     }

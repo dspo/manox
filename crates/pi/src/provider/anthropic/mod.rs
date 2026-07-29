@@ -281,7 +281,7 @@ impl Accumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Model, StopReason};
+    use crate::types::{Model, StopReason, ThinkingKind};
 
     fn ctx() -> AgentContext {
         AgentContext {
@@ -292,7 +292,7 @@ mod tests {
                 provider: "anthropic".into(),
                 id: "claude-test".into(),
                 context_window: 200_000,
-                supports_thinking: false,
+                thinking: ThinkingKind::None,
                 metadata: Default::default(),
             },
             thinking_level: None,

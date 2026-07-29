@@ -320,7 +320,7 @@ impl Clone for SubscriberSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{StopReason, Usage};
+    use crate::types::{StopReason, ThinkingKind, Usage};
 
     struct TestStreamFn;
 
@@ -350,7 +350,7 @@ mod tests {
             provider: "test".into(),
             id: "test".into(),
             context_window: 100_000,
-            supports_thinking: false,
+            thinking: ThinkingKind::None,
             metadata: Default::default(),
         }
     }

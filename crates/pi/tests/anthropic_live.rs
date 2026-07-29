@@ -6,7 +6,7 @@
 
 use pi::provider::anthropic::AnthropicStreamFn;
 use pi::provider::ProviderError;
-use pi::types::Model;
+use pi::types::{Model, ThinkingKind};
 use pi::{AgentContext, AgentEvent, AgentMessage, StreamFn};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +17,7 @@ fn real_model() -> Model {
         id: std::env::var("ANTHROPIC_MODEL")
             .unwrap_or_else(|_| "claude-haiku-4-5-20251001".into()),
         context_window: 200_000,
-        supports_thinking: false,
+        thinking: ThinkingKind::None,
         metadata: Default::default(),
     }
 }
@@ -37,10 +37,10 @@ fn stream_fn() -> Option<AnthropicStreamFn> {
     let key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty())?;
     let mut f = AnthropicStreamFn::new(key);
     // The caller points the SDK at a gateway explicitly; the SDK reads no env.
-    if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
-        if !base.is_empty() {
-            f = f.with_base_url(base);
-        }
+    if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL")
+        && !base.is_empty()
+    {
+        f = f.with_base_url(base);
     }
     Some(f)
 }
