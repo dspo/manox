@@ -108,3 +108,60 @@ async fn abort_mid_stream_returns_aborted() {
         .unwrap_or(false);
     assert!(is_aborted, "expected ProviderError::Aborted, got {err:?}");
 }
+
+#[tokio::test]
+#[ignore = "requires ANTHROPIC_API_KEY and network"]
+async fn live_tool_use_roundtrip() {
+    use pi::types::ContentBlock;
+    use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+    use serde_json::Value as JsonValue;
+
+    // A trivial tool the model can call.
+    struct GetWeather;
+    #[async_trait::async_trait]
+    impl AgentTool for GetWeather {
+        fn name(&self) -> &str { "get_weather" }
+        fn description(&self) -> &str { "Get the weather for a city" }
+        fn parameters_schema(&self) -> JsonValue {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "city": { "type": "string" } },
+                "required": ["city"]
+            })
+        }
+        async fn execute(
+            &self, _id: &str, _p: JsonValue, _s: CancellationToken, _c: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            Ok(AgentToolResult::text("sunny"))
+        }
+    }
+
+    let Some(sf) = stream_fn() else {
+        eprintln!("skipping: ANTHROPIC_API_KEY not set");
+        return;
+    };
+
+    let mut ctx = ctx_with("What's the weather in Paris? You must call get_weather.");
+    ctx.tools = vec![Box::new(GetWeather)];
+
+    let (tx, _rx) = mpsc::channel::<AgentEvent>(256);
+    let msg = sf
+        .stream(&ctx, CancellationToken::new(), tx)
+        .await
+        .expect("tool_use stream should succeed");
+
+    // The model should have emitted a tool_use block with parsed arguments.
+    let AgentMessage::Assistant { content, stop_reason, .. } = &msg else {
+        panic!("expected assistant");
+    };
+    let tool_use = content.iter().find_map(|b| match b {
+        ContentBlock::ToolUse { name, input, .. } => Some((name.clone(), input.clone())),
+        _ => None,
+    });
+    let (name, input) = tool_use.expect("expected a tool_use block");
+    assert_eq!(name, "get_weather");
+    assert!(input.get("city").is_some(), "expected parsed city arg, got {input}");
+    assert_eq!(*stop_reason, Some(pi::types::StopReason::ToolUse));
+
+    eprintln!("tool_use: {name} input={input}");
+}
