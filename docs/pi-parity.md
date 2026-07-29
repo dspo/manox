@@ -68,11 +68,11 @@ pi 已有 8 件基础工具。manox 侧 25+，分四类：
 
 | 工具 | manox（规模） | pi 状态 | 差距说明 |
 |---|---|---|---|
-| Read | read_file.rs (162) | 🟡 | manox 有 hashline tag 铸造、行段选择器（path_selector.rs）、读拒绝清单、LSP 预热 |
-| Write | write_file.rs (204) | 🟡 | manox 有写沙箱限定、file_lock、hashline 前缀剥离 |
-| Edit | edit_file.rs (204) + hashline/ (2569) | 🔲 | **决策（2026-07-29）：移植 hashline，放弃 pi 的 string-replace Edit**。理由：TAG 乐观锁 + 3-way 恢复在并发/长会话漂移场景正确性显著更优，代码已存在故移植成本可控。注意配套：read（tag 铸造 + 编号输出）、write（快照记录）、grep（自动快照）需一并改造 |
+| Read | read_file.rs (162) | ✅ | 已实现（2026-07-29）：hashline tag 铸造 + `[path#TAG]` + `N:TEXT` 编号输出；pi 保留 offset/limit 参数并映射为 LineRange（manox 的 path_selector 行段选择器不搬）；无限定读取封顶 2000 行并给 offset/limit 分页提示；保留 128KB/2000 行字节护栏。读拒绝清单/LSP 预热不搬 |
+| Write | write_file.rs (204) | ✅ | 已实现（2026-07-29）：hashline 前缀剥离（粘贴 read 输出自动去 `[path#TAG]` 头与 `N:` 前缀）+ 快照记录（输出尾部回 `[path#TAG]`）+ mutation_queue 同文件写互斥；保留 pi 的 diff 预览。写沙箱限定/file_lock 不搬（pi 用 FileMutationQueue 阻塞锁代替 NOWAIT file_lock） |
+| Edit | edit_file.rs (204) + hashline/ (2569) | ✅ | 已实现（2026-07-29）：**决策（2026-07-29）：移植 hashline，放弃 pi 的 string-replace Edit**——patch-only schema（多 `[path#TAG]` 区段，manox 字段文档整体搬入 JSON schema description）；FileMutationQueue 锁跨 read→patch→write 临界区；TAG 匹配走 apply（回前应用 + 边界修复 + 冲突检测），失配走 3-way 快照恢复；persist() 恢复 CRLF/BOM/尾换行；输出 `[{path}#{new_tag}]\n{diff}` 多区段以 `\n---\n` 相连；block 系 op（SWAP.BLK/DEL.BLK/INS.BLK.POST）随括号平衡解析一并移植 |
 | Bash | bash.rs (1610) + background_shell.rs (487) | 🟡 | manox 有 brush 持久 shell、seatbelt 沙箱、后台任务、head/tail 过滤、进程组管理。pi bash 仅 120 行 |
-| Grep | grep.rs (320) | 🟡 | manox 有拒绝清单、二进制检测、分页、自动 hashline 快照 |
+| Grep | grep.rs (320) | 🟡 | 自动 hashline 快照已实现（2026-07-29）：命中文件（≤20，按首命中序去重）重读+normalize+record，模型可直接 edit 免重读。拒绝清单/二进制检测/分页未搬 |
 | Glob | glob.rs (154) | 🟡 | gitignore 感知、隐藏文件/目录旗标 |
 | List | list_directory.rs (98) | 🟡 | 秘密文件省略、上限 |
 | WebFetch | web_fetch.rs (229) | 🔲 | 字节上限、重定向限制、截断检测 |
@@ -129,14 +129,14 @@ pi 已有 8 件基础工具。manox 侧 25+，分四类：
 | 子代理定义（agents/*.md） | agents/ + agent_def | 🔲 | 随 Agent 工具一并移植 |
 | Slash commands | command.rs (374) | 🔲(后期) | frontmatter + $ARGUMENTS 渲染 + allowed-tools 门控。**后期补（2026-07-29）** |
 | team 多智能体 | team/ (1758) | 🔲(二期) | TaskList 实体 + 点对点消息 + 授权冒泡，建立在子代理之上（2026-07-29 确认二期） |
-| hashline | hashline/ (2569) | 🔲 | 随 Edit 决策移植（2026-07-29）；全局 OnceLock 快照存储改为注入式依赖 |
+| hashline | hashline/ (2569) | ✅ | 已移植（2026-07-29）：hash/block/parser/apply/recovery/snapshot 六模块逐行移植 + 集成测试（tempfile 化，剥 gpui 提及）；全局 OnceLock 快照存储改为注入式——`tool::ToolState { snapshots: Mutex<SnapshotStore>, mutation_queue: FileMutationQueue }` 经 `ToolContext::tool_state()` 下发；LineRange 内置于 hashline（manox 的 path_selector 不搬）；xxh32 低 16 位 4-hex tag |
 
 ## 8. 成熟判据（MVP 切换集）
 
 **当前阶段聚焦**（pi 已有基础的深化 + 已拍板的移植）：
 
-- [ ] Provider：Completions + Responses 两形状补齐；retry + overflow 分类 + prompt caching 策略
-- [ ] hashline 移植（read/write/edit/grep 配套，已拍板 2026-07-29）
+- [x] Provider：Completions + Responses 两形状补齐（2026-07-29）；retry + overflow 分类（2026-07-29）；prompt caching 策略待对齐
+- [x] hashline 移植（read/write/edit/grep 配套，2026-07-29 完成）
 - [ ] 循环：恢复 nudge、拒绝熔断、取消级联清理
 - [ ] 上下文：自动压缩 + 溢出 compact-retry + 三维 token 计量
 - [ ] 工具：5a 其余项（Bash 持久 shell/后台、BashOutput/TaskStop/WebFetch）、Agent 子代理、worktree、Skill

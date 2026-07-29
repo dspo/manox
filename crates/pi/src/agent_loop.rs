@@ -185,6 +185,9 @@ async fn run_loop_inner(
 
             if !tool_calls.is_empty() {
                 // If the response was truncated, fail all tool calls.
+                let noop_ctx = NoopToolContext {
+                    tool_state: crate::tool::ToolState::new(),
+                };
                 let (executed, result_messages) = if stop_reason == Some(StopReason::MaxTokens) {
                     fail_tool_calls_from_truncated(&tool_calls, sink)
                 } else {
@@ -192,7 +195,7 @@ async fn run_loop_inner(
                         &tool_calls,
                         &context.tools,
                         signal.clone(),
-                        &NoopToolContext,
+                        &noop_ctx,
                         config.sequential_tool_execution,
                     )
                     .await
@@ -376,7 +379,11 @@ fn fail_tool_calls_from_truncated(
 }
 
 /// No-op tool context for when tools don't need access to the execution env.
-struct NoopToolContext;
+/// Owns a real `ToolState` so hashline-aware tools keep a coherent snapshot
+/// store within a single tool batch.
+struct NoopToolContext {
+    tool_state: crate::tool::ToolState,
+}
 
 impl crate::tool::ToolContext for NoopToolContext {
     fn env(&self) -> &dyn crate::env::ExecutionEnv {
@@ -384,6 +391,9 @@ impl crate::tool::ToolContext for NoopToolContext {
     }
     fn cwd(&self) -> &std::path::Path {
         std::path::Path::new(".")
+    }
+    fn tool_state(&self) -> &crate::tool::ToolState {
+        &self.tool_state
     }
 }
 

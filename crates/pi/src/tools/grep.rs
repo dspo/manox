@@ -12,6 +12,7 @@ use regex::RegexBuilder;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
+use crate::hashline;
 use crate::tool::{AgentTool, AgentToolResult, ToolError, ToolContext};
 use crate::tools::truncate::{self, TruncateConfig};
 
@@ -120,7 +121,7 @@ impl AgentTool for GrepTool {
         let glob_set = build_glob_filter(glob_pattern)?;
 
         // Walk the directory tree and collect matches.
-        let matches = search_files(
+        let (matches, matched_paths) = search_files(
             &search_path,
             &regex,
             &glob_set,
@@ -130,6 +131,22 @@ impl AgentTool for GrepTool {
 
         if matches.is_empty() {
             return Ok(AgentToolResult::text("No matches found"));
+        }
+
+        // Record hashline snapshots for matched files so the model can edit
+        // directly without re-reading. Limited to 20 files to bound I/O.
+        {
+            let mut store = ctx
+                .tool_state()
+                .snapshots
+                .lock()
+                .expect("hashline snapshot store poisoned");
+            for path in matched_paths.iter().take(20) {
+                if let Ok(raw) = std::fs::read_to_string(path) {
+                    let normalized = hashline::normalize_to_lf(&raw);
+                    let _ = store.record(path, &normalized);
+                }
+            }
         }
 
         let joined = matches.join("\n");
@@ -180,15 +197,18 @@ fn build_glob_filter(pattern: Option<&str>) -> Result<Option<globset::GlobSet>, 
     Ok(Some(set))
 }
 
-/// Search files for a regex pattern and return matching lines.
+/// Search files for a regex pattern. Returns the formatted matches plus the
+/// paths of files that produced at least one match, in first-match order
+/// (deduplicated), so the caller can record hashline snapshots for them.
 fn search_files(
     search_path: &Path,
     regex: &regex::Regex,
     glob_set: &Option<globset::GlobSet>,
     context_lines: usize,
     limit: usize,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<PathBuf>) {
     let mut results: Vec<String> = Vec::new();
+    let mut matched_paths: Vec<PathBuf> = Vec::new();
 
     let walker = WalkBuilder::new(search_path)
         .hidden(false)
@@ -242,11 +262,14 @@ fn search_files(
                 format!("{}:{}:{}", path.display(), line_idx + 1, line)
             };
 
+            if !matched_paths.iter().any(|p| p == path) {
+                matched_paths.push(path.to_path_buf());
+            }
             results.push(formatted);
         }
     }
 
-    results
+    (results, matched_paths)
 }
 
 /// Format a match with surrounding context lines.

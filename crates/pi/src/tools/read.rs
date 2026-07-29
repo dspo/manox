@@ -1,12 +1,14 @@
-// Read tool — reads files with optional offset, limit, and line-number formatting.
+// Read tool — reads a file, snapshots it for hashline, and returns
+// `[path#TAG]` + `N:TEXT` numbered rows.
 //
-// Output is truncated to avoid overwhelming the context window.
-
-use std::path::Path;
+// An unqualified read caps at 2000 lines with a paging hint; offset/limit map
+// onto a hashline `LineRange` for partial reads. Output is additionally
+// truncated by a byte guard to avoid overwhelming the context window.
 
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
+use crate::hashline::{self, LineRange};
 use crate::tool::{AgentTool, AgentToolResult, ToolError, ToolContext};
 use crate::tools::truncate::{self, TruncateConfig};
 
@@ -17,6 +19,8 @@ impl ReadTool {
     const DEFAULT_MAX_BYTES: usize = 128 * 1024;
     /// Default max lines for output.
     const DEFAULT_MAX_LINES: usize = 2000;
+    /// Lines returned by an unqualified read (no offset/limit).
+    const MAX_READ_LINES: usize = 2000;
 }
 
 #[async_trait::async_trait]
@@ -26,7 +30,10 @@ impl AgentTool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file from the filesystem"
+        "Read a file with optional line-range paging. Output format: first line \
+         `[<path>#<TAG>]` (4-hex snapshot tag for follow-up edits), followed by \
+         `N:TEXT` numbered rows (1-indexed). Without offset/limit the first \
+         2000 lines are returned; use offset/limit to page through longer files."
     }
 
     fn is_read_only(&self) -> bool {
@@ -69,29 +76,31 @@ impl AgentTool for ReadTool {
 
         let path = ctx.cwd().join(path_str);
 
-        // Read the whole file first, then apply offset/limit.
-        let content = ctx
+        let raw = ctx
             .env()
             .read_file(&path, None, None)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
+        let text = hashline::normalize_to_lf(&raw);
+        let path_display = path.display().to_string();
 
-        let lines: Vec<&str> = content.lines().collect();
-        let start_line = offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
-        let end_line = match limit {
-            Some(l) => (start_line + l).min(lines.len()),
-            None => lines.len(),
+        // The snapshot always fingerprints the full file — only display is sliced.
+        let snap = ctx
+            .tool_state()
+            .snapshots
+            .lock()
+            .expect("hashline snapshot store poisoned")
+            .record(&path, &text);
+
+        let formatted = match (offset, limit) {
+            (None, None) => format_full_read(&path_display, &text, &snap.tag),
+            _ => {
+                let start = offset.unwrap_or(1);
+                let end = limit.map(|l| start.saturating_add(l).saturating_sub(1));
+                let ranges = [LineRange { start, end }];
+                hashline::format_numbered_range(&path_display, &text, &snap.tag, &ranges)
+            }
         };
-
-        if start_line >= lines.len() {
-            return Ok(AgentToolResult::text(""));
-        }
-
-        let selected = &lines[start_line..end_line];
-        let display_start = start_line + 1;
-        let total_lines = lines.len();
-
-        let formatted = format_with_line_numbers(selected, display_start, &path);
 
         // Truncate if too large.
         let config = TruncateConfig {
@@ -100,22 +109,7 @@ impl AgentTool for ReadTool {
         };
         let result = truncate::truncate(&formatted, &config);
 
-        let range_info = if offset.is_some() || limit.is_some() {
-            format!(
-                " (lines {}-{} of {})",
-                display_start,
-                end_line,
-                total_lines
-            )
-        } else {
-            format!(" ({} lines)", total_lines)
-        };
-
-        let mut output = format!(
-            "File: {path}{range_info}\n\n{content}",
-            path = path.display(),
-            content = result.content
-        );
+        let mut output = result.content;
         if result.was_truncated {
             output.push_str(&format!(
                 "\n\n[read: {} lines, {} bytes — output truncated]",
@@ -127,21 +121,51 @@ impl AgentTool for ReadTool {
     }
 }
 
-/// Format lines with line numbers, mimicking `cat -n`.
-fn format_with_line_numbers(lines: &[&str], start_line: usize, _path: &Path) -> String {
-    let total_lines = lines.len();
-    let line_num_width = format!("{}", start_line + total_lines - 1).len().max(1);
+/// Format an unqualified read. The output caps at [`ReadTool::MAX_READ_LINES`]
+/// lines — a full-file dump of a 100k-line file would flood the context; the
+/// hint points the model at offset/limit paging for the rest.
+fn format_full_read(path_display: &str, text: &str, tag: &str) -> String {
+    const MAX: usize = ReadTool::MAX_READ_LINES;
+    let line_count = text.lines().count();
+    if line_count <= MAX {
+        return hashline::format_numbered(path_display, text, tag);
+    }
+    let ranges = [LineRange {
+        start: 1,
+        end: Some(MAX),
+    }];
+    let mut out = hashline::format_numbered_range(path_display, text, tag, &ranges);
+    out.push_str(&format!(
+        "\n[Showing lines 1-{MAX} of {line_count}. \
+         Page through the rest with offset/limit, e.g. offset {} limit {}]",
+        MAX + 1,
+        MAX,
+    ));
+    out
+}
 
-    let mut output = String::new();
-    for (i, line) in lines.iter().enumerate() {
-        let line_num = start_line + i;
-        output.push_str(&format!(
-            "{:>width$}\t{}\n",
-            line_num,
-            line,
-            width = line_num_width
-        ));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn small_file_is_not_capped() {
+        let text = "a\nb\nc";
+        let out = format_full_read("/tmp/f.txt", text, "AB12");
+        assert!(out.contains("3:c"));
+        assert!(!out.contains("Showing lines"));
     }
 
-    output
+    #[test]
+    fn large_file_caps_at_max_lines_with_paging_hint() {
+        let text: String = (1..=5000).map(|i| format!("line {i}\n")).collect();
+        let out = format_full_read("/tmp/big.txt", &text, "AB12");
+        assert!(out.contains("1:line 1"));
+        assert!(out.contains("2000:line 2000"));
+        // format_numbered_range appends 3 trailing context lines; nothing
+        // beyond those may appear.
+        assert!(!out.contains("2004:line 2004"));
+        assert!(out.contains("Showing lines 1-2000 of 5000"));
+        assert!(out.contains("offset 2001"), "paging hint: {out}");
+    }
 }

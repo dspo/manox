@@ -1,40 +1,73 @@
-// Edit tool — search-and-replace with diff-based fuzzy matching.
+// Edit tool — apply a hashline patch (line-anchored + TAG validation) to
+// existing files, with 3-way merge recovery on a stale TAG.
 //
-// The edit tool tries an exact string match first. If that fails, it uses
-// the `similar` crate to compute a line-by-line diff and finds the closest
-// matching block. This handles cases where the LLM's `oldText` has slightly
-// different whitespace or indentation than the actual file content.
+// A patch holds one or more `[path#TAG]` sections of `SWAP`/`DEL`/`INS` ops
+// anchored on the ORIGINAL line numbers from `read`. The per-file mutation
+// lock is held across read→patch→write so the TAG check and the write form a
+// single critical section. On write, the file's original CRLF/BOM/trailing
+// newline are restored so the edit is a minimal content delta.
 
-use crate::tool::{AgentTool, AgentToolResult, ToolError, ToolContext};
-use crate::tools::edit_diff;
+use std::path::PathBuf;
+
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
-/// Ratio threshold for fuzzy matching (0.0–1.0).
-/// Values below this are considered not a match.
-const FUZZY_THRESHOLD: f64 = 0.6;
+use crate::hashline;
+use crate::tool::{AgentTool, AgentToolResult, ToolError, ToolContext};
+use crate::tools::edit_diff;
 
 pub struct EditTool;
 
+/// The `patch` field description doubles as the hashline grammar reference
+/// the model sees; keep it in sync with `hashline::parser`.
+const PATCH_DOC: &str = "Hashline patch text. Each file section starts with a header \
+`[<abs-path>#<tag>]` — paste the exact path and 4-hex tag returned by your latest `read` \
+for that file; do NOT write the literal word `PATH`. Example: `[/Users/me/proj/CLAUDE.md#A557]`. \
+Operations: `SWAP N.=M:` replace lines N..=M (inclusive) with the `+TEXT` body rows; \
+`DEL N.=M` delete lines N..=M (no body); `INS.PRE N:` / `INS.POST N:` / `INS.HEAD:` / \
+`INS.TAIL:` insert body rows; `SWAP.BLK N:` / `DEL.BLK N` / `INS.BLK.POST N:` operate on the \
+bracket-block beginning at line N. Body rows are `+TEXT` (`+` alone = blank line; \
+`+-x`/`++x` escapes a literal leading `-`/`+`); a `-`-prefixed markdown list item is NOT a \
+body row — rewrite it with a `+` prefix. Line numbers reference the ORIGINAL file from read \
+and do not shift across hunks. Ranges cover only changed lines; pure additions use `INS`, \
+never a widened `SWAP`. On a stale-TAG rejection, re-`read` before retrying.\n\
+Format gotchas (common miswrites): the range separator is `.=` not `:` — write `SWAP 37.=48:` \
+not `SWAP 37:=48:`. The body starts on the NEXT line as `+`-prefixed rows, never on the same \
+line as the directive. Complete example:\n\
+```text\n\
+[/Users/me/proj/main.py#A557]\n\
+SWAP 37.=48:\n\
++    if args.command == \"add\":\n\
++        handler.add(args.title)\n\
++    else:\n\
++        parser.print_help()\n\
+```";
+
 #[async_trait::async_trait]
 impl AgentTool for EditTool {
-    fn name(&self) -> &str { "edit" }
-    fn description(&self) -> &str { "Edit a file by replacing text" }
-    fn is_read_only(&self) -> bool { false }
+    fn name(&self) -> &str {
+        "edit"
+    }
+
+    fn description(&self) -> &str {
+        "Edit existing files via a hashline patch (line-anchored + TAG validation). \
+         See the patch field docs for the grammar."
+    }
+
+    fn is_read_only(&self) -> bool {
+        false
+    }
 
     fn parameters_schema(&self) -> JsonValue {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Path to the file" },
-                "oldText": { "type": "string", "description": "Text to replace" },
-                "newText": { "type": "string", "description": "Replacement text" },
-                "replaceAll": {
-                    "type": "boolean",
-                    "description": "Replace all occurrences (default: false)"
+                "patch": {
+                    "type": "string",
+                    "description": PATCH_DOC
                 }
             },
-            "required": ["path", "oldText", "newText"]
+            "required": ["patch"]
         })
     }
 
@@ -45,258 +78,138 @@ impl AgentTool for EditTool {
         _signal: CancellationToken,
         ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
-        let path_str = params["path"].as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("path is required".into()))?;
-        let old_text = params["oldText"].as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("oldText is required".into()))?;
-        let new_text = params["newText"].as_str()
-            .ok_or_else(|| ToolError::InvalidArguments("newText is required".into()))?;
-        let replace_all = params["replaceAll"].as_bool().unwrap_or(false);
+        let patch = params["patch"]
+            .as_str()
+            .ok_or_else(|| ToolError::InvalidArguments("patch is required".into()))?;
 
-        let path = ctx.cwd().join(path_str);
-        let content = ctx.env().read_file(&path, None, None).await
-            .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
+        let patches =
+            hashline::parse_patch(patch).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-        let new_content = if replace_all {
-            // Replace all: exact match only.
-            let count = content.matches(old_text).count();
-            if count == 0 {
-                return Err(ToolError::ExecutionFailed(
-                    "oldText not found in file (replaceAll mode requires exact match)".into()
-                ));
+        let mut results: Vec<String> = Vec::new();
+        for fp in patches {
+            let path = resolve_path(ctx, &fp.path);
+            let path_display = path.display().to_string();
+
+            // Hold the mutation lock across read+patch+write so the TAG check
+            // and the write are a single critical section — a concurrent
+            // writer between read and write would stale the TAG and clobber.
+            let _guard = ctx.tool_state().mutation_queue.lock(&path).await;
+
+            let raw = ctx
+                .env()
+                .read_file(&path, None, None)
+                .await
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!("edit read failed {path_display}: {e}"))
+                })?;
+            let had_bom = hashline::has_bom(&raw);
+            let is_crlf = hashline::detect_crlf(&raw);
+            let had_trailing_nl = raw.ends_with('\n');
+            let current = hashline::normalize_to_lf(&raw);
+            let current_tag = hashline::compute_tag(&current);
+
+            let new_text = if current_tag == fp.tag {
+                hashline::apply(&current, &fp.ops)
+                    .map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "edit apply failed {path_display}: {e}"
+                        ))
+                    })?
+                    .text
+            } else {
+                let store = ctx
+                    .tool_state()
+                    .snapshots
+                    .lock()
+                    .expect("hashline snapshot store poisoned");
+                hashline::try_recover(&current, &fp.tag, &fp.ops, &store, &path)
+                    .map_err(|e| ToolError::ExecutionFailed(format!("edit {path_display}: {e}")))?
+            };
+
+            // Restore original line endings, trailing newline, and BOM so
+            // the write is a minimal content delta, not a full-rewrite that
+            // flattens formatting or drops the file's terminating newline.
+            let persisted = persist(&new_text, is_crlf, had_bom, had_trailing_nl);
+            ctx.env().write_file(&path, &persisted).await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("edit write failed {path_display}: {e}"))
+            })?;
+
+            let new_snap = ctx
+                .tool_state()
+                .snapshots
+                .lock()
+                .expect("hashline snapshot store poisoned")
+                .record(&path, &new_text);
+
+            let diff = edit_diff::compute_unified_diff(&current, &new_text, &path);
+            let diff = if edit_diff::is_diff_empty(&diff) {
+                "(no changes)".to_string()
+            } else {
+                diff
+            };
+            results.push(format!("[{path_display}#{}]\n{diff}", new_snap.tag));
+        }
+
+        Ok(AgentToolResult::text(results.join("\n---\n")))
+    }
+}
+
+/// Resolve a patch section path against the tool cwd when it is relative.
+fn resolve_path(ctx: &dyn ToolContext, path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        ctx.cwd().join(path)
+    }
+}
+
+/// Restore the file's original line-ending style, trailing newline, and optional
+/// BOM on write. `apply`/`recover` model files as content lines without
+/// terminators, so the trailing newline the source file carried is restored
+/// here rather than dropped.
+fn persist(text: &str, crlf: bool, bom: bool, trailing_nl: bool) -> String {
+    let mut out = String::with_capacity(text.len() + 3);
+    if bom {
+        out.push('\u{feff}');
+    }
+    if crlf {
+        let mut iter = text.split('\n').peekable();
+        while let Some(line) = iter.next() {
+            out.push_str(line);
+            if iter.peek().is_some() {
+                out.push_str("\r\n");
             }
-            content.replace(old_text, new_text)
+        }
+    } else {
+        out.push_str(text);
+    }
+    // Re-attach a trailing terminator if the original file had one and the
+    // edited content is non-empty (an emptied file stays empty).
+    if trailing_nl && !text.is_empty() {
+        if crlf {
+            out.push_str("\r\n");
         } else {
-            // Single replace: try exact match first, then fuzzy.
-            match try_exact_replace(&content, old_text, new_text) {
-                Ok(result) => result,
-                Err(_) => {
-                    // Try fuzzy matching.
-                    try_fuzzy_replace(&content, old_text, new_text)?
-                }
-            }
-        };
-
-        ctx.env().write_file(&path, &new_content).await
-            .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
-
-        // Compute diff showing what changed.
-        let diff = edit_diff::compute_unified_diff(&content, &new_content, &path);
-
-        let mut output = format!("Edited file: {path}", path = path.display());
-        if !edit_diff::is_diff_empty(&diff) {
-            output.push_str(&format!(
-                "\n\nChanges ({hunks} hunk(s)):\n```diff\n{diff}```",
-                hunks = edit_diff::count_diff_hunks(&diff)
-            ));
-        }
-
-        Ok(AgentToolResult::text(output))
-    }
-}
-
-/// Try an exact string match replacement.
-fn try_exact_replace(
-    content: &str,
-    old_text: &str,
-    new_text: &str,
-) -> Result<String, ()> {
-    let count = content.matches(old_text).count();
-    if count == 0 {
-        return Err(());
-    }
-    if count > 1 {
-        return Err(()); // Not unique — caller should use replaceAll or be more specific.
-    }
-    Ok(content.replacen(old_text, new_text, 1))
-}
-
-/// Try fuzzy matching using line-by-line diff similarity.
-///
-/// Splits both the file content and oldText into lines, then uses the
-/// `similar` crate to find the best matching block. Handles whitespace
-/// normalization for better matching.
-fn try_fuzzy_replace(
-    content: &str,
-    old_text: &str,
-    new_text: &str,
-) -> Result<String, ToolError> {
-    let file_lines: Vec<&str> = content.lines().collect();
-    let old_lines: Vec<&str> = old_text.lines().collect();
-
-    if old_lines.is_empty() {
-        return Err(ToolError::ExecutionFailed("oldText is empty".into()));
-    }
-
-    // Find the best matching block in the file.
-    let best_match = find_best_match(&file_lines, &old_lines);
-
-    match best_match {
-        Some((start, end, similarity)) => {
-            if similarity < FUZZY_THRESHOLD {
-                return Err(ToolError::ExecutionFailed(format!(
-                    "oldText not found in file (best fuzzy match similarity: {:.2}, threshold: {:.2})",
-                    similarity, FUZZY_THRESHOLD
-                )));
-            }
-
-            // Replace the matched block with the new text.
-            let mut result_lines: Vec<&str> = file_lines[..start].to_vec();
-            for line in new_text.lines() {
-                result_lines.push(line);
-            }
-            result_lines.extend_from_slice(&file_lines[end..]);
-
-            Ok(result_lines.join("\n"))
-        }
-        None => {
-            Err(ToolError::ExecutionFailed(
-                "oldText not found in file (no fuzzy match)".into()
-            ))
+            out.push('\n');
         }
     }
-}
-
-/// Find the best matching block of `old_lines` in `file_lines`.
-///
-/// Returns `(start_index, end_index, similarity_ratio)` of the best match.
-fn find_best_match(
-    file_lines: &[&str],
-    old_lines: &[&str],
-) -> Option<(usize, usize, f64)> {
-    if file_lines.is_empty() || old_lines.is_empty() {
-        return None;
-    }
-
-    let old_len = old_lines.len();
-    let mut best_similarity = 0.0f64;
-    let mut best_match: Option<(usize, usize)> = None;
-
-    // Slide a window of size old_lines.len() across the file.
-    for start in 0..=file_lines.len().saturating_sub(old_len) {
-        let end = start + old_len;
-        let window = &file_lines[start..end];
-
-        let similarity = compute_similarity(window, old_lines);
-
-        if similarity > best_similarity {
-            best_similarity = similarity;
-            best_match = Some((start, end));
-        }
-
-        // Early exit on near-perfect match.
-        if similarity > 0.99 {
-            break;
-        }
-    }
-
-    best_match.map(|(s, e)| (s, e, best_similarity))
-}
-
-/// Compute the similarity ratio between two slices of lines.
-///
-/// Uses the `similar` crate's `ChangeTag` to compute a token-level ratio.
-fn compute_similarity(a: &[&str], b: &[&str]) -> f64 {
-    // Normalize whitespace for comparison.
-    let a_normalized: Vec<String> = a.iter().map(|s| normalize_whitespace(s)).collect();
-    let b_normalized: Vec<String> = b.iter().map(|s| normalize_whitespace(s)).collect();
-
-    let a_text = a_normalized.join("\n");
-    let b_text = b_normalized.join("\n");
-
-    let diff = similar::TextDiff::from_lines(&a_text, &b_text);
-
-    let mut same = 0usize;
-    let mut total = 0usize;
-
-    for change in diff.iter_all_changes() {
-        total += 1;
-        if matches!(change.tag(), similar::ChangeTag::Equal) {
-            same += 1;
-        }
-    }
-
-    if total == 0 {
-        return 1.0;
-    }
-
-    same as f64 / total as f64
-}
-
-/// Normalize whitespace for comparison.
-fn normalize_whitespace(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut prev_was_space = false;
-    for ch in s.chars() {
-        if ch.is_whitespace() {
-            if !prev_was_space {
-                result.push(' ');
-                prev_was_space = true;
-            }
-        } else {
-            result.push(ch);
-            prev_was_space = false;
-        }
-    }
-    result.trim().to_string()
+    out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::persist;
 
     #[test]
-    fn test_normalize_whitespace() {
-        assert_eq!(normalize_whitespace("  hello   world  "), "hello world");
-        assert_eq!(normalize_whitespace("\tline1\n\tline2"), "line1 line2");
-    }
-
-    #[test]
-    fn test_compute_similarity_exact() {
-        let a = vec!["hello", "world"];
-        let b = vec!["hello", "world"];
-        assert!(compute_similarity(&a, &b) > 0.99);
-    }
-
-    #[test]
-    fn test_compute_similarity_different() {
-        let a = vec!["hello", "world"];
-        let b = vec!["goodbye", "mars"];
-        assert!(compute_similarity(&a, &b) < 0.5);
-    }
-
-    #[test]
-    fn test_find_best_match() {
-        let file = vec![
-            "fn main() {",
-            "    let x = 1;",
-            "    let y = 2;",
-            "    println!(\"{}\", x + y);",
-            "}",
-        ];
-        let old = vec![
-            "    let x = 1;",
-            "    let y = 2;",
-        ];
-
-        let result = find_best_match(&file, &old);
-        assert!(result.is_some());
-        let (start, end, similarity) = result.unwrap();
-        assert_eq!(start, 1);
-        assert_eq!(end, 3);
-        assert!(similarity > 0.9);
-    }
-
-    #[test]
-    fn test_fuzzy_replace_whitespace() {
-        let content = "fn main() {\n    let x = 1;\n    let y = 2;\n}";
-        let old_text = "let x = 1;\nlet y = 2;"; // no indentation
-        let new_text = "let x = 10;\nlet y = 20;";
-
-        let result = try_fuzzy_replace(content, old_text, new_text);
-        assert!(result.is_ok());
-        let new_content = result.unwrap();
-        assert!(new_content.contains("let x = 10;"));
-        assert!(new_content.contains("let y = 20;"));
+    fn persist_restores_trailing_newline_and_crlf() {
+        // apply yields content without a terminator; persist re-attaches the
+        // file's original trailing newline (LF or CRLF) and BOM.
+        assert_eq!(persist("a\nb", false, false, true), "a\nb\n");
+        assert_eq!(persist("a\nb", true, false, true), "a\r\nb\r\n");
+        // No trailing newline originally → none added.
+        assert_eq!(persist("a\nb", false, false, false), "a\nb");
+        // Emptied content stays empty even if the original had a newline.
+        assert_eq!(persist("", false, false, true), "");
+        // BOM is re-prepended.
+        assert_eq!(persist("x", false, true, false), "\u{feff}x");
     }
 }

@@ -157,6 +157,13 @@ impl ExecutionEnv for TokioExecutionEnv {
             .await
             .map_err(|e| map_io_error(e, path))?;
 
+        // An unqualified read is a raw read: line endings, BOM, and the
+        // trailing newline survive verbatim (hashline tools depend on them
+        // for tag validation and minimal-delta writes).
+        if offset.is_none() && limit.is_none() {
+            return Ok(content);
+        }
+
         let lines: Vec<&str> = content.lines().collect();
         let start = offset.unwrap_or(0).min(lines.len());
         let end = match limit {

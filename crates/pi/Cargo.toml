@@ -21,6 +21,7 @@ regex.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+xxhash-rust.workspace = true
 async-trait = "0.1"
 jsonschema.workspace = true
 

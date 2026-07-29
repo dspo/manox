@@ -8,7 +8,39 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
+use crate::hashline::SnapshotStore;
+use crate::tools::file_mutation_queue::FileMutationQueue;
 use crate::types::ContentBlock;
+
+// ── Tool state ─────────────────────────────────────────────────────────────
+
+/// Session-scoped tool state: hashline snapshots and the file mutation queue.
+///
+/// Carried by the harness's `ToolContext` implementation and shared by all
+/// tools in a run. The snapshot store backs hashline tag validation and 3-way
+/// recovery; the mutation queue serializes concurrent edits to the same file.
+pub struct ToolState {
+    /// Hashline snapshots keyed by path. Interior mutability is a plain
+    /// `Mutex`: snapshot record/lookup never spans an `.await`.
+    pub snapshots: std::sync::Mutex<SnapshotStore>,
+    /// Per-file mutation locks serializing concurrent edits to the same path.
+    pub mutation_queue: FileMutationQueue,
+}
+
+impl ToolState {
+    pub fn new() -> Self {
+        ToolState {
+            snapshots: std::sync::Mutex::new(SnapshotStore::new()),
+            mutation_queue: FileMutationQueue::new(),
+        }
+    }
+}
+
+impl Default for ToolState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // ── Tool trait ──────────────────────────────────────────────────────────────
 
@@ -73,6 +105,8 @@ pub trait ToolContext: Send + Sync {
     fn env(&self) -> &dyn crate::env::ExecutionEnv;
     /// The current working directory.
     fn cwd(&self) -> &std::path::Path;
+    /// Session-scoped tool state (hashline snapshots + file mutation queue).
+    fn tool_state(&self) -> &ToolState;
 }
 
 /// A tool that the agent can invoke.
@@ -320,7 +354,9 @@ mod tests {
     use std::time::Duration;
 
     struct MockEnv;
-    struct MockCtx;
+    struct MockCtx {
+        state: ToolState,
+    }
 
     #[async_trait::async_trait]
     impl ExecutionEnv for MockEnv {
@@ -366,6 +402,9 @@ mod tests {
         fn cwd(&self) -> &Path {
             Path::new("/mock")
         }
+        fn tool_state(&self) -> &ToolState {
+            &self.state
+        }
     }
 
     struct EchoTool;
@@ -392,7 +431,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_single_tool() {
         let tools: Vec<Box<dyn AgentTool>> = vec![Box::new(EchoTool)];
-        let ctx = MockCtx;
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
         let signal = CancellationToken::new();
 
         let (executed, messages) = execute_tool_calls(
@@ -416,7 +457,9 @@ mod tests {
     #[tokio::test]
     async fn test_tool_not_found() {
         let tools: Vec<Box<dyn AgentTool>> = vec![];
-        let ctx = MockCtx;
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
         let signal = CancellationToken::new();
 
         let (executed, _messages) = execute_tool_calls(
