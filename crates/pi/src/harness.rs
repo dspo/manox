@@ -4,10 +4,18 @@
 // integration, and phase management. This is the primary public API
 // for consumers of the harness.
 
+use std::sync::Arc;
+
+use crate::agent::Agent;
+use crate::agent_loop::StreamFn;
+use crate::compaction::{self, CompactionSettings, CompactionResult};
 use crate::session::{Session, SessionStorage};
-use crate::types::{AgentMessage, Model};
+use crate::types::{AgentMessage, AgentContext, Model};
 
 /// The phases the harness can be in.
+///
+/// Structured operations (prompt, compact, retry) require the harness to
+/// be in the Idle phase. Turn transitions happen internally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentHarnessPhase {
     /// No active operation.
@@ -22,36 +30,523 @@ pub enum AgentHarnessPhase {
     Retry,
 }
 
-/// The orchestration layer wrapping the agent loop.
-pub struct AgentHarness<S: SessionStorage> {
-    _session: Session<S>,
-    model: Model,
-    phase: AgentHarnessPhase,
+/// Hook points that consumers can register handlers for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HookPoint {
+    /// Before the agent starts processing a turn.
+    BeforeAgentStart,
+    /// Before the context is sent to the provider.
+    BeforeProviderRequest,
+    /// When a tool call is about to execute.
+    ToolCall,
+    /// After a tool result is received.
+    ToolResult,
+    /// Before the session is compacted.
+    SessionBeforeCompact,
+    /// After the session is compacted.
+    SessionAfterCompact,
 }
 
-impl<S: SessionStorage> AgentHarness<S> {
-    pub fn new(session: Session<S>, model: Model) -> Self {
-        AgentHarness {
-            _session: session,
-            model,
-            phase: AgentHarnessPhase::Idle,
+/// A hook handler receives context about the event and can mutate it.
+pub type HookHandler = Arc<dyn Fn(HookContext) -> HookContext + Send + Sync>;
+
+/// Context passed to hook handlers.
+#[derive(Debug, Clone)]
+pub struct HookContext {
+    /// The hook point being triggered.
+    pub hook: HookPoint,
+    /// The current agent context (messages, model, etc.).
+    pub agent_context: Option<AgentContext>,
+    /// Arbitrary data attached to the hook event.
+    pub data: serde_json::Value,
+}
+
+impl HookContext {
+    pub fn new(hook: HookPoint) -> Self {
+        HookContext {
+            hook,
+            agent_context: None,
+            data: serde_json::Value::Null,
         }
     }
 
+    pub fn with_context(mut self, ctx: AgentContext) -> Self {
+        self.agent_context = Some(ctx);
+        self
+    }
+
+    pub fn with_data(mut self, data: serde_json::Value) -> Self {
+        self.data = data;
+        self
+    }
+}
+
+/// The orchestration layer wrapping the agent loop.
+pub struct AgentHarness<S: SessionStorage> {
+    agent: Agent,
+    session: Session<S>,
+    model: Model,
+    phase: AgentHarnessPhase,
+    compaction_settings: CompactionSettings,
+    hooks: Vec<(HookPoint, HookHandler)>,
+}
+
+impl<S: SessionStorage> AgentHarness<S> {
+    /// Create a new harness with the given session, model, and stream function.
+    pub fn new(
+        session: Session<S>,
+        system_prompt: impl Into<String>,
+        model: Model,
+        stream_fn: Arc<dyn StreamFn>,
+    ) -> Self {
+        let agent = Agent::new(system_prompt, model.clone(), stream_fn);
+        AgentHarness {
+            agent,
+            session,
+            model,
+            phase: AgentHarnessPhase::Idle,
+            compaction_settings: CompactionSettings::default(),
+            hooks: Vec::new(),
+        }
+    }
+
+    /// Current phase.
     pub fn phase(&self) -> AgentHarnessPhase {
         self.phase
     }
 
+    /// The current model.
     pub fn model(&self) -> &Model {
         &self.model
     }
 
+    /// Access the underlying session storage.
+    pub fn session(&self) -> &Session<S> {
+        &self.session
+    }
+
+    /// Access the agent.
+    pub fn agent(&self) -> &Agent {
+        &self.agent
+    }
+
+    /// Mutable access to the agent.
+    pub fn agent_mut(&mut self) -> &mut Agent {
+        &mut self.agent
+    }
+
+    /// Current compaction settings.
+    pub fn compaction_settings(&self) -> &CompactionSettings {
+        &self.compaction_settings
+    }
+
+    /// Update compaction settings.
+    pub fn set_compaction_settings(&mut self, settings: CompactionSettings) {
+        self.compaction_settings = settings;
+    }
+
+    /// Register a hook handler.
+    pub fn on(&mut self, hook: HookPoint, handler: HookHandler) {
+        self.hooks.push((hook, handler));
+    }
+
+    /// Run all registered hooks for a given point.
+    fn run_hooks(&self, hook: HookPoint, mut ctx: HookContext) -> HookContext {
+        for (point, handler) in &self.hooks {
+            if *point == hook {
+                ctx = handler(ctx);
+            }
+        }
+        ctx
+    }
+
     /// Send a user prompt and run the agent loop.
+    ///
+    /// Returns the messages produced during this turn. The messages are
+    /// also persisted to the session.
     pub async fn prompt(
         &mut self,
-        _text: &str,
-    ) -> Result<AgentMessage, anyhow::Error> {
-        // Placeholder — full implementation in Phase 4.
-        anyhow::bail!("not yet implemented")
+        text: &str,
+    ) -> Result<Vec<AgentMessage>, anyhow::Error> {
+        if self.phase != AgentHarnessPhase::Idle {
+            anyhow::bail!(
+                "Cannot prompt while harness is in {:?} phase",
+                self.phase
+            );
+        }
+
+        self.phase = AgentHarnessPhase::Turn;
+
+        // Run before-agent-start hooks.
+        let _hook_ctx = self.run_hooks(
+            HookPoint::BeforeAgentStart,
+            HookContext::new(HookPoint::BeforeAgentStart)
+                .with_data(serde_json::json!({"text": text})),
+        );
+
+        let result = self.agent.prompt(text).await;
+
+        match result {
+            Ok(messages) => {
+                // Persist messages to session.
+                for msg in &messages {
+                    self.session.append_message(msg.clone()).await?;
+                }
+
+                self.phase = AgentHarnessPhase::Idle;
+
+                // Check if compaction is needed.
+                let context_tokens = self.estimate_current_tokens();
+                if compaction::should_compact(
+                    context_tokens,
+                    self.model.context_window,
+                    &self.compaction_settings,
+                ) {
+                    // Compaction is needed — caller should invoke compact().
+                    // We don't auto-compact to avoid surprise latency.
+                }
+
+                Ok(messages)
+            }
+            Err(e) => {
+                self.phase = AgentHarnessPhase::Idle;
+                Err(e)
+            }
+        }
+    }
+
+    /// Continue from the current transcript.
+    pub async fn continue_(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
+        if self.phase != AgentHarnessPhase::Idle {
+            anyhow::bail!(
+                "Cannot continue while harness is in {:?} phase",
+                self.phase
+            );
+        }
+
+        self.phase = AgentHarnessPhase::Turn;
+        let result = self.agent.continue_().await;
+
+        match result {
+            Ok(messages) => {
+                for msg in &messages {
+                    self.session.append_message(msg.clone()).await?;
+                }
+                self.phase = AgentHarnessPhase::Idle;
+                Ok(messages)
+            }
+            Err(e) => {
+                self.phase = AgentHarnessPhase::Idle;
+                Err(e)
+            }
+        }
+    }
+
+    /// Abort the current agent run.
+    pub fn abort(&mut self) {
+        self.agent.abort();
+        self.phase = AgentHarnessPhase::Idle;
+    }
+
+    /// Reset the agent's transcript and queues.
+    pub fn reset(&mut self) {
+        self.agent.reset();
+        self.phase = AgentHarnessPhase::Idle;
+    }
+
+    /// Check whether compaction is needed based on current context size.
+    pub fn needs_compaction(&self) -> bool {
+        let tokens = self.estimate_current_tokens();
+        compaction::should_compact(
+            tokens,
+            self.model.context_window,
+            &self.compaction_settings,
+        )
+    }
+
+    /// Estimate the current token usage of the conversation.
+    fn estimate_current_tokens(&self) -> usize {
+        compaction::estimate_context_tokens(&self.agent.state().messages)
+    }
+
+    /// Run compaction on the current conversation.
+    ///
+    /// This finds the cut point, builds a compaction prompt, and returns
+    /// the compaction result. The caller is responsible for calling the
+    /// LLM with the compaction prompt and providing the summary.
+    pub async fn compact(
+        &mut self,
+        summary: &str,
+    ) -> Result<CompactionResult, anyhow::Error> {
+        if self.phase != AgentHarnessPhase::Idle {
+            anyhow::bail!(
+                "Cannot compact while harness is in {:?} phase",
+                self.phase
+            );
+        }
+
+        self.phase = AgentHarnessPhase::Compaction;
+
+        // Run before-compact hooks.
+        let _hook_ctx = self.run_hooks(
+            HookPoint::SessionBeforeCompact,
+            HookContext::new(HookPoint::SessionBeforeCompact),
+        );
+
+        let messages = self.agent.state().messages.clone();
+        let tokens_before = compaction::estimate_context_tokens(&messages) as u64;
+
+        let cut_point = compaction::find_cut_point(
+            &messages,
+            self.compaction_settings.keep_recent_tokens,
+        );
+
+        let _compacted = &messages[..cut_point];
+        let kept = &messages[cut_point..];
+
+        // Build a new transcript: summary as system context + kept messages.
+        let mut new_messages = Vec::new();
+        new_messages.push(AgentMessage::User {
+            content: vec![crate::types::ContentBlock::Text {
+                text: format!(
+                    "<conversation_history_summary>\n{summary}\n</conversation_history_summary>"
+                ),
+            }],
+            timestamp: chrono::Utc::now(),
+        });
+        new_messages.extend_from_slice(kept);
+
+        let tokens_after = compaction::estimate_context_tokens(&new_messages) as u64;
+
+        // Replace the agent's transcript.
+        self.agent.reset();
+        self.agent.replace_transcript(new_messages);
+
+        let result = CompactionResult {
+            summary: summary.to_string(),
+            first_kept_entry_id: kept.first().map(|_| "compacted".to_string()),
+            tokens_before,
+            tokens_after,
+        };
+
+        // Run after-compact hooks.
+        let _hook_ctx = self.run_hooks(
+            HookPoint::SessionAfterCompact,
+            HookContext::new(HookPoint::SessionAfterCompact)
+                .with_data(serde_json::json!({
+                    "tokens_before": tokens_before,
+                    "tokens_after": tokens_after,
+                    "cut_point": cut_point,
+                })),
+        );
+
+        self.phase = AgentHarnessPhase::Idle;
+        Ok(result)
+    }
+
+    /// Build a compaction prompt for the current conversation.
+    ///
+    /// Returns the prompt that should be sent to the LLM to generate a
+    /// summary, along with the cut point index.
+    pub fn build_compaction_prompt(&self) -> Option<(String, usize)> {
+        let messages = self.agent.state().messages.clone();
+        if messages.is_empty() {
+            return None;
+        }
+
+        let cut_point = compaction::find_cut_point(
+            &messages,
+            self.compaction_settings.keep_recent_tokens,
+        );
+
+        if cut_point == 0 {
+            return None; // Nothing to compact.
+        }
+
+        let compacted = &messages[..cut_point];
+        let prompt = compaction::build_compaction_prompt(compacted, None);
+        Some((prompt, cut_point))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionStorage;
+    use crate::session::SessionTreeEntry;
+    use crate::types::{AgentEvent, ContentBlock, StopReason, Usage};
+    use tokio_util::sync::CancellationToken;
+
+    struct TestStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for TestStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            _on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+        ) -> Result<AgentMessage, anyhow::Error> {
+            Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "Test response".into(),
+                }],
+                model: "test".into(),
+                provider: "test".into(),
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage::default(),
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    fn test_model() -> Model {
+        Model {
+            provider: "test".into(),
+            id: "test".into(),
+            context_window: 100_000,
+            supports_thinking: false,
+            metadata: Default::default(),
+        }
+    }
+
+    // In-memory session storage for testing.
+    struct MemStorage {
+        entries: std::sync::Mutex<Vec<SessionTreeEntry>>,
+        leaf_id: std::sync::Mutex<Option<String>>,
+    }
+
+    impl MemStorage {
+        fn new() -> Self {
+            MemStorage {
+                entries: std::sync::Mutex::new(Vec::new()),
+                leaf_id: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStorage for MemStorage {
+        async fn create_entry_id(&self) -> Result<String, anyhow::Error> {
+            Ok(uuid::Uuid::new_v4().to_string())
+        }
+        async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+            self.entries.lock().unwrap().push(entry.clone());
+            Ok(())
+        }
+        async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
+            Ok(self.entries.lock().unwrap().iter().find(|e| e.id() == id).cloned())
+        }
+        async fn get_leaf_id(&self) -> Result<Option<String>, anyhow::Error> {
+            Ok(self.leaf_id.lock().unwrap().clone())
+        }
+        async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error> {
+            *self.leaf_id.lock().unwrap() = leaf_id.map(|s| s.to_string());
+            Ok(())
+        }
+        async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+            Ok(self.entries.lock().unwrap().clone())
+        }
+        async fn get_path_to_root_or_compaction(
+            &self,
+            _leaf_id: Option<&str>,
+        ) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
+            Ok(self.entries.lock().unwrap().clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_harness_prompt() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+
+        let result = harness.prompt("Hello").await;
+        assert!(result.is_ok());
+
+        let messages = result.unwrap();
+        assert!(!messages.is_empty());
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_harness_phase_guard() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        // Directly set phase to Turn to test the guard.
+        harness.phase = AgentHarnessPhase::Turn;
+        let result = harness.prompt("Hello").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_harness_abort() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        harness.abort();
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_harness_needs_compaction() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        // With empty messages, should not need compaction.
+        assert!(!harness.needs_compaction());
+    }
+
+    #[tokio::test]
+    async fn test_harness_hooks() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+
+        harness.on(
+            HookPoint::BeforeAgentStart,
+            Arc::new(move |ctx| {
+                called_clone.store(true, Ordering::SeqCst);
+                ctx
+            }),
+        );
+
+        let _ = harness.prompt("Hello").await;
+        assert!(called.load(Ordering::SeqCst));
     }
 }

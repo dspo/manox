@@ -167,6 +167,14 @@ impl Agent {
         self.follow_up_queue.clear();
     }
 
+    /// Replace the entire transcript with new messages.
+    ///
+    /// Used by the harness during compaction to swap in the compacted
+    /// conversation.
+    pub fn replace_transcript(&mut self, messages: Vec<AgentMessage>) {
+        self.state.messages = messages;
+    }
+
     /// Start a new prompt from text.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
         if self.active_run.is_some() {

@@ -233,6 +233,19 @@ impl Clone for AgentContext {
     }
 }
 
+impl std::fmt::Debug for AgentContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentContext")
+            .field("system_prompt", &self.system_prompt)
+            .field("messages", &self.messages)
+            .field("tools_count", &self.tools.len())
+            .field("model", &self.model)
+            .field("thinking_level", &self.thinking_level)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
 /// Configuration for a single agent loop invocation.
 pub struct AgentLoopConfig {
     /// Callback to get queued steering messages (injected mid-turn).
