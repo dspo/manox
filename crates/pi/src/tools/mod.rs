@@ -10,6 +10,10 @@ pub mod bash;
 pub mod grep;
 pub mod find;
 pub mod ls;
+pub mod file_mutation_queue;
+pub mod output_accumulator;
+pub mod path_utils;
+pub mod truncate;
 
 use crate::tool::AgentTool;
 use std::collections::HashMap;

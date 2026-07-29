@@ -4,6 +4,8 @@
 // compaction generates a structured summary of the oldest messages, keeping
 // only the most recent turns intact.
 
+pub mod branch_summarization;
+
 use serde::{Deserialize, Serialize};
 
 use crate::types::AgentMessage;
