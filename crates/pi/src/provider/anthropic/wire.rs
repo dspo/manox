@@ -24,10 +24,31 @@ pub struct MessageCreateParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
     pub stream: bool,
+}
+
+/// Controls the model's output. `effort` tunes how hard adaptive-thinking
+/// models reason; it lives here, NOT inside `thinking`.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutputConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+}
+
+/// How hard an adaptive-thinking model reasons.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
 }
 
 /// A system prompt block, optionally carrying a cache breakpoint.
@@ -103,13 +124,25 @@ pub struct ToolParam {
     pub cache_control: Option<CacheControl>,
 }
 
+/// Adaptive thinking: the model decides when and how much to reason. `display`
+/// controls whether thinking text is returned (`summarized`) or only its
+/// signature (`omitted`). Budget-based thinking is intentionally not modelled —
+/// we target adaptive models only.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum ThinkingConfig {
-    #[serde(rename = "enabled")]
-    Enabled { budget_tokens: usize },
-    #[serde(rename = "disabled")]
-    Disabled,
+    #[serde(rename = "adaptive")]
+    Adaptive {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<ThinkingDisplay>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
 }
 
 #[derive(Debug, Clone, Serialize)]

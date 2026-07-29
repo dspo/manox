@@ -15,17 +15,18 @@ use super::wire::*;
 /// Fallback max_tokens when the caller doesn't specify one.
 const DEFAULT_MAX_TOKENS: usize = 8192;
 
-/// Map a thinking level string to a token budget.
+/// Map a thinking level to an adaptive-thinking effort.
 ///
-/// The API takes an explicit `budget_tokens`; pi reasons in named levels. This
-/// budget-based mapping targets older models. Adaptive-thinking models use an
-/// effort field instead — see the plan's open questions.
-fn thinking_budget(level: &str) -> Option<usize> {
+/// pi reasons in named levels; adaptive models take an effort tier instead of
+/// a token budget. Unknown levels fall back to `high`, matching the reference
+/// mapping. "xhigh"/"max" pass through for the models that support them.
+fn map_effort(level: &str) -> Effort {
     match level {
-        "low" => Some(1_024),
-        "medium" => Some(8_192),
-        "high" => Some(32_768),
-        _ => None,
+        "minimal" | "low" => Effort::Low,
+        "medium" => Effort::Medium,
+        "xhigh" => Effort::Xhigh,
+        "max" => Effort::Max,
+        _ => Effort::High,
     }
 }
 
@@ -57,6 +58,7 @@ pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCre
             )
         },
         thinking: thinking_config(context),
+        output_config: output_config(context),
         temperature: options.temperature,
         stop_sequences: None,
         stream: true,
@@ -72,12 +74,28 @@ fn cache_control(options: &StreamOptions) -> Option<CacheControl> {
     Some(CacheControl { kind: "ephemeral", ttl })
 }
 
+/// Adaptive thinking is enabled when the model supports it and a thinking
+/// level is set. Thinking text comes back summarized; its signature is always
+/// preserved for multi-turn continuity.
 fn thinking_config(context: &AgentContext) -> Option<ThinkingConfig> {
     if !context.model.supports_thinking {
         return None;
     }
+    context.thinking_level.as_deref()?;
+    Some(ThinkingConfig::Adaptive {
+        display: Some(ThinkingDisplay::Summarized),
+    })
+}
+
+/// The effort tier lives in `output_config`, separate from `thinking`.
+fn output_config(context: &AgentContext) -> Option<OutputConfig> {
+    if !context.model.supports_thinking {
+        return None;
+    }
     let level = context.thinking_level.as_deref()?;
-    thinking_budget(level).map(|budget_tokens| ThinkingConfig::Enabled { budget_tokens })
+    Some(OutputConfig {
+        effort: Some(map_effort(level)),
+    })
 }
 
 /// Convert domain messages to wire messages, merging every run of consecutive
@@ -335,17 +353,53 @@ mod tests {
     }
 
     #[test]
-    fn thinking_config_injected_only_for_thinking_models() {
+    fn adaptive_thinking_sets_thinking_and_effort() {
         let with = ctx(vec![user("hi")], Some("high"));
+        let req = to_request(&with, &StreamOptions::default());
         assert!(matches!(
-            to_request(&with, &StreamOptions::default()).thinking,
-            Some(ThinkingConfig::Enabled { budget_tokens: 32_768 })
+            req.thinking,
+            Some(ThinkingConfig::Adaptive { display: Some(ThinkingDisplay::Summarized) })
+        ));
+        assert!(matches!(
+            req.output_config,
+            Some(OutputConfig { effort: Some(Effort::High) })
         ));
 
+        // A non-thinking model emits neither, even with a level set.
         let mut no_think = ctx(vec![user("hi")], None);
         no_think.model = model(false);
         no_think.thinking_level = Some("high".into());
-        assert!(to_request(&no_think, &StreamOptions::default()).thinking.is_none());
+        let req = to_request(&no_think, &StreamOptions::default());
+        assert!(req.thinking.is_none());
+        assert!(req.output_config.is_none());
+    }
+
+    #[test]
+    fn effort_maps_levels_and_passthrough() {
+        for (level, want) in [
+            ("minimal", Effort::Low),
+            ("low", Effort::Low),
+            ("medium", Effort::Medium),
+            ("high", Effort::High),
+            ("xhigh", Effort::Xhigh),
+            ("max", Effort::Max),
+            ("unknown", Effort::High),
+        ] {
+            assert!(matches!(map_effort(level), ref e if std::mem::discriminant(e) == std::mem::discriminant(&want)), "level {level}");
+        }
+    }
+
+    #[test]
+    fn thinking_wire_shape_matches_api() {
+        let with = ctx(vec![user("hi")], Some("max"));
+        let req = to_request(&with, &StreamOptions::default());
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["thinking"]["type"], "adaptive");
+        assert_eq!(v["thinking"]["display"], "summarized");
+        assert_eq!(v["output_config"]["effort"], "max");
+        // effort must NOT live inside thinking.
+        assert!(v["thinking"].get("effort").is_none());
+        assert!(v["thinking"].get("budget_tokens").is_none());
     }
 
     #[test]
