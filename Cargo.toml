@@ -13,6 +13,7 @@ members = [
     "crates/agent",
     "crates/agent-ui",
     "crates/manox",
+    "crates/pi",
     "crates/terminal",
     "crates/terminal-ui",
     "crates/components",
@@ -43,6 +44,7 @@ lsp = { path = "crates/lsp" }
 manox-webview = { path = "crates/webview" }
 manox-webview-macros = { path = "crates/webview-macros" }
 http_proxy = { path = "crates/http_proxy" }
+pi = { path = "crates/pi" }
 
 anyhow = "1"
 async-channel = "2"
