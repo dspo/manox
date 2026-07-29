@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::StreamFn;
-use crate::provider::ProviderError;
+use crate::provider::{ProviderError, overflow, retry};
 use crate::provider::sse::SseParser;
 use crate::types::{AgentContext, AgentEvent, AgentMessage, ContentBlock, StreamOptions, Usage};
 
@@ -80,27 +80,18 @@ impl StreamFn for ResponsesStreamFn {
         let body = to_request(context, &self.options);
         let url = format!("{}/responses", self.base_url);
 
-        let request = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&body);
-
-        let response = tokio::select! {
-            _ = signal.cancelled() => return Err(ProviderError::Aborted.into()),
-            res = request.send() => res.map_err(|e| ProviderError::Transport(e.to_string()))?,
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Http {
-                status: status.as_u16(),
-                body: body_text,
-            }
-            .into());
-        }
+        let response = retry::send_with_retry(
+            || {
+                self.client
+                    .post(&url)
+                    .bearer_auth(&self.api_key)
+                    .header("content-type", "application/json")
+                    .json(&body)
+            },
+            &signal,
+            &event_tx,
+        )
+        .await?;
 
         // Consume the SSE byte stream, folding events into an accumulator.
         let mut acc = Accumulator::new(context);
@@ -156,7 +147,7 @@ fn apply_payload(
                 .and_then(JsonValue::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| err.error.to_string());
-            return Err(ProviderError::MidStream(detail).into());
+            return Err(overflow::mid_stream(detail).into());
         }
         if value.get("message").is_some() || value.get("code").is_some() {
             let ev: WireErrorEvent =
@@ -166,7 +157,7 @@ fn apply_payload(
                     .map(|c| format!("error code {c}"))
                     .unwrap_or_else(|| "unknown error".to_string())
             });
-            return Err(ProviderError::MidStream(detail).into());
+            return Err(overflow::mid_stream(detail).into());
         }
         return Ok(());
     };
@@ -305,7 +296,7 @@ impl Accumulator {
                 let ev: WireResponseEvent =
                     serde_json::from_value(value).map_err(ProviderError::Json)?;
                 self.terminal_seen = true;
-                return Err(ProviderError::MidStream(response_failure(&ev.response)).into());
+                return Err(overflow::mid_stream(response_failure(&ev.response)).into());
             }
             "error" => {
                 let ev: WireErrorEvent =
@@ -315,7 +306,7 @@ impl Accumulator {
                         .map(|c| format!("error code {c}"))
                         .unwrap_or_else(|| "unknown error".to_string())
                 });
-                return Err(ProviderError::MidStream(detail).into());
+                return Err(overflow::mid_stream(detail).into());
             }
             // response.created and event kinds we do not model.
             _ => false,
@@ -466,7 +457,7 @@ impl Accumulator {
         self.stop_reason = match response.status.as_deref() {
             Some("incomplete") => Some(crate::types::StopReason::MaxTokens),
             Some("failed") | Some("cancelled") => {
-                return Err(ProviderError::MidStream(response_failure(response)).into());
+                return Err(overflow::mid_stream(response_failure(response)).into());
             }
             // completed, in_progress, queued, and anything unrecognized.
             _ => Some(crate::types::StopReason::EndTurn),

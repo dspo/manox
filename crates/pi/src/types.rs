@@ -244,6 +244,21 @@ pub enum AgentEvent {
         message: Box<AgentMessage>,
         tool_results: Vec<AgentMessage>,
     },
+    /// A provider handshake failed transiently and is being retried. Emitted
+    /// between attempts; a stream that fails after events were already
+    /// forwarded is never retried.
+    Retry {
+        /// 1-indexed attempt that just failed.
+        attempt: u32,
+        /// Total attempt budget including the original attempt.
+        max_attempts: u32,
+        /// Delay before the next attempt.
+        delay: std::time::Duration,
+        /// Short human label, e.g. "429 Too Many Requests" or "connection reset".
+        reason: String,
+        /// Truncated provider error body, when the failure carried one.
+        detail: Option<String>,
+    },
     /// The agent run has completed.
     AgentEnd {
         /// All new messages produced during this run.

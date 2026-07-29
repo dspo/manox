@@ -13,8 +13,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::StreamFn;
-use crate::provider::ProviderError;
 use crate::provider::sse::SseParser;
+use crate::provider::{ProviderError, overflow, retry};
 use crate::types::{AgentContext, AgentEvent, AgentMessage, ContentBlock, StreamOptions, Usage};
 
 use translate::{parse_finish_reason, to_request, to_usage};
@@ -69,27 +69,18 @@ impl StreamFn for CompletionsStreamFn {
         let body = to_request(context, &self.options, &self.base_url);
         let url = format!("{}/chat/completions", self.base_url);
 
-        let request = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&body);
-
-        let response = tokio::select! {
-            _ = signal.cancelled() => return Err(ProviderError::Aborted.into()),
-            res = request.send() => res.map_err(|e| ProviderError::Transport(e.to_string()))?,
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Http {
-                status: status.as_u16(),
-                body: body_text,
-            }
-            .into());
-        }
+        let response = retry::send_with_retry(
+            || {
+                self.client
+                    .post(&url)
+                    .bearer_auth(&self.api_key)
+                    .header("content-type", "application/json")
+                    .json(&body)
+            },
+            &signal,
+            &event_tx,
+        )
+        .await?;
 
         // Consume the SSE byte stream, folding chunks into an accumulator.
         let mut acc = Accumulator::new(context);
@@ -139,7 +130,7 @@ fn apply_payload(
             .and_then(JsonValue::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| err.error.to_string());
-        return Err(ProviderError::MidStream(detail).into());
+        return Err(overflow::mid_stream(detail).into());
     }
     let chunk: WireChunk = serde_json::from_str(payload).map_err(ProviderError::Json)?;
     acc.apply(chunk, tx)

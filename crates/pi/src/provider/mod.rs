@@ -3,10 +3,14 @@
 // Each provider lives in its own submodule with wire types that mirror that
 // provider's protocol exactly. Wire types are never shared across providers;
 // the cross-provider representation is the domain types in `crate::types`.
-// The SSE parser (`sse`) is transport-level and is shared.
+// The SSE parser (`sse`) is transport-level and is shared, as are the
+// handshake retry loop (`retry`) and the context-overflow classifier
+// (`overflow`) — both shape-agnostic.
 
 pub mod anthropic;
 pub mod openai;
+pub mod overflow;
+pub mod retry;
 pub mod sse;
 
 use thiserror::Error;
@@ -17,6 +21,11 @@ pub enum ProviderError {
     /// The API returned a non-2xx status. `body` holds the error envelope.
     #[error("http {status}: {body}")]
     Http { status: u16, body: String },
+
+    /// The request input exceeds the model's context window. Deterministic —
+    /// the loop layer answers with compact-and-retry, not a plain retry.
+    #[error("context overflow: {0}")]
+    Overflow(String),
 
     /// An SSE frame could not be parsed.
     #[error("malformed sse frame: {line}")]

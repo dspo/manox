@@ -1,0 +1,414 @@
+//! Transient-failure retry for the LLM HTTP handshake.
+//!
+//! Every wire sends a streaming POST; a non-2xx status — most painfully 429 —
+//! or a connect-phase transport failure is usually transient. This module
+//! wraps the send in an exponential-backoff retry loop so those recover
+//! silently, emitting [`AgentEvent::Retry`] between attempts; only after
+//! [`MAX_ATTEMPTS`] does the classified error reach the caller.
+//!
+//! Safety boundary: retry happens only at the handshake stage, before any SSE
+//! event has been forwarded. A stream that fails mid-flight is never retried
+//! — re-sending would duplicate output already emitted. Each attempt sends a
+//! byte-identical body, so provider-side prefix caching is unaffected.
+
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::provider::{ProviderError, overflow};
+use crate::types::AgentEvent;
+
+/// Total request budget per stream call, including the original attempt.
+const MAX_ATTEMPTS: u32 = 6;
+const BASE_DELAY: Duration = Duration::from_secs(1);
+const BACKOFF_FACTOR: f64 = 2.0;
+const MAX_DELAY: Duration = Duration::from_secs(30);
+/// Upper bound on a server-advertised `Retry-After`, so a misbehaving upstream
+/// cannot stall a turn indefinitely.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// HTTP statuses whose failure is likely to resolve on retry. The unofficial
+/// 529 ("service overloaded") is included — Anthropic emits it in practice.
+/// 520–524 are Cloudflare gateway errors common to provider front-ends.
+fn should_retry_status(status: u16) -> bool {
+    matches!(
+        status,
+        408 | 429 | 500 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524 | 529
+    )
+}
+
+/// reqwest errors worth retrying. `is_connect` covers only the connect phase,
+/// so a connection reset / broken pipe / HTTP-2 stream reset mid-request (the
+/// common transient-transport class) is caught via the source-chain io kind.
+/// Request-construction (`is_request`) and body-serialization (`is_body`)
+/// errors reproduce identically and are never retried.
+fn is_retryable_send_error(err: &reqwest::Error) -> bool {
+    if err.is_connect() || err.is_timeout() || err.is_redirect() {
+        return true;
+    }
+    let mut source: Option<&dyn std::error::Error> = Some(err);
+    while let Some(s) = source {
+        if let Some(io) = s.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        {
+            return true;
+        }
+        source = s.source();
+    }
+    false
+}
+
+/// Short, user-facing label for a retryable reqwest send error. Mirrors the
+/// retry-decision logic of `is_retryable_send_error` but only classifies — it
+/// never gates a retry. Kept terse so the retry event reads as one line.
+fn classify_send_error(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        return "timeout";
+    }
+    if err.is_redirect() {
+        return "redirect error";
+    }
+    if err.is_connect() {
+        return "connection error";
+    }
+    let mut src: Option<&dyn std::error::Error> = Some(err);
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionReset => return "connection reset",
+                std::io::ErrorKind::ConnectionAborted => return "connection aborted",
+                std::io::ErrorKind::BrokenPipe => return "broken pipe",
+                std::io::ErrorKind::TimedOut => return "timeout",
+                std::io::ErrorKind::UnexpectedEof => return "unexpected EOF",
+                _ => {}
+            }
+        }
+        src = s.source();
+    }
+    "network error"
+}
+
+/// User-facing label for a retryable HTTP status: "429 Too Many Requests" for
+/// standard codes, bare numeric for unofficial ones (529) where no canonical
+/// reason exists — avoids the "<unknown status code>" placeholder.
+fn retry_status_reason(status: reqwest::StatusCode) -> String {
+    match status.canonical_reason() {
+        Some(r) => format!("{} {}", status.as_u16(), r),
+        None => status.as_u16().to_string(),
+    }
+}
+
+/// Cap a provider error body so the retry event's detail stays readable. A
+/// 429 or 5xx body can be a multi-KB HTML/JSON error page; truncate with an
+/// ellipsis. Snaps back to the nearest UTF-8 char boundary so the cut never
+/// splits a multi-byte character (provider bodies often carry non-ASCII).
+fn truncate_body(body: &str) -> String {
+    const MAX: usize = 2000;
+    if body.len() <= MAX {
+        body.to_string()
+    } else {
+        let mut end = MAX;
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &body[..end])
+    }
+}
+
+/// Parse `Retry-After`-style headers. Supports the non-standard
+/// `retry-after-ms` (milliseconds) and the standard `Retry-After` (seconds).
+/// The HTTP-date form is not parsed — providers emit integer seconds in
+/// practice; an unparseable value falls back to computed backoff.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(ms) = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+    {
+        return Some(Duration::from_millis(ms));
+    }
+    let s = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    s.parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Exponential backoff for `attempt` (1-indexed): `BASE_DELAY * 2^(attempt-1)`,
+/// ±20% jitter, capped at `MAX_DELAY`. The cap applies after jitter so a
+/// jittered value can never exceed `MAX_DELAY`.
+fn backoff(attempt: u32) -> Duration {
+    let exp = BACKOFF_FACTOR.powi((attempt.saturating_sub(1)) as i32);
+    let base = BASE_DELAY.as_secs_f64() * exp;
+    // Cheap entropy: subsec nanos span [0, 1e9), map to ±20%.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as f64;
+    let jitter = 0.8 + 0.4 * (nanos / 1e9);
+    let secs = (base * jitter).max(0.05).min(MAX_DELAY.as_secs_f64());
+    Duration::from_secs_f64(secs)
+}
+
+/// Delay actually slept before attempt N+1: the larger of computed backoff and
+/// a server-advertised `Retry-After`, capped to `MAX_RETRY_AFTER`.
+fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+    let bo = backoff(attempt);
+    let raw = retry_after.map_or(bo, |ra| bo.max(ra));
+    raw.min(MAX_RETRY_AFTER)
+}
+
+/// Send a streaming request, retrying transient handshake failures.
+///
+/// `build` constructs a fresh `RequestBuilder` per attempt — the body must be
+/// re-sent on each retry, so the builder cannot be reused.
+///
+/// On success returns the `reqwest::Response` ready for `bytes_stream()`.
+/// Terminal failures (non-retryable status, non-retryable send error, retries
+/// exhausted) come back classified: overflow rejections as
+/// [`ProviderError::Overflow`], other statuses as [`ProviderError::Http`],
+/// transport failures as [`ProviderError::Transport`]. Cancellation at any
+/// point returns [`ProviderError::Aborted`].
+pub async fn send_with_retry<F>(
+    build: F,
+    signal: &CancellationToken,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) -> Result<reqwest::Response, anyhow::Error>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let result = tokio::select! {
+            _ = signal.cancelled() => return Err(ProviderError::Aborted.into()),
+            res = build().send() => res,
+        };
+        match result {
+            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp) => {
+                let status = resp.status();
+                let retry_after = parse_retry_after(resp.headers());
+                let body = resp.text().await.unwrap_or_default();
+                if !should_retry_status(status.as_u16()) || attempt >= MAX_ATTEMPTS {
+                    return Err(overflow::terminal(status.as_u16(), body).into());
+                }
+                let delay = retry_delay(attempt, retry_after);
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    status = %status,
+                    delay_secs = delay.as_secs(),
+                    "transient status, retrying"
+                );
+                let _ = event_tx
+                    .send(AgentEvent::Retry {
+                        attempt,
+                        max_attempts: MAX_ATTEMPTS,
+                        delay,
+                        reason: retry_status_reason(status),
+                        detail: Some(truncate_body(&body)),
+                    })
+                    .await;
+                tokio::select! {
+                    _ = signal.cancelled() => return Err(ProviderError::Aborted.into()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(err) => {
+                if !is_retryable_send_error(&err) || attempt >= MAX_ATTEMPTS {
+                    return Err(ProviderError::Transport(err.to_string()).into());
+                }
+                let delay = backoff(attempt);
+                tracing::warn!(
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    error = %err,
+                    delay_secs = delay.as_secs(),
+                    "send error, retrying"
+                );
+                let _ = event_tx
+                    .send(AgentEvent::Retry {
+                        attempt,
+                        max_attempts: MAX_ATTEMPTS,
+                        delay,
+                        reason: classify_send_error(&err).to_string(),
+                        detail: None,
+                    })
+                    .await;
+                tokio::select! {
+                    _ = signal.cancelled() => return Err(ProviderError::Aborted.into()),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_statuses() {
+        for s in [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
+            assert!(should_retry_status(s), "{s}");
+        }
+        for s in [400, 401, 403, 404, 409, 422, 451] {
+            assert!(!should_retry_status(s), "{s}");
+        }
+    }
+
+    #[test]
+    fn backoff_is_bounded() {
+        // Without jitter the base grows as 1,2,4,8,16,30 (capped). With ±20%
+        // jitter each sample stays in [0.8×base, 1.2×base] ∩ [0.05, MAX_DELAY].
+        // The cap applies after jitter, so no sample exceeds MAX_DELAY.
+        for attempt in 1..=MAX_ATTEMPTS {
+            let d = backoff(attempt);
+            assert!(d >= Duration::from_millis(40), "attempt {attempt}: {d:?}");
+            assert!(d <= MAX_DELAY, "attempt {attempt}: {d:?} exceeds cap");
+        }
+        // Cap enforced even at extreme attempt counts.
+        assert!(backoff(100) <= MAX_DELAY);
+    }
+
+    #[test]
+    fn retry_delay_takes_max_and_caps() {
+        // No Retry-After → backoff.
+        let d = retry_delay(1, None);
+        assert!(d <= MAX_DELAY && d >= Duration::from_millis(40));
+        // Retry-After larger than backoff wins, but capped to MAX_RETRY_AFTER.
+        let d = retry_delay(1, Some(Duration::from_secs(120)));
+        assert_eq!(d, MAX_RETRY_AFTER);
+        // Backoff larger than Retry-After wins.
+        let d = retry_delay(5, Some(Duration::from_millis(10)));
+        assert!(d > Duration::from_millis(10));
+    }
+
+    #[test]
+    fn parse_retry_after_seconds_and_ms() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after", "5".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(5)));
+
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("retry-after-ms", "2500".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_millis(2500)));
+
+        let h = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&h), None);
+
+        // Unparseable (HTTP-date form) falls back to None → caller uses backoff.
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            "retry-after",
+            "Wed, 01 Jan 2099 00:00:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn retry_status_reason_labels() {
+        let s = reqwest::StatusCode::from_u16(429).unwrap();
+        assert_eq!(retry_status_reason(s), "429 Too Many Requests");
+        let s = reqwest::StatusCode::from_u16(529).unwrap();
+        assert_eq!(retry_status_reason(s), "529");
+    }
+
+    #[test]
+    fn truncate_body_keeps_short_and_caps_long() {
+        assert_eq!(truncate_body("short"), "short");
+        let long = "x".repeat(3000);
+        let t = truncate_body(&long);
+        assert!(t.ends_with('…'));
+        assert!(t.len() < 3000);
+    }
+
+    #[test]
+    fn truncate_body_respects_utf8_boundary() {
+        // A 3-byte CJK char straddling the 2000-byte cut must be dropped
+        // wholesale, not split mid-codepoint (would panic / yield invalid UTF-8).
+        let prefix = "a".repeat(1999);
+        let body = format!("{prefix}中");
+        let t = truncate_body(&body);
+        assert!(t.ends_with('…'));
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+        assert!(!t.contains('中'));
+    }
+
+    #[tokio::test]
+    async fn cancel_during_backoff_aborts() {
+        // A closed port fails the connect phase fast and retryably; the retry
+        // event confirms the backoff sleep has started, and cancelling then
+        // must abort instead of sleeping through.
+        let (tx, mut rx) = mpsc::channel(8);
+        let signal = CancellationToken::new();
+        let sig = signal.clone();
+        let client = reqwest::Client::new();
+        let handle = tokio::spawn(async move {
+            send_with_retry(
+                || client.post("http://127.0.0.1:1/").body("x".to_string()),
+                &signal,
+                &tx,
+            )
+            .await
+        });
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(event, AgentEvent::Retry { attempt: 1, .. }));
+        sig.cancel();
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::Aborted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_retryable_status_is_terminal_and_classified() {
+        // A one-shot server answering a 400 overflow body: the helper must not
+        // retry (exactly one request) and must surface ProviderError::Overflow.
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = r#"{"error":{"message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#;
+                let response = format!(
+                    "HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/");
+        let err = send_with_retry(
+            || client.post(&url).body("x".to_string()),
+            &CancellationToken::new(),
+            &tx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<ProviderError>(),
+            Some(ProviderError::Overflow(_))
+        ));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(rx.try_recv().is_err(), "no retry event for a terminal status");
+    }
+}

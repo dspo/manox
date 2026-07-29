@@ -20,8 +20,8 @@
 | Anthropic Messages 形状 | provider/anthropic.rs (1370) | ✅ | pi 已 live 验证；manox 侧多出 beta header、partial tool_use 事件、签名缺失块丢弃等细节，按需补齐 |
 | OpenAI Completions 形状 | completions.rs (1190) | ✅ | 已实现（2026-07-29）：无 CompatFlags/URL 嗅探/钳制；ThinkingKind 即 compat 维度（Enabled→`thinking:{type}`+reasoning_effort、Adaptive→reasoning_effort 透传、off→disabled/"none"、None-level→省略字段）；响应侧无条件宽容解析（reasoning_content/reasoning/reasoning_text、usage 双拼写 .or()、is_error→`[error] ` 前缀、include_usage 恒发）；max_tokens 字段名与 DeepSeek 空 reasoning_content 回填按 TS Pi 规则；thinking 历史丢弃 |
 | OpenAI Responses 形状 | responses.rs (1135) | ✅ | 已实现（2026-07-29）：reasoning:{effort}（off/None-level→"none"，on→summary:"auto"+include encrypted_content）；thinking 经 Thinking::signature（ResponseReasoningItem 原始 JSON）往返、无 signature 丢弃、跨模型摊平为纯文本；assistant 文本经新增的 Text::signature（`{v:1,id,phase}`）保持条目身份，fallback `msg_pi_*`；tool call id `call_id\|item_id`，fc_ 前缀规则 + 跨模型 id 省略 + 短哈希（cyrb53 精确移植）；孤儿 tool call 合成 "No result provided" 输出；max_output_tokens ≥16、store:false、system 置顶（thinking→developer 否则 system）；usage 减 cached+write；终态事件缺失/裸错误信封（code+message 无 type）均为 MidStream 错误。注意：responses 形状不做 is_error→`[error] ` 折叠（TS Pi 如此，与 completions 形状有意不同）；tool 结果图片不经视觉能力门控（pi 无 input 能力字段，调用方声明正确性） |
-| 握手重试 | retry.rs (383) | 🔲 | 429/5xx/网络错误指数退避+jitter，Retry-After 遵从，6 次上限，仅握手阶段重试，Retry 事件上抛 UI。**决策（2026-07-29）：上浮 provider/ 公共层，形状无关装饰器，anthropic/openai 共用** |
-| 上下文溢出分类 | overflow.rs (163) | 🔲 | ~18 种跨厂商溢出报文模式匹配 + 限流排除模式 → 路由到 compact-retry。**决策（2026-07-29）：同上浮，产出 ProviderError::Overflow 供循环层 compact-retry** |
+| 握手重试 | retry.rs (383) | ✅ | 已实现（2026-07-29）：provider/retry.rs 形状无关装饰器，三形状共用。429/408/5xx（含 520–524/529）+ 连接期传输错误指数退避 ±20% jitter、Retry-After/retry-after-ms 遵从（≤60s 上限）、6 次总尝试、仅握手阶段重试、AgentEvent::Retry 上抛、终态错误经 overflow 分类。架构差异：pi 的 StreamFn 自带 CancellationToken（manox 靠 tx.is_closed 轮询），错误经 Result 返回而非事件转发 |
+| 上下文溢出分类 | overflow.rs (163) | ✅ | 已实现（2026-07-29）：provider/overflow.rs，20 种跨厂商溢出子串 + 7 种限流排除、413 恒判溢出；terminal()（握手非 2xx）与 mid_stream()（流内错误文本）两个构造点统一产出 ProviderError::Overflow，三形状已接线。循环层的 compact-retry 路由属 §3 后续项 |
 | Prompt caching 策略 | anthropic_cache.rs (493) | 🔲 | 3 断点策略（system 尾/最后工具/messages[-2]）、1h TTL 仅限官方端点、≤4 断点上限、`MANOX_PROMPT_CACHING` 覆盖 |
 | SSE 解析 + 截断 JSON 修复 | sse.rs (80) | 🟡 | pi 有 SseParser；manox 另有 `fix_streamed_json`（分隔符栈修复流式 JSON），tool_use 组装需要 |
 | Thinking 三态 + effort | 散见各 wire + mod.rs `anthropic_supports_effort` | ✅ | pi 刚完成（ThinkingKind + output_config.effort）；manox 的 effort 按模型 id 门控，pi 由调用方声明，职责划分更干净 |
@@ -38,7 +38,7 @@
 | 拒绝熔断 | thread.rs `MAX_CONSECUTIVE_TOOL_DENIALS` | 🔲 | 连续拒绝 → 注入收尾指令 → 二次触发硬停 |
 | MaxTokens 截断处理 | thread.rs | 🟡 | pi 目前 fail 掉全部 tool calls；manox 有更细的恢复路径 |
 | 子代理轮数上限 | thread.rs `max_turns` | 🟡 | pi 有全局 max_turns；manox 仅子代理受限 + 两次软着陆（先指令后硬停） |
-| 事件体系 | ThreadEvent (~40 变体) | 🟡 | pi AgentEvent 已覆盖主生命周期；缺 Retry/PlanDelta/SubagentProgress/PrefixStability/TokenUsageUpdated 等产品化事件 |
+| 事件体系 | ThreadEvent (~40 变体) | 🟡 | pi AgentEvent 已覆盖主生命周期 + Retry；缺 PlanDelta/SubagentProgress/PrefixStability/TokenUsageUpdated 等产品化事件 |
 
 ## 3. 上下文管理
 
