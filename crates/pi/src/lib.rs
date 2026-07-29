@@ -17,6 +17,7 @@ pub mod harness;
 pub mod session;
 pub mod settings;
 pub mod tool;
+pub mod tools;
 pub mod trust;
 pub mod types;
 
@@ -31,3 +32,4 @@ pub use harness::AgentHarness;
 pub use types::{AgentMessage, AgentEvent, AgentContext, AgentLoopConfig, AgentState};
 pub use env::ExecutionEnv;
 pub use tool::{AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext};
+pub use tools::ToolRegistry;

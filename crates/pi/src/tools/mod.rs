@@ -48,3 +48,45 @@ impl Default for ToolRegistry {
         Self::new()
     }
 }
+
+impl ToolRegistry {
+    /// Register all default built-in tools.
+    pub fn register_defaults(&mut self) {
+        self.register(Box::new(read::ReadTool));
+        self.register(Box::new(write::WriteTool));
+        self.register(Box::new(edit::EditTool));
+        self.register(Box::new(bash::BashTool::new(None)));
+        self.register(Box::new(grep::GrepTool));
+        self.register(Box::new(find::FindTool));
+        self.register(Box::new(ls::LsTool));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_registry() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(read::ReadTool));
+        assert_eq!(registry.names(), vec!["read"]);
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_register_defaults() {
+        let mut registry = ToolRegistry::new();
+        registry.register_defaults();
+        let names = registry.names();
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"write"));
+        assert!(names.contains(&"edit"));
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"grep"));
+        assert!(names.contains(&"find"));
+        assert!(names.contains(&"ls"));
+        assert_eq!(names.len(), 7);
+    }
+}
