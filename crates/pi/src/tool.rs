@@ -44,7 +44,7 @@ impl AgentToolResult {
     /// Create a simple text result.
     pub fn text(text: impl Into<String>) -> Self {
         AgentToolResult {
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::Text { text: text.into(), signature: None }],
             details: None,
             is_error: false,
             usage: None,
@@ -55,7 +55,7 @@ impl AgentToolResult {
     /// Create an error result.
     pub fn error(text: impl Into<String>) -> Self {
         AgentToolResult {
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::Text { text: text.into(), signature: None }],
             details: None,
             is_error: true,
             usage: None,

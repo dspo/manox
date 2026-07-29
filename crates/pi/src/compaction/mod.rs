@@ -174,7 +174,7 @@ pub fn build_compaction_prompt(
                     content
                         .iter()
                         .filter_map(|b| {
-                            if let crate::types::ContentBlock::Text { text } = b {
+                            if let crate::types::ContentBlock::Text { text, .. } = b {
                                 Some(text.as_str())
                             } else {
                                 None
@@ -214,6 +214,7 @@ mod tests {
         AgentMessage::User {
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
+                signature: None,
             }],
             timestamp: chrono::Utc::now(),
         }
@@ -223,6 +224,7 @@ mod tests {
         AgentMessage::Assistant {
             content: vec![ContentBlock::Text {
                 text: text.to_string(),
+                signature: None,
             }],
             model: "test".into(),
             provider: "test".into(),

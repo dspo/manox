@@ -1,7 +1,8 @@
 // OpenAI-compatible providers, one submodule per API shape.
 //
 // `completions` covers the Chat Completions protocol spoken by OpenAI and
-// most OpenAI-compatible endpoints.
+// most OpenAI-compatible endpoints; `responses` covers the Responses
+// protocol spoken by OpenAI's newer models.
 //
 // Compatibility policy: the request side encodes exactly what the caller
 // declared — `ThinkingKind` selects the thinking wire mechanism and effort
@@ -14,6 +15,7 @@
 // helpers below, each a documented protocol requirement of the endpoint.
 
 pub mod completions;
+pub mod responses;
 
 /// Endpoints whose Chat Completions implementation only accepts the legacy
 /// `max_tokens` field name; everything else takes `max_completion_tokens`.

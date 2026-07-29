@@ -37,5 +37,6 @@ pub use env::ExecutionEnv;
 pub use provider::ProviderError;
 pub use provider::anthropic::AnthropicStreamFn;
 pub use provider::openai::completions::CompletionsStreamFn;
+pub use provider::openai::responses::ResponsesStreamFn;
 pub use tool::{AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext};
 pub use tools::ToolRegistry;

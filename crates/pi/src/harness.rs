@@ -311,6 +311,7 @@ impl<S: SessionStorage> AgentHarness<S> {
                 text: format!(
                     "<conversation_history_summary>\n{summary}\n</conversation_history_summary>"
                 ),
+                signature: None,
             }],
             timestamp: chrono::Utc::now(),
         });
@@ -390,6 +391,7 @@ mod tests {
             Ok(AgentMessage::Assistant {
                 content: vec![ContentBlock::Text {
                     text: "Test response".into(),
+                    signature: None,
                 }],
                 model: "test".into(),
                 provider: "test".into(),

@@ -426,6 +426,7 @@ mod tests {
             Ok(AgentMessage::Assistant {
                 content: vec![ContentBlock::Text {
                     text: "Hello, I'm a mock assistant.".into(),
+                    signature: None,
                 }],
                 model: "mock".into(),
                 provider: "mock".into(),
@@ -505,6 +506,7 @@ mod tests {
                 return Ok(AgentMessage::Assistant {
                     content: vec![ContentBlock::Text {
                         text: "done".into(),
+                        signature: None,
                     }],
                     model: "mock".into(),
                     provider: "mock".into(),
@@ -592,6 +594,7 @@ mod tests {
         let text_msg = AgentMessage::Assistant {
             content: vec![ContentBlock::Text {
                 text: "Tool executed successfully.".into(),
+                signature: None,
             }],
             model: "mock".into(),
             provider: "mock".into(),
@@ -695,7 +698,7 @@ mod tests {
         if let Some(AgentMessage::ToolResult { is_error, content, .. }) = tool_result {
             assert!(is_error, "truncated tool call should be an error");
             let text = content.iter().filter_map(|b| {
-                if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None }
+                if let ContentBlock::Text { text, .. } = b { Some(text.as_str()) } else { None }
             }).collect::<Vec<_>>().join("");
             assert!(
                 text.contains("output token limit") || text.contains("truncated"),

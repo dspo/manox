@@ -160,7 +160,7 @@ fn to_message_params(messages: &[AgentMessage]) -> Vec<MessageParam> {
 /// Map a content block that appears in a user/tool_result message.
 fn block_to_param(block: &ContentBlock) -> ContentBlockParam {
     match block {
-        ContentBlock::Text { text } => ContentBlockParam::Text {
+        ContentBlock::Text { text, .. } => ContentBlockParam::Text {
             text: text.clone(),
             cache_control: None,
         },
@@ -189,7 +189,7 @@ fn block_to_param(block: &ContentBlock) -> ContentBlockParam {
 /// thinking params.
 fn assistant_block_to_param(block: &ContentBlock) -> Option<ContentBlockParam> {
     match block {
-        ContentBlock::Text { text } => Some(ContentBlockParam::Text {
+        ContentBlock::Text { text, .. } => Some(ContentBlockParam::Text {
             text: text.clone(),
             cache_control: None,
         }),
@@ -276,7 +276,7 @@ mod tests {
         AgentMessage::ToolResult {
             tool_call_id: id.into(),
             tool_name: "read".into(),
-            content: vec![ContentBlock::Text { text: text.into() }],
+            content: vec![ContentBlock::Text { text: text.into(), signature: None }],
             is_error: false,
             details: None,
             timestamp: chrono::Utc::now(),

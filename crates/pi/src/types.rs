@@ -18,7 +18,16 @@ use std::collections::HashMap;
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        /// Opaque provider data that must be echoed back verbatim on later
+        /// turns to preserve the block's server-side identity (item id and
+        /// phase for the OpenAI Responses API). `None` for providers whose
+        /// protocol carries no text identity, such as Anthropic and Chat
+        /// Completions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     #[serde(rename = "image")]
     Image { source: ImageSource },
     #[serde(rename = "tool_use")]
@@ -105,6 +114,7 @@ impl AgentMessage {
         AgentMessage::User {
             content: vec![ContentBlock::Text {
                 text: text.into(),
+                signature: None,
             }],
             timestamp: Utc::now(),
         }

@@ -150,7 +150,7 @@ fn user_content(blocks: &[ContentBlock]) -> Option<UserContent> {
     let mut parts: Vec<UserPart> = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::Text { text: t } => {
+            ContentBlock::Text { text: t, signature: None } => {
                 text.push_str(t);
                 parts.push(UserPart::Text { text: t.clone() });
             }
@@ -176,7 +176,7 @@ fn assistant_param(blocks: &[ContentBlock], reasoning_backfill: bool) -> Option<
     let mut tool_calls = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Text { text: t, signature: None } => text.push_str(t),
             ContentBlock::ToolUse { id, name, input } => tool_calls.push(ToolCallParam {
                 id: id.clone(),
                 kind: "function",
@@ -210,7 +210,7 @@ fn tool_result_parts(blocks: &[ContentBlock]) -> (String, Vec<UserPart>) {
     let mut images = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::Text { text } => texts.push(text.as_str()),
+            ContentBlock::Text { text, .. } => texts.push(text.as_str()),
             ContentBlock::Image { source } => images.push(image_part(source)),
             _ => {}
         }
@@ -384,7 +384,7 @@ mod tests {
                 thinking: "hmm".into(),
                 signature: Some("sig".into()),
             },
-            ContentBlock::Text { text: "answer".into() },
+            ContentBlock::Text { text: "answer".into(), signature: None },
         ]);
         let v = request(&ctx(vec![user("q"), msg], ThinkingKind::None, None));
         let m = &v["messages"][2];
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn tool_calls_serialize_with_string_arguments_and_plain_content() {
         let msg = assistant(vec![
-            ContentBlock::Text { text: "checking".into() },
+            ContentBlock::Text { text: "checking".into(), signature: None },
             ContentBlock::ToolUse {
                 id: "t1".into(),
                 name: "read".into(),
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn tool_results_get_own_messages_and_error_folds() {
-        let text = |s: &str| vec![ContentBlock::Text { text: s.into() }];
+        let text = |s: &str| vec![ContentBlock::Text { text: s.into(), signature: None }];
         let v = request(&ctx(
             vec![
                 user("q"),
@@ -481,7 +481,7 @@ mod tests {
     fn user_message_with_image_uses_parts_encoding() {
         let msg = AgentMessage::User {
             content: vec![
-                ContentBlock::Text { text: "what is this".into() },
+                ContentBlock::Text { text: "what is this".into(), signature: None },
                 ContentBlock::Image {
                     source: ImageSource::Url { url: "https://x/y.png".into() },
                 },
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn deepseek_backfills_empty_reasoning_content() {
-        let thinking_ctx = || ctx(vec![user("q"), assistant(vec![ContentBlock::Text { text: "a".into() }])], ThinkingKind::Enabled, Some("high"));
+        let thinking_ctx = || ctx(vec![user("q"), assistant(vec![ContentBlock::Text { text: "a".into(), signature: None }])], ThinkingKind::Enabled, Some("high"));
 
         let v = serde_json::to_value(to_request(&thinking_ctx(), &StreamOptions::default(), "https://api.deepseek.com/v1")).unwrap();
         assert_eq!(v["messages"][2]["reasoning_content"], "");
@@ -549,7 +549,7 @@ mod tests {
         assert!(v["messages"][2].get("reasoning_content").is_none());
 
         // A non-thinking model never backfills, even against DeepSeek.
-        let plain = ctx(vec![user("q"), assistant(vec![ContentBlock::Text { text: "a".into() }])], ThinkingKind::None, None);
+        let plain = ctx(vec![user("q"), assistant(vec![ContentBlock::Text { text: "a".into(), signature: None }])], ThinkingKind::None, None);
         let v = serde_json::to_value(to_request(&plain, &StreamOptions::default(), "https://api.deepseek.com/v1")).unwrap();
         assert!(v["messages"][2].get("reasoning_content").is_none());
     }

@@ -183,6 +183,7 @@ impl Agent {
 
         let content = vec![ContentBlock::Text {
             text: text.to_string(),
+            signature: None,
         }];
         let user_message = AgentMessage::User {
             content,
@@ -335,6 +336,7 @@ mod tests {
             Ok(AgentMessage::Assistant {
                 content: vec![ContentBlock::Text {
                     text: "Test response".into(),
+                    signature: None,
                 }],
                 model: "test".into(),
                 provider: "test".into(),

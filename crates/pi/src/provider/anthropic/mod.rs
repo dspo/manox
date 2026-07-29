@@ -181,7 +181,7 @@ impl Accumulator {
                 self.ensure_index(index);
                 match content_block {
                     WireContentBlock::Text { .. } => {
-                        self.blocks[index] = ContentBlock::Text { text: String::new() };
+                        self.blocks[index] = ContentBlock::Text { text: String::new(), signature: None };
                     }
                     WireContentBlock::Thinking { .. } => {
                         self.blocks[index] = ContentBlock::Thinking {
@@ -207,7 +207,7 @@ impl Accumulator {
                 self.ensure_index(index);
                 match delta {
                     WireDelta::Text { text } => {
-                        if let ContentBlock::Text { text: t } = &mut self.blocks[index] {
+                        if let ContentBlock::Text { text: t, signature: None } = &mut self.blocks[index] {
                             t.push_str(&text);
                         }
                     }
@@ -265,7 +265,7 @@ impl Accumulator {
 
     fn ensure_index(&mut self, index: usize) {
         while self.blocks.len() <= index {
-            self.blocks.push(ContentBlock::Text { text: String::new() });
+            self.blocks.push(ContentBlock::Text { text: String::new(), signature: None });
         }
     }
 
@@ -328,7 +328,7 @@ mod tests {
         // Final text assembled.
         match &msg {
             AgentMessage::Assistant { content, stop_reason, .. } => {
-                assert!(matches!(&content[0], ContentBlock::Text { text } if text == "Hello, world"));
+                assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world"));
                 assert_eq!(*stop_reason, Some(StopReason::EndTurn));
             }
             _ => panic!("expected assistant"),

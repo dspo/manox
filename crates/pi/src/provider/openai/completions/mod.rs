@@ -269,13 +269,13 @@ impl Accumulator {
         let index = match self.open_text {
             Some(i) => i,
             None => {
-                self.blocks.push(ContentBlock::Text { text: String::new() });
+                self.blocks.push(ContentBlock::Text { text: String::new(), signature: None });
                 let i = self.blocks.len() - 1;
                 self.open_text = Some(i);
                 i
             }
         };
-        if let ContentBlock::Text { text: t } = &mut self.blocks[index] {
+        if let ContentBlock::Text { text: t, signature: None } = &mut self.blocks[index] {
             t.push_str(text);
         }
     }
@@ -443,7 +443,7 @@ mod tests {
 
         match &msg {
             AgentMessage::Assistant { content, stop_reason, .. } => {
-                assert!(matches!(&content[0], ContentBlock::Text { text } if text == "Hello, world"));
+                assert!(matches!(&content[0], ContentBlock::Text { text, .. } if text == "Hello, world"));
                 assert_eq!(*stop_reason, Some(StopReason::EndTurn));
             }
             _ => panic!("expected assistant"),
@@ -470,7 +470,7 @@ mod tests {
         assert_eq!(content.len(), 2);
         assert!(matches!(&content[0], ContentBlock::Thinking { thinking, signature }
             if thinking == "let me think" && signature.is_none()));
-        assert!(matches!(&content[1], ContentBlock::Text { text } if text == "answer"));
+        assert!(matches!(&content[1], ContentBlock::Text { text, .. } if text == "answer"));
     }
 
     #[test]
