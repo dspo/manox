@@ -11,6 +11,9 @@ use std::collections::HashMap;
 // ── Message types ───────────────────────────────────────────────────────────
 
 /// A content block within a message sent to or received from an LLM.
+///
+/// Serde tags mirror the Anthropic Messages API wire format so that blocks
+/// round-trip without a lossy translation layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
@@ -18,14 +21,23 @@ pub enum ContentBlock {
     Text { text: String },
     #[serde(rename = "image")]
     Image { source: ImageSource },
-    #[serde(rename = "toolCall")]
-    ToolCall {
+    #[serde(rename = "tool_use")]
+    ToolUse {
         id: String,
         name: String,
-        arguments: JsonValue,
+        input: JsonValue,
     },
+    /// A model reasoning trace. `signature` is opaque provider data that must
+    /// be echoed back verbatim on later turns to preserve thinking continuity.
     #[serde(rename = "thinking")]
-    Thinking { thinking: String },
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// An encrypted reasoning trace whose content the provider redacted.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 /// Source of an image in a content block.
@@ -53,6 +65,9 @@ pub enum AgentMessage {
         content: Vec<ContentBlock>,
         model: String,
         provider: String,
+        /// The protocol stop_reason reported by the provider. `None` while the
+        /// message is still streaming or when the run ended without one
+        /// (aborted, errored) — see [`Termination`].
         #[serde(default)]
         stop_reason: Option<StopReason>,
         #[serde(default)]
@@ -106,35 +121,74 @@ impl AgentMessage {
     }
 }
 
-/// Why the assistant stopped generating.
+/// Why the assistant stopped generating, as reported by the provider.
+///
+/// Mirrors the Anthropic Messages API `stop_reason` values exactly. Local
+/// interruptions (user abort, provider error) are NOT represented here — they
+/// surface through [`Termination`] and the error channel instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
-    /// Natural completion (end_turn).
+    /// Natural completion.
     EndTurn,
-    /// Token limit reached.
-    Length,
-    /// Tool call requested.
+    /// Output token limit reached.
+    MaxTokens,
+    /// A stop sequence was hit.
+    StopSequence,
+    /// The model requested a tool call.
     ToolUse,
-    /// Aborted by user or system.
+    /// The model paused a long-running turn (may be resumed).
+    PauseTurn,
+    /// The model refused the request.
+    Refusal,
+    /// The model's context window was exceeded.
+    ModelContextWindowExceeded,
+}
+
+/// Why a run ended without a protocol `stop_reason`.
+///
+/// These are local interruptions, distinct from anything the provider reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Termination {
+    /// Aborted by the user or system.
     Aborted,
-    /// Provider error.
+    /// The provider or transport errored.
     Error,
 }
 
 /// Token usage for a single assistant message.
+///
+/// Field names mirror the Anthropic Messages API usage object.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
-    pub input: u64,
+    pub input_tokens: u64,
     #[serde(default)]
-    pub output: u64,
+    pub output_tokens: u64,
     #[serde(default)]
-    pub cache_read: u64,
+    pub cache_read_input_tokens: u64,
     #[serde(default)]
-    pub cache_write: u64,
+    pub cache_creation_input_tokens: u64,
+    /// Breakdown of cache creation by TTL, when the provider reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+/// Cache creation split by TTL.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheCreation {
     #[serde(default)]
-    pub total: u64,
+    pub ephemeral_1h_input_tokens: u64,
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u64,
+}
+
+impl Usage {
+    /// Total input tokens: direct input plus cache reads and writes.
+    pub fn total_input(&self) -> u64 {
+        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
 }
 
 // ── Event types ─────────────────────────────────────────────────────────────

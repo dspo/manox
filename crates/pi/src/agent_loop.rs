@@ -151,7 +151,10 @@ async fn run_loop_inner(
                 _ => None,
             };
 
-            if stop_reason == Some(StopReason::Error) || stop_reason == Some(StopReason::Aborted) {
+            // A refusal carries no tool calls; end the run without executing.
+            // Local interruptions (abort, transport error) surface through the
+            // error channel, not through a protocol stop_reason.
+            if stop_reason == Some(StopReason::Refusal) {
                 sink.emit(AgentEvent::TurnEnd {
                     message: Box::new(message),
                     tool_results: Vec::new(),
@@ -167,8 +170,8 @@ async fn run_loop_inner(
                 AgentMessage::Assistant { content, .. } => content
                     .iter()
                     .filter_map(|block| {
-                        if let ContentBlock::ToolCall { id, name, arguments } = block {
-                            Some((id.as_str(), name.as_str(), arguments.clone()))
+                        if let ContentBlock::ToolUse { id, name, input } = block {
+                            Some((id.as_str(), name.as_str(), input.clone()))
                         } else {
                             None
                         }
@@ -182,7 +185,7 @@ async fn run_loop_inner(
 
             if !tool_calls.is_empty() {
                 // If the response was truncated, fail all tool calls.
-                let (executed, result_messages) = if stop_reason == Some(StopReason::Length) {
+                let (executed, result_messages) = if stop_reason == Some(StopReason::MaxTokens) {
                     fail_tool_calls_from_truncated(&tool_calls, sink)
                 } else {
                     execute_tool_calls(
@@ -574,10 +577,10 @@ mod tests {
 
         // First response: a tool call.
         let tool_call_msg = AgentMessage::Assistant {
-            content: vec![ContentBlock::ToolCall {
+            content: vec![ContentBlock::ToolUse {
                 id: "call_1".into(),
                 name: "echo".into(),
-                arguments: serde_json::json!({"message": "hello"}),
+                input: serde_json::json!({"message": "hello"}),
             }],
             model: "mock".into(),
             provider: "mock".into(),
@@ -657,14 +660,14 @@ mod tests {
         // Assistant message with stop_reason == Length and a tool call.
         // The tool call should be failed because the response was truncated.
         let truncated_msg = AgentMessage::Assistant {
-            content: vec![ContentBlock::ToolCall {
+            content: vec![ContentBlock::ToolUse {
                 id: "call_truncated".into(),
                 name: "echo".into(),
-                arguments: serde_json::json!({"message": "incomplete"}),
+                input: serde_json::json!({"message": "incomplete"}),
             }],
             model: "mock".into(),
             provider: "mock".into(),
-            stop_reason: Some(StopReason::Length),
+            stop_reason: Some(StopReason::MaxTokens),
             usage: Usage::default(),
             timestamp: chrono::Utc::now(),
         };

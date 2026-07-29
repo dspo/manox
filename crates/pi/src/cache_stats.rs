@@ -58,7 +58,7 @@ pub fn compute_cache_waste(
 
     for msg in messages {
         if let AgentMessage::Assistant { usage, model, provider, timestamp, .. } = msg {
-            let prompt_tokens = usage.input + usage.cache_read + usage.cache_write;
+            let prompt_tokens = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
             if prompt_tokens == 0 {
                 continue;
             }
@@ -75,7 +75,7 @@ pub fn compute_cache_waste(
                 model_key: format!("{provider}/{model}"),
                 timestamp_ms: timestamp.timestamp_millis() as u64,
                 reported_cache: prev.map(|p| p.reported_cache).unwrap_or(false)
-                    || usage.cache_read + usage.cache_write > 0,
+                    || usage.cache_read_input_tokens + usage.cache_creation_input_tokens > 0,
             });
         }
     }
@@ -92,12 +92,12 @@ fn detect_miss(
 ) -> Option<CacheMiss> {
     let prev = prev.as_ref()?;
 
-    if usage.cache_read + usage.cache_write == 0 && !prev.reported_cache {
+    if usage.cache_read_input_tokens + usage.cache_creation_input_tokens == 0 && !prev.reported_cache {
         return None;
     }
 
     let missed_tokens =
-        prev.prompt_tokens.min(prompt_tokens).saturating_sub(usage.cache_read);
+        prev.prompt_tokens.min(prompt_tokens).saturating_sub(usage.cache_read_input_tokens);
 
     if missed_tokens <= NOISE_FLOOR_TOKENS {
         return None;
