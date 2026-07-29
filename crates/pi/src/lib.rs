@@ -20,12 +20,14 @@ pub mod tool;
 pub mod trust;
 pub mod types;
 
-mod agent;
-mod agent_loop;
+pub mod agent;
+pub mod agent_loop;
 
 pub use agent::Agent;
+pub use agent::QueueMode;
 pub use agent_loop::run_loop;
+pub use agent_loop::{StreamFn, EventSink};
 pub use harness::AgentHarness;
 pub use types::{AgentMessage, AgentEvent, AgentContext, AgentLoopConfig, AgentState};
 pub use env::ExecutionEnv;
-pub use tool::{AgentTool, AgentToolResult, ExecutionMode, ToolContext};
+pub use tool::{AgentTool, AgentToolResult, ExecutedToolCall, ExecutionMode, ToolContext};

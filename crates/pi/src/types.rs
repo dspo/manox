@@ -107,7 +107,7 @@ impl AgentMessage {
 }
 
 /// Why the assistant stopped generating.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// Natural completion (end_turn).
