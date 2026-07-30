@@ -13,13 +13,14 @@ use crate::agent::{
     AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, LoopHooks, RunHandle,
 };
 use crate::agent_loop::StreamFn;
-use crate::compaction::{self, CompactionResult, CompactionSettings};
+use crate::compaction::{self, CompactionPreparation, CompactionResult, CompactionSettings};
 use crate::env::{ExecutionEnv, TokioExecutionEnv};
-use crate::session::{CompactionAuthorship, Session, SessionStorage};
+use crate::session::{CompactionAuthorship, Session, SessionStorage, SessionTreeEntry};
 use crate::tool::{AgentToolResult, LocalToolContext, ToolState};
 use crate::types::{
     AgentContext, AgentMessage, CacheRetention, ContentBlock, Model, StopReason, Usage,
 };
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 /// The phases the harness can be in.
@@ -60,15 +61,37 @@ pub enum HookPoint {
 /// A hook handler receives context about the event and can mutate it.
 pub type HookHandler = Arc<dyn Fn(HookContext) -> HookContext + Send + Sync>;
 
-/// A before-compact hook can cancel the compaction or supply its summary
-/// directly, sparing the summarization model call. Mirrors the TS
-/// `SessionBeforeCompactResult`: a provided override persists with
-/// `fromHook = true` and the hook's `details`/`usage` attached.
+/// A before-compact hook's full compaction result, mirroring the TS
+/// `CompactResult`. When a field is `Some`, the harness persists that value
+/// verbatim (`fromHook = true`) instead of its own cut analysis — so a TS hook
+/// returning a full `CompactResult` migrates without behavioral drift. The
+/// `summary` is required (an empty summary is refused before persisting).
 #[derive(Debug, Clone, Default)]
 pub struct BeforeCompactOverride {
     pub summary: String,
-    pub details: Option<JsonValue>,
+    pub first_kept_entry_id: Option<String>,
+    pub tokens_before: Option<u64>,
     pub usage: Option<Usage>,
+    pub retained_tail: Option<Vec<AgentMessage>>,
+    pub details: Option<JsonValue>,
+}
+
+/// The typed `session_before_compact` hook event, mirroring the TS
+/// `SessionBeforeCompactEvent`. Serialized into [`HookContext::data`] so a
+/// handler receives the TS-shaped `preparation` and `branchEntries` rather
+/// than an ad-hoc payload. The TS `signal: AbortSignal` has no Rust sync-hook
+/// equivalent — the hook is a synchronous closure with nothing to observe —
+/// and cancellation is expressed the other direction via the result's
+/// `cancel` field ([`HookContext::with_cancel_compaction`]).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBeforeCompactEvent<'a> {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub preparation: &'a CompactionPreparation,
+    pub branch_entries: &'a [SessionTreeEntry],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<&'a str>,
 }
 
 /// Context passed to hook handlers.
@@ -486,8 +509,16 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// to summarize the compacted prefix, and persists a `Compaction` entry
     /// carrying the real first-kept entry id, the pre-compaction token count,
     /// the summarization usage, and the retained tail. The agent transcript is
-    /// rewritten to the summary message plus the kept tail.
-    pub async fn compact(&mut self) -> Result<CompactionResult, anyhow::Error> {
+    /// rewritten to the summary message plus the retained tail. A
+    /// `session_before_compact` hook receives the typed [`CompactionPreparation`]
+    /// and the session branch entries, and may cancel or supply a full
+    /// [`BeforeCompactOverride`] persisted verbatim. `custom_instructions`
+    /// mirrors the TS `compact(customInstructions?)` argument and is surfaced
+    /// on the hook event.
+    pub async fn compact(
+        &mut self,
+        custom_instructions: Option<&str>,
+    ) -> Result<CompactionResult, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot compact while harness is in {:?} phase", self.phase);
         }
@@ -497,6 +528,16 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         self.phase = AgentHarnessPhase::Compaction;
 
+        // The session branch the harness is compacting — the same entries TS
+        // exposes as `branchEntries` on the `session_before_compact` event.
+        let branch_entries = match self.session.build_context().await {
+            Ok(entries) => entries,
+            Err(e) => {
+                self.phase = AgentHarnessPhase::Idle;
+                return Err(e);
+            }
+        };
+
         let messages = self.agent.state().messages.clone();
         let tokens_before = compaction::estimate_context_tokens(&messages).tokens;
         let cut_point =
@@ -505,56 +546,92 @@ impl<S: SessionStorage> AgentHarness<S> {
         let kept = &messages[cut_point..];
         let first_kept_entry_id = self.message_entry_ids.get(cut_point).cloned().flatten();
 
-        // A before-compact hook can cancel the run or supply the summary
-        // directly, sparing the summarization model call. It fires after the
-        // cut analysis — mirroring TS, which prepares the compaction then emits
-        // the hook with `preparation` + `branchEntries` — so the handler can
-        // decide on the specific content being compacted. A supplied override
-        // persists with `fromHook` and the hook's `details`/`usage`.
+        // The hook fires after the cut analysis — mirroring TS, which prepares
+        // the compaction then emits the event with `preparation` +
+        // `branchEntries` — so the handler decides on the specific content.
+        // The typed event carries the full TS `CompactionPreparation`
+        // (split-turn is always false here) plus the session branch and custom
+        // instructions, rather than a trimmed ad-hoc payload.
+        let preparation = compaction::build_preparation(
+            &branch_entries,
+            &messages,
+            cut_point,
+            first_kept_entry_id.clone(),
+            tokens_before,
+            &self.compaction_settings,
+        );
+        let event = SessionBeforeCompactEvent {
+            kind: "session_before_compact",
+            preparation: &preparation,
+            branch_entries: &branch_entries,
+            custom_instructions,
+        };
         let hook_ctx = self.run_hooks(
             HookPoint::SessionBeforeCompact,
-            HookContext::new(HookPoint::SessionBeforeCompact).with_data(serde_json::json!({
-                "preparation": {
-                    "tokensBefore": tokens_before,
-                    "cutPoint": cut_point,
-                    "keptMessageCount": kept.len(),
-                    "firstKeptEntryId": first_kept_entry_id,
-                },
-                "branchEntries": compacted,
-            })),
+            HookContext::new(HookPoint::SessionBeforeCompact)
+                .with_data(serde_json::to_value(&event).unwrap_or(serde_json::Value::Null)),
         );
         if hook_ctx.cancel_compaction {
             self.phase = AgentHarnessPhase::Idle;
             anyhow::bail!("compaction cancelled by before-compact hook");
         }
 
-        // The hook's override supplies only the summary content; the structural
-        // fields (tokens_before, retained tail, first-kept entry) still derive
-        // from the harness's cut analysis, since the harness owns the transcript.
-        let (summary_text, usage, authorship) = match hook_ctx.compact_override {
-            Some(override_) => (
-                override_.summary,
-                override_.usage,
-                CompactionAuthorship {
-                    details: override_.details,
-                    from_hook: true,
-                },
-            ),
-            None => self.summarize_via_model(compacted).await?,
+        // Resolve the compaction result. A hook override supplies a full
+        // TS-shaped `CompactResult`: each `Some` field is persisted verbatim
+        // (`fromHook = true`), each `None` falls back to the harness's cut
+        // analysis. Otherwise the harness summarizes the prefix itself. An
+        // empty summary never persists — it would discard the compacted
+        // history; the model path bails inside `summarize_via_model`, the hook
+        // path is refused here.
+        let (
+            summary_text,
+            first_kept_entry_id,
+            tokens_before,
+            usage,
+            details,
+            retained_tail,
+            from_hook,
+            tail_from_hook,
+        ) = match hook_ctx.compact_override {
+            Some(o) => {
+                if o.summary.trim().is_empty() {
+                    self.phase = AgentHarnessPhase::Idle;
+                    anyhow::bail!("before-compact hook supplied an empty summary");
+                }
+                let first_kept_entry_id = o.first_kept_entry_id.or(first_kept_entry_id);
+                let tokens_before = o.tokens_before.unwrap_or(tokens_before);
+                let tail_from_hook = o.retained_tail.is_some();
+                let retained_tail = o.retained_tail.unwrap_or_else(|| kept.to_vec());
+                (
+                    o.summary,
+                    first_kept_entry_id,
+                    tokens_before,
+                    o.usage,
+                    o.details,
+                    retained_tail,
+                    true,
+                    tail_from_hook,
+                )
+            }
+            None => {
+                let (summary, usage) = self.summarize_via_model(compacted).await?;
+                (
+                    summary,
+                    first_kept_entry_id,
+                    tokens_before,
+                    usage,
+                    None,
+                    kept.to_vec(),
+                    false,
+                    false,
+                )
+            }
         };
 
-        // An empty summary must never persist: it would replace the compacted
-        // prefix with nothing and lose history. The model path bails inside
-        // `summarize_via_model`; this guard closes the same hole for a hook
-        // override that supplies no text.
-        if summary_text.trim().is_empty() {
-            self.phase = AgentHarnessPhase::Idle;
-            anyhow::bail!("summarization failed (no summary)");
-        }
-
-        // `authorship` moves into the persisted entry; surface its `details` on
-        // the returned result so callers see the same payload a hook attached.
-        let details = authorship.details.clone();
+        let authorship = CompactionAuthorship {
+            details: details.clone(),
+            from_hook,
+        };
 
         // Persist the boundary first — the session is the durable record and
         // a failure here leaves the agent transcript untouched.
@@ -565,7 +642,7 @@ impl<S: SessionStorage> AgentHarness<S> {
                 first_kept_entry_id.clone(),
                 tokens_before,
                 usage.clone(),
-                kept.to_vec(),
+                retained_tail.clone(),
                 authorship,
             )
             .await
@@ -577,19 +654,25 @@ impl<S: SessionStorage> AgentHarness<S> {
             }
         };
 
-        // Rebuild the transcript: summary as context + kept messages. The
+        // Rebuild the transcript: summary as context + the retained tail. The
         // summary message carries the boundary instant, so a transcript
         // rebuilt from storage equals this one exactly.
-        let mut new_messages = Vec::with_capacity(kept.len() + 1);
+        let mut new_messages = Vec::with_capacity(retained_tail.len() + 1);
         new_messages.push(summary_message(&summary_text, boundary));
-        new_messages.extend_from_slice(kept);
+        new_messages.extend_from_slice(&retained_tail);
 
         self.agent.reset();
         self.agent.replace_transcript(new_messages);
-        // The summary is synthetic; kept messages retain their entry ids.
-        let mut new_ids: Vec<Option<String>> = Vec::with_capacity(kept.len() + 1);
+        // The summary is synthetic. A hook-supplied tail carries unknown entry
+        // ids (the hook's messages need not be the harness's persisted entries);
+        // the harness-computed tail retains the ids it walked from the session.
+        let mut new_ids: Vec<Option<String>> = Vec::with_capacity(retained_tail.len() + 1);
         new_ids.push(None);
-        new_ids.extend(self.message_entry_ids[cut_point..].iter().cloned());
+        if tail_from_hook {
+            new_ids.extend((0..retained_tail.len()).map(|_| None));
+        } else {
+            new_ids.extend(self.message_entry_ids[cut_point..].iter().cloned());
+        }
         self.message_entry_ids = new_ids;
 
         self.last_compaction_at = Some(boundary);
@@ -602,7 +685,7 @@ impl<S: SessionStorage> AgentHarness<S> {
             tokens_after,
             usage,
             details,
-            retained_tail: kept.to_vec(),
+            retained_tail,
         };
 
         // Run after-compact hooks.
@@ -621,14 +704,13 @@ impl<S: SessionStorage> AgentHarness<S> {
 
     /// Summarize the compacted prefix via the harness stream function.
     ///
-    /// Returns the summary text, the summarization usage, and the default
-    /// authorship (`from_hook: false`, no `details`). A terminal
+    /// Returns the summary text and the summarization usage. A terminal
     /// `Error`/`Aborted` stop reason or an empty summary bails before anything
     /// is persisted so the transcript and session stay intact.
     async fn summarize_via_model(
         &mut self,
         compacted: &[AgentMessage],
-    ) -> Result<(String, Option<Usage>, CompactionAuthorship), anyhow::Error> {
+    ) -> Result<(String, Option<Usage>), anyhow::Error> {
         let prompt = compaction::build_compaction_prompt(compacted, None);
         let summary_context = AgentContext {
             system_prompt:
@@ -694,7 +776,7 @@ impl<S: SessionStorage> AgentHarness<S> {
             };
             return Err(anyhow::anyhow!("summarization failed ({label}){detail}"));
         }
-        Ok((summary_text, usage, CompactionAuthorship::default()))
+        Ok((summary_text, usage))
     }
 
     /// Build a compaction prompt for the current conversation.
@@ -1108,7 +1190,7 @@ mod tests {
         // After compaction the retained usage measured a different prefix, so
         // the post-compaction count is the plain character heuristic and the
         // harness does not immediately ask for another compaction.
-        let result = harness.compact().await.unwrap();
+        let result = harness.compact(None).await.unwrap();
         assert!(
             result.tokens_after < 1_000,
             "tokens_after={}",
@@ -1154,7 +1236,7 @@ mod tests {
         assert!(harness.needs_compaction());
 
         let before = *harness.session().storage().append_calls.lock().unwrap();
-        harness.compact().await.unwrap();
+        harness.compact(None).await.unwrap();
         let after = *harness.session().storage().append_calls.lock().unwrap();
 
         // One append_entry for the compaction; no spurious leaf write.
@@ -1220,7 +1302,7 @@ mod tests {
             .len();
         let transcript_before = harness.agent_mut().state().messages.len();
 
-        let err = harness.compact().await.unwrap_err();
+        let err = harness.compact(None).await.unwrap_err();
         assert!(
             err.to_string().contains("summarization failed (aborted)"),
             "{}",
@@ -1288,7 +1370,7 @@ mod tests {
             Arc::new(|ctx: HookContext| ctx.with_cancel_compaction()),
         );
 
-        let err = harness.compact().await.unwrap_err();
+        let err = harness.compact(None).await.unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
 
         // No compaction entry was persisted.
@@ -1385,11 +1467,12 @@ mod tests {
                         total_tokens: 7,
                         ..Default::default()
                     }),
+                    ..Default::default()
                 })
             }),
         );
 
-        let result = harness.compact().await.expect("hook-supplied compact");
+        let result = harness.compact(None).await.expect("hook-supplied compact");
         assert_eq!(result.summary, "hook-authored summary");
         // The summarization model was never called.
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1440,9 +1523,9 @@ mod tests {
         assert_eq!(result.retained_tail.len(), compaction.4);
     }
 
-    /// The before-compact hook receives the compaction preparation and the
-    /// messages being compacted, so it can decide on the specific content
-    /// rather than blind. Mirrors the TS `preparation` + `branchEntries`.
+    /// The before-compact hook receives the TS-shaped `preparation` and the
+    /// session `branchEntries`, so it can decide on the specific content being
+    /// compacted rather than blind. Mirrors the TS `SessionBeforeCompactEvent`.
     #[tokio::test]
     async fn test_before_compact_hook_receives_preparation_and_branch_entries() {
         use std::sync::Mutex;
@@ -1455,40 +1538,18 @@ mod tests {
             test_model(),
             Arc::new(TestStreamFn),
         );
-        // A transcript large enough that `find_cut_point` compacts a non-empty
-        // prefix (its tail exceeds the keep-recent budget), so the hook sees
-        // real `branchEntries` rather than an empty array.
+        // Build a real session (two long prompts → two user/assistant pairs
+        // persisted as Message entries) so `branchEntries` is non-empty. The
+        // keep-recent budget sits between one and two turns, so the cut lands
+        // mid-transcript: a non-empty prefix is summarized and a non-empty tail
+        // with a real first-kept entry id is retained.
+        let long = "x".repeat(2048);
+        harness.prompt(&long).await.unwrap();
+        harness.prompt(&long).await.unwrap();
         harness.set_compaction_settings(CompactionSettings {
-            keep_recent_tokens: 1,
+            keep_recent_tokens: 600,
             ..Default::default()
         });
-        let long = "x".repeat(2048);
-        let assistant = AgentMessage::Assistant {
-            content: vec![ContentBlock::Text {
-                text: long.clone(),
-                signature: None,
-            }],
-            model: "test".into(),
-            provider: "test".into(),
-            api: "test".into(),
-            response_model: None,
-            response_id: None,
-            diagnostics: None,
-            stop_reason: Some(StopReason::Stop),
-            usage: Box::new(Usage {
-                total_tokens: 90_000,
-                ..Default::default()
-            }),
-            error_message: None,
-            timestamp: chrono::Utc::now(),
-        };
-        harness
-            .agent_mut()
-            .replace_transcript(vec![AgentMessage::user(&long), assistant]);
-        // `replace_transcript` bypasses session persistence, so align the
-        // harness's entry-id index with the synthetic transcript by hand — a
-        // non-empty cut point indexes into this vec when rewriting ids.
-        harness.message_entry_ids = vec![None, None];
 
         let captured = Arc::new(Mutex::new(serde_json::Value::Null));
         harness.on(HookPoint::SessionBeforeCompact, {
@@ -1499,12 +1560,31 @@ mod tests {
             })
         });
 
-        harness.compact().await.expect("compact");
+        harness.compact(None).await.expect("compact");
 
         let data = captured.lock().unwrap().clone();
+        assert_eq!(
+            data.get("type").and_then(|v| v.as_str()),
+            Some("session_before_compact"),
+            "the typed event carries the TS discriminator: {data}"
+        );
+        // `customInstructions` is omitted (None) when compact() takes none —
+        // the field is part of the contract but absent on the wire, matching
+        // TS optionality.
+        assert!(data.get("customInstructions").is_none());
+
         let preparation = data
             .get("preparation")
             .expect("hook data carries preparation");
+        // TS `CompactionPreparation` field names and shapes.
+        assert!(
+            preparation
+                .get("firstKeptEntryId")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "firstKeptEntryId is the real id of the first retained entry: {preparation}"
+        );
         assert!(
             preparation
                 .get("tokensBefore")
@@ -1513,14 +1593,59 @@ mod tests {
                 > 0,
             "preparation reports the pre-compaction token count: {preparation}"
         );
-        assert!(preparation.get("cutPoint").is_some());
+        assert!(
+            !preparation
+                .get("isSplitTurn")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            "the Rust port never splits a turn"
+        );
+        let messages_to_summarize = preparation
+            .get("messagesToSummarize")
+            .and_then(|v| v.as_array())
+            .expect("preparation carries messagesToSummarize");
+        assert!(
+            !messages_to_summarize.is_empty(),
+            "messagesToSummarize holds the compacted prefix"
+        );
+        let retained_tail = preparation
+            .get("retainedTail")
+            .and_then(|v| v.as_array())
+            .expect("preparation carries retainedTail");
+        assert!(
+            !retained_tail.is_empty(),
+            "retainedTail holds the kept suffix"
+        );
+        // The Rust port has no split-turn prefix.
+        assert!(
+            preparation
+                .get("turnPrefixMessages")
+                .and_then(|v| v.as_array())
+                .map(|a| a.is_empty())
+                .unwrap_or(false),
+            "turnPrefixMessages is always empty"
+        );
+        // No prior compaction on this branch.
+        assert!(
+            preparation.get("previousSummary").is_none(),
+            "previousSummary is absent when the branch never compacted"
+        );
+        assert!(
+            preparation.get("fileOps").is_some(),
+            "fileOps is always present"
+        );
+        assert!(
+            preparation.get("settings").is_some(),
+            "settings is always present"
+        );
+
         let branch_entries = data
             .get("branchEntries")
             .and_then(|v| v.as_array())
             .expect("hook data carries branchEntries");
         assert!(
             !branch_entries.is_empty(),
-            "branchEntries holds the messages being compacted"
+            "branchEntries holds the session entries of the branch"
         );
     }
 
@@ -1571,12 +1696,13 @@ mod tests {
                     summary: "   \n\t".into(),
                     details: None,
                     usage: None,
+                    ..Default::default()
                 })
             }),
         );
 
-        let err = harness.compact().await.unwrap_err();
-        assert!(err.to_string().contains("no summary"), "{err}");
+        let err = harness.compact(None).await.unwrap_err();
+        assert!(err.to_string().contains("empty summary"), "{err}");
 
         // No compaction entry was persisted and the transcript is intact.
         assert_eq!(
@@ -1625,7 +1751,10 @@ mod tests {
             .agent_mut()
             .replace_transcript(vec![AgentMessage::user("q"), assistant]);
 
-        let result = harness.compact().await.expect("compact must not deadlock");
+        let result = harness
+            .compact(None)
+            .await
+            .expect("compact must not deadlock");
         assert_eq!(result.summary, "summary");
     }
 
@@ -1674,7 +1803,7 @@ mod tests {
             harness
                 .agent_mut()
                 .replace_transcript(vec![AgentMessage::user("q"), stale_assistant.clone()]);
-            let result = harness.compact().await.unwrap();
+            let result = harness.compact(None).await.unwrap();
             assert_eq!(result.tokens_before, 90_000);
         }
 
@@ -1754,7 +1883,7 @@ mod tests {
                 Arc::new(TestStreamFn),
             );
             harness.prompt("first").await.unwrap();
-            harness.compact().await.unwrap();
+            harness.compact(None).await.unwrap();
             harness.prompt("second").await.unwrap();
             expected = serde_json::to_value(&harness.agent().state().messages).unwrap();
         }

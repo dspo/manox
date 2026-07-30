@@ -86,7 +86,7 @@ async fn main() {
     harness.prompt("hello").await.expect("prompt");
     harness.prompt("world").await.expect("prompt");
 
-    let result = harness.compact().await.expect("compact");
+    let result = harness.compact(None).await.expect("compact");
     println!(
         "compacted: tokens_before={} tokens_after={} first_kept_entry_id={:?}",
         result.tokens_before, result.tokens_after, result.first_kept_entry_id

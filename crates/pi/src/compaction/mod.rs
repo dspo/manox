@@ -6,13 +6,18 @@
 
 pub mod branch_summarization;
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::session::SessionTreeEntry;
 use crate::types::{AgentMessage, ContentBlock, StopReason, Usage};
 
-/// Compaction settings.
+/// Compaction settings. Serializes as camelCase to match the TS Pi
+/// `settings.json` on-disk shape (`reserveTokens`, `keepRecentTokens`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
     /// Whether compaction is enabled.
     pub enabled: bool,
@@ -49,6 +54,49 @@ pub struct CompactionResult {
     pub details: Option<JsonValue>,
     /// The messages kept intact across the compaction, stored verbatim.
     pub retained_tail: Vec<AgentMessage>,
+}
+
+/// File paths touched by the compacted region, grouped by operation kind.
+/// Mirrors the TS `FileOperations`; the sets serialize as JSON arrays.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileOperations {
+    /// Files inspected by `read` tool calls.
+    pub read: BTreeSet<String>,
+    /// Files produced by `write` tool calls.
+    pub written: BTreeSet<String>,
+    /// Files changed by `edit` tool calls.
+    pub edited: BTreeSet<String>,
+}
+
+/// The compaction preparation handed to the `session_before_compact` hook:
+/// the exact messages being summarized and kept, plus the surrounding context
+/// the summarization folds in (previous summary, file operations, settings).
+/// Mirrors the TS `CompactionPreparation`. The Rust port never splits a turn,
+/// so `turn_prefix_messages` is always empty and `is_split_turn` is false.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionPreparation {
+    /// The first entry kept intact; `None` when the whole transcript is
+    /// summarized (the wire field is then omitted, matching TS optionality).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub first_kept_entry_id: Option<String>,
+    /// The messages replaced by the summary.
+    pub messages_to_summarize: Vec<AgentMessage>,
+    /// Messages prefixing a split turn's retained suffix — always empty here.
+    pub turn_prefix_messages: Vec<AgentMessage>,
+    /// The messages kept intact after the boundary.
+    pub retained_tail: Vec<AgentMessage>,
+    /// Whether the cut splits an in-progress turn — always false here.
+    pub is_split_turn: bool,
+    /// Estimated context tokens before compaction.
+    pub tokens_before: u64,
+    /// The previous compaction's summary, when this branch already compacted.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub previous_summary: Option<String>,
+    /// File paths touched across the summarized messages.
+    pub file_ops: FileOperations,
+    /// The settings governing this compaction.
+    pub settings: CompactionSettings,
 }
 
 /// Total context tokens for one usage block: the provider-reported total
@@ -326,6 +374,111 @@ pub fn build_compaction_prompt(
         essential for continuing the work without losing context.\n\n\
         <conversation>\n{messages_text}\n</conversation>"
     )
+}
+
+/// Build the TS-shaped [`CompactionPreparation`] for the before-compact hook.
+///
+/// `branch` is the session path (last compaction … leaf) — the same entries TS
+/// exposes as `branchEntries`. `messages` is the flat transcript the harness
+/// compacts; `cut_point` splits it into `messages_to_summarize` / `retained_tail`.
+/// The previous compaction's summary (if the path starts at one) becomes
+/// `previous_summary`, and file operations are extracted from the summarized
+/// region plus any prior non-hook compaction's recorded file lists.
+pub fn build_preparation(
+    branch: &[SessionTreeEntry],
+    messages: &[AgentMessage],
+    cut_point: usize,
+    first_kept_entry_id: Option<String>,
+    tokens_before: u64,
+    settings: &CompactionSettings,
+) -> CompactionPreparation {
+    let messages_to_summarize = messages[..cut_point].to_vec();
+    let retained_tail = messages[cut_point..].to_vec();
+
+    // The path starts at the last compaction boundary when one exists; its
+    // summary is the `previousSummary` the summarization folds in.
+    let previous_summary = match branch.first() {
+        Some(SessionTreeEntry::Compaction { summary, .. }) => Some(summary.clone()),
+        _ => None,
+    };
+
+    let file_ops = extract_file_operations(&messages_to_summarize, branch);
+
+    CompactionPreparation {
+        first_kept_entry_id,
+        messages_to_summarize,
+        turn_prefix_messages: Vec::new(),
+        retained_tail,
+        is_split_turn: false,
+        tokens_before,
+        previous_summary,
+        file_ops,
+        settings: settings.clone(),
+    }
+}
+
+/// File paths touched by the compacted region, mirroring the TS
+/// `extractFileOperations`: assistant tool calls with a `path` argument are
+/// classified as read / written / edited, and a previous (non-hook) compaction
+/// carrying `{readFiles, modifiedFiles}` details seeds the accumulator so file
+/// operations survive across repeated compactions.
+fn extract_file_operations(
+    messages: &[AgentMessage],
+    branch: &[SessionTreeEntry],
+) -> FileOperations {
+    let mut ops = FileOperations::default();
+    if let Some(SessionTreeEntry::Compaction {
+        details: Some(d),
+        from_hook,
+        ..
+    }) = branch.first()
+    {
+        // A hook-authored boundary owns its own details shape; only the
+        // harness's `{readFiles, modifiedFiles}` payload carries forward here.
+        if *from_hook != Some(true) {
+            if let Some(arr) = d.get("readFiles").and_then(|v| v.as_array()) {
+                for f in arr.iter().filter_map(|v| v.as_str()) {
+                    ops.read.insert(f.to_string());
+                }
+            }
+            if let Some(arr) = d.get("modifiedFiles").and_then(|v| v.as_array()) {
+                for f in arr.iter().filter_map(|v| v.as_str()) {
+                    ops.edited.insert(f.to_string());
+                }
+            }
+        }
+    }
+    for msg in messages {
+        extract_file_ops_from_message(msg, &mut ops);
+    }
+    ops
+}
+
+/// Classify a message's assistant tool calls into the file-operation sets.
+/// Only `read`, `write`, and `edit` calls carrying a `path` argument count.
+fn extract_file_ops_from_message(message: &AgentMessage, ops: &mut FileOperations) {
+    let AgentMessage::Assistant { content, .. } = message else {
+        return;
+    };
+    for block in content {
+        if let ContentBlock::ToolUse { name, input, .. } = block {
+            let Some(path) = input.get("path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            match name.as_str() {
+                "read" => {
+                    ops.read.insert(path.to_string());
+                }
+                "write" => {
+                    ops.written.insert(path.to_string());
+                }
+                "edit" => {
+                    ops.edited.insert(path.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[cfg(test)]
