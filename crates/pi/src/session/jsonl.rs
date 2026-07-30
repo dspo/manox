@@ -876,4 +876,32 @@ mod tests {
             other => panic!("expected Leaf, got {other:?}"),
         }
     }
+
+    /// A `Label` entry with no label text must omit the field on disk (TS
+    /// types it `string | undefined`), not serialize it as `null`.
+    #[tokio::test]
+    async fn test_label_entry_omits_unset_label_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let entry = SessionTreeEntry::Label {
+            id: "lab1".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            target_id: "t".into(),
+            label: None,
+        };
+        storage.append_entry(&entry).await.unwrap();
+
+        let on_disk = tokio::fs::read_to_string(dir.path().join("session.jsonl"))
+            .await
+            .unwrap();
+        let label_line = on_disk
+            .lines()
+            .find(|l| l.contains("\"type\":\"label\""))
+            .unwrap();
+        assert!(
+            !label_line.contains("\"label\":"),
+            "unset label field leaked onto disk: {label_line}"
+        );
+    }
 }

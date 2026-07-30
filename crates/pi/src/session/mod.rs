@@ -120,6 +120,9 @@ pub enum SessionTreeEntry {
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         target_id: String,
+        // TS types `label` as `string | undefined` and omits it when unset;
+        // skip-on-None keeps Rust output byte-identical to a TS-written entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
     /// Free-form session metadata (agent identity, environment, config snapshot).
