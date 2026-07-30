@@ -22,7 +22,7 @@ async fn main() {
 
     let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta)
         .await
-        .expect("open");
+        .expect("create");
     let session = Session::new(storage);
 
     // Append a linear thread: user → assistant → user → assistant.
