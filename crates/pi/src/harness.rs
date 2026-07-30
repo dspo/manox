@@ -4,18 +4,21 @@
 // integration, and phase management. This is the primary public API
 // for consumers of the harness.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::Agent;
+use crate::agent::{
+    AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, LoopHooks,
+};
 use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionResult, CompactionSettings};
 use crate::env::{ExecutionEnv, TokioExecutionEnv};
 use crate::session::{Session, SessionStorage};
-use crate::tool::{LocalToolContext, ToolState};
+use crate::tool::{AgentToolResult, LocalToolContext, ToolState};
 use crate::types::{AgentContext, AgentMessage, CacheRetention, ContentBlock, Model, Usage};
+use serde_json::Value as JsonValue;
 
 /// The phases the harness can be in.
 ///
@@ -98,7 +101,11 @@ pub struct AgentHarness<S: SessionStorage> {
     /// estimates for the rewritten transcript. Recovered from the persisted
     /// session by [`AgentHarness::recover_boundary`].
     last_compaction_at: Option<chrono::DateTime<chrono::Utc>>,
-    hooks: Vec<(HookPoint, HookHandler)>,
+    /// Registered hook handlers, grouped by point. Shared via
+    /// `Arc<Mutex<..>>` so the closures cloned into the agent's loop config
+    /// read the live registration list — `on()` calls after construction
+    /// still fire.
+    hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>,
     /// The streaming function used for the summarization call in `compact()`.
     stream_fn: Arc<dyn StreamFn>,
     /// Entry ids aligned by index with the agent transcript. `None` marks a
@@ -125,12 +132,14 @@ impl<S: SessionStorage> AgentHarness<S> {
         let tool_state = Arc::new(ToolState::new());
         let tool_ctx: Arc<dyn crate::tool::ToolContext> =
             Arc::new(LocalToolContext::new(env, cwd, tool_state));
-        let agent = Agent::new(
+        let hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(
             system_prompt,
             model.clone(),
             Arc::clone(&stream_fn),
             tool_ctx,
         );
+        agent.set_loop_hooks(build_loop_hooks(Arc::clone(&hooks)));
         AgentHarness {
             agent,
             session,
@@ -138,7 +147,7 @@ impl<S: SessionStorage> AgentHarness<S> {
             phase: AgentHarnessPhase::Idle,
             compaction_settings: CompactionSettings::default(),
             last_compaction_at: None,
-            hooks: Vec::new(),
+            hooks,
             stream_fn,
             message_entry_ids: Vec::new(),
         }
@@ -187,12 +196,13 @@ impl<S: SessionStorage> AgentHarness<S> {
 
     /// Register a hook handler.
     pub fn on(&mut self, hook: HookPoint, handler: HookHandler) {
-        self.hooks.push((hook, handler));
+        self.hooks.lock().unwrap().push((hook, handler));
     }
 
     /// Run all registered hooks for a given point.
     fn run_hooks(&self, hook: HookPoint, mut ctx: HookContext) -> HookContext {
-        for (point, handler) in &self.hooks {
+        let hooks = self.hooks.lock().unwrap();
+        for (point, handler) in hooks.iter() {
             if *point == hook {
                 ctx = handler(ctx);
             }
@@ -556,6 +566,60 @@ impl<S: SessionStorage> AgentHarness<S> {
         let compacted = &messages[..cut_point];
         let prompt = compaction::build_compaction_prompt(compacted, None);
         Some((prompt, cut_point))
+    }
+}
+
+/// Build the loop-config observation closures that route the harness's
+/// registered hooks into the agent loop. Each closure clones the shared hook
+/// list so it sees handlers registered via `on()` after the harness is built.
+fn build_loop_hooks(hooks: Arc<Mutex<Vec<(HookPoint, HookHandler)>>>) -> LoopHooks {
+    let provider = Arc::clone(&hooks);
+    let before_provider_request: BeforeProviderRequestHook = Arc::new(move |ctx: &AgentContext| {
+        let mut hc = HookContext::new(HookPoint::BeforeProviderRequest).with_context(ctx.clone());
+        let list = provider.lock().unwrap();
+        for (point, handler) in list.iter() {
+            if *point == HookPoint::BeforeProviderRequest {
+                hc = handler(hc);
+            }
+        }
+    });
+
+    let tool = Arc::clone(&hooks);
+    let before_tool_call: BeforeToolCallHook =
+        Arc::new(move |id: &str, name: &str, args: &JsonValue| {
+            let mut hc = HookContext::new(HookPoint::ToolCall).with_data(serde_json::json!({
+                "tool_call_id": id,
+                "tool_name": name,
+                "args": args.clone(),
+            }));
+            let list = tool.lock().unwrap();
+            for (point, handler) in list.iter() {
+                if *point == HookPoint::ToolCall {
+                    hc = handler(hc);
+                }
+            }
+            // Hooks observe tool calls; blocking is a separate concern.
+            None
+        });
+
+    let result = Arc::clone(&hooks);
+    let after_tool_call: AfterToolCallHook = Arc::new(move |r: &AgentToolResult| {
+        let mut hc = HookContext::new(HookPoint::ToolResult).with_data(serde_json::json!({
+            "is_error": r.is_error,
+        }));
+        let list = result.lock().unwrap();
+        for (point, handler) in list.iter() {
+            if *point == HookPoint::ToolResult {
+                hc = handler(hc);
+            }
+        }
+        r.clone()
+    });
+
+    LoopHooks {
+        before_provider_request: Some(before_provider_request),
+        before_tool_call: Some(before_tool_call),
+        after_tool_call: Some(after_tool_call),
     }
 }
 
@@ -1150,5 +1214,168 @@ mod tests {
 
         let _ = harness.prompt("Hello").await;
         assert!(called.load(Ordering::SeqCst));
+    }
+
+    // A tool that echoes its `message` arg, used to exercise the tool hook
+    // path end-to-end through the harness's real ToolContext.
+    struct EchoTool;
+
+    #[async_trait::async_trait]
+    impl crate::tool::AgentTool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "Echoes the input"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {"message": {"type": "string"}}})
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            params: serde_json::Value,
+            _signal: CancellationToken,
+            _ctx: &dyn crate::tool::ToolContext,
+        ) -> Result<crate::tool::AgentToolResult, crate::tool::ToolError> {
+            let msg = params["message"].as_str().unwrap_or("no message");
+            Ok(crate::tool::AgentToolResult::text(msg))
+        }
+    }
+
+    // A stream fn that issues one tool call then stops, so a single prompt
+    // drives a full tool-execution round through the harness.
+    struct ToolUseStreamFn {
+        call: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamFn for ToolUseStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let n = self.call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(AgentMessage::Assistant {
+                    content: vec![crate::types::ContentBlock::ToolUse {
+                        id: "t1".into(),
+                        name: "echo".into(),
+                        input: serde_json::json!({"message": "hi"}),
+                    }],
+                    model: "test".into(),
+                    provider: "test".into(),
+                    api: "test".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    stop_reason: Some(StopReason::ToolUse),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            } else {
+                Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                        signature: None,
+                    }],
+                    model: "test".into(),
+                    provider: "test".into(),
+                    api: "test".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    stop_reason: Some(StopReason::Stop),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn before_provider_request_hook_fires_on_prompt() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&count);
+        harness.on(
+            HookPoint::BeforeProviderRequest,
+            Arc::new(move |ctx| {
+                count_clone.fetch_add(1, Ordering::SeqCst);
+                assert!(ctx.agent_context.is_some());
+                ctx
+            }),
+        );
+
+        let _ = harness.prompt("Hello").await.unwrap();
+        assert!(
+            count.load(Ordering::SeqCst) >= 1,
+            "BeforeProviderRequest must fire when the provider is called"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_and_tool_result_hooks_fire_during_execution() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(ToolUseStreamFn {
+                call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        )
+        .with_tools(Arc::from(vec![
+            Box::new(EchoTool) as Box<dyn crate::tool::AgentTool>
+        ]));
+
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tool_call = Arc::new(AtomicUsize::new(0));
+        let tool_result = Arc::new(AtomicUsize::new(0));
+        let tc = Arc::clone(&tool_call);
+        let tr = Arc::clone(&tool_result);
+        harness.on(
+            HookPoint::ToolCall,
+            Arc::new(move |ctx| {
+                if ctx.data.get("tool_name").and_then(|v| v.as_str()) == Some("echo") {
+                    tc.fetch_add(1, Ordering::SeqCst);
+                }
+                ctx
+            }),
+        );
+        harness.on(
+            HookPoint::ToolResult,
+            Arc::new(move |ctx| {
+                tr.fetch_add(1, Ordering::SeqCst);
+                let _ = ctx;
+                ctx
+            }),
+        );
+
+        let _ = harness.prompt("run the echo tool").await.unwrap();
+        assert_eq!(
+            tool_call.load(Ordering::SeqCst),
+            1,
+            "ToolCall hook must fire once for the echo call"
+        );
+        assert_eq!(
+            tool_result.load(Ordering::SeqCst),
+            1,
+            "ToolResult hook must fire once for the echo result"
+        );
     }
 }

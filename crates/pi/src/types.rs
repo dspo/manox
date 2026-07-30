@@ -413,6 +413,8 @@ pub type StopAfterTurnFn = Box<dyn Fn(&AgentMessage, &[AgentMessage]) -> bool + 
 pub type BeforeToolCallFn = Box<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
 /// Patches a tool result after execution.
 pub type AfterToolCallFn = Box<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
+/// Observes the context right before it is sent to the provider.
+pub type BeforeProviderRequestFn = Box<dyn Fn(&AgentContext) + Send + Sync>;
 
 /// Configuration for a single agent loop invocation.
 #[derive(Default)]
@@ -429,6 +431,8 @@ pub struct AgentLoopConfig {
     pub before_tool_call: Option<BeforeToolCallFn>,
     /// Called after a tool call executes to patch the result.
     pub after_tool_call: Option<AfterToolCallFn>,
+    /// Called right before the context is handed to the provider, each turn.
+    pub before_provider_request: Option<BeforeProviderRequestFn>,
     /// Whether tools execute sequentially (default: parallel).
     pub sequential_tool_execution: bool,
     /// Maximum number of turns before forcing a stop.

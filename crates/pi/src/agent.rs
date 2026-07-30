@@ -8,11 +8,12 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{EventSink, StreamFn, run_loop, run_loop_continue};
-use crate::tool::ToolContext;
+use crate::tool::{AgentToolResult, ToolContext};
 use crate::types::{
-    AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState, CacheRetention,
-    ContentBlock, Model,
+    AfterToolCallFn, AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState,
+    BeforeProviderRequestFn, BeforeToolCallFn, CacheRetention, ContentBlock, Model,
 };
+use serde_json::Value as JsonValue;
 
 /// Controls how queued messages are drained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +91,22 @@ impl EventSink for SubscriberSink {
     }
 }
 
+/// Per-run observation hooks cloned into each turn's `AgentLoopConfig`.
+///
+/// Held as `Arc<dyn Fn>` so `create_loop_config` can produce a fresh `Box`
+/// closure per run without owning the (un-`Clone`) originals. The harness
+/// fills these from its registered `HookPoint`s.
+pub type BeforeProviderRequestHook = Arc<dyn Fn(&AgentContext) + Send + Sync>;
+pub type BeforeToolCallHook = Arc<dyn Fn(&str, &str, &JsonValue) -> Option<String> + Send + Sync>;
+pub type AfterToolCallHook = Arc<dyn Fn(&AgentToolResult) -> AgentToolResult + Send + Sync>;
+
+#[derive(Default)]
+pub struct LoopHooks {
+    pub before_provider_request: Option<BeforeProviderRequestHook>,
+    pub before_tool_call: Option<BeforeToolCallHook>,
+    pub after_tool_call: Option<AfterToolCallHook>,
+}
+
 /// The Agent wraps the raw agent loop with state management, event
 /// subscription, and message queuing (steering / follow-up).
 pub struct Agent {
@@ -117,6 +134,9 @@ pub struct Agent {
     session_id: Option<String>,
     /// Prompt cache retention preference forwarded to providers.
     cache_retention: CacheRetention,
+    /// Observation hooks forwarded into each turn's loop config. The harness
+    /// fills these so its registered `HookPoint`s fire inside the loop.
+    loop_hooks: LoopHooks,
 }
 
 impl Agent {
@@ -141,6 +161,7 @@ impl Agent {
             tool_ctx,
             session_id: None,
             cache_retention: CacheRetention::default(),
+            loop_hooks: LoopHooks::default(),
         }
     }
 
@@ -165,6 +186,11 @@ impl Agent {
     /// Set the prompt cache retention preference forwarded to providers.
     pub fn set_cache_retention(&mut self, retention: CacheRetention) {
         self.cache_retention = retention;
+    }
+
+    /// Set the per-run observation hooks forwarded into the loop config.
+    pub fn set_loop_hooks(&mut self, hooks: LoopHooks) {
+        self.loop_hooks = hooks;
     }
 
     /// Current agent state.
@@ -294,13 +320,27 @@ impl Agent {
     fn create_loop_config(&self) -> AgentLoopConfig {
         let steering = Arc::clone(&self.steering_queue);
         let follow_up = Arc::clone(&self.follow_up_queue);
+        let before_provider = self.loop_hooks.before_provider_request.as_ref().map(|h| {
+            let h = Arc::clone(h);
+            Box::new(move |ctx: &AgentContext| h(ctx)) as BeforeProviderRequestFn
+        });
+        let before_tool = self.loop_hooks.before_tool_call.as_ref().map(|h| {
+            let h = Arc::clone(h);
+            Box::new(move |id: &str, name: &str, args: &JsonValue| h(id, name, args))
+                as BeforeToolCallFn
+        });
+        let after_tool = self.loop_hooks.after_tool_call.as_ref().map(|h| {
+            let h = Arc::clone(h);
+            Box::new(move |r: &AgentToolResult| h(r)) as AfterToolCallFn
+        });
         AgentLoopConfig {
             get_steering_messages: Some(Box::new(move || steering.lock().unwrap().drain())),
             get_follow_up_messages: Some(Box::new(move || follow_up.lock().unwrap().drain())),
             prepare_next_turn: None,
             should_stop_after_turn: None,
-            before_tool_call: None,
-            after_tool_call: None,
+            before_tool_call: before_tool,
+            after_tool_call: after_tool,
+            before_provider_request: before_provider,
             sequential_tool_execution: false,
             max_turns: None,
         }

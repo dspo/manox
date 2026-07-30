@@ -185,7 +185,8 @@ async fn run_loop_inner(
 
             // Stream assistant response.
             let message =
-                stream_assistant_response(context, signal, Arc::clone(&stream_fn), sink).await?;
+                stream_assistant_response(context, signal, Arc::clone(&stream_fn), config, sink)
+                    .await?;
 
             new_messages.push(message.clone());
             context.messages.push(message.clone());
@@ -342,8 +343,15 @@ async fn stream_assistant_response(
     context: &AgentContext,
     signal: &CancellationToken,
     stream_fn: Arc<dyn StreamFn>,
+    config: &AgentLoopConfig,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<AgentMessage, anyhow::Error> {
+    // Fire the provider-request observer before the stream starts, so a
+    // registered hook sees the exact context about to be sent.
+    if let Some(before) = &config.before_provider_request {
+        before(context);
+    }
+
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
 
     // Clone what the spawned task needs.
