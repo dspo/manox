@@ -532,6 +532,15 @@ impl<S: SessionStorage> AgentHarness<S> {
             None => self.summarize_via_model(compacted).await?,
         };
 
+        // An empty summary must never persist: it would replace the compacted
+        // prefix with nothing and lose history. The model path bails inside
+        // `summarize_via_model`; this guard closes the same hole for a hook
+        // override that supplies no text.
+        if summary_text.trim().is_empty() {
+            self.phase = AgentHarnessPhase::Idle;
+            anyhow::bail!("summarization failed (no summary)");
+        }
+
         // Persist the boundary first — the session is the durable record and
         // a failure here leaves the agent transcript untouched.
         let boundary = match self
@@ -1393,6 +1402,74 @@ mod tests {
             Some(serde_json::json!({"files": ["a.rs", "b.rs"]}))
         );
         assert_eq!(compaction.3.map(|u| u.total_tokens), Some(7));
+    }
+
+    /// A hook override with an empty summary must not persist a compaction:
+    /// the compacted prefix would be replaced with nothing and lost. Same
+    /// invariant the model path enforces for empty model summaries.
+    #[tokio::test]
+    async fn test_before_compact_hook_empty_summary_rejected() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        let assistant = AgentMessage::Assistant {
+            content: vec![],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+        let entries_before = harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap()
+            .len();
+
+        harness.on(
+            HookPoint::SessionBeforeCompact,
+            Arc::new(|ctx: HookContext| {
+                ctx.with_compact_override(BeforeCompactOverride {
+                    summary: "   \n\t".into(),
+                    details: None,
+                    usage: None,
+                })
+            }),
+        );
+
+        let err = harness.compact().await.unwrap_err();
+        assert!(err.to_string().contains("no summary"), "{err}");
+
+        // No compaction entry was persisted and the transcript is intact.
+        assert_eq!(
+            harness
+                .session()
+                .storage()
+                .get_entries()
+                .await
+                .unwrap()
+                .len(),
+            entries_before
+        );
+        assert_eq!(harness.agent_mut().state().messages.len(), 2);
     }
 
     #[tokio::test]
