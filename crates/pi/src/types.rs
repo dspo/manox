@@ -300,7 +300,7 @@ pub enum AgentEvent {
 /// Sink for agent lifecycle events emitted during the loop and the tool
 /// execution pipeline. Implementations forward events to subscribers or
 /// capture them in tests.
-pub trait EventSink: Send {
+pub trait EventSink: Send + Sync {
     fn emit(&self, event: AgentEvent);
 }
 

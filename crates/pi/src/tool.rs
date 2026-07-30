@@ -54,6 +54,15 @@ pub enum ExecutionMode {
     Sequential,
 }
 
+/// Mid-execution progress channel for a tool. The loop supplies an
+/// implementation that forwards each emit as a `ToolExecutionUpdate` event;
+/// tools that produce incremental output (a streaming shell, a long copy)
+/// report it through here. Tools with nothing to report simply never call it.
+pub trait ToolProgress: Send + Sync {
+    /// Report an incremental update for the running tool call.
+    fn emit(&self, details: JsonValue);
+}
+
 /// The result of a tool execution.
 ///
 /// The `content` is what gets sent back to the LLM. The `details` are
@@ -198,6 +207,22 @@ pub trait AgentTool: Send + Sync {
         signal: CancellationToken,
         ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError>;
+
+    /// Execute with a progress reporter. Tools that emit incremental output
+    /// override this and call `progress.emit(...)`; the default delegates to
+    /// [`execute`](Self::execute) so tools with nothing to report are
+    /// unchanged.
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: JsonValue,
+        signal: CancellationToken,
+        ctx: &dyn ToolContext,
+        progress: &dyn ToolProgress,
+    ) -> Result<AgentToolResult, ToolError> {
+        let _ = progress;
+        self.execute(tool_call_id, params, signal, ctx).await
+    }
 }
 
 // ── Tool error ──────────────────────────────────────────────────────────────
@@ -244,9 +269,18 @@ pub async fn execute_tool_calls(
     signal: CancellationToken,
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
-    sink: &dyn EventSink,
+    sink: &(dyn EventSink + Send + Sync),
     sequential: bool,
 ) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
+    // A tool that declares itself Sequential forces the whole batch to run
+    // one call at a time, so its per-call ordering holds.
+    let any_tool_sequential = tool_calls.iter().any(|(_, name, _)| {
+        tools
+            .iter()
+            .find(|t| t.name() == *name)
+            .is_some_and(|t| t.execution_mode() == ExecutionMode::Sequential)
+    });
+    let sequential = sequential || any_tool_sequential;
     if sequential {
         execute_sequential(tool_calls, tools, signal, ctx, config, sink).await
     } else {
@@ -260,7 +294,7 @@ async fn execute_sequential(
     signal: CancellationToken,
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
-    sink: &dyn EventSink,
+    sink: &(dyn EventSink + Send + Sync),
 ) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
     let mut executed = Vec::with_capacity(tool_calls.len());
     let mut messages = Vec::with_capacity(tool_calls.len());
@@ -280,7 +314,7 @@ async fn execute_parallel(
     signal: CancellationToken,
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
-    sink: &dyn EventSink,
+    sink: &(dyn EventSink + Send + Sync),
 ) -> (Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>) {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -302,13 +336,29 @@ async fn execute_parallel(
     (executed, messages)
 }
 
+/// Forwards a tool's mid-execution emits to the loop's sink as
+/// `ToolExecutionUpdate` events, tagged with the call's id.
+struct SinkProgress<'a> {
+    tool_call_id: String,
+    sink: &'a (dyn EventSink + Send + Sync),
+}
+
+impl<'a> ToolProgress for SinkProgress<'a> {
+    fn emit(&self, details: JsonValue) {
+        self.sink.emit(AgentEvent::ToolExecutionUpdate {
+            tool_call_id: self.tool_call_id.clone(),
+            details,
+        });
+    }
+}
+
 async fn execute_one(
     call: (&str, &str, &JsonValue),
     tools: &[Box<dyn AgentTool>],
     signal: CancellationToken,
     ctx: &dyn ToolContext,
     config: &AgentLoopConfig,
-    sink: &dyn EventSink,
+    sink: &(dyn EventSink + Send + Sync),
 ) -> ExecutedToolCall {
     let (tool_call_id, tool_name, args) = call;
     let id = tool_call_id.to_string();
@@ -392,7 +442,14 @@ async fn execute_one(
         };
     }
 
-    let mut result = match tool.execute(tool_call_id, args.clone(), signal, ctx).await {
+    let progress = SinkProgress {
+        tool_call_id: id.clone(),
+        sink,
+    };
+    let mut result = match tool
+        .execute_with_progress(tool_call_id, args.clone(), signal, ctx, &progress)
+        .await
+    {
         Ok(r) => r,
         Err(e) => AgentToolResult::error(format!("{e}")),
     };
@@ -619,5 +676,90 @@ mod tests {
         .await;
 
         assert!(executed[0].result.is_error);
+    }
+
+    // A sink that records every emitted event for lifecycle assertions.
+    struct RecordingSink(std::sync::Mutex<Vec<AgentEvent>>);
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: AgentEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// A tool that reports mid-execution progress before completing.
+    struct ProgressTool;
+
+    #[async_trait::async_trait]
+    impl AgentTool for ProgressTool {
+        fn name(&self) -> &str {
+            "progress"
+        }
+        fn description(&self) -> &str {
+            "Emits progress then returns text"
+        }
+        fn parameters_schema(&self) -> JsonValue {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _: &str,
+            _: JsonValue,
+            _: CancellationToken,
+            _: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            unreachable!("execute_with_progress must be used when present")
+        }
+        async fn execute_with_progress(
+            &self,
+            _: &str,
+            _: JsonValue,
+            _: CancellationToken,
+            _: &dyn ToolContext,
+            progress: &dyn ToolProgress,
+        ) -> Result<AgentToolResult, ToolError> {
+            progress.emit(serde_json::json!({"step": "halfway"}));
+            Ok(AgentToolResult::text("done"))
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_emit_surfaces_as_tool_execution_update() {
+        let tools: Vec<Box<dyn AgentTool>> = vec![Box::new(ProgressTool)];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+        let signal = CancellationToken::new();
+
+        let (executed, _messages) = execute_tool_calls(
+            &[("call_1", "progress", serde_json::json!({}))],
+            &tools,
+            signal,
+            &ctx,
+            &AgentLoopConfig::default(),
+            &sink,
+            false,
+        )
+        .await;
+
+        let events = sink.0.lock().unwrap();
+        let start = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "call_1"));
+        let update = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionUpdate { tool_call_id, details } if tool_call_id == "call_1" && details["step"] == "halfway"));
+        let end = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::ToolExecutionEnd { tool_call_id } if tool_call_id == "call_1"));
+        // Start, update, end all present and in lifecycle order.
+        let (start, update, end) = (
+            start.expect("start"),
+            update.expect("update"),
+            end.expect("end"),
+        );
+        assert!(start < update, "update must follow start");
+        assert!(update < end, "end must follow update");
+        assert!(!executed[0].result.is_error);
     }
 }

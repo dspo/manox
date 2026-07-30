@@ -255,8 +255,16 @@ async fn run_loop_inner(
                 has_more_tool_calls = !all_terminate;
 
                 for result in &tool_results {
+                    // A tool result is a settled message in its own turn; give
+                    // it a matched MessageStart/MessageEnd pair like TS Pi.
+                    sink.emit(AgentEvent::MessageStart {
+                        message: Box::new(result.clone()),
+                    });
                     context.messages.push(result.clone());
                     new_messages.push(result.clone());
+                    sink.emit(AgentEvent::MessageEnd {
+                        message: Box::new(result.clone()),
+                    });
                 }
             }
 
