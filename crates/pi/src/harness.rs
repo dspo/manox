@@ -88,6 +88,11 @@ pub struct AgentHarness<S: SessionStorage> {
     model: Model,
     phase: AgentHarnessPhase,
     compaction_settings: CompactionSettings,
+    /// Timestamp of the latest compaction. Usage recorded at or before it
+    /// measured a different message prefix, so it never anchors token
+    /// estimates for the rewritten transcript. In-memory only: a session
+    /// restored from storage starts without a boundary.
+    last_compaction_at: Option<chrono::DateTime<chrono::Utc>>,
     hooks: Vec<(HookPoint, HookHandler)>,
 }
 
@@ -106,6 +111,7 @@ impl<S: SessionStorage> AgentHarness<S> {
             model,
             phase: AgentHarnessPhase::Idle,
             compaction_settings: CompactionSettings::default(),
+            last_compaction_at: None,
             hooks: Vec::new(),
         }
     }
@@ -265,8 +271,23 @@ impl<S: SessionStorage> AgentHarness<S> {
     }
 
     /// Estimate the current token usage of the conversation.
+    ///
+    /// An assistant usage block only anchors the estimate when it was
+    /// recorded after the latest compaction; anything older measured the
+    /// pre-compaction prefix and the whole transcript falls back to the
+    /// character heuristic.
     fn estimate_current_tokens(&self) -> u64 {
-        compaction::estimate_context_tokens(&self.agent.state().messages).tokens
+        let messages = &self.agent.state().messages;
+        let estimate = compaction::estimate_context_tokens(messages);
+        let stale_anchor = match (estimate.last_usage_index, self.last_compaction_at) {
+            (Some(i), Some(at)) => messages[i].timestamp() <= at,
+            _ => false,
+        };
+        if stale_anchor {
+            messages.iter().map(compaction::estimate_tokens).sum()
+        } else {
+            estimate.tokens
+        }
     }
 
     /// Run compaction on the current conversation.
@@ -317,11 +338,12 @@ impl<S: SessionStorage> AgentHarness<S> {
         });
         new_messages.extend_from_slice(kept);
 
-        let tokens_after = compaction::estimate_context_tokens(&new_messages).tokens;
-
-        // Replace the agent's transcript.
+        // Replace the agent's transcript. The boundary is stamped before the
+        // post-compaction count so the stale retained usage cannot anchor it.
         self.agent.reset();
         self.agent.replace_transcript(new_messages);
+        self.last_compaction_at = Some(chrono::Utc::now());
+        let tokens_after = self.estimate_current_tokens();
 
         let result = CompactionResult {
             summary: summary.to_string(),
@@ -523,6 +545,46 @@ mod tests {
         );
 
         // With empty messages, should not need compaction.
+        assert!(!harness.needs_compaction());
+    }
+
+    #[tokio::test]
+    async fn test_compact_drops_stale_usage_anchor() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        // An assistant whose usage exceeds the threshold anchors the estimate.
+        let assistant = AgentMessage::Assistant {
+            content: vec![],
+            model: "test".into(),
+            provider: "test".into(),
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            },
+            timestamp: chrono::Utc::now(),
+        };
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+        assert!(harness.needs_compaction());
+
+        // After compaction the retained usage measured a different prefix, so
+        // the post-compaction count is the plain character heuristic and the
+        // harness does not immediately ask for another compaction.
+        let result = harness.compact("summary").await.unwrap();
+        assert!(
+            result.tokens_after < 1_000,
+            "tokens_after={}",
+            result.tokens_after
+        );
         assert!(!harness.needs_compaction());
     }
 

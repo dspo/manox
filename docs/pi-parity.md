@@ -44,7 +44,7 @@
 
 | 能力 | manox 位置（规模） | pi 状态 | 说明 |
 |---|---|---|---|
-| 自动压缩 | compact.rs + thread.rs | 🟡 | 子件 a（token 计量）已落地（2026-07-30，见下行）；子件 b+c（摘要载体+核心压缩）、d（触发路由）待做，对齐 TS Pi compaction.ts |
+| 自动压缩 | compact.rs + thread.rs | 🟡 | 子件 a（token 计量）已落地（2026-07-30，见下行）；harness 已先行落地 TS Pi 触发层的压缩边界 timestamp guard（压缩前的 usage 不作锚点，回退纯启发式）；子件 b+c（摘要载体+核心压缩）、d（触发路由）待做，对齐 TS Pi compaction.ts |
 | 溢出 compact-retry | thread.rs | 🔲 | 单次兜底：overflow 分类 → 压缩 → 重试一次（子件 d） |
 | Token 计量 | token_meter.rs | ✅ | 子件 a（2026-07-30）：`Usage.total_tokens` + `Model.max_tokens` 补齐（三 shape 落值：Anthropic/Completions 线边界折叠求和、Responses 取 wire 原值）；`calculate_context_tokens`（total>0 优先否则四类求和）、`estimate_context_tokens`（usage 锚定 + 尾部字符启发）、`estimate_tokens`（按消息形状：user/toolResult/custom=text+image(4800)，assistant=text+thinking+toolCall(name+JSON)，UTF-16 码元 ceil/4）、`should_compact`（i64 阈值减法）逐项对齐 TS Pi compaction.ts |
 | 前缀稳定性检测 | prefix_stability.rs | 🔲 | 请求指纹对比，检测 KV cache 破坏源（产品化观测，可后期） |
