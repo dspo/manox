@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SessionTreeEntry {
-    #[serde(rename = "message")]
+    #[serde(rename = "message", rename_all = "camelCase")]
     Message {
         id: String,
         parent_id: Option<String>,

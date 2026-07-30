@@ -508,6 +508,52 @@ mod tests {
         assert_eq!(ts, None);
     }
 
+    /// A Message entry persisted by manox must write camelCase `parentId` so
+    /// the file is a valid TS Pi v3 session (and other tools reading it do not
+    /// silently lose ancestry). Guards against dropping `rename_all` on the
+    /// variant.
+    #[tokio::test]
+    async fn test_message_entry_writes_camel_case_parent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+
+        let root = SessionTreeEntry::Message {
+            id: "root".into(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            message: AgentMessage::user("root"),
+        };
+        let child = SessionTreeEntry::Message {
+            id: "child".into(),
+            parent_id: Some("root".into()),
+            timestamp: chrono::Utc::now(),
+            message: AgentMessage::user("child"),
+        };
+        storage.append_entry(&root).await.unwrap();
+        storage.append_entry(&child).await.unwrap();
+
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        let child_line = on_disk
+            .lines()
+            .find(|l| l.contains("\"id\":\"child\""))
+            .unwrap();
+        assert!(
+            child_line.contains("\"parentId\":\"root\""),
+            "expected camelCase parentId on disk, got: {child_line}"
+        );
+        assert!(
+            !child_line.contains("parent_id"),
+            "snake_case parent_id leaked onto disk: {child_line}"
+        );
+
+        // Ancestry survives the disk round-trip.
+        let reopened = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let path = reopened.get_path_to_root_or_compaction(None).await.unwrap();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[1].parent_id(), Some("root"));
+    }
+
     /// A real TS Pi v3 session file uses camelCase entry fields, stores a
     /// message's own timestamp as epoch milliseconds, and writes no `leaf`
     /// entries. Such a file must load with the leaf cursor at the last entry.
@@ -560,15 +606,37 @@ mod tests {
         // The message entry's inner message carried an epoch-millis timestamp
         // and a text content block.
         match &entries[2] {
-            SessionTreeEntry::Message { message, .. } => match message {
-                AgentMessage::User { content, .. } => {
-                    assert!(matches!(
-                    &content[0], crate::types::ContentBlock::Text { text, .. } if text == "hello"
-                                ));
+            SessionTreeEntry::Message {
+                id,
+                parent_id,
+                message,
+                ..
+            } => {
+                assert_eq!(id, "m1");
+                // camelCase `parentId` must deserialize into `parent_id` — a
+                // missing `rename_all` on the variant silently drops ancestry.
+                assert_eq!(parent_id.as_deref(), Some("t1"));
+                match message {
+                    AgentMessage::User { content, .. } => {
+                        assert!(matches!(
+                        &content[0], crate::types::ContentBlock::Text { text, .. } if text == "hello"
+                                    ));
+                    }
+                    other => panic!("expected User message, got {other:?}"),
                 }
-                other => panic!("expected User message, got {other:?}"),
-            },
+            }
             other => panic!("expected Message entry, got {other:?}"),
         }
+
+        // The full ancestry chain must survive a load: walking from the leaf
+        // reaches the model_change and thinking_level_change entries via
+        // camelCase `parentId`.
+        let path = storage.get_path_to_root_or_compaction(None).await.unwrap();
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[2].id(), "m1");
+        assert_eq!(path[2].parent_id(), Some("t1"));
+        assert_eq!(path[1].id(), "t1");
+        assert_eq!(path[0].id(), "c1");
+        assert!(path[0].parent_id().is_none());
     }
 }
