@@ -68,7 +68,7 @@ pub fn last_assistant_usage(messages: &[AgentMessage]) -> Option<&Usage> {
             stop_reason: Some(_),
             usage,
             ..
-        } if calculate_context_tokens(usage) > 0 => Some(usage),
+        } if calculate_context_tokens(usage) > 0 => Some(&**usage),
         _ => None,
     })
 }
@@ -101,7 +101,7 @@ pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextUsageEstimat
                 stop_reason: Some(_),
                 usage,
                 ..
-            } if calculate_context_tokens(usage) > 0 => Some((i, usage)),
+            } if calculate_context_tokens(usage) > 0 => Some((i, &**usage)),
             _ => None,
         });
 
@@ -336,8 +336,13 @@ mod tests {
             }],
             model: "test".into(),
             provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::Stop),
             usage: Default::default(),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -347,8 +352,13 @@ mod tests {
             content: vec![],
             model: "test".into(),
             provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::Stop),
-            usage,
+            usage: Box::new(usage),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -467,8 +477,13 @@ mod tests {
             ],
             model: "test".into(),
             provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::Stop),
             usage: Default::default(),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
         // (4 + 4 + 4 + 12) / 4 = 6

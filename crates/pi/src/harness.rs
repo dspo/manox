@@ -495,8 +495,13 @@ mod tests {
                 }],
                 model: "test".into(),
                 provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
                 stop_reason: Some(StopReason::Stop),
-                usage: Usage::default(),
+                usage: Box::new(Usage::default()),
+                error_message: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -660,11 +665,16 @@ mod tests {
             content: vec![],
             model: "test".into(),
             provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::Stop),
-            usage: Usage {
+            usage: Box::new(Usage {
                 total_tokens: 90_000,
                 ..Default::default()
-            },
+            }),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
         harness
@@ -699,11 +709,16 @@ mod tests {
             content: vec![],
             model: "test".into(),
             provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::Stop),
-            usage: Usage {
+            usage: Box::new(Usage {
                 total_tokens: 90_000,
                 ..Default::default()
-            },
+            }),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
 

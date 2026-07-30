@@ -378,8 +378,13 @@ mod tests {
                 }],
                 model: "test".into(),
                 provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
                 stop_reason: Some(StopReason::Stop),
-                usage: Usage::default(),
+                usage: Box::new(Usage::default()),
+                error_message: None,
                 timestamp: chrono::Utc::now(),
             })
         }

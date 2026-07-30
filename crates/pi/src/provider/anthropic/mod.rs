@@ -126,7 +126,7 @@ struct Accumulator {
     /// Raw partial JSON for the tool_use block currently streaming, by index.
     open_json: std::collections::HashMap<usize, String>,
     stop_reason: Option<crate::types::StopReason>,
-    usage: Usage,
+    usage: Box<Usage>,
     started: bool,
 }
 
@@ -138,7 +138,7 @@ impl Accumulator {
             blocks: Vec::new(),
             open_json: std::collections::HashMap::new(),
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
             started: false,
         }
     }
@@ -148,8 +148,13 @@ impl Accumulator {
             content: self.blocks.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: self.stop_reason,
             usage: self.usage.clone(),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -162,7 +167,7 @@ impl Accumulator {
         match event {
             RawStreamEvent::MessageStart { message } => {
                 if let Some(u) = &message.usage {
-                    self.usage = to_usage(u);
+                    *self.usage = to_usage(u);
                 }
                 self.started = true;
                 let _ = tx.try_send(AgentEvent::MessageStart {

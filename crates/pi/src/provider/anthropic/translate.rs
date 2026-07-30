@@ -309,6 +309,8 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
             + output_tokens
             + cache_read_input_tokens
             + cache_creation_input_tokens,
+        reasoning_tokens: None,
+        cost: None,
     }
 }
 
@@ -356,8 +358,13 @@ mod tests {
             }],
             model: "claude-test".into(),
             provider: "anthropic".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::ToolUse),
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -449,8 +456,13 @@ mod tests {
             }],
             model: "m".into(),
             provider: "anthropic".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
         let ctx = ctx(vec![msg], ThinkingKind::None, None);

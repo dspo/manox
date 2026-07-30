@@ -156,7 +156,7 @@ struct Accumulator {
     /// parsed once the stream completes.
     tool_calls: Vec<ToolCallAcc>,
     stop_reason: Option<crate::types::StopReason>,
-    usage: Usage,
+    usage: Box<Usage>,
     started: bool,
 }
 
@@ -178,7 +178,7 @@ impl Accumulator {
             open_thinking: None,
             tool_calls: Vec::new(),
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
             started: false,
         }
     }
@@ -188,8 +188,13 @@ impl Accumulator {
             content: self.blocks.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),
+            api: "openai_completions".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: self.stop_reason,
             usage: self.usage.clone(),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -204,7 +209,7 @@ impl Accumulator {
             .as_ref()
             .or_else(|| chunk.choices.first().and_then(|c| c.usage.as_ref()))
         {
-            self.usage = to_usage(usage);
+            *self.usage = to_usage(usage);
         }
         if !self.started {
             self.started = true;

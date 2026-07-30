@@ -74,13 +74,33 @@ pub enum AgentMessage {
         content: Vec<ContentBlock>,
         model: String,
         provider: String,
+        /// The wire API shape used for this turn ("anthropic",
+        /// "openai_completions", "openai_responses", ...). Distinct from
+        /// `provider`, which names the vendor.
+        api: String,
+        /// Concrete `chunk.model` when the upstream returns a different one
+        /// than requested (e.g. OpenRouter `auto` -> `anthropic/...`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_model: Option<String>,
+        /// Provider-specific response/message identifier when exposed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        /// Redacted provider/runtime diagnostics for failures and recoveries.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostics: Option<Vec<JsonValue>>,
         /// The stop reason reported for this turn. `None` only while the
         /// message is still streaming; a finalized message always carries one
         /// — `Error`/`Aborted` cover provider failures and local interrupts.
         #[serde(default)]
         stop_reason: Option<StopReason>,
-        #[serde(default)]
-        usage: Usage,
+        /// Boxed so the `Assistant` variant — by far the largest, carrying the
+        /// provider's full response payload — stays off the enum's inline size.
+        /// `Box<Usage>` derefs to `Usage`, so reads are transparent.
+        #[serde(default = "default_usage")]
+        usage: Box<Usage>,
+        /// Failure explanation when `stop_reason` is `Error`/`Aborted`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
         #[serde(default = "chrono::Utc::now")]
         timestamp: DateTime<Utc>,
     },
@@ -169,11 +189,18 @@ pub struct Usage {
     /// Breakdown of cache creation by TTL, when the provider reports it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation: Option<CacheCreation>,
+    /// Reasoning/thinking tokens, when the provider reports them. A subset
+    /// of `output_tokens`; `None` when the provider exposes no breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
     /// Total context tokens. Providers that report a total (Responses) use
     /// it verbatim; the other shapes compute the sum of all token classes
     /// at the wire boundary. Zero means no usage was reported at all.
     #[serde(default)]
     pub total_tokens: u64,
+    /// Monetary cost for this response, when a rate card was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Cost>,
 }
 
 /// Cache creation split by TTL.
@@ -185,11 +212,31 @@ pub struct CacheCreation {
     pub ephemeral_5m_input_tokens: u64,
 }
 
+/// Monetary cost broken down by token class.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Cost {
+    #[serde(default)]
+    pub input: f64,
+    #[serde(default)]
+    pub output: f64,
+    #[serde(default)]
+    pub cache_read: f64,
+    #[serde(default)]
+    pub cache_write: f64,
+    #[serde(default)]
+    pub total: f64,
+}
+
 impl Usage {
     /// Total input tokens: direct input plus cache reads and writes.
     pub fn total_input(&self) -> u64 {
         self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
     }
+}
+
+/// Serde default for the boxed `usage` field on `Assistant`.
+fn default_usage() -> Box<Usage> {
+    Box::new(Usage::default())
 }
 
 // ── Event types ─────────────────────────────────────────────────────────────

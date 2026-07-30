@@ -450,8 +450,13 @@ mod tests {
                 }],
                 model: "mock".into(),
                 provider: "mock".into(),
+                api: "mock".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
                 stop_reason: Some(StopReason::Stop),
-                usage: Usage::default(),
+                usage: Box::new(Usage::default()),
+                error_message: None,
                 timestamp: chrono::Utc::now(),
             })
         }
@@ -535,8 +540,13 @@ mod tests {
                     }],
                     model: "mock".into(),
                     provider: "mock".into(),
+                    api: "mock".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
                     stop_reason: Some(StopReason::Stop),
-                    usage: Usage::default(),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
                     timestamp: chrono::Utc::now(),
                 });
             }
@@ -619,8 +629,13 @@ mod tests {
             }],
             model: "mock".into(),
             provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::ToolUse),
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -632,8 +647,13 @@ mod tests {
             }],
             model: "mock".into(),
             provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::Stop),
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -709,8 +729,13 @@ mod tests {
             }],
             model: "mock".into(),
             provider: "mock".into(),
+            api: "mock".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: Some(StopReason::Length),
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         };
 

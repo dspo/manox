@@ -194,7 +194,7 @@ struct Accumulator {
     /// completed response, not on `output_item.done`).
     reasoning_blocks: HashMap<String, usize>,
     stop_reason: Option<crate::types::StopReason>,
-    usage: Usage,
+    usage: Box<Usage>,
     started: bool,
     /// A `response.completed` / `response.incomplete` / `response.failed`
     /// event arrived. A stream that ends without one is a protocol
@@ -211,7 +211,7 @@ impl Accumulator {
             slots: HashMap::new(),
             reasoning_blocks: HashMap::new(),
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
             started: false,
             terminal_seen: false,
         }
@@ -222,8 +222,13 @@ impl Accumulator {
             content: self.blocks.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),
+            api: "openai_responses".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: self.stop_reason,
             usage: self.usage.clone(),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
@@ -485,7 +490,7 @@ impl Accumulator {
         self.terminal_seen = true;
         self.backfill_reasoning_signatures(&response.output);
         if let Some(usage) = &response.usage {
-            self.usage = to_usage(usage);
+            *self.usage = to_usage(usage);
         }
         self.stop_reason = match response.status.as_deref() {
             Some("incomplete") => Some(crate::types::StopReason::Length),

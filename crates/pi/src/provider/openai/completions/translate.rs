@@ -319,6 +319,8 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         cache_creation_input_tokens: 0,
         cache_creation: None,
         total_tokens: input_tokens + output_tokens + hit,
+        reasoning_tokens: None,
+        cost: None,
     }
 }
 
@@ -350,8 +352,13 @@ mod tests {
             content,
             model: "gpt-test".into(),
             provider: "openai".into(),
+            api: "openai_completions".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }

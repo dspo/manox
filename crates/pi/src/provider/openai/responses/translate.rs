@@ -504,6 +504,8 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         cache_creation_input_tokens: written,
         cache_creation: None,
         total_tokens: wire.total_tokens.unwrap_or(0),
+        reasoning_tokens: None,
+        cost: None,
     }
 }
 
@@ -539,8 +541,13 @@ mod tests {
             content,
             model: model_id.into(),
             provider: provider.into(),
+            api: "openai_responses".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
             stop_reason: None,
-            usage: Usage::default(),
+            usage: Box::new(Usage::default()),
+            error_message: None,
             timestamp: chrono::Utc::now(),
         }
     }
