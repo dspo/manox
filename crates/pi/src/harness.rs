@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{
-    AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, LoopHooks,
+    AfterToolCallHook, Agent, BeforeProviderRequestHook, BeforeToolCallHook, LoopHooks, RunHandle,
 };
 use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionResult, CompactionSettings};
@@ -182,6 +182,11 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// Mutable access to the agent.
     pub fn agent_mut(&mut self) -> &mut Agent {
         &mut self.agent
+    }
+
+    /// Decoupled handle for mid-run control (steer/follow_up/abort).
+    pub fn run_handle(&self) -> RunHandle {
+        self.agent.run_handle()
     }
 
     /// Current compaction settings.

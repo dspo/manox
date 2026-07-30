@@ -120,7 +120,9 @@ pub struct Agent {
     /// `get_follow_up_messages` callback to resume a run that would otherwise
     /// have ended.
     follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
-    active_run: Option<CancellationToken>,
+    /// The active run's cancel token, shared with [`RunHandle`] so `abort`
+    /// can cancel a run in flight without an `&mut self` borrow on the Agent.
+    active_run: Arc<Mutex<Option<CancellationToken>>>,
     stream_fn: Arc<dyn StreamFn>,
     sink: SubscriberSink,
     /// Tools mounted on the agent and forwarded into each turn's context.
@@ -154,7 +156,7 @@ impl Agent {
             state: AgentState::new(system_prompt, model),
             steering_queue: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
             follow_up_queue: Arc::new(Mutex::new(PendingMessageQueue::new(QueueMode::OneAtATime))),
-            active_run: None,
+            active_run: Arc::new(Mutex::new(None)),
             stream_fn,
             sink: SubscriberSink::new(),
             tools: Arc::from(Vec::new()),
@@ -230,9 +232,28 @@ impl Agent {
     }
 
     /// Abort the current run, if one is active.
-    pub fn abort(&mut self) {
-        if let Some(token) = self.active_run.take() {
+    pub fn abort(&self) {
+        if let Some(token) = self.active_run.lock().unwrap().take() {
             token.cancel();
+        }
+    }
+
+    /// Whether a run is currently in flight.
+    fn is_running(&self) -> bool {
+        self.active_run.lock().unwrap().is_some()
+    }
+
+    /// A decoupled handle for mid-run control.
+    ///
+    /// `prompt`/`continue_` take `&mut self` for the whole run, so the Agent's
+    /// own `steer`/`follow_up`/`abort` cannot be called while a run is in
+    /// flight. The handle shares the same `Arc`-backed queues and cancel slot,
+    /// exposing `&self` methods callable from another task during the run.
+    pub fn run_handle(&self) -> RunHandle {
+        RunHandle {
+            steering_queue: Arc::clone(&self.steering_queue),
+            follow_up_queue: Arc::clone(&self.follow_up_queue),
+            active_run: Arc::clone(&self.active_run),
         }
     }
 
@@ -257,7 +278,7 @@ impl Agent {
 
     /// Start a new prompt from text.
     pub async fn prompt(&mut self, text: &str) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        if self.active_run.is_some() {
+        if self.is_running() {
             anyhow::bail!("Agent is already processing a prompt.");
         }
 
@@ -274,7 +295,7 @@ impl Agent {
 
     /// Continue from the current transcript.
     pub async fn continue_(&mut self) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        if self.active_run.is_some() {
+        if self.is_running() {
             anyhow::bail!("Agent is already processing.");
         }
 
@@ -422,12 +443,12 @@ impl Agent {
             >,
         >,
     {
-        if self.active_run.is_some() {
+        if self.is_running() {
             anyhow::bail!("Agent is already processing.");
         }
 
         let token = CancellationToken::new();
-        self.active_run = Some(token.clone());
+        *self.active_run.lock().unwrap() = Some(token.clone());
         self.state.is_streaming = true;
         self.state.streaming_message = None;
         self.state.error_message = None;
@@ -437,7 +458,7 @@ impl Agent {
         self.state.is_streaming = false;
         self.state.streaming_message = None;
         self.state.error_message = None;
-        self.active_run = None;
+        *self.active_run.lock().unwrap() = None;
 
         result
     }
@@ -448,6 +469,53 @@ impl Clone for SubscriberSink {
         SubscriberSink {
             events: Arc::clone(&self.events),
         }
+    }
+}
+
+/// Decoupled, cloneable handle for mid-run control of an [`Agent`].
+///
+/// Shares the agent's steering/follow-up queues and cancel slot via `Arc`, so
+/// `steer`/`follow_up`/`abort` work from another task while `prompt` holds the
+/// exclusive borrow on the Agent.
+#[derive(Clone)]
+pub struct RunHandle {
+    steering_queue: Arc<Mutex<PendingMessageQueue>>,
+    follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
+    active_run: Arc<Mutex<Option<CancellationToken>>>,
+}
+
+impl RunHandle {
+    /// Queue a steering message injected into the current or next turn.
+    pub fn steer(&self, message: AgentMessage) {
+        self.steering_queue.lock().unwrap().enqueue(message);
+    }
+
+    /// Queue a follow-up message that resumes a run that would otherwise stop.
+    pub fn follow_up(&self, message: AgentMessage) {
+        self.follow_up_queue.lock().unwrap().enqueue(message);
+    }
+
+    /// Cancel the active run, if one is in flight.
+    pub fn abort(&self) {
+        if let Some(token) = self.active_run.lock().unwrap().take() {
+            token.cancel();
+        }
+    }
+
+    /// Whether either queue has pending messages.
+    pub fn has_queued_messages(&self) -> bool {
+        self.steering_queue.lock().unwrap().has_items()
+            || self.follow_up_queue.lock().unwrap().has_items()
+    }
+
+    /// Remove all queued steering messages.
+    pub fn clear_steering_queue(&self) {
+        self.steering_queue.lock().unwrap().clear();
+    }
+
+    /// Remove all queued follow-up messages.
+    pub fn clear_follow_up_queue(&self) {
+        self.follow_up_queue.lock().unwrap().clear();
     }
 }
 
@@ -601,7 +669,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_abort() {
-        let mut agent = Agent::new(
+        let agent = Agent::new(
             "You are a test assistant.",
             test_model(),
             Arc::new(TestStreamFn),
@@ -665,6 +733,101 @@ mod tests {
         assert!(
             !agent.has_queued_messages(),
             "steering queue must be drained after the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_via_run_handle_shares_steering_queue() {
+        // F3: RunHandle must share the same steering queue the loop drains,
+        // so a message enqueued through the handle before a run is injected.
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+            test_tool_ctx(),
+        );
+        let handle = agent.run_handle();
+        handle.steer(AgentMessage::user("STEER-HANDLE"));
+
+        let messages = agent.prompt("hi").await.unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, AgentMessage::User { content, .. }
+                    if content.iter().any(|b| matches!(b, ContentBlock::Text { text, .. } if text == "STEER-HANDLE")))),
+            "handle-steered message must appear in the run's new messages"
+        );
+        assert!(
+            !agent.has_queued_messages(),
+            "shared steering queue must be drained after the run"
+        );
+    }
+
+    /// Stream fn that blocks until the run is cancelled, then surfaces an
+    /// `Aborted` terminal — lets an abort test exercise a run in flight.
+    struct BlockingStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for BlockingStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            signal: CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            signal.cancelled().await;
+            Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "aborted".into(),
+                    signature: None,
+                }],
+                model: "test".into(),
+                provider: "test".into(),
+                api: "test".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(StopReason::Aborted),
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_via_run_handle_terminates_run_in_flight() {
+        // F3: RunHandle::abort must cancel a run in flight via the shared
+        // cancel slot, without needing an &mut self on the Agent (which prompt
+        // holds for the whole run).
+        //
+        // `prompt`'s future is not `Send` (the loop's pinned executor future
+        // borrows `&mut AgentContext`), so drive it on a `LocalSet` instead of
+        // a multi-threaded `tokio::spawn`.
+        let mut agent = Agent::new(
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(BlockingStreamFn),
+            test_tool_ctx(),
+        );
+        let handle = agent.run_handle();
+
+        let result = tokio::task::LocalSet::new()
+            .run_until(async move {
+                let join = tokio::task::spawn_local(async move { agent.prompt("hi").await });
+                // Let the run register its cancel token in the shared slot.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                handle.abort();
+                tokio::time::timeout(std::time::Duration::from_secs(2), join)
+                    .await
+                    .expect("abort did not terminate the run within timeout")
+                    .expect("spawned task panicked")
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "aborted run must complete with Ok, got: {:?}",
+            result.err()
         );
     }
 }

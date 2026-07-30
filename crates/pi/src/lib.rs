@@ -30,6 +30,7 @@ pub mod agent_loop;
 
 pub use agent::Agent;
 pub use agent::QueueMode;
+pub use agent::RunHandle;
 pub use agent_loop::run_loop;
 pub use agent_loop::{EventSink, StreamFn};
 pub use env::ExecutionEnv;
