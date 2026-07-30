@@ -264,9 +264,42 @@ impl<S: SessionStorage> AgentHarness<S> {
     ///
     /// A harness constructed over an existing session must call this before
     /// relying on [`AgentHarness::needs_compaction`]; a fresh session holds
-    /// no compaction entries and the boundary stays unset.
+    /// no compaction entries and the boundary stays unset. Only the boundary
+    /// is recovered — [`AgentHarness::restore`] rebuilds the transcript too.
     pub async fn recover_boundary(&mut self) -> Result<(), anyhow::Error> {
         self.last_compaction_at = self.session.latest_compaction_timestamp().await?;
+        Ok(())
+    }
+
+    /// Rebuild the agent transcript from the persisted session.
+    ///
+    /// The context walk stops at the latest compaction boundary; that entry
+    /// contributes the summary message and its retained tail, and later
+    /// entries contribute their messages verbatim. The compaction boundary
+    /// used by token estimation is recovered alongside.
+    pub async fn restore(&mut self) -> Result<(), anyhow::Error> {
+        let entries = self.session.build_context().await?;
+        let mut messages = Vec::new();
+        for entry in &entries {
+            match entry {
+                crate::session::SessionTreeEntry::Compaction {
+                    summary,
+                    retained_tail,
+                    timestamp,
+                    ..
+                } => {
+                    messages.push(summary_message(summary, *timestamp));
+                    messages.extend(retained_tail.iter().cloned());
+                }
+                crate::session::SessionTreeEntry::Message { message, .. } => {
+                    messages.push(message.clone());
+                }
+                _ => {}
+            }
+        }
+        self.agent.reset();
+        self.agent.replace_transcript(messages);
+        self.recover_boundary().await?;
         Ok(())
     }
 
@@ -336,15 +369,7 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         // Build a new transcript: summary as system context + kept messages.
         let mut new_messages = Vec::new();
-        new_messages.push(AgentMessage::User {
-            content: vec![crate::types::ContentBlock::Text {
-                text: format!(
-                    "<conversation_history_summary>\n{summary}\n</conversation_history_summary>"
-                ),
-                signature: None,
-            }],
-            timestamp: chrono::Utc::now(),
-        });
+        new_messages.push(summary_message(summary, chrono::Utc::now()));
         new_messages.extend_from_slice(kept);
 
         // Replace the agent's transcript. The boundary is stamped before the
@@ -409,6 +434,24 @@ impl<S: SessionStorage> AgentHarness<S> {
         let compacted = &messages[..cut_point];
         let prompt = compaction::build_compaction_prompt(compacted, None);
         Some((prompt, cut_point))
+    }
+}
+
+/// The in-transcript carrier for a compaction summary: a tagged user
+/// message. Kept symmetric between compaction and restore so the summary
+/// reads identically whether it was just written or rebuilt from storage.
+fn summary_message(
+    summary: &str,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> AgentMessage {
+    AgentMessage::User {
+        content: vec![crate::types::ContentBlock::Text {
+            text: format!(
+                "<conversation_history_summary>\n{summary}\n</conversation_history_summary>"
+            ),
+            signature: None,
+        }],
+        timestamp,
     }
 }
 
@@ -691,6 +734,71 @@ mod tests {
             .agent_mut()
             .replace_transcript(vec![AgentMessage::user("q"), stale_assistant]);
         assert!(harness.needs_compaction());
+    }
+
+    #[tokio::test]
+    async fn test_restore_rebuilds_transcript_from_session() {
+        use crate::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let meta = || JsonlSessionMetadata {
+            id: "s".into(),
+            cwd: "/test".into(),
+            created_at: chrono::Utc::now(),
+        };
+
+        // Run a turn, compact, run another turn — all over an on-disk session.
+        {
+            let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+            let session = Session::new(storage);
+            let mut harness = AgentHarness::new(
+                session,
+                "You are a test assistant.",
+                test_model(),
+                Arc::new(TestStreamFn),
+            );
+            harness.prompt("first").await.unwrap();
+            harness.compact("summary").await.unwrap();
+            harness.prompt("second").await.unwrap();
+        }
+
+        // A fresh harness restores the full transcript: summary, retained
+        // tail, and the post-compaction messages.
+        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        harness.restore().await.unwrap();
+
+        fn text_of(m: &AgentMessage) -> &str {
+            match m {
+                AgentMessage::User { content, .. } | AgentMessage::Assistant { content, .. } => {
+                    match &content[0] {
+                        ContentBlock::Text { text, .. } => text.as_str(),
+                        _ => "",
+                    }
+                }
+                _ => "",
+            }
+        }
+        let messages = &harness.agent().state().messages;
+        assert_eq!(messages.len(), 5, "{messages:?}");
+        assert_eq!(
+            text_of(&messages[0]),
+            "<conversation_history_summary>\nsummary\n</conversation_history_summary>"
+        );
+        assert_eq!(text_of(&messages[1]), "first");
+        assert!(matches!(&messages[2], AgentMessage::Assistant { .. }));
+        assert_eq!(text_of(&messages[3]), "second");
+        assert!(matches!(&messages[4], AgentMessage::Assistant { .. }));
+
+        // The estimation boundary came along: needs_compaction works without
+        // a separate recover_boundary() call.
+        assert!(!harness.needs_compaction());
     }
 
     #[tokio::test]
