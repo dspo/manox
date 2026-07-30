@@ -204,7 +204,9 @@ impl<S: SessionStorage> AgentHarness<S> {
                 }
 
                 self.phase = AgentHarnessPhase::Idle;
-                persist_result?;
+                if let Err(e) = persist_result {
+                    return Err(self.revert_transcript_after_persist_failure(e).await);
+                }
 
                 // Check if compaction is needed.
                 let context_tokens = self.estimate_current_tokens();
@@ -248,7 +250,9 @@ impl<S: SessionStorage> AgentHarness<S> {
                     }
                 }
                 self.phase = AgentHarnessPhase::Idle;
-                persist_result?;
+                if let Err(e) = persist_result {
+                    return Err(self.revert_transcript_after_persist_failure(e).await);
+                }
                 Ok(messages)
             }
             Err(e) => {
@@ -311,6 +315,26 @@ impl<S: SessionStorage> AgentHarness<S> {
         self.agent.replace_transcript(messages);
         self.recover_boundary().await?;
         Ok(())
+    }
+
+    /// Reconcile the agent with the session after a turn's persistence
+    /// failed partway. The session is the durable record, so the transcript
+    /// is rebuilt from it: both views then hold exactly the persisted prefix,
+    /// which is also what any later [`AgentHarness::restore`] produces.
+    async fn revert_transcript_after_persist_failure(
+        &mut self,
+        persist_error: anyhow::Error,
+    ) -> anyhow::Error {
+        match self.restore().await {
+            Ok(()) => anyhow::anyhow!(
+                "failed to persist messages: {persist_error:#}; \
+                 transcript reverted to the persisted session"
+            ),
+            Err(revert_error) => anyhow::anyhow!(
+                "failed to persist messages: {persist_error:#}; \
+                 reverting the transcript to the persisted session also failed: {revert_error:#}"
+            ),
+        }
     }
 
     /// Check whether compaction is needed based on current context size.
@@ -515,6 +539,10 @@ mod tests {
     struct MemStorage {
         entries: std::sync::Mutex<Vec<SessionTreeEntry>>,
         leaf_id: std::sync::Mutex<Option<String>>,
+        /// Number of `append_entry` calls so far.
+        append_calls: std::sync::Mutex<u64>,
+        /// Call number at which `append_entry` fails; `u64::MAX` means never.
+        fail_at_call: std::sync::Mutex<u64>,
     }
 
     impl MemStorage {
@@ -522,6 +550,8 @@ mod tests {
             MemStorage {
                 entries: std::sync::Mutex::new(Vec::new()),
                 leaf_id: std::sync::Mutex::new(None),
+                append_calls: std::sync::Mutex::new(0),
+                fail_at_call: std::sync::Mutex::new(u64::MAX),
             }
         }
     }
@@ -532,6 +562,12 @@ mod tests {
             Ok(uuid::Uuid::new_v4().to_string())
         }
         async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+            let mut calls = self.append_calls.lock().unwrap();
+            *calls += 1;
+            if *calls == *self.fail_at_call.lock().unwrap() {
+                anyhow::bail!("injected append failure");
+            }
+            drop(calls);
             self.entries.lock().unwrap().push(entry.clone());
             Ok(())
         }
@@ -819,6 +855,70 @@ mod tests {
         // The estimation boundary came along: needs_compaction works without
         // a separate recover_boundary() call.
         assert!(!harness.needs_compaction());
+    }
+
+    #[tokio::test]
+    async fn test_persist_failure_on_first_message_reverts_to_empty() {
+        let storage = MemStorage::new();
+        *storage.fail_at_call.lock().unwrap() = 1;
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        let err = harness.prompt("hi").await.unwrap_err();
+        assert!(
+            err.to_string().contains("failed to persist messages"),
+            "{err:#}"
+        );
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+
+        // Nothing persisted, so the reverted transcript is empty too —
+        // identical to what a fresh harness would restore from this session.
+        assert!(harness.agent().state().messages.is_empty());
+        assert!(harness.session().build_context().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_persist_failure_mid_turn_keeps_only_the_persisted_prefix() {
+        let storage = MemStorage::new();
+        *storage.fail_at_call.lock().unwrap() = 2;
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+
+        // The user message persists; the assistant reply does not.
+        let err = harness.prompt("hi").await.unwrap_err();
+        assert!(
+            err.to_string().contains("failed to persist messages"),
+            "{err:#}"
+        );
+        assert_eq!(harness.phase(), AgentHarnessPhase::Idle);
+
+        // Both views hold exactly the persisted prefix: the pending user
+        // message, and nothing else.
+        let messages = &harness.agent().state().messages;
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(matches!(&messages[0], AgentMessage::User { .. }));
+        assert_eq!(harness.session().build_context().await.unwrap().len(), 1);
+
+        // With the failure spent, continuing answers the pending user
+        // message — the conversation continues coherently, not forked.
+        let produced = harness.continue_().await.unwrap();
+        assert!(
+            produced
+                .iter()
+                .any(|m| matches!(m, AgentMessage::Assistant { .. }))
+        );
+        assert_eq!(harness.agent().state().messages.len(), 2);
+        assert_eq!(harness.session().build_context().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -1,8 +1,10 @@
-# Plan: 在 manox 中增加 `pi` crate
+# Plan: 以 `pi` crate 替换 manox 自研 harness 内核
 
 ## Context
 
-将 Pi coding agent 的 harness 层（agent loop、tool calling、compaction、session 管理）移植到 Rust，作为 manox 工作区的一个新 crate `crates/pi`。
+将 Pi coding agent 的 harness 层（agent loop、tool calling、compaction、session 管理）完整移植到 Rust，形成 manox 最终唯一的 harness 内核 `crates/pi`。
+
+`pi` crate 成熟前保持独立开发，不要求 manox 提前接线；这一阶段以尽可能对齐 Pi TS 核心行为、相关 examples 可运行和差分测试通过为验收标准。成熟后，manox 将整体迁移到 `pi` crate，并完全移除目前自研的 harness 内核，不保留长期双栈、旧内核适配层或面向旧实现的兼容承诺。
 
 **范围边界：**
 - ✅ 移植：agent loop 状态机、Agent 类、AgentHarness 编排层、compaction、session tree（JSONL 持久化）、7 个内置工具、settings 管理、trust 管理、cache miss 检测
@@ -208,11 +210,19 @@ pub trait AgentTool: Send + Sync {
 
 ## 与 manox 现有 `agent` crate 的关系
 
-Pi crate 是**独立库**，不修改 manox 现有 `agent` crate。两者的关系：
+`pi` crate 是 manox harness 内核的**最终替代实现**，不是与现有自研 harness 长期共存的可选库。迁移分为两个阶段：
 
-- Pi crate 提供完整的 agent harness（loop + harness + compaction + session + tools）
-- manox 的 `agent` crate 可以**选择使用** Pi crate 的组件（如 compaction 算法、tool 实现）
-- 如果未来统一，可以在 manox `agent` 中实现 `ExecutionEnv` trait 并注入 Pi harness
+1. **独立成熟阶段**
+   - `pi` crate 独立实现完整的 agent harness（loop + harness + compaction + session + tools）
+   - 暂不要求 manox 接线，避免未成熟内核影响现有功能
+   - 以 Pi TS 核心语义为基准持续补齐实现和差分测试
+
+2. **整体迁移阶段**
+   - manox 完全切换到 `pi` crate 作为 harness 内核
+   - 删除 manox 当前自研 harness 内核及其重复实现
+   - 不保留新旧内核并行运行、按组件选择接入或旧 harness API 兼容层
+
+迁移期间可以编写一次性的调用侧改造代码，但这些代码只服务于完成切换，不构成长期兼容边界。迁移完成后的架构中只保留 `pi` crate 这一套 harness 内核。
 
 ## 交付方式
 
