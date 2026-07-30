@@ -2,14 +2,16 @@
 //
 // Layout of the single `session.jsonl` file:
 //   line 0 — a session header: `{"type":"session","version":3,"id":..,"timestamp":..,"cwd":..}`.
-//   line 1.. — session-tree entries, appended in occurrence order. Leaf-cursor
-//              moves are recorded as `leaf` entries, so the file is strictly
-//              append-only: no field is ever rewritten.
+//   line 1.. — session-tree entries, appended in occurrence order. The leaf
+//              cursor is the id of the last appended entry — there is no
+//              `leaf` entry, matching the TS Pi v3 schema. The file is
+//              strictly append-only: no field is ever rewritten. Branching
+//              (pointing the cursor at an older entry) is an in-memory
+//              override set via `set_leaf_id` and does not persist; the
+//              linear path a real session follows needs no override.
 //
-// The current leaf is the `target_id` of the last `leaf` entry in the file
-// (or `None` when no `leaf` entry exists). `open` validates line 0 is a v3
-// session header and errors on any mismatch or corruption — there is no
-// silent recovery from an older or damaged file.
+// `open` validates line 0 is a v3 session header and errors on any mismatch
+// or corruption — there is no silent recovery from an older or damaged file.
 
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
@@ -47,7 +49,8 @@ pub struct JsonlSessionStorage {
     jsonl_path: PathBuf,
     /// All entries after the header, cached in memory.
     entries: Mutex<Vec<SessionTreeEntry>>,
-    /// Cached current leaf id, derived from the last `leaf` entry.
+    /// Current leaf cursor. Defaults to the last appended entry; an
+    /// in-memory override via `set_leaf_id` (for branching) is not persisted.
     leaf_id: Mutex<Option<String>>,
     /// Metadata read from the header (file is authoritative on reopen).
     pub metadata: JsonlSessionMetadata,
@@ -118,17 +121,16 @@ impl JsonlSessionStorage {
         };
 
         let mut entries = Vec::new();
-        let mut leaf_id: Option<String> = None;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
             let entry: SessionTreeEntry = serde_json::from_str(&line)?;
-            if let SessionTreeEntry::Leaf { target_id, .. } = &entry {
-                leaf_id = target_id.clone();
-            }
             entries.push(entry);
         }
+        // The leaf cursor is the last appended entry — there is no `leaf`
+        // entry in the v3 schema.
+        let leaf_id = entries.last().map(|e| e.id().to_string());
 
         Ok(JsonlSessionStorage {
             jsonl_path: path.to_path_buf(),
@@ -158,9 +160,8 @@ impl SessionStorage for JsonlSessionStorage {
     async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
         let line = serde_json::to_string(entry)? + "\n";
         self.append_line(&line).await?;
-        if let SessionTreeEntry::Leaf { target_id, .. } = entry {
-            *self.leaf_id.lock().await = target_id.clone();
-        }
+        // The appended entry becomes the leaf cursor — no `leaf` entry.
+        *self.leaf_id.lock().await = Some(entry.id().to_string());
         self.entries.lock().await.push(entry.clone());
         Ok(())
     }
@@ -175,15 +176,10 @@ impl SessionStorage for JsonlSessionStorage {
     }
 
     async fn set_leaf_id(&self, leaf_id: Option<&str>) -> Result<(), anyhow::Error> {
-        let id = self.create_entry_id().await?;
-        let parent_id = self.leaf_id.lock().await.clone();
-        let entry = SessionTreeEntry::Leaf {
-            id,
-            parent_id,
-            timestamp: chrono::Utc::now(),
-            target_id: leaf_id.map(|s| s.to_string()),
-        };
-        self.append_entry(&entry).await
+        // In-memory override for branching; not persisted, matching a schema
+        // that records no `leaf` entry. The linear path needs no override.
+        *self.leaf_id.lock().await = leaf_id.map(|s| s.to_string());
+        Ok(())
     }
 
     async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
@@ -267,6 +263,7 @@ mod tests {
 
         assert!(storage.get_leaf_id().await.unwrap().is_none());
 
+        // set_leaf_id is an in-memory override (no `leaf` entry is written).
         storage.set_leaf_id(Some("entry-42")).await.unwrap();
         assert_eq!(
             storage.get_leaf_id().await.unwrap(),
@@ -291,13 +288,12 @@ mod tests {
                 message: AgentMessage::user("hi"),
             };
             storage.append_entry(&msg).await.unwrap();
-            storage.set_leaf_id(Some("m1")).await.unwrap();
+            // No `leaf` entry exists; the cursor is the last appended entry.
         }
 
         let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
         let entries = storage.get_entries().await.unwrap();
-        // One message plus one leaf entry appended by set_leaf_id.
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 1);
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
 
         // The first line on disk is the v3 session header.
@@ -510,5 +506,69 @@ mod tests {
         session.storage().set_leaf_id(Some("root")).await.unwrap();
         let ts = session.latest_compaction_timestamp().await.unwrap();
         assert_eq!(ts, None);
+    }
+
+    /// A real TS Pi v3 session file uses camelCase entry fields, stores a
+    /// message's own timestamp as epoch milliseconds, and writes no `leaf`
+    /// entries. Such a file must load with the leaf cursor at the last entry.
+    #[tokio::test]
+    async fn test_loads_real_ts_pi_v3_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        // Mirrors the on-disk shape captured from a real TS Pi session: header,
+        // a model_change (camelCase modelId), a thinking_level_change
+        // (camelCase thinkingLevel), and a message whose inner timestamp is
+        // integer millis. No `leaf` entry.
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"model_change","id":"c1","parentId":null,"timestamp":"2026-05-28T07:13:46.617Z","provider":"anthropic","modelId":"claude-opus-4-7"}"#,
+            "\n",
+            r#"{"type":"thinking_level_change","id":"t1","parentId":"c1","timestamp":"2026-05-28T07:13:46.617Z","thinkingLevel":"medium"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":"t1","timestamp":"2026-05-28T07:14:32.753Z","message":{"role":"user","content":[{"type":"text","text":"hello"}],"timestamp":1779952472751}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        let meta = JsonlSessionMetadata {
+            id: "s1".into(),
+            cwd: "/proj".into(),
+            created_at: chrono::Utc::now(),
+        };
+        let storage = JsonlSessionStorage::open(dir.path(), meta).await.unwrap();
+
+        let entries = storage.get_entries().await.unwrap();
+        assert_eq!(entries.len(), 3);
+        // No `leaf` entry: the cursor is the last appended entry.
+        assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
+
+        // The model_change and thinking_level_change deserialized with their
+        // camelCase fields mapped.
+        match &entries[0] {
+            SessionTreeEntry::ModelChange { model_id, .. } => {
+                assert_eq!(model_id, "claude-opus-4-7");
+            }
+            other => panic!("expected ModelChange, got {other:?}"),
+        }
+        match &entries[1] {
+            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => {
+                assert_eq!(thinking_level.as_deref(), Some("medium"));
+            }
+            other => panic!("expected ThinkingLevelChange, got {other:?}"),
+        }
+        // The message entry's inner message carried an epoch-millis timestamp
+        // and a text content block.
+        match &entries[2] {
+            SessionTreeEntry::Message { message, .. } => match message {
+                AgentMessage::User { content, .. } => {
+                    assert!(matches!(
+                    &content[0], crate::types::ContentBlock::Text { text, .. } if text == "hello"
+                                ));
+                }
+                other => panic!("expected User message, got {other:?}"),
+            },
+            other => panic!("expected Message entry, got {other:?}"),
+        }
     }
 }

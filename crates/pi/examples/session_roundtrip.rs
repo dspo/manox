@@ -90,7 +90,6 @@ fn print_path(label: &str, path: &[SessionTreeEntry]) {
                 _ => "assistant".into(),
             },
             SessionTreeEntry::Compaction { .. } => "compaction".into(),
-            SessionTreeEntry::Leaf { .. } => "leaf".into(),
             _ => "other".into(),
         })
         .collect();

@@ -67,7 +67,7 @@ pub enum AgentMessage {
     #[serde(rename = "user")]
     User {
         content: Vec<ContentBlock>,
-        #[serde(default = "chrono::Utc::now")]
+        #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
     #[serde(rename = "assistant")]
@@ -102,7 +102,7 @@ pub enum AgentMessage {
         /// Failure explanation when `stop_reason` is `Error`/`Aborted`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_message: Option<String>,
-        #[serde(default = "chrono::Utc::now")]
+        #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
     #[serde(rename = "toolResult")]
@@ -114,7 +114,7 @@ pub enum AgentMessage {
         is_error: bool,
         #[serde(default)]
         details: Option<JsonValue>,
-        #[serde(default = "chrono::Utc::now")]
+        #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
     /// Extension point for custom message types.
@@ -124,7 +124,7 @@ pub enum AgentMessage {
         content: Vec<ContentBlock>,
         #[serde(default)]
         details: Option<JsonValue>,
-        #[serde(default = "chrono::Utc::now")]
+        #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
     },
 }
@@ -238,6 +238,35 @@ impl Usage {
 /// Serde default for the boxed `usage` field on `Assistant`.
 fn default_usage() -> Box<Usage> {
     Box::new(Usage::default())
+}
+
+/// Serde for `AgentMessage` timestamps as epoch milliseconds — the on-disk
+/// shape TS Pi v3 stores for a message's own timestamp (entry-level
+/// timestamps stay ISO strings). Used only for session storage; the wire
+/// formats build their own request structs and never touch this.
+mod ts_millis {
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(dt: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_i64(dt.timestamp_millis())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Number(n) => {
+                let ms = n.as_i64().ok_or_else(|| {
+                    serde::de::Error::custom("timestamp must be integer milliseconds")
+                })?;
+                DateTime::<Utc>::from_timestamp_millis(ms)
+                    .ok_or_else(|| serde::de::Error::custom("timestamp millis out of range"))
+            }
+            _ => Err(serde::de::Error::custom(
+                "timestamp must be integer milliseconds",
+            )),
+        }
+    }
 }
 
 // ── Event types ─────────────────────────────────────────────────────────────
