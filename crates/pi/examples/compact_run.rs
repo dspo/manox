@@ -72,7 +72,7 @@ async fn main() {
         metadata: None,
     };
 
-    let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta)
+    let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta)
         .await
         .expect("open");
     let session = Session::new(storage);
@@ -93,18 +93,9 @@ async fn main() {
     );
 
     // Inspect the persisted entry — its fields must match the in-memory result.
-    let storage = JsonlSessionStorage::open(
-        dir.path(),
-        JsonlSessionMetadata {
-            id: "demo".into(),
-            cwd: dir.path().to_string_lossy().into_owned(),
-            created_at: chrono::Utc::now(),
-            parent_session_path: None,
-            metadata: None,
-        },
-    )
-    .await
-    .expect("reopen");
+    let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
+        .await
+        .expect("reopen");
     let mut found = None;
     for entry in storage.get_entries().await.expect("entries") {
         if let SessionTreeEntry::Compaction {

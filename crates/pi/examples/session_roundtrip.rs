@@ -20,7 +20,7 @@ async fn main() {
         metadata: None,
     };
 
-    let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta)
+    let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta)
         .await
         .expect("open");
     let session = Session::new(storage);
@@ -61,18 +61,9 @@ async fn main() {
     );
 
     // Reopen from disk: the leaf and all entries survived.
-    let storage = JsonlSessionStorage::open(
-        &dir.path().join("session.jsonl"),
-        JsonlSessionMetadata {
-            id: "demo".into(),
-            cwd: dir.path().to_string_lossy().into_owned(),
-            created_at: chrono::Utc::now(),
-            parent_session_path: None,
-            metadata: None,
-        },
-    )
-    .await
-    .expect("reopen");
+    let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
+        .await
+        .expect("reopen");
     let entries = storage.get_entries().await.expect("entries");
     println!(
         "reopened: {} entries, leaf={:?}",

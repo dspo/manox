@@ -15,7 +15,7 @@ use crate::agent::{
 use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionResult, CompactionSettings};
 use crate::env::{ExecutionEnv, TokioExecutionEnv};
-use crate::session::{Session, SessionStorage};
+use crate::session::{CompactionAuthorship, Session, SessionStorage};
 use crate::tool::{AgentToolResult, LocalToolContext, ToolState};
 use crate::types::{
     AgentContext, AgentMessage, CacheRetention, ContentBlock, Model, StopReason, Usage,
@@ -60,11 +60,23 @@ pub enum HookPoint {
 /// A hook handler receives context about the event and can mutate it.
 pub type HookHandler = Arc<dyn Fn(HookContext) -> HookContext + Send + Sync>;
 
+/// A before-compact hook can cancel the compaction or supply its summary
+/// directly, sparing the summarization model call. Mirrors the TS
+/// `SessionBeforeCompactResult`: a provided override persists with
+/// `fromHook = true` and the hook's `details`/`usage` attached.
+#[derive(Debug, Clone, Default)]
+pub struct BeforeCompactOverride {
+    pub summary: String,
+    pub details: Option<JsonValue>,
+    pub usage: Option<Usage>,
+}
+
 /// Context passed to hook handlers.
 ///
 /// Handlers return a (possibly mutated) copy; the harness threads selected
 /// fields back into the loop. `agent_context` feeds the provider request,
-/// `block_reason` gates a tool call, and `tool_result` patches a tool result.
+/// `block_reason` gates a tool call, `tool_result` patches a tool result, and
+/// `cancel_compaction`/`compact_override` steer the compaction flow.
 #[derive(Debug, Clone)]
 pub struct HookContext {
     /// The hook point being triggered.
@@ -78,6 +90,12 @@ pub struct HookContext {
     /// A replacement `AgentToolResult` at the `ToolResult` point; when set it
     /// supplants the result the tool produced.
     pub tool_result: Option<AgentToolResult>,
+    /// At the `SessionBeforeCompact` point, aborts the compaction without
+    /// persisting anything.
+    pub cancel_compaction: bool,
+    /// At the `SessionBeforeCompact` point, supplies the summary directly so
+    /// the harness skips the summarization model call.
+    pub compact_override: Option<BeforeCompactOverride>,
 }
 
 impl HookContext {
@@ -88,6 +106,8 @@ impl HookContext {
             data: serde_json::Value::Null,
             block_reason: None,
             tool_result: None,
+            cancel_compaction: false,
+            compact_override: None,
         }
     }
 
@@ -108,6 +128,19 @@ impl HookContext {
 
     pub fn with_block_reason(mut self, reason: impl Into<String>) -> Self {
         self.block_reason = Some(reason.into());
+        self
+    }
+
+    /// At `SessionBeforeCompact`, cancel the compaction without persisting.
+    pub fn with_cancel_compaction(mut self) -> Self {
+        self.cancel_compaction = true;
+        self
+    }
+
+    /// At `SessionBeforeCompact`, supply the summary directly and skip the
+    /// summarization model call. The persisted entry carries `fromHook`.
+    pub fn with_compact_override(mut self, override_: BeforeCompactOverride) -> Self {
+        self.compact_override = Some(override_);
         self
     }
 }
@@ -464,11 +497,17 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         self.phase = AgentHarnessPhase::Compaction;
 
-        // Run before-compact hooks.
-        let _hook_ctx = self.run_hooks(
+        // A before-compact hook can cancel the run or supply the summary
+        // directly, sparing the summarization model call. A supplied override
+        // persists with `fromHook` and the hook's `details`/`usage`.
+        let hook_ctx = self.run_hooks(
             HookPoint::SessionBeforeCompact,
             HookContext::new(HookPoint::SessionBeforeCompact),
         );
+        if hook_ctx.cancel_compaction {
+            self.phase = AgentHarnessPhase::Idle;
+            anyhow::bail!("compaction cancelled by before-compact hook");
+        }
 
         let messages = self.agent.state().messages.clone();
         let tokens_before = compaction::estimate_context_tokens(&messages).tokens;
@@ -476,77 +515,22 @@ impl<S: SessionStorage> AgentHarness<S> {
             compaction::find_cut_point(&messages, self.compaction_settings.keep_recent_tokens);
         let compacted = &messages[..cut_point];
         let kept = &messages[cut_point..];
-
-        let prompt = compaction::build_compaction_prompt(compacted, None);
-        let summary_context = AgentContext {
-            system_prompt:
-                "You compress a coding agent's conversation history into a concise summary.".into(),
-            messages: vec![AgentMessage::user(prompt)],
-            tools: Arc::from(Vec::new()),
-            model: self.model.clone(),
-            thinking_level: None,
-            cache_retention: CacheRetention::None,
-            session_id: None,
-            metadata: Default::default(),
-        };
-        let signal = CancellationToken::new();
-        let (event_tx, mut event_rx) = mpsc::channel::<crate::types::AgentEvent>(64);
-        // Run the summarization stream concurrently with draining its events:
-        // the producer would block on the 64-cap channel once it fills, so the
-        // receiver must drain while it runs, not after.
-        let stream_fn = Arc::clone(&self.stream_fn);
-        let stream_handle =
-            tokio::spawn(async move { stream_fn.stream(&summary_context, signal, event_tx).await });
-        // The harness does not surface summarization events; just keep the
-        // channel empty so the producer never blocks.
-        while event_rx.recv().await.is_some() {}
-        let summary_response = match stream_handle.await {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => {
-                self.phase = AgentHarnessPhase::Idle;
-                return Err(e);
-            }
-            Err(join_err) => {
-                self.phase = AgentHarnessPhase::Idle;
-                return Err(anyhow::Error::new(join_err));
-            }
-        };
-
-        let (summary_text, usage) = extract_summary(&summary_response);
-        // A failed summarization must not persist an empty compaction: that
-        // would replace the compacted prefix with nothing and lose history.
-        // An Error/Aborted terminal or an empty summary is a failure; bail
-        // before touching the session or transcript so both stay intact.
-        let failed = match &summary_response {
-            AgentMessage::Assistant {
-                stop_reason: Some(StopReason::Error | StopReason::Aborted),
-                ..
-            } => true,
-            _ => summary_text.trim().is_empty(),
-        };
-        if failed {
-            self.phase = AgentHarnessPhase::Idle;
-            let label = match &summary_response {
-                AgentMessage::Assistant {
-                    stop_reason: Some(StopReason::Error),
-                    ..
-                } => "error",
-                AgentMessage::Assistant {
-                    stop_reason: Some(StopReason::Aborted),
-                    ..
-                } => "aborted",
-                _ => "no summary",
-            };
-            let detail = match &summary_response {
-                AgentMessage::Assistant {
-                    error_message: Some(msg),
-                    ..
-                } => format!(": {msg}"),
-                _ => String::new(),
-            };
-            return Err(anyhow::anyhow!("summarization failed ({label}){detail}"));
-        }
         let first_kept_entry_id = self.message_entry_ids.get(cut_point).cloned().flatten();
+
+        // The hook's override supplies only the summary content; the structural
+        // fields (tokens_before, retained tail, first-kept entry) still derive
+        // from the harness's cut analysis, since the harness owns the transcript.
+        let (summary_text, usage, authorship) = match hook_ctx.compact_override {
+            Some(override_) => (
+                override_.summary,
+                override_.usage,
+                CompactionAuthorship {
+                    details: override_.details,
+                    from_hook: true,
+                },
+            ),
+            None => self.summarize_via_model(compacted).await?,
+        };
 
         // Persist the boundary first — the session is the durable record and
         // a failure here leaves the agent transcript untouched.
@@ -558,6 +542,7 @@ impl<S: SessionStorage> AgentHarness<S> {
                 tokens_before,
                 usage.clone(),
                 kept.to_vec(),
+                authorship,
             )
             .await
         {
@@ -605,6 +590,84 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         self.phase = AgentHarnessPhase::Idle;
         Ok(result)
+    }
+
+    /// Summarize the compacted prefix via the harness stream function.
+    ///
+    /// Returns the summary text, the summarization usage, and the default
+    /// authorship (`from_hook: false`, no `details`). A terminal
+    /// `Error`/`Aborted` stop reason or an empty summary bails before anything
+    /// is persisted so the transcript and session stay intact.
+    async fn summarize_via_model(
+        &mut self,
+        compacted: &[AgentMessage],
+    ) -> Result<(String, Option<Usage>, CompactionAuthorship), anyhow::Error> {
+        let prompt = compaction::build_compaction_prompt(compacted, None);
+        let summary_context = AgentContext {
+            system_prompt:
+                "You compress a coding agent's conversation history into a concise summary.".into(),
+            messages: vec![AgentMessage::user(prompt)],
+            tools: Arc::from(Vec::new()),
+            model: self.model.clone(),
+            thinking_level: None,
+            cache_retention: CacheRetention::None,
+            session_id: None,
+            metadata: Default::default(),
+        };
+        let signal = CancellationToken::new();
+        let (event_tx, mut event_rx) = mpsc::channel::<crate::types::AgentEvent>(64);
+        // Run the summarization stream concurrently with draining its events:
+        // the producer would block on the 64-cap channel once it fills, so the
+        // receiver must drain while it runs, not after.
+        let stream_fn = Arc::clone(&self.stream_fn);
+        let stream_handle =
+            tokio::spawn(async move { stream_fn.stream(&summary_context, signal, event_tx).await });
+        // The harness does not surface summarization events; just keep the
+        // channel empty so the producer never blocks.
+        while event_rx.recv().await.is_some() {}
+        let summary_response = match stream_handle.await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                self.phase = AgentHarnessPhase::Idle;
+                return Err(e);
+            }
+            Err(join_err) => {
+                self.phase = AgentHarnessPhase::Idle;
+                return Err(anyhow::Error::new(join_err));
+            }
+        };
+
+        let (summary_text, usage) = extract_summary(&summary_response);
+        let failed = match &summary_response {
+            AgentMessage::Assistant {
+                stop_reason: Some(StopReason::Error | StopReason::Aborted),
+                ..
+            } => true,
+            _ => summary_text.trim().is_empty(),
+        };
+        if failed {
+            self.phase = AgentHarnessPhase::Idle;
+            let label = match &summary_response {
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Error),
+                    ..
+                } => "error",
+                AgentMessage::Assistant {
+                    stop_reason: Some(StopReason::Aborted),
+                    ..
+                } => "aborted",
+                _ => "no summary",
+            };
+            let detail = match &summary_response {
+                AgentMessage::Assistant {
+                    error_message: Some(msg),
+                    ..
+                } => format!(": {msg}"),
+                _ => String::new(),
+            };
+            return Err(anyhow::anyhow!("summarization failed ({label}){detail}"));
+        }
+        Ok((summary_text, usage, CompactionAuthorship::default()))
     }
 
     /// Build a compaction prompt for the current conversation.
@@ -1154,6 +1217,184 @@ mod tests {
         );
     }
 
+    /// A `SessionBeforeCompact` hook can cancel the run: nothing is persisted
+    /// and the transcript is left intact. Mirrors the TS `cancel` branch.
+    #[tokio::test]
+    async fn test_before_compact_hook_can_cancel() {
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(TestStreamFn),
+        );
+        let assistant = AgentMessage::Assistant {
+            content: vec![],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+        let entries_before = harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap()
+            .len();
+
+        harness.on(
+            HookPoint::SessionBeforeCompact,
+            Arc::new(|ctx: HookContext| ctx.with_cancel_compaction()),
+        );
+
+        let err = harness.compact().await.unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+
+        // No compaction entry was persisted.
+        assert_eq!(
+            harness
+                .session()
+                .storage()
+                .get_entries()
+                .await
+                .unwrap()
+                .len(),
+            entries_before
+        );
+        // The transcript is untouched.
+        assert_eq!(harness.agent_mut().state().messages.len(), 2);
+    }
+
+    /// A `SessionBeforeCompact` hook can supply the summary directly: the
+    /// summarization model is never called, and the persisted entry carries
+    /// `fromHook` and the hook's `details`. Mirrors the TS `compaction` branch.
+    #[tokio::test]
+    async fn test_before_compact_hook_can_supply_summary() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingStreamFn {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl StreamFn for CountingStreamFn {
+            async fn stream(
+                &self,
+                _context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(AgentMessage::Assistant {
+                    content: vec![ContentBlock::Text {
+                        text: "MUST NOT BE USED".into(),
+                        signature: None,
+                    }],
+                    model: "test".into(),
+                    provider: "test".into(),
+                    api: "test".into(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    stop_reason: Some(StopReason::Stop),
+                    usage: Box::new(Usage::default()),
+                    error_message: None,
+                    timestamp: chrono::Utc::now(),
+                })
+            }
+        }
+
+        let storage = MemStorage::new();
+        let session = Session::new(storage);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut harness = AgentHarness::new(
+            session,
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(CountingStreamFn {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let assistant = AgentMessage::Assistant {
+            content: vec![],
+            model: "test".into(),
+            provider: "test".into(),
+            api: "test".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(StopReason::Stop),
+            usage: Box::new(Usage {
+                total_tokens: 90_000,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        harness
+            .agent_mut()
+            .replace_transcript(vec![AgentMessage::user("q"), assistant]);
+
+        harness.on(
+            HookPoint::SessionBeforeCompact,
+            Arc::new(|ctx: HookContext| {
+                ctx.with_compact_override(BeforeCompactOverride {
+                    summary: "hook-authored summary".into(),
+                    details: Some(serde_json::json!({"files": ["a.rs", "b.rs"]})),
+                    usage: Some(Usage {
+                        total_tokens: 7,
+                        ..Default::default()
+                    }),
+                })
+            }),
+        );
+
+        let result = harness.compact().await.expect("hook-supplied compact");
+        assert_eq!(result.summary, "hook-authored summary");
+        // The summarization model was never called.
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // The persisted entry carries fromHook and the hook's details.
+        let compaction = harness
+            .session()
+            .storage()
+            .get_entries()
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|e| match e {
+                SessionTreeEntry::Compaction {
+                    summary,
+                    from_hook,
+                    details,
+                    usage,
+                    ..
+                } => Some((summary.clone(), *from_hook, details.clone(), usage.clone())),
+                _ => None,
+            })
+            .expect("compaction persisted");
+        assert_eq!(compaction.0, "hook-authored summary");
+        assert_eq!(compaction.1, Some(true));
+        assert_eq!(
+            compaction.2,
+            Some(serde_json::json!({"files": ["a.rs", "b.rs"]}))
+        );
+        assert_eq!(compaction.3.map(|u| u.total_tokens), Some(7));
+    }
+
     #[tokio::test]
     async fn test_compact_drains_more_events_than_channel_capacity() {
         // The summarization channel caps at 64 events; ChattyStreamFn emits
@@ -1223,7 +1464,7 @@ mod tests {
 
         // Compact in a first harness over an on-disk session.
         {
-            let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
                 .await
                 .unwrap();
             let session = Session::new(storage);
@@ -1242,7 +1483,7 @@ mod tests {
 
         // Reopen the session from disk: the compaction entry survived, with
         // the retained tail embedded for a future context rebuild.
-        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
             .await
             .unwrap();
         let entries = storage.get_entries().await.unwrap();
@@ -1273,7 +1514,7 @@ mod tests {
         assert!(!harness.needs_compaction());
 
         // Without recovery the stale usage anchors and the threshold trips.
-        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
             .await
             .unwrap();
         let session = Session::new(storage);
@@ -1305,7 +1546,7 @@ mod tests {
         // Run a turn, compact, run another turn — all over an on-disk session.
         let expected;
         {
-            let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+            let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
                 .await
                 .unwrap();
             let session = Session::new(storage);
@@ -1323,7 +1564,7 @@ mod tests {
 
         // A fresh harness restores the full transcript: summary, retained
         // tail, and the post-compaction messages.
-        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta())
+        let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"))
             .await
             .unwrap();
         let session = Session::new(storage);

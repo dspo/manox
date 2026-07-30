@@ -119,7 +119,7 @@ async fn main() {
         parent_session_path: None,
         metadata: None,
     };
-    let storage = JsonlSessionStorage::open(&dir.path().join("session.jsonl"), meta)
+    let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta)
         .await
         .expect("open");
     let session = Session::new(storage);

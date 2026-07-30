@@ -256,6 +256,16 @@ pub struct Session<S: SessionStorage> {
     storage: S,
 }
 
+/// Authorship of a persisted compaction: whether a before-compact hook
+/// supplied the summary (skipping the summarization model call), and the
+/// structured payload it attached. The model path passes `from_hook: false`
+/// with no `details`.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionAuthorship {
+    pub details: Option<JsonValue>,
+    pub from_hook: bool,
+}
+
 impl<S: SessionStorage> Session<S> {
     pub fn new(storage: S) -> Self {
         Session { storage }
@@ -294,6 +304,7 @@ impl<S: SessionStorage> Session<S> {
         tokens_before: u64,
         usage: Option<Usage>,
         retained_tail: Vec<AgentMessage>,
+        authorship: CompactionAuthorship,
     ) -> Result<(String, DateTime<Utc>), anyhow::Error> {
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
@@ -308,8 +319,8 @@ impl<S: SessionStorage> Session<S> {
             tokens_before,
             usage,
             retained_tail,
-            details: None,
-            from_hook: None,
+            details: authorship.details,
+            from_hook: Some(authorship.from_hook),
         };
         self.storage.append_entry(&entry).await?;
         Ok((id, timestamp))
