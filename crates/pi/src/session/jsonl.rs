@@ -432,6 +432,7 @@ mod tests {
             summary: "summarized".into(),
             first_kept_entry_id: None,
             tokens_before: 1000,
+            usage: None,
             retained_tail: vec![AgentMessage::user("kept")],
         };
         let post = SessionTreeEntry::Message {
@@ -466,6 +467,7 @@ mod tests {
             summary: id.into(),
             first_kept_entry_id: None,
             tokens_before: 0,
+            usage: None,
             retained_tail: Vec::new(),
         };
         let message = |id: &str, parent: &str, secs: i64| SessionTreeEntry::Message {

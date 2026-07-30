@@ -8,7 +8,7 @@
 pub mod jsonl;
 
 use crate::compaction::branch_summarization::BranchSummary;
-use crate::types::AgentMessage;
+use crate::types::{AgentMessage, Usage};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -32,6 +32,9 @@ pub enum SessionTreeEntry {
         summary: String,
         first_kept_entry_id: Option<String>,
         tokens_before: u64,
+        /// Token usage reported by the summarization call, when recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
         /// The messages kept intact across the compaction, stored verbatim
         /// so a rebuilt context needs no walk past the boundary.
         #[serde(default)]
@@ -239,6 +242,7 @@ impl<S: SessionStorage> Session<S> {
         summary: &str,
         first_kept_entry_id: Option<String>,
         tokens_before: u64,
+        usage: Option<Usage>,
         retained_tail: Vec<AgentMessage>,
     ) -> Result<(String, DateTime<Utc>), anyhow::Error> {
         let id = self.storage.create_entry_id().await?;
@@ -252,6 +256,7 @@ impl<S: SessionStorage> Session<S> {
             summary: summary.to_string(),
             first_kept_entry_id,
             tokens_before,
+            usage,
             retained_tail,
         };
         self.storage.append_entry(&entry).await?;

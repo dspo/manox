@@ -6,13 +6,16 @@
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
 use crate::agent::Agent;
 use crate::agent_loop::StreamFn;
 use crate::compaction::{self, CompactionResult, CompactionSettings};
 use crate::env::{ExecutionEnv, TokioExecutionEnv};
 use crate::session::{Session, SessionStorage};
 use crate::tool::{LocalToolContext, ToolState};
-use crate::types::{AgentContext, AgentMessage, Model};
+use crate::types::{AgentContext, AgentMessage, CacheRetention, ContentBlock, Model, Usage};
 
 /// The phases the harness can be in.
 ///
@@ -96,6 +99,14 @@ pub struct AgentHarness<S: SessionStorage> {
     /// session by [`AgentHarness::recover_boundary`].
     last_compaction_at: Option<chrono::DateTime<chrono::Utc>>,
     hooks: Vec<(HookPoint, HookHandler)>,
+    /// The streaming function used for the summarization call in `compact()`.
+    stream_fn: Arc<dyn StreamFn>,
+    /// Entry ids aligned by index with the agent transcript. `None` marks a
+    /// synthetic carrier (a compaction summary message, or a message folded
+    /// into a compaction entry's retained tail on restore) that has no
+    /// standalone `Message` entry. Drives the real `first_kept_entry_id`
+    /// recorded by `compact()`.
+    message_entry_ids: Vec<Option<String>>,
 }
 
 impl<S: SessionStorage> AgentHarness<S> {
@@ -114,7 +125,12 @@ impl<S: SessionStorage> AgentHarness<S> {
         let tool_state = Arc::new(ToolState::new());
         let tool_ctx: Arc<dyn crate::tool::ToolContext> =
             Arc::new(LocalToolContext::new(env, cwd, tool_state));
-        let agent = Agent::new(system_prompt, model.clone(), stream_fn, tool_ctx);
+        let agent = Agent::new(
+            system_prompt,
+            model.clone(),
+            Arc::clone(&stream_fn),
+            tool_ctx,
+        );
         AgentHarness {
             agent,
             session,
@@ -123,6 +139,8 @@ impl<S: SessionStorage> AgentHarness<S> {
             compaction_settings: CompactionSettings::default(),
             last_compaction_at: None,
             hooks: Vec::new(),
+            stream_fn,
+            message_entry_ids: Vec::new(),
         }
     }
 
@@ -204,12 +222,16 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         match result {
             Ok(messages) => {
-                // Persist messages to session.
+                // Persist messages to session, tracking the entry id of each
+                // so `compact()` can record the real first-kept entry.
                 let mut persist_result = Ok(());
                 for msg in &messages {
-                    if let Err(e) = self.session.append_message(msg.clone()).await {
-                        persist_result = Err(e);
-                        break;
+                    match self.session.append_message(msg.clone()).await {
+                        Ok(id) => self.message_entry_ids.push(Some(id)),
+                        Err(e) => {
+                            persist_result = Err(e);
+                            break;
+                        }
                     }
                 }
 
@@ -251,9 +273,12 @@ impl<S: SessionStorage> AgentHarness<S> {
             Ok(messages) => {
                 let mut persist_result = Ok(());
                 for msg in &messages {
-                    if let Err(e) = self.session.append_message(msg.clone()).await {
-                        persist_result = Err(e);
-                        break;
+                    match self.session.append_message(msg.clone()).await {
+                        Ok(id) => self.message_entry_ids.push(Some(id)),
+                        Err(e) => {
+                            persist_result = Err(e);
+                            break;
+                        }
                     }
                 }
                 self.phase = AgentHarnessPhase::Idle;
@@ -278,6 +303,7 @@ impl<S: SessionStorage> AgentHarness<S> {
     /// Reset the agent's transcript and queues.
     pub fn reset(&mut self) {
         self.agent.reset();
+        self.message_entry_ids.clear();
         self.phase = AgentHarnessPhase::Idle;
     }
 
@@ -301,6 +327,7 @@ impl<S: SessionStorage> AgentHarness<S> {
     pub async fn restore(&mut self) -> Result<(), anyhow::Error> {
         let entries = self.session.build_context().await?;
         let mut messages = Vec::new();
+        let mut entry_ids: Vec<Option<String>> = Vec::new();
         for entry in &entries {
             match entry {
                 crate::session::SessionTreeEntry::Compaction {
@@ -309,10 +336,17 @@ impl<S: SessionStorage> AgentHarness<S> {
                     timestamp,
                     ..
                 } => {
+                    // The summary is a synthetic carrier; the retained tail is
+                    // folded into the entry, so neither has a standalone id.
+                    entry_ids.push(None);
+                    for _ in retained_tail {
+                        entry_ids.push(None);
+                    }
                     messages.push(summary_message(summary, *timestamp));
                     messages.extend(retained_tail.iter().cloned());
                 }
-                crate::session::SessionTreeEntry::Message { message, .. } => {
+                crate::session::SessionTreeEntry::Message { id, message, .. } => {
+                    entry_ids.push(Some(id.clone()));
                     messages.push(message.clone());
                 }
                 _ => {}
@@ -320,6 +354,7 @@ impl<S: SessionStorage> AgentHarness<S> {
         }
         self.agent.reset();
         self.agent.replace_transcript(messages);
+        self.message_entry_ids = entry_ids;
         self.recover_boundary().await?;
         Ok(())
     }
@@ -376,12 +411,17 @@ impl<S: SessionStorage> AgentHarness<S> {
 
     /// Run compaction on the current conversation.
     ///
-    /// This finds the cut point, builds a compaction prompt, and returns
-    /// the compaction result. The caller is responsible for calling the
-    /// LLM with the compaction prompt and providing the summary.
-    pub async fn compact(&mut self, summary: &str) -> Result<CompactionResult, anyhow::Error> {
+    /// Finds the cut point, asks the model (via the harness stream function)
+    /// to summarize the compacted prefix, and persists a `Compaction` entry
+    /// carrying the real first-kept entry id, the pre-compaction token count,
+    /// the summarization usage, and the retained tail. The agent transcript is
+    /// rewritten to the summary message plus the kept tail.
+    pub async fn compact(&mut self) -> Result<CompactionResult, anyhow::Error> {
         if self.phase != AgentHarnessPhase::Idle {
             anyhow::bail!("Cannot compact while harness is in {:?} phase", self.phase);
+        }
+        if self.agent.state().messages.is_empty() {
+            anyhow::bail!("Cannot compact an empty transcript");
         }
 
         self.phase = AgentHarnessPhase::Compaction;
@@ -394,18 +434,53 @@ impl<S: SessionStorage> AgentHarness<S> {
 
         let messages = self.agent.state().messages.clone();
         let tokens_before = compaction::estimate_context_tokens(&messages).tokens;
-
         let cut_point =
             compaction::find_cut_point(&messages, self.compaction_settings.keep_recent_tokens);
-
-        let _compacted = &messages[..cut_point];
+        let compacted = &messages[..cut_point];
         let kept = &messages[cut_point..];
+
+        let prompt = compaction::build_compaction_prompt(compacted, None);
+        let summary_context = AgentContext {
+            system_prompt:
+                "You compress a coding agent's conversation history into a concise summary.".into(),
+            messages: vec![AgentMessage::user(prompt)],
+            tools: Arc::from(Vec::new()),
+            model: self.model.clone(),
+            thinking_level: None,
+            cache_retention: CacheRetention::None,
+            session_id: None,
+            metadata: Default::default(),
+        };
+        let signal = CancellationToken::new();
+        let (event_tx, mut event_rx) = mpsc::channel::<crate::types::AgentEvent>(64);
+        let summary_response = match self
+            .stream_fn
+            .stream(&summary_context, signal, event_tx)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                self.phase = AgentHarnessPhase::Idle;
+                return Err(e);
+            }
+        };
+        // Drain summarization events — the harness does not surface them.
+        while event_rx.recv().await.is_some() {}
+
+        let (summary_text, usage) = extract_summary(&summary_response);
+        let first_kept_entry_id = self.message_entry_ids.get(cut_point).cloned().flatten();
 
         // Persist the boundary first — the session is the durable record and
         // a failure here leaves the agent transcript untouched.
         let boundary = match self
             .session
-            .append_compaction(summary, None, tokens_before, kept.to_vec())
+            .append_compaction(
+                &summary_text,
+                first_kept_entry_id.clone(),
+                tokens_before,
+                usage.clone(),
+                kept.to_vec(),
+            )
             .await
         {
             Ok((_id, timestamp)) => timestamp,
@@ -415,21 +490,27 @@ impl<S: SessionStorage> AgentHarness<S> {
             }
         };
 
-        // Build a new transcript: summary as system context + kept messages.
-        // The summary message carries the boundary instant, so a transcript
+        // Rebuild the transcript: summary as context + kept messages. The
+        // summary message carries the boundary instant, so a transcript
         // rebuilt from storage equals this one exactly.
-        let mut new_messages = Vec::new();
-        new_messages.push(summary_message(summary, boundary));
+        let mut new_messages = Vec::with_capacity(kept.len() + 1);
+        new_messages.push(summary_message(&summary_text, boundary));
         new_messages.extend_from_slice(kept);
 
         self.agent.reset();
         self.agent.replace_transcript(new_messages);
+        // The summary is synthetic; kept messages retain their entry ids.
+        let mut new_ids: Vec<Option<String>> = Vec::with_capacity(kept.len() + 1);
+        new_ids.push(None);
+        new_ids.extend(self.message_entry_ids[cut_point..].iter().cloned());
+        self.message_entry_ids = new_ids;
+
         self.last_compaction_at = Some(boundary);
         let tokens_after = self.estimate_current_tokens();
 
         let result = CompactionResult {
-            summary: summary.to_string(),
-            first_kept_entry_id: kept.first().map(|_| "compacted".to_string()),
+            summary: summary_text,
+            first_kept_entry_id,
             tokens_before,
             tokens_after,
         };
@@ -483,6 +564,31 @@ fn summary_message(summary: &str, timestamp: chrono::DateTime<chrono::Utc>) -> A
             signature: None,
         }],
         timestamp,
+    }
+}
+
+/// Pull the summary text and token usage out of the summarization response.
+///
+/// Only a completed assistant turn carries trustworthy usage; an unfinished
+/// or non-assistant response contributes no usage anchor.
+fn extract_summary(message: &AgentMessage) -> (String, Option<Usage>) {
+    match message {
+        AgentMessage::Assistant {
+            content,
+            usage,
+            stop_reason: Some(_),
+            ..
+        } => {
+            let text = content
+                .iter()
+                .find_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            (text, Some((**usage).clone()))
+        }
+        _ => (String::new(), None),
     }
 }
 
@@ -701,7 +807,7 @@ mod tests {
         // After compaction the retained usage measured a different prefix, so
         // the post-compaction count is the plain character heuristic and the
         // harness does not immediately ask for another compaction.
-        let result = harness.compact("summary").await.unwrap();
+        let result = harness.compact().await.unwrap();
         assert!(
             result.tokens_after < 1_000,
             "tokens_after={}",
@@ -751,7 +857,7 @@ mod tests {
             harness
                 .agent_mut()
                 .replace_transcript(vec![AgentMessage::user("q"), stale_assistant.clone()]);
-            let result = harness.compact("summary").await.unwrap();
+            let result = harness.compact().await.unwrap();
             assert_eq!(result.tokens_before, 90_000);
         }
 
@@ -768,7 +874,7 @@ mod tests {
             } => Some((summary.clone(), *tokens_before, retained_tail.len())),
             _ => None,
         });
-        assert_eq!(boundary, Some(("summary".to_string(), 90_000, 2)));
+        assert_eq!(boundary, Some(("Test response".to_string(), 90_000, 2)));
 
         // A fresh harness over the restored session recovers the boundary, so
         // a transcript whose usage predates the compaction cannot anchor.
@@ -823,7 +929,7 @@ mod tests {
                 Arc::new(TestStreamFn),
             );
             harness.prompt("first").await.unwrap();
-            harness.compact("summary").await.unwrap();
+            harness.compact().await.unwrap();
             harness.prompt("second").await.unwrap();
             expected = serde_json::to_value(&harness.agent().state().messages).unwrap();
         }
@@ -855,7 +961,7 @@ mod tests {
         assert_eq!(messages.len(), 5, "{messages:?}");
         assert_eq!(
             text_of(&messages[0]),
-            "<conversation_history_summary>\nsummary\n</conversation_history_summary>"
+            "<conversation_history_summary>\nTest response\n</conversation_history_summary>"
         );
         assert_eq!(text_of(&messages[1]), "first");
         assert!(matches!(&messages[2], AgentMessage::Assistant { .. }));
