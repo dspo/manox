@@ -195,16 +195,15 @@ impl SessionStorage for JsonlSessionStorage {
         let parent_id = self.leaf_id.lock().await.clone();
         let id = self.create_entry_id().await?;
         let entry = SessionTreeEntry::Leaf {
-            id: id.clone(),
+            id,
             parent_id,
             timestamp: chrono::Utc::now(),
             target_id: leaf_id.map(|s| s.to_string()),
         };
-        let line = serde_json::to_string(&entry)? + "\n";
-        self.append_line(&line).await?;
-        self.entries.lock().await.push(entry);
-        *self.leaf_id.lock().await = leaf_id.map(|s| s.to_string());
-        Ok(())
+        // Reuse the shared append path so the leaf entry lands on disk, in the
+        // in-memory index, and as the cursor through one code path — the
+        // cursor becomes the leaf's `targetId` via `leaf_cursor_after`.
+        self.append_entry(&entry).await
     }
 
     async fn get_entries(&self) -> Result<Vec<SessionTreeEntry>, anyhow::Error> {
@@ -903,5 +902,88 @@ mod tests {
             !label_line.contains("\"label\":"),
             "unset label field leaked onto disk: {label_line}"
         );
+    }
+
+    /// A full branching lifecycle must stay consistent across disk round-trips:
+    /// append → branch back via `set_leaf_id` → append again → reopen → walk.
+    /// The later message parents onto the leaf's `targetId` (the cursor), and
+    /// the leaf entry never appears in the walked context — matching TS
+    /// `setLeafId` / `leafIdAfterEntry` / `getPathToRootOrCompaction`.
+    #[tokio::test]
+    async fn test_branch_lifecycle_round_trips_consistently() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+
+        let storage = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        let session = Session::new(storage);
+
+        let m1 = session
+            .append_message(AgentMessage::user("first"))
+            .await
+            .unwrap();
+        // Branch back to m1: a leaf entry is persisted, cursor redirects to m1.
+        session.storage().set_leaf_id(Some(&m1)).await.unwrap();
+        assert_eq!(
+            session.storage().get_leaf_id().await.unwrap(),
+            Some(m1.clone())
+        );
+
+        // A message appended after the branch parents onto the cursor (m1),
+        // not the leaf entry's own id.
+        let m2 = session
+            .append_message(AgentMessage::user("second"))
+            .await
+            .unwrap();
+        assert_eq!(
+            session.storage().get_leaf_id().await.unwrap(),
+            Some(m2.clone())
+        );
+
+        let entries = session.storage().get_entries().await.unwrap();
+        // m1, the leaf entry, m2 — leaf is persisted, not an in-memory override.
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().any(|e| e.id() == m1));
+        assert!(entries.iter().any(|e| e.id() == m2));
+        assert!(
+            entries.iter().any(|e| matches!(e, SessionTreeEntry::Leaf { target_id, .. } if target_id.as_deref() == Some(&m1))),
+            "no leaf entry redirecting to m1 was persisted"
+        );
+
+        // Reopen: the trailing message is the cursor, the leaf survives on disk.
+        let reopened = JsonlSessionStorage::open(dir.path(), meta()).await.unwrap();
+        assert_eq!(reopened.get_leaf_id().await.unwrap(), Some(m2.clone()));
+        assert_eq!(reopened.get_entries().await.unwrap().len(), 3);
+
+        // The walked context skips the leaf entry: m2 → m1, no leaf in path.
+        let session = Session::new(reopened);
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(ctx.len(), 2);
+        assert_eq!(ctx[0].id(), m1);
+        assert_eq!(ctx[1].id(), m2);
+        assert!(
+            !ctx.iter()
+                .any(|e| matches!(e, SessionTreeEntry::Leaf { .. })),
+            "leaf entry leaked into the walked context"
+        );
+
+        // The on-disk file is a strictly append-only sequence of valid lines.
+        let on_disk = tokio::fs::read_to_string(&path).await.unwrap();
+        let mut types: Vec<String> = on_disk
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .unwrap()
+                    .get("type")
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(types.remove(0), "session");
+        assert_eq!(types, vec!["message", "leaf", "message"]);
     }
 }
