@@ -186,6 +186,10 @@ enum Slot {
 struct Accumulator {
     model: String,
     provider: String,
+    /// Response id from `response.created`/terminal, surfaced as `response_id`.
+    response_id: Option<String>,
+    /// Model the upstream routed to, surfaced as `response_model`.
+    response_model: Option<String>,
     blocks: Vec<ContentBlock>,
     /// Open output slots by their protocol `output_index`.
     slots: HashMap<usize, Slot>,
@@ -207,6 +211,8 @@ impl Accumulator {
         Accumulator {
             model: context.model.id.clone(),
             provider: context.model.provider.clone(),
+            response_id: None,
+            response_model: None,
             blocks: Vec::new(),
             slots: HashMap::new(),
             reasoning_blocks: HashMap::new(),
@@ -218,13 +224,16 @@ impl Accumulator {
     }
 
     fn current(&self) -> AgentMessage {
+        // Response failures bubble as `Err` (handled by the loop's terminal
+        // message path), so a finalized message here never carries a failure
+        // stop reason and needs no `error_message`.
         AgentMessage::Assistant {
             content: self.blocks.clone(),
             model: self.model.clone(),
             provider: self.provider.clone(),
             api: "openai_responses".into(),
-            response_model: None,
-            response_id: None,
+            response_model: self.response_model.clone(),
+            response_id: self.response_id.clone(),
             diagnostics: None,
             stop_reason: self.stop_reason,
             usage: self.usage.clone(),
@@ -299,6 +308,19 @@ impl Accumulator {
                     }
                     _ => false,
                 }
+            }
+            "response.created" | "response.in_progress" | "response.queued" => {
+                let ev: WireResponseEvent =
+                    serde_json::from_value(value).map_err(ProviderError::Json)?;
+                // The created event carries the upstream-assigned id and (when
+                // the request is rerouted) the model the endpoint picked.
+                if let Some(id) = &ev.response.id {
+                    self.response_id = Some(id.clone());
+                }
+                if let Some(m) = &ev.response.model {
+                    self.response_model = Some(m.clone());
+                }
+                false
             }
             "response.completed" | "response.incomplete" => {
                 let ev: WireResponseEvent =
@@ -488,6 +510,14 @@ impl Accumulator {
     /// usage, and the stop reason.
     fn finalize_response(&mut self, response: &WireResponse) -> Result<(), anyhow::Error> {
         self.terminal_seen = true;
+        // Backstop: capture the id/model from the terminal event when the
+        // created event was absent or carried none.
+        if let Some(id) = &response.id {
+            self.response_id = Some(id.clone());
+        }
+        if let Some(m) = &response.model {
+            self.response_model = Some(m.clone());
+        }
         self.backfill_reasoning_signatures(&response.output);
         if let Some(usage) = &response.usage {
             *self.usage = to_usage(usage);

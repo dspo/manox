@@ -504,7 +504,10 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         cache_creation_input_tokens: written,
         cache_creation: None,
         total_tokens: wire.total_tokens.unwrap_or(0),
-        reasoning_tokens: None,
+        reasoning_tokens: wire
+            .output_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens),
         cost: None,
     }
 }
@@ -1023,6 +1026,7 @@ mod tests {
                 cached_tokens: Some(700),
                 cache_write_tokens: Some(100),
             }),
+            output_tokens_details: None,
         };
         let u = to_usage(&wire);
         assert_eq!(u.input_tokens, 200);
@@ -1042,6 +1046,7 @@ mod tests {
                 cached_tokens: Some(99),
                 cache_write_tokens: None,
             }),
+            output_tokens_details: None,
         };
         assert_eq!(to_usage(&bad).input_tokens, 0);
     }

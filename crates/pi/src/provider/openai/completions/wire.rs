@@ -222,12 +222,23 @@ pub struct WireUsage {
     pub prompt_cache_hit_tokens: Option<u64>,
     #[serde(default)]
     pub prompt_tokens_details: Option<WirePromptTokensDetails>,
+    /// Breakdown of completion tokens, when the endpoint reports it.
+    #[serde(default)]
+    pub completion_tokens_details: Option<WireCompletionTokensDetails>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WirePromptTokensDetails {
     #[serde(default)]
     pub cached_tokens: Option<u64>,
+}
+
+/// Completion-token breakdown. `reasoning_tokens` is the subset of
+/// `completion_tokens` spent on reasoning, when the endpoint reports it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WireCompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Some endpoints answer 2xx and then stream an error object as data. The

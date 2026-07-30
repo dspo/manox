@@ -28,13 +28,30 @@ fn map_effort(level: &str) -> Effort {
     }
 }
 
+/// Map a thinking level to a reasoning token budget for enabled (non-adaptive)
+/// models, clamped below the request's `max_tokens` so the API's
+/// `budget_tokens < max_tokens` rule holds. The floor is the protocol minimum
+/// of 1024.
+fn map_budget(level: &str, max_tokens: usize) -> u64 {
+    let mapped = match level {
+        "minimal" | "low" => 2_048,
+        "medium" => 4_096,
+        "xhigh" => 12_288,
+        "max" => 16_384,
+        _ => 8_192, // "high" and any unknown level
+    };
+    let cap = (max_tokens.saturating_sub(256)).max(1024) as u64;
+    mapped.clamp(1024, cap)
+}
+
 /// Build the API request body from the agent context and stream options.
 pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCreateParams {
     let cache_control = cache_control(context);
     let messages = crate::provider::transform::repair_tool_flow(&context.messages);
+    let max_tokens = options.max_tokens.unwrap_or(context.model.max_tokens);
     MessageCreateParams {
         model: context.model.id.clone(),
-        max_tokens: options.max_tokens.unwrap_or(context.model.max_tokens),
+        max_tokens,
         system: Some(vec![SystemBlock {
             kind: "text",
             text: context.system_prompt.clone(),
@@ -42,7 +59,7 @@ pub fn to_request(context: &AgentContext, options: &StreamOptions) -> MessageCre
         }]),
         messages: to_message_params(&messages, cache_control.as_ref()),
         tools: tools_param(context, cache_control.as_ref()),
-        thinking: thinking_config(context),
+        thinking: thinking_config(context, max_tokens),
         output_config: output_config(context),
         temperature: options.temperature,
         stop_sequences: None,
@@ -95,27 +112,34 @@ fn tools_param(
 /// The thinking field mirrors the model's thinking protocol: `"off"` forces
 /// `disabled`, a set level picks `adaptive` or `enabled` per the model's
 /// [`ThinkingKind`], and no level at all omits the field (server default).
-/// Thinking text comes back summarized; its signature is always preserved for
-/// multi-turn continuity.
-fn thinking_config(context: &AgentContext) -> Option<ThinkingConfig> {
+/// Enabled (non-adaptive) models carry a `budget_tokens` cap derived from the
+/// level and clamped below `max_tokens`; adaptive models defer depth to
+/// `output_config.effort`. Thinking text comes back summarized; its signature
+/// is always preserved for multi-turn continuity.
+fn thinking_config(context: &AgentContext, max_tokens: usize) -> Option<ThinkingConfig> {
     let display = Some(ThinkingDisplay::Summarized);
     match context.model.thinking {
         ThinkingKind::None => None,
         kind => match context.thinking_level.as_deref() {
             None => None,
             Some("off") => Some(ThinkingConfig::Disabled),
-            Some(_) => Some(match kind {
+            Some(level) => Some(match kind {
                 ThinkingKind::Adaptive => ThinkingConfig::Adaptive { display },
-                ThinkingKind::Enabled => ThinkingConfig::Enabled { display },
+                ThinkingKind::Enabled => ThinkingConfig::Enabled {
+                    display,
+                    budget_tokens: Some(map_budget(level, max_tokens)),
+                },
                 ThinkingKind::None => unreachable!(),
             }),
         },
     }
 }
 
-/// The effort tier lives in `output_config`, separate from `thinking`.
+/// The effort tier lives in `output_config`, separate from `thinking`. It is
+/// the depth knob for adaptive models only; enabled (non-adaptive) models
+/// govern depth via `thinking.budget_tokens` and carry no effort tier.
 fn output_config(context: &AgentContext) -> Option<OutputConfig> {
-    if !context.model.supports_thinking() {
+    if !matches!(context.model.thinking, ThinkingKind::Adaptive) {
         return None;
     }
     let level = context.thinking_level.as_deref()?;
@@ -498,26 +522,26 @@ mod tests {
     }
 
     #[test]
-    fn enabled_kind_uses_enabled_shape_without_budget() {
+    fn enabled_kind_emits_budget_tokens() {
         let ctx = ctx(vec![user("hi")], ThinkingKind::Enabled, Some("high"));
         let req = to_request(&ctx, &StreamOptions::default());
         assert!(matches!(
             req.thinking,
             Some(ThinkingConfig::Enabled {
-                display: Some(ThinkingDisplay::Summarized)
+                display: Some(ThinkingDisplay::Summarized),
+                budget_tokens: Some(_),
             })
         ));
-        assert!(matches!(
-            req.output_config,
-            Some(OutputConfig {
-                effort: Some(Effort::High)
-            })
-        ));
+        // Enabled models take no effort tier — depth is governed by budget.
+        assert!(req.output_config.is_none());
 
-        // The enabled wire shape carries no budget_tokens — depth comes from effort.
+        // The enabled wire shape carries a budget_tokens, clamped below
+        // max_tokens (the model's default of 8_192 caps "high" → 7_936).
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["thinking"]["type"], "enabled");
-        assert!(v["thinking"].get("budget_tokens").is_none());
+        let budget = v["thinking"]["budget_tokens"].as_u64().unwrap();
+        assert!(budget >= 1024);
+        assert!(budget < 8_192);
     }
 
     #[test]

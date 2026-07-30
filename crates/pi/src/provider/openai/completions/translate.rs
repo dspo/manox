@@ -319,7 +319,10 @@ pub fn to_usage(wire: &WireUsage) -> crate::types::Usage {
         cache_creation_input_tokens: 0,
         cache_creation: None,
         total_tokens: input_tokens + output_tokens + hit,
-        reasoning_tokens: None,
+        reasoning_tokens: wire
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens),
         cost: None,
     }
 }
@@ -731,6 +734,7 @@ mod tests {
             completion_tokens: Some(50),
             prompt_cache_hit_tokens: Some(800),
             prompt_tokens_details: None,
+            completion_tokens_details: None,
         };
         let u = to_usage(&flat);
         assert_eq!(u.input_tokens, 200);
@@ -747,6 +751,7 @@ mod tests {
             prompt_tokens_details: Some(WirePromptTokensDetails {
                 cached_tokens: Some(800),
             }),
+            completion_tokens_details: None,
         };
         let u = to_usage(&nested);
         assert_eq!(u.input_tokens, 200);
@@ -758,6 +763,7 @@ mod tests {
             completion_tokens: None,
             prompt_cache_hit_tokens: Some(99),
             prompt_tokens_details: None,
+            completion_tokens_details: None,
         };
         assert_eq!(to_usage(&bad).input_tokens, 0);
     }
