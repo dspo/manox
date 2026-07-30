@@ -289,21 +289,25 @@ pub fn find_cut_point(messages: &[AgentMessage], keep_recent_tokens: usize) -> u
 
 /// Adjust the cut point to a safe boundary.
 ///
-/// A safe boundary is one where the retained tail starts on a message a
-/// provider accepts as the first message of a request — a `User` or
-/// `Assistant`, never a `ToolResult`. A `ToolResult` first message would be
-/// orphaned: its matching `ToolUse` was summarized into the prefix, so the
-/// provider sees a result with no preceding call and rejects the sequence.
+/// A safe boundary is one where the retained tail starts on a `User` or
+/// `Assistant` — the only messages that both a provider accepts as the first
+/// message of a request and that cannot orphan a later `ToolResult`. Cutting
+/// at a `ToolResult` orphans its own `ToolUse` (summarized into the prefix);
+/// cutting at a `Custom` can orphan a later `ToolResult` whose `ToolUse` sits
+/// before the `Custom`. `Custom` is an unconstrained extension point —
+/// `repair_tool_flow` shows it can legitimately appear between a `tool_use`
+/// and its synthetic result — so it is never treated as a boundary.
 ///
-/// Mirroring TS `findValidCutPoints`, the boundary is the first non-`ToolResult`
-/// message at or after the candidate. A tool chain therefore stays intact on
-/// whichever side of the cut it lands — the whole `Assistant(tool_use) →
-/// ToolResult` run is retained together or summarized together, never split.
+/// This is more conservative than TS `findValidCutPoints`, which lists
+/// `custom` as a valid cut: TS pairs that selection with split-turn
+/// dual-summarization (`isSplitTurn`), which this Rust compaction does not
+/// implement (see `CompactionPreparation`). Without that safety net, only a
+/// `User` or `Assistant` is a provably safe cut.
 fn find_safe_cut(messages: &[AgentMessage], candidate: usize) -> usize {
     let mut idx = candidate.min(messages.len());
     while idx < messages.len() {
         match &messages[idx] {
-            AgentMessage::ToolResult { .. } => idx += 1,
+            AgentMessage::ToolResult { .. } | AgentMessage::Custom { .. } => idx += 1,
             _ => return idx,
         }
     }
@@ -908,38 +912,42 @@ mod tests {
         }
     }
 
-    /// A `Custom` message is a valid cut boundary, mirroring TS
-    /// `findValidCutPoints`, which lists `custom` alongside `user` and
-    /// `assistant` and excludes only `toolResult`.
-    ///
-    /// Compaction reads the raw stored transcript (`harness::compact` clones
-    /// `agent.state().messages`), never the request-time `repair_tool_flow`
-    /// output — that transform is the only thing able to interleave a
-    /// `Custom` between a tool_use and its synthetic result, and it is not
-    /// persisted. The agent loop stores `Custom` only at turn boundaries, so a
-    /// `Custom` in compaction's input never sits mid tool chain and cutting
-    /// there orphans nothing. Locking this in keeps `find_safe_cut` faithful
-    /// to TS rather than advancing past `Custom`.
+    /// A `Custom` is never a safe cut boundary. Unlike TS, this Rust
+    /// compaction does not implement split-turn dual-summarization, so cutting
+    /// at a `Custom` that sits between a `tool_use` and its result would orphan
+    /// the result. `Custom` is an unconstrained extension point —
+    /// `repair_tool_flow` shows it can legitimately appear mid tool chain — so
+    /// `find_safe_cut` advances past it to the next `User` or `Assistant`.
     #[test]
-    fn find_safe_cut_treats_custom_as_valid_boundary() {
-        let custom = AgentMessage::Custom {
-            custom_type: "note".into(),
-            content: vec![ContentBlock::Text {
-                text: "turn starter".into(),
-                signature: None,
-            }],
-            details: None,
-            timestamp: chrono::Utc::now(),
-        };
-        let msgs = vec![
-            make_user("q"),
-            make_assistant("a"),
-            custom,
-            make_user("follow-up"),
+    fn find_safe_cut_advances_past_custom() {
+        fn custom() -> AgentMessage {
+            AgentMessage::Custom {
+                custom_type: "note".into(),
+                content: vec![ContentBlock::Text {
+                    text: "x".into(),
+                    signature: None,
+                }],
+                details: None,
+                timestamp: chrono::Utc::now(),
+            }
+        }
+
+        // Custom between a tool_use assistant and its result — the exact
+        // shape `repair_tool_flow` can produce. Cutting at the Custom would
+        // orphan the result; find_safe_cut advances past both the Custom and
+        // the result to the trailing user.
+        let mid_chain = vec![
+            make_tool_use_assistant("c1", "read", "a.rs"),
+            custom(),
+            make_tool_result("c1", "read"),
+            make_user("next"),
         ];
-        // Candidate at the Custom (index 2): `find_safe_cut` returns it
-        // rather than advancing, matching TS.
-        assert_eq!(find_safe_cut(&msgs, 2), 2);
+        assert_eq!(find_safe_cut(&mid_chain, 1), 3);
+
+        // A Custom at a turn boundary is still advanced past — the safe cut is
+        // the following user, never the Custom itself.
+        let at_boundary = vec![make_user("q"), make_assistant("a"), custom(), make_user("q2")];
+        assert_eq!(find_safe_cut(&at_boundary, 2), 3);
     }
 
     #[test]
